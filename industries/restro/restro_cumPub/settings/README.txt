@@ -1,0 +1,1 @@
+Open settings/settings-dashboard.html first.
