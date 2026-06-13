@@ -10,8 +10,7 @@ THEME :
 'LIGHT',
 
 DASHBOARD :
-'dashboard.html',
-
+ '/Dashboard/index.html',
 LOGIN :
 'client-login.html'
 
