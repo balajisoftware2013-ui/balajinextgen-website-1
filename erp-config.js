@@ -122,9 +122,9 @@ const INDUSTRY_DASHBOARD = {
   RESTAURANT : 'Dashboard/restaurant/dashboard.html',
   CAFE       : 'Dashboard/restaurant/dashboard.html',
   TEA        : 'Dashboard/restaurant/dashboard.html',
-  RETAIL     : 'Dashboard/restaurant/dashboard.html'',
-  GROCERY    : 'Dashboard/restaurant/dashboard.html'',
-  SUPERMARKET: 'Dashboard/restaurant/dashboard.html'',
+  RETAIL     : 'Dashboard/restaurant/dashboard.html',
+  GROCERY    : 'Dashboard/restaurant/dashboard.html',
+  SUPERMARKET: 'Dashboard/restaurant/dashboard.html',
   DEFAULT    : 'Dashboard/dashboard.html',
 };
 
