@@ -114,17 +114,17 @@ const ROLE_DASHBOARD = {
   STAFF        : 'Dashboard/employee-dashboard.html',
   HR           : 'Dashboard/manager-dashboard.html',
   SUPERVISOR   : 'Dashboard/manager-dashboard.html',
-  DEFAULT      : 'Dashboard/dashboard.html',
+  DEFAULT      : 'Dashboard/main_dashboard.html',
 };
 
 /* ── INDUSTRY → DASHBOARD MAP ─────────────────────────────────── */
 const INDUSTRY_DASHBOARD = {
-  RESTAURANT : 'Dashboard/restaurant/welcome.html',
-  CAFE       : 'Dashboard/restaurant/welcome.html',
-  TEA        : 'Dashboard/restaurant/welcome.html',
-  RETAIL     : 'Dashboard/retail/Dashboard.html',
-  GROCERY    : 'Dashboard/retail/Dashboard.html',
-  SUPERMARKET: 'Dashboard/retail/Dashboard.html',
+  RESTAURANT : 'Dashboard/restaurant/dashboard.html',
+  CAFE       : 'Dashboard/restaurant/dashboard.html',
+  TEA        : 'Dashboard/restaurant/dashboard.html',
+  RETAIL     : 'Dashboard/restaurant/dashboard.html'',
+  GROCERY    : 'Dashboard/restaurant/dashboard.html'',
+  SUPERMARKET: 'Dashboard/restaurant/dashboard.html'',
   DEFAULT    : 'Dashboard/dashboard.html',
 };
 
