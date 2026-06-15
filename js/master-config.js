@@ -8,10 +8,13 @@ window.BALAJI_MASTER = {
   buildDate: '2026-06',
 
   /* ── YOUR GAS BACKEND URL ── */
-  gasUrl: '', // PASTE YOUR GAS WEB APP URL HERE
+  // ↓ Go to script.google.com → Deploy → Manage Deployments → copy URL ending in /exec
+  gasUrl: 'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec',
 
-  /* ── MASTER SPREADSHEET ID (for Super Admin — holds all company list, users, sessions) ── */
-  masterSheetId: '', // PASTE YOUR MASTER GOOGLE SHEET ID HERE
+  /* ── MASTER SPREADSHEET ID ── */
+  // ↓ Open your Google Sheet → copy the ID from the URL
+  // URL looks like: docs.google.com/spreadsheets/d/  >>>THIS_PART<<<  /edit
+  masterSheetId: '1VpsTwdULiaj-YeyllgBcYk4txKXrr', // ← YOUR LIVE DB ID (already in GAS backend)
 
   /* ── COMPANY REGISTRY (add all 20 companies here) ── */
   companies: [
