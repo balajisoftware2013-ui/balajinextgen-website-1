@@ -54,12 +54,12 @@ const ROLE_DASHBOARD = {
    Only map to industries that have a REAL working dashboard file —
    everything else falls back to Dashboard/dashboard.html (common ERP). */
 const INDUSTRY_DASHBOARD = {
-  RESTAURANT : 'Dashboard/restaurant/dashboard.html',
-  CAFE       : 'Dashboard/restaurant/dashboard.html',
-  TEA        : 'Dashboard/restaurant/dashboard.html',
-  RETAIL     : 'Dashboard/retail/Dashboard.html',
-  GROCERY    : 'Dashboard/retail/Dashboard.html',
-  SUPERMARKET: 'Dashboard/retail/Dashboard.html',
+  RESTAURANT : 'Dashboard/dashboard.html',
+  CAFE       : 'Dashboard/dashboard.html',
+  TEA        : 'Dashboard/dashboard.html',
+  RETAIL     : 'Dashboard/Dashboard.html',
+  GROCERY    : 'Dashboard/Dashboard.html',
+  SUPERMARKET: 'Dashboard/Dashboard.html',
   /* everything else (hotel, medical, school, pharmacy, construction,
      fruit, juice, ecommerce, distribution, realestate, generic) → */
   DEFAULT    : 'Dashboard/dashboard.html',
