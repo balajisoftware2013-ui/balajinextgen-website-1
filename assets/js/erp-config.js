@@ -14,7 +14,7 @@
 const ERP_REGISTRY_SHEET_ID   = '1FuNJ_XejE2ekYTnk71wXVZ79hRJgu7pmIA6fuE-Iu7I';
 const ERP_REGISTRY_SHEET_NAME = 'TEMPLATE_REGISTRY';
 
-const ERP_FALLBACK_API = 'https://script.google.com/macros/s/AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx/exec';
+const ERP_FALLBACK_API = 'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec';
 
 const ERP_KEYS = {
   USER:    'ERP_USER',
