@@ -3,10 +3,296 @@
 <head>
 <script>
 /* ── Balaji NextGen ERP GAS Bridge ── */
-const GAS_URL='https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec';
-const CLIENT_ID=(function(){try{var u=JSON.parse(sessionStorage.getItem('erpUser')||localStorage.getItem('erpUser')||'{}');return u.CLIENT_ID||u.clientId||'';}catch(e){return '';}})();
-async function gasApi(action,payload){payload=payload||{};try{var r=await fetch(GAS_URL,{method:'POST',body:JSON.stringify(Object.assign({action:action,clientId:CLIENT_ID},payload))});return await r.json();}catch(e){return{success:false,error:e.message};}}
-function gasToast(m,t){var e=document.getElementById('_gasToast');if(!e){e=document.createElement('div');e.id='_gasToast';document.body.appendChild(e);}e.style.cssText='position:fixed;bottom:20px;right:20px;z-index:9999;padding:10px 18px;border-radius:8px;font-size:13px;color:#fff;background:'+(t==='error'?'#dc2626':t==='success'?'#16a34a':'#0f172a')+';';e.textContent=m;clearTimeout(e._t);e._t=setTimeout(function(){e.style.display='none';},3000);}
+/* ═══ AUTO DB CONNECTOR v1.1 ═══ */
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  BALAJI NEXTGEN ERP — FRONTEND DB AUTO CONNECTOR v1.1
+ *  Single <script> block — no duplicate declarations.
+ *
+ *  What it does:
+ *    1. On load → calls GAS_DB_AUTO_CONNECTOR to get all active clients
+ *    2. Auto-populates the client switcher buttons (no hardcoded CLIENTS{})
+ *    3. When user switches client → auto-resolves that client's correct
+ *       Google Sheet (Restaurant / PUB / BAR template or their own master DB)
+ *    4. All gasApi() calls use the active client's resolved DB automatically
+ *    5. Handles login / session restore from sessionStorage
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+// ── SINGLE DEPLOYMENT URL ────────────────────────────────────────────────────
+var GAS_URL = 'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec';
+
+// ── RUNTIME STATE ─────────────────────────────────────────────────────────────
+var _activeClientId   = null;
+var _activeClientInfo = null;   // full client object from getAllClients
+var _sessionUser      = null;   // logged-in user
+var _clientRegistry   = {};     // { CL00010: {...}, CL00011: {...}, ... }
+var _registryLoaded   = false;
+
+// ── INDUSTRY → UI CONFIG (icon, color, label) ─────────────────────────────────
+var INDUSTRY_UI = {
+  RESTAURANT:     { icon:'🍽️',  color:'#e67e22', label:'Restaurant'    },
+  RESTAURANT_PUB: { icon:'🍺',  color:'#b8690e', label:'Restaurant+Bar' },
+  BAR:            { icon:'🥃',  color:'#8b5cf6', label:'Bar'            },
+  HOTEL:          { icon:'🏨',  color:'#2655c8', label:'Hotel'          },
+  BAKERY:         { icon:'🥐',  color:'#d97706', label:'Bakery'         },
+  CLOUD_KITCHEN:  { icon:'☁️',  color:'#0891b2', label:'Cloud Kitchen'  },
+  SWEET_SHOP:     { icon:'🍬',  color:'#ec4899', label:'Sweet Shop'     },
+  ELECTRONICS:    { icon:'📱',  color:'#1a9456', label:'Electronics'    },
+  AUTO_DEALER:    { icon:'🚗',  color:'#64748b', label:'Auto Dealer'    },
+  _DEFAULT:       { icon:'🏢',  color:'#475569', label:'Business'       },
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CORE API BRIDGE
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Single point for all GAS calls. Automatically injects clientId.
+ */
+async function gasApi(action, payload) {
+  payload = payload || {};
+  var body = Object.assign({ action: action, clientId: _activeClientId || '' }, payload);
+  try {
+    var r = await fetch(GAS_URL, { method: 'POST', body: JSON.stringify(body) });
+    return await r.json();
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CLIENT REGISTRY BOOTSTRAP
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Called once on page load.
+ * Fetches all clients from GAS, builds registry, renders switcher.
+ */
+async function erp_initClientRegistry() {
+  setGasBadge('⟳ Loading client registry…', 'sync');
+
+  // Restore session from storage
+  try {
+    const stored = JSON.parse(sessionStorage.getItem('erpUser') || localStorage.getItem('erpUser') || '{}');
+    if (stored.sessionToken && stored.clientId) {
+      _activeClientId = stored.clientId;
+      _sessionUser    = stored;
+    }
+  } catch(e) {}
+
+  // Ping GAS
+  const ping = await gasApi('ping');
+  if (!ping.success) {
+    setGasBadge('⚠ GAS offline — using local data', 'err');
+    erp_renderLocalClients();
+    return;
+  }
+
+  // Fetch all clients
+  const res = await gasApi('getAllClients');
+  if (!res.success || !res.clients) {
+    setGasBadge('⚠ Client registry unavailable', 'err');
+    erp_renderLocalClients();
+    return;
+  }
+
+  // Build registry map
+  _clientRegistry = {};
+  res.clients.forEach(cl => { _clientRegistry[cl.clientId] = cl; });
+  _registryLoaded = true;
+
+  // Render client switcher
+  erp_renderClientSwitcher(res.clients);
+
+  // Auto-select: session user's client OR first RESTAURANT_PUB/BAR client
+  if (!_activeClientId && res.clients.length > 0) {
+    const preferred = res.clients.find(c =>
+      ['RESTAURANT_PUB','BAR','RESTAURANT'].includes(c.industry)
+    ) || res.clients[0];
+    _activeClientId = preferred.clientId;
+  }
+
+  await erp_switchClient(_activeClientId, true);
+  setGasBadge(`✓ ${res.count} clients loaded`, 'ok');
+}
+
+/**
+ * Renders client switcher buttons in #tbClients or .tb-clients
+ */
+function erp_renderClientSwitcher(clients) {
+  const container = document.getElementById('tbClients') || document.querySelector('.tb-clients');
+  if (!container) return;
+
+  container.innerHTML = clients.map(cl => {
+    const ui  = INDUSTRY_UI[cl.industry] || INDUSTRY_UI['_DEFAULT'];
+    const exp = cl.expiryDate ? new Date(cl.expiryDate) : null;
+    const isExpired = exp && exp < new Date();
+    const planColor = isExpired ? '#dc2626'
+      : cl.plan === 'ENTERPRISE' ? '#7c3aed'
+      : cl.plan === 'PROFESSIONAL' ? '#2655c8'
+      : cl.plan === 'STANDARD' ? '#1a9456'
+      : '#d97706'; // TRIAL
+
+    return `
+      <button class="cl-btn" id="clBtn_${cl.clientId}"
+        onclick="erp_switchClient('${cl.clientId}')"
+        title="${cl.name} · ${cl.industry} · ${cl.plan}">
+        <div class="cl-dot" style="background:${isExpired?'#dc2626':'#4cff8a'}"></div>
+        <div class="cl-name">${ui.icon} ${cl.name.split(' ').slice(0,2).join(' ')}</div>
+        <div class="cl-id" style="color:${planColor}">${cl.clientId} · ${cl.plan}</div>
+        ${cl.city ? `<div class="cl-id" style="opacity:.6">${cl.city}</div>` : ''}
+      </button>`;
+  }).join('');
+}
+
+/**
+ * Fallback: render static CLIENTS if GAS offline
+ */
+function erp_renderLocalClients() {
+  // Keep existing CLIENTS{} const if defined
+  if (typeof CLIENTS === 'undefined') return;
+  const container = document.getElementById('tbClients') || document.querySelector('.tb-clients');
+  if (!container) return;
+  container.innerHTML = Object.entries(CLIENTS).map(([id, cl]) => `
+    <button class="cl-btn" id="clBtn_${id}" onclick="erp_switchClient('${id}')">
+      <div class="cl-dot"></div>
+      <div class="cl-name">${cl.name}</div>
+      <div class="cl-id">${id}</div>
+    </button>`).join('');
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CLIENT SWITCH — resolves correct DB for every subsequent gasApi call
+// ════════════════════════════════════════════════════════════════════════════
+
+async function erp_switchClient(clientId, silent) {
+  if (!clientId) return;
+  _activeClientId = clientId;
+
+  // Highlight button
+  document.querySelectorAll('.cl-btn').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('clBtn_' + clientId);
+  if (btn) btn.classList.add('active');
+
+  // Get resolved client info
+  let cl = _clientRegistry[clientId];
+  if (!cl) {
+    const res = await gasApi('getClientInfo');
+    cl = res.client || { clientId, name: clientId, industry: 'RESTAURANT' };
+  }
+  _activeClientInfo = cl;
+
+  // Update topbar labels
+  const nameEl = document.getElementById('tbClientName');
+  const subEl  = document.getElementById('tbClientSub');
+  const bannerEl = document.getElementById('sbBannerName');
+  const dashSub  = document.getElementById('dashClientSub');
+  const ui = INDUSTRY_UI[cl.industry] || INDUSTRY_UI['_DEFAULT'];
+
+  if (nameEl) nameEl.textContent = ui.icon + ' ' + cl.name;
+  if (subEl)  subEl.textContent  = clientId + ' · ' + cl.industry + ' · ' + (cl.plan||'TRIAL');
+  if (bannerEl) bannerEl.textContent = cl.name.toUpperCase().slice(0,14);
+  if (dashSub) dashSub.textContent = cl.name + ' — ' + clientId;
+
+  // Show/hide BAR module nav items based on industry
+  erp_toggleBarModuleNav(cl.hasBarModule);
+
+  // Update currentClient for legacy loadData() calls
+  if (typeof currentClient !== 'undefined') currentClient = clientId;
+
+  // Reload data for active page
+  if (!silent) {
+    await gasBootstrap && gasBootstrap();
+    if (typeof refreshAllPages === 'function') refreshAllPages();
+    toast && toast('Switched to ' + cl.name, 'ok');
+  }
+
+  // Fire custom event for other modules to react
+  document.dispatchEvent(new CustomEvent('erpClientChanged', { detail: cl }));
+}
+
+/**
+ * Show BAR nav items only for BAR / RESTAURANT_PUB / RESTAURANT clients
+ */
+function erp_toggleBarModuleNav(show) {
+  const barNavItems = document.querySelectorAll('.bar-module-nav, [data-module="bar"]');
+  barNavItems.forEach(el => { el.style.display = show ? '' : 'none'; });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CLIENT INFO PANEL (optional - call from dashboard)
+// ════════════════════════════════════════════════════════════════════════════
+
+function erp_renderClientInfoCard(containerId) {
+  const el = document.getElementById(containerId);
+  if (!el || !_activeClientInfo) return;
+  const cl = _activeClientInfo;
+  const ui = INDUSTRY_UI[cl.industry] || INDUSTRY_UI['_DEFAULT'];
+  const exp = cl.expiryDate ? new Date(cl.expiryDate) : null;
+  const daysLeft = exp ? Math.ceil((exp - new Date()) / 86400000) : 'N/A';
+  const planColor = daysLeft < 30 ? '#dc2626' : '#1a9456';
+
+  el.innerHTML = `
+    <div style="display:flex;align-items:center;gap:12px;padding:12px;background:var(--surface);border:1.5px solid var(--border);border-radius:10px;margin-bottom:10px;">
+      <div style="font-size:32px;">${ui.icon}</div>
+      <div style="flex:1">
+        <div style="font-weight:800;font-size:13px;">${cl.name}</div>
+        <div style="font-size:10px;color:var(--text3)">${cl.clientId} · ${cl.industry} · ${cl.city}</div>
+        <div style="font-size:9px;margin-top:3px">
+          <span style="background:${planColor};color:#fff;padding:2px 7px;border-radius:4px;font-weight:700">${cl.plan}</span>
+          &nbsp;
+          <span style="color:var(--text3)">${daysLeft} days left · GST: ${cl.gst||'N/A'}</span>
+        </div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:9px;color:var(--text3)">DB Source</div>
+        <div style="font-size:10px;font-weight:700;color:var(--brand)">${cl.clientMasterDbId ? 'LIVE DB' : 'TEMPLATE'}</div>
+      </div>
+    </div>`;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  STATUS BADGE (used by gasLoad, gasBootstrap etc.)
+// ════════════════════════════════════════════════════════════════════════════
+function setGasBadge(msg, type) {
+  let el = document.getElementById('_gasBadge');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = '_gasBadge';
+    el.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:9999;padding:4px 14px;border-radius:20px;font-size:11px;font-weight:700;font-family:"DM Mono",monospace;pointer-events:none;transition:opacity .3s;white-space:nowrap;';
+    document.body.appendChild(el);
+  }
+  const colors = { sync: '#2655c8', ok: '#1a9456', err: '#d42b2b', warn: '#d97706' };
+  el.style.background = colors[type] || '#0f172a';
+  el.style.color = '#fff';
+  el.style.opacity = '1';
+  el.textContent = msg;
+  if (type !== 'sync') {
+    clearTimeout(el._t);
+    el._t = setTimeout(() => { el.style.opacity = '0'; }, 3500);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  AUTO INIT on DOMContentLoaded
+// ════════════════════════════════════════════════════════════════════════════
+document.addEventListener('DOMContentLoaded', () => {
+  // Small delay so existing page scripts set up DOM first
+  setTimeout(() => erp_initClientRegistry(), 100);
+});
+
+// Export for use by other scripts
+window.erp = {
+  gasApi,
+  switchClient:       erp_switchClient,
+  getActiveClient:    () => _activeClientInfo,
+  getActiveClientId:  () => _activeClientId,
+  getRegistry:        () => _clientRegistry,
+  renderClientInfoCard: erp_renderClientInfoCard,
+  setGasBadge,
+};
+
 </script>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -334,7 +620,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--brand);}
   <div class="ai-messages" id="aiMessages">
     <div class="ai-msg bot">👋 Hi! I'm your Bar AI. Ask me about sales, variance, top items, stock levels, profitability, or any bar analytics.</div>
   </div>
-  <div class="ai-chips">
+  <div class="ai-chips" id="aiChips">
     <div class="ai-chip" onclick="askAI('What are the top 5 selling items?')">🏆 Top Items</div>
     <div class="ai-chip" onclick="askAI('Show variance summary')">⚖️ Variance</div>
     <div class="ai-chip" onclick="askAI('Calculate gross profit margin')">💰 Profit</div>
@@ -1161,33 +1447,156 @@ input:focus,select:focus,textarea:focus{border-color:var(--brand);}
 // ═══════════════════════════════════════════════════
 //  DATA STORE
 // ═══════════════════════════════════════════════════
+// ── CLIENT REGISTRY auto-loaded from GAS (GAS_DB_AUTO_CONNECTOR) ──────────────
+// Static fallback — overridden by erp_initClientRegistry() on boot
 const CLIENTS = {
-  CL0001: { name:'SLG Bar', sub:'Siliguri — Hashtag', color:'#b8690e', fyLabel:'FY 2025-26', bannerText:'SLG BAR' },
-  CL0002: { name:'KOL Bar', sub:'Kolkata — Hashtag KOL', color:'#059669', fyLabel:'FY 2025-26', bannerText:'KOL BAR' },
-  CL0003: { name:'New Client', sub:'Not configured', color:'#6340c4', fyLabel:'FY 2025-26', bannerText:'NEW' },
+  CL00010: { name:"VANN'S KITCHEN LLP (HASHTAG)", sub:'Siliguri — RESTAURANT_PUB', color:'#b8690e', fyLabel:'FY 2025-26', bannerText:'HASHTAG SLG', industry:'RESTAURANT_PUB' },
+  CL00011: { name:'SNPA Kitchen LLP (HASHTAG)',   sub:'Kolkata — RESTAURANT_PUB',  color:'#059669', fyLabel:'FY 2025-26', bannerText:'HASHTAG KOL', industry:'RESTAURANT_PUB' },
 };
-let currentClient = 'CL0001';
+let currentClient = 'CL00010';
 let stockView = 'diff';
 
+// ── GAS ↔ Sheet mapping ──────────────────────────────────────────────────────
+const SHEET_MAP = {
+  sales:      'BAR_B12_DAYWISE_SALES_ML',
+  store:      'BAR_B2_STOCK_INWARD',
+  phy:        'BAR_B5_PHYSICAL_STOCK',
+  adj:        'BAR_B6_STOCK_ADJUSTMENT',
+  codemaster: 'BAR_B13_POS_ITEM_MAPPING',
+  menu:       'BAR_B10_COCKTAIL_RECIPE',
+  mocktails:  'BAR_B11_MOCKTAIL_RECIPE',
+  snpa:       'Item wise Sales Analysis',
+};
+
+// ── Row ↔ Object converters ──────────────────────────────────────────────────
+function rowToSale(r){ return { id:r[0]||Date.now(), date:r[0]||'', outletId:r[1]||'', itemCode:r[2]||'', product:r[3]||'', group:r[4]||'', qty:Number(r[5])||0, mlQty:Number(r[6])||0, rate:Number(r[7])||0, gross:Number(r[8])||0, discount:Number(r[9])||0, amount:Number(r[10])||0, tax:Number(r[11])||0, billAmt:Number(r[12])||0 }; }
+function saleToRow(d){ return [d.date||todayStr(), currentClient, d.itemCode||'', d.product||'', d.group||'', d.qty||0, d.mlQty||0, d.rate||0, d.gross||d.amount||0, d.discount||0, d.amount||0, d.tax||0, d.billAmt||d.amount||0]; }
+
+function rowToStore(r){ return { id:r[0]||Date.now(), date:r[1]||'', outletId:r[2]||'', vendor:r[3]||'', invoice:r[4]||'', itemCode:r[5]||'', barName:r[6]||'', qtyBtl:Number(r[7])||0, bottleML:Number(r[8])||0, qtyML:Number(r[9])||0, uom:r[10]||'', rate:Number(r[11])||0, amount:Number(r[12])||0, godown:r[13]||'', excise:Number(r[14])||0, remarks:r[15]||'' }; }
+function storeToRow(d){ return [d.id||Date.now(), d.date||todayStr(), currentClient, d.vendor||'', d.invoice||'', d.itemCode||'', d.barName||'', d.qtyBtl||0, d.bottleML||750, d.qtyML||0, d.uom||'ML', d.rate||0, d.amount||0, d.godown||'', d.excise||0, d.remarks||'']; }
+
+function rowToPhy(r){ return { id:r[0]||Date.now(), date:r[1]||'', outletId:r[2]||'', itemCode:r[3]||'', itemName:r[4]||'', group:r[5]||'', unit:r[6]||'', mrp:Number(r[7])||0, cost:Number(r[8])||0, costPerML:Number(r[9])||0, sysQtyML:Number(r[10])||0, phyQtyML:Number(r[11])||0, diffML:Number(r[12])||0, diffBtl:Number(r[13])||0, diffVal:Number(r[14])||0, remarks:r[15]||'', verifiedBy:r[16]||'' }; }
+function phyToRow(d){ return [d.id||Date.now(), d.date||todayStr(), currentClient, d.itemCode||'', d.itemName||'', d.group||'', d.unit||'ML', d.mrp||0, d.cost||0, d.costPerML||0, d.sysQtyML||0, d.phyQtyML||0, d.diffML||0, d.diffBtl||0, d.diffVal||0, d.remarks||'', d.verifiedBy||'']; }
+
+function rowToAdj(r){ return { id:r[0]||Date.now(), date:r[1]||'', outletId:r[2]||'', itemCode:r[3]||'', itemName:r[4]||'', adjType:r[5]||'', recQtyML:Number(r[6])||0, reIssueML:Number(r[7])||0, marks:r[8]||'', remarks:r[9]||'', costPrice:Number(r[10])||0, totalValue:Number(r[11])||0, approvedBy:r[12]||'' }; }
+function adjToRow(d){ return [d.id||Date.now(), d.date||todayStr(), currentClient, d.itemCode||'', d.itemName||'', d.adjType||'Wastage', d.recQtyML||0, d.reIssueML||0, d.marks||'', d.remarks||'', d.costPrice||0, d.totalValue||0, d.approvedBy||'']; }
+
+function rowToCM(r){ return { id:r[0]||Date.now(), itemCode:r[1]||'', posName:r[2]||'', report:r[2]||'', store:r[3]||'', rawCode:r[3]||'', ml:Number(r[4])||0, issueML:Number(r[5])||0, conv:Number(r[6])||1, outletId:r[7]||'' }; }
+function cmToRow(d){ return [d.id||Date.now(), d.itemCode||'', d.report||d.posName||'', d.store||d.rawCode||'', d.ml||0, d.issueML||d.ml||0, d.conv||1, currentClient]; }
+
+function rowToMenu(r){ return { id:r[0]||Date.now(), name:r[1]||'', category:r[2]||'', price:Number(r[3])||0, tax:r[4]||'', outletId:r[5]||'', rmCode:r[6]||'', rmName:r[7]||'', qtyML:Number(r[8])||0, uom:r[9]||'ML', costPerServe:Number(r[10])||0, active:r[11]!==false, ingredients:[{name:r[7]||'',ml:Number(r[8])||0}] }; }
+function menuToRow(d){ const ing=d.ingredients&&d.ingredients[0]; return [d.id||Date.now(), d.name||'', d.category||'Cocktail', d.price||0, d.tax||'', currentClient, ing?ing.code||'':'', ing?ing.name||'':'', ing?ing.ml||0:0, 'ML', d.costPerServe||0, true]; }
+
+// ── In-memory cache (loaded per client from GAS) ─────────────────────────────
+const _cache = {};
+const _loading = {};
+const _dirty  = {};
+
 function getKey(tbl){ return `bj_${currentClient}_${tbl}`; }
-function loadData(tbl){ try{ return JSON.parse(localStorage.getItem(getKey(tbl)))||[]; }catch(e){ return []; } }
-function saveData(tbl,arr){ try{ localStorage.setItem(getKey(tbl), JSON.stringify(arr)); }catch(e){ toast('Storage full!','err'); } }
+function _cacheKey(tbl){ return `${currentClient}__${tbl}`; }
+
+// Sync localStorage fallback read
+function loadData(tbl){
+  const ck = _cacheKey(tbl);
+  if(_cache[ck]) return _cache[ck];
+  try{ return JSON.parse(localStorage.getItem(getKey(tbl)))||[]; }catch(e){ return []; }
+}
+
+// Sync write: update cache + localStorage immediately, mark dirty
+function saveData(tbl, arr){
+  const ck = _cacheKey(tbl);
+  _cache[ck] = arr;
+  try{ localStorage.setItem(getKey(tbl), JSON.stringify(arr)); }catch(e){}
+  _dirty[ck] = true;
+}
+
+// ── GAS pull: load one table from Google Sheets into cache ───────────────────
+async function gasLoad(tbl, silent){
+  const sheet = SHEET_MAP[tbl];
+  if(!sheet) return;
+  const ck = _cacheKey(tbl);
+  if(_loading[ck]) return;
+  _loading[ck] = true;
+  if(!silent) setGasBadge('⟳ Syncing '+tbl+'…', 'sync');
+  const res = await gasApi('fetchSheet', { tab: sheet });
+  _loading[ck] = false;
+  if(!res.success){ if(!silent) setGasBadge('⚠ Sync error', 'err'); return; }
+  const rows = res.data || [];
+  let parsed;
+  if(tbl==='sales')      parsed = rows.map(rowToSale);
+  else if(tbl==='store') parsed = rows.map(rowToStore);
+  else if(tbl==='phy')   parsed = rows.map(rowToPhy);
+  else if(tbl==='adj')   parsed = rows.map(rowToAdj);
+  else if(tbl==='codemaster') parsed = rows.map(rowToCM);
+  else if(tbl==='menu')  parsed = rows.map(rowToMenu);
+  else if(tbl==='mocktails') parsed = rows.map(rowToMenu);
+  else parsed = rows.map((r,i)=>({ id:i, _row:r }));
+  _cache[ck] = parsed;
+  try{ localStorage.setItem(getKey(tbl), JSON.stringify(parsed)); }catch(e){}
+  if(!silent) setGasBadge('✓ Synced '+rows.length+' rows', 'ok');
+}
+
+// ── GAS push: append new rows to Google Sheets ──────────────────────────────
+async function gasPush(tbl, newRows){
+  const sheet = SHEET_MAP[tbl];
+  if(!sheet || !newRows || !newRows.length) return;
+  setGasBadge('⬆ Pushing…', 'sync');
+  let rows;
+  if(tbl==='sales')      rows = newRows.map(saleToRow);
+  else if(tbl==='store') rows = newRows.map(storeToRow);
+  else if(tbl==='phy')   rows = newRows.map(phyToRow);
+  else if(tbl==='adj')   rows = newRows.map(adjToRow);
+  else if(tbl==='codemaster') rows = newRows.map(cmToRow);
+  else if(tbl==='menu')  rows = newRows.map(menuToRow);
+  else if(tbl==='mocktails') rows = newRows.map(menuToRow);
+  else rows = newRows;
+  const res = await gasApi('appendRows', { tab: sheet, rows });
+  if(res.success) setGasBadge('✓ Saved to Sheets', 'ok');
+  else setGasBadge('⚠ Push failed', 'err');
+  return res;
+}
+
+// ── Status badge helper ──────────────────────────────────────────────────────
+function setGasBadge(msg, type){
+  let el = document.getElementById('_gasBadge');
+  if(!el){
+    el = document.createElement('div'); el.id='_gasBadge';
+    el.style.cssText='position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:9999;padding:4px 14px;border-radius:20px;font-size:11px;font-weight:700;font-family:DM Mono,monospace;pointer-events:none;transition:opacity .3s;';
+    document.body.appendChild(el);
+  }
+  const colors = { sync:'#2655c8', ok:'#1a9456', err:'#d42b2b' };
+  el.style.background = colors[type]||'#0f172a'; el.style.color='#fff'; el.style.opacity='1';
+  el.textContent = msg;
+  if(type!=='sync') { clearTimeout(el._t); el._t=setTimeout(()=>{ el.style.opacity='0'; },3000); }
+}
+
+// ── Boot: load core tables from GAS on startup ───────────────────────────────
+async function gasBootstrap(){
+  setGasBadge('⟳ Connecting to Google Sheets…', 'sync');
+  const ping = await gasApi('ping');
+  if(!ping.success){ setGasBadge('⚠ GAS offline — using local cache', 'err'); return; }
+  // Load all core tables in parallel
+  await Promise.all(['sales','store','phy','adj','codemaster','menu','mocktails'].map(t=>gasLoad(t, true)));
+  setGasBadge('✓ Live — Google Sheets connected', 'ok');
+  refreshAllPages();
+}
+
+// ── Sync button handler ───────────────────────────────────────────────────────
+async function gasSync(){
+  await Promise.all(['sales','store','phy','adj','codemaster','menu','mocktails'].map(t=>gasLoad(t, true)));
+  setGasBadge('✓ All tables refreshed', 'ok');
+  refreshAllPages();
+  toast('Synced from Google Sheets','ok');
+}
 
 // ═══════════════════════════════════════════════════
 //  CLIENT SWITCH & NAV
 // ═══════════════════════════════════════════════════
 function switchClient(id){
   currentClient = id;
-  document.querySelectorAll('.cl-btn').forEach(b=>b.classList.remove('active'));
-  const btn = document.getElementById('clBtn_'+id);
-  if(btn) btn.classList.add('active');
-  const cl = CLIENTS[id]||CLIENTS.CL0001;
-  document.getElementById('tbClientName').textContent = cl.name;
-  document.getElementById('tbClientSub').textContent = id+' · '+cl.fyLabel;
-  document.getElementById('sbBannerName').textContent = cl.bannerText;
-  document.getElementById('dashClientSub').textContent = cl.name+' — '+id+' · '+cl.fyLabel;
-  refreshAllPages();
-  toast('Switched to '+id+' — '+cl.name,'ok');
+  _activeClientId = id;
+  // Delegate to auto-connector (updates UI + resolves correct DB)
+  erp_switchClient(id);
 }
 
 function navTo(page){
@@ -1524,7 +1933,7 @@ function addSaleRecord(){
   if(!d.date||!d.product||!d.qty){ toast('Fill required fields','warn'); return; }
   const cm = loadData('codemaster').find(r=>r.report&&r.report.toLowerCase()===d.product.toLowerCase());
   if(cm){ if(!d.reportName) d.reportName=cm.report; if(!d.group) d.group=cm.group; d.unitML=Number(cm.sell)||0; d.totalML=d.unitML*d.qty; }
-  const arr=loadData('sales'); arr.push(d); saveData('sales',arr);
+  const arr=loadData('sales'); arr.push(d); saveData('sales',arr); gasPush('sales',[d]);
   clearSaleForm(); renderSalesTable(); renderCalcSheet();
   toast('Sale record saved ✓','ok');
 }
@@ -1533,7 +1942,7 @@ function addSaleFromModal(){
   if(!d.date||!d.product){ toast('Fill required fields','warn'); return; }
   const cm=loadData('codemaster').find(r=>r.report&&r.report.toLowerCase()===d.product.toLowerCase());
   if(cm){ d.reportName=cm.report; d.group=cm.group; d.unitML=Number(cm.sell||0); d.totalML=d.unitML*d.qty; }
-  const arr=loadData('sales'); arr.push(d); saveData('sales',arr);
+  const arr=loadData('sales'); arr.push(d); saveData('sales',arr); gasPush('sales',[d]);
   closeModal('modalAddSale'); renderSalesTable(); toast('Added ✓','ok');
 }
 function clearSaleForm(){ ['se_date','se_product','se_qty','se_amount','se_report'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';}); const g=document.getElementById('se_group');if(g)g.value=''; }
@@ -1633,8 +2042,8 @@ function importSalesFromRows(rows){
   // auto-lookup from codemaster for missing ML
   const cm=loadData('codemaster');
   mapped.forEach(r=>{ if(!r.totalML||r.totalML===0){ const c=cm.find(x=>x.report&&x.report.toLowerCase()===r.product.toLowerCase()); if(c){r.unitML=Number(c.sell||0);r.totalML=r.unitML*r.qty;if(!r.group)r.group=c.group;} } });
-  const arr=loadData('sales'); arr.push(...mapped); saveData('sales',arr);
-  renderSalesTable(); toast(`Imported ${mapped.length} sale records ✓`,'ok');
+  const arr=loadData('sales'); arr.push(...mapped); saveData('sales',arr); if(mapped.length) gasPush('sales',mapped);
+  renderSalesTable(); toast(`Imported ${mapped.length} sale records ✓ — pushing to Sheets…`,'ok');
   const prev=document.getElementById('uploadPreview'); if(prev) prev.innerHTML=`<div class="conv-row"><strong>${mapped.length}</strong> records imported.</div>`;
 }
 
@@ -1668,15 +2077,15 @@ function importStoreFromRows(rows){
       if(cm) r.mlEquiv=r.issqty*Number(cm.issue||750);
     }
   });
-  const arr=loadData('store'); arr.push(...mapped); saveData('store',arr);
-  renderStoreTable(); toast(`Imported ${mapped.length} store records ✓`,'ok');
+  const arr=loadData('store'); arr.push(...mapped); saveData('store',arr); if(mapped.length) gasPush('store',mapped);
+  renderStoreTable(); toast(`Imported ${mapped.length} store records ✓ — pushing to Sheets…`,'ok');
   const prev=document.getElementById('storeUploadPreview');if(prev) prev.innerHTML=`<div class="conv-row"><strong>${mapped.length}</strong> store records imported.</div>`;
 }
 
 function importPhyFromRows(rows){
   const mapped=rows.filter(r=>r['REPORT ITEM NAME']||r['Item']||r['Report Name']).map(r=>({id:Date.now()+Math.random(),group:r['GROUP']||r['Group']||'',item:r['REPORT ITEM NAME']||r['Item']||r['Report Name']||'',unit:r['UNIT']||'ML',sysQty:0,phyQty:Number(r['Physical Count']||r['Qty']||0),variance:0,phyDate:fmtDate(r['Date']||r['PhyDate'])||todayStr(),remarks:''}));
-  const arr=loadData('phy'); arr.push(...mapped); saveData('phy',arr);
-  renderPhyTable(); toast(`Imported ${mapped.length} phy stock items ✓`,'ok');
+  const arr=loadData('phy'); arr.push(...mapped); saveData('phy',arr); if(mapped.length) gasPush('phy',mapped);
+  renderPhyTable(); toast(`Imported ${mapped.length} phy stock items ✓ — pushing to Sheets…`,'ok');
 }
 
 function importCMFromRows(rows){
@@ -1690,8 +2099,8 @@ function importCMFromRows(rows){
     other:Number(r['OTHER UNIT']||0),
     group:r['GROUP']||r['Group']||''
   })).filter(r=>r.report);
-  const arr=loadData('codemaster'); arr.push(...mapped); saveData('codemaster',arr);
-  renderCMTable(); populateDatalists(); toast(`Imported ${mapped.length} Code Master items ✓`,'ok');
+  const arr=loadData('codemaster'); arr.push(...mapped); saveData('codemaster',arr); if(mapped.length) gasPush('codemaster',mapped);
+  renderCMTable(); populateDatalists(); toast(`Imported ${mapped.length} Code Master items ✓ — pushing to Sheets…`,'ok');
 }
 
 // ═══════════════════════════════════════════════════
@@ -1704,7 +2113,7 @@ function addStoreRecord(){
   const cm=loadData('codemaster').find(c=>c.report&&c.report.toLowerCase()===d.barName.toLowerCase());
   if(cm) d.mlEquiv=d.issqty*Number(cm.issue||750);
   if(!d.date||!d.item){ toast('Fill required fields','warn'); return; }
-  const arr=loadData('store'); arr.push(d); saveData('store',arr);
+  const arr=loadData('store'); arr.push(d); saveData('store',arr); gasPush('store',[d]);
   renderStoreTable(); toast('Store record saved ✓','ok');
 }
 function addStoreFromModal(){
@@ -1712,7 +2121,7 @@ function addStoreFromModal(){
   d.issval=d.issqty*d.rate;
   const cm=loadData('codemaster').find(c=>c.report&&c.report.toLowerCase()===d.barName.toLowerCase());
   if(cm) d.mlEquiv=d.issqty*Number(cm.issue||750);
-  const arr=loadData('store'); arr.push(d); saveData('store',arr);
+  const arr=loadData('store'); arr.push(d); saveData('store',arr); gasPush('store',[d]);
   closeModal('modalAddStore'); renderStoreTable(); toast('Added ✓','ok');
 }
 function renderStoreTable(filter){
@@ -1746,7 +2155,7 @@ function addPhyRecord(){
   const salesML=sales.filter(s=>s.reportName===d.item||s.product===d.item).reduce((s,r)=>s+Number(r.totalML||0),0);
   const recML=rec.filter(r=>r.barName===d.item).reduce((s,r)=>s+Number(r.mlEquiv||0),0);
   d.sysQty=recML-salesML; d.variance=d.phyQty-d.sysQty;
-  const arr=loadData('phy'); arr.push(d); saveData('phy',arr);
+  const arr=loadData('phy'); arr.push(d); saveData('phy',arr); gasPush('phy',[d]);
   renderPhyTable(); toast('Physical count saved ✓','ok');
 }
 function renderPhyTable(){
@@ -1775,7 +2184,7 @@ function addAdjRecord(){
   const d={id:Date.now(),date:document.getElementById('adj_date').value,item:document.getElementById('adj_item').value,recQty:Number(document.getElementById('adj_rec').value||0),reissue:Number(document.getElementById('adj_reissue').value||0),marks:document.getElementById('adj_marks').value,remarks:document.getElementById('adj_remarks').value,cost:Number(document.getElementById('adj_cost').value||0),total:0};
   d.total=(d.recQty+d.reissue)*d.cost;
   if(!d.date||!d.item){ toast('Fill required fields','warn'); return; }
-  const arr=loadData('adj'); arr.push(d); saveData('adj',arr);
+  const arr=loadData('adj'); arr.push(d); saveData('adj',arr); gasPush('adj',[d]);
   renderAdjTable(); toast('Adjustment saved ✓','ok');
 }
 function renderAdjTable(){
@@ -1800,7 +2209,7 @@ function openAdjModal(){ toast('Use the Add Adjustment form on the right','ok');
 function saveCMRecord(){
   const d={id:Date.now(),report:document.getElementById('cm_report').value.trim(),store:document.getElementById('cm_store').value.trim(),issue:Number(document.getElementById('cm_issue').value||750),barname:document.getElementById('cm_barname').value.trim(),sell:Number(document.getElementById('cm_sell').value||30),other:Number(document.getElementById('cm_other').value||0),group:document.getElementById('cm_group').value};
   if(!d.report||!d.group){ toast('Report Name and Group required','warn'); return; }
-  const arr=loadData('codemaster'); arr.push(d); saveData('codemaster',arr);
+  const arr=loadData('codemaster'); arr.push(d); saveData('codemaster',arr); gasPush('codemaster',[d]);
   renderCMTable(); populateDatalists(); toast('Code Master item saved ✓','ok');
 }
 function saveCMFromModal(){
@@ -1865,7 +2274,7 @@ function saveMenuRecord(){
   const totalML=ings.reduce((s,i)=>s+i.ml,0);
   const totalCost=ings.reduce((s,i)=>s+i.total,0);
   const d={id:Date.now(),name,ingredients:ings,totalML,totalCost,price:Number(document.getElementById('mn_price').value||0)};
-  const arr=loadData('menu'); arr.push(d); saveData('menu',arr);
+  const arr=loadData('menu'); arr.push(d); saveData('menu',arr); gasPush('menu',[d]);
   closeModal('modalMenu'); renderMenuTable(); renderRecipeCards(); toast('Recipe saved ✓','ok');
 }
 function renderMenuTable(){
@@ -1929,7 +2338,7 @@ function handleCocktailUpload(event){
       }
     });
     if(current) recipes.push(current);
-    const arr=loadData('menu'); arr.push(...recipes.filter(r=>r.ingredients.length)); saveData('menu',arr);
+    const arr=loadData('menu'); const newR=recipes.filter(r=>r.ingredients.length); arr.push(...newR); saveData('menu',arr); gasPush('menu',newR);
     renderMenuTable(); renderRecipeCards(); toast(`Imported ${recipes.length} cocktail recipes ✓`,'ok');
   });
 }
@@ -1965,7 +2374,7 @@ function handleMocktailUpload(event){
       else if(current&&ing){ current.ingredients.push({name:String(ing).trim(),qty,uom,rate,total:price}); current.totalCost+=price; }
     });
     if(current) recipes.push(current);
-    const arr=loadData('mocktails'); arr.push(...recipes.filter(r=>r.ingredients.length)); saveData('mocktails',arr);
+    const arr=loadData('mocktails'); const newR=recipes.filter(r=>r.ingredients.length); arr.push(...newR); saveData('mocktails',arr); gasPush('mocktails',newR);
     renderMocktailCards(); toast(`Imported ${recipes.length} mocktail recipes ✓`,'ok');
   });
 }
@@ -2313,6 +2722,8 @@ document.addEventListener('DOMContentLoaded',()=>{
   populateDatalists();
   renderDashboard();
   // Seed demo Code Master if empty
+  // Auto-connect called by erp_initClientRegistry() via ERP_DB_AUTO_CONNECTOR_FRONTEND
+  // gasBootstrap() is called after client resolves
   if(loadData('codemaster').length===0){
     const seed=[
       {id:1,report:'BLACK DOG 30ML',store:'OI-06 WHISKY BLACK DOG 750ML',issue:750,sell:30,barname:'BLACK DOG',group:'OSBI WHISKEY',other:0},
@@ -2330,6 +2741,785 @@ document.addEventListener('DOMContentLoaded',()=>{
     renderCMTable(); populateDatalists();
   }
 });
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   BALAJI NEXTGEN ERP · BAR MODULE v6.0 — COMPLETE ENHANCEMENT LAYER
+   Live GAS · Smart Parsers · Multi-Client · AI · Full Reports · Security
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── EXTEND CLIENT REGISTRY from ERP Master ── */
+const ERP_CLIENTS = {
+  CL00001: { name:'VANN\'S KITCHEN LLP (HASHTAG)', city:'Siliguri', gstin:'19AAMFV9733B1ZS', type:'Restaurant Bar', fy:'2025-26' },
+  CL00002: { name:'SNPA Kitchen LLP (HASHTAG KOL)', city:'Kolkata', gstin:'19AFAFS8409L1ZH', type:'Restaurant Bar', fy:'2025-26' },
+};
+
+/* ── ERP USER SECURITY (from USER_SECURITY_MASTER_DB) ── */
+const ERP_USERS = [
+  { id:'1', code:'BALAJI',    name:'Balaji Super Admin',   role:'SUPER_ADMIN', client:'ALL',      pwd:'Radha@325' },
+  { id:'2', code:'DEV001',    name:'Developer Admin',       role:'ADMIN',       client:'CL00002',  pwd:'Radha@325' },
+  { id:'3', code:'VANNSADMIN',name:'Vanns Kitchen Owner',   role:'SUPER_ADMIN', client:'CL00001',  pwd:'Radha@325' },
+];
+
+/* ── GAS SHEET NAMES (from BAR_MASTER_DB template) ── */
+const GAS_SHEETS = {
+  sales:      'BAR_B12_DAYWISE_SALES_ML',
+  store:      'BAR_B2_STOCK_INWARD',
+  phy:        'BAR_B5_PHYSICAL_STOCK',
+  adj:        'BAR_B6_STOCK_ADJUSTMENT',
+  codeMaster: 'BAR_B13_POS_ITEM_MAPPING',
+  cocktail:   'BAR_B10_COCKTAIL_RECIPE',
+  mocktail:   'BAR_B11_MOCKTAIL_RECIPE',
+  stockLedger:'BAR_B3_STOCK_LEDGER',
+  stockBal:   'BAR_B4_STOCK_BALANCE',
+  dsr:        'BAR_B8_DAILY_DSR',
+  excise:     'BAR_B7_EXCISE_LOG',
+  snpa:       'Item wise Sales Analysis',
+};
+
+/* ═══════════ SMART COLUMN DETECTOR ═══════════ */
+function detectCols(headers) {
+  const h = headers.map(x => String(x||'').toLowerCase().replace(/[_\s]+/g,''));
+  const find = (...keys) => { for(const k of keys){ const i=h.findIndex(x=>x.includes(k)); if(i!==-1)return i; } return -1; };
+  return {
+    date:       find('orderdate','date','billdate','txndate'),
+    product:    find('menuitem','itemname','productname','product','item','description'),
+    qty:        find('billedqty','qty','quantity','soldqty','orderqty','qtysold'),
+    amount:     find('netsale','netamount','amount','saleamount','value','total','gross'),
+    group:      find('menugroup','group','category','dept','itemgroup'),
+    billNo:     find('billno','orderno','invoiceno','billid'),
+    rate:       find('rate','price','mrp'),
+    fy:         find('fyyear','fy','financialyear'),
+    month:      find('month'),
+    uom:        find('uom','unit','baseuom'),
+    barName:    find('barname','reportname','baritemname','softwarename'),
+    issueML:    find('bottlesizeml','bottleml','issueml','unitsell'),
+    sellML:     find('sellml','unitsellml','perserve','pegml'),
+    storeItem:  find('storeitemname','storename','purchasename','rawmaterial'),
+    vendor:     find('vendor','supplier'),
+    invoice:    find('invoice','invno'),
+    costML:     find('costperml','cost/ml','costprice'),
+    totalCost:  find('totalcost','cost','totalamount'),
+    ingredient: find('ingredient','rawmaterial','material'),
+    discount:   find('discount','disc'),
+  };
+}
+
+/* ═══════════ SMART SNPA PARSER (handles Hashtag KOL format) ═══════════ */
+function parseSnpaRows(rows) {
+  if(!rows.length) return [];
+  const headers = Object.keys(rows[0]);
+  const cols = detectCols(headers);
+  return rows.map((r,i)=>{
+    const vals = Object.values(r);
+    const g = (idx) => idx!==-1 ? vals[idx] : '';
+    const date = fmtDate(g(cols.date));
+    const netSale = parseFloat(g(cols.amount))||0;
+    const qty = parseFloat(g(cols.qty))||0;
+    const rate = parseFloat(g(cols.rate))||(qty>0?netSale/qty:0);
+    return {
+      id: Date.now()+i,
+      date, menuItem: String(g(cols.product)||'').trim(),
+      menuGroup: String(g(cols.group)||'').trim(),
+      category: String(vals[17]||g(cols.uom)||'').trim(),
+      qty, rate, netSale,
+      billNo: String(g(cols.billNo)||'').trim(),
+      month: String(g(cols.month)||monthOf(date)||''),
+      fy: String(g(cols.fy)||'FY 2025-26'),
+    };
+  }).filter(r=>r.menuItem||r.netSale);
+}
+
+/* ═══════════ SMART COCKTAIL PARSER ═══════════ */
+function parseCocktailRows(rows) {
+  const recipes=[]; let cur=null; let inHeader=false;
+  for(let i=0;i<rows.length;i++){
+    const vals=Object.values(rows[i]).map(v=>String(v||'').trim());
+    if(!vals.some(v=>v)) continue;
+    const isHdr = vals.some(v=>/^(ingredients?|qty|ml|cost)$/i.test(v));
+    if(isHdr){inHeader=true;continue;}
+    // Recipe name: col0 has text, col1-3 empty or numeric header
+    if(vals[0]&&vals[0].toUpperCase()===vals[0]&&!vals[1]&&!vals[2]){
+      cur={id:Date.now()+i,name:vals[0],type:'cocktail',ingredients:[],totalML:0,totalCost:0,price:0,gp:0};
+      recipes.push(cur); inHeader=false; continue;
+    }
+    if(cur&&vals[0]&&vals[0]!=='INGREDIENTS'){
+      const ml=parseFloat(vals[1])||0;
+      const costML=parseFloat(vals[2])||0;
+      const tot=parseFloat(vals[3])||(ml*costML);
+      cur.ingredients.push({name:vals[0],ml,costPerML:costML,total:tot});
+      cur.totalML+=ml; cur.totalCost+=tot;
+    }
+  }
+  return recipes.filter(r=>r.ingredients.length>0);
+}
+
+/* ═══════════ SMART MOCKTAIL PARSER ═══════════ */
+function parseMocktailRows(rows) {
+  const recipes=[]; let cur=null;
+  for(let i=0;i<rows.length;i++){
+    const vals=Object.values(rows[i]).map(v=>String(v||'').trim());
+    if(!vals.some(v=>v)) continue;
+    if(/MOCKTAIL NAME/i.test(vals[0])) continue;
+    if(vals[0]&&vals[0]!=='' && !parseFloat(vals[0])){
+      // Name row
+      cur={id:Date.now()+i,name:vals[0],type:'mocktail',ingredients:[],totalML:0,totalCost:0,price:0,gp:0};
+      recipes.push(cur);
+    }
+    if(cur&&vals[1]&&vals[1]!=='INGREDIENTS'){
+      const ml=parseFloat(vals[2])||0;
+      const uom=vals[3]||'ML';
+      const rate=parseFloat(vals[4])||0;
+      const tot=parseFloat(vals[5])||(ml*rate);
+      if(vals[1].length>1){
+        cur.ingredients.push({name:vals[1],ml,uom,rate,total:tot});
+        if(uom.toUpperCase()==='ML') cur.totalML+=ml;
+        cur.totalCost+=tot;
+      }
+    }
+  }
+  return recipes.filter(r=>r.name&&r.ingredients.length>0);
+}
+
+/* ═══════════ SMART POS/SALES PARSER ═══════════ */
+function parsePosRows(rows) {
+  if(!rows.length) return [];
+  const headers=Object.keys(rows[0]);
+  const cols=detectCols(headers);
+  const cm=loadData('codemaster');
+  return rows.map((r,i)=>{
+    const vals=Object.values(r);
+    const g=(idx)=>idx!==-1?vals[idx]:'';
+    const date=fmtDate(g(cols.date));
+    const product=String(g(cols.product)||g(cols.barName)||vals[0]||'').trim();
+    const qty=parseFloat(g(cols.qty))||0;
+    const amount=parseFloat(g(cols.amount))||0;
+    const group=String(g(cols.group)||'').trim();
+    const billNo=String(g(cols.billNo)||'').trim();
+    const rate=parseFloat(g(cols.rate))||(qty>0?amount/qty:0);
+    // Auto-match from code master
+    const cmMatch=cm.find(c=>
+      c.report===product||c.barname===product||
+      c.report===String(g(cols.barName)).trim()||
+      (product&&c.report&&c.report.toLowerCase().includes(product.toLowerCase().slice(0,6)))
+    );
+    const mlPU=cmMatch?cmMatch.sell:0;
+    return {
+      id:Date.now()+i, date, product, qty, amount,
+      reportName:cmMatch?cmMatch.report:product,
+      group:cmMatch?cmMatch.group:group,
+      billNo, rate, mlPerUnit:mlPU,
+      totalML:qty*mlPU,
+      month:String(g(cols.month)||monthOf(date)||''),
+      fy:String(g(cols.fy)||'FY 2025-26'),
+      discount:parseFloat(g(cols.discount))||0,
+      source:'POS-Upload',
+    };
+  }).filter(r=>r.product&&r.date);
+}
+
+/* ═══════════ SMART CODE MASTER PARSER ═══════════ */
+function parseCMRows(rows) {
+  if(!rows.length) return [];
+  const headers=Object.keys(rows[0]);
+  const cols=detectCols(headers);
+  return rows.map((r,i)=>{
+    const vals=Object.values(r);
+    const g=(idx)=>idx!==-1?String(vals[idx]||'').trim():'';
+    const report=g(cols.barName)||g(cols.product)||String(vals[0]||'').trim();
+    if(!report) return null;
+    return {
+      id:Date.now()+i,
+      report, store:g(cols.storeItem)||String(vals[1]||'').trim(),
+      issue:parseFloat(g(cols.issueML))||750,
+      sell:parseFloat(g(cols.sellML))||30,
+      barname:g(cols.barName)||report,
+      group:g(cols.group)||'',
+      other:0,
+    };
+  }).filter(Boolean);
+}
+
+/* ═══════════ SMART STORE PARSER ═══════════ */
+function parseStoreRows(rows) {
+  if(!rows.length) return [];
+  const headers=Object.keys(rows[0]);
+  const cols=detectCols(headers);
+  const cm=loadData('codemaster');
+  return rows.map((r,i)=>{
+    const vals=Object.values(r);
+    const g=(idx)=>idx!==-1?vals[idx]:'';
+    const item=String(g(cols.storeItem)||g(cols.product)||vals[1]||'').trim();
+    const qty=parseFloat(g(cols.qty))||0;
+    if(!item||!qty) return null;
+    const rate=parseFloat(g(cols.rate))||0;
+    const uom=String(g(cols.uom)||'BT').trim();
+    const cmMatch=cm.find(c=>c.store===item||c.barname===item||c.report===item);
+    const mlPB=cmMatch?.issue||750;
+    const mlEquiv=uom==='ML'?qty:uom==='LTR'?qty*1000:qty*mlPB;
+    return {
+      id:Date.now()+i,
+      date:fmtDate(g(cols.date)||''),
+      item, uom, issqty:qty, rate,
+      issval:qty*rate,
+      mlEquiv, barName:cmMatch?.report||item,
+      vendor:String(g(cols.vendor)||''),
+      invoice:String(g(cols.invoice)||''),
+      month:String(g(cols.month)||monthOf(fmtDate(g(cols.date)||'')||'')),
+    };
+  }).filter(Boolean);
+}
+
+/* ═══════════ OVERRIDE ALL UPLOAD HANDLERS ═══════════ */
+window.handleSnpaUpload = function(event) {
+  handleExcelUpload(event,'SNPA',rows=>{
+    const parsed=parseSnpaRows(rows);
+    if(!parsed.length){toast('No SNPA data detected','warn');return;}
+    saveData('snpa',parsed);
+    renderSnpa();
+    addImportLog('SNPA Upload',parsed.length,'ok',`Smart-parsed · ${[...new Set(parsed.map(r=>r.menuGroup).filter(Boolean))].length} groups`);
+    toast(`✓ ${parsed.length} SNPA records imported!`,'ok');
+    const lbl=document.getElementById('snpaLabel');
+    if(lbl) lbl.textContent=`${parsed.length} records · ${[...new Set(parsed.map(r=>r.month).filter(Boolean))].length} months`;
+  });
+};
+
+window.handleCocktailUpload = function(event) {
+  handleExcelUpload(event,'Cocktail',rows=>{
+    const recipes=parseCocktailRows(rows);
+    if(!recipes.length){toast('No cocktail recipes found','warn');return;}
+    const existing=loadData('menu');
+    // Remove duplicates by name
+    const names=new Set(existing.map(r=>r.name));
+    const newOnes=recipes.filter(r=>!names.has(r.name));
+    saveData('menu',[...existing,...newOnes]);
+    renderMenuTable(); renderRecipeCards();
+    addImportLog('Cocktail Upload',newOnes.length,'ok',`${newOnes.length} recipes, avg ${(recipes.reduce((s,r)=>s+r.ingredients.length,0)/Math.max(1,recipes.length)).toFixed(1)} ingredients each`);
+    toast(`✓ ${newOnes.length} cocktail recipes imported!`,'ok');
+  });
+};
+
+window.handleMocktailUpload = function(event) {
+  handleExcelUpload(event,'Mocktail',rows=>{
+    const recipes=parseMocktailRows(rows);
+    if(!recipes.length){toast('No mocktail recipes found','warn');return;}
+    const existing=loadData('mocktails');
+    const names=new Set(existing.map(r=>r.name));
+    const newOnes=recipes.filter(r=>!names.has(r.name));
+    saveData('mocktails',[...existing,...newOnes]);
+    renderMocktailCards();
+    addImportLog('Mocktail Upload',newOnes.length,'ok',`Parsed ${newOnes.length} mocktail recipes`);
+    toast(`✓ ${newOnes.length} mocktail recipes imported!`,'ok');
+  });
+};
+
+window.handleSalesFileUpload = function(event) {
+  handleExcelUpload(event,'Sales',rows=>{
+    const parsed=parsePosRows(rows);
+    if(!parsed.length){toast('No sales data found','warn');return;}
+    const existing=loadData('sales');
+    const keys=new Set(existing.map(r=>r.date+'|'+r.product+'|'+r.qty+'|'+r.amount));
+    const newOnes=parsed.filter(r=>!keys.has(r.date+'|'+r.product+'|'+r.qty+'|'+r.amount));
+    saveData('sales',[...existing,...newOnes]);
+    renderSalesTable(); renderCalcSheet(); renderDashboard();
+    addImportLog('POS Sales Upload',newOnes.length,'ok',`Smart column detection · ${newOnes.filter(r=>r.mlPerUnit>0).length} CM-matched`);
+    toast(`✓ ${newOnes.length} sales records imported!`,'ok');
+  });
+};
+
+window.handleStoreFileUpload = function(event) {
+  handleExcelUpload(event,'Store',rows=>{
+    const parsed=parseStoreRows(rows);
+    if(!parsed.length){toast('No store data found','warn');return;}
+    const existing=loadData('store');
+    saveData('store',[...existing,...parsed]);
+    renderStoreTable();
+    addImportLog('Store Upload',parsed.length,'ok','Stock receipts imported');
+    toast(`✓ ${parsed.length} store records imported!`,'ok');
+  });
+};
+
+window.handleCMUpload = function(event) {
+  handleExcelUpload(event,'Code Master',rows=>{
+    const parsed=parseCMRows(rows);
+    if(!parsed.length){toast('No Code Master data found','warn');return;}
+    const existing=loadData('codemaster');
+    const names=new Set(existing.map(r=>r.report));
+    const newOnes=parsed.filter(r=>!names.has(r.report));
+    saveData('codemaster',[...existing,...newOnes]);
+    renderCMTable(); populateDatalists();
+    addImportLog('Code Master Upload',newOnes.length,'ok',`${newOnes.length} new products`);
+    toast(`✓ ${newOnes.length} Code Master items imported!`,'ok');
+  });
+};
+
+/* ═══════════ GAS LIVE SYNC ALL MODULES ═══════════ */
+let _gasSyncing=false;
+async function gasSyncAll(){
+  if(_gasSyncing){toast('Sync already running…','warn');return;}
+  if(!currentClient){toast('Select a client first','warn');return;}
+  _gasSyncing=true;
+  const log=(msg,ok=true)=>{
+    const el=document.getElementById('gasSyncLog');
+    if(el) el.innerHTML+=`<div style="color:${ok?'var(--green)':'var(--red)'}; font-size:9px;padding:2px 0;">${ok?'✓':'✗'} ${msg}</div>`;
+    console.log('[GAS Sync]',msg);
+  };
+  showSyncModal();
+  log('Connecting to GAS…');
+  try {
+    // Ping first
+    const ping=await gasApi('ping');
+    if(!ping?.success&&!ping?.pong){log('GAS unreachable — running offline','');_gasSyncing=false;return;}
+    log(`GAS connected · Client: ${currentClient}`);
+
+    // Pull Sales — BAR_B12_DAYWISE_SALES_ML cols: DATE,OUTLET_ID,ITEM_CODE,ITEM_NAME,ITEM_GROUP,QTY_SOLD,QTY_ML,RATE,GROSS,DISCOUNT,NET,TAX,BILL_AMOUNT
+    const sd=await gasApi('fetchSheet',{tab:GAS_SHEETS.sales});
+    if(sd?.success&&sd.data?.length){
+      const rows=sd.data.map((r,i)=>({
+        id:Date.now()+i, date:r[0]||'', outletId:r[1]||currentClient, itemCode:r[2]||'',
+        product:r[3]||'', group:r[4]||'', qty:parseFloat(r[5])||0, mlQty:parseFloat(r[6])||0,
+        rate:parseFloat(r[7])||0, gross:parseFloat(r[8])||0, discount:parseFloat(r[9])||0,
+        amount:parseFloat(r[10])||0, tax:parseFloat(r[11])||0, billAmt:parseFloat(r[12])||0,
+        source:'GAS',
+      })).filter(r=>r.product);
+      const ex=loadData('sales');
+      const keys=new Set(ex.map(r=>r.date+'|'+r.product));
+      const merged=[...ex,...rows.filter(r=>!keys.has(r.date+'|'+r.product))];
+      saveData('sales',merged);
+      log(`Sales: ${rows.length} rows fetched`);
+    }
+
+    // Pull Store Inward — BAR_B2_STOCK_INWARD
+    const st=await gasApi('fetchSheet',{tab:GAS_SHEETS.store});
+    if(st?.success&&st.data?.length){
+      const rows=st.data.map((r,i)=>({
+        id:r[0]||Date.now()+i, date:r[1]||'', outletId:r[2]||currentClient,
+        vendor:r[3]||'', invoice:r[4]||'', itemCode:r[5]||'', barName:r[6]||'',
+        qtyBtl:parseFloat(r[7])||0, bottleML:parseFloat(r[8])||750,
+        qtyML:parseFloat(r[9])||0, uom:r[10]||'ML', rate:parseFloat(r[11])||0,
+        amount:parseFloat(r[12])||0, godown:r[13]||'', excise:parseFloat(r[14])||0,
+        remarks:r[15]||'', source:'GAS',
+      })).filter(r=>r.barName);
+      saveData('store',rows);
+      log(`Store Inward: ${rows.length} rows`);
+    }
+
+    // Pull Code Master — BAR_B13_POS_ITEM_MAPPING
+    const cm=await gasApi('fetchSheet',{tab:GAS_SHEETS.codeMaster});
+    if(cm?.success&&cm.data?.length){
+      const rows=cm.data.map((r,i)=>({
+        id:r[0]||Date.now()+i, itemCode:r[1]||'', report:r[2]||'', posName:r[2]||'',
+        store:r[3]||'', rawCode:r[3]||'', ml:parseFloat(r[4])||30,
+        sell:parseFloat(r[4])||30, issueML:parseFloat(r[5])||750,
+        issue:parseFloat(r[5])||750, conv:parseFloat(r[6])||1,
+        outletId:r[7]||currentClient, other:0,
+      })).filter(r=>r.report);
+      saveData('codemaster',rows);
+      populateDatalists();
+      log(`Code Master: ${rows.length} items`);
+    }
+
+    // Pull SNPA
+    const snpa=await gasApi('fetchSheet',{tab:GAS_SHEETS.snpa});
+    if(snpa?.success&&snpa.data?.length){
+      const rows=snpa.data.slice(1).map((r,i)=>({
+        id:Date.now()+i,date:fmtDate(r[0]),menuItem:r[4]||'',
+        menuGroup:r[3]||'',category:r[17]||'',
+        qty:parseFloat(r[15])||0,rate:parseFloat(r[8])||0,
+        netSale:parseFloat(r[16])||0,month:r[19]||'',fy:r[18]||'',
+      })).filter(r=>r.menuItem);
+      saveData('snpa',rows);
+      log(`SNPA: ${rows.length} records`);
+    }
+
+    // Physical Stock — BAR_B5_PHYSICAL_STOCK
+    const phy=await gasApi('fetchSheet',{tab:GAS_SHEETS.phy});
+    if(phy?.success&&phy.data?.length){
+      const rows=phy.data.map((r,i)=>({
+        id:r[0]||Date.now()+i, date:r[1]||'', outletId:r[2]||currentClient,
+        itemCode:r[3]||'', itemName:r[4]||'', group:r[5]||'', unit:r[6]||'ML',
+        mrp:parseFloat(r[7])||0, cost:parseFloat(r[8])||0, costPerML:parseFloat(r[9])||0,
+        sysQtyML:parseFloat(r[10])||0, phyQtyML:parseFloat(r[11])||0,
+        diffML:parseFloat(r[12])||0, diffBtl:parseFloat(r[13])||0,
+        diffVal:parseFloat(r[14])||0, remarks:r[15]||'', verifiedBy:r[16]||'',
+        // legacy compat
+        item:r[4]||'', phyQty:parseFloat(r[11])||0, calcClosing:parseFloat(r[10])||0,
+        variance:parseFloat(r[12])||0,
+      })).filter(r=>r.itemName);
+      saveData('phy',rows);
+      log(`Physical Stock: ${rows.length} records`);
+    }
+
+    log('✅ Full sync complete!');
+    addImportLog('GAS Full Sync',0,'ok','All modules synced');
+    renderDashboard(); renderSalesTable(); renderSnpa();
+    toast('✓ GAS Full Sync Complete!','ok');
+  } catch(err){
+    log('Error: '+err.message, false);
+    toast('Sync error: '+err.message,'err');
+  }
+  _gasSyncing=false;
+}
+
+/* ═══════════ GAS PUSH DATA ═══════════ */
+async function gasPushRows(tab, rows){
+  const res=await gasApi('appendRows',{tab,rows});
+  if(res?.success) toast(`✓ Pushed ${rows.length} rows to ${tab}`,'ok');
+  else toast('Push failed: '+(res?.error||'unknown'),'err');
+  return res?.success;
+}
+
+/* ═══════════ SYNC MODAL ═══════════ */
+function showSyncModal(){
+  let m=document.getElementById('_gasSyncModal');
+  if(!m){
+    m=document.createElement('div');
+    m.id='_gasSyncModal';
+    m.className='modal-overlay open';
+    m.innerHTML=`<div class="modal-box" style="max-width:400px;">
+      <div class="modal-head">
+        <div style="font-size:16px;">☁️</div>
+        <div class="modal-title">GAS Live Sync</div>
+        <button class="modal-close" onclick="document.getElementById('_gasSyncModal').remove()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="sync-prog"><div class="sync-spin"></div><span>Connecting to Google Drive…</span></div>
+        <div id="gasSyncLog" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px;max-height:220px;overflow-y:auto;font-family:'DM Mono',monospace;font-size:9px;line-height:1.7;"></div>
+      </div>
+    </div>`;
+    document.body.appendChild(m);
+  }
+}
+
+function addImportLog(source,count,status,details){
+  const log=loadData('importLog');
+  log.unshift({id:Date.now(),ts:new Date().toISOString(),source,count,status,details});
+  if(log.length>200) log.length=200;
+  saveData('importLog',log);
+}
+
+/* ═══════════ RECIPE CARDS — ENHANCED ═══════════ */
+window.renderRecipeCards = function(){
+  const arr=loadData('menu');
+  const grid=document.getElementById('recipeCardGrid');
+  if(!grid) return;
+  if(!arr.length){
+    grid.innerHTML=`<div class="empty-state"><div class="es-icon">🍸</div><div class="es-title">No Cocktail Recipes</div><div class="es-sub">Upload your cocktail recipe Excel or add manually.</div><button class="btn btn-ghost btn-sm" style="margin-top:10px;" onclick="document.getElementById('cocktailUploadFile').click()">📤 Upload Recipe Excel</button></div>`;
+    return;
+  }
+  grid.innerHTML=arr.map(r=>{
+    const gp=r.price>0?((r.price-r.totalCost)/r.price*100).toFixed(1):0;
+    const gpC=gp>=70?'var(--green)':gp>=50?'var(--brand)':'var(--red)';
+    const ingCount=(r.ingredients||[]).length;
+    return `<div class="recipe-card" style="animation:fadeIn .3s ease;">
+      <div class="recipe-card-head" style="display:flex;align-items:center;gap:8px;padding:12px 14px;">
+        <div style="font-size:22px;">🍸</div>
+        <div style="flex:1;min-width:0;">
+          <div class="recipe-card-name" style="font-size:12px;font-weight:800;">${r.name}</div>
+          <div class="recipe-card-type">${r.type||'COCKTAIL'} · ${r.totalML||0}ml · ${ingCount} ingredients</div>
+        </div>
+        <div style="text-align:right;flex-shrink:0;">
+          <div style="font-family:'Poppins',sans-serif;font-size:16px;font-weight:900;color:${gpC};">${r.price?gp+'%':'—'}</div>
+          <div style="font-size:7px;color:rgba(255,255,255,.5);">GP</div>
+        </div>
+      </div>
+      <div class="recipe-card-body">
+        ${(r.ingredients||[]).map(ing=>`
+          <div class="recipe-ing">
+            <span style="color:var(--text);">${ing.name}</span>
+            <span style="font-family:'DM Mono',monospace;font-size:9px;color:var(--text2);">
+              <strong>${ing.ml}</strong>${ing.uom||'ml'}
+              ${ing.total?` <span style="color:var(--text3);">₹${ing.total.toFixed(1)}</span>`:''}
+            </span>
+          </div>`).join('')}
+        <div class="recipe-total"><span style="color:var(--text2);">Recipe Cost</span><span style="color:var(--red);font-weight:700;">₹${(r.totalCost||0).toFixed(2)}</span></div>
+        ${r.price?`<div class="recipe-total"><span>Menu Price</span><span style="color:var(--green);font-weight:700;">₹${r.price}</span></div>`:''}
+        ${r.price&&gp>0?`<div style="margin-top:6px;"><div style="font-size:8px;color:var(--text3);margin-bottom:3px;">Gross Profit ${gp}%</div><div class="prog-bar"><div class="prog-fill" style="width:${Math.min(100,gp)}%;background:${gpC};"></div></div></div>`:''}
+        <div style="margin-top:8px;display:flex;gap:5px;">
+          <button class="btn btn-ghost btn-sm" style="flex:1;" onclick="editRecipe(${r.id})">✏️ Edit</button>
+          <button class="btn btn-ghost btn-sm" style="color:var(--red);border-color:var(--red-bg);" onclick="delMenu(${r.id})">🗑</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+};
+
+function editRecipe(id){
+  const menu=loadData('menu');
+  const r=menu.find(x=>x.id===id);
+  if(!r) return;
+  toast('Edit: '+r.name);
+}
+
+/* ═══════════ MOCKTAIL CARDS — ENHANCED ═══════════ */
+window.renderMocktailCards = function(){
+  const arr=loadData('mocktails');
+  const grid=document.getElementById('mocktailCardGrid');
+  if(!grid) return;
+  if(!arr.length){
+    grid.innerHTML=`<div class="empty-state"><div class="es-icon">🥤</div><div class="es-title">No Mocktail Recipes</div><div class="es-sub">Upload the mocktail recipe Excel to get started.</div></div>`;
+    return;
+  }
+  grid.innerHTML=arr.map(r=>{
+    const gp=r.price>0?((r.price-r.totalCost)/r.price*100).toFixed(1):null;
+    const gpC=gp>=70?'var(--green)':gp>=50?'var(--brand)':'var(--teal)';
+    return `<div class="recipe-card">
+      <div class="recipe-card-head" style="display:flex;align-items:center;gap:8px;padding:12px 14px;">
+        <div style="font-size:22px;">🥤</div>
+        <div style="flex:1;"><div class="recipe-card-name">${r.name}</div><div class="recipe-card-type">MOCKTAIL · ${r.totalML||0}ml</div></div>
+        ${gp?`<div style="text-align:right;"><div style="font-family:'Poppins',sans-serif;font-size:16px;font-weight:900;color:${gpC};">${gp}%</div><div style="font-size:7px;color:rgba(255,255,255,.5);">GP</div></div>`:''}
+      </div>
+      <div class="recipe-card-body">
+        ${(r.ingredients||[]).map(ing=>`<div class="recipe-ing"><span>${ing.name}</span><span style="font-family:'DM Mono',monospace;font-size:9px;"><strong>${ing.ml}</strong>${ing.uom||'ml'}${ing.total?` ₹${ing.total.toFixed(1)}`:''}</span></div>`).join('')}
+        <div class="recipe-total"><span>Recipe Cost</span><span style="color:var(--red);">₹${(r.totalCost||0).toFixed(2)}</span></div>
+        ${r.price?`<div class="recipe-total"><span>Menu Price</span><span style="color:var(--green);">₹${r.price}</span></div>`:''}
+        <button class="btn btn-ghost btn-sm" style="width:100%;margin-top:8px;" onclick="delMocktail(${r.id})">🗑 Remove</button>
+      </div>
+    </div>`;
+  }).join('');
+};
+
+function delMocktail(id){ if(!confirm('Delete?'))return; saveData('mocktails',loadData('mocktails').filter(r=>r.id!==id)); renderMocktailCards(); }
+
+/* ═══════════ ENHANCED AI ASSISTANT (full ERP knowledge) ═══════════ */
+window.getAIReply = function(q){
+  const ql=q.toLowerCase().trim();
+  const sales=loadData('sales'), store=loadData('store');
+  const cm=loadData('codemaster'), phy=loadData('phy');
+  const snpa=loadData('snpa'), menu=loadData('menu');
+  const mocktails=loadData('mocktails'), adj=loadData('adj');
+  const cl=CLIENTS[currentClient]||{name:'Unknown'};
+
+  // Top sellers
+  if(ql.includes('top')||ql.includes('best sell')||ql.includes('popular')){
+    const src=snpa.length?snpa:sales;
+    const map={};
+    src.forEach(r=>{
+      const k=r.menuItem||r.reportName||r.product||'—';
+      if(!map[k]) map[k]={qty:0,rev:0};
+      map[k].qty+=Number(r.qty||0);
+      map[k].rev+=Number(r.netSale||r.amount||0);
+    });
+    const top=Object.entries(map).sort((a,b)=>b[1].rev-a[1].rev).slice(0,10);
+    if(!top.length) return `📭 No sales data yet for ${cl.name}. Upload POS sales or SNPA data first.`;
+    return `🏆 Top 10 Items — ${cl.name}:\n`+top.map(([k,d],i)=>`${i+1}. ${k}\n   Revenue: ₹${formatNum(d.rev)} · Qty: ${d.qty}`).join('\n');
+  }
+
+  // Category analysis
+  if(ql.includes('category')||ql.includes('group')||ql.includes('menu group')){
+    const src=snpa.length?snpa:sales;
+    const map={};
+    src.forEach(r=>{
+      const g=r.menuGroup||r.group||'Other';
+      if(!map[g]) map[g]={qty:0,rev:0,items:new Set()};
+      map[g].qty+=Number(r.qty||0);
+      map[g].rev+=Number(r.netSale||r.amount||0);
+      map[g].items.add(r.menuItem||r.product||'');
+    });
+    const totRev=Object.values(map).reduce((s,d)=>s+d.rev,0);
+    const rows=Object.entries(map).sort((a,b)=>b[1].rev-a[1].rev);
+    return `📊 Category Revenue — ${cl.name}:\n`+rows.map(([g,d])=>`• ${g}: ₹${formatNum(d.rev)} (${(totRev>0?d.rev/totRev*100:0).toFixed(1)}%) · ${d.items.size} items`).join('\n');
+  }
+
+  // Profit and margin
+  if(ql.includes('profit')||ql.includes('margin')||ql.includes('p&l')||ql.includes('gm')){
+    const rev=snpa.length?snpa.reduce((s,r)=>s+Number(r.netSale||0),0):sales.reduce((s,r)=>s+Number(r.amount||0),0);
+    const cost=store.reduce((s,r)=>s+Number(r.issval||0),0);
+    const gp=rev-cost;
+    const gm=rev>0?(gp/rev*100).toFixed(1):0;
+    return `💰 P&L Summary — ${cl.name}:\nRevenue: ₹${formatNum(rev)}\nCOGS: ₹${formatNum(cost)}\nGross Profit: ₹${formatNum(gp)}\nGM%: ${gm}%\n${gm>65?'✅ Excellent margin!':gm>50?'⚠️ Average margin':'🚨 Low margin — review pricing'}`;
+  }
+
+  // Recipe & cocktail cost
+  if(ql.includes('recipe')||ql.includes('cocktail')||ql.includes('mocktail')||ql.includes('cost')){
+    const total=menu.length+mocktails.length;
+    if(!total) return `📭 No recipes loaded for ${cl.name}. Upload cocktail/mocktail Excel.`;
+    const avgGP=menu.filter(r=>r.price>0).reduce((s,r,_,a)=>s+Number(r.gp||0)/a.length,0);
+    const topGP=menu.filter(r=>r.price>0).sort((a,b)=>Number(b.gp)-Number(a.gp)).slice(0,5);
+    return `🍸 Recipe Summary — ${cl.name}:\nCocktails: ${menu.length} · Mocktails: ${mocktails.length}\nAvg GP%: ${avgGP.toFixed(1)}%\n\nTop GP Cocktails:\n`+topGP.map(r=>`• ${r.name}: ${r.gp}% GP, Cost ₹${(r.totalCost||0).toFixed(1)}, Price ₹${r.price}`).join('\n');
+  }
+
+  // Variance / stock accuracy
+  if(ql.includes('variance')||ql.includes('short')||ql.includes('over')||ql.includes('accuracy')){
+    const items=phy.filter(r=>Math.abs(r.variance||0)>1).sort((a,b)=>Math.abs(b.variance)-Math.abs(a.variance));
+    if(!items.length) return `✅ No significant variances found for ${cl.name}.`;
+    const totalVar=items.reduce((s,r)=>s+Math.abs(r.variance||0),0);
+    return `⚖️ Stock Variance — ${cl.name}:\n${items.length} items with variance:\n`+
+      items.slice(0,8).map(r=>`• ${r.item}: ${r.variance>=0?'+':''}${(r.variance||0).toFixed(1)}ml ${r.variance<0?'SHORT':'EXCESS'}`).join('\n')+
+      `\n\nTotal variance: ${formatML(totalVar)}`;
+  }
+
+  // Low stock & reorder
+  if(ql.includes('low stock')||ql.includes('reorder')||ql.includes('purchase')||ql.includes('buy')){
+    const closing={};
+    cm.forEach(c=>closing[c.report]={ml:0,issue:c.issue||750});
+    store.forEach(r=>{ const k=r.barName; if(closing[k]) closing[k].ml+=Number(r.mlEquiv||0); });
+    sales.forEach(r=>{ const k=r.reportName||r.product; if(closing[k]) closing[k].ml-=Number(r.totalML||0); });
+    adj.forEach(r=>{ const k=r.item; if(closing[k]){ const sign=['Other +','Opening Stock'].includes(r.type)?1:-1; closing[k].ml+=sign*Number(r.ml||0); }});
+    const low=Object.entries(closing).filter(([,d])=>d.ml<d.issue).sort((a,b)=>a[1].ml-b[1].ml);
+    if(!low.length) return `✅ All stock levels adequate for ${cl.name}.`;
+    return `📦 Purchase Recommendation — ${cl.name}:\n${low.length} items need restocking:\n`+
+      low.slice(0,10).map(([k,d])=>`• ${k}: ${d.ml<0?'NEGATIVE':'Only '+formatML(d.ml)} → Buy ${Math.ceil(Math.abs(d.ml-d.issue)/d.issue)} bottles`).join('\n');
+  }
+
+  // Monthly trend
+  if(ql.includes('monthly')||ql.includes('trend')||ql.includes('month')){
+    const src=snpa.length?snpa:sales;
+    const months=['Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec','Jan','Feb','Mar'];
+    const map={};
+    months.forEach(m=>map[m]={rev:0,qty:0});
+    src.forEach(r=>{ const m=r.month||monthOf(r.date)||''; if(map[m]) {map[m].rev+=Number(r.netSale||r.amount||0); map[m].qty+=Number(r.qty||0);} });
+    const active=months.filter(m=>map[m].rev>0);
+    if(!active.length) return `📭 No monthly data for ${cl.name}.`;
+    const peak=active.reduce((a,b)=>map[a].rev>map[b].rev?a:b);
+    return `📅 Monthly Trend — ${cl.name} FY 2025-26:\n`+active.map(m=>`• ${m}: ₹${formatNum(map[m].rev)} (${map[m].qty} qty)`).join('\n')+`\n\n🏆 Peak: ${peak} — ₹${formatNum(map[peak].rev)}`;
+  }
+
+  // SNPA summary
+  if(ql.includes('snpa')||ql.includes('itemwise')||ql.includes('pos report')){
+    if(!snpa.length) return `📭 No SNPA data. Upload the SNPA Excel from your POS system.`;
+    const totRev=snpa.reduce((s,r)=>s+Number(r.netSale||0),0);
+    const totQty=snpa.reduce((s,r)=>s+Number(r.qty||0),0);
+    const groups=[...new Set(snpa.map(r=>r.menuGroup).filter(Boolean))];
+    const months=[...new Set(snpa.map(r=>r.month).filter(Boolean))];
+    return `🧮 SNPA Analysis — ${cl.name}:\nTotal Records: ${snpa.length}\nMonths: ${months.join(', ')}\nRevenue: ₹${formatNum(totRev)}\nQty: ${formatNum(totQty)}\nCategories: ${groups.join(', ')}`;
+  }
+
+  // Consumption
+  if(ql.includes('consumption')||ql.includes('consumed')||ql.includes('usage')){
+    const totML=sales.reduce((s,r)=>s+Number(r.totalML||0),0);
+    const byGroup={};
+    sales.forEach(r=>{ const g=r.group||'Other'; byGroup[g]=(byGroup[g]||0)+Number(r.totalML||0); });
+    return `💧 Consumption — ${cl.name}:\nTotal Consumed: ${formatML(totML)}\n\nBy Group:\n`+
+      Object.entries(byGroup).sort((a,b)=>b[1]-a[1]).map(([g,ml])=>`• ${g}: ${formatML(ml)}`).join('\n');
+  }
+
+  // DSR / daily
+  if(ql.includes('today')||ql.includes('daily')||ql.includes('dsr')){
+    const today=todayStr();
+    const todaySales=snpa.length?snpa.filter(r=>r.date===today):sales.filter(r=>r.date===today);
+    const rev=todaySales.reduce((s,r)=>s+Number(r.netSale||r.amount||0),0);
+    const qty=todaySales.reduce((s,r)=>s+Number(r.qty||0),0);
+    if(!todaySales.length) return `📭 No sales data for today (${today}) in ${cl.name}.`;
+    return `📅 Today's Business — ${cl.name}:\nDate: ${today}\nRevenue: ₹${formatNum(rev)}\nQty: ${qty} items\nTransactions: ${todaySales.length}`;
+  }
+
+  // Help
+  return `🤖 Balaji NextGen ERP · Bar AI — ${cl.name}\n\nI can answer:\n• "Top 10 selling items"\n• "Sales by category/group"\n• "Monthly revenue trend"\n• "Profit & margin analysis"\n• "Recipe & cocktail costs"\n• "Stock variance report"\n• "Low stock & purchase suggestions"\n• "Consumption analysis"\n• "Today's DSR"\n• "SNPA summary"`;
+};
+
+/* ═══════════ SNPA ENHANCED: Handle Billwise too ═══════════ */
+const _origHandleSnpa=window.handleSnpaUpload;
+// Already overridden above — this is a reference check
+
+/* ═══════════ DASHBOARD ENHANCED: Quick Actions when empty ═══════════ */
+const _origRenderDash=window.renderDashboard;
+window.renderDashboard=function(){
+  _origRenderDash();
+  setTimeout(()=>{
+    const body=document.getElementById('dashBody');
+    const sales=loadData('sales');
+    const snpa=loadData('snpa');
+    if(body&&!sales.length&&!snpa.length){
+      const qa=document.createElement('div');
+      qa.style.cssText='margin-top:14px;';
+      qa.innerHTML=`
+        <div class="tbl-wrap">
+          <div class="tbl-head"><div class="tbl-title">⚡ Quick Setup</div><div class="tbl-sub" id="qaClient">${(CLIENTS[currentClient]||{name:'Select Client'}).name} — no data yet</div></div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;padding:14px;">
+            ${[
+              {icon:'📊',title:'Upload SNPA',sub:'Item-wise POS report',nav:'snpa',click:`document.getElementById('snpaUploadFile').click()`},
+              {icon:'💹',title:'Upload POS Sales',sub:'Any POS Excel format',nav:'data_bar',click:`document.getElementById('salesFileInput').click()`},
+              {icon:'🏪',title:'Upload Store',sub:'Stock received / GRN',nav:'data_store',click:`document.getElementById('storeFileInput').click()`},
+              {icon:'🔑',title:'Upload Code Master',sub:'Product mapping',nav:'code_master',click:`document.getElementById('cmUploadFile').click()`},
+              {icon:'🍸',title:'Upload Cocktail Recipes',sub:'Auto cost calculator',nav:'menu',click:`document.getElementById('cocktailUploadFile').click()`},
+              {icon:'🥤',title:'Upload Mocktail Recipes',sub:'Ingredient costing',nav:'mocktail',click:`document.getElementById('mocktailUploadFile').click()`},
+            ].map(q=>`
+              <div class="setup-card" style="cursor:pointer;text-align:center;padding:14px;transition:.15s;" onclick="navTo('${q.nav}');setTimeout(()=>{${q.click}},300);" onmouseover="this.style.transform='translateY(-2px)'" onmouseout="this.style.transform=''">
+                <div style="font-size:28px;margin-bottom:6px;">${q.icon}</div>
+                <div style="font-weight:700;font-size:11px;color:var(--text);">${q.title}</div>
+                <div style="font-size:9px;color:var(--text3);margin-top:3px;">${q.sub}</div>
+              </div>`).join('')}
+          </div>
+          <div style="padding:10px 14px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px;background:var(--surface2);">
+            <span style="font-size:9.5px;color:var(--text2);">☁️ <strong>GAS Live:</strong> Configure Google Apps Script URL to sync data automatically from Google Sheets.</span>
+            <button class="btn btn-primary btn-sm" onclick="navTo('gas_settings')">Configure GAS →</button>
+          </div>
+        </div>`;
+      body.appendChild(qa);
+    }
+  },150);
+};
+
+/* ═══════════ ADD SYNC BUTTON TO TOOLBAR ═══════════ */
+document.addEventListener('DOMContentLoaded',()=>{
+  const tbRight=document.querySelector('.tb-right');
+  if(tbRight){
+    // Full GAS Sync button
+    const syncBtn=document.createElement('button');
+    syncBtn.className='tb-icon-btn';
+    syncBtn.title='Full GAS Sync All Modules';
+    syncBtn.innerHTML='☁️';
+    syncBtn.onclick=gasSyncAll;
+    tbRight.insertBefore(syncBtn,tbRight.firstChild);
+  }
+
+  // Add hidden file inputs needed
+  if(!document.getElementById('salesFileInput')){
+    const inp=document.createElement('input');
+    inp.type='file'; inp.id='salesFileInput'; inp.accept='.xlsx,.xls,.csv'; inp.style.display='none';
+    inp.onchange=handleSalesFileUpload;
+    document.body.appendChild(inp);
+  }
+  if(!document.getElementById('storeFileInput')){
+    const inp=document.createElement('input');
+    inp.type='file'; inp.id='storeFileInput'; inp.accept='.xlsx,.xls,.csv'; inp.style.display='none';
+    inp.onchange=handleStoreFileUpload;
+    document.body.appendChild(inp);
+  }
+  if(!document.getElementById('mocktailUploadFile')){
+    const inp=document.createElement('input');
+    inp.type='file'; inp.id='mocktailUploadFile'; inp.accept='.xlsx,.xls,.csv'; inp.style.display='none';
+    inp.onchange=handleMocktailUpload;
+    document.body.appendChild(inp);
+  }
+
+  // Register AI chips
+  const chips=[
+    {label:'🏆 Top 10',q:'Top 10 selling items'},
+    {label:'📊 By Category',q:'Sales by category group'},
+    {label:'💰 Profit',q:'Profit margin analysis'},
+    {label:'📅 Monthly',q:'Monthly revenue trend'},
+    {label:'🍸 Recipes',q:'Cocktail recipe costs'},
+    {label:'⚖️ Variance',q:'Stock variance report'},
+    {label:'📦 Reorder',q:'Low stock purchase suggestions'},
+    {label:'💧 Consumption',q:'Consumption analysis'},
+    {label:'🧮 SNPA',q:'SNPA summary report'},
+    {label:'📅 Today',q:'Today DSR daily report'},
+  ];
+  const chipArea=document.getElementById('aiChips');
+  if(chipArea){
+    chipArea.innerHTML=chips.map(c=>`<div class="ai-chip" onclick="askAI('${c.q}')">${c.label}</div>`).join('');
+  }
+
+  // GAS Status live updater
+  setInterval(()=>{
+    const dot=document.getElementById('gasDot');
+    const lbl=document.getElementById('gasLbl');
+    if(!dot||!lbl) return;
+    const cl=CLIENTS[currentClient];
+    if(!cl) return;
+    if(_gasSyncing){ dot.className='gas-dot syncing'; lbl.textContent='↻ Syncing…'; }
+    else if(GAS_URL&&GAS_URL.includes('script.google.com')){ dot.className='gas-dot ok'; lbl.textContent=`● Live · ${currentClient}`; }
+    else { dot.className='gas-dot idle'; lbl.textContent='○ Offline Mode'; }
+  },3000);
+
+  console.log('[Bar Module v6.0] Complete enhancement layer loaded ✓');
+  console.log('Smart parsers: SNPA, POS, CodeMaster, Store, Cocktail, Mocktail');
+  console.log('GAS sync ready:', GAS_URL);
+});
+
+
 </script>
 </body>
 </html>
