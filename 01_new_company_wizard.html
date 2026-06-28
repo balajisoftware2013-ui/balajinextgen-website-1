@@ -339,10 +339,7 @@ setInterval(tick,1000);tick();
 // ── TOAST ──
 function toast(msg,dur=2600){const t=document.getElementById('toast');t.textContent=msg;t.style.display='block';clearTimeout(window._tt);window._tt=setTimeout(()=>t.style.display='none',dur);}
 
-// ── LOCAL FILE WARNING ──
-if(IS_LOCAL){
-  document.getElementById('localWarnBanner').style.display='flex';
-}
+// Local warning banner only shown by loadStats() if GAS is unreachable
 
 // ── LOGOUT ──
 function logoutUser(){
@@ -359,34 +356,23 @@ function getLocalClientCount(){return getLocalClients().length;}
 
 // ── GAS / OFFLINE ──
 
-/* Fetch with timeout — GAS cold-starts can take 8–12s; allow 15s */
-async function fetchWithTimeout(url, opts={}, ms=15000){
+/* fetch with 15s timeout — GAS cold-starts can take 8-12s */
+async function fetchWithTimeout(url,opts={},ms=15000){
   const ctrl=new AbortController();
   const tid=setTimeout(()=>ctrl.abort(),ms);
-  try{
-    const r=await fetch(url,{...opts,signal:ctrl.signal});
-    clearTimeout(tid);
-    return r;
-  }catch(e){clearTimeout(tid);throw e;}
+  try{const r=await fetch(url,{...opts,signal:ctrl.signal});clearTimeout(tid);return r;}
+  catch(e){clearTimeout(tid);throw e;}
 }
 
 async function gasGet(action){
-  if(IS_LOCAL)return{success:false,error:'local_mode'};
   try{
-    const r=await fetchWithTimeout(GAS_URL+'?action='+action+'&t='+Date.now(),{},{15000});
+    const r=await fetchWithTimeout(GAS_URL+'?action='+action+'&t='+Date.now(),{},15000);
     if(!r.ok)throw new Error('HTTP '+r.status);
     const txt=await r.text();
-    // GAS sometimes wraps JSON in a callback or returns HTML error — guard it
-    const j=JSON.parse(txt);
-    return j;
+    return JSON.parse(txt);
   }catch(e){return{success:false,error:e.message};}
 }
-
 async function gasPost(payload){
-  if(IS_LOCAL){
-    saveLocalClient(payload.clientData||payload);
-    return{success:true,mode:'LOCAL',message:'Saved to browser storage'};
-  }
   try{
     const r=await fetchWithTimeout(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify(payload)},20000);
     if(!r.ok)throw new Error('HTTP '+r.status);
@@ -394,7 +380,6 @@ async function gasPost(payload){
     const j=JSON.parse(txt);
     return{...j,mode:'ONLINE'};
   }catch(e){
-    // Offline / timeout fallback — save locally and queue for sync
     const id=payload.clientData?.CLIENT_ID||('ID'+Date.now());
     localStorage.setItem(OFFLINE_KEY+id,JSON.stringify(payload));
     saveLocalClient(payload.clientData||payload);
@@ -424,57 +409,62 @@ window.addEventListener('offline',updateNetBadge);
 window.addEventListener('load',()=>{setTimeout(syncPending,3000);updateNetBadge();});
 
 // ── LOAD STATS ──
-let autoClientId='CL00001',totalCount=0;
+// ⚠️ UPDATE THIS NUMBER when you add clients directly to the Sheet
+// = the highest CL##### number already used in USER_MASTER / CLIENT_MASTER
+// Current last CLIENT_ID in sheet: CL00014  → next will be CL00015
+const BASE_CLIENT_COUNT = 14;
 
-/* Fallback: generate next ID from localStorage when GAS is unreachable */
+let autoClientId='CL'+String(BASE_CLIENT_COUNT+1).padStart(5,'0'), totalCount=0;
+
+function _nextId(localExtra){
+  // Always add BASE_CLIENT_COUNT so we never collide with existing sheet records
+  const n = BASE_CLIENT_COUNT + localExtra;
+  return 'CL'+String(n+1).padStart(5,'0');
+}
+
 function _offlineFallback(badge){
   badge.className='api-badge api-err';badge.textContent='⚠️ GAS Offline';
   document.getElementById('sheetStatus').textContent='localStorage (GAS unreachable)';
-  totalCount=getLocalClientCount()+getPending();
-  autoClientId='CL'+String(totalCount+1).padStart(5,'0');
+  const localExtra=getLocalClientCount()+getPending();
+  totalCount=BASE_CLIENT_COUNT+localExtra;
+  autoClientId=_nextId(localExtra);
   document.getElementById('nextClientId').textContent=autoClientId+' (offline)';
   document.getElementById('totalClients').textContent=totalCount+' Clients';
   const lc=getLocalClients();
-  document.getElementById('lastClient').textContent=lc.length?(lc[lc.length-1].CLIENT_ID||lc[lc.length-1].clientId||'—'):'—';
+  document.getElementById('lastClient').textContent=lc.length?(lc[lc.length-1].CLIENT_ID||lc[lc.length-1].clientId||'CL'+String(BASE_CLIENT_COUNT).padStart(5,'0')):'CL'+String(BASE_CLIENT_COUNT).padStart(5,'0');
 }
 
 async function loadStats(){
   const badge=document.getElementById('apiStatusBadge');
-
-  /* ── LOCAL file:// mode ── */
-  if(IS_LOCAL){
-    badge.className='api-badge api-err';badge.textContent='⚠️ LOCAL FILE MODE';
-    document.getElementById('sheetStatus').textContent='⚠️ Not connected to Google Sheets';
-    totalCount=getLocalClientCount();
-    autoClientId='CL'+String(totalCount+1).padStart(5,'0');
-    document.getElementById('nextClientId').textContent=autoClientId+' (demo)';
-    document.getElementById('totalClients').textContent=totalCount+' Clients (local)';
-    const lc=getLocalClients();
-    document.getElementById('lastClient').textContent=lc.length?(lc[lc.length-1].CLIENT_ID||lc[lc.length-1].clientId||'—'):'—';
-    const warn=document.getElementById('localWarnBanner');
-    if(warn){warn.style.display='flex';warn.innerHTML='⚠️ <strong>Running as local file</strong> — Not connected to Google Sheets. Client IDs shown are DEMO only. Upload this file to your web server to register real clients.';}
-    data.clientId=autoClientId;renderAll();return;
-  }
-
-  /* ── ONLINE mode — try GAS with retry ── */
   badge.className='api-badge api-wait';badge.textContent='Connecting…';
+
+  // ── Always try GAS first — even from file:// ──
+  // (GAS URL is https:// so browser allows cross-origin fetch from file://)
   let r=null;
   for(let attempt=1;attempt<=2;attempt++){
     r=await gasGet('GET_STATS');
-    if(r.success||r.status==='success') break;
-    if(attempt<2){await new Promise(res=>setTimeout(res,2000));} // wait 2s then retry once
+    if(r.success||r.status==='success')break;
+    if(attempt<2)await new Promise(res=>setTimeout(res,2500));
   }
 
-  if(r && (r.success||r.status==='success')){
+  if(r&&(r.success||r.status==='success')){
     badge.className='api-badge api-ok';badge.textContent='Connected ✓';
     document.getElementById('sheetStatus').textContent='Connected ✓';
+    // Hide local warning if GAS connected successfully
+    const warn=document.getElementById('localWarnBanner');
+    if(warn)warn.style.display='none';
     totalCount=r.total||r.totalClients||0;
     autoClientId=r.nextClientId||('CL'+String(totalCount+1).padStart(5,'0'));
     document.getElementById('nextClientId').textContent=autoClientId;
     document.getElementById('totalClients').textContent=totalCount+' Clients';
     document.getElementById('lastClient').textContent=r.lastClient||'—';
   }else{
+    // GAS unreachable — fall back to local storage + BASE_CLIENT_COUNT
     _offlineFallback(badge);
+    if(IS_LOCAL){
+      const warn=document.getElementById('localWarnBanner');
+      if(warn){warn.style.display='flex';warn.innerHTML='⚠️ <strong>GAS unreachable from local file</strong> — Could not connect to Google Sheets. Using offline mode. Check your internet connection or open via https://.';}
+    }
   }
   data.clientId=autoClientId;renderAll();
 }
@@ -972,7 +962,8 @@ function r2(){
   return `<div class="step-hdr"><div class="step-num-badge">2</div><div class="step-hdr-text"><h3>🏢 Company Details</h3><p>Registration and address information</p></div></div>
   <div class="fg fg-2">
     <div class="field"><label>Company Name <span class="req">*</span></label><input type="text" id="fCompanyName" placeholder="Balaji Enterprises Pvt Ltd" value="${data.companyName}" oninput="data.companyName=this.value;clrE(this)"><span class="err-msg" id="err-companyName">Required</span></div>
-    <div class="field"><label>Company Type</label><select oninput="data.companyType=this.value"><option value="">— Select —</option>${types.map(t=>`<option ${data.companyType===t?'selected':''}>${t}</option>`).join('')}</select></div><input type="text" placeholder="27AAAAA0000A1Z5" value="${data.gstNo}" oninput="data.gstNo=this.value.toUpperCase()" maxlength="15"></div>
+    <div class="field"><label>Company Type</label><select oninput="data.companyType=this.value"><option value="">— Select —</option>${types.map(t=>`<option ${data.companyType===t?'selected':''}>${t}</option>`).join('')}</select></div>
+    <div class="field"><label>GST Number</label><input type="text" placeholder="27AAAAA0000A1Z5" value="${data.gstNo}" oninput="data.gstNo=this.value.toUpperCase()" maxlength="15"></div>
     <div class="field"><label>PAN Number</label><input type="text" placeholder="AAAAA0000A" value="${data.pan}" oninput="data.pan=this.value.toUpperCase()" maxlength="10"></div>
   </div>
   <div class="fg fg-1"><div class="field"><label>Registered Address</label><textarea placeholder="Full office address…" oninput="data.address=this.value">${data.address}</textarea></div></div>
@@ -1055,11 +1046,11 @@ function startDb(){
 
 // ── STEP 6 ──
 function r6(){
-  // ── AUTO-FILL from Step 1 data if not already set ──
-  if(!data.adminName  && data.contactName) data.adminName   = data.contactName;
-  if(!data.adminEmail && data.email)       data.adminEmail  = data.email;
-  if(!data.adminMobile&& data.phone)       data.adminMobile = data.phone;
-  if(!data.adminUsername && data.companyName) data.adminUsername=data.companyName.toLowerCase().replace(/\s+/g,'_').replace(/[^a-z0-9_]/g,'').slice(0,12)+'_admin';
+  // ── AUTO-FILL from Step 1 if not already set ──
+  if(!data.adminName   && data.contactName) data.adminName   = data.contactName;
+  if(!data.adminEmail  && data.email)       data.adminEmail  = data.email;
+  if(!data.adminMobile && data.phone)       data.adminMobile = data.phone;
+  if(!data.adminUsername&&data.companyName) data.adminUsername=data.companyName.toLowerCase().replace(/\s+/g,'_').replace(/[^a-z0-9_]/g,'').slice(0,12)+'_admin';
   if(!data.adminPassword) data.adminPassword='Admin@'+Math.floor(1000+Math.random()*9000);
   const roles=['SUPER_ADMIN','ADMIN','MANAGER'];
   return `<div class="step-hdr"><div class="step-num-badge">6</div><div class="step-hdr-text"><h3>👤 Create Admin User</h3><p>Primary administrator for this ERP</p></div></div>
@@ -1081,7 +1072,7 @@ function r7(){
   data.registeredAt=new Date().toISOString();
   const sector=INDUSTRY_SECTORS.find(s=>s.id===data.industry);
   const modTags=data.modules.map(id=>{const m=ALL_MODULES.find(x=>x.id===id);return m?`<span class="mod-tag">${m.icon} ${m.name}</span>`:''}).join('');
-  const localNote=IS_LOCAL?'<div style="background:#fef3c7;border:1px solid #fde047;border-radius:9px;padding:8px 12px;font-size:11px;color:#92400e;font-weight:600;margin-bottom:10px;">📴 Running locally — data saves to browser storage. Upload to website to save to Google Sheets.</div>':'';
+  const localNote='';
   return `<div class="step-hdr"><div class="step-num-badge" style="background:linear-gradient(135deg,#22c55e,#16a34a);">7</div><div class="step-hdr-text"><h3>✅ Save & Send Credentials</h3><p>Review, save, and share login details</p></div></div>
   <div class="finish-wrap">
     <div class="finish-success"><div class="big-check">🎉</div><div class="fs-title">ERP Instance Ready!</div><div class="fs-sub">For <strong>${data.companyName||'the company'}</strong> · ID: <strong>${data.clientId}</strong></div></div>
@@ -1258,47 +1249,10 @@ async function saveToSheets(sendAfter=false){
   // ── SUCCESS ──────────────────────────────────────────────
   ss.className='save-status ss-saved';ss.textContent='✅ Saved to Google Sheets! Client ID: '+data.clientId;
   toast('✅ Client registered!',3000);loadStats();if(sendAfter)sendCreds('WhatsApp');
+  // Keep buttons disabled with "Saved" label — user must click "Add Another Client" to reset
   if(btnSave)  { btnSave.disabled=true;   btnSave.textContent='✅ Saved to Sheets'; }
   if(btnSaveWa){ btnSaveWa.disabled=true; btnSaveWa.textContent='✅ Saved + Sending…'; }
   _saving=false;
-
-  /* ══ AUTO-SAVE NEW CLIENT DB IDs TO erp-config REGISTRY ══════════════════
-     GAS returns the new Sheet IDs in the response.
-     We save them to localStorage immediately so this client can login
-     right away without needing to manually update erp-config.js.
-     Also tells GAS to register the IDs in DATABASE_REGISTRY sheet. */
-  (function autoSaveClientDB(){
-    const cid    = data.clientId;
-    const master = r.masterDbId  || r.master_db_id  || r.data?.masterDbId  || '';
-    const txn    = r.txnDbId     || r.transaction_db_id || r.data?.txnDbId || r.data?.transactionDbId || '';
-    const report = r.reportDbId  || r.report_db_id  || r.data?.reportDbId  || '';
-    const folder = r.folderId    || r.folder_id     || r.data?.folderId    || '';
-    if(!cid || !master) return; /* GAS didn't return IDs yet — manual fallback */
-
-    /* 1. Save to localStorage so erp-config.js saveSession() can use them */
-    try {
-      const existing = JSON.parse(localStorage.getItem('bnx_db_registry') || '{}');
-      existing[cid] = { name: data.companyName, master, txn, report, folder,
-                        industry: data.industry, plan: data.plan,
-                        created: new Date().toISOString() };
-      localStorage.setItem('bnx_db_registry', JSON.stringify(existing));
-      /* Also set active keys for immediate login */
-      localStorage.setItem('bnx_client_id',         cid);
-      localStorage.setItem('bnx_master_db_id',       master);
-      localStorage.setItem('bnx_transaction_db_id',  txn);
-      localStorage.setItem('bnx_report_db_id',       report);
-      localStorage.setItem('bnx_folder_id',          folder);
-      localStorage.setItem('bnx_client_name',        data.companyName);
-      console.log('[ERP] ✅ New client DB IDs saved to localStorage:', cid, master);
-    } catch(e) { console.warn('[ERP] Could not save client DB to localStorage', e); }
-
-    /* 2. Show the Sheet IDs to admin for reference */
-    const info = document.getElementById('saveStatus');
-    if(info && master) {
-      info.innerHTML = '✅ Saved! Client: <b>'+cid+'</b> · 3 Sheets created · '
-        + '<a href="https://docs.google.com/spreadsheets/d/'+master+'/edit" target="_blank" style="color:#166534;font-weight:700">Open Master DB ↗</a>';
-    }
-  })();
 }
 
 function startNewClient(){
@@ -1356,10 +1310,7 @@ function validate(){
 async function nextStep(){if(!validate())return;if(current===6){const ss=document.getElementById('saveStatus');if(ss&&ss.classList.contains('ss-saved')){toast('✅ Already saved! Add another client or open the dashboard.');return;}await saveToSheets();return;}current++;renderAll();window.scrollTo({top:0,behavior:'smooth'});}
 function prevStep(){if(current===0)return;current--;renderAll();window.scrollTo({top:0,behavior:'smooth'});}
 
-// Show a placeholder until loadStats() resolves and calls renderAll() with the real ID
-data.clientId = '⏳ Loading…';
 renderAll();
-// loadStats() will overwrite clientId and call renderAll() again with the real ID
 </script>
 </body>
 </html>
