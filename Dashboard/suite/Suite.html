@@ -454,6 +454,8 @@ td.c,th.c{text-align:center;}
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 </head>
 <body>
 
@@ -828,9 +830,9 @@ function _logoFallback(img, px) {
     <div class="sec-title">Import Bank Statement</div>
     <div class="panel" style="padding:18px;margin-bottom:14px">
       <div style="font-size:12px;color:var(--sub);margin-bottom:12px">
-        Upload a CSV export of your bank statement. ICICI and HDFC formats are auto-detected (column names like
-        "Withdrawal Amount", "Deposit Amount", "Narration" / "Chq./Ref.No." are matched automatically) — a generic
-        Date/Description/Debit/Credit/Balance CSV also works for any other bank.
+        Upload your bank statement as CSV, Excel (.xls/.xlsx) or PDF. ICICI and HDFC formats are auto-detected (column
+        names like "Withdrawal Amount", "Deposit Amount", "Narration" / "Chq./Ref.No." are matched automatically) — a
+        generic Date/Description/Debit/Credit/Balance file also works for any other bank.
       </div>
       <div class="form-row c2">
         <div class="field"><label>Bank Format</label>
@@ -838,23 +840,32 @@ function _logoFallback(img, px) {
             <option value="auto">Auto-detect (ICICI / HDFC / Generic)</option>
             <option value="icici">ICICI Bank</option>
             <option value="hdfc">HDFC Bank</option>
-            <option value="generic">Generic CSV (Date, Description, Debit, Credit)</option>
+            <option value="generic">Generic (Date, Description, Debit, Credit)</option>
           </select>
         </div>
-        <div class="field"><label>Statement CSV File</label><input type="file" id="bi-file" accept=".csv" onchange="_parseBankStatement(this)"></div>
+        <div class="field"><label>Statement File (CSV / XLS / XLSX / PDF)</label><input type="file" id="bi-file" accept=".csv,.xls,.xlsx,.pdf" onchange="_parseBankStatement(this)"></div>
       </div>
     </div>
     <div class="panel" id="bi-preview-panel" style="display:none">
-      <div class="panel-head" style="display:flex;justify-content:space-between;align-items:center">
-        <span>Preview — review before importing</span>
-        <div style="display:flex;gap:8px">
+      <div class="panel-head" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+        <span>Preview — review, optionally pick a ledger per row, then import</span>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
           <button class="btn btn-outline btn-sm" onclick="_toggleAllBIRows(true)">Select All</button>
           <button class="btn btn-outline btn-sm" onclick="_toggleAllBIRows(false)">Select None</button>
-          <button class="btn btn-orange btn-sm" onclick="_importSelectedBIRows()">📥 Import Selected as Suspense</button>
+          <select id="bi-bulk-ledger" style="padding:6px 10px;border:1.5px solid var(--border);border-radius:8px;font-size:12.5px;font-family:inherit" onchange="_applyBulkLedger(this.value)">
+            <option value="">Set ledger for all selected…</option>
+          </select>
+          <button class="btn btn-emerald btn-sm" onclick="_postSelectedBIRows()">📒 Post Selected to Ledger</button>
+          <button class="btn btn-orange btn-sm" onclick="_importSelectedBIRows()">📥 Import Rest as Suspense</button>
         </div>
       </div>
+      <div style="font-size:11.5px;color:var(--sub);padding:0 16px 8px">
+        Rows where you pick a ledger (party/account) will be posted directly to that party's ledger as a Receipt
+        (deposit) or Payment (withdrawal). Rows left as "— Suspense —" go to the Bank Book as unmatched/suspense
+        entries, same as before.
+      </div>
       <div class="tbl-wrap"><table>
-        <thead><tr><th></th><th>Date</th><th>Description</th><th>Ref No</th><th class="r">Withdrawal</th><th class="r">Deposit</th></tr></thead>
+        <thead><tr><th></th><th>Date</th><th>Description</th><th>Ref No</th><th class="r">Withdrawal</th><th class="r">Deposit</th><th>Post to Ledger</th></tr></thead>
         <tbody id="bi-preview-tbl"></tbody>
       </table></div>
     </div>
@@ -1926,7 +1937,7 @@ function fmtR(n) { return '₹' + Number(n || 0).toLocaleString('en-IN', { maxim
 // ── DATA STORE ───────────────────────────────────────────────
 let DB = {
   sales: [], purchases: [], saleReturns: [], purchaseReturns: [], creditNotes: [],
-  cash: [], bank: [], items: [], customers: [], suppliers: [],
+  cash: [], bank: [], items: [], customers: [], suppliers: [], bankLedger: [],
   settings: {
     bizName: 'Your Business Name', bizTag: 'Wholesale & Retail Dealer',
     bizAddr: '123, Market Road, Siliguri, West Bengal - 734001',
@@ -1943,7 +1954,7 @@ function saveData() { try { localStorage.setItem('bns_db', JSON.stringify(DB)); 
 function loadData() {
   try {
     const d = localStorage.getItem('bns_db');
-    if (d) { const p = JSON.parse(d); Object.assign(DB, p); if (!DB.settings) DB.settings = {}; }
+    if (d) { const p = JSON.parse(d); Object.assign(DB, p); if (!DB.settings) DB.settings = {}; if (!DB.bankLedger) DB.bankLedger = []; }
   } catch (e) {}
 }
 
@@ -2393,60 +2404,130 @@ function _parseAmount(s) {
   return isNaN(n) ? 0 : n;
 }
 
-function _parseBankStatement(input) {
+function _rowsFromAOA(rows) {
+  // Shared logic: given an array-of-arrays (from CSV or XLS/XLSX sheet), find the
+  // header row and map it into normalized {date, desc, ref, debit, credit} rows.
+  if (rows.length < 2) throw new Error('File looks empty');
+  let headerIdx = 0;
+  for (let i = 0; i < Math.min(rows.length, 30); i++) {
+    const joined = rows[i].join(' ').toLowerCase();
+    if (joined.includes('date') && (joined.includes('withdraw') || joined.includes('debit') || joined.includes('deposit') || joined.includes('credit') || joined.includes('narration') || joined.includes('description'))) {
+      headerIdx = i; break;
+    }
+  }
+  const header = rows[headerIdx].map(x => String(x == null ? '' : x));
+  const dateCol  = _findCol(header, ['value date', 'transaction date', 'txn date', 'date']);
+  const descCol  = _findCol(header, ['narration', 'description', 'transaction remarks', 'particulars', 'remarks']);
+  const refCol   = _findCol(header, ['chq', 'ref', 'cheque']);
+  const debitCol = _findCol(header, ['withdrawal', 'debit']);
+  const creditCol= _findCol(header, ['deposit', 'credit']);
+
+  if (dateCol < 0 || (debitCol < 0 && creditCol < 0)) {
+    throw new Error('Could not recognize the columns — make sure the file has Date and Withdrawal/Deposit (or Debit/Credit) columns');
+  }
+
+  return rows.slice(headerIdx + 1)
+    .filter(r => r.length > Math.max(dateCol, debitCol, creditCol) && r[dateCol])
+    .map(r => {
+      const debit  = debitCol  >= 0 ? _parseAmount(r[debitCol])  : 0;
+      const credit = creditCol >= 0 ? _parseAmount(r[creditCol]) : 0;
+      return {
+        date: _normalizeDate(r[dateCol]),
+        desc: descCol >= 0 ? String(r[descCol] || '') : 'Bank transaction',
+        ref:  refCol  >= 0 ? String(r[refCol]  || '') : '',
+        debit, credit,
+        ledger: '', include: true
+      };
+    })
+    .filter(r => r.debit > 0 || r.credit > 0);
+}
+
+// Best-effort line-based parser for ICICI-style PDF statements, where each
+// transaction is laid out across several wrapped lines starting with a serial no.
+// Pattern per row (approx): <sno> <txn-id> <date> <date> <date> <narration...> <amount> - <balance>
+function _rowsFromICICIPdfText(text) {
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const dateRe = /(\d{2}\/\d{2}\/\d{4})/;
+  const amtRe = /([\d,]+\.\d{2})/g;
+  const rows = [];
+  let cur = null;
+  for (const line of lines) {
+    const startMatch = line.match(/^\d+\s+[A-Z]\d+/); // e.g. "35 S1594"
+    if (startMatch && dateRe.test(line)) {
+      if (cur) rows.push(cur);
+      const dates = [...line.matchAll(/(\d{2}\/\d{2}\/\d{4})/g)].map(m => m[1]);
+      const amts = [...line.matchAll(amtRe)];
+      cur = { date: dates.length ? dates[dates.length - 1] : '', desc: line, amts: amts.map(m => m[1]) };
+    } else if (cur) {
+      cur.desc += ' ' + line;
+      const amts = [...line.matchAll(amtRe)];
+      if (amts.length) cur.amts.push(...amts.map(m => m[1]));
+    }
+  }
+  if (cur) rows.push(cur);
+
+  return rows.filter(r => r.date && r.amts.length).map(r => {
+    // Heuristic: a withdrawal line shows "amount -" (amount then balance with no separate credit),
+    // ICICI PDF text marks debit/credit with surrounding dashes that get lost in extraction, so we
+    // fall back to treating the narration's own debit/credit keywords where available, else first
+    // amount = transaction amount, last amount = running balance.
+    const txnAmt = _parseAmount(r.amts[0]);
+    const isCredit = /\b(NEFT-|UPI\/.*Pay\/|DEP-|BY CASH|CR-|CREDIT)\b/i.test(r.desc) && !/\bDR-/i.test(r.desc);
+    return {
+      date: _normalizeDate(r.date),
+      desc: r.desc.replace(/\s+/g, ' ').slice(0, 200),
+      ref: '',
+      debit: isCredit ? 0 : txnAmt,
+      credit: isCredit ? txnAmt : 0,
+      ledger: '', include: true
+    };
+  });
+}
+
+async function _parseBankStatement(input) {
   const file = input.files[0];
   if (!file) return;
-  const reader = new FileReader();
-  reader.onload = e => {
-    try {
-      const rows = _parseCSV(e.target.result);
-      if (rows.length < 2) { showStatus('CSV file looks empty', 'err'); return; }
-      // Find the header row (first row that looks like column names, not a transaction)
-      let headerIdx = 0;
-      for (let i = 0; i < Math.min(rows.length, 15); i++) {
-        const joined = rows[i].join(' ').toLowerCase();
-        if (joined.includes('date') && (joined.includes('withdraw') || joined.includes('debit') || joined.includes('deposit') || joined.includes('credit') || joined.includes('narration') || joined.includes('description'))) {
-          headerIdx = i; break;
-        }
+  const name = file.name.toLowerCase();
+  try {
+    if (name.endsWith('.csv') || name.endsWith('.txt')) {
+      const text = await file.text();
+      _biParsedRows = _rowsFromAOA(_parseCSV(text));
+    } else if (name.endsWith('.xls') || name.endsWith('.xlsx')) {
+      if (typeof XLSX === 'undefined') { showStatus('Excel reader library failed to load — check your internet connection and try again', 'err'); return; }
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array', cellDates: false });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const aoa = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' });
+      _biParsedRows = _rowsFromAOA(aoa);
+    } else if (name.endsWith('.pdf')) {
+      if (typeof pdfjsLib === 'undefined') { showStatus('PDF reader library failed to load — check your internet connection and try again', 'err'); return; }
+      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      const buf = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+      let fullText = '';
+      for (let p = 1; p <= pdf.numPages; p++) {
+        const page = await pdf.getPage(p);
+        const content = await page.getTextContent();
+        fullText += content.items.map(it => it.str).join(' ') + '\n';
       }
-      const header = rows[headerIdx];
-      const dateCol  = _findCol(header, ['value date', 'transaction date', 'txn date', 'date']);
-      const descCol  = _findCol(header, ['narration', 'description', 'transaction remarks', 'particulars', 'remarks']);
-      const refCol   = _findCol(header, ['chq', 'ref', 'cheque']);
-      const debitCol = _findCol(header, ['withdrawal', 'debit']);
-      const creditCol= _findCol(header, ['deposit', 'credit']);
-
-      if (dateCol < 0 || (debitCol < 0 && creditCol < 0)) {
-        showStatus('Could not recognize this CSV\'s columns — make sure it has Date and Withdrawal/Deposit (or Debit/Credit) columns', 'err');
-        return;
+      _biParsedRows = _rowsFromICICIPdfText(fullText);
+      if (_biParsedRows.length) {
+        showStatus('PDF parsed with best-effort layout detection — amounts/debit-credit direction can be wrong on wrapped lines, please double-check each row before posting', 'success');
       }
-
-      _biParsedRows = rows.slice(headerIdx + 1)
-        .filter(r => r.length > Math.max(dateCol, debitCol, creditCol) && r[dateCol])
-        .map(r => {
-          const debit  = debitCol  >= 0 ? _parseAmount(r[debitCol])  : 0;
-          const credit = creditCol >= 0 ? _parseAmount(r[creditCol]) : 0;
-          return {
-            date: _normalizeDate(r[dateCol]),
-            desc: descCol >= 0 ? r[descCol] : 'Bank transaction',
-            ref:  refCol  >= 0 ? r[refCol]  : '',
-            debit, credit,
-            include: true
-          };
-        })
-        .filter(r => r.debit > 0 || r.credit > 0);
-
-      if (!_biParsedRows.length) {
-        showStatus('No transaction rows found in this file', 'err');
-        return;
-      }
-      _renderBIPreview();
-      showStatus(_biParsedRows.length + ' transactions found — review and import below', 'success');
-    } catch (err) {
-      showStatus('Could not read this CSV file: ' + err.message, 'err');
+    } else {
+      showStatus('Unsupported file type — please upload a .csv, .xls, .xlsx or .pdf bank statement', 'err');
+      return;
     }
-  };
-  reader.readAsText(file);
+
+    if (!_biParsedRows.length) {
+      showStatus('No transaction rows could be found in this file', 'err');
+      return;
+    }
+    _renderBIPreview();
+    showStatus(_biParsedRows.length + ' transactions found — review, pick a ledger per row if needed, then post/import below', 'success');
+  } catch (err) {
+    showStatus('Could not read this file: ' + err.message, 'err');
+  }
 }
 
 function _normalizeDate(s) {
@@ -2462,21 +2543,68 @@ function _normalizeDate(s) {
   return today();
 }
 
+function _bankLedgerOptions() {
+  // Parties available to post against: customers, suppliers, plus a few common
+  // generic expense/income heads for things like bank charges, salary, owner drawings.
+  const generic = ['Bank Charges', 'Interest Income', 'Salary / Wages', 'Rent', 'Owner Drawings / Capital', 'GST Payment', 'Loan / EMI', 'Other Income', 'Other Expense'];
+  const parties = [...new Set([...DB.customers.map(c => c.name), ...DB.suppliers.map(s => s.name)])];
+  return [...parties, ...generic];
+}
+function _ledgerSelectHTML(i, selected) {
+  const opts = _bankLedgerOptions();
+  return '<select style="padding:4px 6px;border:1.5px solid var(--border);border-radius:6px;font-size:12px;font-family:inherit;min-width:150px" onchange="_biParsedRows[' + i + '].ledger=this.value">' +
+    '<option value="">— Suspense —</option>' +
+    opts.map(o => '<option' + (o === selected ? ' selected' : '') + '>' + esc(o) + '</option>').join('') +
+    '</select>';
+}
 function _renderBIPreview() {
   document.getElementById('bi-preview-panel').style.display = '';
   document.getElementById('bi-preview-tbl').innerHTML = _biParsedRows.map((r,i) =>
     '<tr><td><input type="checkbox" ' + (r.include?'checked':'') + ' onchange="_biParsedRows[' + i + '].include=this.checked"></td>' +
     '<td>' + fmtDate(r.date) + '</td><td>' + esc(r.desc) + '</td><td>' + esc(r.ref || '—') + '</td>' +
-    '<td class="r">' + (r.debit ? fmtMoney(r.debit) : '') + '</td><td class="r">' + (r.credit ? fmtMoney(r.credit) : '') + '</td></tr>'
+    '<td class="r">' + (r.debit ? fmtMoney(r.debit) : '') + '</td><td class="r">' + (r.credit ? fmtMoney(r.credit) : '') + '</td>' +
+    '<td>' + _ledgerSelectHTML(i, r.ledger) + '</td></tr>'
   ).join('');
+  const bulkSel = document.getElementById('bi-bulk-ledger');
+  bulkSel.innerHTML = '<option value="">Set ledger for all selected…</option>' +
+    _bankLedgerOptions().map(o => '<option>' + esc(o) + '</option>').join('');
+}
+function _applyBulkLedger(val) {
+  if (!val) return;
+  _biParsedRows.forEach(r => { if (r.include) r.ledger = val; });
+  _renderBIPreview();
 }
 function _toggleAllBIRows(state) {
   _biParsedRows.forEach(r => r.include = state);
   _renderBIPreview();
 }
+function _postSelectedBIRows() {
+  const selected = _biParsedRows.filter(r => r.include && r.ledger);
+  if (!selected.length) { showStatus('Select at least one row and pick a ledger for it before posting', 'err'); return; }
+  selected.forEach(r => {
+    DB.bankLedger.push({
+      date: r.date, party: r.ledger, desc: r.desc, ref: r.ref,
+      type: r.credit > 0 ? 'Receipt' : 'Payment',
+      amount: r.credit > 0 ? r.credit : r.debit
+    });
+    // Also reflect the movement in the Bank Book as a cleared (already-matched) entry,
+    // since it's posted straight to a ledger rather than parked as suspense.
+    DB.bank.push({
+      date: r.date, particulars: r.desc + ' (' + r.ledger + ')', chq: r.ref,
+      type: r.credit > 0 ? 'Deposit' : 'Withdrawal',
+      amount: r.credit > 0 ? r.credit : r.debit,
+      status: 'cleared'
+    });
+  });
+  saveData();
+  showStatus(selected.length + ' transaction(s) posted to ledger', 'success');
+  _biParsedRows = _biParsedRows.filter(r => !(r.include && r.ledger));
+  if (_biParsedRows.length) { _renderBIPreview(); } else { document.getElementById('bi-preview-panel').style.display = 'none'; document.getElementById('bi-file').value = ''; }
+  renderBank(); renderBankImportPage(); renderLedgerPage();
+}
 function _importSelectedBIRows() {
-  const selected = _biParsedRows.filter(r => r.include);
-  if (!selected.length) { showStatus('Select at least one row to import', 'err'); return; }
+  const selected = _biParsedRows.filter(r => r.include && !r.ledger);
+  if (!selected.length) { showStatus('Select at least one row without a ledger assigned (those should use "Post Selected to Ledger" instead)', 'err'); return; }
   selected.forEach(r => {
     DB.bank.push({
       date: r.date, particulars: r.desc, chq: r.ref,
@@ -2487,9 +2615,8 @@ function _importSelectedBIRows() {
   });
   saveData();
   showStatus(selected.length + ' transaction(s) imported as Suspense — clear them below once verified', 'success');
-  document.getElementById('bi-preview-panel').style.display = 'none';
-  document.getElementById('bi-file').value = '';
-  _biParsedRows = [];
+  _biParsedRows = _biParsedRows.filter(r => !(r.include && !r.ledger));
+  if (_biParsedRows.length) { _renderBIPreview(); } else { document.getElementById('bi-preview-panel').style.display = 'none'; document.getElementById('bi-file').value = ''; }
   renderBank(); renderBankImportPage();
 }
 function renderBankImportPage() {
@@ -2762,7 +2889,7 @@ async function _loadMasterFromCloud() {
 
 
 function renderLedgerPage() {
-  const parties = [...new Set([...DB.sales.map(s => s.party), ...DB.purchases.map(p => p.party)])];
+  const parties = [...new Set([...DB.sales.map(s => s.party), ...DB.purchases.map(p => p.party), ...DB.bankLedger.map(b => b.party)])];
   const sel = document.getElementById('ledger-sel');
   const cur = sel.value;
   sel.innerHTML = '<option value="">-- Select Party --</option>' + parties.map(p => '<option' + (p === cur ? ' selected' : '') + '>' + esc(p) + '</option>').join('');
@@ -2780,6 +2907,7 @@ function renderLedger() {
   DB.saleReturns.filter(r => r.party === party).forEach(r => entries.push({ date: r.date, type: 'Sale Return', ref: r.inv, dr: r.amt, cr: 0 }));
   DB.purchaseReturns.filter(r => r.party === party).forEach(r => entries.push({ date: r.date, type: 'Pur. Return', ref: r.inv, dr: 0, cr: r.amt }));
   DB.creditNotes.filter(c => c.party === party).forEach(c => entries.push({ date: c.date, type: 'Credit Note', ref: c.no, dr: c.amt, cr: 0 }));
+  DB.bankLedger.filter(b => b.party === party).forEach(b => entries.push({ date: b.date, type: b.type, ref: b.ref || b.desc, dr: b.type === 'Payment' ? b.amount : 0, cr: b.type === 'Receipt' ? b.amount : 0 }));
   if (from) entries = entries.filter(e => e.date >= from);
   if (to)   entries = entries.filter(e => e.date <= to);
   entries.sort((a, b) => a.date.localeCompare(b.date));
@@ -3461,7 +3589,7 @@ ${sales.concat(purch).join('\n')}
 function clearTransactions() {
   if (!confirm('Delete all Sales, Purchases, Returns, Cash Book and Bank Book entries?\n\nThis cannot be undone. Business Settings will NOT be affected.')) return;
   DB.sales = []; DB.purchases = []; DB.saleReturns = []; DB.purchaseReturns = [];
-  DB.creditNotes = []; DB.cash = []; DB.bank = [];
+  DB.creditNotes = []; DB.cash = []; DB.bank = []; DB.bankLedger = [];
   saveData(); showStatus('All transactions cleared', 'warn');
   try { renderDashboard(); } catch(e) {}
 }
