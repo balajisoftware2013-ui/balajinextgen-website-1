@@ -410,7 +410,7 @@ function WP360_loadUsers() {
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  ★ NEW in v13 — AUTHORITATIVE DUPLICATE-CONTACT CHECK ★
+//  ★ AUTHORITATIVE DUPLICATE-CONTACT CHECK ★
 //  Scans the real CLIENT_MASTER rows (source of truth) for an existing
 //  mobile or email within this app's industry. This is what closes the
 //  "same mobile number can end up on a separate dashboard" hole, since
@@ -434,10 +434,6 @@ function WP360_findDuplicateContact(mobile, email) {
     return null;
   } catch(err) {
     WP360_logError('WP360_findDuplicateContact', err.toString());
-    // Fail CLOSED is not possible here without risking false blocks on a
-    // transient sheet error, but we log it so it's visible in ERROR_LOG.
-    // registerClient() below still runs its own uid-existence check as a
-    // second line of defense.
     return null;
   }
 }
@@ -485,10 +481,8 @@ function WP360_registerClient(dataJson) {
     });
   }
 
-  // ── Line of defense #2 (★ NEW v13 — THE ACTUAL FIX ★): same mobile
-  //    or email already tied to a DIFFERENT userid/client. This is the
-  //    check that was missing and allowed the same phone number to end
-  //    up owning multiple separate dashboards. ─────────────────────────
+  // ── Line of defense #2: same mobile or email already tied to a
+  //    DIFFERENT userid/client. ─────────────────────────
   const dup = WP360_findDuplicateContact(d.mobile, d.email);
   if (dup) {
     const ex = WP360_getClientSheetId(dup.clientId);
@@ -586,8 +580,7 @@ function WP360_hashPass(pw) {
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  ★ NEW v14 — SUPER ADMIN LOGIN (server-side, credentials never ship
-//  to the browser) ★
+//  ★ SUPER ADMIN LOGIN (server-side, credentials never ship to browser) ★
 // ══════════════════════════════════════════════════════════════════
 function WP360_superAdminLogin(dataJson) {
   let d;
@@ -609,7 +602,7 @@ function WP360_superAdminLogin(dataJson) {
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  ★ NEW v14 — ONE-TIME SETUP: run this MANUALLY from the Apps Script
+//  ★ ONE-TIME SETUP: run this MANUALLY from the Apps Script
 //  editor (select this function → Run) to store your Super Admin login.
 //  It is NEVER called from the web app, so it's never reachable by a
 //  browser. Edit the two values below, run it once, then you can leave
@@ -643,9 +636,6 @@ function WP360_adminListClients() {
     const userByClient = {};
     userRows.forEach(u => { userByClient[u.CLIENT_ID] = u; });
 
-    // ★ NEW v13: flag rows that share a PHONE with another row, so the
-    //   Super Admin panel can visibly spot any pre-existing duplicates
-    //   created before this fix (e.g. from your Drive screenshot).
     const phoneCounts = {};
     clients.forEach(c => {
       const p = String(c.PHONE || '').trim();
@@ -1200,11 +1190,6 @@ function WP360_getClientSummary() {
   return clients;
 }
 
-// ★ NEW v13 — run this manually once after deploying to find any
-//   duplicate-mobile accounts that were already created by the old
-//   buggy backend (like the "suman123" duplicate folder in your Drive
-//   screenshot). It does NOT delete anything — it only reports them so
-//   you can decide which account/folder to keep and which to merge.
 function WP360_findExistingDuplicates() {
   const clients = WP360_findAllRows(WP360_CONFIG.USER_SECURITY_SHEET_ID, 'CLIENT_MASTER', 'INDUSTRY', WP360_CONFIG.INDUSTRY);
   const byPhone = {};
