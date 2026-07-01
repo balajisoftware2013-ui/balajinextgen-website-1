@@ -11,15 +11,31 @@ WHAT'S IN THIS ZIP
      voice search (search bar + AI panel).
    - GAS_URL is already pointed at your existing /exec deployment.
 
-2. Code.gs
-   - The backend (Apps Script). Handles REGISTER_CLIENT, LOGIN,
-     SUITE_SAVE_DB / SUITE_LOAD_DB, CHECK_SUBSCRIPTION.
-   - Uses sequential CLIENT_ID (reads CLIENT_MASTER, continues from
-     CL00015 -> CL00016...), correct real headers for every tab it
-     writes to.
-   - TEMPLATE_SHEET_ID now points to TEM049
-     (Balaji_BusinessOS_Database_Template, sheet ID
-     18moaYrNWFKR5etfS2Y4HVjbmyrxCRJxBxQeynz1i9hA) — NOT the old TEM047.
+2. BUSINESS_OS_BACKEND.gs  (renamed from Code.gs)
+   - IMPORTANT: your Apps Script project (BALAJI_NEXTGEN_ERP_V2_CORE) is
+     shared across multiple products — WealthPilot360, leads-api,
+     security-api, master-control, etc. all live in the SAME project,
+     and GAS merges every .gs file into one execution context. Your
+     Business OS backend already lives there as a file literally named
+     "BUSINESS OS BACKEND.gs" (per your screenshot) — this file is the
+     UPDATED version of that same file. Paste this content INTO that
+     existing file (don't create a new one called "Code.gs" — that
+     name is already taken by something else in your project and
+     could collide).
+   - NEW this round: LOG_SALE / LOG_PURCHASE actions — every sale and
+     purchase now writes an actual visible row into the SALES /
+     PURCHASES tabs of the client's Sheet (upserted by ID, so retries
+     don't create duplicates), IN ADDITION to the existing fast
+     APP_DATA JSON sync. This is what makes new invoices show up when
+     you open the Sheet directly — previously only the JSON blob was
+     updated, never the visible SALES/PURCHASES rows.
+   - NEW: UPLOAD_ATTACHMENT action — purchase bill photos/PDFs now
+     upload for real to the client's Google Drive folder (same folder
+     as their database Sheet) and get a real Drive link stored on the
+     purchase record, instead of just remembering the filename.
+   - Still handles REGISTER_CLIENT, LOGIN, SUITE_SAVE_DB / SUITE_LOAD_DB,
+     CHECK_SUBSCRIPTION as before. Same TEM049 template, same
+     sequential CLIENT_ID logic.
 
 3. Balaji_BusinessOS_Database_Template.xlsx
    - The per-client database template (TEM049) — matches the app's DB
@@ -73,10 +89,13 @@ Step 2 — Master data
   In USER_SECURITY_MASTER_DB, do the same for MASTER_DROPDOWNS.
 
 Step 3 — Backend
-  Open your Apps Script project (bound to the /exec URL already in
-  the HTML) and paste in Code.gs, replacing the old code entirely.
-  Deploy > Manage deployments > Edit > New version > Deploy.
-  (Keep the same /exec URL — don't create a new deployment.)
+  Open BALAJI_NEXTGEN_ERP_V2_CORE in Apps Script, click on the file
+  literally named "BUSINESS OS BACKEND.gs" in the left sidebar, select
+  all, delete, and paste in the full content of BUSINESS_OS_BACKEND.gs
+  from this zip. Deploy > Manage deployments > Edit (pencil icon on
+  your existing deployment) > New version > Deploy.
+  (Keep the SAME /exec URL — don't create a new deployment, or the
+  URL in the HTML won't match anymore.)
 
 Step 4 — Frontend + PWA files
   Upload balaji-business-os.html, manifest.json, and sw.js to your
