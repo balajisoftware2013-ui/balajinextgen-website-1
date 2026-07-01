@@ -198,8 +198,8 @@ function login(req){
         const cr = findRow(USER_SECURITY_SHEET_ID, 'CLIENT_REGISTRY', 'CLIENT_ID', clientId);
         if(cr){ sheetId = cr.DATABASE_ID; bizName = cr.COMPANY_NAME; plan = cr.PLAN_NAME; trialEnd = new Date(cr.EXPIRY_DATE).getTime(); }
       }
-      const loaded = sheetId ? loadDB({sheetId}) : {data:null};
-      return {success:true, clientId: clientId||'ALL', sheetId, role, bizName, plan, trialEnd, data: loaded.data, userId};
+      const loaded = sheetId ? loadDB({sheetId}) : {data:null, lastSynced:0};
+      return {success:true, clientId: clientId||'ALL', sheetId, role, bizName, plan, trialEnd, data: loaded.data, lastSynced: loaded.lastSynced, userId};
     }
   }
   logLoginHistory('', '', '', '', 'FAILED');
@@ -230,15 +230,17 @@ function saveDB(req){
   let sh = ss.getSheetByName('APP_DATA') || ss.insertSheet('APP_DATA');
   sh.getRange(1,1).setValue('DB_JSON');
   sh.getRange(1,2).setValue(JSON.stringify(req.data));
-  sh.getRange(1,3).setValue(new Date());
-  return {success:true};
+  const ts = new Date();
+  sh.getRange(1,3).setValue(ts);
+  return {success:true, lastSynced: ts.getTime()};
 }
 function loadDB(req){
   const ss = SpreadsheetApp.openById(req.sheetId);
   const sh = ss.getSheetByName('APP_DATA');
-  if(!sh) return {success:true, data:null};
+  if(!sh) return {success:true, data:null, lastSynced:0};
   const json = sh.getRange(1,2).getValue();
-  return {success:true, data: json ? JSON.parse(json) : null};
+  const ts = sh.getRange(1,3).getValue();
+  return {success:true, data: json ? JSON.parse(json) : null, lastSynced: ts ? new Date(ts).getTime() : 0};
 }
 
 function checkSubscription(req){
