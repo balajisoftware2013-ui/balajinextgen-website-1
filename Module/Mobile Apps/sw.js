@@ -1,9 +1,16 @@
-// Balaji NextGen — Business OS — minimal service worker
-// Purpose: satisfies the "installable PWA" requirement (Chrome/Android need an active
-// service worker with a fetch handler) and gives basic offline resilience for the app shell.
-// This intentionally does NOT cache API calls to Google Apps Script — those always go live.
-
-const CACHE_NAME = 'balaji-bos-v1';
+// Balaji NextGen — Business OS — service worker
+// Purpose: (1) satisfies the "installable PWA" requirement, (2) gives basic offline
+// resilience for the app shell, (3) makes sure new deployments actually reach users
+// instead of getting stuck on a stale cached copy forever.
+//
+// STRATEGY: network-first for the HTML/manifest — always try to fetch the LATEST
+// version first, and only fall back to the cached copy if the network request fails
+// (genuinely offline). This is the opposite of cache-first, which was the bug: once
+// cached, a cache-first strategy NEVER re-checks the network, so every future deploy
+// was invisible until someone manually cleared their browser cache.
+//
+// Bump CACHE_NAME any time you want to force a clean slate for all users.
+const CACHE_NAME = 'balaji-bos-v2';
 const APP_SHELL = ['./balaji-business-os.html', './manifest.json'];
 
 self.addEventListener('install', event => {
@@ -27,10 +34,31 @@ self.addEventListener('fetch', event => {
   // Never cache Google Apps Script calls — must always be live/fresh
   if (url.includes('script.google.com')) return;
 
+  // Images (the logo, etc.) rarely change — serve from cache instantly if we have it,
+  // and only hit the network the very first time. This is what actually fixes "logo
+  // loads slowly every time" — a fresh network fetch on every single page load.
+  if (event.request.destination === 'image') {
+    event.respondWith(
+      caches.match(event.request).then(cached => {
+        if (cached) return cached;
+        return fetch(event.request).then(response => {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone)).catch(()=>{});
+          return response;
+        });
+      })
+    );
+    return;
+  }
+
+  // Everything else (the HTML app shell, manifest) — network-first, see note above.
   event.respondWith(
-    caches.match(event.request).then(cached => {
-      if (cached) return cached;
-      return fetch(event.request).catch(() => cached);
-    })
+    fetch(event.request)
+      .then(response => {
+        const clone = response.clone();
+        caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone)).catch(()=>{});
+        return response;
+      })
+      .catch(() => caches.match(event.request))
   );
 });

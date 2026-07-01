@@ -14,6 +14,7 @@
     document.head.appendChild(__m);
   }
 </script>
+<link rel="preload" href="assets/Logos/logo.png" as="image">
 <link rel="apple-touch-icon" href="assets/Logos/logo.png">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -1579,7 +1580,22 @@ window.addEventListener('appinstalled', ()=>{ document.getElementById('installBa
   }
 })();
 if('serviceWorker' in navigator && (location.protocol==='http:'||location.protocol==='https:')){
-  window.addEventListener('load', ()=>{ navigator.serviceWorker.register('sw.js').catch(()=>{}); });
+  window.addEventListener('load', ()=>{
+    navigator.serviceWorker.register('sw.js').then(reg=>{
+      // If a new service worker takes over (new deploy detected), reload once
+      // automatically so the person always ends up on the latest version —
+      // this is what fixes "app doesn't show my update until I clear browser data".
+      let refreshed = false;
+      navigator.serviceWorker.addEventListener('controllerchange', ()=>{
+        if(refreshed) return;
+        refreshed = true;
+        window.location.reload();
+      });
+      // Also actively check for an update on every load (catches the case where
+      // the old service worker is still controlling the page)
+      reg.update().catch(()=>{});
+    }).catch(()=>{});
+  });
 }
 
 const seed = {
@@ -1659,6 +1675,15 @@ function attemptSync(){
 function scheduleSyncRetry(){
   clearTimeout(_syncRetryTimer);
   _syncRetryTimer = setTimeout(attemptSync, 8000);
+}
+function syncItemRow(it){
+  logRowToSheet('LOG_PARTY', {tab:'ITEMS', row:[it.id, it.name, it.unit, it.hsn, it.pRate, it.sRate, it.gst, it.stock, it.min]});
+}
+function syncCustomerRow(c){
+  logRowToSheet('LOG_PARTY', {tab:'CUSTOMERS', row:[c.id, c.name, c.mobile, c.due, c.limit||0, c.lastDate||'']});
+}
+function syncSupplierRow(s){
+  logRowToSheet('LOG_PARTY', {tab:'SUPPLIERS', row:[s.id, s.name, s.mobile, s.due]});
 }
 function logRowToSheet(action, payload){
   if(!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL)) return;
@@ -2422,10 +2447,11 @@ function saveBill(print, sendWa){
     return {id:c.id, name:it.name||'Item', hsn:it.hsn||'—', qty:c.qty, rate:c.sRate, amt:c.sRate*c.qty, gst: gstType==='gst' ? (it.gst||0) : 0};
   });
   DB.sales.unshift({id, cust:billCustomer.id, date:today, total, mode, gstType, lineItems: billedItems.map(it=>({id:it.id, name:it.name, qty:it.qty, rate:it.rate}))});
-  cart.forEach(c=>{ const it = DB.items.find(x=>x.id===c.id); if(it) it.stock = Math.max(0, it.stock-c.qty); });
+  cart.forEach(c=>{ const it = DB.items.find(x=>x.id===c.id); if(it){ it.stock = Math.max(0, it.stock-c.qty); syncItemRow(it); } });
   if(mode==='Credit'){ billCustomer.due += total; } else if(mode==='Cash'){ DB.cash += total; } else { bankAdjust(total); }
   persistDB();
   logRowToSheet('LOG_SALE', {id, cust:billCustomer.id, date:today, total, mode});
+  syncCustomerRow(billCustomer);
   if(sendWa){
     openInvoiceDoc(id, billCustomer, total, mode, billedItems, gstType);
     toast('Invoice ready — tap Share on WhatsApp');
@@ -2805,50 +2831,82 @@ function setRptFilter(f, el){
   if(f!=='custom') openReport(_lastReportType);
 }
 function applyCustomDates(){ openReport(_lastReportType); }
-function filterSalesForReport(){
+function filterByDateRange(arr, dateField){
   const f = _rptFilter;
   const today = new Date();
   const todStr = todayStr();
-  if(f==='today') return DB.sales.filter(s=>s.date===todStr);
-  if(f==='yesterday') return DB.sales.filter(s=>s.date===yesterdayStr());
+  if(f==='today') return arr.filter(x=>x[dateField]===todStr);
+  if(f==='yesterday') return arr.filter(x=>x[dateField]===yesterdayStr());
   if(f==='week'){
     const d=new Date(today); d.setDate(d.getDate()-7);
     const from=d.toISOString().slice(0,10);
-    return DB.sales.filter(s=>s.date>=from && s.date<=todStr);
+    return arr.filter(x=>x[dateField]>=from && x[dateField]<=todStr);
   }
   if(f==='month'){
     const from=todStr.slice(0,7)+'-01';
-    return DB.sales.filter(s=>s.date>=from && s.date<=todStr);
+    return arr.filter(x=>x[dateField]>=from && x[dateField]<=todStr);
   }
   if(f==='lastmonth'){
-    const y=today.getFullYear(), m=today.getMonth(); // 0-indexed
+    const y=today.getFullYear(), m=today.getMonth();
     const start=new Date(y, m-1, 1).toISOString().slice(0,10);
-    const end=new Date(y, m, 0).toISOString().slice(0,10); // last day of previous month
-    return DB.sales.filter(s=>s.date>=start && s.date<=end);
+    const end=new Date(y, m, 0).toISOString().slice(0,10);
+    return arr.filter(x=>x[dateField]>=start && x[dateField]<=end);
   }
   if(f==='year'){
-    // Indian financial year: Apr 1 – Mar 31
     const fyStartYear = today.getMonth()>=3 ? today.getFullYear() : today.getFullYear()-1;
     const start=`${fyStartYear}-04-01`, end=`${fyStartYear+1}-03-31`;
-    return DB.sales.filter(s=>s.date>=start && s.date<=end);
+    return arr.filter(x=>x[dateField]>=start && x[dateField]<=end);
   }
   if(f==='custom'){
     const from=(document.getElementById('rptFrom')||{}).value||'';
     const to=(document.getElementById('rptTo')||{}).value||'';
-    return DB.sales.filter(s=>(!from||s.date>=from)&&(!to||s.date<=to));
+    return arr.filter(x=>(!from||x[dateField]>=from)&&(!to||x[dateField]<=to));
   }
-  return DB.sales;
+  return arr;
 }
+function filterSalesForReport(){ return filterByDateRange(DB.sales, 'date'); }
 
 /* ── EXPORT FUNCTIONS ────────────────────────────────────────────── */
 function exportReportCSV(){
-  const sales = filterSalesForReport();
-  const rows=[['Invoice','Customer','Date','Amount','Mode','GST Type']].concat(
-    sales.map(s=>[s.id,(DB.customers.find(c=>c.id===s.cust)||{}).name||'—',s.date,s.total,s.mode||'—',s.gstType||'gst'])
-  );
+  const type = _lastReportType;
+  let rows;
+  if(type==='purchase'){
+    rows=[['Purchase ID','Supplier','Date','Amount','Mode','Invoice No']].concat(
+      DB.purchases.map(p=>[p.id,(DB.suppliers.find(s=>s.id===p.supp)||{}).name||'—',p.date,p.total,p.mode||'—',p.invNo||''])
+    );
+  } else if(type==='stock' || type==='stockledger'){
+    rows=[['Item','Unit','Stock','Purchase Rate','Sale Rate','Stock Value']].concat(
+      DB.items.map(i=>[i.name,i.unit,i.stock,i.pRate,i.sRate,i.pRate*i.stock])
+    );
+  } else if(type==='gst'){
+    const s = filterSalesForReport();
+    const gstSales=s.reduce((a,x)=>a+x.total*0.18/1.18,0);
+    const gstPurch=DB.purchases.reduce((a,p)=>a+p.total*0.18/1.18,0);
+    rows=[['Metric','Amount'],['Output GST (Sales)',gstSales.toFixed(2)],['Input GST (Purchase)',gstPurch.toFixed(2)],['Net GST Payable',Math.max(0,gstSales-gstPurch).toFixed(2)]];
+  } else if(type==='pl'){
+    const s = filterSalesForReport();
+    const totalSales=s.reduce((a,x)=>a+x.total,0), totalPurch=DB.purchases.reduce((a,p)=>a+p.total,0);
+    const gross=totalSales-totalPurch, exp=DB.expensesToday||0;
+    rows=[['Metric','Amount'],['Sales Revenue',totalSales],['Cost of Goods',-totalPurch],['Gross Profit',gross],['Expenses',-exp],['Net Profit',gross-exp]];
+  } else if(type==='bs'){
+    const sv=DB.items.reduce((a,i)=>a+i.pRate*i.stock,0);
+    const dr=DB.customers.reduce((a,c)=>a+c.due,0), cr=DB.suppliers.reduce((a,s)=>a+s.due,0);
+    const ta=DB.cash+DB.bank+sv+dr;
+    rows=[['Item','Amount'],['Cash in Hand',DB.cash],['Bank Balance',DB.bank],['Stock Value',sv],['Customer Dues',dr],['Total Assets',ta],['Supplier Dues',cr],["Owner's Capital",ta-cr]];
+  } else if(type==='returns'){
+    rows=[['Type','ID','Party','Date','Amount']].concat(
+      (DB.creditNotes||[]).map(cn=>['Credit Note',cn.id,(DB.customers.find(c=>c.id===cn.cust)||{}).name||'—',cn.date,cn.amount]),
+      (DB.debitNotes||[]).map(dn=>['Debit Note',dn.id,(DB.suppliers.find(s=>s.id===dn.supp)||{}).name||'—',dn.date,dn.amount])
+    );
+  } else {
+    const s = filterSalesForReport();
+    rows=[['Invoice','Customer','Date','Amount','Mode','GST Type']].concat(
+      s.map(x=>[x.id,(DB.customers.find(c=>c.id===x.cust)||{}).name||'—',x.date,x.total,x.mode||'—',x.gstType||'gst'])
+    );
+  }
   const blob=new Blob([rows.map(r=>r.join(',')).join('\n')],{type:'text/csv'});
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
-  a.download=`report_${_rptFilter}_${Date.now()}.csv`; a.click();
+  a.download=`${type}_report_${_rptFilter}_${Date.now()}.csv`; a.click();
   toast('Excel CSV downloaded ✓');
 }
 function exportAllCSV(){
@@ -2961,16 +3019,28 @@ function openReport(type, el){
   } else if(type==='stock'){
     tbl=DB.items.map(i=>`<div class="cart-row"><span>${i.name} <span class="d-meta">HSN ${i.hsn||'—'}</span></span><span class="mono ${i.stock<=i.min?'due':''}">${i.stock} ${i.unit} = ${fmt(i.pRate*i.stock)}</span></div>`).join('');
   } else if(type==='stockledger'){
-    // Movement log per item: purchases (IN) + sales (OUT) + returns, newest first
-    let rows = [];
-    (DB.purchases||[]).forEach(p=>(p.lineItems||[]).forEach(li=>rows.push({date:p.date, item:li.name, dir:'IN', qty:li.qty, ref:p.id})));
-    (DB.sales||[]).forEach(s=>(s.lineItems||[]).forEach(li=>rows.push({date:s.date, item:li.name, dir:'OUT', qty:li.qty, ref:s.id})));
-    (DB.creditNotes||[]).forEach(cn=>(cn.lineItems||[]).forEach(li=>rows.push({date:cn.date, item:li.name, dir:'IN', qty:li.qty, ref:cn.id+' (Sales Return)'})));
-    (DB.debitNotes||[]).forEach(dn=>(dn.lineItems||[]).forEach(li=>rows.push({date:dn.date, item:li.name, dir:'OUT', qty:li.qty, ref:dn.id+' (Purchase Return)'})));
-    rows.sort((a,b)=> a.date<b.date?1:-1);
-    tbl = rows.length ? rows.slice(0,60).map(r=>`
-      <div class="cart-row"><span>${r.date} · ${r.item} · ${r.ref}</span><span class="mono ${r.dir==='IN'?'green':'due'}">${r.dir==='IN'?'+':'−'}${r.qty}</span></div>`).join('')
-      : '<div class="cart-row"><span>No stock movement recorded yet (only tracked for purchases/sales made after this update)</span><span></span></div>';
+    const periodPurchases = filterByDateRange(DB.purchases||[], 'date');
+    const periodCN = filterByDateRange(DB.creditNotes||[], 'date');
+    const periodDN = filterByDateRange(DB.debitNotes||[], 'date');
+    const summary = DB.items.map(it=>{
+      let purQty=0, purVal=0, salQty=0, salVal=0, adjQty=0;
+      periodPurchases.forEach(p=>(p.lineItems||[]).forEach(li=>{ if(li.id===it.id){ purQty+=li.qty; purVal+=li.qty*li.rate; }}));
+      sales.forEach(s=>(s.lineItems||[]).forEach(li=>{ if(li.id===it.id){ salQty+=li.qty; salVal+=li.qty*li.rate; }}));
+      periodCN.forEach(cn=>(cn.lineItems||[]).forEach(li=>{ if(li.id===it.id) adjQty+=li.qty; }));
+      periodDN.forEach(dn=>(dn.lineItems||[]).forEach(li=>{ if(li.id===it.id) adjQty-=li.qty; }));
+      const closingQty = it.stock;
+      const openingQty = closingQty - purQty + salQty - adjQty;
+      return {id:it.id, name:it.name, openingQty, purQty, purVal, salQty, salVal, adjQty, closingQty, closingRate:it.pRate, closingVal:closingQty*it.pRate};
+    }).filter(r=>r.purQty || r.salQty || r.adjQty);
+    tbl = summary.length ? summary.map(r=>`
+      <div class="cart-row" style="cursor:pointer;flex-direction:column;align-items:stretch;padding:9px 0;" onclick="viewStockLedgerDetail('${r.id}')">
+        <div style="display:flex;justify-content:space-between;"><b>${r.name}</b><span style="color:var(--primary);font-size:10px;font-weight:700;">DETAILS ›</span></div>
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--sub);margin-top:2px;">
+          <span>Open ${r.openingQty} → Purch +${r.purQty} → Sale −${r.salQty}${r.adjQty?` → Adj ${r.adjQty>0?'+':''}${r.adjQty}`:''} → Close ${r.closingQty} @ ${fmt(r.closingRate)}</span>
+          <span class="mono">${fmt(r.closingVal)}</span>
+        </div>
+      </div>`).join('')
+      : '<div class="cart-row"><span>No stock movement for this period</span><span></span></div>';
   } else if(type==='itemwise'){
     const itemSales = {}, itemPurch = {};
     sales.forEach(s=>(s.lineItems||[]).forEach(li=>{ itemSales[li.name]=(itemSales[li.name]||0)+li.qty*li.rate; }));
@@ -2998,7 +3068,7 @@ function openReport(type, el){
     const total=DB.purchases.reduce((a,p)=>a+p.total,0);
     tbl=`<div class="cart-row"><span>Total Purchase</span><span class="mono">${fmt(total)}</span></div>
       <div class="cart-row"><span>Transactions</span><span class="mono">${DB.purchases.length}</span></div>`
-      +DB.purchases.slice(0,8).map(p=>`<div class="cart-row" style="cursor:pointer;" onclick="viewPurchaseEntry('${p.id}')"><span>${p.id} · ${(DB.suppliers.find(s=>s.id===p.supp)||{}).name||'—'} <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(p.total)}</span></div>`).join('');
+      +DB.purchases.slice(0,8).map(p=>`<div class="cart-row" style="cursor:pointer;" onclick="viewPurchaseEntry('${p.id}')"><span>${p.id} · ${(DB.suppliers.find(s=>s.id===p.supp)||{}).name||'—'}${p.invNo?' · '+p.invNo:''}${p.invoiceFileUrl?' 📎':''} <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(p.total)}</span></div>`).join('');
   } else {
     tbl=sales.slice(0,8).map(s=>`<div class="cart-row" style="cursor:pointer;" onclick="viewSaleEntry('${s.id}')"><span>${s.id} · ${(DB.customers.find(c=>c.id===s.cust)||{}).name||'—'} <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(s.total)}</span></div>`).join('')||'<div class="cart-row"><span>No data for this period</span><span></span></div>';
   }
@@ -3018,11 +3088,48 @@ function viewPurchaseEntry(id){
   const p = DB.purchases.find(x=>x.id===id);
   if(!p) return;
   const supp = DB.suppliers.find(s=>s.id===p.supp) || {id:'', name:'—', mobile:''};
-  let msg = `Purchase ${p.id}\nSupplier: ${supp.name}\nDate: ${p.date}\nMode: ${p.mode}\n\n`;
-  (p.lineItems||[]).forEach(li=> msg += `${li.name} x${li.qty} @ ${fmt(li.rate)} = ${fmt(li.rate*li.qty)}\n`);
-  msg += `\nTotal: ${fmt(p.total)}`;
-  if(p.invNo) msg += `\nSupplier Invoice: ${p.invNo}`;
-  alert(msg); // lightweight viewer — full doc template coming for purchase side
+  if(!document.getElementById('page-reports').classList.contains('active')) goPage('reports');
+  document.getElementById('reportTitle').textContent = 'Purchase '+p.id;
+  const itemRows = (p.lineItems||[]).map(li=>`
+    <div class="cart-row"><span>${li.name} × ${li.qty} @ ${fmt(li.rate)}</span><span class="mono">${fmt(li.rate*li.qty)}</span></div>`).join('');
+  const attachmentRow = p.invoiceFileUrl
+    ? `<div class="cart-row"><span>📎 Attachment</span><a href="${p.invoiceFileUrl}" target="_blank" style="color:var(--primary);font-weight:700;">View / Download ›</a></div>`
+    : p.invoiceFile
+      ? `<div class="cart-row"><span>📎 Attachment</span><span style="color:var(--sub);">${p.invoiceFile} (still uploading or upload failed — check connection)</span></div>`
+      : '';
+  document.getElementById('reportTableWrap').innerHTML =
+    `<div class="cart-row" style="cursor:pointer;color:var(--primary);font-weight:700;" onclick="openReport('purchase')">← Back to Purchase Register</div>
+     <div class="cart-row"><span>Supplier</span><span class="mono">${supp.name}</span></div>
+     <div class="cart-row"><span>Date</span><span class="mono">${p.date}</span></div>
+     ${p.invNo ? `<div class="cart-row"><span>Supplier Invoice No.</span><span class="mono">${p.invNo}</span></div>` : ''}
+     <div class="cart-row"><span>Mode</span><span class="mono">${p.mode}</span></div>
+     <div class="cart-row"><span>Status</span><span class="mono">${p.mode==='Credit' ? (supp.due>0?'Due':'Paid') : 'Paid'}</span></div>
+     ${attachmentRow}
+     <div class="cart-row" style="font-weight:700;margin-top:8px;"><span>Items</span><span></span></div>
+     ${itemRows}
+     <div class="cart-total"><span>Total</span><span class="mono">${fmt(p.total)}</span></div>
+     <div style="display:flex;gap:8px;margin-top:12px;">
+       <button class="btn btn-outline" style="flex:1;" onclick="window.print()">🖨️ Print</button>
+       <button class="btn btn-outline" style="flex:1;" onclick="waOpen('${supp.mobile||''}', 'Purchase ${p.id} — ${supp.name} — Total ${fmt(p.total)}${p.invNo?' — Ref '+p.invNo:''}')">💬 WhatsApp</button>
+     </div>`;
+}
+function viewStockLedgerDetail(itemId){
+  const it = DB.items.find(i=>i.id===itemId);
+  if(!it) return;
+  let rows = [];
+  DB.purchases.forEach(p=>(p.lineItems||[]).forEach(li=>{ if(li.id===itemId) rows.push({date:p.date, voucher:p.id, type:'Purchase', party:(DB.suppliers.find(s=>s.id===p.supp)||{}).name||'—', inQty:li.qty, outQty:0, rate:li.rate}); }));
+  DB.sales.forEach(s=>(s.lineItems||[]).forEach(li=>{ if(li.id===itemId) rows.push({date:s.date, voucher:s.id, type:'Sale', party:(DB.customers.find(c=>c.id===s.cust)||{}).name||'—', inQty:0, outQty:li.qty, rate:li.rate}); }));
+  (DB.creditNotes||[]).forEach(cn=>(cn.lineItems||[]).forEach(li=>{ if(li.id===itemId) rows.push({date:cn.date, voucher:cn.id, type:'Sales Return', party:(DB.customers.find(c=>c.id===cn.cust)||{}).name||'—', inQty:li.qty, outQty:0, rate:li.rate}); }));
+  (DB.debitNotes||[]).forEach(dn=>(dn.lineItems||[]).forEach(li=>{ if(li.id===itemId) rows.push({date:dn.date, voucher:dn.id, type:'Purchase Return', party:(DB.suppliers.find(s=>s.id===dn.supp)||{}).name||'—', inQty:0, outQty:li.qty, rate:li.rate}); }));
+  rows.sort((a,b)=> a.date<b.date?-1:1);
+  let bal = 0;
+  const withBalance = rows.map(r=>{ bal += r.inQty - r.outQty; return Object.assign({}, r, {balance:bal}); });
+  document.getElementById('reportTitle').textContent = it.name+' — Movement Detail';
+  document.getElementById('reportTableWrap').innerHTML =
+    `<div class="cart-row" style="cursor:pointer;color:var(--primary);font-weight:700;" onclick="openReport('stockledger')">← Back to Stock Ledger Summary</div>`
+    + (withBalance.length ? withBalance.map(r=>`
+      <div class="cart-row"><span>${r.date} · ${r.voucher} · ${r.type} · ${r.party}</span><span class="mono">${r.inQty?'+'+r.inQty:'−'+r.outQty} <span style="color:var(--sub);">(Bal ${r.balance})</span></span></div>
+    `).join('') : '<div class="cart-row"><span>No movement recorded for this item yet</span><span></span></div>');
 }
 function drawBars(vals){
   const c = document.getElementById('reportChart');
@@ -3165,9 +3272,14 @@ function doClosing(){
 function populateBillRef(kind){
   const isCollect = kind==='collect';
   const partyId = document.getElementById(isCollect?'collectFrom':'payTo').value;
-  const bills = isCollect ? DB.sales.filter(s=>s.cust===partyId) : DB.purchases.filter(p=>p.supp===partyId);
+  // Only Credit-mode bills carry an outstanding due — a Cash/UPI/Bank sale was
+  // already settled at the time of sale, so it should never show up here as if
+  // it still needs a payment against it.
+  const bills = isCollect
+    ? DB.sales.filter(s=>s.cust===partyId && s.mode==='Credit')
+    : DB.purchases.filter(p=>p.supp===partyId && p.mode==='Credit');
   const sel = document.getElementById(isCollect?'collectBillRef':'payBillRef');
-  const optLabel = isCollect ? (b=>`${b.id} — ${fmt(b.total)} (${b.date})`) : (b=>`${b.id} — ${fmt(b.total)} (${b.date})`);
+  const optLabel = b=>`${b.id} — ${fmt(b.total)} (${b.date})`;
   sel.innerHTML = '<option value="">General / On Account (no specific bill)</option>' +
     bills.map(b=>`<option value="${b.id}">${optLabel(b)}</option>`).join('');
 }
@@ -3191,6 +3303,7 @@ function recordCollect(){
   if(!DB.paymentsIn) DB.paymentsIn = [];
   DB.paymentsIn.unshift({id:'RCT'+Date.now()%100000, cust:c.id, amount:amt, mode, billRef: billRef||null, txnRef: txnRef||null, date:new Date().toISOString().slice(0,10)});
   persistDB();
+  syncCustomerRow(c);
   document.getElementById('collectRef').value='';
   toast(billRef ? `Payment recorded against ${billRef}` : 'Payment recorded'); closeAllSheets(); renderDashboard();
   sendPaymentAck(c, amt, mode, billRef, 'received');
@@ -3207,6 +3320,7 @@ function recordPay(){
   if(!DB.paymentsOut) DB.paymentsOut = [];
   DB.paymentsOut.unshift({id:'PMT'+Date.now()%100000, supp:s.id, amount:amt, mode, billRef: billRef||null, txnRef: txnRef||null, date:new Date().toISOString().slice(0,10)});
   persistDB();
+  syncSupplierRow(s);
   document.getElementById('payRef').value='';
   toast(billRef ? `Payment made against ${billRef}` : 'Payment made'); closeAllSheets(); renderDashboard();
   sendPaymentAck(s, amt, mode, billRef, 'paid');
@@ -3321,12 +3435,13 @@ function recordPurchase(){
   DB.purchases.unshift(purchRecord);
   purchCart.forEach(c=>{
     const it = DB.items.find(i=>i.id===c.id);
-    if(it){ it.stock = (it.stock||0)+c.qty; it.pRate = c.pRate; }
+    if(it){ it.stock = (it.stock||0)+c.qty; it.pRate = c.pRate; syncItemRow(it); }
   });
   if(mode==='Credit'){ s.due += amt; } else if(mode==='Cash'){ DB.cash -= amt; } else { bankAdjust(-amt); }
   s.lastPurchaseDate = invDate;
   persistDB();
   logRowToSheet('LOG_PURCHASE', {id, supp:s.id, date:invDate, total:amt, mode});
+  syncSupplierRow(s);
   if(_purchInvoiceFile){
     uploadPurchaseAttachment(purchRecord, _purchInvoiceFile);
   }
@@ -3649,12 +3764,12 @@ function addCustomer(){
     const c = DB.customers.find(x=>x.id===editId);
     if(c){ c.name=name; c.mobile=mobile; c.limit=limit; c.gstin=gstin; c.address=address; }
     document.getElementById('ncEditId').value=''; document.getElementById('addCustTitle').textContent='New Customer';
-    persistDB(); toast('Customer updated'); closeAllSheets(); moneyTab('customers');
+    persistDB(); syncCustomerRow(c); toast('Customer updated'); closeAllSheets(); moneyTab('customers');
     return;
   }
   const newC = {id:'C'+(DB.customers.length+1+Date.now()%1000), name, mobile, due:0, limit, lastDate:'', gstin, address};
   DB.customers.push(newC);
-  persistDB(); toast('Customer added'); closeAllSheets();
+  persistDB(); syncCustomerRow(newC); toast('Customer added'); closeAllSheets();
   if(window._billingAddReturn==='customer'){
     window._billingAddReturn = null;
     billCustomer = newC;
@@ -3674,12 +3789,12 @@ function addSupplier(){
     const s = DB.suppliers.find(x=>x.id===editId);
     if(s){ s.name=name; s.mobile=mobile; s.gstin=gstin; s.address=address; }
     document.getElementById('nsEditId').value=''; document.getElementById('addSuppTitle').textContent='New Supplier';
-    persistDB(); toast('Supplier updated'); closeAllSheets(); moneyTab('suppliers');
+    persistDB(); syncSupplierRow(s); toast('Supplier updated'); closeAllSheets(); moneyTab('suppliers');
     return;
   }
   const newS = {id:'S'+(DB.suppliers.length+1+Date.now()%1000), name, mobile, due:0, gstin, address};
   DB.suppliers.push(newS);
-  persistDB(); toast('Supplier added'); closeAllSheets();
+  persistDB(); syncSupplierRow(newS); toast('Supplier added'); closeAllSheets();
   if(window._billingAddReturn==='purchSupplier'){
     window._billingAddReturn = null;
     openSheet('purchaseSheet');
