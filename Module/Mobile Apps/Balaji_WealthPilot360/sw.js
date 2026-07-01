@@ -1,6 +1,6 @@
 // Balaji WealthPilot 360 — Service Worker
 // Upload this file to the SAME Netlify folder as Balaji_WealthPilot360.html
-// (e.g. /Module/Mobile Apps/sw.js) so it's registered same-origin.
+// (e.g. /Module/Mobile Apps/Balaji_WealthPilot360/sw.js) so it's registered same-origin.
 const CACHE = 'wp360-v2';
 
 self.addEventListener('install', e => {
