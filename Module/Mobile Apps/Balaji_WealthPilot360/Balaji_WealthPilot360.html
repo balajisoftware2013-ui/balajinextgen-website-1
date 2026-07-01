@@ -282,6 +282,10 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--body-bg);color
 /* Offline banner */
 #offlineBanner{display:none;position:fixed;top:0;left:0;right:0;z-index:9998;background:linear-gradient(90deg,#F59E0B,#D97706);color:#fff;text-align:center;font-size:12px;font-weight:700;padding:6px 16px;letter-spacing:.3px}
 #offlineBanner.show{display:block}
+#cloudSyncBanner{display:none;position:fixed;top:0;left:0;right:0;z-index:9998;background:linear-gradient(90deg,#DC2626,#B91C1C);color:#fff;text-align:center;font-size:12px;font-weight:700;padding:6px 16px;letter-spacing:.3px}
+#cloudSyncBanner.show{display:block}
+#cloudSyncBanner button{margin-left:10px;background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.5);color:#fff;border-radius:6px;padding:2px 10px;font-size:11px;font-weight:700;cursor:pointer}
+#cloudSyncBanner button:hover{background:rgba(255,255,255,0.35)}
 .toast{background:var(--card-bg);border:1px solid var(--card-border);border-radius:var(--radius-sm);padding:12px 18px;font-size:13px;display:flex;align-items:center;gap:10px;animation:toastIn .3s ease;box-shadow:var(--shadow);min-width:240px;color:var(--text)}
 @keyframes toastIn{from{transform:translateX(60px);opacity:0}to{transform:translateX(0);opacity:1}}
 .toast.success{border-left:3px solid var(--emerald)}
@@ -927,6 +931,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--body-bg);color
 
 
 <div id="offlineBanner">📵 You are offline – all data is saved locally and will sync when back online</div>
+<div id="cloudSyncBanner">⚠️ Cloud backend not responding — new registrations won't save to Drive right now <button onclick="location.reload()">Retry</button></div>
 
 <!-- ══════════ AUTH SCREEN ══════════ -->
 <div id="authScreen">
@@ -6277,6 +6282,7 @@ function checkAutoLogin() {
 async function init(){
   // ── Start splash screen immediately ──────────────────────────
   _initSplash();
+  const _splashStartedAt = Date.now();
 
   // Set theme immediately
   const theme = localStorage.getItem('wp-theme') || 'orange-light';
@@ -6289,31 +6295,50 @@ async function init(){
     document.getElementById('offlineBanner').classList.add('show');
   }
 
-  // Try to sync users with a generous timeout so multi-device login never
-  // races against an empty local cache (was 1500ms — too short for cold
-  // GAS starts / mobile networks, causing "blank data on other device").
+  // v15 FIX ("logo delay"): the user-registry sync below can take up to
+  // 8 seconds when the GAS backend is slow/unreachable — previously the
+  // splash screen (your logo) stayed on screen the ENTIRE time because
+  // hiding it was awaited on this sync finishing. The logo has nothing
+  // to do with cloud sync status, so it no longer waits: it hides on its
+  // own short timer, and the sync runs in the background. The Login
+  // button still shows "Syncing..." until the sync settles, and if it
+  // ends up failing, a visible banner explains why (instead of only a
+  // console warning nobody but a developer would see).
   let _userSyncTimedOut = false;
   const _loginBtn = document.getElementById('loginSubmitBtn');
   if (_loginBtn) { _loginBtn.disabled = true; _loginBtn.textContent = '⏳ Syncing account data...'; }
-  try {
-    await Promise.race([
-      _syncUsersFromStorage(),
-      new Promise(resolve => setTimeout(() => { _userSyncTimedOut = true; resolve(); }, 8000))
-    ]);
-  } catch(e) {}
-  if (_loginBtn) { _loginBtn.disabled = false; _loginBtn.textContent = '🔑 Login'; }
-  if (_userSyncTimedOut) {
-    console.warn('[WP360] User registry sync timed out after 8s — login may use stale/empty local cache. Check network/GAS deployment.');
-    toast('⚠️ Slow connection — if login fails, please retry in a few seconds', 'info');
-  }
 
-  // Check auto-login — enterApp() renders synchronously from localStorage
-  if(checkAutoLogin()) {
-    _hideSplash(); // hide splash after successful auto-login
-    return;
-  }
-  // No session — show auth screen, hide splash
-  _hideSplash();
+  const _syncPromise = Promise.race([
+    _syncUsersFromStorage().then(() => 'ok').catch(() => 'error'),
+    new Promise(resolve => setTimeout(() => { _userSyncTimedOut = true; resolve('timeout'); }, 8000))
+  ]).then((result) => {
+    if (_loginBtn) { _loginBtn.disabled = false; _loginBtn.textContent = '🔑 Login'; }
+    const banner = document.getElementById('cloudSyncBanner');
+    if (_userSyncTimedOut || result === 'error') {
+      console.warn('[WP360] User registry sync ' + (result === 'error' ? 'failed' : 'timed out after 8s') + ' — login may use stale/empty local cache. Check network/GAS deployment.');
+      if (GAS_URL && banner) banner.classList.add('show'); // only warn if cloud sync was actually expected
+      toast('⚠️ Slow connection — if login fails, please retry in a few seconds', 'info');
+    } else if (banner) {
+      banner.classList.remove('show');
+    }
+  });
+
+  // Splash/logo hides on its own short timer — NOT tied to the network
+  // sync above. checkAutoLogin() uses whatever's already in the local
+  // cache (fine for a returning user on the same device); the
+  // background sync above will refresh that cache for next time.
+  const MIN_SPLASH_MS = 900;
+  const _elapsed = Date.now() - _splashStartedAt;
+  const _splashDelay = Math.max(0, MIN_SPLASH_MS - _elapsed);
+  setTimeout(() => {
+    if (checkAutoLogin()) {
+      _hideSplash(); // hide splash after successful auto-login
+      return;
+    }
+    // No session — show auth screen, hide splash
+    _hideSplash();
+  }, _splashDelay);
+  return;
   // No session — auth screen is already visible by default
 }
 
@@ -6705,8 +6730,8 @@ init();
     name: 'Balaji WealthPilot 360',
     short_name: 'WealthPilot360',
     description: 'Personal Finance Manager by Balaji NextGen Solutions',
-    start_url: location.pathname,          // ✅ FIX: blob-hosted manifests need an absolute path — './' was silently ignored
-    scope: location.pathname.replace(/[^/]+$/, ''),
+    start_url: location.origin + location.pathname,  // v15 FIX: a blob: manifest resolves relative/path-only URLs against ITS OWN blob address, not the page — that's why 'start_url ignored, URL is invalid' showed up even on https. A full absolute URL (with origin) resolves correctly regardless of the manifest's own address.
+    scope: location.origin + location.pathname.replace(/[^/]+$/, ''),
     display: 'standalone',
     orientation: 'portrait-primary',
     background_color: '#FF7A1A',
