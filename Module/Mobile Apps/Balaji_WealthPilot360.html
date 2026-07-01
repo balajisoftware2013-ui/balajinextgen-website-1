@@ -939,6 +939,9 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--body-bg);color
 
     </div>
 
+    <button class="auth-btn" style="background:linear-gradient(135deg,#10B981,#059669);margin-bottom:4px" onclick="startDemo()">🚀 Explore Free — See All Features (3 Months)</button>
+    <div style="font-size:10px;color:#9A7060;text-align:center;margin-bottom:10px">No signup needed to explore — try every feature free before you register</div>
+
     <div class="auth-tabs">
       <button class="auth-tab active" onclick="switchAuthTab('login')">🔑 Login</button>
       <button class="auth-tab" onclick="switchAuthTab('register')">✨ Register</button>
@@ -2409,6 +2412,7 @@ async function _storageDel(key) {
 // ── Layer 1: GAS Web App calls ──────────────────────────────
 async function _gasPost(payload) {
   if (!GAS_URL) return null;
+  if (typeof currentUser !== 'undefined' && currentUser && currentUser.isDemo) return null; // demo mode: local-only, never hits cloud
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15000); // 15s timeout for GAS
@@ -2448,6 +2452,11 @@ async function _gasLoadUsers() {
 }
 async function _gasRegisterClient(clientData) {
   return await _gasPost({ action: 'REGISTER_CLIENT', data: JSON.stringify(clientData) });
+}
+// v13: authoritative server-side duplicate check (mobile/email against
+// CLIENT_MASTER — the real source of truth, not the local users cache).
+async function _gasCheckContact(mobile, email) {
+  return await _gasPost({ action: 'CHECK_CONTACT', data: JSON.stringify({ mobile, email }) });
 }
 async function _gasGetClientInfo(uid) {
   return await _gasPost({ action: 'GET_CLIENT', uid });
@@ -5159,46 +5168,70 @@ async function doRegister() {
   const regBtn = document.querySelector('#auth-register .auth-btn');
   if (regBtn) { regBtn.disabled = true; regBtn.textContent = '⏳ Checking...'; }
 
-  // ── Merge local + cloud users for duplicate check ──────────
+  // ── Merge local + cloud users for the SOFT (userid) duplicate check ──
+  // NOTE: mobile/email duplicates are NOT trusted from this local cache
+  // anymore (v13) — that cache can be empty/stale per-browser and is
+  // exactly what let the same mobile number register a second, separate
+  // dashboard. The cache is still useful for a quick userid check.
   let users = getUsers();
   if (GAS_URL) {
     try {
       const cloudUsers = await _gasLoadUsers();
       if (cloudUsers && typeof cloudUsers === 'object') {
-        // Merge cloud into local (cloud is authoritative for duplicates)
         Object.assign(users, cloudUsers);
         saveUsers(users); // keep local in sync
       }
     } catch(e) {} // if GAS offline, fall back to local-only check
-  }
-
-  // ── Duplicate checks against merged user list ──────────────
-  if (Object.values(users).some(u => u.mobile === mobile)) {
-    if (regBtn) { regBtn.disabled = false; regBtn.textContent = 'Create Account'; }
-    return showAuthErr('reg','⚠️ Mobile number already registered — please login instead');
-  }
-  if (Object.values(users).some(u => u.email && u.email.toLowerCase() === email)) {
-    if (regBtn) { regBtn.disabled = false; regBtn.textContent = 'Create Account'; }
-    return showAuthErr('reg','⚠️ Email already registered — please login instead');
   }
   if (users[userid]) {
     if (regBtn) { regBtn.disabled = false; regBtn.textContent = 'Create Account'; }
     return showAuthErr('reg','⚠️ User ID already taken — choose another');
   }
 
-  // ── Create account ─────────────────────────────────────────
   const uid = userid;
   const chosenPlan = plan || 'trial'; // default = trial 90 days
   const trialDays = PLANS[chosenPlan] ? PLANS[chosenPlan].days : 90;
   const expiryDate = new Date(Date.now() + trialDays*86400000).toISOString().slice(0,10);
-  users[uid] = { uid, name, mobile, email, userid, city, plan: chosenPlan, planExpiry: expiryDate, pwd: hashPwd(pwd), createdAt: new Date().toISOString(), loginHistory: [], dataKey: 'wp360_data_'+uid };
-  saveUsers(users);
+  const clientPayload = { uid, name, mobile, email, userid, city, plan: chosenPlan, planExpiry: expiryDate, createdAt: new Date().toISOString() };
 
-  // Register in GAS CLIENT_MASTER + save user registry to cloud
+  // ── ★ v13 FIX: SERVER is the authority on mobile/email duplicates ───
+  // Call REGISTER_CLIENT and WAIT for its answer before creating anything
+  // locally. This is what stops the same mobile number from ending up
+  // with a second, separate account/dashboard.
   if (GAS_URL) {
-    _gasRegisterClient({ uid, name, mobile, email, userid, city, plan: chosenPlan, planExpiry: expiryDate, createdAt: new Date().toISOString() }).catch(()=>{});
-    _gasSaveUsers(users).catch(()=>{});
+    if (regBtn) regBtn.textContent = '⏳ Verifying with server...';
+    let serverResult = null;
+    try {
+      const raw = await _gasRegisterClient(clientPayload);
+      serverResult = raw ? JSON.parse(raw) : null;
+    } catch(e) { serverResult = null; }
+
+    if (serverResult && serverResult.status === 'duplicate_mobile') {
+      if (regBtn) { regBtn.disabled = false; regBtn.textContent = 'Create Account'; }
+      return showAuthErr('reg','⚠️ This mobile number is already registered' + (serverResult.existingName ? ' to "'+serverResult.existingName+'"' : '') + ' — please login instead.');
+    }
+    if (serverResult && serverResult.status === 'duplicate_email') {
+      if (regBtn) { regBtn.disabled = false; regBtn.textContent = 'Create Account'; }
+      return showAuthErr('reg','⚠️ This email is already registered' + (serverResult.existingName ? ' to "'+serverResult.existingName+'"' : '') + ' — please login instead.');
+    }
+    if (serverResult && serverResult.status === 'already_exists') {
+      if (regBtn) { regBtn.disabled = false; regBtn.textContent = 'Create Account'; }
+      return showAuthErr('reg','⚠️ User ID already taken — choose another');
+    }
+    if (!serverResult || serverResult.status !== 'registered') {
+      // Server unreachable or errored — do NOT silently create a
+      // duplicate-risk account. Ask the person to retry rather than
+      // falling back to an unverified local-only registration.
+      if (regBtn) { regBtn.disabled = false; regBtn.textContent = 'Create Account'; }
+      return showAuthErr('reg','⚠️ Could not verify with server right now. Please check your connection and try again.');
+    }
   }
+
+  // ── Server confirmed a clean registration (or GAS_URL not configured,
+  //    e.g. local demo build) — now create the local account record ───
+  users[uid] = { uid, name, mobile, email, userid, city, plan: chosenPlan, planExpiry: expiryDate, pwd: hashPwd(pwd), createdAt: clientPayload.createdAt, loginHistory: [], dataKey: 'wp360_data_'+uid };
+  saveUsers(users);
+  if (GAS_URL) _gasSaveUsers(users).catch(()=>{});
 
   if (regBtn) { regBtn.disabled = false; regBtn.textContent = 'Create Account'; }
   _userIsNew = true; // ✅ FIX: mark new user so seedDemo fires on first login only
@@ -5240,6 +5273,20 @@ function detectLoginHint(val) {
   else if (val.length >= 3)         msg = '🪪 Detected: User ID';
   hint.textContent = msg;
   hint.style.display = msg ? '' : 'none';
+}
+
+// ── Explore Free Demo: instant local-only sandbox, no signup, no cloud sync ──
+function startDemo() {
+  const uid = 'demo_' + Date.now();
+  currentUser = {
+    uid, name: 'Demo User', email: 'demo@wealthpilot360.in',
+    userid: 'demo', mobile: '9999999999',
+    plan: 'enterprise', planExpiry: new Date(Date.now() + 90*86400000).toISOString().slice(0,10),
+    isDemo: true, dataKey: 'wp360_data_' + uid
+  };
+  _userIsNew = true; // triggers seedDemo() sample data inside enterApp()
+  toast('🚀 Demo mode — explore every feature free, no signup needed', 'success');
+  enterApp();
 }
 
 function doLogin() {
@@ -6293,6 +6340,14 @@ function _renderPlanBadge() {
     const tbr = document.querySelector('.topbar-right');
     if (tbr) tbr.prepend(badge);
   }
+  if (currentUser && currentUser.isDemo) {
+    badge.textContent = '🚀 Demo Mode — Register to Keep Data';
+    badge.style.background = 'rgba(16,185,129,.15)';
+    badge.style.color = '#059669';
+    badge.title = 'This data is local to this browser only. Register a free account to save it permanently.';
+    badge.onclick = () => { doLogout(); switchAuthTab('register'); toast('Register to keep exploring with permanent, synced data', 'info'); };
+    return;
+  }
   if (expired) {
     badge.textContent = '⚠️ Plan Expired';
     badge.style.background = 'rgba(239,68,68,.15)';
@@ -6569,7 +6624,8 @@ init();
     name: 'Balaji WealthPilot 360',
     short_name: 'WealthPilot360',
     description: 'Personal Finance Manager by Balaji NextGen Solutions',
-    start_url: './',
+    start_url: location.pathname,          // ✅ FIX: blob-hosted manifests need an absolute path — './' was silently ignored
+    scope: location.pathname.replace(/[^/]+$/, ''),
     display: 'standalone',
     orientation: 'portrait-primary',
     background_color: '#FF7A1A',
@@ -6586,47 +6642,20 @@ init();
   const mBlob = new Blob([JSON.stringify(MANIFEST)], { type: 'application/manifest+json' });
   document.getElementById('pwa-manifest-link').href = URL.createObjectURL(mBlob);
 
-  /* ── 3. Service Worker (offline cache via Blob URL) ── */
-  const SW_CODE = `
-const CACHE = 'wp360-v1';
-const OFFLINE_HTML = '/offline.html';
-
-self.addEventListener('install', e => {
-  self.skipWaiting();
-  e.waitUntil(
-    caches.open(CACHE).then(c => c.addAll([]))
-  );
-});
-
-self.addEventListener('activate', e => {
-  e.waitUntil(
-    caches.keys().then(keys =>
-      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
-    ).then(() => self.clients.claim())
-  );
-});
-
-self.addEventListener('fetch', e => {
-  if (e.request.method !== 'GET') return;
-  e.respondWith(
-    fetch(e.request)
-      .then(res => {
-        const clone = res.clone();
-        caches.open(CACHE).then(c => c.put(e.request, clone));
-        return res;
-      })
-      .catch(() => caches.match(e.request))
-  );
-});
-  `;
-
+  /* ── 3. Service Worker ──────────────────────────────────────────
+     ✅ FIX: Chrome/Edge/Firefox refuse to register a service worker
+     from a blob: URL — "The URL protocol of the script is not
+     supported" is a hard browser restriction, not fixable from JS.
+     The SW must be a real static file served same-origin, so it now
+     lives in sw.js (upload it next to this HTML file on Netlify,
+     same folder) and we register that file directly. ── */
   if ('serviceWorker' in navigator) {
-    const swBlob = new Blob([SW_CODE], { type: 'application/javascript' });
-    const swURL  = URL.createObjectURL(swBlob);
-    navigator.serviceWorker.register(swURL, { scope: './' })
+    const swPath = location.pathname.replace(/[^/]+$/, '') + 'sw.js';
+    navigator.serviceWorker.register(swPath, { scope: location.pathname.replace(/[^/]+$/, '') })
       .then(reg => console.log('[PWA] SW registered', reg.scope))
-      .catch(err => console.warn('[PWA] SW registration failed:', err));
+      .catch(err => console.warn('[PWA] SW registration failed (upload sw.js next to this HTML file):', err.message));
   }
+
 
   /* ── 4. Install Prompt Logic ── */
   let _deferredPrompt = null;
