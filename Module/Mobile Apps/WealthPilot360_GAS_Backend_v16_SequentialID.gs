@@ -97,6 +97,7 @@ function doPost(e) {
       case 'LOAD_DB':              return WP360_resp(true, WP360_loadClientSheet(uid));
       case 'DELETE_DB':            return WP360_resp(true, WP360_clearClientSheet(uid));
       case 'REGISTER_CLIENT':      return WP360_resp(true, WP360_registerClient(data));
+      case 'LOGIN_CLIENT':         return WP360_resp(true, WP360_loginClient(data));
       case 'CHECK_CONTACT':        return WP360_resp(true, WP360_checkContact(data));
       case 'SUPER_ADMIN_LOGIN':    return WP360_resp(true, WP360_superAdminLogin(data));
       case 'GET_CLIENT':           return WP360_resp(true, WP360_getClientInfo(uid));
@@ -105,7 +106,7 @@ function doPost(e) {
       case 'UPLOAD_DOCUMENT':      return WP360_resp(true, WP360_uploadDocument(uid, data));
       case 'ADMIN_LIST_CLIENTS':   return WP360_resp(true, WP360_adminListClients());
       case 'DIAG':                 return WP360_resp(true, WP360_diag());
-      case 'PING':                 return WP360_resp(true, 'pong – Balaji WP360 GAS v14 OK (Unified/ERP-MasterControl, TEM048, dup-guard+admin-serverauth)');
+      case 'PING':                 return WP360_resp(true, 'pong – Balaji WP360 GAS v16 OK (Unified/ERP-MasterControl, TEM048, sequential CL000XX CLIENT_ID, dup-guard+admin-serverauth)');
       default:                     return WP360_resp(false, 'Unknown action: ' + action);
     }
   } catch(err) {
@@ -460,6 +461,44 @@ function WP360_checkContact(dataJson) {
 }
 
 // ══════════════════════════════════════════════════════════════════
+//  SEQUENTIAL CLIENT_ID GENERATOR (v16 fix)
+//  WealthPilot360 used to set CLIENT_ID = the person's chosen login
+//  string (e.g. "raijagarnath123"), which doesn't match the CL000XX
+//  numbering used by Business OS / ERP. This scans BOTH the WP360
+//  CLIENT_MASTER and the shared MASTER_CONTROL CLIENT_DATABASE_REGISTRY
+//  (which is written to by every product) so the sequence never
+//  collides with an ID already issued by another product.
+// ══════════════════════════════════════════════════════════════════
+function WP360_nextClientId() {
+  let maxNum = 0;
+
+  const scanForMax = (spreadsheetId, tabName, col) => {
+    try {
+      const sh = SpreadsheetApp.openById(spreadsheetId).getSheetByName(tabName);
+      if (!sh) return;
+      const values = sh.getDataRange().getValues();
+      const header = values[0];
+      const idx = header.indexOf(col);
+      if (idx === -1) return;
+      for (let i = 1; i < values.length; i++) {
+        const v = String(values[i][idx] || '').trim();
+        const m = v.match(/^CL0*([0-9]+)$/i);
+        if (m) {
+          const n = parseInt(m[1], 10);
+          if (n > maxNum) maxNum = n;
+        }
+      }
+    } catch(e) { Logger.log('WP360_nextClientId scan failed for ' + tabName + ': ' + e); }
+  };
+
+  scanForMax(WP360_CONFIG.USER_SECURITY_SHEET_ID, 'CLIENT_MASTER', 'CLIENT_ID');
+  scanForMax(WP360_CONFIG.MASTER_CONTROL_SHEET_ID, 'CLIENT_DATABASE_REGISTRY', 'CLIENT_ID');
+
+  const next = maxNum + 1;
+  return 'CL' + String(next).padStart(5, '0');
+}
+
+// ══════════════════════════════════════════════════════════════════
 //  CLIENT REGISTRATION
 // ══════════════════════════════════════════════════════════════════
 function WP360_registerClient(dataJson) {
@@ -467,26 +506,29 @@ function WP360_registerClient(dataJson) {
   try { d = typeof dataJson === 'string' ? JSON.parse(dataJson) : dataJson; }
   catch(e) { return 'parse_error'; }
 
-  const uid = d.uid || d.userid;
-  if (!uid) return 'no_uid';
+  // loginId = the human-chosen "User ID" from the registration form —
+  // used ONLY for login lookup from now on, never as CLIENT_ID.
+  const loginId = d.uid || d.userid;
+  if (!loginId) return 'no_uid';
 
-  // ── Line of defense #1: exact same userid already registered ──────
-  const existing = WP360_findRow(WP360_CONFIG.USER_SECURITY_SHEET_ID, 'CLIENT_MASTER', 'CLIENT_ID', uid);
-  if (existing) {
-    const ex = WP360_getClientSheetId(uid);
+  // ── Line of defense #1: this login id is already taken ────────────
+  const existingLogin = WP360_findRow(WP360_CONFIG.USER_SECURITY_SHEET_ID, 'CLIENT_MASTER', 'ADMIN_USERNAME', loginId);
+  if (existingLogin) {
+    const ex = WP360_getClientSheetId(existingLogin.CLIENT_ID);
     return JSON.stringify({
       status: 'already_exists',
+      clientId:       existingLogin.CLIENT_ID,
       clientSheetId:  ex ? ex.id  : '',
       clientSheetUrl: ex ? ex.url : ''
     });
   }
 
   // ── Line of defense #2: same mobile or email already tied to a
-  //    DIFFERENT userid/client. ─────────────────────────
+  //    DIFFERENT client. ─────────────────────────
   const dup = WP360_findDuplicateContact(d.mobile, d.email);
   if (dup) {
     const ex = WP360_getClientSheetId(dup.clientId);
-    Logger.log('⛔ Blocked duplicate registration attempt: ' + dup.field + ' already used by CLIENT_ID ' + dup.clientId + ' (new attempt uid=' + uid + ')');
+    Logger.log('⛔ Blocked duplicate registration attempt: ' + dup.field + ' already used by CLIENT_ID ' + dup.clientId + ' (new attempt loginId=' + loginId + ')');
     return JSON.stringify({
       status:          dup.field === 'mobile' ? 'duplicate_mobile' : 'duplicate_email',
       existingClientId: dup.clientId,
@@ -495,6 +537,11 @@ function WP360_registerClient(dataJson) {
       clientSheetUrl:  ex ? ex.url : ''
     });
   }
+
+  // ── Generate the real CLIENT_ID (CL000XX) — used for the sheet,
+  //    the folder, and every registry row below. loginId is kept
+  //    ONLY as ADMIN_USERNAME for login lookup.
+  const uid = WP360_nextClientId();
 
   const sheetInfo = WP360_createClientSheet(uid, d.name);
   const planDays  = WP360_CONFIG.PLAN_DAYS[d.plan] || 90;
@@ -507,13 +554,13 @@ function WP360_registerClient(dataJson) {
     CLIENT_ID: uid, CONTACT_NAME: d.name||'', PHONE: d.mobile||'', ALT_PHONE:'', EMAIL: d.email||'',
     COMPANY_NAME: d.name||'', COMPANY_TYPE: 'INDIVIDUAL', GST_NO:'', PAN:'', ADDRESS:'', CITY: d.city||'',
     STATE:'', PIN:'', INDUSTRY: WP360_CONFIG.INDUSTRY, PLAN: plan, ERP_URL: apiUrl,
-    ADMIN_NAME: d.name||'', ADMIN_EMAIL: d.email||'', ADMIN_USERNAME: uid, ADMIN_PASSWORD: d.password||'',
+    ADMIN_NAME: d.name||'', ADMIN_EMAIL: d.email||'', ADMIN_USERNAME: loginId, ADMIN_PASSWORD: d.password||'',
     ADMIN_MOBILE: d.mobile||'', ADMIN_ROLE: 'OWNER', STATUS: 'ACTIVE', LICENSE_STATUS: 'ACTIVE',
     REGISTERED_BY: 'WEALTHPILOT360_SELF_REGISTER', REGISTERED_AT: now, LAST_UPDATED: now
   });
 
   WP360_appendRowByHeader(WP360_CONFIG.USER_SECURITY_SHEET_ID, 'USER_MASTER', {
-    USER_ID: uid + '-U1', CLIENT_ID: uid, USER_CODE: uid, FULL_NAME: d.name||'', EMAIL: d.email||'',
+    USER_ID: uid + '-U1', CLIENT_ID: uid, USER_CODE: loginId, FULL_NAME: d.name||'', EMAIL: d.email||'',
     MOBILE_NO: d.mobile||'', PASSWORD: WP360_hashPass(d.password||''), ROLE: 'OWNER', INDUSTRY: WP360_CONFIG.INDUSTRY,
     BRANCH: 'PERSONAL', ACCESS_LEVEL: 'FULL', STATUS: 'ACTIVE', WEB_ACCESS: 'YES', APP_ACCESS: 'YES',
     OTP_ACCESS: 'NO', LOGIN_TYPE: 'PASSWORD', COMPANY_NAME: d.name||'', DEPARTMENT: 'PERSONAL_FINANCE',
@@ -565,10 +612,12 @@ function WP360_registerClient(dataJson) {
     STATUS: 'SUCCESS'
   });
 
-  Logger.log('✅ Registered WealthPilot360 client: ' + uid + ' → ' + sheetInfo.url);
+  Logger.log('✅ Registered WealthPilot360 client: ' + uid + ' (login: ' + loginId + ') → ' + sheetInfo.url);
 
   return JSON.stringify({
     status: 'registered',
+    clientId:        uid,
+    loginId:         loginId,
     clientSheetId:   sheetInfo.id,
     clientSheetUrl:  sheetInfo.url,
     clientSheetName: sheetInfo.name
@@ -577,6 +626,45 @@ function WP360_registerClient(dataJson) {
 
 function WP360_hashPass(pw) {
   return Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(pw)));
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  CLIENT LOGIN (v16 fix)
+//  Resolves the person's typed "User ID" (ADMIN_USERNAME) + password
+//  to their real CLIENT_ID (CL000XX), since the two are no longer the
+//  same string. Also accepts mobile number as an alternate login key.
+// ══════════════════════════════════════════════════════════════════
+function WP360_loginClient(dataJson) {
+  let d;
+  try { d = typeof dataJson === 'string' ? JSON.parse(dataJson) : dataJson; }
+  catch(e) { return JSON.stringify({ status: 'parse_error' }); }
+
+  const loginInput = String(d.uid || d.userid || d.mobile || '').trim();
+  if (!loginInput) return JSON.stringify({ status: 'no_login_id' });
+
+  let row = WP360_findRow(WP360_CONFIG.USER_SECURITY_SHEET_ID, 'CLIENT_MASTER', 'ADMIN_USERNAME', loginInput);
+  if (!row) row = WP360_findRow(WP360_CONFIG.USER_SECURITY_SHEET_ID, 'CLIENT_MASTER', 'PHONE', loginInput);
+  if (!row) return JSON.stringify({ status: 'not_found' });
+
+  if (d.password) {
+    const hashed = WP360_hashPass(d.password);
+    const userRow = WP360_findRow(WP360_CONFIG.USER_SECURITY_SHEET_ID, 'USER_MASTER', 'CLIENT_ID', row.CLIENT_ID);
+    if (!userRow || String(userRow.PASSWORD) !== hashed) {
+      return JSON.stringify({ status: 'wrong_password' });
+    }
+  }
+
+  const sheetInfo = WP360_getClientSheetId(row.CLIENT_ID);
+  return JSON.stringify({
+    status:          'ok',
+    clientId:        row.CLIENT_ID,
+    loginId:         row.ADMIN_USERNAME,
+    name:            row.CONTACT_NAME || row.COMPANY_NAME || '',
+    mobile:          row.PHONE || '',
+    email:           row.EMAIL || '',
+    clientSheetId:   sheetInfo ? sheetInfo.id  : '',
+    clientSheetUrl:  sheetInfo ? sheetInfo.url : ''
+  });
 }
 
 // ══════════════════════════════════════════════════════════════════
