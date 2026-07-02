@@ -2501,12 +2501,21 @@ async function _storageDel(key) {
 }
 
 // ── Layer 1: GAS Web App calls ──────────────────────────────
-async function _gasPost(payload) {
+async function _gasPost(payload, timeoutMs) {
   if (!GAS_URL) return null;
   if (typeof currentUser !== 'undefined' && currentUser && currentUser.isDemo) return null; // demo mode: local-only, never hits cloud
+  // FIX: REGISTER_CLIENT does a full template copy + writes across 2
+  // spreadsheets + creates 17 Drive subfolders — this routinely takes
+  // longer than 15s. The OLD hardcoded 15s abort meant the browser gave
+  // up before the server finished, even though the server WAS actually
+  // succeeding (which is why orphaned CL000XX rows/sheets appeared with
+  // no matching local account — the success screen never ran, so the
+  // local user record never got saved). Give slow actions more room.
+  const SLOW_ACTIONS = { REGISTER_CLIENT: 55000, SAVE_DB: 30000, LOAD_DB: 30000 };
+  const effectiveTimeout = timeoutMs || SLOW_ACTIONS[payload && payload.action] || 15000;
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000); // 15s timeout for GAS
+    const timer = setTimeout(() => controller.abort(), effectiveTimeout);
     const r = await fetch(GAS_URL, {
       method:   'POST',
       redirect: 'follow',          // GAS redirects — must follow
@@ -5717,7 +5726,7 @@ function startDemo() {
 }
 
 let _loggingInWP = false;
-function doLogin() {
+async function doLogin() {
   // Same double-submit guard as registration — a fast double-click on
   // the Login button used to fire doLogin() twice with no guard at all.
   if (_loggingInWP) return;
@@ -5743,6 +5752,44 @@ function doLogin() {
       const isEmail  = /@/.test(raw) && u.email && u.email.toLowerCase() === raw.toLowerCase();
       const isUserid = !isMobile && !isEmail && u.userid && u.userid.toLowerCase() === raw.toLowerCase();
       if (isMobile || isEmail || isUserid) { found = u; break; }
+    }
+
+    // ── FIX: local browser storage is only a CACHE. If this browser
+    // has never seen this account (different device, cache cleared,
+    // or — very commonly — registration actually succeeded on the
+    // server but the OLD 15s timeout made the browser bail out before
+    // saving locally), fall back to asking the server directly via the
+    // LOGIN_CLIENT action, which already exists in the backend but was
+    // never being called from here. If the server confirms the
+    // account + password, rehydrate it into local storage so future
+    // logins on this browser work offline too. ──────────────────────
+    if (!found && GAS_URL) {
+      if (loginBtn) loginBtn.textContent = '⏳ Checking with server...';
+      try {
+        const raw2 = await _gasPost({ action: 'LOGIN_CLIENT', data: JSON.stringify({ uid: raw, mobile: raw, password: pwd }) });
+        const serverResult = raw2 ? JSON.parse(raw2) : null;
+        if (serverResult && serverResult.status === 'ok') {
+          found = {
+            uid: serverResult.clientId,
+            name: serverResult.name || serverResult.loginId,
+            mobile: serverResult.mobile || '',
+            email: serverResult.email || '',
+            userid: serverResult.loginId,
+            plan: 'trial',
+            pwd: hashPwd(pwd), // server already verified it; cache locally hashed
+            createdAt: new Date().toISOString(),
+            loginHistory: [],
+            dataKey: 'wp360_data_' + serverResult.clientId
+          };
+          users[found.uid] = found;
+          saveUsers(users);
+        } else if (serverResult && serverResult.status === 'wrong_password') {
+          addLoginEntry(serverResult.clientId, false);
+          showAuthErr('login','Incorrect password');
+          return;
+        }
+      } catch(e) { /* server unreachable — fall through to "no account" below */ }
+      if (loginBtn) loginBtn.textContent = '🔑 Login';
     }
 
     if (!found) {
