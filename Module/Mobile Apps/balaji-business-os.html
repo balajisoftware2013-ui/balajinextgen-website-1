@@ -354,6 +354,21 @@ body.mode-accountant .owner-hint{display:none;}
 .doc-bank-block b{display:block;font-size:12px;margin-bottom:3px;}
 .doc-declaration{margin-top:10px;font-size:10px;color:var(--sub);line-height:1.5;border-top:1px dashed var(--border);padding-top:8px;}
 .doc-balance-row{display:flex;justify-content:space-between;font-size:11.5px;color:var(--sub);margin-top:4px;}
+.doc-ledger-row{display:flex;justify-content:space-between;align-items:flex-start;padding:9px 0;border-bottom:1px solid var(--border);}
+.doc-ledger-row .dl-left{flex:1;min-width:0;padding-right:10px;}
+.doc-ledger-row .dl-date{font-size:10px;color:var(--sub);font-weight:600;}
+.doc-ledger-row .dl-label{font-size:12.5px;font-weight:600;margin-top:1px;line-height:1.3;}
+.doc-ledger-row .dl-right{text-align:right;flex-shrink:0;}
+.doc-ledger-row .dl-amt{font-size:13px;font-weight:800;}
+.doc-ledger-row .dl-amt.debit{color:var(--red);}
+.doc-ledger-row .dl-amt.credit{color:var(--green);}
+.doc-ledger-row .dl-bal{font-size:10px;color:var(--sub);margin-top:2px;}
+.doc-summary-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;}
+.doc-summary-cell{background:var(--body-bg);border-radius:11px;padding:10px 12px;}
+.doc-summary-cell .lbl{font-size:9.5px;color:var(--sub);font-weight:800;text-transform:uppercase;letter-spacing:.3px;}
+.doc-summary-cell .val{font-size:15px;font-weight:800;margin-top:3px;}
+.doc-summary-cell .val.small{font-size:12px;font-weight:700;}
+.doc-empty{padding:20px 0;text-align:center;color:var(--sub);font-size:12.5px;}
 #docSheet.pos-format{max-width:300px;}
 #docSheet.pos-format #docPrintArea{font-family:'Courier New',monospace;}
 #docSheet.pos-format .doc-head{flex-direction:column;align-items:center;text-align:center;border-bottom:1px dashed var(--navy);}
@@ -1567,6 +1582,13 @@ body.mode-accountant .owner-hint{display:none;}
       <div><b id="docPartyName">—</b><div class="d-meta" id="docPartyMeta">—</div></div>
       <div class="d-meta" id="docDate">—</div>
     </div>
+    <div class="rpt-filter-row" id="docPeriodRow" style="display:none;">
+      <div class="rpt-chip active" data-days="0" onclick="setDocPeriod(0,this)">All Time</div>
+      <div class="rpt-chip" data-days="30" onclick="setDocPeriod(30,this)">This Month</div>
+      <div class="rpt-chip" data-days="90" onclick="setDocPeriod(90,this)">Last 3 Months</div>
+      <div class="rpt-chip" data-days="180" onclick="setDocPeriod(180,this)">Last 6 Months</div>
+    </div>
+    <div id="docSummary"></div>
     <div id="docBody"></div>
     <div class="doc-total-row"><span id="docTotalLabel">Total</span><span class="mono" id="docTotalVal">₹0</span></div>
     <div class="doc-pay-block" id="docPayBlock" style="display:none;">
@@ -1589,6 +1611,9 @@ body.mode-accountant .owner-hint{display:none;}
   <div class="doc-actions">
     <button class="btn btn-outline" onclick="window.print()">🖨️ Print / Save PDF</button>
     <button class="btn wa-btn" onclick="shareDocOnWhatsApp()">💬 Share on WhatsApp</button>
+  </div>
+  <div class="doc-actions" id="docExcelRow" style="display:none;margin-top:8px;">
+    <button class="btn btn-outline" onclick="exportDocLedgerCSV()">📊 Export Excel (CSV)</button>
   </div>
 </div>
 
@@ -2844,28 +2869,95 @@ function openDoc(type, partyId, partyType){
   document.getElementById('docDeclaration').style.display = 'none';
   document.getElementById('docThanks').style.display = 'none';
 
-  let bodyHtml = '', totalLabel = 'Outstanding Balance', totalVal = fmt(p.due||0);
+  document.getElementById('docPeriodRow').style.display = type==='ledger' ? 'flex' : 'none';
+  document.getElementById('docExcelRow').style.display = 'flex';
+  _docCtx = {type, party:p, partyType};
+  _docPeriodDays = 0;
+  document.querySelectorAll('#docPeriodRow .rpt-chip').forEach(c=>c.classList.toggle('active', c.dataset.days==='0'));
+
+  renderDocBody();
+  closeAllSheets(); openSheet('docSheet');
+}
+/* Combined, chronologically-sorted transaction trail for a party — the single
+   source of truth used by the on-screen ledger, the PDF, and the CSV export,
+   so all three always agree with each other and with the party's `due` field. */
+function getPartyLedgerTxns(p, partyType){
+  const txns = [];
+  if(partyType==='customers'){
+    DB.sales.filter(s=>s.cust===p.id && s.mode==='Credit').forEach(s=>
+      txns.push({date:s.date, label:`${s.id} · Credit Sale`, debit:s.total, credit:0}));
+    (DB.paymentsIn||[]).filter(r=>r.cust===p.id).forEach(r=>
+      txns.push({date:r.date, label:(r.billRef?`Payment · ${r.billRef}`:'Payment received')+` (${r.mode})`, debit:0, credit:r.amount}));
+  } else {
+    DB.purchases.filter(pu=>pu.supp===p.id && pu.mode==='Credit').forEach(pu=>
+      txns.push({date:pu.date, label:`${pu.id}${pu.item?' · '+pu.item:''} · Credit Purchase`, debit:pu.total, credit:0}));
+    (DB.paymentsOut||[]).filter(pm=>pm.supp===p.id).forEach(pm=>
+      txns.push({date:pm.date, label:(pm.billRef?`Payment · ${pm.billRef}`:'Payment made')+` (${pm.mode})`, debit:0, credit:pm.amount}));
+  }
+  txns.sort((a,b)=> new Date(a.date) - new Date(b.date));
+  let bal = 0;
+  txns.forEach(t=>{ bal += t.debit - t.credit; t.balance = bal; });
+  return txns; // ascending order, running balance included
+}
+let _docPeriodDays = 0;
+function setDocPeriod(days, el){
+  _docPeriodDays = days;
+  document.querySelectorAll('#docPeriodRow .rpt-chip').forEach(c=>c.classList.remove('active'));
+  el.classList.add('active');
+  renderDocBody();
+}
+function renderDocBody(){
+  if(!_docCtx) return;
+  const { type, party:p, partyType } = _docCtx;
+  let txns = getPartyLedgerTxns(p, partyType);
+  if(type==='ledger' && _docPeriodDays>0){
+    const cutoff = new Date(); cutoff.setDate(cutoff.getDate()-_docPeriodDays);
+    txns = txns.filter(t=> new Date(t.date) >= cutoff);
+  }
 
   if(type==='statement'){
-    bodyHtml = `
-      <div class="doc-row"><span>Credit Limit</span><span class="mono">${fmt(p.limit||0)}</span></div>
-      <div class="doc-row"><span>Last Activity</span><span class="mono">${p.lastDate||p.lastPurchaseDate||'—'}</span></div>
-      <div class="doc-row"><span>Status</span><span class="mono">${p.due>0?'Outstanding':'No Dues'}</span></div>`;
-  } else { // ledger — full transaction trail
-    const txns = partyType==='customers'
-      ? DB.sales.filter(s=>s.cust===p.id).map(s=>({d:s.date, label:s.id+' · Sale', amt:s.total, dir:'+'}))
-      : DB.purchases.filter(pu=>pu.supp===p.id).map(pu=>({d:pu.date, label:pu.id+(pu.item?' · '+pu.item:' · Purchase'), amt:pu.total, dir:'+'}));
-    bodyHtml = txns.length ? txns.map(t=>`
-      <div class="doc-row"><span>${t.d} — ${t.label}</span><span class="mono">${t.dir}${fmt(t.amt)}</span></div>`).join('')
-      : `<div class="doc-row"><span>No transactions yet</span><span></span></div>`;
-    totalLabel = 'Current Balance Due';
+    const totalBilled = txns.reduce((a,t)=>a+t.debit,0);
+    const totalSettled = txns.reduce((a,t)=>a+t.credit,0);
+    const lastDate = txns.length ? txns[txns.length-1].date : (p.lastDate||p.lastPurchaseDate||'—');
+    document.getElementById('docSummary').innerHTML = `
+      <div class="doc-summary-grid">
+        <div class="doc-summary-cell"><div class="lbl">Total Billed</div><div class="val mono">${fmt(totalBilled)}</div></div>
+        <div class="doc-summary-cell"><div class="lbl">Total ${partyType==='customers'?'Received':'Paid'}</div><div class="val mono">${fmt(totalSettled)}</div></div>
+        <div class="doc-summary-cell"><div class="lbl">Credit Limit</div><div class="val mono">${fmt(p.limit||0)}</div></div>
+        <div class="doc-summary-cell"><div class="lbl">Last Activity</div><div class="val small">${lastDate}</div></div>
+      </div>`;
+    document.getElementById('docBody').innerHTML = `
+      <div class="doc-row"><span>Account Status</span><span class="mono">${(p.due||0)>0?'⚠️ Outstanding':'✅ No Dues'}</span></div>
+      <div class="lc-act" style="justify-content:center;margin-top:10px;" onclick="closeAllSheets();openDoc('ledger','${p.id}','${partyType}')">📒 View Full Transaction History</div>`;
+    document.getElementById('docTotalLabel').textContent = 'Outstanding Balance';
+    document.getElementById('docTotalVal').textContent = fmt(p.due||0);
+  } else { // ledger — full running-balance trail, latest first
+    document.getElementById('docSummary').innerHTML = '';
+    document.getElementById('docBody').innerHTML = txns.length ? txns.slice().reverse().map(t=>`
+      <div class="doc-ledger-row">
+        <div class="dl-left"><div class="dl-date">${t.date}</div><div class="dl-label">${t.label}</div></div>
+        <div class="dl-right">
+          <div class="dl-amt mono ${t.debit?'debit':'credit'}">${t.debit?'+':'−'}${fmt(t.debit||t.credit)}</div>
+          <div class="dl-bal mono">Bal: ${fmt(t.balance)}</div>
+        </div>
+      </div>`).join('') : `<div class="doc-empty">No transactions in this period</div>`;
+    document.getElementById('docTotalLabel').textContent = 'Current Balance Due';
+    document.getElementById('docTotalVal').textContent = fmt(p.due||0);
   }
-  document.getElementById('docBody').innerHTML = bodyHtml;
-  document.getElementById('docTotalLabel').textContent = totalLabel;
-  document.getElementById('docTotalVal').textContent = totalVal;
-
-  _docCtx = {type, party:p, partyType};
-  closeAllSheets(); openSheet('docSheet');
+}
+function exportDocLedgerCSV(){
+  if(!_docCtx){ toast('Open a statement or ledger first'); return; }
+  const { party:p, partyType } = _docCtx;
+  const txns = getPartyLedgerTxns(p, partyType);
+  const rows = [['Date','Particulars','Debit','Credit','Balance']];
+  txns.forEach(t=> rows.push([t.date, t.label, t.debit||'', t.credit||'', t.balance]));
+  rows.push(['','','','Current Balance Due', p.due||0]);
+  const blob = new Blob([rows.map(r=>r.join(',')).join('\n')], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${partyType==='customers'?'customer':'supplier'}_${p.name.replace(/\s+/g,'_')}_ledger.csv`;
+  a.click();
+  toast('Excel CSV downloaded ✓');
 }
 /* ── REAL PDF GENERATION (jsPDF) + WhatsApp file sharing ─────────────
    wa.me links can ONLY pre-fill text, never attach files — that's a hard
@@ -2950,12 +3042,19 @@ async function buildDocPDF(){
   doc.setFillColor(245,245,247); doc.rect(marginX, y-11, rightX-marginX, 20, 'F');
   doc.setFont('helvetica','bold'); doc.setFontSize(8.5); doc.setTextColor(60,60,60);
   const colItem=marginX+4, colHsn=270, colQty=335, colRate=395, colGst=450, colAmt=rightX-4;
-  doc.text('ITEM', colItem, y+3);
-  if(showHsn) doc.text('HSN', colHsn, y+3);
-  doc.text('QTY', colQty, y+3);
-  doc.text('RATE', colRate, y+3);
-  if(gstType==='gst') doc.text('GST%', colGst, y+3);
-  doc.text('AMOUNT', colAmt, y+3, {align:'right'});
+  if(type==='invoice'){
+    doc.text('ITEM', colItem, y+3);
+    if(showHsn) doc.text('HSN', colHsn, y+3);
+    doc.text('QTY', colQty, y+3);
+    doc.text('RATE', colRate, y+3);
+    if(gstType==='gst') doc.text('GST%', colGst, y+3);
+    doc.text('AMOUNT', colAmt, y+3, {align:'right'});
+  } else {
+    doc.text('DATE & PARTICULARS', colItem, y+3);
+    doc.text('DEBIT', 400, y+3, {align:'right'});
+    doc.text('CREDIT', 475, y+3, {align:'right'});
+    doc.text('BALANCE', colAmt, y+3, {align:'right'});
+  }
   y += 18;
   doc.setFont('helvetica','normal'); doc.setFontSize(9.5); doc.setTextColor(30,30,30);
 
@@ -2974,13 +3073,19 @@ async function buildDocPDF(){
       if(y>720){ doc.addPage(); y=50; }
     });
   } else {
-    const txns = _docCtx.partyType==='customers'
-      ? DB.sales.filter(s=>s.cust===party.id).map(s=>({d:s.date, label:s.id, amt:s.total}))
-      : DB.purchases.filter(p=>p.supp===party.id).map(p=>({d:p.date, label:p.id, amt:p.total}));
+    // Statement / Ledger — same combined debit-credit-running-balance trail
+    // shown on screen and in the CSV export, so all three always match.
+    let txns = getPartyLedgerTxns(party, _docCtx.partyType);
+    if(type==='ledger' && _docPeriodDays>0){
+      const cutoff = new Date(); cutoff.setDate(cutoff.getDate()-_docPeriodDays);
+      txns = txns.filter(t=> new Date(t.date) >= cutoff);
+    }
     if(txns.length){
       txns.forEach(t=>{
-        doc.text(`${t.d} — ${t.label}`, colItem, y);
-        doc.text(fmt(t.amt), colAmt, y, {align:'right'});
+        doc.text(`${t.date} — ${t.label}`.slice(0,60), colItem, y);
+        if(t.debit) doc.text(fmt(t.debit), 400, y, {align:'right'});
+        if(t.credit) doc.text(fmt(t.credit), 475, y, {align:'right'});
+        doc.text(fmt(t.balance), colAmt, y, {align:'right'});
         y += 16;
         if(y>720){ doc.addPage(); y=50; }
       });
