@@ -107,6 +107,7 @@ function doPost(e) {
       case 'LOAN_UPLOAD_DOCUMENT': return WP360_resp(true, WP360_uploadLoanDocument(uid, data));
       case 'INSURANCE_UPLOAD_DOCUMENT': return WP360_resp(true, WP360_uploadInsuranceDocument(uid, data));
       case 'ADMIN_LIST_CLIENTS':   return WP360_resp(true, WP360_adminListClients());
+      case 'ADMIN_RESET_PASSWORD':  return WP360_resp(true, WP360_adminResetPassword(uid, data));
       case 'DIAG':                 return WP360_resp(true, WP360_diag());
       case 'PING':                 return WP360_resp(true, 'pong – Balaji WP360 GAS v17 OK (Sequential CL000XX, DB_<id>_<name> naming, full folder structure, header-safe writes)');
       default:                     return WP360_resp(false, 'Unknown action: ' + action);
@@ -773,6 +774,35 @@ function WP360_setSuperAdminCredentials() {
 //  rows (source of truth written by REGISTER_CLIENT / UPDATE_SUBSCRIPTION),
 //  filtered to INDUSTRY = WEALTH360, joined with USER_MASTER.
 // ══════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════
+//  ADMIN_RESET_PASSWORD — updates the server-side record only
+//  (CLIENT_MASTER.ADMIN_PASSWORD + USER_MASTER.PASSWORD hash). The
+//  frontend is responsible for ALSO updating the WEALTHPILOT_USER_CACHE
+//  blob via SAVE_USERS, since that cache — not this sheet — is what
+//  actually gates client login. This action exists so the sheet stays
+//  a truthful record even though it isn't the auth source of truth.
+// ══════════════════════════════════════════════════════════════════
+function WP360_adminResetPassword(uid, dataJson) {
+  let d;
+  try { d = typeof dataJson === 'string' ? JSON.parse(dataJson) : dataJson; }
+  catch(e) { return JSON.stringify({ status: 'parse_error' }); }
+  if (!uid) return JSON.stringify({ status: 'no_uid' });
+
+  const newPass = String(d.newPassword || '');
+  if (newPass.length < 6) return JSON.stringify({ status: 'too_short' });
+
+  const cm = WP360_findRow(WP360_CONFIG.USER_SECURITY_SHEET_ID, 'CLIENT_MASTER', 'CLIENT_ID', uid);
+  if (!cm) return JSON.stringify({ status: 'not_found' });
+  WP360_updateCell(WP360_CONFIG.USER_SECURITY_SHEET_ID, 'CLIENT_MASTER', cm._rowIndex, 'ADMIN_PASSWORD', newPass);
+  WP360_updateCell(WP360_CONFIG.USER_SECURITY_SHEET_ID, 'CLIENT_MASTER', cm._rowIndex, 'LAST_UPDATED', new Date());
+
+  const um = WP360_findRow(WP360_CONFIG.USER_SECURITY_SHEET_ID, 'USER_MASTER', 'CLIENT_ID', uid);
+  if (um) WP360_updateCell(WP360_CONFIG.USER_SECURITY_SHEET_ID, 'USER_MASTER', um._rowIndex, 'PASSWORD', WP360_hashPass(newPass));
+
+  Logger.log('🔑 Super Admin reset password for CLIENT_ID ' + uid);
+  return JSON.stringify({ status: 'ok' });
+}
+
 function WP360_adminListClients() {
   try {
     const clients = WP360_findAllRows(WP360_CONFIG.USER_SECURITY_SHEET_ID, 'CLIENT_MASTER', 'INDUSTRY', WP360_CONFIG.INDUSTRY);
