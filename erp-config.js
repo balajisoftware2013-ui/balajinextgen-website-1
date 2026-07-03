@@ -31,7 +31,7 @@ const ROLE_DASHBOARD = {
   ADMIN        : 'Dashboard/dashboard.html',
   MANAGER      : 'Dashboard/manager-dashboard.html',
   ACCOUNTANT   : 'Dashboard/accounts/accounts.html',
-  CASHIER      : 'Dashboard/cashier-dashboard.html',
+  CASHIER      : 'Dashboard/restaurant/cashier-dashboard.html',
   CHEF         : 'Dashboard/chef-dashboard.html',
   WAITER       : 'Dashboard/employee-dashboard.html',
   STORE_MANAGER: 'Dashboard/inventory/inventory.html',
