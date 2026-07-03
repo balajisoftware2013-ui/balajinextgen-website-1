@@ -351,6 +351,57 @@
     return '₹' + n.toLocaleString('en-IN');
   }
 
+  /* ══ SMART AUTOMATION — REORDER SUGGESTIONS ═══════════════════
+     Uses the adjustments log _logMovement() already writes on every
+     stock change (purchases, kitchen issues, bar issues, sales) to
+     compute real average daily consumption per item, then suggests
+     how much to reorder and how many days of stock are left —
+     instead of just flagging "low stock" with no guidance on how
+     much to actually order. Grounded in real movement history that
+     was already being captured but never used for this. */
+  function reorderSuggestions(leadTimeDays) {
+    leadTimeDays = leadTimeDays || 3; // default: assume 3 days from order to delivery
+    const items = getItems();
+    const inv = _read(KEYS.INVENTORY) || {};
+    const adjustments = inv.adjustments || [];
+    const lookbackDays = 30;
+    const cutoff = new Date(Date.now() - lookbackDays * 86400000);
+
+    return items
+      .filter(i => (Number(i.stock)||0) <= (Number(i.minStock)||5) * 1.5) // low or approaching low
+      .map(item => {
+        // Sum negative movements (consumption: kitchen/bar issues, sales) for this item in the lookback window
+        const consumedMovs = adjustments.filter(a =>
+          (a.itemId === item.id || a.itemId === item.sku || a.itemName === item.name) &&
+          a.delta < 0 && new Date(a.date) >= cutoff
+        );
+        const totalConsumed = consumedMovs.reduce((s,a) => s + Math.abs(a.delta), 0);
+        const daysWithData = consumedMovs.length
+          ? Math.max(1, Math.ceil((Date.now() - new Date(consumedMovs[0].date)) / 86400000))
+          : lookbackDays;
+        const avgDailyUse = totalConsumed / Math.min(daysWithData, lookbackDays);
+
+        const currentStock = Number(item.stock) || 0;
+        const daysOfStockLeft = avgDailyUse > 0 ? Math.floor(currentStock / avgDailyUse) : null;
+
+        // Suggested reorder: cover lead time + a safety buffer of minStock, up to maxStock if set
+        const target = item.maxStock ? Number(item.maxStock) : (Number(item.minStock)||5) * 3;
+        const projectedUseBeforeDelivery = avgDailyUse * leadTimeDays;
+        const suggestedQty = Math.max(0, Math.ceil(target - currentStock + projectedUseBeforeDelivery));
+
+        return {
+          id: item.id, sku: item.sku, name: item.name, category: item.category,
+          currentStock, minStock: Number(item.minStock)||5,
+          avgDailyUse: Math.round(avgDailyUse * 100) / 100,
+          daysOfStockLeft, // null = not enough movement history to estimate
+          suggestedReorderQty: suggestedQty,
+          urgency: daysOfStockLeft === null ? 'unknown' : daysOfStockLeft <= leadTimeDays ? 'urgent' : daysOfStockLeft <= leadTimeDays * 2 ? 'soon' : 'normal',
+          basis: consumedMovs.length ? (consumedMovs.length + ' movements over ' + Math.min(daysWithData,lookbackDays) + ' days') : 'No consumption history yet — using min-stock buffer only',
+        };
+      })
+      .sort((a,b) => (a.daysOfStockLeft ?? 999) - (b.daysOfStockLeft ?? 999));
+  }
+
   /* ══ GAS SYNC ════════════════════════════════════════════════ */
   async function gasSync() {
     const user = _user();
@@ -466,6 +517,7 @@
       <button onclick="InventoryBridge.sync();InventoryBridge._refresh()" style="background:#1e40af;color:#fff;border:none;border-radius:4px;padding:1px 8px;font-size:10px;cursor:pointer">⟳ Sync</button>
       <button onclick="InventoryBridge.gasSync().then(r=>alert(r.ok?'✅ GAS Synced!':'❌ '+r.message))" style="background:#16a34a;color:#fff;border:none;border-radius:4px;padding:1px 8px;font-size:10px;cursor:pointer">☁ GAS Push</button>
       <button onclick="InventoryBridge.gasPull().then(r=>InventoryBridge._refresh())" style="background:#7c3aed;color:#fff;border:none;border-radius:4px;padding:1px 8px;font-size:10px;cursor:pointer">☁ GAS Pull</button>
+      <button onclick="InventoryBridge._showReorderPanel()" style="background:#ea580c;color:#fff;border:none;border-radius:4px;padding:1px 8px;font-size:10px;cursor:pointer">🤖 Smart Reorder</button>
       <span style="margin-left:auto;font-size:10px" id="_br_time">—</span>
     `;
     document.body.appendChild(bar);
@@ -473,6 +525,38 @@
     document.body.style.paddingBottom = (document.body.style.paddingBottom || '0').replace(/\d+/,'') || '0';
     const curr = parseInt(document.body.style.paddingBottom)||0;
     document.body.style.paddingBottom = (curr + 26) + 'px';
+  }
+
+  function _showReorderPanel() {
+    const suggestions = reorderSuggestions();
+    let modal = document.getElementById('_bridge_reorder_modal');
+    if (modal) modal.remove();
+    modal = document.createElement('div');
+    modal.id = '_bridge_reorder_modal';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10000;display:flex;align-items:center;justify-content:center;';
+    const urgencyColor = { urgent:'#ef4444', soon:'#f59e0b', normal:'#16a34a', unknown:'#94a3b8' };
+    const rows = suggestions.length ? suggestions.map(s => `
+      <tr>
+        <td style="padding:8px 10px;border-bottom:1px solid #e5e7eb;">${s.name}</td>
+        <td style="padding:8px 10px;border-bottom:1px solid #e5e7eb;text-align:right;">${s.currentStock}</td>
+        <td style="padding:8px 10px;border-bottom:1px solid #e5e7eb;text-align:right;">${s.avgDailyUse}/day</td>
+        <td style="padding:8px 10px;border-bottom:1px solid #e5e7eb;text-align:right;color:${urgencyColor[s.urgency]};font-weight:700;">${s.daysOfStockLeft ?? '—'} days left</td>
+        <td style="padding:8px 10px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:700;">${s.suggestedReorderQty}</td>
+        <td style="padding:8px 10px;border-bottom:1px solid #e5e7eb;font-size:10px;color:#6b7280;">${s.basis}</td>
+      </tr>`).join('') : '<tr><td colspan="6" style="padding:20px;text-align:center;color:#94a3b8;">No items currently low or approaching low stock.</td></tr>';
+    modal.innerHTML = `
+      <div style="background:#fff;border-radius:12px;max-width:800px;width:92vw;max-height:80vh;overflow:auto;padding:20px;font-family:system-ui,sans-serif;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+          <h3 style="margin:0;font-size:16px;">🤖 Smart Reorder Suggestions</h3>
+          <button onclick="document.getElementById('_bridge_reorder_modal').remove()" style="border:none;background:#f3f4f6;width:26px;height:26px;border-radius:6px;cursor:pointer;">✕</button>
+        </div>
+        <div style="font-size:11px;color:#6b7280;margin-bottom:12px;">Based on real consumption from the last 30 days of logged stock movements (purchases, kitchen/bar issues, sales) — not a guess.</div>
+        <table style="width:100%;border-collapse:collapse;font-size:12px;">
+          <thead><tr style="background:#f9fafb;"><th style="padding:8px 10px;text-align:left;">Item</th><th style="padding:8px 10px;text-align:right;">Current</th><th style="padding:8px 10px;text-align:right;">Avg Use</th><th style="padding:8px 10px;text-align:right;">Runway</th><th style="padding:8px 10px;text-align:right;">Suggest Order</th><th style="padding:8px 10px;text-align:left;">Basis</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+    document.body.appendChild(modal);
   }
 
   function _refresh() {
@@ -518,7 +602,7 @@
 
   /* ══ PUBLIC API ═════════════════════════════════════════════ */
   global.InventoryBridge = {
-    sync, gasSync, gasPull,
+    sync, gasSync, gasPull, reorderSuggestions, _showReorderPanel,
     getItems, getShared, getStock, adjustStock, upsertItem, stockAlert,
     getModuleLinks, getRecommendedModule,
     onPurchaseSaved, onGRNSaved, onSaleSaved, onKitchenIssueSaved, onBarIssueSaved,

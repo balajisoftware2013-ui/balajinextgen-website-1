@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <script src="../inventory-bridge.js"></script>
+  <script src="../inventory/inventory-bridge.js"></script>
   <script src="../erp-config.js"></script>
 
 <meta charset="UTF-8">
@@ -1040,9 +1040,34 @@ function completePOS(print=true){
   let totalDis=0;if(disPct>0)totalDis=sub*disPct/100;if(disAmt>0)totalDis=Math.max(totalDis,disAmt);
   const bill={id:uid(),billNo:`POS-${DB.seq.pos.toString().padStart(5,'0')}`,date:new Date().toISOString().split('T')[0],customer:cust||{name:'Walk-in'},items:[...posCart],subtotal:sub,gstTotal:tax,discount:totalDis,grandTotal:sub+tax-totalDis,payMode:posPaymentMode,industry:v('pos-industry'),createdAt:new Date().toISOString()};
   DB.pos.push(bill);DB.seq.pos++;save();
+
+  // BUG FIX: this saved the bill but never actually reduced stock —
+  // this page loads inventory-bridge.js but never called it, so every
+  // POS sale recorded revenue while the item master stayed unchanged.
+  // Deducting stock now, and honestly flagging any item that isn't in
+  // the shared item master yet instead of silently losing the deduction.
+  const notFound = deductStockForSaleItems(bill.items, 'POS Sale '+bill.billNo);
+  if (notFound.length) toast('⚠️ Bill saved, but stock not updated for: '+notFound.join(', ')+' (not in item master)','warn','⚠️');
+
   if(print)printPOS(bill,PS.format);else toast('Bill saved: '+bill.billNo,'ok','🏪');
   clearCart();rendDash();
   saveSalesDocToDrive(bill,'pos','POS Bill');
+}
+
+/* Shared helper for both POS and Tax Invoice — loops sale items and
+   deducts real stock via the bridge, returning names of any items
+   that couldn't be matched in the shared item master so the caller
+   can warn instead of silently losing the adjustment. */
+function deductStockForSaleItems(items, reason){
+  const notFound = [];
+  if (typeof InventoryBridge === 'undefined' || !items) return notFound;
+  items.forEach(it => {
+    const qty = Number(it.qty)||0;
+    if (qty <= 0) return;
+    const result = InventoryBridge.adjustStock(it.id || it.name, -qty, reason);
+    if (result === false) notFound.push(it.name);
+  });
+  return notFound;
 }
 
 // ════ DOCUMENT BUILDER ════
@@ -1268,6 +1293,23 @@ function saveDoc(type){
     createdAt:new Date().toISOString()
   };
   DB[dt.arr].push(doc);DB.seq[dt.seq]++;save();
+
+  // BUG FIX: same as POS — this saved the document but never touched
+  // stock. Only deducting for Tax Invoice ('inv'), since that's the
+  // unambiguous completed-sale record. Quotation and Sales Order are
+  // deliberately NOT deducted — goods haven't left yet. Delivery
+  // Challan ('dc') is also deliberately left alone: if your workflow
+  // issues both a DC and an Invoice for the same delivery, deducting
+  // on both would double-count the stock loss. If DC is your actual
+  // point of goods-leaving in your workflow instead of Invoice, tell
+  // me and I'll move the deduction there instead — but doing both
+  // without knowing your real workflow risks silently corrupting
+  // stock counts, which is worse than not deducting automatically yet.
+  if (type === 'inv'){
+    const notFound = deductStockForSaleItems(doc.items, 'Invoice '+doc.docNo);
+    if (notFound.length) toast('⚠️ Invoice saved, but stock not updated for: '+notFound.join(', ')+' (not in item master)','warn','⚠️');
+  }
+
   rendDocList(type);rendDash();rendRegs();rendEInvoice();
   toast(`${dt.label} saved: ${doc.docNo}`,'ok',dt.icon);
   saveSalesDocToDrive(doc,type,dt.label);
