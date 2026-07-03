@@ -636,6 +636,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--brand);}
 .gas-status.ok{background:var(--green);}
 .gas-status.sync{background:var(--brand);animation:pulse 1s infinite;}
 .gas-status.err{background:var(--red);}
+.gas-status-pill{display:inline-block;padding:4px 10px;border-radius:20px;font-size:9.5px;font-weight:700;background:var(--surface3);color:var(--text2);}
+.gas-status-pill.ok{background:var(--green-bg);color:var(--green);}
+.gas-status-pill.sync{background:var(--brand-bg);color:var(--brand);}
+.gas-status-pill.idle{background:var(--surface3);color:var(--text3);}
 
 .hamburger{display:none;width:34px;height:34px;border-radius:8px;border:1px solid var(--border);
   background:var(--surface);cursor:pointer;font-size:16px;align-items:center;justify-content:center;flex-shrink:0;margin-right:8px;}
@@ -879,6 +883,11 @@ table thead th{position:sticky;top:0;background:var(--surface);z-index:1;}
         <div class="sb-label">Stock View</div>
         <div style="padding:4px 6px;"><div class="stock-toggle"><button class="st-btn active" id="stDiff" onclick="setStockView('diff')">Variance</button><button class="st-btn" id="stTotal" onclick="setStockView('total')">Total ML</button></div></div>
       </div>
+      <div class="sb-divider"></div>
+      <div class="sb-section">
+        <div class="sb-label">Admin</div>
+        <div class="sb-item" id="nav_settings" onclick="navTo('settings')"><span class="sb-icon">⚙️</span>Settings</div>
+      </div>
     </div>
     <div id="main">
 
@@ -1016,6 +1025,7 @@ table thead th{position:sticky;top:0;background:var(--surface);z-index:1;}
             <div class="ph-right">
               <button class="btn btn-primary btn-sm" onclick="openAddSaleModal()">+ Add Sale</button>
               <button class="btn btn-ghost btn-sm" onclick="exportTableCSV('tblSales','sales_export')">⬇ CSV</button>
+              <button class="btn btn-ghost btn-sm" data-pos-only style="display:none;" onclick="const rows=window._pendingInventoryConvert&&window._pendingInventoryConvert.length?window._pendingInventoryConvert:loadData('sales');const r=autoCaptureInventory(rows);toast('Converted '+r.converted+' item(s) to inventory ✓','ok');window._pendingInventoryConvert=null;">📦 Convert to Inventory</button>
             </div>
           </div>
         </div>
@@ -1562,6 +1572,16 @@ table thead th{position:sticky;top:0;background:var(--surface);z-index:1;}
         <div class="page-body" id="plBody"></div>
       </div>
 
+      <!-- ══ SETTINGS ══ -->
+      <div class="page" id="pg-settings">
+        <div class="page-header">
+          <div class="ph-row">
+            <div><div class="ph-title">⚙️ Settings</div><div class="ph-sub">POS connection · Auto-capture · Client module setup</div></div>
+          </div>
+        </div>
+        <div class="page-body" id="settingsBody"></div>
+      </div>
+
     </div>
   </div>
 </div>
@@ -1684,6 +1704,156 @@ const CLIENTS = {
 };
 let currentClient = 'CL00010';
 let stockView = 'diff';
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CLIENT-WISE MODULE SETTINGS — POS Connect / Auto-Capture / Manual Upload
+//  Every client can independently run:
+//    • Single Module  → manual entry + Excel/POS-export upload only (no live POS link)
+//    • POS Connected  → live POS link, with Auto-Capture Yes/No choice
+//  Manual Excel upload always stays available in BOTH modes as a fallback.
+// ═══════════════════════════════════════════════════════════════════════════
+function _settingsKey(clientId){ return 'bj_moduleSettings_' + (clientId||currentClient); }
+
+function getModuleSettings(clientId){
+  clientId = clientId || currentClient;
+  let stored = null;
+  try{ stored = JSON.parse(localStorage.getItem(_settingsKey(clientId))); }catch(e){ stored = null; }
+  const defaults = { posEnabled:false, posAutoCapture:false, posEndpoint:'', manualUploadAlways:true };
+  return Object.assign({}, defaults, stored||{});
+}
+
+function saveModuleSettings(clientId, patch){
+  clientId = clientId || currentClient;
+  const merged = Object.assign(getModuleSettings(clientId), patch);
+  try{ localStorage.setItem(_settingsKey(clientId), JSON.stringify(merged)); }catch(e){}
+  applyModuleVisibility();
+  return merged;
+}
+
+/** Show/hide POS-live-connection UI and update status labels for the active client.
+ *  Manual entry / Excel upload panels are NEVER hidden — they stay available always. */
+function applyModuleVisibility(){
+  const s = getModuleSettings(currentClient);
+  document.querySelectorAll('[data-pos-only]').forEach(el=>{
+    el.style.display = s.posEnabled ? '' : 'none';
+  });
+  const modeLbl = document.getElementById('posModeBadge');
+  if(modeLbl){
+    modeLbl.textContent = s.posEnabled ? (s.posAutoCapture ? '🟢 POS Connected · Auto-Capture ON' : '🟡 POS Connected · Manual Confirm') : '⚪ Single Module · Manual/Upload Only';
+    modeLbl.className = 'gas-status-pill ' + (s.posEnabled ? (s.posAutoCapture?'ok':'sync') : 'idle');
+  }
+}
+
+/** Converts newly captured POS sales rows into an Inventory/Store consumption
+ *  entry (Stock Adjustment table) using Code Master ML mapping — this is the
+ *  "auto capture → convert inventory" step. Runs automatically when a client's
+ *  Auto-Capture setting is ON, or manually via the "Convert to Inventory" button. */
+function autoCaptureInventory(salesRows){
+  if(!salesRows || !salesRows.length) return { converted:0, skipped:0 };
+  const cm = loadData('codemaster');
+  const adj = loadData('adj');
+  const newAdj = [];
+  let skipped = 0;
+  salesRows.forEach(r=>{
+    const prod = String(r.product||'').toLowerCase();
+    const match = cm.find(c=>c.report && String(c.report).toLowerCase()===prod);
+    const ml = Number(r.totalML) || (match ? Number(match.issueML||match.ml||0) * Number(r.qty||1) : 0);
+    if(ml>0){
+      newAdj.push({
+        id: Date.now()+Math.random(),
+        date: r.date||todayStr(),
+        outletId: currentClient,
+        itemCode: match?match.itemCode:'',
+        itemName: r.product||'',
+        adjType: 'POS Auto-Issue',
+        recQtyML: 0,
+        reIssueML: ml,
+        marks: 'Auto',
+        remarks: 'Auto-captured from POS sale → inventory issue',
+        costPrice: 0,
+        totalValue: 0,
+        approvedBy: 'System (Auto)',
+      });
+    } else { skipped++; }
+  });
+  if(newAdj.length){
+    adj.push(...newAdj);
+    saveData('adj', adj);
+    gasPush('adj', newAdj);
+    if(typeof renderAdjTable==='function') renderAdjTable();
+  }
+  return { converted:newAdj.length, skipped };
+}
+
+/** Renders the Settings page: per-client POS connect toggle, auto-capture
+ *  choice, manual upload note, and GAS sync URL info. */
+function renderSettingsPage(){
+  const body = document.getElementById('settingsBody');
+  if(!body) return;
+  const cl = CLIENTS[currentClient] || { name:currentClient };
+  const s = getModuleSettings(currentClient);
+  body.innerHTML = `
+    <div class="tbl-wrap" style="margin-bottom:14px;">
+      <div class="tbl-head">
+        <div class="tbl-title">🏢 ${cl.name}</div>
+        <div class="tbl-sub">${currentClient} · Configure this client's data-capture mode independently of other clients</div>
+      </div>
+      <div style="padding:16px;">
+        <div class="fg" style="margin-bottom:14px;">
+          <label style="font-size:11px;font-weight:800;margin-bottom:8px;display:block;">Module Mode</label>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;">
+            <label class="setup-card" style="flex:1;min-width:220px;cursor:pointer;padding:14px;display:flex;gap:10px;align-items:flex-start;border:2px solid ${!s.posEnabled?'var(--brand)':'var(--border)'};">
+              <input type="radio" name="posMode" value="off" ${!s.posEnabled?'checked':''} onchange="saveModuleSettings(currentClient,{posEnabled:false});renderSettingsPage();" style="margin-top:2px;">
+              <div>
+                <div style="font-weight:800;font-size:11.5px;">📥 Single Module (No POS)</div>
+                <div style="font-size:9.5px;color:var(--text3);margin-top:3px;">Manual entry + Excel/POS-export upload only. Nothing auto-connects — recommended for clients starting with one module.</div>
+              </div>
+            </label>
+            <label class="setup-card" style="flex:1;min-width:220px;cursor:pointer;padding:14px;display:flex;gap:10px;align-items:flex-start;border:2px solid ${s.posEnabled?'var(--brand)':'var(--border)'};">
+              <input type="radio" name="posMode" value="on" ${s.posEnabled?'checked':''} onchange="saveModuleSettings(currentClient,{posEnabled:true});renderSettingsPage();" style="margin-top:2px;">
+              <div>
+                <div style="font-weight:800;font-size:11.5px;">🔗 POS Connected</div>
+                <div style="font-size:9.5px;color:var(--text3);margin-top:3px;">Live POS sync via GAS. Choose below whether captured sales convert to inventory automatically or need manual confirm.</div>
+              </div>
+            </label>
+          </div>
+        </div>
+
+        <div data-pos-only style="${s.posEnabled?'':'display:none;'}border-top:1px solid var(--border);padding-top:14px;margin-top:4px;">
+          <div class="fg" style="margin-bottom:14px;">
+            <label style="font-size:11px;font-weight:800;margin-bottom:8px;display:block;">POS Sheet / Endpoint (GAS)</label>
+            <input type="text" id="posEndpointInput" value="${s.posEndpoint||GAS_URL}" placeholder="Google Apps Script Web App URL for this client's POS feed" style="width:100%;">
+            <div style="font-size:9px;color:var(--text3);margin-top:4px;">This is the deployment that pulls live POS export rows for ${cl.name}.</div>
+          </div>
+          <div class="fg" style="margin-bottom:8px;">
+            <label style="font-size:11px;font-weight:800;margin-bottom:8px;display:block;">Auto-Capture → Inventory</label>
+            <div class="stock-toggle" style="width:fit-content;">
+              <button class="st-btn ${s.posAutoCapture?'active':''}" onclick="saveModuleSettings(currentClient,{posAutoCapture:true});renderSettingsPage();toast('Auto-capture turned ON for ${cl.name}','ok');">Yes — Auto</button>
+              <button class="st-btn ${!s.posAutoCapture?'active':''}" onclick="saveModuleSettings(currentClient,{posAutoCapture:false});renderSettingsPage();toast('Auto-capture turned OFF — manual confirm required','warn');">No — Manual Confirm</button>
+            </div>
+            <div style="font-size:9.5px;color:var(--text3);margin-top:6px;">
+              ${s.posAutoCapture
+                ? 'Every POS sale captured is instantly converted into a Stock Adjustment (inventory issue) — no extra click needed.'
+                : 'POS sales are captured, but you must click "Convert to Inventory" on the POS Sales page before stock updates.'}
+            </div>
+          </div>
+        </div>
+
+        <div style="border-top:1px solid var(--border);padding-top:14px;margin-top:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <span id="posModeBadge" class="gas-status-pill"></span>
+          <span style="font-size:9.5px;color:var(--text3);">📤 Manual Excel/POS-export upload is <strong>always available</strong> on the POS Sales page, in both modes.</span>
+        </div>
+        <div style="margin-top:10px;">
+          <button class="btn btn-primary btn-sm" onclick="if(document.getElementById('posEndpointInput'))saveModuleSettings(currentClient,{posEndpoint:document.getElementById('posEndpointInput').value});toast('Settings saved for ${cl.name} ✓','ok');applyModuleVisibility();">✓ Save Settings</button>
+        </div>
+      </div>
+    </div>
+    <div class="tbl-wrap">
+      <div class="tbl-head"><div class="tbl-title">☁️ Google Sheets Sync</div><div class="tbl-sub">Applies globally · used for manual "Full GAS Sync"</div></div>
+      <div style="padding:14px;font-size:10px;color:var(--text2);word-break:break-all;">${GAS_URL}</div>
+    </div>`;
+  applyModuleVisibility();
+}
 
 // ── GAS ↔ Sheet mapping ──────────────────────────────────────────────────────
 const SHEET_MAP = {
@@ -1826,6 +1996,7 @@ function switchClient(id){
   _activeClientId = id;
   // Delegate to auto-connector (updates UI + resolves correct DB)
   erp_switchClient(id);
+  applyModuleVisibility();
 }
 
 function navTo(page){
@@ -1836,6 +2007,8 @@ function navTo(page){
   const pg = document.getElementById('pg-'+page);
   if(pg) pg.classList.add('active');
   refreshPage(page);
+  // Mobile: close the slide-out sidebar after navigating so the page is visible
+  if(window.innerWidth<=860 && typeof closeBarSidebar==='function') closeBarSidebar();
 }
 
 function refreshPage(page){
@@ -1855,6 +2028,7 @@ function refreshPage(page){
   else if(page==='daywise') renderDaywise();
   else if(page==='store_mov') renderStoreMov();
   else if(page==='profit') renderPL();
+  else if(page==='settings') renderSettingsPage();
 }
 function refreshAllPages(){
   renderDashboard();
@@ -2664,6 +2838,19 @@ function importSalesFromRows(rows){
   const arr=loadData('sales'); arr.push(...mapped); saveData('sales',arr); if(mapped.length) gasPush('sales',mapped);
   renderSalesTable(); toast(`Imported ${mapped.length} sale records ✓ — pushing to Sheets…`,'ok');
   const prev=document.getElementById('uploadPreview'); if(prev) prev.innerHTML=`<div class="conv-row"><strong>${mapped.length}</strong> records imported.</div>`;
+  // Client-wise auto-capture: convert POS sales straight into Inventory/Store
+  // consumption if this client has POS + Auto-Capture ON. If POS is on but
+  // Auto-Capture is off, surface a manual "Convert to Inventory" button instead.
+  const _ms = getModuleSettings(currentClient);
+  if(_ms.posEnabled && mapped.length){
+    if(_ms.posAutoCapture){
+      const res = autoCaptureInventory(mapped);
+      toast(`Auto-captured ${res.converted} item(s) into Inventory/Store ✓`,'ok');
+    } else if(prev){
+      window._pendingInventoryConvert = mapped;
+      prev.innerHTML += `<div class="conv-row" style="margin-top:6px;"><button class="btn btn-primary btn-sm" onclick="const r=autoCaptureInventory(window._pendingInventoryConvert||[]);toast('Converted '+r.converted+' item(s) to inventory ✓','ok');window._pendingInventoryConvert=null;">📦 Convert to Inventory</button></div>`;
+    }
+  }
 }
 
 function importStoreFromRows(rows){
@@ -3659,6 +3846,18 @@ window.handleSalesFileUpload = function(event) {
     renderSalesTable(); renderCalcSheet(); renderDashboard();
     addImportLog('POS Sales Upload',newOnes.length,'ok',`Smart column detection · ${newOnes.filter(r=>r.mlPerUnit>0).length} CM-matched`);
     toast(`✓ ${newOnes.length} sales records imported!`,'ok');
+    // Client-wise: auto-capture into Inventory/Store if this client has POS +
+    // Auto-Capture ON; otherwise leave a manual "Convert to Inventory" prompt.
+    const _ms = (typeof getModuleSettings==='function') ? getModuleSettings(currentClient) : {posEnabled:false};
+    if(_ms.posEnabled && newOnes.length){
+      if(_ms.posAutoCapture){
+        const res=autoCaptureInventory(newOnes);
+        toast(`Auto-captured ${res.converted} item(s) into Inventory/Store ✓`,'ok');
+      } else {
+        window._pendingInventoryConvert=newOnes;
+        toast(`${newOnes.length} sales imported · open Settings or click "Convert to Inventory" to update stock`,'warn');
+      }
+    }
   });
 };
 
@@ -4151,6 +4350,7 @@ document.addEventListener('DOMContentLoaded',()=>{
 
   restoreTheme();
   seedAllClientsDummyData();
+  applyModuleVisibility();
   console.log('[Bar Module v6.0] Complete enhancement layer loaded ✓');
   console.log('Smart parsers: SNPA, POS, CodeMaster, Store, Cocktail, Mocktail');
   console.log('GAS sync ready:', GAS_URL);
