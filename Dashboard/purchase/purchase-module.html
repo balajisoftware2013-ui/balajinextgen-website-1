@@ -2691,8 +2691,40 @@ async function processInvoiceScan(file){
     }
   }
 }
+// Recompute Taxable/Extra-Charges/TCS/TDS/Grand Total from the actual item rows, the same
+// way calcPTotals() will when the invoice is finally saved. The AI's top-level header fields
+// (taxable/total/gstAmt) can disagree with the sum of item "amt" values (seen on BEVCO invoices
+// with embedded rebates), which previously caused the "AI Verification Check" panel, the
+// "Smart Match Review" popup, and the saved Purchase Invoice to each show a different total.
+// This is now the single source of truth used everywhere in the scan→review→save flow.
+function computeReconciledTotals(d){
+  const items=d.items||[];
+  const itemsTaxable=items.reduce((s,it)=>s+(+it.amt||((+it.qty||0)*(+it.rate||0))),0);
+  const spf=+d.specialPurposeFee||0,rog=+d.roundOffGovt||0;
+  const freight=+d.freight||+d.freightCharge||0,lu=+d.loadingUnloading||+d.loading||+d.lu||0;
+  const otherChg=+d.otherCharges||+d.otherChg||0;
+  const totalExtraChg=spf+rog+freight+lu+otherChg;
+  const productCodeTaxable=itemsTaxable+totalExtraChg;
+  const gstAmt=+d.gstAmt||((+d.cgst||0)+(+d.sgst||0)+(+d.igst||0))||0;
+  const tcsRate=+d.tcsRate||0;
+  const tcsAmt=tcsRate?+(productCodeTaxable*tcsRate/100).toFixed(2):(+d.tcs||0);
+  const tdsRate=+d.tdsRate||0;
+  const tdsAmt=tdsRate?+(productCodeTaxable*tdsRate/100).toFixed(2):(+d.tds||0);
+  const grandTotal=productCodeTaxable+gstAmt+tcsAmt-tdsAmt;
+  // MISMATCH CHECK: the AI's header-level "taxable" (its own read of the invoice subtotal
+  // line) can disagree with the sum of individual item "amt" values it also extracted. Either
+  // number can be the wrong one (a misread header, OR a misread single line item — seen on a
+  // real BEVCO invoice where "89163.30" was OCR'd as "69163.30" on one line, a ₹20,000 miss
+  // that summed-items alone would silently swallow). Neither source is trustworthy by default,
+  // so flag it instead of picking one silently — the person must check the actual paper invoice.
+  const headerTaxable=+d.taxable||0;
+  const taxableMismatch=headerTaxable>0&&Math.abs(headerTaxable-itemsTaxable)>1;
+  const mismatchDiff=+(headerTaxable-itemsTaxable).toFixed(2);
+  return{itemsTaxable,spf,rog,freight,lu,otherChg,totalExtraChg,productCodeTaxable,gstAmt,tcsRate,tcsAmt,tdsRate,tdsAmt,grandTotal,headerTaxable,taxableMismatch,mismatchDiff};
+}
 function showExtracted(){
   if(!extractedData)return;
+  const rt=computeReconciledTotals(extractedData);
   el('extractedArea').style.display='block';
   const itemsHtml=extractedData.items&&extractedData.items.length
     ?`<div style="margin-top:12px;grid-column:1/-1"><div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.4px;margin-bottom:6px">📦 ${extractedData.items.length} Items Extracted</div>
@@ -2706,13 +2738,13 @@ function showExtracted(){
     <div class="ex-item"><label>Invoice Date</label><div class="val">${fmtD(extractedData.invoiceDate)}</div></div>
     <div class="ex-item"><label>Bill To</label><div class="val">${extractedData.billTo||'—'}</div></div>
     <div class="ex-item"><label>Mode</label><div class="val">${extractedData.mode==='accounting'?'📑 Accounting':'📦 Inventory'}</div></div>
-    <div class="ex-item"><label>Taxable Amt</label><div class="val">${fmt(extractedData.taxable)}</div></div>
-    <div class="ex-item"><label>GST Total</label><div class="val">${fmt(extractedData.gstAmt)}</div></div>
-    ${extractedData.specialPurposeFee?`<div class="ex-item"><label>Special Purpose Fee</label><div class="val" style="color:var(--warn)">${fmt(extractedData.specialPurposeFee)}</div></div>`:''}
-    ${extractedData.roundOffGovt?`<div class="ex-item"><label>Round Off (Govt.)</label><div class="val" style="color:var(--warn)">${fmt(extractedData.roundOffGovt)}</div></div>`:''}
-    ${extractedData.tcs?`<div class="ex-item"><label>TCS ${extractedData.tcsRate?extractedData.tcsRate+'%':''}</label><div class="val" style="color:var(--blue)">${fmt(extractedData.tcs)}</div></div>`:''}
+    <div class="ex-item"><label>Taxable Amt</label><div class="val">${fmt(rt.itemsTaxable)}</div></div>
+    <div class="ex-item"><label>GST Total</label><div class="val">${fmt(rt.gstAmt)}</div></div>
+    ${rt.spf?`<div class="ex-item"><label>Special Purpose Fee</label><div class="val" style="color:var(--warn)">${fmt(rt.spf)}</div></div>`:''}
+    ${rt.rog?`<div class="ex-item"><label>Round Off (Govt.)</label><div class="val" style="color:var(--warn)">${fmt(rt.rog)}</div></div>`:''}
+    ${rt.tcsAmt?`<div class="ex-item"><label>TCS ${rt.tcsRate?rt.tcsRate+'%':''}</label><div class="val" style="color:var(--blue)">${fmt(rt.tcsAmt)}</div></div>`:''}
     <div class="ex-item" style="grid-column:1/-1"><label>Grand Total</label>
-      <div class="val" style="color:var(--brand);font-size:20px;font-weight:900">${fmt(extractedData.total)}
+      <div class="val" style="color:var(--brand);font-size:20px;font-weight:900">${fmt(rt.grandTotal)}
         ${extractedData.driveLink?`<a href="${extractedData.driveLink}" target="_blank" class="badge b-green" style="font-size:11px;text-decoration:none;margin-left:8px;vertical-align:middle">📁 View in Drive ↗</a>`:''}
         ${extractedData.manualDrive&&!extractedData.driveLink?`<button class="btn btn-green btn-sm" style="margin-left:8px;vertical-align:middle" onclick="doManualDriveSave()">📁 Save to Drive</button>`:''}
       </div>
@@ -2720,8 +2752,9 @@ function showExtracted(){
     ${itemsHtml}`;
   el('verifyPanel').innerHTML=`
     <div style="display:flex;flex-direction:column;gap:6px">
-      <div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--border);font-size:12.5px"><span>📋 Grand Total</span><b>${fmt(extractedData.total)}</b><span class="badge b-green">✅ Extracted</span></div>
-      <div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--border);font-size:12.5px"><span>🧮 GST</span><b>${fmt(extractedData.gstAmt)}</b><span class="badge b-green">✅ Verified</span></div>
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--border);font-size:12.5px"><span>📋 Grand Total</span><b>${fmt(rt.grandTotal)}</b><span class="badge b-green">✅ Extracted</span></div>
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--border);font-size:12.5px"><span>🧮 GST</span><b>${fmt(rt.gstAmt)}</b><span class="badge b-green">✅ Verified</span></div>
+      ${rt.taxableMismatch?`<div style="padding:9px 10px;margin:2px 0;background:#fef2f2;border:1.5px solid #fecaca;border-radius:8px;font-size:11.5px;color:#991b1b;line-height:1.5">⚠️ <b>Item total (${fmt(rt.itemsTaxable)}) doesn't match the AI-read invoice subtotal (${fmt(rt.headerTaxable)})</b> — diff ${fmt(Math.abs(rt.mismatchDiff))}. One line item was likely misread. Verify against the paper invoice in the next Review step before saving.</div>`:''}
       <div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;font-size:12.5px"><span>🏭 Vendor GSTIN</span><b style="font-size:11px">${extractedData.gstin||'Not found'}</b><span class="badge ${extractedData.gstin?'b-green':'b-amber'}">${extractedData.gstin?'✅ Found':'⚠️ None'}</span></div>
       ${extractedData.driveLink?`<div style="padding:7px 0;font-size:12px;color:var(--green);font-weight:700">📁 Saved to Google Drive · <a href="${extractedData.driveLink}" target="_blank" style="color:var(--brand)">Open file →</a></div>`:''}
       ${extractedData.manualDrive&&!extractedData.driveLink?`<div style="padding:7px 0;font-size:12px;color:var(--text2)">📁 Drive: <button class="btn btn-green btn-sm" onclick="doManualDriveSave()">💾 Save to Drive Folder</button> <span style="color:var(--text3);font-size:10px">(downloads file + opens Drive)</span></div>`:''}
@@ -3134,6 +3167,7 @@ window.addEventListener('load',init);
           <tbody id="smItemRows"></tbody>
         </table>
       </div>
+      <div id="smMismatchWarning" style="display:none;margin-top:10px;padding:10px 12px;background:#fef2f2;border:1.5px solid #fecaca;border-radius:8px;font-size:12px;color:#991b1b;line-height:1.5"></div>
     </div>
 
     <!-- TOTALS + SUMMARY -->
@@ -3289,6 +3323,8 @@ function normaliseItems(items){
 
 
 let smMatchedVendorId=null;
+let smItemMatched=0,smItemNewC=0;
+let smMismatchDismissed=false;
 
 // Distinct-SKU variant markers, checked longest-phrase-first so e.g. "double black" wins over
 // the bare "black" that also appears inside it. If two item names each contain a marker from
@@ -3377,6 +3413,7 @@ function autoSelectLedger(data){
 function openSmartMatch(){
   if(!extractedData){toast('No scan data','err','⚠️');return;}
   const d=extractedData;
+  smMismatchDismissed=false;
   // Engine tag
   const et=el('smEngineTag');
   if(et)et.textContent=currentAIEngine==='gpt'?'GPT-4o':currentAIEngine==='gemini'?'Gemini':'Claude AI';
@@ -3446,24 +3483,69 @@ function openSmartMatch(){
       <td style="text-align:center;font-size:12px;white-space:nowrap">${it.qty} ${it.unit||''}</td>
       <td style="text-align:right;font-size:12px;font-family:'JetBrains Mono',monospace">₹${(+it.rate||0).toFixed(2)}</td>
       <td style="text-align:center;font-size:12px">${it.gst||0}%</td>
-      <td style="text-align:right;font-weight:700;font-size:12px;font-family:'JetBrains Mono',monospace">₹${(+it.amt||0).toFixed(2)}</td>
+      <td style="text-align:right"><input type="number" step="0.01" id="smAmt${i}" data-orig="${(+it.amt||0).toFixed(2)}" value="${(+it.amt||0).toFixed(2)}" oninput="smAmtEdited(${i})" title="Click to correct if the AI misread this amount" style="width:95px;text-align:right;font-weight:700;font-size:12px;font-family:'JetBrains Mono',monospace;border:1.5px solid var(--border2);border-radius:5px;padding:4px 6px;outline:none"></td>
     </tr>`;
   }).join('');
   const ib=el('smItemRows');if(ib)ib.innerHTML=rows||'<tr class="empty-r"><td colspan="6">No items</td></tr>';
-  const is=el('smItemStats');if(is)is.innerHTML=`<span class="badge b-green" style="font-size:10px">${matched} matched</span> <span class="badge b-amber" style="font-size:10px">${newC} new</span>`;
+  const is=el('smItemStats');if(is)is.innerHTML=`<span class="badge b-green" style="font-size:10px">${matched} matched</span> <span class="badge b-amber" style="font-size:10px">${newC} new</span> <span style="font-size:10px;color:var(--text3);margin-left:6px">✏️ Amt is editable — fix it here if the AI misread a line</span>`;
+  smItemMatched=matched;smItemNewC=newC;
+  refreshSmartMatchTotals();
+  openM('mSmartMatch');
+}
 
-  // ── Totals
-  ss('sm-sub',fmt(d.taxable));ss('sm-gst',fmt(d.gstAmt));ss('sm-grand',fmt(d.total));
-  // BEVCO extra charges
+// Recompute & repaint the Review totals + mismatch banner from the current (possibly
+// user-edited) extractedData.items — shared by openSmartMatch() and smAmtEdited() so the
+// numbers stay live as soon as someone corrects an AI misread, without a full re-render.
+function refreshSmartMatchTotals(){
+  const d=extractedData;if(!d)return;
+  const items=d.items||[];
+  const rt=computeReconciledTotals(d);
+  ss('sm-sub',fmt(rt.itemsTaxable));ss('sm-gst',fmt(rt.gstAmt));ss('sm-grand',fmt(rt.grandTotal));
   const spfRow=el('sm-spf-row'),rogRow=el('sm-rog-row'),tcsRow=el('sm-tcs-row');
-  if(d.specialPurposeFee){ss('sm-spf',fmt(d.specialPurposeFee));if(spfRow)spfRow.style.display='flex';}else{if(spfRow)spfRow.style.display='none';}
-  if(d.roundOffGovt){ss('sm-rog',fmt(d.roundOffGovt));if(rogRow)rogRow.style.display='flex';}else{if(rogRow)rogRow.style.display='none';}
-  if(d.tcs){ss('sm-tcs',fmt(d.tcs));ss('sm-tcs-lbl','TCS '+(d.tcsRate?d.tcsRate+'%':''));if(tcsRow)tcsRow.style.display='flex';}else{if(tcsRow)tcsRow.style.display='none';}
+  if(rt.spf){ss('sm-spf',fmt(rt.spf));if(spfRow)spfRow.style.display='flex';}else{if(spfRow)spfRow.style.display='none';}
+  if(rt.rog){ss('sm-rog',fmt(rt.rog));if(rogRow)rogRow.style.display='flex';}else{if(rogRow)rogRow.style.display='none';}
+  if(rt.tcsAmt){ss('sm-tcs',fmt(rt.tcsAmt));ss('sm-tcs-lbl','TCS '+(rt.tcsRate?rt.tcsRate+'%':''));if(tcsRow)tcsRow.style.display='flex';}else{if(tcsRow)tcsRow.style.display='none';}
+  const lsel=el('smLedgerSel');
   const sel=(DB.ledgerAccounts||[]).find(l=>l.id===(lsel?.value||''));
   const sum=el('smSummary');
-  if(sum)sum.innerHTML=`Supplier: <b>${d.vendorName}</b><br>Invoice: <b>${d.invoiceNo}</b> · ${fmtD(d.invoiceDate)}<br>Items: <b>${items.length}</b> (${matched} matched, ${newC} new)<br>Ledger: <b>${sel?.name||'—'}</b><br>Total: <b style="color:var(--brand);font-size:14px">${fmt(d.total)}</b>`;
+  if(sum)sum.innerHTML=`Supplier: <b>${d.vendorName}</b><br>Invoice: <b>${d.invoiceNo}</b> · ${fmtD(d.invoiceDate)}<br>Items: <b>${items.length}</b> (${smItemMatched||0} matched, ${smItemNewC||0} new)<br>Ledger: <b>${sel?.name||'—'}</b><br>Total: <b style="color:var(--brand);font-size:14px">${fmt(rt.grandTotal)}</b>`;
+  // ── Mismatch warning: AI's extracted invoice subtotal vs sum of its own (possibly now-corrected) line items
+  const mw=el('smMismatchWarning');
+  if(mw){
+    if(rt.taxableMismatch&&!smMismatchDismissed){
+      mw.style.display='block';
+      mw.innerHTML=`⚠️ <b>Totals don't match — please verify against the paper invoice.</b><br>
+        AI-read invoice subtotal: <b>${fmt(rt.headerTaxable)}</b> &nbsp;vs&nbsp; Sum of line items below: <b>${fmt(rt.itemsTaxable)}</b> &nbsp;(diff: <b>${fmt(Math.abs(rt.mismatchDiff))}</b>)<br>
+        One of the item amounts above was likely misread by the AI. Correct it directly in the Amt column — totals update live — then check this warning clears.
+        <div style="margin-top:8px"><button class="btn btn-xs" onclick="dismissSmMismatch()" style="background:#fff;border:1.5px solid #fecaca;color:#991b1b">✓ I've checked the items against the invoice — dismiss</button></div>`;
+    }else{
+      mw.style.display='none';
+    }
+  }
+}
 
-  openM('mSmartMatch');
+// Lets the person dismiss the mismatch warning once they've manually verified the item amounts
+// against the paper invoice (e.g. when the AI's own header total turns out to be the wrong
+// number this time, not the items). Stays dismissed for the rest of this Review session.
+function dismissSmMismatch(){
+  smMismatchDismissed=true;
+  const mw=el('smMismatchWarning');
+  if(mw)mw.style.display='none';
+}
+
+// Called on every keystroke in an item's Amt field. Writes the correction straight into
+// extractedData (the same object confirmSmartImport()/importExtracted() will read from), marks
+// the field visually so it's clear it was hand-corrected, and live-updates totals + the
+// mismatch banner so the person can see immediately whether their fix resolves the gap.
+function smAmtEdited(i){
+  const d=extractedData;if(!d||!d.items||!d.items[i])return;
+  const inp=el('smAmt'+i);if(!inp)return;
+  const val=+inp.value||0;
+  d.items[i].amt=val;
+  const orig=+inp.dataset.orig||0;
+  inp.style.borderColor=Math.abs(val-orig)>0.005?'var(--amber,#f59e0b)':'var(--border2)';
+  inp.style.background=Math.abs(val-orig)>0.005?'#fffbeb':'';
+  refreshSmartMatchTotals();
 }
 
 function smUseVendor(id,name){
