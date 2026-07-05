@@ -28,23 +28,23 @@ const ROLE_DASHBOARD = {
   SUPER_ADMIN  : 'Dashboard/super-admin-dashboard.html',
   DEVELOPER    : 'Dashboard/developer-dashboard.html',
   OWNER        : 'Dashboard/owner-dashboard.html',
-  ADMIN        : 'Dashboard/dashboard.html',
+  ADMIN        : 'welcome.html',
   MANAGER      : 'Dashboard/manager-dashboard.html',
   ACCOUNTANT   : 'Dashboard/accounts/accounts.html',
-  CASHIER      : 'Dashboard/restaurant/cashier-dashboard.html',
-  CHEF         : 'Dashboard/chef-dashboard.html',
+  CASHIER      : 'Dashboard/restaurant/restaurant-dashboard.html',
+  CHEF         : 'Dashboard/restaurant/chef-dashboard.html',
   WAITER       : 'Dashboard/employee-dashboard.html',
   STORE_MANAGER: 'Dashboard/inventory/inventory.html',
   CEO          : 'Dashboard/Ceo-dashboard.html',
   MD           : 'Dashboard/owner-dashboard.html',
-  CLIENT       : 'Dashboard/dashboard.html',
-  DEMO         : 'Dashboard/dashboard.html',
+  CLIENT       : 'welcome.html',
+  DEMO         : 'welcome.html',
   ACCT         : 'Dashboard/balaji-staff-portal.html',
   PARTTIME     : 'Dashboard/employee-dashboard.html',
   STAFF        : 'Dashboard/employee-dashboard.html',
   HR           : 'Dashboard/manager-dashboard.html',
   SUPERVISOR   : 'Dashboard/manager-dashboard.html',
-  DEFAULT      : 'Dashboard/dashboard.html',
+  DEFAULT      : 'welcome.html',
 };
 
 /* ── INDUSTRY-SPECIFIC DASHBOARDS ──────────────────────────────
@@ -54,12 +54,12 @@ const ROLE_DASHBOARD = {
    Only map to industries that have a REAL working dashboard file —
    everything else falls back to Dashboard/dashboard.html (common ERP). */
 const INDUSTRY_DASHBOARD = {
-  RESTAURANT : 'Dashboard/dashboard.html',
-  CAFE       : 'Dashboard/dashboard.html',
-  TEA        : 'Dashboard/dashboard.html',
-  RETAIL     : 'Dashboard/Dashboard.html',
-  GROCERY    : 'Dashboard/Dashboard.html',
-  SUPERMARKET: 'Dashboard/Dashboard.html',
+  RESTAURANT : 'welcome.html',
+  CAFE       : 'welcome.html',
+  TEA        : 'welcome.html',
+  RETAIL     : 'welcome.html',
+  GROCERY    : 'welcome.html',
+  SUPERMARKET: 'welcome.html',
   /* everything else (hotel, medical, school, pharmacy, construction,
      fruit, juice, ecommerce, distribution, realestate, generic) → */
   DEFAULT    : 'Dashboard/dashboard.html',
