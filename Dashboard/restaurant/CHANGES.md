@@ -46,3 +46,16 @@ robustness. Kept the existing navy/cream colour theme as-is, per your call.
 
 Everything else (KPIs, MTD panel, category/collection/online tables, CSV
 export, Drive save) was already working correctly and untouched.
+
+## monthly-dsr.html — same bug found and fixed
+
+Checked this one too since it shares the same codebase as daily-sales-report.html.
+Same duplicate hamburger-menu bug was present (old broken button + working new
+one, both stacked). Removed the dead/duplicate one — same fix as above.
+This file already had `id="sidebar"` so it wasn't crashing here, just showing
+two overlapping menu buttons on mobile.
+
+Everything else in this file (Print, Export CSV, AI assistant) checked out —
+no duplicate IDs, no dangling button references. It doesn't have the PDF/POS-
+print/WhatsApp buttons yet like the Reports Hub — say the word if you want
+the same treatment here too.
