@@ -180,6 +180,11 @@ tr:hover td{background:var(--surface2);}
     <div class="hero-title">Every master record, one place.</div>
     <div class="hero-sub">Menu, recipes, staff, suppliers and floor layout — kept in sync across POS, KOT and Reports the moment you save here.</div>
     <div class="hero-stats" id="heroStats"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
+      <button class="tb-btn" style="background:#fff;" onclick="downloadAllMasterTemplates()">⬇ Download Complete Master Setup Template (one sheet, every category)</button>
+      <button class="tb-btn" style="background:#fff;" onclick="document.getElementById('masterSetupFileInput').click()">⬆ Upload Filled Master Setup</button>
+    </div>
+    <input type="file" id="masterSetupFileInput" accept=".xlsx,.xls,.csv" style="display:none" onchange="handleMasterSetupUpload(event)">
     <div class="hero-scallop"></div>
   </div>
   <div class="content" id="content"></div>
@@ -373,6 +378,115 @@ const MASTER_CONFIG = [
     ]},
 ];
 
+/* ── DOWNLOAD TEMPLATES ──
+   Reads header names straight from MASTER_CONFIG above — the same
+   config that drives the Add/Edit forms — so a template can never
+   drift out of sync with what the form actually asks for. Categories
+   with no fields (Recipe, Bar Menu, Settings) link to their own
+   dedicated pages instead and are skipped here on purpose. */
+function downloadCategoryTemplate(key){
+  const c = MASTER_CONFIG.find(x=>x.key===key);
+  if (!c || !c.fields || !c.fields.length){ showToast('This category has no flat-table template — it is managed on its own dedicated page.'); return; }
+  const headers = c.fields.map(f=>f.name);
+  const ws = XLSX.utils.aoa_to_sheet([headers]);
+  ws['!cols'] = headers.map(()=>({wch:16}));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, c.label.slice(0,31));
+  XLSX.writeFile(wb, c.label.replace(/\s+/g,'_')+'_Template.xlsx');
+  showToast('Template downloaded — fill it up and upload via Upload Excel above');
+}
+
+// FIX ("wrong — master hub one sheet complete master"): this was 19
+// separate tiny tabs, which isn't what was asked for. Now it's ONE
+// sheet — every category stacked in sequence with a bold section
+// label, its column headers, then blank rows to fill in, so the whole
+// business's starting setup can be filled from top to bottom in a
+// single continuous sheet and handed back as one file.
+function downloadAllMasterTemplates(){
+  const maxCols = Math.max(...MASTER_CONFIG.filter(c=>c.fields&&c.fields.length).map(c=>c.fields.length));
+  const rows = [];
+  const merges = [];
+  rows.push(['COMPLETE MASTER SETUP — fill in every section that applies to your business']);
+  merges.push({ s:{r:0,c:0}, e:{r:0,c:maxCols-1} });
+  rows.push([]);
+
+  let count = 0;
+  MASTER_CONFIG.forEach(c=>{
+    if (!c.fields || !c.fields.length) return; // Recipe/Bar Menu/Settings link to their own dedicated pages, skipped here
+    const sectionRow = rows.length;
+    rows.push([c.icon + '  ' + c.label.toUpperCase()]);
+    merges.push({ s:{r:sectionRow,c:0}, e:{r:sectionRow,c:maxCols-1} });
+    rows.push(c.fields.map(f=>f.name));
+    for (let i=0;i<5;i++) rows.push([]); // 5 blank fill-in rows per section
+    rows.push([]); // spacer before next section
+    count++;
+  });
+
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  ws['!merges'] = merges;
+  ws['!cols'] = Array(maxCols).fill({wch:17});
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Master Setup');
+  XLSX.writeFile(wb, 'Master_Setup_Template.xlsx');
+  showToast('Master Setup template downloaded — one sheet, ' + count + ' sections, fill in and upload back with the Upload Filled Master Setup button');
+}
+
+// Parses the single sectioned sheet from downloadAllMasterTemplates()
+// back apart — scans for each category's section-label row (icon +
+// label, uppercased), reads the header row directly below it, then
+// every non-empty row after that as data until the next section
+// label or a run of blank rows. Bulk-imports each detected section
+// straight to its matching category.
+async function handleMasterSetupUpload(e){
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = async function(evt){
+    const wb = XLSX.read(evt.target.result, {type:'binary'});
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    const grid = XLSX.utils.sheet_to_json(sheet, {header:1, defval:''});
+    const sectionStarts = MASTER_CONFIG
+      .filter(c=>c.fields && c.fields.length)
+      .map(c => ({ key:c.key, label:c.label, needle: c.label.toUpperCase() }));
+
+    let imported = 0, totalRecords = 0;
+    const summary = [];
+    for (let r = 0; r < grid.length; r++){
+      const cellText = String(grid[r][0]||'').toUpperCase();
+      const match = sectionStarts.find(s => cellText.includes(s.needle));
+      if (!match) continue;
+      const c = cfg(match.key);
+      const headerRow = grid[r+1] || [];
+      const records = [];
+      let blankRun = 0;
+      for (let rr = r+2; rr < grid.length && blankRun < 2; rr++){
+        const row = grid[rr] || [];
+        const isBlank = row.every(v => String(v||'').trim()==='');
+        if (isBlank){ blankRun++; continue; }
+        blankRun = 0;
+        const data = {};
+        c.fields.forEach((f)=>{
+          const headerIdx = headerRow.findIndex(h => String(h||'').trim().toUpperCase() === f.name);
+          data[f.name] = headerIdx>=0 ? String(row[headerIdx]||'') : '';
+        });
+        if (Object.values(data).some(v=>v!=='')) records.push(data);
+      }
+      if (records.length){
+        const count = await bulkImportRecords(match.key, records);
+        totalRecords += count; imported++;
+        summary.push(match.label + ': ' + count);
+      }
+    }
+    await renderNav();
+    await renderContent();
+    showToast(imported
+      ? `Imported ${totalRecords} record(s) across ${imported} section(s) — ${summary.join(', ')}`
+      : 'No filled-in sections found — make sure this is the downloaded Master Setup template with data added under each section.');
+  };
+  reader.readAsBinaryString(file);
+  e.target.value = '';
+}
+
 const CLIENT_ID = (new URLSearchParams(location.search).get('client')) || 'CL00010';
 const CLIENT_INDUSTRY = (new URLSearchParams(location.search).get('industry')) || 'RESTAURANT';
 
@@ -562,6 +676,7 @@ async function renderContent(){
     actions.innerHTML = '';
   } else if (c.fields){
     actions.innerHTML = `
+      <button class="tb-btn" onclick="downloadCategoryTemplate('${c.key}')">⬇ Download Template</button>
       <button class="tb-btn upload" onclick="document.getElementById('fileInput').click()">⬆ Upload Excel</button>
       <button class="tb-btn primary" onclick="openModal()">+ Add ${c.label}</button>`;
   } else {
