@@ -2520,8 +2520,10 @@ const DB = {
   creditCards:[],subscriptions:[],documents:[],budgets:[],
   accounting:[],
   auditLog:[],           // v19: local activity log (add/edit/delete)
-  cashRegister:{},       // v19: keyed by date -> {opening:{...}, closing:{...}}
-  bankLedger:{ openingBalance:0, entries:[] } // v19: bank deposit/withdrawal/etc ledger
+  cashRegister:{},       // v20: keyed by date -> {closing:{...}} (daily reconciliation only)
+  cashSettings:{ set:false, openingAmount:0, openingDate:'', user:'', account:'Personal', note:'' }, // v20: ONE-TIME opening cash setup, auto carries forward
+  bankLedger:{ openingBalance:0, entries:[] }, // legacy single-account (kept for backward-compat migration)
+  bankAccounts:{}        // v20: multiple bank accounts -> { id: {name, openingBalance, entries:[]} }
 };
 let incomePeriod='month';
 let budgetView='month';
@@ -3215,6 +3217,9 @@ const pageTitles={dashboard:'Dashboard',dues:'Due Dashboard',networth:'Net Worth
 let currentSection='dashboard';
 
 let _navSuppressPush = false; // true while responding to a popstate event
+// v20: convenience wrapper so dashboard cards/reports can link straight
+// to a section without each caller having to look up the nav element.
+function _navTo(sec){ navigate(sec, document.querySelector('[data-section="'+sec+'"]')); }
 function navigate(id,el){
   // Check plan access for non-free sections
   const freeSections = ['dashboard','dues','settings','calculator'];
@@ -3399,27 +3404,36 @@ document.addEventListener('click',e=>{const p=document.getElementById('notifPane
 // ════════════════════════════════════════
 // v19: dashboard cash/bank balance helpers (used by renderDashboard + Cash & Bank)
 function _computeCashBalance(){
-  const dates = Object.keys(DB.cashRegister||{}).sort();
-  if (!dates.length) {
+  const cs = DB.cashSettings;
+  if (!cs || !cs.set) {
+    // No opening cash set up yet — fall back to a pure net of cash-mode
+    // transactions so the dashboard still shows something meaningful.
     return DB.transactions.filter(t=>(t.mode||'Cash')==='Cash').reduce((s,t)=>s+(t.type==='income'?1:-1)*Number(t.amount),0);
   }
-  const lastDate = dates[dates.length-1];
-  const reg = DB.cashRegister[lastDate];
-  if (reg.closing) return Number(reg.closing.physicalCash);
-  if (reg.opening) {
-    const range = _computePeriodRange('today');
-    const todTx = _cbTxInRange(range).filter(t=>(t.mode||'Cash')==='Cash');
-    const net = todTx.reduce((s,t)=>s+(t.type==='income'?1:-1)*Number(t.amount),0);
-    return Number(reg.opening.amount) + net;
-  }
-  return 0;
+  let bal = Number(cs.openingAmount)||0;
+  const fromDate = new Date(cs.openingDate);
+  DB.transactions.forEach(t=>{
+    if ((t.mode||'Cash') !== 'Cash') return;
+    if (!t.date) return;
+    if (new Date(t.date) < fromDate) return;
+    bal += (t.type==='income'?1:-1)*Number(t.amount);
+  });
+  // Fold in any past reconciliation differences recorded at closing time
+  // (theft/counting error/etc.) so the running balance stays accurate
+  // going forward without needing a daily "opening" step.
+  Object.values(DB.cashRegister||{}).forEach(reg=>{
+    if (reg.closing && reg.closing.difference) bal += Number(reg.closing.difference);
+  });
+  return bal;
 }
 function _computeBankBalance(){
-  if (!DB.bankLedger) return 0;
+  _ensureBankAccounts();
   const CREDIT_TYPES=['Deposit','Interest'];
-  const totalCredit = DB.bankLedger.entries.filter(e=>CREDIT_TYPES.includes(e.type)).reduce((s,e)=>s+Number(e.amount),0);
-  const totalDebit  = DB.bankLedger.entries.filter(e=>!CREDIT_TYPES.includes(e.type)).reduce((s,e)=>s+Number(e.amount),0);
-  return Number(DB.bankLedger.openingBalance||0)+totalCredit-totalDebit;
+  return Object.values(DB.bankAccounts||{}).reduce((total, ledger)=>{
+    const totalCredit = ledger.entries.filter(e=>CREDIT_TYPES.includes(e.type)).reduce((s,e)=>s+Number(e.amount),0);
+    const totalDebit  = ledger.entries.filter(e=>!CREDIT_TYPES.includes(e.type)).reduce((s,e)=>s+Number(e.amount),0);
+    return total + Number(ledger.openingBalance||0) + totalCredit - totalDebit;
+  }, 0);
 }
 function _sumOutstandingAcct(type){
   const entries = (DB.accounting||[]).filter(e=>e.type===type);
@@ -3452,18 +3466,18 @@ function renderDashboard(){
   const pendingBills    = DB.bills.filter(b=>b.status!=='Paid').length;
 
   document.getElementById('dashKpis').innerHTML=`
-    <div class="kpi-card orange"><div class="kpi-label">Net Worth</div><div class="kpi-value">${fmtK(netWorth)}</div><div class="kpi-sub trend-up">↑ Your total wealth</div><div class="kpi-icon">💎</div></div>
-    <div class="kpi-card emerald"><div class="kpi-label">Monthly Income</div><div class="kpi-value">${fmtK(monthIncome)}</div><div class="kpi-sub">This month</div><div class="kpi-icon">💰</div></div>
-    <div class="kpi-card danger"><div class="kpi-label">Monthly Expenses</div><div class="kpi-value">${fmtK(monthExp)}</div><div class="kpi-sub">This month</div><div class="kpi-icon">💸</div></div>
-    <div class="kpi-card info"><div class="kpi-label">Investments</div><div class="kpi-value">${fmtK(totalCurrentInv)}</div><div class="kpi-sub">${totalInvested?((totalCurrentInv-totalInvested)/totalInvested*100).toFixed(1)+'% return':'No data'}</div><div class="kpi-icon">📈</div></div>
-    <div class="kpi-card warning"><div class="kpi-label">Upcoming Dues</div><div class="kpi-value">${upcomingCount}</div><div class="kpi-sub">Next 30 days</div><div class="kpi-icon">📅</div></div>
-    <div class="kpi-card purple"><div class="kpi-label">Subscriptions</div><div class="kpi-value">${fmtK(subTotal)}</div><div class="kpi-sub">Monthly spend</div><div class="kpi-icon">🔄</div></div>
-    <div class="kpi-card emerald"><div class="kpi-label">Cash Balance</div><div class="kpi-value">${fmtK(cashBalance)}</div><div class="kpi-sub">Cash register</div><div class="kpi-icon">💵</div></div>
-    <div class="kpi-card info"><div class="kpi-label">Bank Balance</div><div class="kpi-value">${fmtK(bankBalance)}</div><div class="kpi-sub">Bank ledger</div><div class="kpi-icon">🏦</div></div>
-    <div class="kpi-card emerald"><div class="kpi-label">Today's Collection</div><div class="kpi-value">${fmtK(todayCollection)}</div><div class="kpi-sub">Today</div><div class="kpi-icon">🧾</div></div>
-    <div class="kpi-card info"><div class="kpi-label">Outstanding Receivable</div><div class="kpi-value">${fmtK(outstandingRecv)}</div><div class="kpi-sub">To be collected</div><div class="kpi-icon">📥</div></div>
-    <div class="kpi-card danger"><div class="kpi-label">Outstanding Payable</div><div class="kpi-value">${fmtK(outstandingPay)}</div><div class="kpi-sub">To be paid</div><div class="kpi-icon">📤</div></div>
-    <div class="kpi-card warning"><div class="kpi-label">Bills</div><div class="kpi-value">${pendingBills}/${totalBills}</div><div class="kpi-sub">Pending / Total</div><div class="kpi-icon">📋</div></div>
+    <div class="kpi-card orange" style="cursor:pointer" onclick="_navTo('networth')"><div class="kpi-label">Net Worth</div><div class="kpi-value">${fmtK(netWorth)}</div><div class="kpi-sub trend-up">↑ Your total wealth</div><div class="kpi-icon">💎</div></div>
+    <div class="kpi-card emerald" style="cursor:pointer" onclick="_navTo('income')"><div class="kpi-label">Monthly Income</div><div class="kpi-value">${fmtK(monthIncome)}</div><div class="kpi-sub">This month</div><div class="kpi-icon">💰</div></div>
+    <div class="kpi-card danger" style="cursor:pointer" onclick="_navTo('income')"><div class="kpi-label">Monthly Expenses</div><div class="kpi-value">${fmtK(monthExp)}</div><div class="kpi-sub">This month</div><div class="kpi-icon">💸</div></div>
+    <div class="kpi-card info" style="cursor:pointer" onclick="_navTo('investments')"><div class="kpi-label">Investments</div><div class="kpi-value">${fmtK(totalCurrentInv)}</div><div class="kpi-sub">${totalInvested?((totalCurrentInv-totalInvested)/totalInvested*100).toFixed(1)+'% return':'No data'}</div><div class="kpi-icon">📈</div></div>
+    <div class="kpi-card warning" style="cursor:pointer" onclick="_navTo('dues')"><div class="kpi-label">Upcoming Dues</div><div class="kpi-value">${upcomingCount}</div><div class="kpi-sub">Next 30 days</div><div class="kpi-icon">📅</div></div>
+    <div class="kpi-card purple" style="cursor:pointer" onclick="_navTo('subscriptions')"><div class="kpi-label">Subscriptions</div><div class="kpi-value">${fmtK(subTotal)}</div><div class="kpi-sub">Monthly spend</div><div class="kpi-icon">🔄</div></div>
+    <div class="kpi-card emerald" style="cursor:pointer" onclick="_navTo('cashbank')"><div class="kpi-label">Cash Balance</div><div class="kpi-value">${fmtK(cashBalance)}</div><div class="kpi-sub">Cash register</div><div class="kpi-icon">💵</div></div>
+    <div class="kpi-card info" style="cursor:pointer" onclick="_navTo('cashbank')"><div class="kpi-label">Bank Balance</div><div class="kpi-value">${fmtK(bankBalance)}</div><div class="kpi-sub">Bank ledger</div><div class="kpi-icon">🏦</div></div>
+    <div class="kpi-card emerald" style="cursor:pointer" onclick="_navTo('cashbank')"><div class="kpi-label">Today's Collection</div><div class="kpi-value">${fmtK(todayCollection)}</div><div class="kpi-sub">Today</div><div class="kpi-icon">🧾</div></div>
+    <div class="kpi-card info" style="cursor:pointer" onclick="_navTo('accounting')"><div class="kpi-label">Outstanding Receivable</div><div class="kpi-value">${fmtK(outstandingRecv)}</div><div class="kpi-sub">To be collected</div><div class="kpi-icon">📥</div></div>
+    <div class="kpi-card danger" style="cursor:pointer" onclick="_navTo('accounting')"><div class="kpi-label">Outstanding Payable</div><div class="kpi-value">${fmtK(outstandingPay)}</div><div class="kpi-sub">To be paid</div><div class="kpi-icon">📤</div></div>
+    <div class="kpi-card warning" style="cursor:pointer" onclick="_navTo('bills')"><div class="kpi-label">Bills</div><div class="kpi-value">${pendingBills}/${totalBills}</div><div class="kpi-sub">Pending / Total</div><div class="kpi-icon">📋</div></div>
   `;
 
   const dues=[...DB.bills.map(b=>({name:b.name,amount:b.amount,due:b.due,type:'Bill'})),...DB.loans.map(l=>({name:l.name,amount:l.emi,due:l.due,type:'EMI'})),...DB.insurance.map(i=>({name:i.name,amount:i.premium,due:i.renewal,type:'Insurance'}))]
@@ -3898,53 +3912,65 @@ function renderCashRegister(){
   const cashPayments= txns.filter(t=>t.type==='expense' && (t.mode||'Cash')==='Cash').reduce((s,t)=>s+Number(t.amount),0);
   const expenses    = txns.filter(t=>t.type==='expense').reduce((s,t)=>s+Number(t.amount),0);
 
+  const cs = DB.cashSettings;
   const todayKey = today();
-  const todayReg = DB.cashRegister[todayKey] || {};
-  const opening  = todayReg.opening;
-  const closing  = todayReg.closing;
+  const todayClosing = (DB.cashRegister[todayKey]||{}).closing;
+  const currentBalance = _computeCashBalance();
 
-  // History rows across the whole register (for period P&L style Cash Report)
-  const regDates = Object.keys(DB.cashRegister).filter(d=>{ const dd=new Date(d); return dd>=range.from && dd<=range.to; }).sort();
-  const periodOpeningAmt = regDates.length && DB.cashRegister[regDates[0]].opening ? Number(DB.cashRegister[regDates[0]].opening.amount) : 0;
-  const periodClosingAmt = regDates.length && DB.cashRegister[regDates[regDates.length-1]].closing ? Number(DB.cashRegister[regDates[regDates.length-1]].closing.physicalCash) : (periodOpeningAmt + cashSales - cashPayments);
+  // ── v20: Opening Cash is a ONE-TIME setup that auto carries forward.
+  // No daily "open the register" step is needed any more — the running
+  // balance below already reflects every cash transaction since setup,
+  // plus any past reconciliation differences. Closing is now just an
+  // OPTIONAL daily physical-count check, not a requirement to unlock
+  // anything else.
+  if (!cs || !cs.set) {
+    el.innerHTML = `
+    <div class="card" style="max-width:480px">
+      <div class="card-title">🌅 Set Up Opening Cash <span style="font-weight:400;font-size:11px;color:var(--muted)">(one-time only)</span></div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:10px">Set this once. From now on your Cash Balance updates automatically from every Cash transaction — you never need to "open" the register again.</div>
+      <div class="form-group"><label class="form-label">Opening Amount (₹) *</label><input class="form-input" id="co-amount" type="number" placeholder="5000"></div>
+      <div class="form-group"><label class="form-label">As of Date</label><input class="form-input" id="co-date" type="date" value="${today()}"></div>
+      <div class="form-group"><label class="form-label">Account / Counter</label><input class="form-input" id="co-account" placeholder="Personal / Wallet" value="Personal"></div>
+      <div class="form-group"><label class="form-label">Note (optional)</label><input class="form-input" id="co-note" placeholder="e.g. Starting cash in hand"></div>
+      <button class="btn btn-primary" onclick="saveCashOpeningOneTime()">💾 Save Opening Cash</button>
+    </div>`;
+    return;
+  }
 
   el.innerHTML = `
   ${_periodSelectorHtml(_cbPeriod, _cbCustomFrom, _cbCustomTo, 'setCbPeriod')}
 
-  <div class="grid-2" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px">
+  <div class="kpi-grid" style="margin-bottom:16px">
+    <div class="kpi-card emerald"><div class="kpi-label">Current Cash Balance</div><div class="kpi-value">${fmtK(currentBalance)}</div><div class="kpi-icon">💵</div></div>
+    <div class="kpi-card info"><div class="kpi-label">Opening (since ${cs.openingDate})</div><div class="kpi-value">${fmtK(cs.openingAmount)}</div><div class="kpi-icon">🌅</div></div>
+  </div>
+
+  <div class="grid-2" style="gap:14px;margin-bottom:16px">
     <div class="card">
-      <div class="card-title">🌅 Cash Opening ${opening ? '<span class="badge badge-green" style="margin-left:8px">Done Today</span>' : ''}</div>
-      ${opening ? `
-        <div class="calc-row"><span>Date / Time</span><span>${opening.date} ${opening.time||''}</span></div>
-        <div class="calc-row"><span>User</span><span>${opening.user||'-'}</span></div>
-        <div class="calc-row"><span>Account/Counter</span><span>${opening.account||'-'}</span></div>
-        <div class="calc-row"><span>Opening Amount</span><span style="font-weight:700">${fmt(opening.amount)}</span></div>
-        ${opening.note?`<div class="calc-row"><span>Note</span><span>${opening.note}</span></div>`:''}
-      ` : `
-        <div class="form-group"><label class="form-label">Opening Amount (₹) *</label><input class="form-input" id="co-amount" type="number" placeholder="5000"></div>
-        <div class="form-group"><label class="form-label">Account / Counter</label><input class="form-input" id="co-account" placeholder="Personal / Wallet / Counter 1" value="Personal"></div>
-        <div class="form-group"><label class="form-label">Note (optional)</label><input class="form-input" id="co-note" placeholder="e.g. Start of day cash"></div>
-        <button class="btn btn-primary" onclick="saveCashOpening()">💾 Open Cash Register</button>
-      `}
+      <div class="card-title">⚙️ Opening Cash Setup</div>
+      <div class="calc-row"><span>Opening Amount</span><span style="font-weight:700">${fmt(cs.openingAmount)}</span></div>
+      <div class="calc-row"><span>As of Date</span><span>${cs.openingDate}</span></div>
+      <div class="calc-row"><span>Account</span><span>${cs.account||'-'}</span></div>
+      ${cs.note?`<div class="calc-row"><span>Note</span><span>${cs.note}</span></div>`:''}
+      <button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="editCashOpeningSetup()">✏️ Correct Opening Setup</button>
+      <div style="font-size:11px;color:var(--muted);margin-top:6px">Only use this to fix a mistake — it recalculates your whole cash history, not for daily use.</div>
     </div>
     <div class="card">
-      <div class="card-title">🌙 Cash Closing ${closing ? '<span class="badge badge-green" style="margin-left:8px">Done Today</span>' : ''}</div>
-      ${!opening ? '<div style="color:var(--muted);font-size:12px;padding:12px">Open the cash register first</div>' : closing ? `
-        <div class="calc-row"><span>Date / Time</span><span>${closing.date} ${closing.time||''}</span></div>
-        <div class="calc-row"><span>Expected Cash</span><span>${fmt(closing.expectedCash)}</span></div>
-        <div class="calc-row"><span>Physical Cash</span><span style="font-weight:700">${fmt(closing.physicalCash)}</span></div>
-        <div class="calc-row"><span>Difference</span><span style="font-weight:700;color:${Number(closing.difference)===0?'var(--emerald)':'var(--danger)'}">${fmt(closing.difference)}</span></div>
-        ${closing.remarks?`<div class="calc-row"><span>Remarks</span><span>${closing.remarks}</span></div>`:''}
-        <div class="calc-row"><span>Approved By</span><span>${closing.approvedBy||'-'}</span></div>
+      <div class="card-title">🌙 Today's Cash Closing ${todayClosing ? '<span class="badge badge-green" style="margin-left:8px">Done Today</span>' : '<span class="badge badge-yellow" style="margin-left:8px">Optional</span>'}</div>
+      ${todayClosing ? `
+        <div class="calc-row"><span>Time</span><span>${todayClosing.time||''}</span></div>
+        <div class="calc-row"><span>Expected Cash</span><span>${fmt(todayClosing.expectedCash)}</span></div>
+        <div class="calc-row"><span>Physical Cash</span><span style="font-weight:700">${fmt(todayClosing.physicalCash)}</span></div>
+        <div class="calc-row"><span>Difference</span><span style="font-weight:700;color:${Number(todayClosing.difference)===0?'var(--emerald)':'var(--danger)'}">${fmt(todayClosing.difference)}</span></div>
+        ${todayClosing.remarks?`<div class="calc-row"><span>Remarks</span><span>${todayClosing.remarks}</span></div>`:''}
+        <div class="calc-row"><span>Approved By</span><span>${todayClosing.approvedBy||'-'}</span></div>
       ` : `
-        <div class="calc-row"><span>Opening Amount</span><span>${fmt(opening.amount)}</span></div>
-        <div class="calc-row"><span>+ Cash Sales</span><span style="color:var(--emerald)">${fmt(cashSales)}</span></div>
-        <div class="calc-row"><span>− Cash Payments</span><span style="color:var(--danger)">${fmt(cashPayments)}</span></div>
-        <div class="calc-row" style="font-weight:700"><span>Expected Cash</span><span>${fmt(Number(opening.amount)+cashSales-cashPayments)}</span></div>
-        <div class="form-group" style="margin-top:8px"><label class="form-label">Physical Cash Counted (₹) *</label><input class="form-input" id="cc-physical" type="number" placeholder="Count your cash drawer"></div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:8px">Optional: count your physical cash to check it matches what the app expects.</div>
+        <div class="calc-row" style="font-weight:700"><span>Expected Cash (right now)</span><span>${fmt(currentBalance)}</span></div>
+        <div class="form-group" style="margin-top:8px"><label class="form-label">Physical Cash Counted (₹) *</label><input class="form-input" id="cc-physical" type="number" placeholder="Count your cash"></div>
         <div class="form-group"><label class="form-label">Remarks</label><input class="form-input" id="cc-remarks" placeholder="Optional remarks"></div>
         <div class="form-group"><label class="form-label">Approved By</label><input class="form-input" id="cc-approver" placeholder="Your name" value="${currentUser?currentUser.name:''}"></div>
-        <button class="btn btn-primary" onclick="saveCashClosing()">🔒 Close Cash Register</button>
+        <button class="btn btn-primary btn-sm" onclick="saveCashClosing()">🔒 Record Today's Closing</button>
       `}
     </div>
   </div>
@@ -3967,7 +3993,7 @@ function renderCashRegister(){
   </div>
 
   <div class="card">
-    <div class="card-title" style="display:flex;justify-content:space-between">
+    <div class="card-title" style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px">
       <span>💰 Cash Report — ${range.label}</span>
       <div style="display:flex;gap:6px">
         <button class="btn btn-ghost btn-sm" onclick="printElementReport('cashReportPrintArea')">🖨️ Print</button>
@@ -3976,48 +4002,45 @@ function renderCashRegister(){
       </div>
     </div>
     <div id="cashReportPrintArea">
-      <div class="calc-row"><span>Opening Balance</span><span>${fmt(periodOpeningAmt)}</span></div>
+      <div class="calc-row"><span>Opening Balance (this period)</span><span>${fmt(currentBalance-(cashSales+cardSales+upiSales+bankRecpts-cashPayments))}</span></div>
       <div class="calc-row"><span>Total Receipts (Cash+Card+UPI+Bank)</span><span style="color:var(--emerald)">${fmt(cashSales+cardSales+upiSales+bankRecpts)}</span></div>
       <div class="calc-row"><span>Total Payments</span><span style="color:var(--danger)">${fmt(cashPayments)}</span></div>
-      <div class="calc-row" style="font-weight:700"><span>Closing Balance</span><span>${fmt(periodClosingAmt)}</span></div>
+      <div class="calc-row" style="font-weight:700"><span>Closing Balance</span><span>${fmt(currentBalance)}</span></div>
     </div>
   </div>
   `;
 }
 
-function saveCashOpening(){
+function saveCashOpeningOneTime(){
   const amount = document.getElementById('co-amount').value;
   if (!amount || Number(amount) < 0) { toast('Enter a valid opening amount','error'); return; }
-  const todayKey = today();
-  if (!DB.cashRegister[todayKey]) DB.cashRegister[todayKey] = {};
-  DB.cashRegister[todayKey].opening = {
-    date: todayKey,
-    time: new Date().toTimeString().slice(0,5),
+  DB.cashSettings = {
+    set: true,
+    openingAmount: Number(amount),
+    openingDate: document.getElementById('co-date').value || today(),
     user: currentUser ? currentUser.name : 'User',
     account: document.getElementById('co-account').value.trim() || 'Personal',
-    amount: Number(amount),
     note: document.getElementById('co-note').value.trim()
   };
-  logAudit('cash_open','Cash Register', fmt(Number(amount)));
+  logAudit('cash_open','Cash Register', 'One-time opening: '+fmt(Number(amount)));
   saveDB();
   renderCashRegister();
-  toast('✅ Cash register opened for today!', 'success');
+  toast('✅ Opening cash set! Your balance now updates automatically.', 'success');
+}
+
+function editCashOpeningSetup(){
+  if (!confirm('This recalculates your entire cash history from a new starting point. Only do this to fix a mistake. Continue?')) return;
+  DB.cashSettings.set = false;
+  renderCashRegister();
 }
 
 function saveCashClosing(){
-  const todayKey = today();
-  const reg = DB.cashRegister[todayKey];
-  if (!reg || !reg.opening) { toast('Open the cash register first','error'); return; }
   const physical = document.getElementById('cc-physical').value;
   if (physical === '' || isNaN(Number(physical))) { toast('Enter the physical cash counted','error'); return; }
-
-  const range = _computePeriodRange('today');
-  const txns = _cbTxInRange(range);
-  const cashSales   = txns.filter(t=>t.type==='income'  && (t.mode||'Cash')==='Cash').reduce((s,t)=>s+Number(t.amount),0);
-  const cashPayments= txns.filter(t=>t.type==='expense' && (t.mode||'Cash')==='Cash').reduce((s,t)=>s+Number(t.amount),0);
-  const expected = Number(reg.opening.amount) + cashSales - cashPayments;
-
-  reg.closing = {
+  const expected = _computeCashBalance();
+  const todayKey = today();
+  if (!DB.cashRegister[todayKey]) DB.cashRegister[todayKey] = {};
+  DB.cashRegister[todayKey].closing = {
     date: todayKey,
     time: new Date().toTimeString().slice(0,5),
     expectedCash: expected,
@@ -4026,19 +4049,72 @@ function saveCashClosing(){
     remarks: document.getElementById('cc-remarks').value.trim(),
     approvedBy: document.getElementById('cc-approver').value.trim() || (currentUser?currentUser.name:'')
   };
-  logAudit('cash_close','Cash Register', 'Diff: '+fmt(reg.closing.difference));
+  logAudit('cash_close','Cash Register', 'Diff: '+fmt(DB.cashRegister[todayKey].closing.difference));
   saveDB();
   renderCashRegister();
-  toast('✅ Cash register closed for today!', 'success');
+  toast('✅ Cash closing recorded for today!', 'success');
 }
 
-// ── Bank Ledger ───────────────────────────────────────────────
+// ── v20: Multiple Bank Accounts ──────────────────────────────
 const BANK_ENTRY_TYPES = ['Deposit','Withdrawal','Cheque','UPI','NEFT','RTGS','IMPS','Charges','Interest'];
+let _activeBankAccountId = null;
+
+function _ensureBankAccounts(){
+  if (!DB.bankAccounts) DB.bankAccounts = {};
+  // Migrate legacy single-account ledger the first time, if present and
+  // nothing has been migrated yet.
+  if (Object.keys(DB.bankAccounts).length === 0 && DB.bankLedger && (DB.bankLedger.openingBalance || (DB.bankLedger.entries||[]).length)) {
+    DB.bankAccounts['acc1'] = { name: 'Primary Account', openingBalance: DB.bankLedger.openingBalance||0, entries: DB.bankLedger.entries||[] };
+  }
+  if (Object.keys(DB.bankAccounts).length === 0) {
+    DB.bankAccounts['acc1'] = { name: 'Primary Account', openingBalance: 0, entries: [] };
+  }
+  if (!_activeBankAccountId || !DB.bankAccounts[_activeBankAccountId]) {
+    _activeBankAccountId = Object.keys(DB.bankAccounts)[0];
+  }
+}
+
+function addBankAccount(){
+  const name = prompt('Name this bank account (e.g. HDFC Savings, SBI Current):');
+  if (!name || !name.trim()) return;
+  const id = 'acc' + Date.now();
+  DB.bankAccounts[id] = { name: name.trim(), openingBalance: 0, entries: [] };
+  _activeBankAccountId = id;
+  logAudit('add','Bank Account', name.trim());
+  saveDB();
+  renderBankLedger();
+  toast('✅ Bank account added!', 'success');
+}
+function setActiveBankAccount(id){
+  _activeBankAccountId = id;
+  renderBankLedger();
+}
+function renameActiveBankAccount(){
+  _ensureBankAccounts();
+  const acc = DB.bankAccounts[_activeBankAccountId];
+  const name = prompt('Rename this bank account:', acc.name);
+  if (!name || !name.trim()) return;
+  acc.name = name.trim();
+  saveDB();
+  renderBankLedger();
+}
+function deleteActiveBankAccount(){
+  _ensureBankAccounts();
+  if (Object.keys(DB.bankAccounts).length <= 1) { toast('You need at least one bank account','error'); return; }
+  const acc = DB.bankAccounts[_activeBankAccountId];
+  if (!confirm('Delete bank account "'+acc.name+'" and all its transactions?')) return;
+  delete DB.bankAccounts[_activeBankAccountId];
+  _activeBankAccountId = null;
+  logAudit('delete','Bank Account', acc.name);
+  saveDB();
+  renderBankLedger();
+}
+
 function renderBankLedger(){
   const el = document.getElementById('bankLedgerContent');
   if (!el) return;
-  if (!DB.bankLedger) DB.bankLedger = { openingBalance:0, entries:[] };
-  const ledger = DB.bankLedger;
+  _ensureBankAccounts();
+  const ledger = DB.bankAccounts[_activeBankAccountId];
   const range = _computePeriodRange(_cbPeriod, _cbCustomFrom, _cbCustomTo);
   const entriesInRange = ledger.entries.filter(e=>{ const d=new Date(e.date); return d>=range.from && d<=range.to; });
 
@@ -4050,7 +4126,14 @@ function renderBankLedger(){
   const periodCredit = entriesInRange.filter(e=>CREDIT_TYPES.includes(e.type)).reduce((s,e)=>s+Number(e.amount),0);
   const periodDebit  = entriesInRange.filter(e=>!CREDIT_TYPES.includes(e.type)).reduce((s,e)=>s+Number(e.amount),0);
 
-  el.innerHTML = `
+  const acctTabsHtml = `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;align-items:center">
+    ${Object.keys(DB.bankAccounts).map(id=>`<button class="btn btn-sm ${id===_activeBankAccountId?'btn-primary':'btn-ghost'}" onclick="setActiveBankAccount('${id}')">🏦 ${DB.bankAccounts[id].name}</button>`).join('')}
+    <button class="btn btn-ghost btn-sm" onclick="addBankAccount()">➕ Add Account</button>
+    <button class="btn btn-ghost btn-sm" onclick="renameActiveBankAccount()">✏️ Rename</button>
+    ${Object.keys(DB.bankAccounts).length>1?`<button class="btn btn-ghost btn-sm" onclick="deleteActiveBankAccount()">🗑 Delete</button>`:''}
+  </div>`;
+
+  el.innerHTML = acctTabsHtml + `
   ${_periodSelectorHtml(_cbPeriod, _cbCustomFrom, _cbCustomTo, 'setCbPeriod')}
   <div class="kpi-grid" style="margin-bottom:16px">
     <div class="kpi-card info"><div class="kpi-label">Opening Balance</div><div class="kpi-value">${fmtK(ledger.openingBalance||0)}</div><div class="kpi-icon">🏦</div></div>
@@ -4059,9 +4142,9 @@ function renderBankLedger(){
     <div class="kpi-card orange"><div class="kpi-label">Closing Balance</div><div class="kpi-value">${fmtK(closingBalance)}</div><div class="kpi-icon">💎</div></div>
   </div>
 
-  <div class="grid-2" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px">
+  <div class="grid-2" style="gap:14px;margin-bottom:16px">
     <div class="card">
-      <div class="card-title">⚙️ Set Opening Balance</div>
+      <div class="card-title">⚙️ Set Opening Balance — ${ledger.name}</div>
       <div class="form-group"><label class="form-label">Bank Opening Balance (₹)</label><input class="form-input" id="bl-opening" type="number" value="${ledger.openingBalance||0}"></div>
       <button class="btn btn-ghost btn-sm" onclick="saveBankOpeningBalance()">💾 Save Opening Balance</button>
     </div>
@@ -4078,8 +4161,8 @@ function renderBankLedger(){
   </div>
 
   <div class="card">
-    <div class="card-title" style="display:flex;justify-content:space-between">
-      <span>📜 Bank Transactions — ${range.label}</span>
+    <div class="card-title" style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <span>📜 ${ledger.name} — ${range.label}</span>
       <div style="display:flex;gap:6px">
         <button class="btn btn-ghost btn-sm" onclick="printElementReport('bankLedgerTableWrap')">🖨️ Print</button>
         <button class="btn btn-ghost btn-sm" onclick="exportTableCSV('bankLedgerTable','bank_ledger')">⬇ CSV</button>
@@ -4104,25 +4187,26 @@ function renderBankLedger(){
 }
 
 function saveBankOpeningBalance(){
+  _ensureBankAccounts();
   const v = document.getElementById('bl-opening').value;
-  DB.bankLedger.openingBalance = Number(v)||0;
-  logAudit('bank_opening','Bank Ledger', fmt(Number(v)||0));
+  DB.bankAccounts[_activeBankAccountId].openingBalance = Number(v)||0;
+  logAudit('bank_opening', DB.bankAccounts[_activeBankAccountId].name, fmt(Number(v)||0));
   saveDB();
   renderBankLedger();
   toast('✅ Bank opening balance saved!', 'success');
 }
 
 function addBankEntry(){
+  _ensureBankAccounts();
   const type = document.getElementById('bl-type').value;
   const amount = document.getElementById('bl-amount').value;
   if (!amount || Number(amount) <= 0) { toast('Enter a valid amount','error'); return; }
-  if (!DB.bankLedger) DB.bankLedger = { openingBalance:0, entries:[] };
-  DB.bankLedger.entries.push({
+  DB.bankAccounts[_activeBankAccountId].entries.push({
     type, amount: Number(amount),
     date: document.getElementById('bl-date').value || today(),
     note: document.getElementById('bl-note').value.trim()
   });
-  logAudit('add','Bank Ledger', type+' '+fmt(Number(amount)));
+  logAudit('add','Bank Ledger', DB.bankAccounts[_activeBankAccountId].name+': '+type+' '+fmt(Number(amount)));
   saveDB();
   document.getElementById('bl-amount').value='';
   document.getElementById('bl-note').value='';
@@ -4131,9 +4215,11 @@ function addBankEntry(){
 }
 
 function deleteBankEntry(idx){
+  _ensureBankAccounts();
   if (!confirm('Remove this bank transaction?')) return;
-  const removed = DB.bankLedger.entries[idx];
-  DB.bankLedger.entries.splice(idx,1);
+  const ledger = DB.bankAccounts[_activeBankAccountId];
+  const removed = ledger.entries[idx];
+  ledger.entries.splice(idx,1);
   logAudit('delete','Bank Ledger', removed ? (removed.type+' '+fmt(removed.amount)) : '');
   saveDB();
   renderBankLedger();
@@ -5028,7 +5114,7 @@ function renderReports() {
 
   <!-- ── TAB 6: CHARTS (v17) ── -->
   <div id="rPane6" style="display:none">
-    <div class="grid-2" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+    <div class="grid-2" style="gap:14px;margin-bottom:14px">
       <div class="card">
         <div class="card-title">💰 Income vs Expense</div>
         <div style="position:relative;height:220px;margin-top:10px"><canvas id="chartIncExp"></canvas></div>
@@ -5165,7 +5251,7 @@ function renderStatementsPane(){
           <button class="btn btn-ghost btn-sm" onclick="shareReportWhatsApp('stmtReportArea','${title}')">💬 WhatsApp</button>
         </div>
       </div>
-      <div id="stmtReportArea">${body}</div>
+      <div id="stmtReportArea" style="overflow-x:auto">${body}</div>
     </div>
   `;
 }
@@ -5185,8 +5271,11 @@ function _stmtDayBook(txns){
 
 function _stmtCashBook(range, txns){
   const cashTx = txns.filter(t=>(t.mode||'Cash')==='Cash');
-  const regDates = Object.keys(DB.cashRegister).filter(d=>{const dd=new Date(d);return dd>=range.from&&dd<=range.to;}).sort();
-  const opening = regDates.length && DB.cashRegister[regDates[0]].opening ? Number(DB.cashRegister[regDates[0]].opening.amount) : 0;
+  const cs = DB.cashSettings;
+  // Opening balance for this period = current cash balance minus this period's cash net movement
+  const periodNet = cashTx.reduce((s,t)=>s+(t.type==='income'?1:-1)*Number(t.amount),0);
+  const currentBal = _computeCashBalance();
+  const opening = (cs && cs.set) ? (currentBal - periodNet) : 0;
   let running = opening;
   const rows = cashTx.map(t=>{
     running += (t.type==='income'?1:-1)*Number(t.amount);
@@ -5201,24 +5290,29 @@ function _stmtCashBook(range, txns){
 }
 
 function _stmtBankBook(range, txns){
+  _ensureBankAccounts();
   const bankModes = ['Bank','UPI','NEFT','RTGS','IMPS','Cheque','Card'];
   const bankTx = txns.filter(t=>bankModes.includes(t.mode));
-  const ledgerEntries = (DB.bankLedger?DB.bankLedger.entries:[]).filter(e=>{const d=new Date(e.date);return d>=range.from&&d<=range.to;});
-  let running = Number(DB.bankLedger?DB.bankLedger.openingBalance:0);
-  const combined = [
-    ...bankTx.map(t=>({date:t.date, desc:t.desc, credit:t.type==='income'?Number(t.amount):0, debit:t.type==='expense'?Number(t.amount):0})),
-    ...ledgerEntries.map(e=>({date:e.date, desc:e.type+(e.note?' — '+e.note:''), credit:['Deposit','Interest'].includes(e.type)?Number(e.amount):0, debit:['Deposit','Interest'].includes(e.type)?0:Number(e.amount)}))
-  ].sort((a,b)=>new Date(a.date)-new Date(b.date));
-  const rows = combined.map(e=>{
-    running += e.credit - e.debit;
-    return `<tr><td style="font-size:11px">${e.date}</td><td>${e.desc}</td>
-      <td style="color:var(--emerald)">${e.credit?fmt(e.credit):''}</td>
-      <td style="color:var(--danger)">${e.debit?fmt(e.debit):''}</td>
-      <td style="font-weight:700">${fmt(running)}</td></tr>`;
-  }).join('');
-  return `<div class="calc-row" style="font-weight:700"><span>Opening Balance</span><span>${fmt(Number(DB.bankLedger?DB.bankLedger.openingBalance:0))}</span></div>
-    <table class="data-table" id="stmtReportTable"><thead><tr><th>Date</th><th>Description</th><th>Credit</th><th>Debit</th><th>Balance</th></tr></thead><tbody>${rows||'<tr><td colspan="5" style="text-align:center;color:var(--muted)">No bank entries</td></tr>'}</tbody></table>
-    <div class="calc-row" style="font-weight:700;margin-top:8px"><span>Closing Balance</span><span>${fmt(running)}</span></div>`;
+  const accountRows = Object.values(DB.bankAccounts).map(ledger=>{
+    const entries = ledger.entries.filter(e=>{const d=new Date(e.date);return d>=range.from&&d<=range.to;});
+    let running = Number(ledger.openingBalance||0);
+    const combined = entries.map(e=>({date:e.date, desc:e.type+(e.note?' — '+e.note:''), credit:['Deposit','Interest'].includes(e.type)?Number(e.amount):0, debit:['Deposit','Interest'].includes(e.type)?0:Number(e.amount)}))
+      .sort((a,b)=>new Date(a.date)-new Date(b.date));
+    const rows = combined.map(e=>{
+      running += e.credit - e.debit;
+      return `<tr><td style="font-size:11px">${e.date}</td><td>${ledger.name}</td><td>${e.desc}</td>
+        <td style="color:var(--emerald)">${e.credit?fmt(e.credit):''}</td>
+        <td style="color:var(--danger)">${e.debit?fmt(e.debit):''}</td>
+        <td style="font-weight:700">${fmt(running)}</td></tr>`;
+    }).join('');
+    return { name: ledger.name, opening: ledger.openingBalance||0, closing: running, rows };
+  });
+  const allRows = accountRows.map(a=>a.rows).join('');
+  const totalClosing = accountRows.reduce((s,a)=>s+a.closing,0);
+  const totalOpening = accountRows.reduce((s,a)=>s+Number(a.opening),0);
+  return `<div class="calc-row" style="font-weight:700"><span>Opening Balance (all accounts)</span><span>${fmt(totalOpening)}</span></div>
+    <table class="data-table" id="stmtReportTable"><thead><tr><th>Date</th><th>Account</th><th>Description</th><th>Credit</th><th>Debit</th><th>Balance</th></tr></thead><tbody>${allRows||'<tr><td colspan="6" style="text-align:center;color:var(--muted)">No bank entries</td></tr>'}</tbody></table>
+    <div class="calc-row" style="font-weight:700;margin-top:8px"><span>Closing Balance (all accounts)</span><span>${fmt(totalClosing)}</span></div>`;
 }
 
 function _stmtLedger(txns, cats){
@@ -5277,7 +5371,7 @@ function _stmtBalanceSheet(){
   const loanVal = DB.loans.reduce((s,l)=>s+Number(l.outstanding),0);
   const totalAssets = manualAssets.reduce((s,a)=>s+Number(a.value),0)+investVal;
   const totalLiabs  = manualLiabs.reduce((s,a)=>s+Number(a.value),0)+loanVal;
-  return `<div class="grid-2" style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+  return `<div class="grid-2" style="gap:14px">
     <div>
       <div style="font-weight:700;margin-bottom:6px;color:var(--emerald)">Assets</div>
       ${manualAssets.map(a=>`<div class="calc-row"><span>${a.name}</span><span>${fmt(a.value)}</span></div>`).join('')}
@@ -6753,6 +6847,10 @@ function runGlobalSearch(){
   DB.investments.forEach((inv,i)=>{ if((inv.name||'').toLowerCase().includes(q)) results.push({icon:'📈',label:inv.name,sub:inv.type||'',section:'investments'}); });
   DB.insurance.forEach((ins,i)=>{ if((ins.name||'').toLowerCase().includes(q)) results.push({icon:'🛡️',label:ins.name,sub:ins.type||'',section:'insurance'}); });
   DB.goals.forEach((g,i)=>{ if((g.name||'').toLowerCase().includes(q)) results.push({icon:'🎯',label:g.name,sub:'Target '+fmt(g.target),section:'goals'}); });
+  // v20: search across every bank account's ledger entries too
+  Object.values(DB.bankAccounts||{}).forEach(ledger=>{
+    (ledger.entries||[]).forEach(e=>{ if((e.type||'').toLowerCase().includes(q)||(e.note||'').toLowerCase().includes(q)) results.push({icon:'🏦',label:ledger.name+': '+e.type,sub:(e.note||'')+' · '+fmt(e.amount),section:'cashbank'}); });
+  });
   resEl.innerHTML = results.length ? results.slice(0,30).map(r=>`<div class="calc-row" style="cursor:pointer" onclick="closeModal('searchModal');navigate('${r.section}',document.querySelector('[data-section=\\'${r.section}\\']'))"><span>${r.icon} ${r.label}</span><span style="color:var(--muted);font-size:11px">${r.sub}</span></div>`).join('') : '<div style="color:var(--muted);font-size:12px;text-align:center;padding:12px">No matches</div>';
 }
 
