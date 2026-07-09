@@ -2103,6 +2103,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--body-bg);color
       <button class="btn btn-ghost" style="padding:14px;flex-direction:column;gap:4px" onclick="closeModal('quickAddModal');openModal('insuranceModal')">🛡️<span style="font-size:11px">Insurance</span></button>
       <button class="btn btn-ghost" style="padding:14px;flex-direction:column;gap:4px" onclick="closeModal('quickAddModal');openModal('investModal')">📈<span style="font-size:11px">Investment</span></button>
       <button class="btn btn-ghost" style="padding:14px;flex-direction:column;gap:4px" onclick="closeModal('quickAddModal');openModal('incomeModal')">💰<span style="font-size:11px">Transaction</span></button>
+      <button class="btn btn-ghost" style="padding:14px;flex-direction:column;gap:4px" onclick="closeModal('quickAddModal');openAcctEntryModal()">📒<span style="font-size:11px">Accounting Entry</span></button>
       <button class="btn btn-ghost" style="padding:14px;flex-direction:column;gap:4px" onclick="closeModal('quickAddModal');openModal('goalModal')">🎯<span style="font-size:11px">Goal</span></button>
       <button class="btn btn-ghost" style="padding:14px;flex-direction:column;gap:4px" onclick="closeModal('quickAddModal');openModal('ccModal')">💳<span style="font-size:11px">Credit Card</span></button>
       <button class="btn btn-ghost" style="padding:14px;flex-direction:column;gap:4px" onclick="closeModal('quickAddModal');openModal('subModal')">🔄<span style="font-size:11px">Subscription</span></button>
@@ -2599,13 +2600,21 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--body-bg);color
     </div>
     <div class="form-row">
       <div class="form-group"><label class="form-label">Status</label>
-        <select class="form-input form-select" id="acct-status">
+        <select class="form-input form-select" id="acct-status" onchange="_toggleAcctPaidFields()">
           <option value="outstanding">⏳ Outstanding</option>
           <option value="paid">✅ Paid</option>
           <option value="partial">🔶 Partial</option>
         </select>
       </div>
       <div class="form-group"><label class="form-label">Paid Amount (₹)</label><input class="form-input" id="acct-paid-amt" type="number" placeholder="0" min="0"></div>
+    </div>
+    <div class="form-row" id="acct-paid-mode-row" style="display:none">
+      <div class="form-group"><label class="form-label">Paid Via</label>
+        <select class="form-input form-select" id="acct-paid-mode">
+          ${['Cash','Bank','UPI','Card','Cheque','NEFT','RTGS','IMPS'].map(m=>`<option value="${m}">${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group"><label class="form-label" style="visibility:hidden">.</label><div style="font-size:11px;color:var(--muted);padding-top:8px">Also logs this payment into Cash & Bank automatically.</div></div>
     </div>
     <div class="form-group"><label class="form-label">Notes</label><input class="form-input" id="acct-notes" placeholder="Invoice no, reference, etc."></div>
     <div class="modal-footer-sticky" style="display:flex;gap:8px;justify-content:flex-end">
@@ -3736,10 +3745,9 @@ function _computeCashBalance(){
 }
 function _computeBankBalance(){
   _ensureBankAccounts();
-  const CREDIT_TYPES=['Deposit','Interest'];
   return Object.values(DB.bankAccounts||{}).reduce((total, ledger)=>{
-    const totalCredit = ledger.entries.filter(e=>CREDIT_TYPES.includes(e.type)).reduce((s,e)=>s+Number(e.amount),0);
-    const totalDebit  = ledger.entries.filter(e=>!CREDIT_TYPES.includes(e.type)).reduce((s,e)=>s+Number(e.amount),0);
+    const totalCredit = ledger.entries.filter(e=>_bankEntryIsCredit(e)).reduce((s,e)=>s+Number(e.amount),0);
+    const totalDebit  = ledger.entries.filter(e=>!_bankEntryIsCredit(e)).reduce((s,e)=>s+Number(e.amount),0);
     return total + Number(ledger.openingBalance||0) + totalCredit - totalDebit;
   }, 0);
 }
@@ -4270,6 +4278,26 @@ function renderCashRegister(){
       </div>`;
       return;
     }
+    // v25 FIX: on slower/mobile connections the ONE global cloud fetch at
+    // login could still occasionally lose the race and mark itself "done"
+    // with no data. Rather than immediately asking you to set up Opening
+    // Cash again (risking a duplicate/overwritten setup), give it exactly
+    // one more direct check here before showing the form.
+    if (GAS_URL && currentUser && !_cashSetupRetryDone) {
+      _cashSetupRetryDone = true;
+      el.innerHTML = `
+      <div class="card" style="max-width:480px">
+        <div class="card-title">⏳ Double-checking your saved setup…</div>
+        <div style="font-size:12px;color:var(--muted)">Making sure your Opening Cash wasn't just slow to load.</div>
+      </div>`;
+      _gasLoadDB(currentUser.uid).then(d=>{
+        if (d && typeof d === 'object' && d.cashSettings && d.cashSettings.set) {
+          Object.keys(DB).forEach(k => { if(d[k]!==undefined) DB[k]=d[k]; });
+          _storageSet(STORE_DB_KEY + '_' + currentUser.uid, DB);
+        }
+      }).catch(()=>{}).finally(()=> renderCashRegister());
+      return;
+    }
     el.innerHTML = `
     <div class="card" style="max-width:480px">
       <div class="card-title">🌅 Set Up Opening Cash <span style="font-weight:400;font-size:11px;color:var(--muted)">(one-time only)</span></div>
@@ -4422,7 +4450,22 @@ function saveCashClosing(){
 }
 
 // ── v20: Multiple Bank Accounts ──────────────────────────────
-const BANK_ENTRY_TYPES = ['Deposit','Withdrawal','Cheque','UPI','NEFT','RTGS','IMPS','Charges','Interest'];
+// v25 FIX: BANK_ENTRY_TYPES used to mix "direction" (Deposit/Withdrawal)
+// with "payment mode" (UPI/Cheque/NEFT/RTGS/IMPS) and "category" (Charges/
+// Interest) all in one dropdown — confusing, and the mode options are
+// redundant on a page that's already scoped to one bank account. Replaced
+// with two clean fields: Direction (Money In / Money Out) + Head/Account
+// (Vendor Payment, Customer Payment, etc.) — same idea as the Cash Ledger's
+// category field, including free-typing a custom head.
+const BANK_HEADS_IN  = ['Customer Payment','Deposit','Interest Received','Refund Received','Loan Received','Other Income'];
+const BANK_HEADS_OUT = ['Vendor Payment','Expenses Payment','Bank Charges','Drawing','Withdrawal','Loan Repayment','Salary Payment','Other Payment'];
+// Backward-compatible credit check: new entries carry `direction`; old
+// entries (saved before this fix) only have `type` from the old list.
+function _bankEntryIsCredit(e){
+  if (e.direction) return e.direction === 'in';
+  return ['Deposit','Interest'].includes(e.type);
+}
+function _bankEntryHead(e){ return e.head || e.type || '-'; }
 let _activeBankAccountId = null;
 
 function _ensureBankAccounts(){
@@ -4484,13 +4527,12 @@ function renderBankLedger(){
   const range = _computePeriodRange(_cbPeriod, _cbCustomFrom, _cbCustomTo);
   const entriesInRange = ledger.entries.filter(e=>{ const d=new Date(e.date); return d>=range.from && d<=range.to; });
 
-  const CREDIT_TYPES = ['Deposit','Interest'];
-  const totalCredit = ledger.entries.filter(e=>CREDIT_TYPES.includes(e.type)).reduce((s,e)=>s+Number(e.amount),0);
-  const totalDebit  = ledger.entries.filter(e=>!CREDIT_TYPES.includes(e.type)).reduce((s,e)=>s+Number(e.amount),0);
+  const totalCredit = ledger.entries.filter(e=>_bankEntryIsCredit(e)).reduce((s,e)=>s+Number(e.amount),0);
+  const totalDebit  = ledger.entries.filter(e=>!_bankEntryIsCredit(e)).reduce((s,e)=>s+Number(e.amount),0);
   const closingBalance = Number(ledger.openingBalance||0) + totalCredit - totalDebit;
 
-  const periodCredit = entriesInRange.filter(e=>CREDIT_TYPES.includes(e.type)).reduce((s,e)=>s+Number(e.amount),0);
-  const periodDebit  = entriesInRange.filter(e=>!CREDIT_TYPES.includes(e.type)).reduce((s,e)=>s+Number(e.amount),0);
+  const periodCredit = entriesInRange.filter(e=>_bankEntryIsCredit(e)).reduce((s,e)=>s+Number(e.amount),0);
+  const periodDebit  = entriesInRange.filter(e=>!_bankEntryIsCredit(e)).reduce((s,e)=>s+Number(e.amount),0);
 
   const acctTabsHtml = `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;align-items:center">
     ${Object.keys(DB.bankAccounts).map(id=>`<button class="btn btn-sm ${id===_activeBankAccountId?'btn-primary':'btn-ghost'}" onclick="setActiveBankAccount('${id}')">🏦 ${DB.bankAccounts[id].name}</button>`).join('')}
@@ -4519,8 +4561,15 @@ function renderBankLedger(){
     </div>
     <div class="card">
       <div class="card-title">➕ Add Bank Transaction</div>
-      <div class="form-group"><label class="form-label">Type</label>
-        <select class="form-input form-select" id="bl-type">${BANK_ENTRY_TYPES.map(t=>`<option value="${t}">${t}</option>`).join('')}</select>
+      <div class="form-group"><label class="form-label">Direction</label>
+        <select class="form-input form-select" id="bl-direction" onchange="_updateBankHeadOptions()">
+          <option value="in">💰 Money In</option>
+          <option value="out">💸 Money Out</option>
+        </select>
+      </div>
+      <div class="form-group"><label class="form-label">Head / Account</label>
+        <input class="form-input" id="bl-head" list="bl-head-suggestions" placeholder="e.g. Vendor Payment">
+        <datalist id="bl-head-suggestions"></datalist>
       </div>
       <div class="form-group"><label class="form-label">Amount (₹) *</label><input class="form-input" id="bl-amount" type="number"></div>
       <div class="form-group"><label class="form-label">Date</label><input class="form-input" id="bl-date" type="date" value="${today()}"></div>
@@ -4546,8 +4595,8 @@ function renderBankLedger(){
         <tbody>
           ${entriesInRange.slice().reverse().map(e=>{
             const idx = ledger.entries.indexOf(e);
-            const isCredit = CREDIT_TYPES.includes(e.type);
-            return `<tr><td style="font-size:11px">${e.date}</td><td><span class="badge ${isCredit?'badge-green':'badge-red'}">${e.type}</span></td><td>${e.note||'-'}</td><td style="font-weight:700;color:${isCredit?'var(--emerald)':'var(--danger)'}">${isCredit?'+':'-'}${fmt(e.amount)}</td><td><button class="btn btn-ghost btn-sm" onclick="deleteBankEntry(${idx})">🗑</button></td></tr>`;
+            const isCredit = _bankEntryIsCredit(e);
+            return `<tr><td style="font-size:11px">${e.date}</td><td><span class="badge ${isCredit?'badge-green':'badge-red'}">${_bankEntryHead(e)}</span></td><td>${e.note||'-'}</td><td style="font-weight:700;color:${isCredit?'var(--emerald)':'var(--danger)'}">${isCredit?'+':'-'}${fmt(e.amount)}</td><td><button class="btn btn-ghost btn-sm" onclick="deleteBankEntry(${idx})">🗑</button></td></tr>`;
           }).join('') || '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">No bank transactions in this period</td></tr>'}
         </tbody>
       </table>
@@ -4557,6 +4606,16 @@ function renderBankLedger(){
     </div>
   </div>
   `;
+  _updateBankHeadOptions();
+}
+
+// v25: repopulate the Head/Account suggestion list whenever Direction changes
+function _updateBankHeadOptions(){
+  const dirEl = document.getElementById('bl-direction');
+  const dl = document.getElementById('bl-head-suggestions');
+  if (!dirEl || !dl) return;
+  const list = dirEl.value === 'out' ? BANK_HEADS_OUT : BANK_HEADS_IN;
+  dl.innerHTML = list.map(h=>`<option value="${h}">`).join('');
 }
 
 function saveBankOpeningBalance(){
@@ -4582,17 +4641,20 @@ function quickAddBankEntry(){
 
 function addBankEntry(){
   _ensureBankAccounts();
-  const type = document.getElementById('bl-type').value;
+  const direction = document.getElementById('bl-direction').value; // 'in' | 'out'
+  const head = document.getElementById('bl-head').value.trim() || (direction==='in' ? 'Other Income' : 'Other Payment');
   const amount = document.getElementById('bl-amount').value;
   if (!amount || Number(amount) <= 0) { toast('Enter a valid amount','error'); return; }
   DB.bankAccounts[_activeBankAccountId].entries.push({
-    type, amount: Number(amount),
+    direction, head, type: head, // `type` kept in sync for any older code path that still reads it
+    amount: Number(amount),
     date: document.getElementById('bl-date').value || today(),
     note: document.getElementById('bl-note').value.trim()
   });
-  logAudit('add','Bank Ledger', DB.bankAccounts[_activeBankAccountId].name+': '+type+' '+fmt(Number(amount)));
+  logAudit('add','Bank Ledger', DB.bankAccounts[_activeBankAccountId].name+': '+head+' '+fmt(Number(amount)));
   saveDB();
   document.getElementById('bl-amount').value='';
+  document.getElementById('bl-head').value='';
   document.getElementById('bl-note').value='';
   renderBankLedger();
   toast('✅ Bank transaction added!', 'success');
@@ -5958,7 +6020,7 @@ function _stmtBankBook(range, txns){
   const accountRows = Object.values(DB.bankAccounts).map(ledger=>{
     const entries = ledger.entries.filter(e=>{const d=new Date(e.date);return d>=range.from&&d<=range.to;});
     let running = Number(ledger.openingBalance||0);
-    const combined = entries.map(e=>({date:e.date, desc:e.type+(e.note?' — '+e.note:''), credit:['Deposit','Interest'].includes(e.type)?Number(e.amount):0, debit:['Deposit','Interest'].includes(e.type)?0:Number(e.amount)}))
+    const combined = entries.map(e=>({date:e.date, desc:_bankEntryHead(e)+(e.note?' — '+e.note:''), credit:_bankEntryIsCredit(e)?Number(e.amount):0, debit:_bankEntryIsCredit(e)?0:Number(e.amount)}))
       .sort((a,b)=>new Date(a.date)-new Date(b.date));
     const rows = combined.map(e=>{
       running += e.credit - e.debit;
@@ -7124,6 +7186,12 @@ function setAcctType(type) {
     document.getElementById('acct-type-debtor').style.color = 'var(--muted)';
   }
 }
+// v25: show "Paid Via" only when there's actually a paid amount to log
+function _toggleAcctPaidFields(){
+  const status = document.getElementById('acct-status').value;
+  const row = document.getElementById('acct-paid-mode-row');
+  if (row) row.style.display = (status==='paid'||status==='partial') ? 'flex' : 'none';
+}
 function openAcctEntryModal(id) {
   document.getElementById('acctModalTitle').textContent = id ? '📒 Edit Entry' : '📒 Add Accounting Entry';
   document.getElementById('acct-edit-id').value = id || '';
@@ -7134,6 +7202,7 @@ function openAcctEntryModal(id) {
   document.getElementById('acct-due').value = '';
   document.getElementById('acct-status').value = 'outstanding';
   document.getElementById('acct-paid-amt').value = '';
+  document.getElementById('acct-paid-mode').value = 'Cash';
   document.getElementById('acct-notes').value = '';
   setAcctType('debtor');
   if (id !== undefined && id !== '') {
@@ -7145,10 +7214,12 @@ function openAcctEntryModal(id) {
       document.getElementById('acct-due').value = e.due || '';
       document.getElementById('acct-status').value = e.status || 'outstanding';
       document.getElementById('acct-paid-amt').value = e.paidAmt || '';
+      document.getElementById('acct-paid-mode').value = e.paidMode || 'Cash';
       document.getElementById('acct-notes').value = e.notes || '';
       setAcctType(e.type || 'debtor');
     }
   }
+  _toggleAcctPaidFields();
   openModal('acctEntryModal');
 }
 let _acctSaveInProgress = false;
@@ -7162,17 +7233,52 @@ function saveAcctEntry() {
   if (!amount) { toast('Enter a valid amount', 'error'); return; }
   if (!DB.accounting) DB.accounting = [];
   const editId = document.getElementById('acct-edit-id').value;
+  const status = document.getElementById('acct-status').value;
+  const paidAmt = parseFloat(document.getElementById('acct-paid-amt').value) || 0;
+  const paidMode = document.getElementById('acct-paid-mode').value;
+  const acctType = document.getElementById('acct-type-val').value; // debtor | creditor
+  const existing = editId ? DB.accounting.find(x => x.id === editId) : null;
   const entry = {
     id: editId || Date.now().toString(),
     name,
-    type: document.getElementById('acct-type-val').value,
+    type: acctType,
     amount,
     date: document.getElementById('acct-date').value || today(),
     due: document.getElementById('acct-due').value || '',
-    status: document.getElementById('acct-status').value,
-    paidAmt: parseFloat(document.getElementById('acct-paid-amt').value) || 0,
-    notes: document.getElementById('acct-notes').value.trim()
+    status,
+    paidAmt,
+    paidMode,
+    notes: document.getElementById('acct-notes').value.trim(),
+    linkedTxId: existing ? existing.linkedTxId : null
   };
+  // v25 FIX (#2): Accounting Entries had no Cash/Bank field, so a marked-
+  // "Paid" debtor/creditor entry never actually moved money in Cash & Bank
+  // — you could mark a loan/vendor payment as Paid and it just vanished
+  // from the cash picture. Now, whenever there's a paid amount, a matching
+  // transaction is auto-created/kept in sync in Cash & Bank so the account
+  // it was actually paid from/to is visible everywhere (Reports, Cash
+  // Book, Bank Book) — and removed again if you switch back to Outstanding.
+  const shouldHaveTx = (status === 'paid' || status === 'partial') && paidAmt > 0;
+  if (shouldHaveTx) {
+    // debtor = money coming IN when paid; creditor = money going OUT when paid
+    const txType = acctType === 'debtor' ? 'income' : 'expense';
+    let tx = entry.linkedTxId ? DB.transactions.find(t => t.acctLinkId === entry.linkedTxId) : null;
+    if (tx) {
+      tx.desc = name; tx.amount = paidAmt; tx.type = txType; tx.date = entry.date; tx.mode = paidMode;
+      tx.cat = acctType === 'debtor' ? 'Customer Payment' : 'Vendor Payment';
+    } else {
+      entry.linkedTxId = 'acct_' + entry.id;
+      DB.transactions.push({
+        desc: name, amount: paidAmt, type: txType, date: entry.date, mode: paidMode,
+        cat: acctType === 'debtor' ? 'Customer Payment' : 'Vendor Payment',
+        notes: 'Auto-logged from Accounting Entry', acctLinkId: entry.linkedTxId
+      });
+    }
+  } else if (entry.linkedTxId) {
+    // Switched back to Outstanding / cleared paid amount — remove the linked cash movement
+    DB.transactions = DB.transactions.filter(t => t.acctLinkId !== entry.linkedTxId);
+    entry.linkedTxId = null;
+  }
   if (editId) {
     const idx = DB.accounting.findIndex(x => x.id === editId);
     if (idx >= 0) DB.accounting[idx] = entry; else DB.accounting.push(entry);
@@ -7186,6 +7292,8 @@ function saveAcctEntry() {
 }
 function deleteAcctEntry(id) {
   if (!confirm('Delete this entry?')) return;
+  const e = (DB.accounting || []).find(x => x.id === id);
+  if (e && e.linkedTxId) DB.transactions = DB.transactions.filter(t => t.acctLinkId !== e.linkedTxId);
   DB.accounting = (DB.accounting || []).filter(x => x.id !== id);
   saveDB();
   toast('Entry deleted', 'info');
@@ -7196,6 +7304,20 @@ function markAcctPaid(id) {
   if (!e) return;
   e.status = 'paid';
   e.paidAmt = e.amount;
+  e.paidMode = e.paidMode || 'Cash';
+  // v25: keep this in sync with the full save flow — also logs the cash movement
+  const txType = e.type === 'debtor' ? 'income' : 'expense';
+  let tx = e.linkedTxId ? DB.transactions.find(t => t.acctLinkId === e.linkedTxId) : null;
+  if (tx) {
+    tx.desc = e.name; tx.amount = e.paidAmt; tx.type = txType; tx.date = e.date; tx.mode = e.paidMode;
+  } else {
+    e.linkedTxId = 'acct_' + e.id;
+    DB.transactions.push({
+      desc: e.name, amount: e.paidAmt, type: txType, date: e.date, mode: e.paidMode,
+      cat: e.type === 'debtor' ? 'Customer Payment' : 'Vendor Payment',
+      notes: 'Auto-logged from Accounting Entry', acctLinkId: e.linkedTxId
+    });
+  }
   saveDB();
   toast('Marked as Paid ✅', 'success');
   renderAccounting();
@@ -7600,6 +7722,7 @@ let _userIsNew = false; // set true ONLY on fresh registration, never on login
 // This flag lets those screens show a "loading" state instead of the
 // setup form until we actually know whether cloud has data.
 let _cloudFetchDone = true; // true = safe to trust DB.cashSettings right now
+let _cashSetupRetryDone = false; // v25: one extra direct check before showing the Opening Cash form (reset per login)
 
 function getUsers() {
   try { return JSON.parse(localStorage.getItem(AUTH_STORE_KEY) || '{}'); } catch(e) { return {}; }
@@ -8945,6 +9068,7 @@ function enterApp() {
     // v23 FIX: until this settles, Cash & Bank / Reports must not trust
     // an empty-looking DB.cashSettings — see _cloudFetchDone declaration.
     _cloudFetchDone = false;
+    _cashSetupRetryDone = false;
     // v24 FIX: 10s was too tight on slower mobile connections (common on
     // Indian mobile networks) — if the cloud fetch didn't answer in time,
     // _cloudFetchDone still flipped to true with NO cloud data merged in,
