@@ -385,6 +385,7 @@ window.INV_MASTER_DB = localStorage.getItem('bnx_master_db_id') || '';
 window.INV_TXN_DB    = localStorage.getItem('bnx_transaction_db_id') || '';
 window.INV_REPORT_DB = localStorage.getItem('bnx_report_db_id') || '';
 </script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 </head>
 <body class="t-blue">
 <div class="sb-backdrop" id="sbBd" onclick="closeSB()"></div>
@@ -6470,7 +6471,293 @@ function loadRoleUsers(){
 }
 
 // ── Import / Export helpers ────────────────────────────────
-function handleImport(input){const f=input.files[0];if(!f)return;toast('Parsing '+f.name+'...','');setTimeout(()=>{document.getElementById('imp-preview').innerHTML=`<div class="alert g">✅ File parsed: <strong>${f.name}</strong> — Ready to import. Click import to proceed.</div><button class="btn p" onclick="toast('Import complete ✓ — Data loaded','s')">📥 Import Now</button>`;},800);}
+// ══════════════════════════════════════════════════════════════════
+//  v30 FIX: handleImport() used to be entirely fake — it never read the
+//  uploaded file at all, just showed a canned "File parsed ✓" message
+//  after a timeout regardless of what (or whether) a file was chosen.
+//  This is a real parser for the two actual Tally-style report exports
+//  Balaji's clients use (STORE_PURCHASE_REGISTER, STORE_ISSUE) — these
+//  are PRINTED REPORT exports, not flat data tables: a company
+//  letterhead and report title sit above the real headers, and each
+//  bill/issue's header row is followed by one or more indented item
+//  rows below it, Tally-style. This walks the raw grid (not
+//  sheet_to_json's row-1-header assumption, which would fail here),
+//  detects which format was uploaded, skips the letterhead, and
+//  reconstructs each bill/issue with its line items.
+//  NOTE: this export format has no GST breakdown per line — taxable is
+//  set equal to total and CGST/SGST default to 0; edit any imported
+//  invoice afterward if GST needs to be split out.
+// ══════════════════════════════════════════════════════════════════
+let _importParsedRows = null; // {type, records} — staged until "Import Now" is clicked
+function excelDateToStr(v){
+  if (typeof v === 'number') {
+    const d = XLSX.SSF.parse_date_code(v);
+    if (d) return `${d.y}-${String(d.m).padStart(2,'0')}-${String(d.d).padStart(2,'0')}`;
+  }
+  const s = String(v||'').trim();
+  return s || today();
+}
+function handleImport(input){
+  const f = input.files[0];
+  if (!f) return;
+  toast('Reading '+f.name+'…','');
+  const reader = new FileReader();
+  reader.onload = function(e){
+    try {
+      const wb = XLSX.read(e.target.result, {type:'binary', cellDates:false});
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:'', raw:true});
+      const parsed = parseTallyReport(rows);
+      if (!parsed) {
+        document.getElementById('imp-preview').innerHTML = '<div class="alert r">⚠️ Could not recognize this file\'s format. Supported: Purchase Register, Issue Register (Tally-style exports). Try Master Hub\'s own template instead if this is master data.</div>';
+        return;
+      }
+      _importParsedRows = parsed;
+      const labels = {purchase:'Purchase Register', issue:'Issue Register', stockin:'Item-wise Stock In', summary:'Purchase Summary (monthly reference)'};
+      const label = labels[parsed.type] || parsed.type;
+      const itemCount = parsed.type==='purchase'||parsed.type==='issue'
+        ? parsed.records.reduce((s,r)=>s+r.items.length,0)+' line item(s)'
+        : parsed.records.length+' row(s)';
+      document.getElementById('imp-preview').innerHTML = '<div class="alert g">✅ Recognized as <strong>'+label+'</strong> — '+parsed.records.length+' record(s), '+itemCount+' found in <strong>'+f.name+'</strong>.</div>'
+        + '<button class="btn p" onclick="commitParsedImport()">📥 Import Now</button>';
+    } catch(err) {
+      document.getElementById('imp-preview').innerHTML = '<div class="alert r">⚠️ Could not read this file: '+err.message+'</div>';
+    }
+  };
+  reader.readAsBinaryString(f);
+}
+// Detects format by scanning the first ~20 rows for recognizable header
+// keywords (real headers sit several rows below the letterhead/title),
+// then walks the remaining rows: a row with a bill/issue-header shape
+// starts a new record; a row with only item-shaped content is a line
+// item under whatever record came before it; anything else is skipped
+// (blank spacer rows, stray totals).
+function parseTallyReport(rows){
+  let headerRow = -1, mode = null;
+  for (let i=0; i<Math.min(20, rows.length); i++){
+    const line = rows[i].map(c=>String(c||'').toLowerCase());
+    const text = line.join('|');
+    if (text.includes('bill date') && (text.includes('grn') || text.includes('bill no'))){
+      headerRow = i; mode = 'purchase'; break;
+    }
+    if (text.includes('sl no') && text.includes('item')){
+      headerRow = i; mode = 'issue'; break;
+    }
+    // v30: flat stock-in report — real header row, no letterhead offset
+    // trickery beyond skipping to it (unlike purchase/issue above, this
+    // one has NO grouped/multi-row records — every row stands alone).
+    if (text.includes('itemtypename') && text.includes('quantity')){
+      return parseStockInFlat(rows, i);
+    }
+    // v30: multi-month pivot summary — Supplier Name super-header row
+    // followed by a Qty/Amount-per-month sub-header row.
+    if (text.includes('supplier name') && rows[i+1] && rows[i+1].join('|').toLowerCase().includes('qty')){
+      return parsePurchaseSummaryPivot(rows, i);
+    }
+  }
+  if (headerRow === -1) return null;
+
+  const records = [];
+  let current = null;
+  for (let i=headerRow+1; i<rows.length; i++){
+    const r = rows[i];
+    const nonEmpty = r.map((c,idx)=>({idx,v:c})).filter(x=>String(x.v).trim()!=='');
+    if (!nonEmpty.length) continue; // blank spacer row
+
+    if (mode === 'purchase'){
+      // A bill-header row has a numeric (Excel date serial) value
+      // somewhere alongside text elsewhere on the same row — item rows
+      // never carry a date. Ref No / GRN No / Supplier Name occupy the
+      // earlier columns; Item / Qty / Rate / Amount occupy later ones.
+      const dateCell = nonEmpty.find(x=>typeof x.v==='number' && x.v>40000 && x.v<60000);
+      const hasSupplierIsh = nonEmpty.some(x=>typeof x.v==='string' && x.v.length>3 && isNaN(Number(x.v)));
+      if (dateCell && hasSupplierIsh && nonEmpty.length>=2){
+        if (current) records.push(current);
+        const texts = nonEmpty.filter(x=>x.idx!==dateCell.idx && typeof x.v==='string');
+        current = {
+          ref_no: texts[0] ? texts[0].v : '',
+          date: excelDateToStr(dateCell.v),
+          bill_no: texts[1] ? texts[1].v : (texts[0] ? texts[0].v : ''),
+          party_name: texts[texts.length-1] ? texts[texts.length-1].v : 'Unknown Supplier',
+          items: []
+        };
+      } else if (current && nonEmpty.length>=3) {
+        // item row: text (name) + at least 2 numeric cells (qty, rate/amount)
+        const nums = nonEmpty.filter(x=>typeof x.v==='number');
+        const txt = nonEmpty.find(x=>typeof x.v==='string');
+        if (txt && nums.length>=2){
+          const qty = nums[0].v, rate = nums[1].v, amount = nums[nums.length-1].v;
+          current.items.push({ item_name: txt.v, qty, rate, amount: amount||qty*rate });
+        }
+      }
+    } else if (mode === 'issue'){
+      // Group rows (Location, e.g. "BAKERY") have exactly ONE text cell
+      // and nothing else. Issue-header rows carry a voucher no + date.
+      // Item rows carry item name + qty.
+      if (nonEmpty.length===1 && typeof nonEmpty[0].v==='string'){
+        current = current || {};
+        current._group = nonEmpty[0].v; // carries forward as "department"
+        continue;
+      }
+      const dateCell = nonEmpty.find(x=>typeof x.v==='number' && x.v>40000 && x.v<60000);
+      if (dateCell){
+        const carriedGroup = current && current._group;
+        if (current && current.date) records.push(current);
+        const texts = nonEmpty.filter(x=>x.idx!==dateCell.idx && typeof x.v==='string');
+        current = { _group: carriedGroup, ref_no: texts[0]?texts[0].v:'', date: excelDateToStr(dateCell.v), dept: carriedGroup||'General', items: [] };
+      } else if (current && current.date && nonEmpty.length>=2){
+        const nums = nonEmpty.filter(x=>typeof x.v==='number');
+        const txt = nonEmpty.find(x=>typeof x.v==='string');
+        if (txt && nums.length>=1){
+          current.items.push({ item_name: txt.v, qty: nums[0].v });
+        }
+      }
+    }
+  }
+  if (current && (current.date)) records.push(current);
+  return { type: mode, records: records.filter(r=>r.items && r.items.length) };
+}
+
+// v30: STORE_ITEM_TYPE_WISE_STOCK_IN — genuinely flat, one full record
+// per row (ItemType/Item/UOM/Qty/Rate/Gross/Discount/CGST/SGST columns
+// by name, order can vary so headers are matched by name not position).
+function parseStockInFlat(rows, headerRowIdx){
+  const headers = rows[headerRowIdx].map(h=>String(h||'').trim().toUpperCase());
+  const col = name => headers.indexOf(name);
+  const iType=col('ITEMTYPENAME'), iItem=col('ITEM'), iUom=col('UOM'), iQty=col('QUANTITY'),
+        iRate=col('RATE'), iGross=col('GROSSAMOUNT'), iDisc=col('DISCOUNT');
+  const records = [];
+  for (let i=headerRowIdx+1; i<rows.length; i++){
+    const r = rows[i];
+    const item = r[iItem];
+    if (!item || String(item).trim()==='') continue;
+    records.push({
+      item_type: r[iType]||'', item_name: String(item).trim(), uom: r[iUom]||'',
+      qty: Number(r[iQty])||0, rate: Number(r[iRate])||0,
+      gross: Number(r[iGross])||0, discount: Number(r[iDisc])||0
+    });
+  }
+  return { type: 'stockin', records };
+}
+
+// v30: STORE_PURCHASE_SUMMARY — a multi-month PIVOT, not individual
+// transactions (Supplier Name / Item Name rows, with a Qty+Amount
+// column-pair repeating per month). Column positions for each month's
+// Qty/Amount pair are irregular (merged cells shift them), so they're
+// detected dynamically from the two header rows rather than assumed
+// at fixed offsets. This is reference/aggregate data — imported into
+// its own table, NOT fabricated into fake individual purchase bills
+// (there's no real bill number or exact date to attach to them).
+function parsePurchaseSummaryPivot(rows, supplierHeaderRow){
+  const monthRow = rows[supplierHeaderRow];
+  const subRow = rows[supplierHeaderRow+1];
+  const months = [];
+  let curMonth = null;
+  for (let c=0; c<Math.max(monthRow.length, subRow.length); c++){
+    const monthName = String(monthRow[c]||'').trim();
+    if (monthName) curMonth = monthName;
+    const label = String(subRow[c]||'').trim().toLowerCase();
+    if (curMonth && label==='qty'){
+      // find the matching "Amount" column — next non-empty sub-header after this one
+      let amtCol = -1;
+      for (let c2=c+1; c2<subRow.length; c2++){
+        const l2 = String(subRow[c2]||'').trim().toLowerCase();
+        if (l2==='amount'){ amtCol=c2; break; }
+        if (l2==='qty') break; // hit the next month's Qty first — no Amount for this one
+      }
+      months.push({ month: curMonth, qtyCol: c, amtCol });
+      curMonth = null; // consumed — wait for next month name before matching another Qty
+    }
+  }
+  const records = [];
+  let currentSupplier = '';
+  for (let i=supplierHeaderRow+2; i<rows.length; i++){
+    const r = rows[i];
+    const nonEmpty = r.map((c,idx)=>({idx,v:c})).filter(x=>String(x.v).trim()!=='');
+    if (!nonEmpty.length) continue;
+    if (nonEmpty.length===1 && typeof nonEmpty[0].v==='string'){
+      currentSupplier = nonEmpty[0].v; continue; // supplier group row
+    }
+    const itemName = r[1]; // Item Name sits in the same column as Supplier Name (col 1)
+    if (!itemName) continue;
+    months.forEach(m=>{
+      const qty = Number(r[m.qtyCol])||0;
+      const amt = m.amtCol>-1 ? (Number(r[m.amtCol])||0) : 0;
+      if (qty || amt){
+        records.push({ supplier: currentSupplier, item_name: String(itemName).trim(), month: m.month, qty, amount: amt });
+      }
+    });
+  }
+  return { type: 'summary', records };
+}
+function commitParsedImport(){
+  if (!_importParsedRows || !_importParsedRows.records.length){ toast('Nothing staged to import','e'); return; }
+  const { type, records } = _importParsedRows;
+  let count = 0;
+  if (type === 'purchase'){
+    records.forEach(r=>{
+      const total = r.items.reduce((s,it)=>s+(it.amount||0),0);
+      const pi = {
+        _id: uid('PI'), inv_no: r.bill_no || r.ref_no, inv_date: r.date,
+        party_id: null, party_name: r.party_name, status: 'unpaid', due_date:'',
+        taxable: total, cgst: 0, sgst: 0, igst: 0, total,
+        items: r.items.map(it=>({ item_name: it.item_name, hsn:'', qty: it.qty, rate: it.rate, gst_rate:0, cgst:0, sgst:0, amount: it.amount }))
+      };
+      DB.insert('purchase_invoices', pi);
+      count++;
+    });
+    loadPurchaseRegister();
+  } else if (type === 'issue'){
+    records.forEach(r=>{
+      const total = r.items.reduce((s,it)=>s+(it.qty||0),0);
+      DB.insert('dept_issues', {
+        _id: uid('ISS'), date: r.date, dept: r.dept || 'General', issued_to:'', wh_id:'',
+        purpose:'Imported from Issue Register', ack_required:'no', ack_status:'acknowledged',
+        items: r.items.map(it=>({ item_name: it.item_name, qty: it.qty })),
+        total, issued_by: (typeof SESSION!=='undefined'&&SESSION.name)||'Import'
+      });
+      count++;
+    });
+    loadIssueRegister();
+  } else if (type === 'stockin'){
+    // v30: matches each row to an existing item by name (case-insensitive);
+    // if no match, still records the movement with item_id null so the
+    // quantity/value isn't silently lost — item_name is kept on the
+    // ledger entry either way for reference and can be reconciled later.
+    const allItems = DB.all('items');
+    const importDate = today();
+    records.forEach(r=>{
+      const match = allItems.find(it=>(it.name||'').trim().toLowerCase()===r.item_name.toLowerCase());
+      const prevBalance = match ? (DB.all('stock_ledger').filter(l=>l.item_id===match._id).slice(-1)[0]?.balance||0) : 0;
+      DB.insert('stock_ledger', {
+        _id: uid('SL'), item_id: match ? match._id : null, item_name: r.item_name, item_type: r.item_type,
+        wh_id: 'WH001', date: importDate, txn_type: 'stock_in_import',
+        qty_in: r.qty, qty_out: 0, balance: prevBalance + r.qty,
+        rate: r.rate, value: r.gross - (r.discount||0), _ts: (typeof now==='function'?now():Date.now())
+      });
+      count++;
+    });
+    toast(count+' stock-in row(s) added to Stock Ledger — items not matched by name still recorded (with the name shown), for reconciliation.','s');
+  } else if (type === 'summary'){
+    // v30: this is aggregate monthly reference data, not real individual
+    // transactions — no genuine bill number or exact date exists to
+    // attach to a fabricated invoice. Stored in its own table so it can
+    // be looked up (e.g. "what did we typically pay for Ice Cube in
+    // April") without polluting the real Purchase Register with entries
+    // that never actually happened as single bills.
+    records.forEach(r=>{
+      DB.insert('purchase_summary_monthly', {
+        _id: uid('PSM'), supplier_name: r.supplier, item_name: r.item_name,
+        month: r.month, qty: r.qty, amount: r.amount, _ts: (typeof now==='function'?now():Date.now())
+      });
+      count++;
+    });
+    toast(count+' monthly summary row(s) stored for reference (Supplier × Item × Month) — not added as individual purchase bills.','s');
+  }
+  document.getElementById('imp-preview').innerHTML = '<div class="alert g">✅ Imported '+count+' record(s) successfully.</div>';
+  _importParsedRows = null;
+  if (type==='purchase'||type==='issue') toast('Import complete ✓ — '+count+' record(s) loaded','s');
+}
 function downloadTemplate(type){const headers={items:'Item Code,Item Name,Category,Brand,HSN,Unit,Purchase Rate,GST%,Min Stock,Max Stock',vendors:'Vendor Name,GSTIN,Phone,Email,Credit Days,Credit Limit,Opening Balance',opening:'Item Code,Item Name,Warehouse,Qty,Rate',purchase:'Invoice No,Date,Supplier,Item,Qty,Rate,GST%'};const csv=headers[type];const blob=new Blob([csv+'\n'],{type:'text/csv'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='template_'+type+'.csv';a.click();toast('Template downloaded ✓','s');}
 // testAPIEndpoint is now the async version above
 function triggerGSheetSync(){const id=document.getElementById('gs-sheet-id')?.value;if(!id){toast('Enter Google Sheet ID','w');return;}const log=document.getElementById('gs-log');if(log){const t=new Date().toLocaleTimeString('en-IN');log.innerHTML+=`<div style="color:var(--green);">[${t}] Sync initiated...</div><div style="color:var(--muted);">[${t}] Items exported: ${DB.all('items').length}</div><div style="color:var(--muted);">[${t}] Stock records: ${DB.all('stock_ledger').length}</div><div style="color:var(--green);">[${t}] Sync complete ✓</div>`;}toast('Google Sheets sync complete ✓','s');}
