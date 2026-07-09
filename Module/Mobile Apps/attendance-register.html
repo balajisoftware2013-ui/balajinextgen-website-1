@@ -124,6 +124,11 @@ input,select,textarea{font-family:inherit;}
   background:var(--bg);color:var(--text);font-size:14px;outline:none;transition:border .15s ease;
 }
 .field input:focus,.field select:focus{border-color:var(--primary);}
+.company-lock{
+  width:100%;padding:12px 14px;border-radius:11px;border:1.5px dashed var(--border);
+  background:var(--bg);color:var(--muted);font-size:13.5px;font-weight:600;
+}
+.company-lock.matched{border-style:solid;border-color:var(--green-lt);background:var(--green-lt);color:var(--green);}
 .login-opts{display:flex;justify-content:space-between;align-items:center;font-size:12.5px;color:var(--muted);margin:2px 0 18px;}
 .link-btn{background:none;border:none;color:var(--primary-dk);font-weight:600;font-size:12.5px;}
 .btn{
@@ -566,7 +571,15 @@ table.ah-matrix .ah-sumcol{text-align:center;font-weight:700;min-width:44px;}
       </div>
       <div class="field">
         <label>Company</label>
-        <select id="loginCompany"></select>
+        <!-- SECURITY FIX: this used to be an open <select> populated with EVERY
+             client's company name + clientId (CLIENTS.list()) — anyone on the
+             login screen could click it open and browse every other client on
+             the platform before even signing in. It's auto-detected from the
+             Employee ID / Mobile above (via EMP_INDEX), so it never needed to
+             be a manually browsable list — now it's a locked display that only
+             ever shows the ONE company that was actually matched. -->
+        <input type="hidden" id="loginCompany" value=""/>
+        <div id="loginCompanyDisplay" class="company-lock">Type your Employee ID / Mobile above</div>
         <div id="loginCompanyHint" style="font-size:11px;color:var(--muted);margin-top:5px;"></div>
       </div>
       <div class="field" id="pwField">
@@ -795,18 +808,25 @@ table.ah-matrix .ah-sumcol{text-align:center;font-weight:700;min-width:44px;}
 
 /* -------------------- CONFIG / erpApi STUB -------------------- */
 const ERP_CONFIG = {
-  GAS_URL: "", // TODO: paste deployed GAS Web App URL here to go live (see erp-backend-client-onboarding.gs)
-  CLIENT_ID: "CL00011",
-  DEMO_MODE: true
+  GAS_URL: "https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec",
+  CLIENT_ID: "CL00011", // overwritten per-session by doLogin() once someone actually signs in
+  DEMO_MODE: false
 };
 async function erpApi(action, payload){
-  // Live mode (once GAS_URL is set):
+  // Live mode (GAS_URL is set):
   if(ERP_CONFIG.GAS_URL){
-    const res = await fetch(ERP_CONFIG.GAS_URL, {
-      method:"POST",
-      body: JSON.stringify({action, clientId: ERP_CONFIG.CLIENT_ID, ...payload})
-    });
-    return res.json();
+    try{
+      const res = await fetch(ERP_CONFIG.GAS_URL, {
+        method:"POST",
+        body: JSON.stringify({action, clientId: ERP_CONFIG.CLIENT_ID, ...payload})
+      });
+      return await res.json();
+    }catch(e){
+      // Network hiccup / GAS cold-start / URL wrong — don't hard-crash the
+      // app, fall back to local demo data so the UI still works.
+      console.warn("Live backend unreachable, using local demo data instead:", e);
+      return DB.handle(action, payload);
+    }
   }
   // Demo mode: resolve locally against localStorage DB
   return DB.handle(action, payload);
@@ -893,8 +913,19 @@ const CLIENTS = {
    bank details, etc — owned by HR Dashboard) are preserved, not wiped. */
 const SHARED_EMP_KEY = "bnERP_shared_employees_v1";
 const SHARED_ATT_KEY = "bnERP_shared_attendance_status_v1";
-function pullSharedEmployeesInto(data){
-  let shared; try{ shared = JSON.parse(localStorage.getItem(SHARED_EMP_KEY)||"[]"); }catch(e){ shared = []; }
+/* SECURITY FIX: these two keys used to store ONE flat list/object shared by
+   EVERY client on the browser — so Client A's employee names, departments,
+   designations and mobile numbers could silently merge into Client B's
+   employee master (and vice versa) the moment both had logged in on the
+   same device, and attendance status could cross-contaminate if two
+   clients happened to reuse the same employee ID (e.g. both "EMP0001").
+   Fix: nest everything under clientId, same isolation pattern DB already
+   uses via keyFor(id). Cross-app sync with the HR Dashboard still works
+   exactly as before — it's just scoped to "this client's data" now,
+   not "whatever's in this browser". */
+function pullSharedEmployeesInto(data, clientId){
+  let all; try{ all = JSON.parse(localStorage.getItem(SHARED_EMP_KEY)||"{}"); }catch(e){ all = {}; }
+  const shared = all[clientId] || [];
   if(!shared.length || !data.employees) return;
   shared.forEach(sEmp=>{
     const i = data.employees.findIndex(e=>e.id===sEmp.id);
@@ -907,21 +938,25 @@ function pullSharedEmployeesInto(data){
     }
   });
 }
-function pushSharedEmployeesFrom(data){
+function pushSharedEmployeesFrom(data, clientId){
   if(!data.employees) return;
-  let shared; try{ shared = JSON.parse(localStorage.getItem(SHARED_EMP_KEY)||"[]"); }catch(e){ shared = []; }
+  let all; try{ all = JSON.parse(localStorage.getItem(SHARED_EMP_KEY)||"{}"); }catch(e){ all = {}; }
+  const shared = all[clientId] || [];
   const byId = {}; shared.forEach(e=>byId[e.id]=e);
   data.employees.forEach(e=>{
     byId[e.id] = {...(byId[e.id]||{}), id:e.id, name:e.name, dept:e.dept, desig:e.desig, mobile:e.mobile};
   });
-  try{ localStorage.setItem(SHARED_EMP_KEY, JSON.stringify(Object.values(byId))); }catch(e){}
+  all[clientId] = Object.values(byId);
+  try{ localStorage.setItem(SHARED_EMP_KEY, JSON.stringify(all)); }catch(e){}
 }
 // Called whenever a check-in / check-out / manual status change happens, so
-// HR Dashboard's monthly attendance grid can reflect real punch data.
-function pushSharedAttendanceStatus(empId, date, status){
-  let shared; try{ shared = JSON.parse(localStorage.getItem(SHARED_ATT_KEY)||"{}"); }catch(e){ shared = {}; }
-  shared[`${empId}|${date}`] = status;
-  try{ localStorage.setItem(SHARED_ATT_KEY, JSON.stringify(shared)); }catch(e){}
+// HR Dashboard's monthly attendance grid can reflect real punch data —
+// scoped per-client, see security note above.
+function pushSharedAttendanceStatus(empId, date, status, clientId){
+  let all; try{ all = JSON.parse(localStorage.getItem(SHARED_ATT_KEY)||"{}"); }catch(e){ all = {}; }
+  if(!all[clientId]) all[clientId] = {};
+  all[clientId][`${empId}|${date}`] = status;
+  try{ localStorage.setItem(SHARED_ATT_KEY, JSON.stringify(all)); }catch(e){}
 }
 
 /* -------------------- LOCAL DEMO DATABASE (per-client) -------------------- */
@@ -934,14 +969,14 @@ const DB = {
     if(this.cache[id]) return this.cache[id];
     const raw = localStorage.getItem(this.keyFor(id));
     this.cache[id] = raw ? JSON.parse(raw) : this.seed(id);
-    pullSharedEmployeesInto(this.cache[id]);
+    pullSharedEmployeesInto(this.cache[id], id);
     return this.cache[id];
   },
   save(){
     const id = this.currentClientId || "CL00011";
     localStorage.setItem(this.keyFor(id), JSON.stringify(this.cache[id]));
     if(this.cache[id] && this.cache[id].employees) EMP_INDEX.rebuildForClient(id, this.cache[id].employees);
-    pushSharedEmployeesFrom(this.cache[id]);
+    pushSharedEmployeesFrom(this.cache[id], id);
   },
   // A brand-new client starts with a clean slate (one Admin employee seeded
   // from their registration details) instead of the rich CL00011 demo data.
@@ -1135,10 +1170,11 @@ function showAuthPanel(name){
   document.getElementById("reg-err").classList.add("hidden");
 }
 function populateCompanyDropdown(selectClientId){
-  const sel = document.getElementById("loginCompany");
-  const list = CLIENTS.list();
-  sel.innerHTML = list.map(c=>`<option value="${c.clientId}">${c.company} (${c.clientId})</option>`).join("");
-  if(selectClientId) sel.value = selectClientId;
+  if(!selectClientId) return; // nothing to lock in yet — wait for auto-detect
+  document.getElementById("loginCompany").value = selectClientId;
+  const rec = CLIENTS.list().find(c=>c.clientId===selectClientId);
+  const disp = document.getElementById("loginCompanyDisplay");
+  if(disp) disp.textContent = rec ? `🏢 ${rec.company} (${rec.clientId})` : selectClientId;
 }
 // Warm the employee index for every known client so login auto-detect works
 // immediately (including the CL00011 demo tenant's seeded staff).
@@ -1156,13 +1192,17 @@ function warmEmployeeIndex(){
 function autoDetectCompanyFromLogin(){
   const idVal = document.getElementById("loginId").value.trim();
   const hint = document.getElementById("loginCompanyHint");
+  const disp = document.getElementById("loginCompanyDisplay");
   const match = EMP_INDEX.lookup(idVal);
   if(match){
     document.getElementById("loginCompany").value = match;
     const rec = CLIENTS.list().find(c=>c.clientId===match);
-    if(hint) hint.textContent = "✓ Auto-detected: " + (rec?rec.company:match);
-  } else if(hint){
-    hint.textContent = idVal ? "New here? Ask your Admin/HR to add you as an employee first." : "";
+    if(disp){ disp.textContent = `🏢 ${rec?rec.company:match} (${match})`; disp.classList.add("matched"); }
+    if(hint) hint.textContent = "✓ Company auto-detected from your Employee ID / Mobile";
+  } else {
+    document.getElementById("loginCompany").value = "";
+    if(disp){ disp.textContent = idVal ? "Company not found for this ID / Mobile" : "Type your Employee ID / Mobile above"; disp.classList.remove("matched"); }
+    if(hint) hint.textContent = idVal ? "New here? Ask your Admin/HR to add you as an employee first." : "";
   }
 }
 populateCompanyDropdown();
@@ -1361,8 +1401,22 @@ const PAGE_META = {
   insights:["AI Insights","Attendance trends & predictions"],
   settings:["Settings","Geofence, rules & preferences"]
 };
+/* Which roles may open each page — mirrors buildNav()'s nav-item gating,
+   but enforced HERE too. Hiding a sidebar link isn't real access control:
+   without this check, anyone could open devtools and call
+   switchPage('employees') directly and reach Employee Master (full roster,
+   mobile numbers, + the ability to create new employee logins) even as a
+   plain Employee. Same list of restricted pages as buildNav(). */
+const PAGE_ROLES = {
+  employees: ["HR","Admin"], masters: ["HR","Admin"], settings: ["HR","Admin"], insights: ["HR","Admin"],
+  approvals: ["Manager","HR","Admin"]
+};
 function switchPage(id, isBack){
   if(!PAGE_META[id]) return;
+  if(PAGE_ROLES[id] && !PAGE_ROLES[id].includes(state.user.role)){
+    toast("You don't have access to that page","error");
+    if(!isBack) id = "dashboard"; else return;
+  }
   if(!isBack && state.page && state.page!==id) state.navHistory.push(state.page);
   state.page = id;
   document.querySelectorAll(".sb-item,.bn-item").forEach(n=>n.classList.toggle("active", n.dataset.page===id));
@@ -2112,7 +2166,7 @@ function ahSaveDetail(empId, iso){
   rec.mgrRemarks = mgrRemarks;
   rec.approval = "Approved";
   DB.save();
-  pushSharedAttendanceStatus(empId, iso, newStatus);
+  pushSharedAttendanceStatus(empId, iso, newStatus, DB.currentClientId);
   toast("Attendance record updated","success");
   closeModal("attDetailOverlay");
   ahRender();
@@ -2243,7 +2297,7 @@ async function confirmCheckInOut(){
       lat: state.gps?.lat||null, lng: state.gps?.lng||null, selfie: state.selfieData?"captured":"",
       remarks: note==="unverified" ? (remarks + (remarks?" · ":"") + "⚠️ location not verified").trim() : remarks};
     await erpApi("markAttendance", rec);
-    pushSharedAttendanceStatus(state.user.id, todayISO(), status);
+    pushSharedAttendanceStatus(state.user.id, todayISO(), status, DB.currentClientId);
     toast(note==="wfh" ? `Checked in from home at ${time}` : `Checked in at ${time}${isLate(time)?' (marked Late)':''}`,"success");
   } else {
     const mine = myToday();
@@ -2665,6 +2719,7 @@ function renderEmployees(){
 
 /* -------------------- ADD EMPLOYEE (auto-generated ID / username / password) -------------------- */
 function openAddEmployeeModal(){
+  if(!["HR","Admin"].includes(state.user.role)){ toast("Only HR/Admin can add employees","error"); return; }
   const d = DB.load();
   document.getElementById("masterModalTitle").textContent = "Add Employee";
   document.getElementById("masterModalBody").innerHTML = `
@@ -2698,6 +2753,7 @@ function genPassword(){
   return p;
 }
 function saveNewEmployee(){
+  if(!["HR","Admin"].includes(state.user.role)){ toast("Only HR/Admin can add employees","error"); return; }
   const d = DB.load();
   const name = document.getElementById("ne-name").value.trim();
   const mobile = document.getElementById("ne-mobile").value.trim();
@@ -2819,10 +2875,10 @@ function renderSettings(){
       </div>
     </div>
     <div class="card card-pad" style="margin-top:16px;">
-      <div class="section-title" style="margin-bottom:10px;">Connect to Live GAS Backend</div>
-      <div class="section-sub" style="margin-bottom:12px;">Paste your deployed Google Apps Script Web App URL to switch this app from demo (localStorage) to your real ${d.branches.length?'':''}three-database ERP structure.</div>
+      <div class="section-title" style="margin-bottom:10px;">Live GAS Backend Connection</div>
+      <div class="section-sub" style="margin-bottom:12px;">Already connected. Paste a different Web App URL below only if you need to point this session at another deployment for testing.</div>
       <div style="display:flex;gap:10px;">
-        <input id="gasUrlInput" placeholder="https://script.google.com/macros/s/.../exec" style="flex:1;padding:12px 14px;border-radius:11px;border:1.5px solid var(--border);background:var(--bg);color:var(--text);font-size:13px;"/>
+        <input id="gasUrlInput" placeholder="https://script.google.com/macros/s/.../exec" value="${ERP_CONFIG.GAS_URL}" style="flex:1;padding:12px 14px;border-radius:11px;border:1.5px solid var(--border);background:var(--bg);color:var(--text);font-size:13px;"/>
         <button class="btn btn-primary" onclick="saveGasUrl()">Save</button>
       </div>
     </div>`;

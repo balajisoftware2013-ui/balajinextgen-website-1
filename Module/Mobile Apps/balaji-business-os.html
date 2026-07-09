@@ -718,9 +718,15 @@ body.mode-accountant .owner-hint{display:none;}
         <div style="font-size:11px;color:var(--ob-faint);font-weight:700;letter-spacing:.3px;">BUSINESS</div>
         <div id="welcomeBizName" style="font-size:14px;font-weight:800;color:var(--ob-heading);margin-bottom:10px;">—</div>
         <div style="font-size:11px;color:var(--ob-faint);font-weight:700;letter-spacing:.3px;">CLIENT ID</div>
-        <div id="welcomeClientId" style="font-size:14px;font-weight:800;color:var(--ob-heading);margin-bottom:10px;">—</div>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+          <div id="welcomeClientId" style="font-size:14px;font-weight:800;color:var(--ob-heading);flex:1;">—</div>
+          <button type="button" onclick="_copyWelcomeField('welcomeClientId')" style="border:1px solid var(--ob-border);background:#fff;border-radius:6px;padding:3px 8px;font-size:11px;cursor:pointer;">📋 Copy</button>
+        </div>
         <div style="font-size:11px;color:var(--ob-faint);font-weight:700;letter-spacing:.3px;">LOGIN ID (MOBILE)</div>
-        <div id="welcomeMobile" style="font-size:14px;font-weight:800;color:var(--ob-heading);">—</div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <div id="welcomeMobile" style="font-size:14px;font-weight:800;color:var(--ob-heading);flex:1;">—</div>
+          <button type="button" onclick="_copyWelcomeField('welcomeMobile')" style="border:1px solid var(--ob-border);background:#fff;border-radius:6px;padding:3px 8px;font-size:11px;cursor:pointer;">📋 Copy</button>
+        </div>
       </div>
       <div style="font-size:12px;color:var(--ob-faint2);margin-bottom:14px;">Please log in with your mobile number and the password you just created to enter your business.</div>
       <button class="btn btn-primary" style="width:100%;" onclick="goToLoginAfterRegister()">🔑 Continue to Login →</button>
@@ -2211,7 +2217,25 @@ async function submitRegister(){
       migrateData: (SESSION && SESSION.isDemo) ? DB : null
     })});
     const out = await res.json();
-    if(!out.success) throw new Error(out.message || 'Registration failed');
+    // v28 FIX: the server can say "no" for two very different reasons —
+    // (a) it never got the request at all (network/fetch failure — genuinely
+    //     "could not reach server"), or
+    // (b) it DID respond, perfectly correctly, saying "this mobile/email is
+    //     already registered" (out.duplicate === true).
+    // These used to be handled identically below, wrapping a clean, already
+    // helpful duplicate message in "Could not reach server: ..." — which
+    // reads as a connectivity problem when it's actually just validation.
+    // This is very likely what "already exist show then fixing option"
+    // was pointing at: the message was confusing, not obviously actionable.
+    if(!out.success){
+      if(out.duplicate){
+        obShow('ob-register');
+        msgEl.style.color='#c00';
+        msgEl.innerHTML = out.message + ' <a href="javascript:void(0)" onclick="goToLoginAfterRegister();document.getElementById(\'loginId\').value=\''+mobile.replace(/'/g,"\\'")+'\';" style="color:var(--primary);font-weight:800;text-decoration:underline;">Login Instead →</a>';
+        return;
+      }
+      throw new Error(out.message || 'Registration failed');
+    }
     // ── Data is prepared and cached locally, but we do NOT auto-enter
     // the app anymore. Instead show a Welcome screen with the new
     // Client ID, then require the owner to log in fresh with the
@@ -2348,6 +2372,20 @@ function applyFontSize(size){
   const saved = localStorage.getItem('BNOS_FONT_SIZE') || 'fs-normal';
   applyFontSize(saved);
 })();
+// v27: tap-to-copy for Client ID / Login ID on the post-registration
+// welcome screen — was plain text only, easy to mistype when writing it
+// down by hand.
+function _copyWelcomeField(elId){
+  const el = document.getElementById(elId);
+  if (!el) return;
+  const text = el.textContent.trim();
+  if (!text || text==='—') return;
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(text).then(()=>toast('📋 Copied: '+text)).catch(()=>toast('Could not copy — select and copy manually'));
+  } else {
+    toast('Copy not supported — select and copy manually');
+  }
+}
 function setTheme(t){
   document.body.classList.remove('theme-trustline','theme-mango','theme-sunset','theme-amberGold','theme-coral','theme-tangerine','theme-cloudflare','theme-chatgpt','theme-tally','theme-icici');
   document.body.classList.add(t);
@@ -5565,7 +5603,85 @@ function bankAdjust(amt){ // credits/debits the primary bank account, keeps DB.b
   DB.bankAccounts[0].balance += amt;
   recalcBankTotal();
 }
+// ══════════════════════════════════════════════════════════════════
+//  v28: CLIENT DATABASE AUTO-UPGRADE
+//
+//  Every client's actual data lives in THEIR OWN Google Sheet (cloned
+//  from the template at registration, loaded/saved via SUITE_LOAD_DB /
+//  SUITE_SAVE_DB as one JSON blob). A client who registered months ago
+//  has an older-shaped DB than what this current HTML file now expects
+//  (expense categories, purchase GST fields, bank ledger direction/head,
+//  etc. didn't exist yet when their data was created).
+//
+//  This runs once per load, is safe to run every time (each step only
+//  acts on data that's actually missing the new shape), and permanently
+//  WRITES the upgraded shape back into DB — not just a runtime fallback
+//  — so the client's saved database itself is brought current, same as
+//  normalizeBankAccounts()/normalizeInvoiceSettings() already did for
+//  bank accounts and invoice settings. DB.schemaVersion tracks how far
+//  a given client's database has been upgraded, so future additions can
+//  each be gated the same way without re-running old steps forever.
+// ══════════════════════════════════════════════════════════════════
+const CLIENT_DB_SCHEMA_VERSION = 2;
+function autoUpgradeClientDB(){
+  const startVersion = DB.schemaVersion || 0;
+  if (startVersion >= CLIENT_DB_SCHEMA_VERSION) return; // already current
+
+  let upgraded = false;
+
+  // Step 1 (schema v1): custom Expense accounts list must exist as an array
+  if (!Array.isArray(DB.expenseCats)) { DB.expenseCats = []; upgraded = true; }
+
+  // Step 1 (schema v1): older purchase records saved before GST tracking
+  // existed have no taxable/gstTotal fields — backfill from their line
+  // items so Purchase Register / reports never see `undefined`.
+  (DB.purchases||[]).forEach(p=>{
+    if (p.taxable===undefined || p.gstTotal===undefined) {
+      const li = p.lineItems||[];
+      const taxable = li.reduce((s,x)=>s+(Number(x.rate)||0)*(Number(x.qty)||0), 0);
+      const gstTotal = li.reduce((s,x)=>s+(Number(x.rate)||0)*(Number(x.qty)||0)*((Number(x.gst)||0)/100), 0);
+      p.taxable = taxable || (p.total||0);
+      p.gstTotal = gstTotal || 0;
+      upgraded = true;
+    }
+    (p.lineItems||[]).forEach(li=>{ if(li.gst===undefined){ li.gst = 0; upgraded = true; } });
+  });
+
+  // Step 1 (schema v1): older bank ledger entries only have `type`
+  // (Deposit/Withdrawal/UPI/Cheque/...) — write the real direction+head
+  // fields into the data itself instead of only computing them at
+  // render time, so every future code path can rely on them directly.
+  Object.values(DB.bankAccounts||{}).forEach(ledger=>{
+    (ledger.entries||[]).forEach(e=>{
+      if (!e.direction) {
+        e.direction = ['Deposit','Interest'].includes(e.type) ? 'in' : 'out';
+        e.head = e.type || (e.direction==='in' ? 'Other Income' : 'Other Payment');
+        upgraded = true;
+      }
+    });
+  });
+
+  // Step 2 (schema v2): sale line items saved before per-line GST
+  // correction existed — backfill from the item master where possible,
+  // so historical invoices don't show a blank GST% if reopened.
+  (DB.sales||[]).forEach(s=>{
+    (s.lineItems||[]).forEach(li=>{
+      if (li.gst===undefined) {
+        const it = DB.items.find(x=>x.id===li.id);
+        li.gst = it ? (it.gst||0) : 0;
+        upgraded = true;
+      }
+    });
+  });
+
+  DB.schemaVersion = CLIENT_DB_SCHEMA_VERSION;
+  if (upgraded) {
+    persistDB();
+    console.log('Business OS: client database auto-upgraded to schema v'+CLIENT_DB_SCHEMA_VERSION+' (was v'+startVersion+').');
+  }
+}
 function bootApp(){
+  autoUpgradeClientDB();
   normalizeBankAccounts();
   normalizeInvoiceSettings();
   // v26 FIX (#1): corrected — ICICI Bank's actual brand color is orange,
