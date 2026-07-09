@@ -139,8 +139,8 @@ td{padding:7px 12px;border-bottom:1px solid var(--border);color:var(--text2);}
       <div class="card-body">
         <div class="sheet-list">
           <div class="sheet-card">
-            <div class="sname">💰 Starting Transactions (2 tabs)</div>
-            <div class="srows">Guest Net Dues, Daily Collection</div>
+            <div class="sname">💰 Starting Transactions (4 tabs)</div>
+            <div class="srows">Guest Net Dues, Daily Collection, Purchase Accounting, Kitchen Consumption</div>
             <button class="tb-btn primary" style="width:100%;" onclick="downloadTransactionTemplate()">⬇ Download Transactions Template</button>
           </div>
         </div>
@@ -219,40 +219,46 @@ const TARGET_TABLES = [
   { value:'',                  label:'— Skip this sheet —' },
   { value:'SALES',             label:'Sales / POS Bills (bill-level)' },
   { value:'SALES_ITEMS',       label:'Sales — Item-wise Line Items' },
+  { value:'SALES_SUMMARY',     label:'Sales — Item-wise Summary (totals only, no invoice-level rows)' },
   { value:'BANK_SWEEP',        label:'Payment Gateway Sweep / Settlement' },
   { value:'BANK_STATEMENT',    label:'Bank Statement' },
   { value:'ONLINE_AGGREGATOR', label:'Aggregator Sales (Swiggy/Zomato)' },
   { value:'GUEST_DUES',        label:'Guest Net Dues / Opening Dues' },
   { value:'DAILY_COLLECTION',  label:'Daily Collection' },
   { value:'PURCHASE',          label:'Purchase Register' },
+  { value:'PURCHASE_ACCOUNTING', label:'Purchase Accounting (Bill-level, Dr head)' },
+  { value:'KITCHEN_CONSUMPTION', label:'Kitchen Consumption / Issue' },
+  { value:'STORE_STOCK_IN',    label:'Store — Item-wise Stock In' },
+  { value:'STORE_ISSUE',       label:'Store — Issue to Kitchen/Bar' },
   { value:'GST_REGISTER',      label:'GST Register (GSTR2B etc)' },
 ];
 
-// FIX ("two template include and mapping total pos system"): recognizes
-// BOTH real POS export formats Balaji actually uses — whichever software
-// a client's system is on, upload it as-is and it maps correctly:
-//   Format A — Data_Pos_Head / Sweep_Transaction_* / Data ItemWise_Outlet /
-//              Data_SwigySell / Data_Sell Zomato / Opening Dues / Bank*
-//   Format B — Daily Sales Report / ItemWise Report / Sheet1 (payment
-//              breakdown) / Opening Due
-// Sheet-NAME matching is tried first (fast, exact for these two real
-// formats). If a sheet is renamed or from an unknown source, header-
-// SIGNATURE matching (checking the actual column names of row 1) is
-// tried next — far more robust than name alone, since real POS software
-// tends to keep its column names stable even when people rename tabs.
+// v29: 5 more real sheet names found in actual client exports
+// (CL00010_VANNS_TRANSACTION_IMPORT, CL00011_VANNS_DATA_POS_SYSTEMS)
+// that weren't recognized by name before — Purchase_Accounting,
+// Kitchen_Consumtion (client's own spelling, kept as-is), the two
+// STORE_* stock-movement tabs, and Itemwise Summery (distinct from
+// Data ItemWise_Outlet — this one is pre-aggregated totals, no
+// invoice-level rows, hence the separate SALES_SUMMARY target so it
+// doesn't get force-fit into the invoice-level SALES_ITEMS table).
 const AUTO_GUESS = [
   { match:/^data_pos_head$/i,                          target:'SALES' },
   { match:/^daily sales report$/i,                      target:'SALES' },
   { match:/^sheet1$/i,                                  target:'SALES' }, // Format B payment breakdown — name-only fallback, lowest priority
   { match:/^data itemwise_outlet$/i,                    target:'SALES_ITEMS' },
   { match:/^itemwise report$/i,                         target:'SALES_ITEMS' },
+  { match:/itemwise.*summ?ery|itemwise.*summary/i,      target:'SALES_SUMMARY' },
   { match:/sweep_transaction|sweep_settlement/i,        target:'BANK_SWEEP' },
   { match:/^bank[a-z]+$/i,                              target:'BANK_STATEMENT' },
   { match:/swigysell|swiggy/i,                          target:'ONLINE_AGGREGATOR' },
   { match:/sell zomato|zomato/i,                        target:'ONLINE_AGGREGATOR' },
   { match:/opening due/i,                               target:'GUEST_DUES' },
   { match:/daily.*collection/i,                         target:'DAILY_COLLECTION' },
-  { match:/purchase.*register|purchase.*summary/i,      target:'PURCHASE' },
+  { match:/^store_purchase[_ ]register$|^store_purchase[_ ]summary$/i, target:'PURCHASE' },
+  { match:/purchase_accounting/i,                       target:'PURCHASE_ACCOUNTING' },
+  { match:/kitchen_consum[pt]tion/i,                     target:'KITCHEN_CONSUMPTION' },
+  { match:/store_item[_ ]wise[_ ]stockin/i,             target:'STORE_STOCK_IN' },
+  { match:/^store_issue$/i,                             target:'STORE_ISSUE' },
   { match:/gstr/i,                                      target:'GST_REGISTER' },
 ];
 
@@ -265,9 +271,12 @@ const HEADER_SIGNATURES = [
   { target:'SALES',             need:['tableno.','settlementtime','pax'] },
   { target:'SALES_ITEMS',       need:['itemname','qty','rate','netvalue'] },
   { target:'SALES_ITEMS',       need:['itemname','qty','rate','amount'] },
+  { target:'SALES_SUMMARY',     need:['itemsubgroupname','itemname','ncqty','gross'] },
   { target:'BANK_SWEEP',        need:['mid','tid','rrn'] },
   { target:'BANK_STATEMENT',    need:['valuedate','withdrawalamt','depositamt'] },
   { target:'GUEST_DUES',        need:['billdate','billno','billamount','dues'] },
+  { target:'PURCHASE_ACCOUNTING', need:['suppliersname','billno','billamount','itemsheaddr'] },
+  { target:'KITCHEN_CONSUMPTION', need:['department','itemname','quantity','actualrate'] },
 ];
 function normHdr(h){ return String(h||'').toLowerCase().replace(/[^a-z0-9]/g,''); }
 function guessBySignature(headerRow){
@@ -307,6 +316,26 @@ function downloadTransactionTemplate(){
   const dcSheet = XLSX.utils.aoa_to_sheet([dcHeaders, ...dcExample]);
   dcSheet['!cols'] = dcHeaders.map(()=>({wch:13}));
   XLSX.utils.book_append_sheet(wb, dcSheet, 'Daily Collection');
+
+  // v29: added per the real column shapes found in actual client
+  // exports (Purchase_Accounting, Kitchen_Consumtion) — these two were
+  // previously only importable if a client's own export already had
+  // them; now new clients get a blank starter template for both too.
+  const paHeaders = ['FY','Month','Purchase Date','Suppliers Name','Bill No','Bill Amount','Items Head (Dr)','Attached','Entry Status','Bill Remarks'];
+  const paExample = [
+    ['2026-27','April','01-04-2026','ABC Traders','B-1001',12500,'Food & Beverage','Yes','Posted',''],
+  ];
+  const paSheet = XLSX.utils.aoa_to_sheet([paHeaders, ...paExample]);
+  paSheet['!cols'] = paHeaders.map(()=>({wch:14}));
+  XLSX.utils.book_append_sheet(wb, paSheet, 'Purchase_Accounting');
+
+  const kcHeaders = ['Date','Month','Department','Item Name','Unit','Quantity','Actual Rate','Total Amount','GROUP','Rate Contact'];
+  const kcExample = [
+    ['01-04-2026','April','Kitchen','Chicken Boneless','Kg',12,220,2640,'Non-Veg',''],
+  ];
+  const kcSheet = XLSX.utils.aoa_to_sheet([kcHeaders, ...kcExample]);
+  kcSheet['!cols'] = kcHeaders.map(()=>({wch:14}));
+  XLSX.utils.book_append_sheet(wb, kcSheet, 'Kitchen_Consumtion');
 
   XLSX.writeFile(wb, 'Starting_Transactions_Template.xlsx');
   showToast('Transactions template downloaded — fill up and upload back here');
