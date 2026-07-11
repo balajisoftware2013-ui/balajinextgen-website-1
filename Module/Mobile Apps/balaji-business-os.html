@@ -701,6 +701,12 @@ body.mode-accountant .owner-hint{display:none;}
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+  // pdf.js needs its worker script location set explicitly when loaded this way
+  if(window.pdfjsLib){ pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; }
+</script>
 </head>
 <body class="mode-owner theme-icici">
 <script>
@@ -1509,10 +1515,10 @@ body.mode-accountant .owner-hint{display:none;}
   <div class="sheet-title">📄 Import Bank Statement</div>
   <div id="biStep1">
     <div style="font-size:11.5px;color:var(--sub);margin-bottom:12px;line-height:1.6;">
-      Upload your bank's CSV statement export (Net Banking → Statement → Download as CSV). Works with most bank formats — it looks for Date, Narration/Description, and Debit/Withdrawal + Credit/Deposit columns automatically.
+      Upload your bank statement as <b>CSV</b>, <b>Excel (.xlsx/.xls)</b>, or <b>PDF</b>. CSV/Excel work best — they read the Date/Narration/Debit/Credit columns directly. PDF is best-effort (bank PDF layouts vary a lot): it'll pull out amounts and dates but you may need to double-check or flip Withdrawal ↔ Deposit on a few rows before posting.
     </div>
-    <input type="file" id="biFile" accept=".csv" style="display:none;" onchange="handleBankStatementFile(this)">
-    <button class="btn btn-primary" onclick="document.getElementById('biFile').click()">📤 Choose CSV File</button>
+    <input type="file" id="biFile" accept=".csv,.xlsx,.xls,.pdf" style="display:none;" onchange="handleBankStatementFile(this)">
+    <button class="btn btn-primary" onclick="document.getElementById('biFile').click()">📤 Choose Statement File</button>
   </div>
   <div id="biStep2" style="display:none;">
     <div id="biSummary" style="font-size:11.5px;color:var(--sub);margin-bottom:10px;line-height:1.6;"></div>
@@ -6542,34 +6548,113 @@ function _parseFlexibleDate(s){
 function handleBankStatementFile(input){
   const file = input.files && input.files[0];
   if(!file) return;
-  const reader = new FileReader();
-  reader.onload = (e)=>{
-    const rows = _parseCSV(String(e.target.result||''));
-    if(rows.length < 2){ toast('Could not read any rows from this file'); return; }
-    const header = rows[0].map(h=>String(h).trim().toLowerCase());
-    const findCol = (keywords)=> header.findIndex(h=> keywords.some(k=>h.includes(k)));
-    const cDate = findCol(['date']);
-    const cDesc = findCol(['narration','description','particulars','details','remarks']);
-    const cDr = findCol(['withdrawal','debit']);
-    const cCr = findCol(['deposit','credit']);
-    if(cDate===-1 || (cDr===-1 && cCr===-1)){
-      toast('Could not detect Date/Debit/Credit columns in this CSV — check the header row'); return;
+  const name = file.name.toLowerCase();
+  if(name.endsWith('.xlsx') || name.endsWith('.xls')){
+    if(!window.XLSX){ toast('Excel support is still loading — wait a moment and try again'); return; }
+    const reader = new FileReader();
+    reader.onload = (e)=>{
+      try{
+        const wb = XLSX.read(new Uint8Array(e.target.result), {type:'array'});
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(sheet, {header:1, raw:false, defval:''}).map(r=>r.map(c=>String(c)));
+        _processStatementTable(rows);
+      }catch(err){ toast('Could not read this Excel file: '+err.message); }
+    };
+    reader.readAsArrayBuffer(file);
+  } else if(name.endsWith('.pdf')){
+    handleBankStatementPDF(file);
+  } else if(name.endsWith('.csv') || file.type==='text/csv' || file.type===''){
+    const reader = new FileReader();
+    reader.onload = (e)=> _processStatementTable(_parseCSV(String(e.target.result||'')));
+    reader.readAsText(file);
+  } else {
+    toast('Please upload a .csv, .xlsx, .xls, or .pdf bank statement');
+  }
+}
+// Shared row-table processor for CSV and Excel — both give a clean 2D array
+// with a proper header row, so the same column-detection logic works for
+// either. (PDF text extraction can't reliably preserve columns, so it uses
+// a separate line-pattern heuristic instead — see handleBankStatementPDF.)
+function _processStatementTable(rows){
+  if(!rows || rows.length < 2){ toast('Could not read any rows from this file'); return; }
+  const header = rows[0].map(h=>String(h||'').trim().toLowerCase());
+  const findCol = (keywords)=> header.findIndex(h=> keywords.some(k=>h.includes(k)));
+  const cDate = findCol(['date']);
+  const cDesc = findCol(['narration','description','particulars','details','remarks']);
+  const cDr = findCol(['withdrawal','debit']);
+  const cCr = findCol(['deposit','credit']);
+  if(cDate===-1 || (cDr===-1 && cCr===-1)){
+    toast('Could not detect Date/Debit/Credit columns — check the header row in your file'); return;
+  }
+  _biParsedRows = rows.slice(1).map(r=>{
+    const dr = Number(String(r[cDr]||'0').replace(/[^0-9.\-]/g,''))||0;
+    const cr = Number(String(r[cCr]||'0').replace(/[^0-9.\-]/g,''))||0;
+    return {
+      date: _parseFlexibleDate(r[cDate]) || todayStr(),
+      desc: (cDesc>-1 ? String(r[cDesc]||'') : '').trim().slice(0,90),
+      dr, cr,
+      action: dr>0 ? 'payment' : (cr>0 ? 'receipt' : 'skip'),
+      ledgerId: '', expCat: (DB.expenseCats && DB.expenseCats[0]) || 'Bank Charges'
+    };
+  }).filter(r=> r.dr>0 || r.cr>0);
+  if(!_biParsedRows.length){ toast('No transactions with an amount found'); return; }
+  renderBankImportPreview();
+}
+// PDF statement import — best effort. pdf.js only gives back flat text per
+// page, not real table columns, so this looks for lines that contain both
+// a date and a money amount and treats those as transaction rows. It can't
+// reliably tell withdrawal vs deposit from a flattened line (that depended
+// on which column the number was in), so every row defaults to Withdrawal
+// and the preview lets you flip it to Deposit per row before posting.
+async function handleBankStatementPDF(file){
+  if(!window.pdfjsLib){ toast('PDF support is still loading — wait a moment and try again'); return; }
+  toast('Reading PDF…');
+  try{
+    const buf = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({data: buf}).promise;
+    const lines = [];
+    for(let p=1; p<=pdf.numPages; p++){
+      const page = await pdf.getPage(p);
+      const content = await page.getTextContent();
+      const byY = {};
+      content.items.forEach(it=>{
+        const y = Math.round(it.transform[5]);
+        (byY[y] = byY[y]||[]).push(it.str);
+      });
+      Object.keys(byY).map(Number).sort((a,b)=>b-a).forEach(y=> lines.push(byY[y].join(' ')));
     }
-    _biParsedRows = rows.slice(1).map(r=>{
-      const dr = Number(String(r[cDr]||'0').replace(/[^0-9.\-]/g,''))||0;
-      const cr = Number(String(r[cCr]||'0').replace(/[^0-9.\-]/g,''))||0;
-      return {
-        date: _parseFlexibleDate(r[cDate]) || todayStr(),
-        desc: (cDesc>-1 ? String(r[cDesc]||'') : '').trim().slice(0,90),
-        dr, cr,
-        action: dr>0 ? 'payment' : (cr>0 ? 'receipt' : 'skip'),
-        ledgerId: '', expCat: (DB.expenseCats && DB.expenseCats[0]) || 'Bank Charges'
-      };
-    }).filter(r=> r.dr>0 || r.cr>0);
-    if(!_biParsedRows.length){ toast('No transactions with an amount found'); return; }
+    const dateRe = /(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/;
+    const amtRe = /[\d,]+\.\d{2}/g;
+    _biParsedRows = [];
+    lines.forEach(line=>{
+      const dm = line.match(dateRe);
+      if(!dm) return;
+      const amounts = line.match(amtRe);
+      if(!amounts || !amounts.length) return;
+      // Last number on a statement line is usually the running balance —
+      // use the one before it as the transaction amount when there are 2+.
+      const amt = Number((amounts.length>=2 ? amounts[amounts.length-2] : amounts[0]).replace(/,/g,''))||0;
+      if(!amt) return;
+      const desc = line.replace(dateRe,'').replace(amtRe,'').trim().slice(0,90);
+      _biParsedRows.push({
+        date: _parseFlexibleDate(dm[1]) || todayStr(), desc, dr: amt, cr: 0,
+        action: 'payment', ledgerId: '', expCat: (DB.expenseCats && DB.expenseCats[0]) || 'Bank Charges'
+      });
+    });
+    if(!_biParsedRows.length){
+      toast('Could not detect transaction rows in this PDF — try CSV/Excel from your bank for reliable results'); return;
+    }
     renderBankImportPreview();
-  };
-  reader.readAsText(file);
+  }catch(err){
+    toast('Could not read this PDF: '+err.message);
+  }
+}
+function _biFlipDirection(i){
+  const r = _biParsedRows[i];
+  const amt = r.dr || r.cr;
+  if(r.dr>0){ r.dr = 0; r.cr = amt; r.action = 'receipt'; }
+  else { r.cr = 0; r.dr = amt; r.action = 'payment'; }
+  renderBankImportPreview();
 }
 function renderBankImportPreview(){
   document.getElementById('biStep1').style.display = 'none';
@@ -6583,7 +6668,11 @@ function renderBankImportPreview(){
   document.getElementById('biRows').innerHTML = _biParsedRows.map((r,i)=>`
     <div class="panel" style="margin-top:8px;padding:10px 12px;">
       <div style="display:flex;justify-content:space-between;font-size:12px;">
-        <b>${r.date}</b><span class="mono ${r.dr?'due':'green'}">${r.dr?'−'+fmt(r.dr):'+'+fmt(r.cr)}</span>
+        <b>${r.date}</b>
+        <span style="display:flex;align-items:center;gap:6px;">
+          <span class="mono ${r.dr?'due':'green'}">${r.dr?'−'+fmt(r.dr):'+'+fmt(r.cr)}</span>
+          <span onclick="_biFlipDirection(${i})" style="cursor:pointer;font-size:10px;color:var(--primary);font-weight:700;" title="Flip Withdrawal ↔ Deposit">🔄 Flip</span>
+        </span>
       </div>
       <div style="font-size:11px;color:var(--sub);margin:3px 0 8px;">${r.desc||'—'}</div>
       <select onchange="_biParsedRows[${i}].action=this.value; renderBankImportPreview();" style="margin-bottom:6px;">
