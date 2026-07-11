@@ -8950,7 +8950,13 @@ function _doLogoutConfirmed() {
 
 function enterApp() {
   document.getElementById('authScreen').classList.add('hidden');
-  _hideSplash(); // hide splash when user logs in
+  // v25 FIX ("wrong data on open" bug): splash used to be hidden HERE,
+  // instantly, before the real cloud data (LOAD_DB) had come back — so
+  // on every re-open you'd see a flash of stale/local numbers that then
+  // silently swapped to the correct ones a moment later. The splash is
+  // now kept up until the cloud fetch settles (or a bounded timeout, for
+  // offline use) — see the GAS_URL block near the end of this function,
+  // which is what actually calls _hideSplash() now.
   _startSessionTimeout(); // start inactivity timer
   const uid = currentUser.uid;
   const dataKey = currentUser.dataKey || ('wp360_data_' + uid);
@@ -9069,6 +9075,23 @@ function enterApp() {
     // an empty-looking DB.cashSettings — see _cloudFetchDone declaration.
     _cloudFetchDone = false;
     _cashSetupRetryDone = false;
+
+    // v25 FIX: fetch the cloud copy ONCE and reuse the same promise for
+    // (a) the real-time splash gate below and (b) the slower merge-safety
+    // race further down — previously two separate _gasLoadDB(uid) calls
+    // would have fired one HTTP request each for no reason.
+    const _cloudFetchPromise = _gasLoadDB(uid);
+
+    // v25 NEW ("wrong data on open" fix): keep the splash screen up
+    // until the cloud fetch actually answers, so the app opens straight
+    // to the real/current numbers instead of flashing stale local data
+    // first. Bounded to 8s so a slow/offline connection still reveals
+    // the (best-effort local) dashboard instead of getting stuck.
+    Promise.race([
+      _cloudFetchPromise,
+      new Promise(resolve => setTimeout(() => resolve('__splash_timeout__'), 8000))
+    ]).finally(() => _hideSplash());
+
     // v24 FIX: 10s was too tight on slower mobile connections (common on
     // Indian mobile networks) — if the cloud fetch didn't answer in time,
     // _cloudFetchDone still flipped to true with NO cloud data merged in,
@@ -9077,7 +9100,7 @@ function enterApp() {
     // even though it was already saved — and briefly show stale/blank data
     // elsewhere too. Giving it more room to actually hear back fixes both.
     Promise.race([
-      _gasLoadDB(uid),
+      _cloudFetchPromise,
       new Promise(resolve => setTimeout(() => resolve(null), 25000))
     ]).then(cloudData => {
       // ── CLOUD MERGE LOGIC ──────────────────────────────────────
@@ -9157,6 +9180,11 @@ function enterApp() {
 
     // Fetch client's Google Sheet URL for quick-access button
     setTimeout(() => _fetchAndShowSheetUrl(uid), 3000);
+  } else {
+    // v25: no cloud configured at all — nothing to wait for, so reveal
+    // the (local-only) dashboard right away instead of leaving the
+    // splash stuck up with nothing left to gate on.
+    _hideSplash();
   }
 }
 
@@ -9263,7 +9291,10 @@ async function init(){
   const _splashDelay = Math.max(0, MIN_SPLASH_MS - _elapsed);
   setTimeout(() => {
     if (checkAutoLogin()) {
-      _hideSplash(); // hide splash after successful auto-login
+      // v25 FIX: don't hide the splash here — enterApp() (called by
+      // checkAutoLogin above) now keeps it up until the real cloud data
+      // has actually arrived (or a bounded timeout), so the app opens
+      // straight to correct numbers instead of flashing stale ones.
       return;
     }
     // No session — show auth screen, hide splash
