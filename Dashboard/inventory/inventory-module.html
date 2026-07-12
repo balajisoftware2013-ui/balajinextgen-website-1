@@ -763,16 +763,62 @@ function toast(msg,type='',icon='ℹ️'){
 // ════ CROSS-MODULE SYNC ════
 function syncNow(){
   const log=[];const now=new Date().toISOString();
+  // ── ONE-TIME CLEANUP: remove stale 'GRN-SYNC-*' stockIn records left over from
+  // the old duplicate pull-sync mechanism (removed above). Those records hard-coded
+  // rate:0 and were being counted a SECOND time on top of InventoryBridge's own live
+  // adjustments for the same GRN, inflating stock qty and zeroing out Stock Value.
+  // Safe to run every sync — matches only the legacy record shape, does nothing once
+  // they're gone. GRN quantities themselves aren't lost: InventoryBridge's adjustment
+  // records (the ones actually driving stock now) are untouched.
+  const beforeCount=DB.stockIn.length;
+  DB.stockIn=DB.stockIn.filter(si=>!(si.siNo||'').startsWith('GRN-SYNC-'));
+  const legacyRemoved=beforeCount-DB.stockIn.length;
+  if(legacyRemoved>0)log.push({time:now,msg:'🧹 Removed '+legacyRemoved+' stale legacy GRN-SYNC entries (now superseded by live InventoryBridge sync)'});
   // Read Purchase module data → Stock In
   try{
     const pd=localStorage.getItem(PURCH_KEY);
     if(pd){
       const pdb=JSON.parse(pd);
-      // Sync items from purchase module's item master to shared
-      const pItems=pdb.items||[];pItems.forEach(it=>{
+      // Sync items from purchase module's REAL item registry (DB.itemMaster, saved
+      // under pdb.itemMaster) — NOT pdb.items. pdb.items is a derived display cache
+      // that InventoryBridge itself writes FROM SHARED.items (see refreshCachedCopies
+      // below), so it starts empty and can only ever mirror items that already made
+      // it into SHARED — a circular dependency that meant items created via Smart
+      // Match Review (new liquor/grocery items etc.) never reached the shared master,
+      // which is why Total Items and Stock Value stayed at 0 no matter how many GRNs
+      // were received. pdb.items is kept as a fallback for older data only.
+      const pItems=pdb.itemMaster||pdb.items||[];pItems.forEach(it=>{
         const ex=SHARED.items.find(si=>si.name===it.name||(it.code&&si.code===it.code));
-        if(!ex){SHARED.items.push({id:uid(),code:it.code||('P'+SHARED.items.length.toString().padStart(4,'0')),name:it.name,category:it.category||it.cat||'',hsn:it.hsn||'',unit:it.unit||'Nos',gst:it.gst||18,rate:it.costRate||it.rate||0,srate:it.saleRate||it.srate||0,mrp:it.mrp||0,min:it.min||10,opening:0,barcode:it.barcode||'',desc:it.desc||'',source:'purchase',createdAt:now});}
+        if(!ex){SHARED.items.push({id:uid(),code:it.code||it.id||('P'+SHARED.items.length.toString().padStart(4,'0')),name:it.name,category:it.category||it.cat||'',hsn:it.hsn||'',unit:it.unit||'Nos',gst:it.gst||18,rate:it.lastRate||it.costRate||it.rate||0,srate:it.saleRate||it.srate||0,mrp:it.mrp||0,min:it.min||10,opening:0,barcode:it.barcode||'',desc:it.desc||'',source:'purchase',createdAt:now});}
+        else if((it.lastRate||it.costRate)&&!ex.rate){ex.rate=it.lastRate||it.costRate;} // backfill rate on items that already existed but had none
       });
+
+      // ── BACKFILL: GRNs recorded before items existed in SHARED (the pdb.items vs
+      // pdb.itemMaster bug above) had InventoryBridge.adjustStock() fail silently at
+      // the time, so their accepted qty never became a stock movement. Now that the
+      // item sync above is fixed, replay any GRN that has no matching adjustment yet.
+      // Done directly against the in-memory SHARED/DB (same objects saveShared()/
+      // saveDB() write out at the end of this function) rather than calling
+      // InventoryBridge.adjustStock() here, which does its own independent
+      // localStorage read/write — it wouldn't yet see items pushed into SHARED just
+      // above (not saved until the end of this function), and its write could then
+      // be clobbered by this function's own later save.
+      {
+        const grns=pdb.grns||[];
+        let backfilled=0;
+        grns.forEach(g=>{
+          const acceptedQty=+g.accepted||0;if(acceptedQty<=0)return;
+          if(DB.adjustments.some(a=>a.refId===g.id))return; // already recorded
+          const item=SHARED.items.find(si=>si.name===g.item);
+          if(!item)return; // still genuinely missing from master — nothing to backfill against
+          const before=calcStock(item.id);
+          const rate=+g.rate||0;
+          DB.adjustments.push({id:uid(),adjNo:'ADJ-'+(DB.seq.adj++),date:g.date||now.split('T')[0],itemId:item.id,itemName:item.name,before,diff:acceptedQty,after:before+acceptedQty,rate,refId:g.id,ref:g.no||'',party:g.vendorName||'',reason:'GRN '+g.no+' from '+(g.vendorName||'')+' (backfilled by sync)',source:'InventoryBridge',reversed:false,createdAt:now});
+          if(rate>0)item.rate=rate;
+          backfilled++;
+        });
+        if(backfilled>0)log.push({time:now,msg:'⏪ Backfilled '+backfilled+' GRN stock movement(s) that were missed before the item master sync fix'});
+      }
 
       // ── STOCK IN from GRNs is now handled live by InventoryBridge ──
       // Purchase module's saveGRN()/editGRN()/deleteGRN() call
