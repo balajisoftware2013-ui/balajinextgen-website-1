@@ -774,29 +774,23 @@ function syncNow(){
         if(!ex){SHARED.items.push({id:uid(),code:it.code||('P'+SHARED.items.length.toString().padStart(4,'0')),name:it.name,category:it.category||it.cat||'',hsn:it.hsn||'',unit:it.unit||'Nos',gst:it.gst||18,rate:it.costRate||it.rate||0,srate:it.saleRate||it.srate||0,mrp:it.mrp||0,min:it.min||10,opening:0,barcode:it.barcode||'',desc:it.desc||'',source:'purchase',createdAt:now});}
       });
 
-      // ── STOCK IN comes ONLY from actual GRNs (goods physically received & accepted) ──
-      // NOT from raw purchase invoices — recording an invoice doesn't mean goods
-      // arrived — and NEVER from Accounting/Expense entries (Rent, Electricity,
-      // Professional Fees, etc. — pdb.acctInvs). Those have nothing to do with
-      // stock and must never create a stock movement. The purchase module keeps
-      // GRNs (pdb.grns) completely separate from Accounting Invoices, so we only
-      // ever read pdb.grns here, using ACCEPTED qty (not received qty — rejected
-      // goods aren't usable stock even though they were physically delivered).
-      const grns=pdb.grns||[];
-      let grnSynced=0;
-      grns.forEach(g=>{
-        const acceptedQty=+g.accepted||0;
-        if(acceptedQty<=0)return;
-        const exists=DB.stockIn.find(si=>si.grnItemId===g.id);
-        if(exists)return;
-        const itemId=SHARED.items.find(si=>si.name===g.item)?.id||'';
-        DB.stockIn.push({id:uid(),siNo:'GRN-SYNC-'+DB.seq.si++,date:g.date||now.split('T')[0],party:g.vendorName||'Purchase Sync',items:[{itemId,name:g.item||'',qty:acceptedQty,unit:'Nos',rate:0}],ref:g.no||'',grnItemId:g.id,source:'Purchase Module (GRN)',notes:'Auto-synced from Purchase Module GRN — accepted qty only',createdAt:now});
-        grnSynced++;
-        log.push({time:now,msg:'Stock In synced from GRN: '+g.no+' ('+g.item+')'});
-      });
+      // ── STOCK IN from GRNs is now handled live by InventoryBridge ──
+      // Purchase module's saveGRN()/editGRN()/deleteGRN() call
+      // InventoryBridge.adjustStock() directly the moment a GRN is
+      // saved/edited/deleted (writing straight into DB.adjustments with
+      // the real rate + refId), whether or not this Inventory module tab
+      // is even open. This block used to ALSO read pdb.grns and push a
+      // second, separate DB.stockIn record per GRN — every accepted
+      // quantity was being counted twice in calcStock() (once via
+      // stockIn, once via adjustments), and this copy always hardcoded
+      // rate:0, which is why Stock Ledger's Rate/Value columns and the
+      // Stock Value dashboard card showed ₹0.00 even when stock quantity
+      // was correct. Removed to stop the double-count; buildLedger() now
+      // reads GRN movements straight from DB.adjustments instead (see
+      // below), with the real rate carried through.
       const acctSkipped=(pdb.acctInvs||[]).length;
       ss('d-purch',(pdb.purchases||[]).length);
-      log.push({time:now,msg:'Purchase module: '+pItems.length+' items, '+grnSynced+' GRN receipts synced — '+acctSkipped+' Accounting/Expense entries correctly skipped (no stock effect)'});
+      log.push({time:now,msg:'Purchase module: '+pItems.length+' items synced · GRN stock movements are synced live via InventoryBridge, not here · '+acctSkipped+' Accounting/Expense entries correctly skipped (no stock effect)'});
     }
   }catch(e){log.push({time:now,msg:'Purchase sync error: '+e.message});}
 
@@ -1185,6 +1179,16 @@ function buildLedger(){
   const entries=[];
   DB.stockIn.forEach(si=>{si.items?.forEach(it=>{if(it.itemId||it.name){entries.push({date:si.date,itemId:it.itemId,itemName:it.name||SHARED.items.find(i=>i.id===it.itemId)?.name||'',inQty:it.qty,outQty:0,unit:it.unit||'Nos',rate:it.rate||0,source:si.source||'Manual',ref:si.siNo,party:si.party||'',createdAt:si.createdAt});}});});
   DB.stockOut.forEach(so=>{so.items?.forEach(it=>{if(it.itemId||it.name){entries.push({date:so.date,itemId:it.itemId,itemName:it.name||SHARED.items.find(i=>i.id===it.itemId)?.name||'',inQty:0,outQty:it.qty,unit:it.unit||'Nos',rate:it.rate||0,source:so.source||'Manual',ref:so.soNo,party:so.party||'',createdAt:so.createdAt});}});});
+  // GRN (and any other) stock movements pushed live by InventoryBridge from the
+  // Purchase module — these carry the real per-unit rate and refId, unlike the
+  // old pull-sync copy this replaced. Skip reversal entries whose diff exactly
+  // undoes an already-listed original (both are shown so the trail stays
+  // auditable — a deleted/edited GRN shows its original IN plus the reversal).
+  (DB.adjustments||[]).forEach(a=>{
+    if(a.source!=='InventoryBridge'&&a.source!=='InventoryBridge-Reversal')return; // manual Adjustments page entries are shown on their own screen, not here
+    const qty=+a.diff||0;if(qty===0)return;
+    entries.push({date:a.date,itemId:a.itemId,itemName:a.itemName||'',inQty:qty>0?qty:0,outQty:qty<0?-qty:0,unit:'Nos',rate:a.rate||0,source:a.source==='InventoryBridge-Reversal'?'Purchase Module (GRN reversed)':'Purchase Module (GRN)',ref:a.ref||a.refId||a.adjNo,party:a.party||'',createdAt:a.createdAt});
+  });
   return entries.sort((a,b)=>new Date(b.date)-new Date(a.date)||(b.createdAt||'').localeCompare(a.createdAt||''));
 }
 function rendLedger(){

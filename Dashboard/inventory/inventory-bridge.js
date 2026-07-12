@@ -101,14 +101,26 @@
   }
 
   /**
-   * InventoryBridge.adjustStock(itemIdOrName, qtyDelta, reason)
+   * InventoryBridge.adjustStock(itemIdOrName, qtyDelta, reason, opts)
    * qtyDelta: positive for goods received (GRN), negative for goods sold.
+   * opts (optional): { refId, rate, party, ref }
+   *   - refId: links this movement back to its source record (a GRN line, a
+   *     sales invoice line, etc.) so reverseByRef() can undo exactly this
+   *     movement later without guessing or double-reversing.
+   *   - rate: the real per-unit cost for this movement. Previously dropped
+   *     entirely — every GRN-driven adjustment recorded rate 0, which is
+   *     why Stock Ledger / Stock Value always showed ₹0.00 regardless of
+   *     the actual purchase price. Now stored on the record AND written
+   *     back onto the item master's own `rate` field (last-known cost),
+   *     so Item Master, Stock Ledger and Stock Value all agree.
+   *   - party: vendor/customer name, for display in Stock Ledger.
    * Returns: the adjustment record on success, or false if the item
    * isn't in the shared item master (caller should warn the user).
    */
-  function adjustStock(itemIdOrName, qtyDelta, reason){
+  function adjustStock(itemIdOrName, qtyDelta, reason, opts){
     const qty = Number(qtyDelta) || 0;
     if(qty === 0) return null;
+    opts = opts || {};
 
     const shared = loadShared();
     const item = findItem(shared, itemIdOrName);
@@ -118,6 +130,7 @@
     const before = calcStock(shared, db, item.id);
     const after = before + qty;
     const now = new Date().toISOString();
+    const rate = +opts.rate || 0;
 
     const rec = {
       id: uid(),
@@ -126,16 +139,71 @@
       itemId: item.id,
       itemName: item.name,
       before, diff: qty, after,
+      rate,
+      refId: opts.refId || '',
+      ref: opts.ref || '',
+      party: opts.party || '',
       reason: reason || (qty > 0 ? 'Stock received (bridge)' : 'Stock issued (bridge)'),
       source: 'InventoryBridge',
+      reversed: false,
       createdAt: now
     };
     db.adjustments.push(rec);
     writeJSON(INV_KEY, db);
 
+    // Keep the item master's cost current — last GRN rate wins, same as
+    // the Purchase module's own "lastRate" tracking on its item cache.
+    if(rate > 0){
+      const idx = shared.items.findIndex(i => i.id === item.id);
+      if(idx >= 0){ shared.items[idx].rate = rate; writeJSON(SHARED_KEY, shared); }
+    }
+
     refreshCachedCopies(shared, db);
 
     return rec;
+  }
+
+  /**
+   * InventoryBridge.reverseByRef(refId)
+   * Undoes the stock effect of every unreversed adjustment tagged with this
+   * refId (e.g. all movements from one GRN), by pushing an equal-and-opposite
+   * adjustment for each and marking the originals reversed so a second
+   * delete/edit on the same GRN can't reverse it twice.
+   * Returns true if anything was found and reversed, false otherwise (caller
+   * should fall back to a manual adjustStock() reversal in that case).
+   */
+  function reverseByRef(refId){
+    if(!refId) return false;
+    const shared = loadShared();
+    const db = loadInvDB();
+    const targets = db.adjustments.filter(a => a.refId === refId && !a.reversed);
+    if(!targets.length) return false;
+
+    const now = new Date().toISOString();
+    targets.forEach(a => {
+      a.reversed = true;
+      db.adjustments.push({
+        id: uid(),
+        adjNo: 'ADJ-' + (db.seq.adj++),
+        date: now.split('T')[0],
+        itemId: a.itemId,
+        itemName: a.itemName,
+        before: calcStock(shared, db, a.itemId),
+        diff: -a.diff,
+        after: calcStock(shared, db, a.itemId) - a.diff,
+        rate: a.rate || 0,
+        refId: a.refId + '-reversed',
+        ref: a.ref || '',
+        party: a.party || '',
+        reason: 'Reversal of ' + a.adjNo + ' (' + (a.reason || '') + ')',
+        source: 'InventoryBridge-Reversal',
+        reversed: false,
+        createdAt: now
+      });
+    });
+    writeJSON(INV_KEY, db);
+    refreshCachedCopies(shared, db);
+    return true;
   }
 
   /** Read-only helper other pages can use to show live stock without duplicating the formula. */
@@ -147,5 +215,5 @@
     return calcStock(shared, db, item.id);
   }
 
-  window.InventoryBridge = { adjustStock, getStock };
+  window.InventoryBridge = { adjustStock, reverseByRef, getStock };
 })(window);
