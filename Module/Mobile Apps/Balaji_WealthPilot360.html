@@ -4259,6 +4259,11 @@ function renderCashRegister(){
   const cs = DB.cashSettings;
   const currentBalance = _computeCashBalance();
 
+  // Remember, permanently, that this user really does have Opening Cash
+  // saved — the instant we see it, regardless of which loading path
+  // (local cache, cloud, retry, poll) produced it. See v26 FIX below.
+  if (cs && cs.set && currentUser) _markCashSetupDone(currentUser.uid);
+
   // ── v20: Opening Cash is a ONE-TIME setup that auto carries forward.
   // No daily "open the register" step is needed any more — the running
   // balance below already reflects every cash transaction since setup,
@@ -4266,6 +4271,20 @@ function renderCashRegister(){
   // OPTIONAL daily physical-count check, not a requirement to unlock
   // anything else.
   if (!cs || !cs.set) {
+    // v26 FIX: if we've EVER confirmed real saved Opening Cash for this
+    // user on this browser before, a slow/failed read right now is just
+    // that — slow — never treat it as "never set up". Keep showing a
+    // loading state and keep retrying quietly in the background instead
+    // of falling through to the setup form.
+    if (currentUser && _hasCashSetupFlag(currentUser.uid)) {
+      el.innerHTML = `
+      <div class="card" style="max-width:480px">
+        <div class="card-title">⏳ Loading your Cash Book…</div>
+        <div style="font-size:12px;color:var(--muted)">Your Opening Cash was already set up earlier — just fetching it now. This can take a little longer on a slow connection, but it won't ask you to set it up again.</div>
+      </div>`;
+      if (GAS_URL) _pollForSavedCashSetup(currentUser.uid);
+      return;
+    }
     // v23 FIX: don't show the "set up opening cash" form while we're
     // still waiting to hear back from the cloud — that form used to
     // appear on a slow/first login even for people who'd already set
@@ -4415,6 +4434,7 @@ function saveCashOpeningOneTime(){
   };
   logAudit('cash_open','Cash Register', 'One-time opening: '+fmt(Number(amount)));
   saveDB();
+  if (currentUser) _markCashSetupDone(currentUser.uid); // v26: never ask again on this browser
   renderCashRegister();
   toast('✅ Opening cash set! Your balance now updates automatically.', 'success');
 }
@@ -7724,6 +7744,49 @@ let _userIsNew = false; // set true ONLY on fresh registration, never on login
 let _cloudFetchDone = true; // true = safe to trust DB.cashSettings right now
 let _cashSetupRetryDone = false; // v25: one extra direct check before showing the Opening Cash form (reset per login)
 
+// v26 FIX: "Opening Cash form comes back if the saved data is just slow
+// to load" — v23/v24/v25 above only bought a bit more time (8s/25s/one
+// retry) before giving up and showing the setup form again. On a genuinely
+// slow connection that still wasn't enough, so a user who had ALREADY set
+// up Opening Cash could see the form again, and re-filling it created a
+// duplicate/overwritten entry.
+// Fix: remember — permanently, per user, in localStorage, completely
+// separate from DB/cache — that this browser has successfully seen a real
+// saved Opening Cash for this account at least once. Once that flag is
+// true, the app must NEVER show the setup form again, no matter how long
+// or how many times the read is slow; it just keeps quietly retrying in
+// the background until the real data shows up.
+function _cashSetupFlagKey(uid){ return 'wp360_cash_setup_flag_' + uid; }
+function _markCashSetupDone(uid){
+  if (!uid) return;
+  try { localStorage.setItem(_cashSetupFlagKey(uid), '1'); } catch(e) {}
+}
+function _hasCashSetupFlag(uid){
+  if (!uid) return false;
+  try { return localStorage.getItem(_cashSetupFlagKey(uid)) === '1'; } catch(e) { return false; }
+}
+let _cashPollInFlight = false;
+function _pollForSavedCashSetup(uid){
+  if (_cashPollInFlight || !uid) return;
+  _cashPollInFlight = true;
+  const attempt = () => {
+    _gasLoadDB(uid).then(d => {
+      if (d && typeof d === 'object' && d.cashSettings && d.cashSettings.set) {
+        Object.keys(DB).forEach(k => { if (d[k] !== undefined) DB[k] = d[k]; });
+        _storageSet(STORE_DB_KEY + '_' + uid, DB);
+        try { localStorage.setItem('wp360_data_' + uid, JSON.stringify(DB)); } catch(e) {}
+        try { localStorage.setItem('wp360_db_'   + uid, JSON.stringify(DB)); } catch(e) {}
+        _markCashSetupDone(uid);
+        _cashPollInFlight = false;
+        renderCashRegister();
+      } else {
+        setTimeout(attempt, 4000); // quietly keep trying — we already know real data exists somewhere
+      }
+    }).catch(() => setTimeout(attempt, 4000));
+  };
+  attempt();
+}
+
 function getUsers() {
   try { return JSON.parse(localStorage.getItem(AUTH_STORE_KEY) || '{}'); } catch(e) { return {}; }
 }
@@ -9146,6 +9209,7 @@ function enterApp() {
           _storageSet(dataKey, DB);
           try { localStorage.setItem('wp360_data_' + _cuid, JSON.stringify(DB)); } catch(e) {}
           try { localStorage.setItem('wp360_db_'   + _cuid, JSON.stringify(DB)); } catch(e) {}
+          if (DB.cashSettings && DB.cashSettings.set) _markCashSetupDone(_cuid); // v26
           renderSection(currentSection);
           _setSyncStatus('ok');
           if (Object.keys(cloudData).length > 2) toast('✅ Data synced from cloud', 'success');
