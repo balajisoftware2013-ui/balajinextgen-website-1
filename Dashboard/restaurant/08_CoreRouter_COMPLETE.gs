@@ -291,6 +291,16 @@ function handleSingleAction(body) {
     case 'GET_CONSUMPTION_HISTORY':
       return INV_getConsumptionHistory(body);
 
+    // FIX: added — inventory.html/purchase-module.html/
+    // Restrostock_pro_inventory.html all call these two actions for
+    // their entire local-data sync layer, but neither existed anywhere
+    // in the router, so that sync has never worked at all. See
+    // ADD_TO_46_LiveInventoryBridge_SYNC.gs for the functions.
+    case 'SYNC_PUSH_TABLE':
+      return INV_syncPushTable(body);
+    case 'SYNC_PULL_ALL':
+      return INV_syncPullAll(body);
+
     // ══════════════════════════════════════════════════════════
     // CRM / LOYALTY / CUSTOMER SELF-ORDER CHECK-IN
     // ══════════════════════════════════════════════════════════

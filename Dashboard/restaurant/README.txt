@@ -285,6 +285,53 @@ the only way to fix this for real instead of guessing further.
 
 
 =====================================================
+6. inventory.html + purchase-module.html — DATA CONNECTION
+=====================================================
+
+MAJOR FINDING: these two files (plus Restrostock_pro_inventory.html)
+share ONE local data system — everything lives in browser localStorage
+(BALAJI_SHARED_DB / BALAJI_INVENTORY_DB / BALAJI_PROCUREMENT via a
+DB/InvBridge engine), completely separate from the real ITEM_MASTER/
+PURCHASE_MASTER sheets used by kitchen-indent.html and friends.
+
+inventory.html tries to sync this local data to the backend via
+SYNC_PUSH_TABLE and SYNC_PULL_ALL — but NEITHER action existed
+anywhere in the router. This sync has never worked, for any table,
+ever — not just login_history as first suspected.
+
+YOUR DECISION: build the missing sync generically, keeping Inventory/
+Purchase as their own separate local-table schema (faster than
+rewiring them onto the real ITEM_MASTER/PURCHASE_MASTER schema, but
+means this stays a second, parallel dataset rather than one unified
+system — you can revisit unifying them later if you want).
+
+WHAT WAS BUILT:
+- ADD_TO_46_LiveInventoryBridge_SYNC.gs — INV_syncPushTable and
+  INV_syncPullAll. Each local "table" gets its own real sheet in
+  TRANSACTION_DB named SYNC_<TABLE> (e.g. SYNC_ITEMS,
+  SYNC_STOCK_LEDGER, SYNC_PURCHASE_INVOICES) — the SYNC_ prefix keeps
+  these clearly separate from your real schema sheets, no collision
+  risk. Add the 2 router cases shown at the bottom of that file to
+  08_CoreRouter.gs (also already added to 08_CoreRouter_COMPLETE.gs
+  in this zip).
+- inventory.html — fixed a duplicate erp-config.js include (two
+  separate includes, two different wrong paths: ../erp-config.js and
+  ../../erp-config.js) down to one correct same-folder include.
+- purchase-module.html — this file never pulled anything from the
+  backend itself; it only ever saw real data if inventory.html
+  happened to be opened first in the same browser (shared localStorage
+  keys). Added its own independent pull (pullInventorySyncData()),
+  called on page load, so it works standalone.
+
+WHAT THIS DOES NOT DO: it does not connect Inventory/Purchase's items,
+vendors, stock, etc to the same ITEM_MASTER/PURCHASE_MASTER/GRN_DETAIL
+sheets kitchen-indent.html and purchase history elsewhere in the app
+use. That would need the other option (rewiring these files to call
+GET_ITEMS/SAVE_STOCK_ADJUSTMENT/etc directly) — a bigger job, available
+if you want it done later.
+
+
+=====================================================
 STILL UNRESOLVED — NEEDS YOUR ACTION
 =====================================================
 
