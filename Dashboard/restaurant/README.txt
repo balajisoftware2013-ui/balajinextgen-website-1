@@ -86,6 +86,66 @@ K) KEYBOARD UP/DOWN ARROWS — also added to the custom-item qty field
 
 
 =====================================================
+2. kitchen-consumption.html — WHAT CHANGED
+=====================================================
+
+A) LOGIN BUG FIXED (same pattern as chef-dashboard.html)
+   Was calling ERP.requireLogin() — a method that doesn't exist on the
+   real ERP object — with the wrong erp-config.js path (../../ instead
+   of same-folder). Fixed both. ALSO found and removed a second,
+   completely duplicate erp-config.js include with its own broken
+   login block that referenced loadDashboardData() — a function that
+   doesn't even exist in this file (copy-pasted from chef-dashboard.html
+   by mistake, never belonged here).
+
+B) NEW BACKEND ACTION NEEDED — GET_CONSUMPTION_HISTORY
+   This file already called kcApi('GET_CONSUMPTION_HISTORY', {}) —
+   but that action never existed anywhere in your GAS backend, so it
+   always failed silently. See ADD_TO_46_LiveInventoryBridge.gs in
+   this zip — paste that function into 46_LiveInventoryBridge.gs, and
+   add the one router case shown at the bottom of that file into
+   08_CoreRouter.gs. Then redeploy (Deploy → Manage deployments →
+   New version).
+
+C) REAL DATA EVERYWHERE ("load data all")
+   CONSUMPTION_DATA, WASTAGE_DATA, VARIANCE_DATA were all hardcoded
+   fake arrays — matching the suspiciously round demo numbers you saw
+   (₹14,280 today consumed, etc). Now:
+     - Entry tab's "Today's Consumption" table shows real entries for
+       today, filtered from real loaded history
+     - History tab shows real consumption history
+     - Wastage tab calls the already-built GET_WASTAGE_LOG action
+     - Category Analysis, 7-day trend, and Top Items are all computed
+       from real data, not fabricated
+     - The 6 KPI summary cards at the top (Today Consumed, Wastage,
+       category totals, Entries) were hardcoded directly in the HTML
+       itself — not even JS-rendered before. Now computed for real.
+
+D) IMPORTANT SCHEMA GAP — "estimated" values, clearly labeled
+   Your real KITCHEN_CONSUMPTION sheet only stores DATE, ITEM_NAME,
+   UNIT, ISSUED qty, ENTERED_BY — no rate, category, chef name, or
+   shift. There is no historical rate-at-time-of-use recorded. So all
+   ₹ values shown are ESTIMATES using each item's CURRENT cost price
+   from ITEM_MASTER (joined by item name) — labeled "(est.)" everywhere
+   they appear, rather than presented as exact historical figures.
+   Category is also pulled from ITEM_MASTER the same way. Chef/shift
+   columns show "—" since that data isn't recorded anywhere real yet.
+
+E) VARIANCE TAB — honest placeholder, not fake numbers
+   A real theoretical-vs-actual variance report needs recipe/BOM data
+   (ingredient qty per dish) linked to sales — your RECIPE_MASTER is
+   confirmed empty for both CL00010 and CL00011. Rather than show fake
+   numbers, this tab now explains clearly what's needed before it can
+   show anything real.
+
+F) STILL HARDCODED, NOT TOUCHED (flagging honestly, not silently left)
+   "⚠ 3 Low Stock Items" and "✓ Synced to Inventory" badges near the
+   top are still static text — computing real low-stock count needs
+   comparing ITEM_MASTER's STOCK vs MIN_STOCK, which is a quick
+   addition if you want it done next.
+
+
+=====================================================
 STILL UNRESOLVED — NEEDS YOUR ACTION
 =====================================================
 
