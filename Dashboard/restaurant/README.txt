@@ -70,6 +70,20 @@ I) APPROVE/REJECT NOW ACTUALLY CALL THE BACKEND
    Previously these buttons only showed a toast and did nothing.
    Now call APPROVE_ISSUE_INDENT for real, then refresh both lists.
 
+J) ADD ITEM NOT IN THE MASTER LIST ("item can add chef if not in his list")
+   New "➕ Item Not In List" button next to the search box. Opens a
+   small form (name, unit, qty, remarks) — added items show in their
+   own "Items Not In List" section below the main table. On submit,
+   these are merged into the SAME SAVE_KITCHEN_INDENT call as the
+   regular items — Store sees one combined indent, not two separate
+   ones. Custom items are tagged "(NOT IN LIST)" in ITEM_NAME so
+   Store/kitchen staff can spot them at a glance in the sheet.
+
+K) KEYBOARD UP/DOWN ARROWS — also added to the custom-item qty field
+   (was already on the main table's qty fields from the previous
+   round). Pressing Up/Down while focused in either now increments/
+   decrements by 1, never below 0.
+
 
 =====================================================
 STILL UNRESOLVED — NEEDS YOUR ACTION
