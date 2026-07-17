@@ -2,6 +2,47 @@ BALAJI NEXTGEN ERP — KITCHEN/INVENTORY FIX PACKAGE
 ====================================================
 Generated: 17 July 2026
 
+🔴🔴🔴 CRITICAL CORRECTION — READ THIS FIRST 🔴🔴🔴
+====================================================
+Everything below about 08_CoreRouter.gs and 08_CoreRouter_COMPLETE.gs
+was going into a file that NEVER ACTUALLY RUNS. Proven by exact string
+match: your live /exec URL returns "Balaji NextGen Restaurant ERP API
+is live (v3 - 3-database architecture)" — that message only exists in
+a DIFFERENT file (your "Code.gs" / Code_RestaurantERP.gs, the one with
+its own doPost/doGet/route()). Since both files declared top-level
+doPost/doGet, Apps Script silently picked that one, not
+08_CoreRouter.gs — no matter what was correctly written in the router.
+
+USE THIS FILE INSTEAD: Code_RestaurantERP_v4_ACTUAL_LIVE_FILE.gs
+
+This is your real, live Code.gs (v3) with the actual bugs fixed:
+  - SAVE_KITCHEN_INDENT now accepts items[] batch — THIS is what was
+    causing the blank ITEM_NAME/UNIT/REQUIRED_QTY bug this whole time.
+    v3 only read a single top-level item, never looked inside items[].
+  - GET_ITEMS added — reads 34_ITEM_MASTER (confirmed by v3's own
+    comments as where real data lives, not the empty ITEM_MASTER tab)
+  - SYNC_PUSH_TABLE/SYNC_PULL_ALL — real implementation (v3 explicitly
+    returned "not implemented" for push)
+  - GET_CONSUMPTION_HISTORY added
+  - SAVE_BAR_INDENT / bar-aware GET_PENDING_INDENTS / APPROVE_ISSUE_INDENT added
+
+DO THIS:
+1. Paste Code_RestaurantERP_v4_ACTUAL_LIVE_FILE.gs's content over your
+   live Code.gs file (the one that actually says "v3 - 3-database
+   architecture" when you hit the URL directly)
+2. Deploy → Manage deployments → New version → Deploy
+3. ALSO CHECK: 07_ERPDatabaseRouter.gs and 09_MainRouter.gs — both
+   sound like they could ALSO define doPost/doGet. If they do, you
+   have 3+ competing entry points. Search each for "function doPost"
+   and "function doGet" and remove/rename any that shouldn't be live.
+4. Test SAVE_KITCHEN_INDENT and GET_ITEMS again — both should finally
+   work correctly.
+
+You can ignore 08_CoreRouter_COMPLETE.gs and everything said about it
+below — it may still be useful as a reference for action names/shapes,
+but it's not the file to actually deploy.
+
+
 FILES IN THIS ZIP
 ------------------
 1. kitchen-indent.html  — Kitchen Indent screen, fully rewired
