@@ -3483,15 +3483,30 @@ async function sheetsAppendRowByHeader(spreadsheetId, sheetName, fieldsByHeader)
   if(data.error) throw new Error(data.error.message||`Could not append to "${sheetName}"`);
   return data;
 }
+// Looks up this client's CL#### ID from CLIENT_REGISTRY by matching the
+// company name — used to name the new DB consistently with the existing
+// CL0001x_MASTER_DB / CL0001x_TRANSACTION_DB convention already in use.
+async function lookupClientId(mcSheet, clientName){
+  const rows=await sheetsGetValues(mcSheet, 'CLIENT_REGISTRY!A:J');
+  const header=rows[0]||[];
+  const idCol=header.indexOf('CLIENT_ID'), nameCol=header.indexOf('CLIENT_NAME');
+  if(idCol<0||nameCol<0) return null;
+  const norm=s=>String(s||'').trim().toLowerCase();
+  const hit=rows.slice(1).find(r=>norm(r[nameCol])===norm(clientName));
+  return hit ? hit[idCol] : null;
+}
 function provisionLog(msg, cls){
   const el=document.getElementById('provisionLog'); if(!el) return;
   const c = cls==='err'?'#DC2626':cls==='ok'?'#16A34A':'#334155';
   el.innerHTML += `<div style="color:${c};">${msg}</div>`;
 }
-// Checks the client's HR Module Drive folder. If it already has files in
-// it, that's treated as "client database already exists" and nothing is
-// touched. Only when the folder is genuinely empty does it copy the TEM032
-// template in and log a new row to DATABASE_REGISTRY.
+// The authoritative check is DATABASE_REGISTRY itself (MODULE="HR" +
+// OWNER=this client) — that's the real source of truth for "does this
+// client already have a separate HR database", matching the actual columns
+// (DATABASE_ID, DATABASE_NAME, SPREADSHEET_ID, MODULE, OWNER, STATUS,
+// CREATED_DATE, LAST_UPDATED, DB_VERSION, MIGRATION_STATUS) found in the
+// real Master Control sheet. The destination Drive folder is checked too,
+// as a heads-up, but registry presence is what decides whether to copy.
 async function provisionHrModuleDb(){
   const el=document.getElementById('provisionLog'); if(el) el.innerHTML='';
   if(!gdriveAccessToken){ toast('Connect Google Drive first','err'); nav('gdrive'); return; }
@@ -3501,28 +3516,50 @@ async function provisionHrModuleDb(){
     toast('Fill in the ERP Master Control fields in Company Settings first','err');
     return;
   }
+  const clientName = activeClient().name || settings.company || 'Client';
   try{
-    provisionLog('▶ Checking HR Module folder for existing files…');
-    const children=await gdriveListFolderChildren(hrFolder);
-    if(children.length){
-      provisionLog(`✔ Folder already has ${children.length} file(s) (${children.map(f=>esc(f.name)).join(', ')}) — client database already exists, nothing copied.`,'ok');
+    provisionLog(`▶ Looking up "${esc(clientName)}" in CLIENT_REGISTRY…`);
+    const clientId = await lookupClientId(mcSheet, clientName);
+    if(clientId) provisionLog(`✔ Found client ID: ${esc(clientId)}`,'ok');
+    else provisionLog(`⚠ No CLIENT_REGISTRY row matched this company name exactly — continuing without a CL#### prefix.`,'err');
+
+    provisionLog('▶ Checking DATABASE_REGISTRY for an existing HR database for this client…');
+    const dbRows = await sheetsGetValues(mcSheet, 'DATABASE_REGISTRY!A:J');
+    const dbHeader = dbRows[0]||[];
+    const modCol=dbHeader.indexOf('MODULE'), ownCol=dbHeader.indexOf('OWNER'), nameCol=dbHeader.indexOf('DATABASE_NAME');
+    const norm=s=>String(s||'').trim().toLowerCase();
+    const existing = dbRows.slice(1).find(r=>
+      norm(r[modCol])==='hr' && (norm(r[ownCol])===norm(clientId||'')||norm(r[ownCol])===norm(clientName))
+    );
+    if(existing){
+      provisionLog(`✔ Already registered: "${esc(existing[nameCol])}" — client database already exists, nothing copied.`,'ok');
       toast('HR Module DB already exists — skipped');
       return;
     }
-    provisionLog('ℹ Folder is empty — no client database record found. Copying TEM032 template…');
-    const clientName = activeClient().name || settings.company || 'Client';
-    const newName = `${clientName}_HR_MASTER_DB`;
-    const copied = await gdriveCopyFile(tem032, newName, hrFolder);
+
+    provisionLog('ℹ No HR database record found for this client. Checking destination folder…');
+    const children=await gdriveListFolderChildren(hrFolder);
+    if(children.length) provisionLog(`⚠ Note: HR Module folder already has ${children.length} file(s) not yet in the registry — copying anyway and registering this new one.`,'err');
+
+    const dbName = clientId ? `${clientId}_HR_MASTER_DB` : `${clientName.replace(/[^A-Za-z0-9]+/g,'_')}_HR_MASTER_DB`;
+    provisionLog(`▶ Copying TEM032 template as "${esc(dbName)}"…`);
+    const copied = await gdriveCopyFile(tem032, dbName, hrFolder);
     const link = `https://docs.google.com/spreadsheets/d/${copied.id}/edit`;
-    provisionLog(`✔ Copied template as "${esc(newName)}" — <a href="${link}" target="_blank">${link}</a>`,'ok');
+    provisionLog(`✔ Copied — <a href="${link}" target="_blank">${link}</a>`,'ok');
+
     provisionLog('▶ Logging new row to DATABASE_REGISTRY…');
     const now=new Date().toISOString();
     await sheetsAppendRowByHeader(mcSheet, 'DATABASE_REGISTRY', {
-      TEMPLATE_ID:'TEM032', CLIENT_NAME:clientName, INDUSTRY:'HR',
-      TEMPLATE_NAME:'BALAJI_NEXTGEN_HR_PAYROLL_MASTER_DB',
-      GOOGLE_SHEET_ID:copied.id, GOOGLE_DRIVE_FOLDER_ID:hrFolder,
-      VERSION:'2.0', STATUS:'ACTIVE', CREATED_AT:now, UPDATED_AT:now,
-      LINK:link, APP_NAME:'HR_MASTER_DB'
+      DATABASE_ID: clientId ? `${clientId}_HR` : `HR_${Date.now()}`,
+      DATABASE_NAME: dbName,
+      SPREADSHEET_ID: copied.id,
+      MODULE: 'HR',
+      OWNER: clientId || clientName,
+      STATUS: 'ACTIVE',
+      CREATED_DATE: now,
+      LAST_UPDATED: now,
+      DB_VERSION: 'v1.0',
+      MIGRATION_STATUS: 'OK'
     });
     provisionLog('✔ DATABASE_REGISTRY updated.','ok');
     toast('HR Module DB provisioned ✓');
