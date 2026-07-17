@@ -54,10 +54,10 @@ async function erpApi(action, payload){
     // Added to find the persistent blank ITEM_NAME/UNIT/REQUIRED_QTY bug
     // in SAVE_KITCHEN_INDENT without needing the Network tab — this
     // prints directly in Console. Safe to remove once that bug is found.
-    console.log('[erpApi] →', action, JSON.parse(JSON.stringify(body)));
+    console.log('[erpApi] → ' + action + ' ' + JSON.stringify(body));
     const resp = await fetch(KITCHEN_INDENT_API_URL, { method:'POST', body: JSON.stringify(body) });
     const json = await resp.json();
-    console.log('[erpApi] ←', action, json);
+    console.log('[erpApi] ← ' + action + ' ' + JSON.stringify(json));
     return json;
   }catch(e){
     console.error('[erpApi] ERROR', action, e.message);
@@ -379,7 +379,7 @@ td.num{font-family:'JetBrains Mono',monospace;font-weight:600;text-align:right;}
     <div class="tab-pane" id="pane-history">
       <div class="card">
         <div class="card-hdr">
-          <h3>📋 Indent History (Last 30 Days)</h3>
+          <h3>📋 Indent History</h3>
           <div style="display:flex;gap:6px;">
             <input type="text" placeholder="Search…" style="padding:6px 10px;border:1.5px solid var(--border);border-radius:6px;font-size:12px;background:var(--bg);color:var(--text);font-family:inherit;outline:none;" oninput="filterHistory(this.value)">
             <select class="tb-btn" onchange="filterHistoryStatus(this.value)" style="padding:6px 10px;">
@@ -387,6 +387,21 @@ td.num{font-family:'JetBrains Mono',monospace;font-weight:600;text-align:right;}
               <option>Pending</option><option>Approved</option><option>Received</option>
             </select>
           </div>
+        </div>
+        <!-- FIX ("check day/month/qtr/year/customer date"): date-range
+             filter, was fixed at "Last 30 Days" with no way to change it. -->
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:0 18px 14px;">
+          <button class="tb-btn active" data-range="today" onclick="setHistoryRange('today',this)">Today</button>
+          <button class="tb-btn" data-range="week" onclick="setHistoryRange('week',this)">This Week</button>
+          <button class="tb-btn" data-range="month" onclick="setHistoryRange('month',this)">This Month</button>
+          <button class="tb-btn" data-range="quarter" onclick="setHistoryRange('quarter',this)">This Quarter</button>
+          <button class="tb-btn" data-range="year" onclick="setHistoryRange('year',this)">This Year</button>
+          <button class="tb-btn" data-range="all" onclick="setHistoryRange('all',this)">All Time</button>
+          <span style="width:1px;height:20px;background:var(--border);margin:0 4px;"></span>
+          <input type="date" id="histFromDate" style="padding:5px 8px;border:1.5px solid var(--border);border-radius:6px;font-size:12px;background:var(--bg);color:var(--text);">
+          <span style="color:var(--muted);font-size:12px;">to</span>
+          <input type="date" id="histToDate" style="padding:5px 8px;border:1.5px solid var(--border);border-radius:6px;font-size:12px;background:var(--bg);color:var(--text);">
+          <button class="tb-btn primary" onclick="setHistoryRange('custom',null)">Apply</button>
         </div>
         <div class="tbl-wrap">
           <table>
@@ -486,7 +501,14 @@ td.num{font-family:'JetBrains Mono',monospace;font-weight:600;text-align:right;}
 
 <script>
 // ── ITEM DATA ──
-const INDENT_ITEMS = [
+// FIX ("indent items load default"): this was a permanently hardcoded
+// list, never synced with your real RAW_MATERIAL_MASTER/ITEM_MASTER —
+// any new/removed item on your actual master list would never show
+// here. Renamed to a FALLBACK, used only if the real backend fetch
+// (GET_ITEMS, already built server-side in 46_LiveInventoryBridge.gs)
+// fails — so the screen still works offline/on error, but always
+// prefers real data when the server is reachable.
+const INDENT_ITEMS_FALLBACK = [
   // English Vegetables
   {id:'EV01',name:'ASPARAGUS',cat:'English Vegetable',uom:'GM',stock:200,min:100},
   {id:'EV02',name:'AVOCADO',cat:'English Vegetable',uom:'PC',stock:5,min:4},
@@ -627,8 +649,26 @@ const INDENT_ITEMS = [
   {id:'FL02',name:'CHARCOAL',cat:'Fuel',uom:'KG',stock:10,min:5},
 ];
 
+let INDENT_ITEMS = INDENT_ITEMS_FALLBACK.slice();
 let qtyMap = {};
 let fullItemList = [...INDENT_ITEMS];
+
+// Fetches the real item list (GET_ITEMS, from ITEM_MASTER) and re-renders
+// the New Indent table with it. Falls back to the static list above if
+// the server can't be reached, so the screen still works either way.
+async function loadRealItems() {
+  const res = await erpApi('GET_ITEMS', {});
+  if (!res || !res.success || !(res.data && res.data.items && res.data.items.length)) {
+    console.warn('[loadRealItems] Using fallback item list — backend returned no items or failed');
+    return;
+  }
+  INDENT_ITEMS = res.data.items.map(i => ({
+    id: i.ITEM_ID, name: i.NAME, cat: i.CATEGORY || 'Other', uom: i.UNIT || '',
+    stock: Number(i.STOCK) || 0, min: Number(i.MIN_STOCK) || 0,
+  }));
+  fullItemList = [...INDENT_ITEMS];
+  renderTable(INDENT_ITEMS);
+}
 
 // ── RENDER TABLE ──
 function renderTable(items) {
@@ -781,6 +821,49 @@ function addHistoryRow(num) {
 // line per item rather than one line per "indent number" like the
 // old demo did — that grouped view isn't possible without adding a
 // BATCH_ID column to KITCHEN_INDENT. Ask me if you want that added.
+// FIX ("check day/month/qtr/year/customer date"): date-range filter for
+// Indent History. Backend DATE format is 'dd-MM-yyyy' (see 46_LiveInventoryBridge.gs) —
+// parsed explicitly rather than relying on new Date(str), which mis-parses
+// dd-MM-yyyy in most browsers (reads it as MM-dd-yyyy instead).
+function parseIndentDate(s) {
+  if (!s) return null;
+  const parts = String(s).split(/[-/]/);
+  if (parts.length !== 3) return null;
+  // dd-MM-yyyy (real backend format) vs dd/MM/yyyy (some older rows) — same order either way
+  const [d, m, y] = parts.map(Number);
+  if (!d || !m || !y) return null;
+  return new Date(y, m - 1, d);
+}
+let _historyRange = 'today';
+function setHistoryRange(range, el) {
+  _historyRange = range;
+  document.querySelectorAll('[data-range]').forEach(b => b.classList.remove('active'));
+  if (el) el.classList.add('active');
+  renderHistory();
+}
+function getHistoryRangeBounds() {
+  const now = new Date();
+  const startOfDay = d => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  if (_historyRange === 'today') return [startOfDay(now), startOfDay(now)];
+  if (_historyRange === 'week') {
+    const day = now.getDay(); // 0=Sun
+    const monday = new Date(now); monday.setDate(now.getDate() - ((day + 6) % 7));
+    return [startOfDay(monday), startOfDay(now)];
+  }
+  if (_historyRange === 'month') return [new Date(now.getFullYear(), now.getMonth(), 1), startOfDay(now)];
+  if (_historyRange === 'quarter') {
+    const q = Math.floor(now.getMonth() / 3);
+    return [new Date(now.getFullYear(), q * 3, 1), startOfDay(now)];
+  }
+  if (_historyRange === 'year') return [new Date(now.getFullYear(), 0, 1), startOfDay(now)];
+  if (_historyRange === 'custom') {
+    const from = document.getElementById('histFromDate').value;
+    const to = document.getElementById('histToDate').value;
+    return [from ? new Date(from) : null, to ? new Date(to) : null];
+  }
+  return [null, null]; // 'all'
+}
+
 let _historyCache = [];
 function todayDDMMYYYY() {
   const d = new Date();
@@ -804,11 +887,20 @@ async function loadIndentHistory() {
 }
 function renderHistory() {
   const tbody = document.getElementById('historyTbody');
-  if (!_historyCache.length) {
-    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:20px;">No indents yet.</td></tr>';
+  const [from, to] = getHistoryRangeBounds();
+  const filtered = _historyCache.filter(r => {
+    if (!from && !to) return true; // 'all'
+    const d = parseIndentDate(r.DATE);
+    if (!d) return true; // don't hide rows with unparseable dates
+    if (from && d < from) return false;
+    if (to && d > to) return false;
+    return true;
+  });
+  if (!filtered.length) {
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:20px;">No indents in this range.</td></tr>';
     return;
   }
-  tbody.innerHTML = _historyCache.slice().reverse().map(r => {
+  tbody.innerHTML = filtered.slice().reverse().map(r => {
     const status = String(r.STATUS || 'PENDING').toLowerCase();
     return `<tr>
     <td><strong>${r.IND_ID || ''}</strong></td><td>${r.DATE || ''}</td>
@@ -901,12 +993,83 @@ function viewIndentDetail(indId) {
   `;
 
   document.getElementById('viewIndentFooter').innerHTML = isPending ? `
+    <button class="tb-btn" onclick="printIndentDetail('${r.IND_ID}')">🖨 Print / PDF</button>
+    <button class="tb-btn" onclick="shareIndentWhatsApp('${r.IND_ID}')">💬 WhatsApp</button>
     <button class="tb-btn" onclick="indentCloseModal('viewIndentModal')">Close</button>
     <button class="tb-btn danger" onclick="approveIndent('${r.IND_ID}', 0)">✕ Reject</button>
     <button class="tb-btn primary" onclick="approveIndent('${r.IND_ID}', parseFloat(document.getElementById('viewIssueQty').value) || 0)">✓ Approve &amp; Issue</button>
-  ` : `<button class="tb-btn" onclick="indentCloseModal('viewIndentModal')">Close</button>`;
+  ` : `
+    <button class="tb-btn" onclick="printIndentDetail('${r.IND_ID}')">🖨 Print / PDF</button>
+    <button class="tb-btn" onclick="shareIndentWhatsApp('${r.IND_ID}')">💬 WhatsApp</button>
+    <button class="tb-btn" onclick="indentCloseModal('viewIndentModal')">Close</button>`;
 
   indentOpenModal('viewIndentModal');
+}
+
+// FIX ("can print proper format"): opens a clean, print-only formatted
+// page for one indent — in the browser's Print dialog, choosing
+// "Save as PDF" as the destination produces a real PDF file. There is
+// no client-side JS way to skip that dialog and generate a PDF file
+// silently without a PDF-generation library (none is loaded in this
+// file) — this is the standard way this is done in plain HTML/JS.
+function printIndentDetail(indId) {
+  const r = _pendingCache.find(x => x.IND_ID === indId) || _historyCache.find(x => x.IND_ID === indId);
+  if (!r) { showToast('Indent not found', 'warn'); return; }
+  const status = String(r.STATUS || 'PENDING').toUpperCase();
+  const win = window.open('', '_blank');
+  win.document.write(`
+    <html><head><title>Indent ${r.IND_ID}</title>
+    <style>
+      body{font-family:Arial,sans-serif;padding:32px;color:#1a1a1a;}
+      h1{font-size:20px;border-bottom:2px solid #c2590a;padding-bottom:10px;}
+      table{width:100%;border-collapse:collapse;margin-top:20px;}
+      td{padding:8px 4px;border-bottom:1px solid #ddd;}
+      td:first-child{color:#666;width:160px;}
+      .footer{margin-top:40px;font-size:11px;color:#888;}
+    </style></head><body>
+    <h1>📦 Kitchen Indent — ${r.IND_ID}</h1>
+    <table>
+      <tr><td>Date</td><td><strong>${r.DATE || ''}</strong></td></tr>
+      <tr><td>Item</td><td><strong>${r.ITEM_NAME || ''}</strong></td></tr>
+      <tr><td>Requested Qty</td><td>${r.REQUIRED_QTY || 0} ${r.UNIT || ''}</td></tr>
+      <tr><td>Issued Qty</td><td>${r.ISSUED_QTY || 0} ${r.UNIT || ''}</td></tr>
+      <tr><td>Requested By</td><td>${r.ISSUED_BY || ''}</td></tr>
+      <tr><td>Context</td><td>${r.REMARKS || ''}</td></tr>
+      <tr><td>Status</td><td><strong>${status}</strong></td></tr>
+    </table>
+    <div class="footer">Balaji NextGen ERP — Kitchen Indent · Printed ${new Date().toLocaleString('en-IN')}</div>
+    <script>window.onload = () => window.print();<\/script>
+    </body></html>
+  `);
+  win.document.close();
+}
+
+// FIX ("whatsapp both text and pdf copy direct shared to inventory to
+// store"): a browser cannot silently attach a generated PDF to a
+// WhatsApp message — WhatsApp's web/app links (wa.me) only support
+// pre-filled TEXT, never a file attachment, for security reasons (no
+// browser or website is allowed to do this without the user manually
+// picking the file). So the real flow is: (1) use Print/PDF above and
+// choose "Save as PDF" in the print dialog, (2) this button opens
+// WhatsApp with the text summary pre-filled, (3) manually attach the
+// saved PDF from WhatsApp's own attach button. This is a WhatsApp
+// platform limitation, not something fixable from this file.
+function shareIndentWhatsApp(indId) {
+  const r = _pendingCache.find(x => x.IND_ID === indId) || _historyCache.find(x => x.IND_ID === indId);
+  if (!r) { showToast('Indent not found', 'warn'); return; }
+  const lines = ['📦 *KITCHEN INDENT*', '━━━━━━━━━',
+    '🏷️ Indent No : *' + r.IND_ID + '*',
+    '📅 Date      : ' + (r.DATE || ''),
+    '🍽️ Item      : ' + (r.ITEM_NAME || ''),
+    '📊 Qty       : ' + (r.REQUIRED_QTY || 0) + ' ' + (r.UNIT || ''),
+    '👤 By        : ' + (r.ISSUED_BY || ''),
+    '📋 Status    : ' + String(r.STATUS || 'PENDING').toUpperCase(),
+    '━━━━━━━━━', '_Balaji NextGen ERP Kitchen_'];
+  const msg = lines.join('\n');
+  showToast('Opening WhatsApp — attach the saved PDF manually if needed', 'ok');
+  const waNum = localStorage.getItem('BNJ_FACTORY_WA') || '';
+  if (waNum) window.open('https://wa.me/' + waNum.replace(/[^0-9]/g, '') + '?text=' + encodeURIComponent(msg), '_blank');
+  else if (navigator.clipboard) { navigator.clipboard.writeText(msg); showToast('Copied — paste in WhatsApp', 'success'); }
 }
 function filterHistory(val) {
   const v = val.toLowerCase();
@@ -1010,6 +1173,7 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('indentDate').value = new Date().toISOString().split('T')[0];
   document.getElementById('topDate').textContent = new Date().toLocaleDateString('en-IN', {weekday:'short',day:'numeric',month:'short',year:'numeric'});
   renderTable(INDENT_ITEMS);
+  loadRealItems();
   loadIndentHistory();
   loadPendingIndents();
 });
