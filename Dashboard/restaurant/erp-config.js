@@ -144,8 +144,20 @@
   }
 
   /* ── Session Helpers ── */
+  /* FIX: welcome.html (the actual login/session-setting page) stores
+     the session under 'ERP_USER' (uppercase), never 'erpUser'. This
+     function previously only checked 'erpUser', so any page using
+     ERP.getUser() (like chef-dashboard.html's login guard) always got
+     null even for a genuinely logged-in user — causing an immediate
+     redirect back to login, which then bounced back to welcome since
+     it saw a valid ERP_USER session there. Now checks ERP_USER first
+     (the real key), falling back to erpUser for compatibility. */
   function getUser() {
-    try { return JSON.parse(sessionStorage.getItem('erpUser') || localStorage.getItem('erpUser') || 'null'); }
+    try {
+      var raw = localStorage.getItem('ERP_USER') || sessionStorage.getItem('ERP_USER')
+             || sessionStorage.getItem('erpUser') || localStorage.getItem('erpUser') || 'null';
+      return JSON.parse(raw);
+    }
     catch(e) { return null; }
   }
 
@@ -153,6 +165,11 @@
     const s = JSON.stringify(u);
     sessionStorage.setItem('erpUser', s);
     localStorage.setItem('erpUser', s);
+    /* FIX: also write ERP_USER — the key welcome.html and other
+       pages actually check — so a session set via ERP.setUser()
+       is recognized everywhere, not just by pages using erpUser. */
+    sessionStorage.setItem('ERP_USER', s);
+    localStorage.setItem('ERP_USER', s);
     /* Also cache the client's DB IDs so modules can read them instantly */
     const db = getClientDB(u.CLIENT_ID);
     if (db) {
