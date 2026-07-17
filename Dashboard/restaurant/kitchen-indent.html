@@ -406,6 +406,16 @@ td.num{font-family:'JetBrains Mono',monospace;font-weight:600;text-align:right;}
   </div>
 </div>
 
+<!-- View Indent Modal — lets Store see full details and adjust issue
+     qty BEFORE approving/rejecting, instead of guessing from a list row -->
+<div class="modal-overlay" id="viewIndentModal">
+  <div class="modal" style="max-width:480px;">
+    <div class="modal-hdr"><h2>📋 Indent Detail</h2><button class="modal-close" onclick="indentCloseModal('viewIndentModal')">✕</button></div>
+    <div class="modal-body" id="viewIndentBody" style="font-size:13px;line-height:1.8;"></div>
+    <div class="modal-ftr" id="viewIndentFooter"></div>
+  </div>
+</div>
+
 <!-- Confirm Modal -->
 <div class="modal-overlay" id="confirmModal">
   <div class="modal" style="max-width:480px;">
@@ -630,7 +640,7 @@ function renderTable(items) {
         <td style="font-family:'JetBrains Mono',monospace;font-weight:600;font-size:11px;">${item.uom}</td>
         <td class="num" style="color:${lowStock?'var(--red)':'var(--green)'};">${item.stock} ${item.uom}</td>
         <td class="num" style="color:var(--muted);">${item.min} ${item.uom}</td>
-        <td><input type="number" class="qty-input${val?' filled':''}" min="0" step="0.1" value="${val}" placeholder="0" data-id="${item.id}" oninput="onQtyChange('${item.id}',this)"></td>
+        <td><input type="number" class="qty-input${val?' filled':''}" min="0" step="0.1" value="${val}" placeholder="0" data-id="${item.id}" oninput="onQtyChange('${item.id}',this)" onkeydown="handleQtyArrowKey(event,this)"></td>
         <td><input type="text" style="width:120px;padding:5px 8px;border:1.5px solid var(--border);border-radius:6px;font-size:11px;background:var(--bg);color:var(--text);font-family:inherit;" placeholder="Remarks…" data-remarks="${item.id}"></td>
       </tr>`;
     });
@@ -643,6 +653,20 @@ function onQtyChange(id, el) {
   const v = parseFloat(el.value);
   if (v > 0) { qtyMap[id] = v; el.classList.add('filled'); } else { delete qtyMap[id]; el.classList.remove('filled'); }
   updateSummary();
+}
+// FIX ("keyboard up/down arrow can work easily fillup"): number inputs
+// already support ArrowUp/ArrowDown natively in most browsers, but the
+// step was too small to be quick to use (0.1) and it never called
+// onQtyChange, so the running total/summary didn't update until you
+// clicked away. This makes Up/Down a full +1/-1 step and immediately
+// syncs qtyMap + the summary bar, same as manual typing does.
+function handleQtyArrowKey(e, el) {
+  if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+  e.preventDefault();
+  const cur = parseFloat(el.value) || 0;
+  const next = e.key === 'ArrowUp' ? cur + 1 : Math.max(0, cur - 1);
+  el.value = next;
+  onQtyChange(el.dataset.id, el);
 }
 function updateSummary() {
   const count = Object.keys(qtyMap).length;
@@ -703,6 +727,7 @@ function finalSubmit() {
     dept: dept, shift: shift, priority: priority, issuedBy: by,
   }).then(function(res){
     if(!res || !res.success){ showToast('⚠ Indent saved locally but Store was not reachable — retry later','warn'); }
+    else { loadIndentHistory(); loadPendingIndents(); }
   });
 
   var lines = ['\u{1F4E6} *KITCHEN INDENT REQUEST*','\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501',
@@ -717,7 +742,6 @@ function finalSubmit() {
 
   qtyMap = {}; renderTable(INDENT_ITEMS);
   showToast('\u2713 Indent '+num+' submitted!','success');
-  addHistoryRow(num);
 
   var waNum = localStorage.getItem('BNJ_FACTORY_WA') || '';
   if(!waNum){ waNum = prompt('Factory/Store WhatsApp number (with country code):','919832014403'); if(waNum) localStorage.setItem('BNJ_FACTORY_WA', waNum.replace(/[^0-9]/g,'')); }
@@ -741,37 +765,129 @@ function addHistoryRow(num) {
 }
 
 // ── HISTORY DATA ──
-const HISTORY = [
-  {num:'IND-004821',date:'03/06/2026',shift:'Lunch',dept:'Main Kitchen',items:12,by:'Head Chef',priority:'Normal',status:'received'},
-  {num:'IND-004820',date:'03/06/2026',shift:'Breakfast',dept:'Bakery',items:5,by:'Bakery Chef',priority:'Normal',status:'approved'},
-  {num:'IND-004819',date:'02/06/2026',shift:'Dinner',dept:'Main Kitchen',items:8,by:'Head Chef',priority:'Urgent',status:'approved'},
-  {num:'IND-004818',date:'02/06/2026',shift:'Lunch',dept:'Bar',items:6,by:'Bar Manager',priority:'Normal',status:'received'},
-  {num:'IND-004817',date:'01/06/2026',shift:'All Day',dept:'Main Kitchen',items:15,by:'Head Chef',priority:'Normal',status:'received'},
-];
-const PENDING_ITEMS = [
-  {item:'ONION BIG',qty:10,uom:'KG',by:'Head Chef',time:'09:30 AM',priority:'Urgent'},
-  {item:'FRESH CORIANDER',qty:2,uom:'KG',by:'Head Chef',time:'10:00 AM',priority:'Normal'},
-  {item:'CHICKEN BREAST B/L',qty:5,uom:'KG',by:'Head Chef',time:'11:15 AM',priority:'Urgent'},
-];
+// FIX: previously hardcoded demo arrays (IND-004821 etc) that never
+// matched the real KITCHEN_INDENT sheet. Now fetches real rows via
+// GET_PENDING_INDENTS (already built server-side, never called from
+// this screen before). NOTE: your real sheet stores one row per item
+// per submission (no shared batch/submission ID), so this lists one
+// line per item rather than one line per "indent number" like the
+// old demo did — that grouped view isn't possible without adding a
+// BATCH_ID column to KITCHEN_INDENT. Ask me if you want that added.
+let _historyCache = [];
+async function loadIndentHistory() {
+  const tbody = document.getElementById('historyTbody');
+  tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:20px;">Loading…</td></tr>';
+  const res = await erpApi('GET_PENDING_INDENTS', {});
+  if (!res || !res.success) {
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--red);padding:20px;">Could not load history — Store server unreachable.</td></tr>';
+    return;
+  }
+  _historyCache = (res.data && res.data.indents || []).filter(r => r.INDENT_TYPE === 'KITCHEN');
+  renderHistory();
+}
 function renderHistory() {
-  document.getElementById('historyTbody').innerHTML = HISTORY.map(r => `<tr>
-    <td><strong>${r.num}</strong></td><td>${r.date}</td><td>${r.shift}</td><td>${r.dept}</td>
-    <td class="num">${r.items}</td><td>${r.by}</td>
-    <td><span class="status-badge ${r.priority.toLowerCase()}">${r.priority}</span></td>
-    <td><span class="status-badge ${r.status}">${r.status.charAt(0).toUpperCase()+r.status.slice(1)}</span></td>
-    <td><button class="tb-btn" style="padding:3px 8px;font-size:10px;" onclick="showToast('Viewing '+r.num)">View</button></td>
-  </tr>`).join('');
+  const tbody = document.getElementById('historyTbody');
+  if (!_historyCache.length) {
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:20px;">No indents yet.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = _historyCache.slice().reverse().map(r => {
+    const status = String(r.STATUS || 'PENDING').toLowerCase();
+    return `<tr>
+    <td><strong>${r.IND_ID || ''}</strong></td><td>${r.DATE || ''}</td>
+    <td colspan="2" style="color:var(--muted);font-size:11px;">${r.REMARKS || ''}</td>
+    <td>${r.ITEM_NAME || ''}</td><td class="num">${r.REQUIRED_QTY || 0} ${r.UNIT || ''}</td>
+    <td>${r.ISSUED_BY || ''}</td>
+    <td><span class="status-badge ${status}">${status.charAt(0).toUpperCase()+status.slice(1)}</span></td>
+    <td><button class="tb-btn" style="padding:3px 8px;font-size:10px;" onclick="viewIndentDetail('${r.IND_ID}')">View</button></td>
+  </tr>`;
+  }).join('');
+}
+
+// FIX: Pending tab previously showed 3 hardcoded fake items with
+// Approve/Reject buttons that only called showToast() — no backend
+// call at all. Now fetches real PENDING kitchen indents and Approve
+// actually calls APPROVE_ISSUE_INDENT (already built server-side).
+let _pendingCache = [];
+async function loadPendingIndents() {
+  const tbody = document.getElementById('pendingTbody');
+  tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:20px;">Loading…</td></tr>';
+  const res = await erpApi('GET_PENDING_INDENTS', { status: 'PENDING' });
+  if (!res || !res.success) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--red);padding:20px;">Could not load pending indents — Store server unreachable.</td></tr>';
+    return;
+  }
+  _pendingCache = (res.data && res.data.indents || []).filter(r => r.INDENT_TYPE === 'KITCHEN');
+  renderPending();
 }
 function renderPending() {
-  document.getElementById('pendingTbody').innerHTML = PENDING_ITEMS.map(r => `<tr>
-    <td><strong>${r.item}</strong></td><td class="num">${r.qty}</td><td>${r.uom}</td>
-    <td>${r.by}</td><td style="color:var(--muted);font-size:11px;">${r.time}</td>
-    <td><span class="status-badge ${r.priority==='Urgent'?'urgent':'pending'}">${r.priority}</span></td>
+  const tbody = document.getElementById('pendingTbody');
+  if (!_pendingCache.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:20px;">Nothing pending.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = _pendingCache.map(r => `<tr>
+    <td><strong>${r.ITEM_NAME || ''}</strong></td><td class="num">${r.REQUIRED_QTY || 0}</td><td>${r.UNIT || ''}</td>
+    <td>${r.ISSUED_BY || ''}</td><td style="color:var(--muted);font-size:11px;">${r.DATE || ''}</td>
+    <td style="color:var(--muted);font-size:11px;">${r.REMARKS || ''}</td>
     <td style="display:flex;gap:4px;">
-      <button class="tb-btn success" style="padding:3px 8px;font-size:10px;" onclick="showToast('Approved!')">✓ Approve</button>
-      <button class="tb-btn danger" style="padding:3px 8px;font-size:10px;" onclick="showToast('Rejected')">✕</button>
+      <button class="tb-btn" style="padding:3px 8px;font-size:10px;" onclick="viewIndentDetail('${r.IND_ID}')">View</button>
+      <button class="tb-btn success" style="padding:3px 8px;font-size:10px;" onclick="approveIndent('${r.IND_ID}', ${r.REQUIRED_QTY || 0})">✓ Approve</button>
+      <button class="tb-btn danger" style="padding:3px 8px;font-size:10px;" onclick="approveIndent('${r.IND_ID}', 0)">✕ Reject</button>
     </td>
   </tr>`).join('');
+}
+async function approveIndent(indId, issuedQty) {
+  const by = document.getElementById('indentBy').value || 'Store';
+  const res = await erpApi('APPROVE_ISSUE_INDENT', { indentType: 'KITCHEN', indId, issuedQty, issuedBy: by });
+  if (res && res.success) {
+    showToast(issuedQty > 0 ? 'Issued' : 'Rejected');
+    loadPendingIndents();
+    loadIndentHistory();
+    indentCloseModal('viewIndentModal');
+  } else {
+    showToast('⚠ Action failed — Store server unreachable', 'warn');
+  }
+}
+
+// FIX ("need to view which is indent given, can check and alter before
+// approve or issue"): View previously only showed a toast with the ID.
+// Now opens a real modal with the full row (item, qty asked, dept/
+// shift/priority from REMARKS, current status) and — if still PENDING —
+// an editable "Issue Qty" field so Store can adjust the amount actually
+// being sent (e.g. partial stock available) before approving, instead
+// of only being able to approve the full requested qty from the list row.
+function viewIndentDetail(indId) {
+  const r = _pendingCache.find(x => x.IND_ID === indId) || _historyCache.find(x => x.IND_ID === indId);
+  if (!r) { showToast('Indent not found', 'warn'); return; }
+  const status = String(r.STATUS || 'PENDING').toUpperCase();
+  const isPending = status === 'PENDING' || status === 'PARTIALLY_ISSUED';
+
+  document.getElementById('viewIndentBody').innerHTML = `
+    <div style="display:grid;grid-template-columns:120px 1fr;row-gap:6px;">
+      <div style="color:var(--muted);">Indent ID</div><div><strong>${r.IND_ID}</strong></div>
+      <div style="color:var(--muted);">Date</div><div>${r.DATE || ''}</div>
+      <div style="color:var(--muted);">Item</div><div><strong>${r.ITEM_NAME || ''}</strong></div>
+      <div style="color:var(--muted);">Requested Qty</div><div>${r.REQUIRED_QTY || 0} ${r.UNIT || ''}</div>
+      <div style="color:var(--muted);">Requested By</div><div>${r.ISSUED_BY || ''}</div>
+      <div style="color:var(--muted);">Context</div><div style="color:var(--muted);font-size:12px;">${r.REMARKS || ''}</div>
+      <div style="color:var(--muted);">Status</div><div><span class="status-badge ${status.toLowerCase()}">${status}</span></div>
+    </div>
+    ${isPending ? `
+    <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border);">
+      <label style="font-size:12px;color:var(--muted);">Issue Qty (adjust if partial stock)</label>
+      <input type="number" id="viewIssueQty" min="0" step="0.1" value="${r.REQUIRED_QTY || 0}"
+        style="width:100%;margin-top:6px;padding:8px 10px;border:1.5px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-family:inherit;">
+    </div>` : ''}
+  `;
+
+  document.getElementById('viewIndentFooter').innerHTML = isPending ? `
+    <button class="tb-btn" onclick="indentCloseModal('viewIndentModal')">Close</button>
+    <button class="tb-btn danger" onclick="approveIndent('${r.IND_ID}', 0)">✕ Reject</button>
+    <button class="tb-btn primary" onclick="approveIndent('${r.IND_ID}', parseFloat(document.getElementById('viewIssueQty').value) || 0)">✓ Approve &amp; Issue</button>
+  ` : `<button class="tb-btn" onclick="indentCloseModal('viewIndentModal')">Close</button>`;
+
+  indentOpenModal('viewIndentModal');
 }
 function filterHistory(val) {
   const v = val.toLowerCase();
@@ -828,6 +944,8 @@ function setTab(name, el) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById('pane-' + name).classList.add('active');
   el.classList.add('active');
+  if (name === 'history') loadIndentHistory();
+  if (name === 'pending') loadPendingIndents();
 }
 
 // ── SETTINGS ──
@@ -873,8 +991,8 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('indentDate').value = new Date().toISOString().split('T')[0];
   document.getElementById('topDate').textContent = new Date().toLocaleDateString('en-IN', {weekday:'short',day:'numeric',month:'short',year:'numeric'});
   renderTable(INDENT_ITEMS);
-  renderHistory();
-  renderPending();
+  loadIndentHistory();
+  loadPendingIndents();
 });
 </script>
 
