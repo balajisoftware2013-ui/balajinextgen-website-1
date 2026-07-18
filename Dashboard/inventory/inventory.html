@@ -6436,10 +6436,23 @@ function switchIssTab(id, btn) {
   document.querySelectorAll('#p-issue .tab').forEach(t=>t.classList.remove('on'));
   if(btn)btn.classList.add('on');
 }
-function loadIssueRegister() {
-  const issues=DB.all('dept_issues').sort((a,b)=>b._ts>a._ts?1:-1);
+// FIX ("not sync system direct read and write"): these three
+// functions previously read/wrote to a local DB engine, synced only
+// periodically (and unreliably, per the CID resolution bug found
+// earlier) to the real backend. Now every load and every save talks
+// directly to DEPT_ISSUE_LOG via erpApi — same proven pattern as
+// kitchen-indent.html's GET_PENDING_INDENTS/SAVE_KITCHEN_INDENT.
+async function fetchDeptIssues(pendingAckOnly) {
+  const res = await erpApi('GET_DEPT_ISSUES', { pendingAckOnly: !!pendingAckOnly });
+  if (!res || !res.success) { toast('Could not reach server — check connection', 'e'); return []; }
+  return (res.data && res.data.issues) || [];
+}
+
+async function loadIssueRegister() {
   const regBody=document.getElementById('iss-reg-body');
   if(!regBody)return;
+  regBody.innerHTML = '<tr><td colspan="11" class="tbl-empty">Loading…</td></tr>';
+  const issues = (await fetchDeptIssues(false)).sort((a,b)=> a.date < b.date ? 1 : -1);
   const from=document.getElementById('iss-reg-from')?.value||'';
   const to=document.getElementById('iss-reg-to')?.value||'';
   const dept=document.getElementById('iss-reg-dept')?.value||'';
@@ -6448,44 +6461,56 @@ function loadIssueRegister() {
   if(to)filtered=filtered.filter(i=>i.date<=to);
   if(dept)filtered=filtered.filter(i=>i.dept===dept);
   regBody.innerHTML=filtered.length?filtered.map(iss=>`
-    <tr><td style="font-family:'JetBrains Mono',monospace;font-size:11px;">${iss._id}</td>
-    <td>${iss.date}</td><td>${iss.dept}</td><td>${iss.issued_to||'—'}</td>
+    <tr><td style="font-family:'JetBrains Mono',monospace;font-size:11px;">${iss.id}</td>
+    <td>${iss.date}</td><td>${iss.dept}</td><td>${iss.issuedTo||'—'}</td>
     <td class="r">${(iss.items||[]).length}</td>
     <td class="r" style="font-weight:700;">${fmt(iss.total||0)}</td>
-    <td>${DB.findOne('warehouses',{_id:iss.wh_id})?.name||'—'}</td>
-    <td class="estamp"><strong>Store Mgr</strong></td>
-    <td><span class="badge ${iss.ack_status==='acknowledged'?'g':iss.ack_required==='no'?'gr':'o'}">${iss.ack_status==='acknowledged'?'Acknowledged':iss.ack_required==='no'?'N/A':'Pending'}</span></td>
-    <td>${iss.ack_by||'—'}</td>
-    <td><button class="btn" style="padding:2px 7px;font-size:11px;" onclick="printIssueSplit('${iss._id}')">🖨 Slip</button></td></tr>
+    <td>${DB.findOne('warehouses',{_id:iss.warehouseId})?.name||iss.warehouseId||'—'}</td>
+    <td class="estamp"><strong>${iss.issuedBy || 'Unknown'}</strong></td>
+    <td><span class="badge ${iss.ackStatus==='acknowledged'?'g':iss.ackRequired==='no'?'gr':'o'}">${iss.ackStatus==='acknowledged'?'Acknowledged':iss.ackRequired==='no'?'N/A':'Pending'}</span></td>
+    <td>${iss.ackBy||'—'}</td>
+    <td><button class="btn" style="padding:2px 7px;font-size:11px;" onclick="printIssueSplit('${iss.id}')">🖨 Slip</button></td></tr>
   `).join(''):'<tr><td colspan="11" class="tbl-empty">No issue records found</td></tr>';
 }
-function loadPendingACK() {
-  const issues=DB.all('dept_issues').filter(i=>i.ack_required==='yes'&&i.ack_status!=='acknowledged');
+
+async function loadPendingACK() {
+  const body = document.getElementById('iss-ack-body');
+  body.innerHTML = '<tr><td colspan="8" class="tbl-empty">Loading…</td></tr>';
+  const issues = await fetchDeptIssues(true);
   const cnt=issues.length;
   const el=document.getElementById('nb-ack');if(el)el.textContent=cnt;
-  document.getElementById('iss-ack-body').innerHTML=issues.length?issues.map(iss=>{
+  body.innerHTML=issues.length?issues.map(iss=>{
     const daysPending=Math.floor((new Date()-new Date(iss.date))/86400000);
     return`<tr>
-      <td style="font-family:'JetBrains Mono',monospace;font-size:11px;">${iss._id}</td>
+      <td style="font-family:'JetBrains Mono',monospace;font-size:11px;">${iss.id}</td>
       <td>${iss.date}</td><td>${iss.dept}</td>
       <td class="r">${(iss.items||[]).length}</td><td class="r">${fmt(iss.total||0)}</td>
-      <td class="estamp"><strong>${iss.issued_by || 'Unknown'}</strong></td>
+      <td class="estamp"><strong>${iss.issuedBy || 'Unknown'}</strong></td>
       <td style="color:${daysPending>2?'var(--red)':'var(--orange)'};">${daysPending} days</td>
-      <td><button class="btn s" style="padding:2px 7px;font-size:11px;" onclick="acknowledgeIssue('${iss._id}')">✅ Acknowledge</button>
+      <td><button class="btn s" style="padding:2px 7px;font-size:11px;" onclick="acknowledgeIssue('${iss.id}')">✅ Acknowledge</button>
           <button class="btn" style="padding:2px 7px;font-size:11px;" onclick="toast('WhatsApp reminder sent','s')">💬 Remind</button></td>
     </tr>`;
   }).join(''):'<tr><td colspan="8" class="tbl-empty">No pending acknowledgments ✅</td></tr>';
 }
-function acknowledgeIssue(id) {
-  DB.update('dept_issues',id,{ack_status:'acknowledged',ack_by:SESSION.name||'Store Manager',ack_role:SESSION.role||'',ack_date:today()});
-  loadPendingACK();toast('Issue acknowledged ✓ by '+(SESSION.name||'Store Manager'),'s');
+
+async function acknowledgeIssue(id) {
+  const res = await erpApi('ACK_DEPT_ISSUE', { issueId: id, ackBy: SESSION.name||'Store Manager', ackRole: SESSION.role||'' });
+  if (res && res.success) {
+    loadPendingACK();
+    toast('Issue acknowledged ✓ by '+(SESSION.name||'Store Manager'),'s');
+  } else {
+    toast('⚠ Could not reach server — try again', 'e');
+  }
 }
 function showIssueHistory(){switchIssTab('iss-register',null);loadIssueRegister();}
 function showPendingACK(){switchIssTab('iss-pending-ack',null);loadPendingACK();}
 function printIssueSplit(id){window.print();toast('Issue slip printing...','');}
-// Override saveIssue to persist properly
+// Override saveIssue to persist directly to the real backend —
+// FIX ("not sync system direct read and write"): was only writing to
+// local storage (DB.insert), relying on the periodic sync layer to
+// eventually push it — now saves straight to DEPT_ISSUE_LOG on submit.
 const _origSaveIssue=saveIssue;
-window.saveIssue=function(){
+window.saveIssue=async function(){
   const dept=document.getElementById('iss-dept').value;
   const to=document.getElementById('iss-to').value.trim();
   const wh=document.getElementById('iss-wh').value;
@@ -6503,11 +6528,16 @@ window.saveIssue=function(){
     DB.insert('stock_ledger',{_id:uid('SL'),item_id:iid,wh_id:wh,date,txn_type:'dept_issue',qty_in:0,qty_out:qty,balance:Math.max(0,prev-qty),rate,value:qty*rate});
   });
   if(!items.length){toast('Add items to issue','e');return;}
-  const count=DB.all('dept_issues').length+1;
-  const issId='ISS/'+new Date().getFullYear()+'/'+String(count).padStart(4,'0');
-  DB.insert('dept_issues',{_id:issId,date,dept,issued_to:to,wh_id:wh,purpose:document.getElementById('iss-purpose')?.value||'',ack_required:ackReq,ack_status:'pending',items,total,issued_by:SESSION.name||'Store Manager'});
+  const res = await erpApi('SAVE_DEPT_ISSUE', {
+    date, dept, issuedTo: to, warehouseId: wh, purpose: document.getElementById('iss-purpose')?.value||'',
+    ackRequired: ackReq, items, total, issuedBy: SESSION.name||'Store Manager',
+  });
+  if (!res || !res.success) {
+    toast('⚠ Could not reach server — issue not saved, try again', 'e');
+    return;
+  }
   const nbEl=document.getElementById('nb-ack');if(nbEl)nbEl.textContent=parseInt(nbEl.textContent||0)+1;
-  toast('Issue '+issId+' saved — Stock updated ✓','s');
+  toast('Issue '+res.issueId+' saved — Stock updated ✓','s');
   document.getElementById('iss-items-body').innerHTML='';
   loadDashboard();
 };

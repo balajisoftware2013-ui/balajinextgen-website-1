@@ -203,6 +203,63 @@ function route(dbs, req){
     case 'BAR_STORE_RECEIVE':
       return bumpBarReceived(dbs.txnId, req);
 
+    // FIX ("not sync system direct read and write"): inventory.html's
+    // Dept Issue Register was entirely localStorage-based (via a
+    // local DB engine + a periodic SYNC_PUSH_TABLE/SYNC_PULL_ALL
+    // layer), which kept showing stale demo data due to CID
+    // resolution issues. These three actions replace that with direct
+    // read/write on every action, same pattern as SAVE_KITCHEN_INDENT/
+    // GET_PENDING_INDENTS — no local cache, no periodic sync, every
+    // page load and every save talks to the real sheet immediately.
+    case 'SAVE_DEPT_ISSUE': {
+      const issueId = req.id || Utilities.getUuid();
+      appendRowByHeader(dbs.txnId, 'DEPT_ISSUE_LOG',
+        ['ISSUE_ID','CLIENT_ID','DATE','DEPT','ISSUED_TO','WAREHOUSE_ID','PURPOSE','ACK_REQUIRED','ACK_STATUS','ITEMS_JSON','TOTAL','ISSUED_BY','ACK_BY','ACK_ROLE','ACK_DATE'],
+        {ISSUE_ID:issueId, CLIENT_ID:req.clientId, DATE:req.date||new Date(), DEPT:req.dept||'',
+         ISSUED_TO:req.issuedTo||'', WAREHOUSE_ID:req.warehouseId||'', PURPOSE:req.purpose||'',
+         ACK_REQUIRED:req.ackRequired||'yes', ACK_STATUS:'pending', ITEMS_JSON:JSON.stringify(req.items||[]),
+         TOTAL:req.total||0, ISSUED_BY:req.issuedBy||'', ACK_BY:'', ACK_ROLE:'', ACK_DATE:''}
+      );
+      return { success:true, issueId: issueId };
+    }
+
+    case 'GET_DEPT_ISSUES': {
+      const rows = readTable(dbs.txnId, 'DEPT_ISSUE_LOG');
+      const wantPendingOnly = req.pendingAckOnly === true || req.pendingAckOnly === 'true';
+      const mapped = rows.map(function(r){
+        let items = [];
+        try { items = JSON.parse(r.ITEMS_JSON || '[]'); } catch(e) {}
+        return {
+          id: r.ISSUE_ID, date: r.DATE, dept: r.DEPT, issuedTo: r.ISSUED_TO, warehouseId: r.WAREHOUSE_ID,
+          purpose: r.PURPOSE, ackRequired: r.ACK_REQUIRED, ackStatus: r.ACK_STATUS, items: items,
+          total: Number(r.TOTAL) || 0, issuedBy: r.ISSUED_BY, ackBy: r.ACK_BY, ackRole: r.ACK_ROLE, ackDate: r.ACK_DATE,
+        };
+      });
+      const filtered = wantPendingOnly
+        ? mapped.filter(function(i){ return i.ackRequired === 'yes' && i.ackStatus !== 'acknowledged'; })
+        : mapped;
+      return { success:true, data: { issues: filtered } };
+    }
+
+    case 'ACK_DEPT_ISSUE': {
+      const sh = sheet(dbs.txnId, 'DEPT_ISSUE_LOG');
+      if (!sh) return { success:false, message:'DEPT_ISSUE_LOG not found' };
+      const data = sh.getDataRange().getValues();
+      const hdr = data[0];
+      const idIdx = hdr.indexOf('ISSUE_ID'), statusIdx = hdr.indexOf('ACK_STATUS'),
+            byIdx = hdr.indexOf('ACK_BY'), roleIdx = hdr.indexOf('ACK_ROLE'), dateIdx = hdr.indexOf('ACK_DATE');
+      for (let i = 1; i < data.length; i++) {
+        if (String(data[i][idIdx]) === String(req.issueId)) {
+          sh.getRange(i+1, statusIdx+1).setValue('acknowledged');
+          sh.getRange(i+1, byIdx+1).setValue(req.ackBy || '');
+          sh.getRange(i+1, roleIdx+1).setValue(req.ackRole || '');
+          sh.getRange(i+1, dateIdx+1).setValue(new Date());
+          return { success:true };
+        }
+      }
+      return { success:false, message:'Issue not found: '+req.issueId };
+    }
+
     case 'SAVE_STOCK_ADJUSTMENT':
       appendRowByHeader(dbs.txnId, 'STOCK_ADJUSTMENTS',
         ['ADJ_ID','CLIENT_ID','DATE','ITEM_ID','ITEM_NAME','UNIT','DELTA','REASON','SOURCE','REFERENCE','ENTERED_BY','ENTRY_TIME'],
