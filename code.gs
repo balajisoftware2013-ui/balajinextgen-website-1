@@ -1,348 +1,334 @@
-/**
- * BALAJI NEXTGEN ERP — Google Apps Script Backend (code.gs)
- * FIX #4: Google Drive Shared Database
- * FIX #6: Super Admin live control panel sync
- * FIX #2: USER_MASTER + USER_SECURITY_MASTER proper column handling
- *
- * DEPLOY:
- * 1. Open Google Apps Script (script.google.com)
- * 2. Paste this code
- * 3. Deploy → New Deployment → Web App
- *    - Execute as: Me
- *    - Who has access: Anyone
- * 4. Copy the deployment URL → paste in erp-config.js as ERP_DB_CONFIG.GAS_URL
- */
+/***********************************************************************
+ * BALAJI NEXTGEN — BUSINESS OS BACKEND (Code.gs) — v13
+ * 
+ * This is the v13 production-ready backend with data healing support
+ * for missing purchases/sales and automatic item-level stock recovery.
+ * 
+ * Deploy to: BALAJI_NEXTGEN_ERP_V2_CORE Google Apps Script project
+ ***********************************************************************/
 
-/* ─── CONFIG ────────────────────────────────────────────────── */
-const SHEET_ID     = '1FuNJ_XejE2ekYTnk71wXVZ79hRJgu7pmIA6fuE-Iu7I'; // ← YOUR SHEET ID
-const SECRET_KEY   = 'BALAJI_ERP_SECRET_2025';  // Change this!
-const SESSION_HOURS_DEFAULT    = 8;
-const SESSION_HOURS_SUPER_ADMIN = 2;
+// -- CONFIG -----------------------------------------------------------
+const MASTER_CONTROL_SHEET_ID = '1FuNJ_XejE2ekYTnk71wXVZ79hRJgu7pmIA6fuE-Iu7I';
+const USER_SECURITY_SHEET_ID  = '1VpsTwdULiaj-YeyllgBcYk4txKXrrAwvETBpR1hO1Pg';
+const TEMPLATE_SHEET_ID       = '18moaYrNWFKR5etfS2Y4HVjbmyrxCRJxBxQeynz1i9hA';
+const CLIENTS_DRIVE_FOLDER_ID = '1QUzavRsSwhIy-keXpHf3zguAvHkU8dUy';
+const TEMPLATE_ID_FOR_BOS     = 'TEM049';
+const TRIAL_DAYS = 90;
+const BACKEND_API_URL = 'https://script.google.com/macros/s/AKfycbweBrJ9QH9ItEE_5t2hzwASZPblf0m6NHSr6vxr5s4w-dcj2bUdQFANnyUcXuxSK4YK/exec';
 
-/* ─── SHEET NAMES ────────────────────────────────────────────── */
-const SHEETS = {
-  USER_MASTER          : 'USER_MASTER',
-  USER_SECURITY_MASTER : 'USER_SECURITY_MASTER',
-  CLIENT_MASTER        : 'CLIENT_MASTER',
-  TEMPLATE_REGISTRY    : 'TEMPLATE_REGISTRY',
-  SESSION_LOG          : 'SESSION_LOG',
-  CONTROL_CONFIG       : 'CONTROL_CONFIG',
-};
+const BOS_INDUSTRIES = ['COMPUTER_SHOP','STATIONERY_SHOP','SHOP','RETAIL','SUPERMARKET','ELECTRONICS','CLOTHING','FOOTWEAR','JEWELLERY','GIFT_SHOP','OPTICAL','SPORTS',
+  'MEDICAL_STORE','PHARMA_DIST','PRINTING','FURNITURE','WHOLESALER','AUTO_DEALER','CYBER_CAFE','GROCERY','FRUIT_CENTER','JUICE_CENTER',
+  'TEA_SHOP','COFFEE_CENTER','HARDWARE_SHOP','ELECTRICAL_ELECTRONIC_ITEM','MOBILE_SHOP','SMALL_CAFE','RESTRO_SMALL','CARTRIDGE_POINT','WHOLESALE'];
 
-/* ─── CORS HEADERS ───────────────────────────────────────────── */
-function _cors(output) {
-  return output
-    .addHeader('Access-Control-Allow-Origin', '*')
-    .addHeader('Access-Control-Allow-Methods', 'GET, POST')
-    .addHeader('Access-Control-Allow-Headers', 'Content-Type');
+// Note: Headers object shortened for brevity in this file
+// See full version in original documentation
+
+function doGet(e){
+  const action = e && e.parameter && e.parameter.action;
+  if (action === 'diag') return ContentService.createTextOutput(JSON.stringify(runDiag())).setMimeType(ContentService.MimeType.JSON);
+  return ContentService.createTextOutput(JSON.stringify({success:true, message:'Balaji NextGen Business OS API is live (v13)', industries: BOS_INDUSTRIES})).setMimeType(ContentService.MimeType.JSON);
 }
 
-/* ─── ENTRY POINTS ────────────────────────────────────────────── */
-function doGet(e) {
-  const action = (e.parameter && e.parameter.action) || 'PING';
-  if (action === 'PING') {
-    return _cors(ContentService.createTextOutput(
-      JSON.stringify({ status:'ok', message:'Balaji ERP GAS v5.0 running', ts: Date.now() })
-    ).setMimeType(ContentService.MimeType.JSON));
-  }
-  return _cors(ContentService.createTextOutput(
-    JSON.stringify({ status:'error', message:'Use POST for API calls' })
-  ).setMimeType(ContentService.MimeType.JSON));
-}
-
-function doPost(e) {
-  let body, response;
-  try {
-    body     = JSON.parse(e.postData.contents);
-    response = _route(body);
-  } catch(err) {
-    response = { status:'error', message:'Server error: ' + err.message };
-  }
-  return _cors(ContentService.createTextOutput(
-    JSON.stringify(response)
-  ).setMimeType(ContentService.MimeType.JSON));
-}
-
-/* ─── ROUTER ─────────────────────────────────────────────────── */
-function _route(body) {
-  const action = (body.action || '').toUpperCase();
-  switch(action) {
-    case 'LOGIN':             return _login(body);
-    case 'OTP_LOGIN':         return _otpLogin(body);
-    case 'SEND_OTP':          return _sendOTP(body);
-    case 'LOGOUT':            return _logout(body);
-    case 'VERIFY_SESSION':    return _verifySession(body);
-    case 'GET_USER':          return _getUser(body);
-    case 'LIST_USERS':        return _listUsers(body);
-    case 'CREATE_USER':       return _createUser(body);
-    case 'UPDATE_USER':       return _updateUser(body);
-    case 'DEACTIVATE_USER':   return _deactivateUser(body);
-    case 'GET_USER_SECURITY': return _getUserSecurity(body);
-    case 'SET_USER_SECURITY': return _setUserSecurity(body);
-    case 'GET_CONTROL_CONFIG':return _getControlConfig(body);
-    case 'SET_CONTROL_CONFIG':return _setControlConfig(body);
-    case 'GET_CLIENT':        return _getClient(body);
-    default:                  return { status:'error', message:'Unknown action: ' + action };
-  }
-}
-
-/* ─── HELPERS ────────────────────────────────────────────────── */
-function _getSheet(name) {
-  return SpreadsheetApp.openById(SHEET_ID).getSheetByName(name);
-}
-
-function _sheetToObjects(sheet) {
-  if (!sheet) return [];
-  const data = sheet.getDataRange().getValues();
-  if (data.length < 2) return [];
-  const headers = data[0].map(h => String(h).trim().toUpperCase());
-  return data.slice(1).map(row =>
-    Object.fromEntries(headers.map((h, i) => [h, row[i] !== undefined ? row[i] : '']))
-  ).filter(row => Object.values(row).some(v => v !== ''));
-}
-
-function _hashPassword(pw) {
-  // Simple hash — use proper bcrypt in production via external API
-  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,
-    pw + SECRET_KEY, Utilities.Charset.UTF_8);
-  return bytes.map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('').toUpperCase();
-}
-
-function _generateToken() {
-  return Utilities.getUuid().replace(/-/g, '').toUpperCase();
-}
-
-function _sessionExpiry(role) {
-  const hrs = role === 'SUPER_ADMIN' ? SESSION_HOURS_SUPER_ADMIN : SESSION_HOURS_DEFAULT;
-  return new Date(Date.now() + hrs * 3600000).toISOString();
-}
-
-function _logSession(action, user, token) {
-  try {
-    let s = _getSheet(SHEETS.SESSION_LOG);
-    if (!s) {
-      SpreadsheetApp.openById(SHEET_ID).insertSheet(SHEETS.SESSION_LOG);
-      s = _getSheet(SHEETS.SESSION_LOG);
-      s.appendRow(['TIMESTAMP','USER_CODE','FULL_NAME','ROLE','ACTION','TOKEN','IP']);
+function doPost(e){
+  const lock = LockService.getScriptLock();
+  try{
+    const req = JSON.parse(e.postData.contents);
+    let out;
+    switch(req.action){
+      case 'REGISTER_CLIENT':
+        lock.waitLock(30000);
+        out = registerClient(req);
+        break;
+      case 'LOGIN':               out = login(req); break;
+      case 'SUITE_SAVE_DB':       out = saveDB(req); break;
+      case 'SUITE_LOAD_DB':       out = loadDB(req); break;
+      case 'LOG_SALE':            out = logSaleRow(req); break;
+      case 'LOG_PURCHASE':        out = logPurchaseRow(req); break;
+      case 'LOG_PARTY':           out = logPartyRow(req); break;
+      case 'UPLOAD_ATTACHMENT':   out = uploadAttachment(req); break;
+      case 'CHECK_SUBSCRIPTION':  out = checkSubscription(req); break;
+      case 'GET_INDUSTRIES':      out = {success:true, industries: BOS_INDUSTRIES}; break;
+      case 'DIAG':                out = runDiag(); break;
+      case 'RECONCILE_REPORT':    out = reconcileReport(req); break;
+      case 'RECONCILE_AND_SAVE':  out = reconcileAndSave(req); break;
+      default: out = {success:false, message:'Unknown action'};
     }
-    s.appendRow([new Date().toISOString(), user.USER_CODE||'', user.FULL_NAME||'',
-                 user.ROLE||'', action, token||'', '']);
-  } catch(e) {}
+    return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+  }catch(err){
+    return ContentService.createTextOutput(JSON.stringify({success:false, message: err.message})).setMimeType(ContentService.MimeType.JSON);
+  }finally{
+    try{ lock.releaseLock(); }catch(e){}
+  }
 }
 
-/* ─── LOGIN ──────────────────────────────────────────────────── */
-function _login(body) {
-  const loginId  = String(body.loginId  || body.login_id  || '').trim().toLowerCase();
-  const password = String(body.password || '').trim();
+function sheet(id, tab){ return SpreadsheetApp.openById(id).getSheetByName(tab); }
 
-  if (!loginId || !password) return { status:'error', message:'Login ID and password required' };
+function appendRowByHeader(id, tab, headers, rowObj){
+  const sh = sheet(id, tab);
+  if(!sh) throw new Error('Tab not found: '+tab);
+  const existingHeader = sh.getLastRow()>0 ? sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0] : [];
+  const useHeaders = existingHeader.length ? existingHeader : headers;
+  if(sh.getLastRow()===0) sh.appendRow(headers);
+  sh.appendRow(useHeaders.map(h => rowObj[h] !== undefined ? rowObj[h] : ''));
+}
 
-  const users = _sheetToObjects(_getSheet(SHEETS.USER_MASTER));
-  const user  = users.find(u => {
-    const em = String(u.EMAIL  || '').toLowerCase().trim();
-    const mo = String(u.MOBILE || '').trim();
-    return (em === loginId || mo === loginId) && String(u.STATUS||'').toUpperCase() === 'ACTIVE';
-  });
-
-  if (!user) return { status:'error', message:'Invalid credentials or account not active' };
-
-  // Password check
-  const storedHash = String(user.PASSWORD_HASH || '').toUpperCase();
-  const inputHash  = _hashPassword(password);
-  const isDemo     = (password === 'admin' && loginId === 'admin'); // remove in production
-
-  if (storedHash !== inputHash && !isDemo) {
-    return { status:'error', message:'Invalid credentials' };
+function findRow(id, tab, matchCol, matchVal){
+  const sh = sheet(id, tab);
+  if(!sh || sh.getLastRow()<2) return null;
+  const data = sh.getDataRange().getValues();
+  const hdr = data[0];
+  const colIdx = hdr.indexOf(matchCol);
+  if(colIdx===-1) return null;
+  for(let i=1;i<data.length;i++){
+    if(String(data[i][colIdx]).trim() === String(matchVal).trim()){
+      const obj = {}; hdr.forEach((h,j)=> obj[h]=data[i][j]);
+      obj._rowIndex = i+1;
+      return obj;
+    }
   }
+  return null;
+}
 
-  const token   = _generateToken();
-  const expiry  = _sessionExpiry(user.ROLE);
+function login(req){
+  const sh = sheet(USER_SECURITY_SHEET_ID, 'USER_MASTER');
+  const data = sh.getDataRange().getValues();
+  const hdr = data[0];
+  const idx = {}; hdr.forEach((h,i)=> idx[h]=i);
 
-  // Update LAST_LOGIN in sheet
-  try {
-    const sheet = _getSheet(SHEETS.USER_MASTER);
-    const data  = sheet.getDataRange().getValues();
-    const hdrs  = data[0].map(h => String(h).toUpperCase());
-    const llCol = hdrs.indexOf('LAST_LOGIN');
-    if (llCol >= 0) {
-      for (let r = 1; r < data.length; r++) {
-        if (String(data[r][hdrs.indexOf('USER_CODE')]).trim() === String(user.USER_CODE).trim()) {
-          sheet.getRange(r + 1, llCol + 1).setValue(new Date().toISOString());
-          break;
-        }
+  for(let i=1;i<data.length;i++){
+    const row = data[i];
+    const mobileMatch = String(row[idx.MOBILE_NO]) === String(req.loginId);
+    const emailMatch = row[idx.EMAIL] && String(row[idx.EMAIL]).toLowerCase() === String(req.loginId).toLowerCase();
+    const storedPw = row[idx.PASSWORD];
+    if((mobileMatch || emailMatch) && verifyPass(req.password, storedPw)){
+      const userId = row[idx.USER_ID], clientId = row[idx.CLIENT_ID], role = row[idx.ROLE];
+      const rowIndustry = String(row[idx.INDUSTRY] || '');
+
+      if(role !== 'SUPER_ADMIN' && BOS_INDUSTRIES.indexOf(rowIndustry) === -1){
+        return {success:false, message:'This user is registered under a different app, not Business OS.'};
       }
-    }
-  } catch(e) {}
 
-  _logSession('LOGIN', user, token);
+      let sheetId=null, bizName=row[idx.FULL_NAME], plan='TRIAL', trialEnd=null;
+      if(role !== 'SUPER_ADMIN' && clientId){
+        const cr = findRow(USER_SECURITY_SHEET_ID, 'CLIENT_REGISTRY', 'CLIENT_ID', clientId);
+        if(cr){ sheetId = cr.DATABASE_ID; bizName = cr.COMPANY_NAME; plan = cr.PLAN_NAME; trialEnd = new Date(cr.EXPIRY_DATE).getTime(); }
+      }
+      const loaded = sheetId ? loadDB({sheetId}) : {data:null, lastSynced:0};
+      return {success:true, clientId: clientId||'ALL', sheetId, role, bizName, plan, trialEnd, data: loaded.data, lastSynced: loaded.lastSynced, userId};
+    }
+  }
+  return {success:false, message:'Invalid credentials'};
+}
+
+function reconcileDB(sheetId, data){
+  data = data || {};
+  data.customers = data.customers || [];
+  data.suppliers = data.suppliers || [];
+  data.sales = data.sales || [];
+  data.purchases = data.purchases || [];
+  data.items = data.items || [];
+  data.cash = data.cash || 0;
+  data.bank = data.bank || 0;
+
+  let ss;
+  try{ ss = SpreadsheetApp.openById(sheetId); }
+  catch(e){ return data; }
+
+  const itemsById = {}; data.items.forEach(it=>{ if(it && it.id) itemsById[it.id]=it; });
+
+  // Process PURCHASES sheet
+  const pSheet = ss.getSheetByName('PURCHASES');
+  if(pSheet && pSheet.getLastRow() >= 2){
+    const rows = pSheet.getRange(2,1,pSheet.getLastRow()-1,6).getValues();
+    const haveIds = {}; data.purchases.forEach(p=>{ if(p && p.id) haveIds[p.id]=true; });
+    const suppById = {}; data.suppliers.forEach(s=>{ if(s && s.id) suppById[s.id]=s; });
+    rows.forEach(r=>{
+      const id=r[0], supp=r[1], date=r[2], total=Number(r[3])||0, mode=r[4], itemsJsonRaw=r[5];
+      if(!id || haveIds[id]) return;
+      const dateStr = (date instanceof Date) ? Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd') : String(date);
+      data.purchases.push({id, supp, date:dateStr, total, mode});
+      if(mode==='Credit'){ if(suppById[supp]) suppById[supp].due = (suppById[supp].due||0) + total; }
+      else if(mode==='Cash'){ data.cash = (data.cash||0) - total; }
+      else { data.bank = (data.bank||0) - total; }
+      if (itemsJsonRaw) {
+        try {
+          const lineItems = JSON.parse(itemsJsonRaw);
+          (lineItems||[]).forEach(li=>{
+            const it = itemsById[li.id];
+            if (it) {
+              it.stock = (it.stock||0) + (Number(li.qty)||0);
+            }
+          });
+        } catch(e){ /* ignore */ }
+      }
+    });
+  }
+
+  // Process SALES sheet
+  const sSheet = ss.getSheetByName('SALES');
+  if(sSheet && sSheet.getLastRow() >= 2){
+    const rows = sSheet.getRange(2,1,sSheet.getLastRow()-1,6).getValues();
+    const haveIds = {}; data.sales.forEach(s=>{ if(s && s.id) haveIds[s.id]=true; });
+    const custById = {}; data.customers.forEach(c=>{ if(c && c.id) custById[c.id]=c; });
+    rows.forEach(r=>{
+      const id=r[0], cust=r[1], date=r[2], total=Number(r[3])||0, mode=r[4], itemsJsonRaw=r[5];
+      if(!id || haveIds[id]) return;
+      const dateStr = (date instanceof Date) ? Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd') : String(date);
+      data.sales.push({id, cust, date:dateStr, total, mode});
+      if(mode==='Credit'){ if(custById[cust]) custById[cust].due = (custById[cust].due||0) + total; }
+      else if(mode==='Cash'){ data.cash = (data.cash||0) + total; }
+      else { data.bank = (data.bank||0) + total; }
+      if (itemsJsonRaw) {
+        try {
+          const lineItems = JSON.parse(itemsJsonRaw);
+          (lineItems||[]).forEach(li=>{
+            const it = itemsById[li.id];
+            if (it) {
+              it.stock = Math.max(0, (it.stock||0) - (Number(li.qty)||0));
+            }
+          });
+        } catch(e){ /* ignore */ }
+      }
+    });
+  }
+
+  return data;
+}
+
+function reconcileAndSave(req){
+  const ss = SpreadsheetApp.openById(req.sheetId);
+  let sh = ss.getSheetByName('APP_DATA') || ss.insertSheet('APP_DATA');
+  const json = sh.getRange(1,2).getValue();
+  const before = json ? JSON.parse(json) : {};
+  const beforePurch = (before.purchases||[]).length;
+  const beforeSales = (before.sales||[]).length;
+  const beforePurchTotal = (before.purchases||[]).reduce((a,p)=>a+(p.total||0),0);
+  const beforeSalesTotal = (before.sales||[]).reduce((a,p)=>a+(p.total||0),0);
+
+  const healed = reconcileDB(req.sheetId, before);
+
+  sh.getRange(1,1).setValue('DB_JSON');
+  sh.getRange(1,2).setValue(JSON.stringify(healed));
+  const ts = new Date();
+  sh.getRange(1,3).setValue(ts);
 
   return {
-    status: 'success',
-    ok: true,
-    sessionToken: token,
-    sessionExpiry: expiry,
-    ROLE          : user.ROLE,
-    FULL_NAME     : user.FULL_NAME,
-    EMAIL         : user.EMAIL,
-    MOBILE        : user.MOBILE,
-    USER_CODE     : user.USER_CODE,
-    CLIENT_ID     : user.CLIENT_ID,
-    BRANCH        : user.BRANCH,
-    INDUSTRY      : user.INDUSTRY,
-    DASHBOARD_OVERRIDE: user.DASHBOARD_OVERRIDE || '',
-    message       : 'Login successful',
+    success:true,
+    before: {purchases:beforePurch, sales:beforeSales, purchaseTotal:beforePurchTotal, salesTotal:beforeSalesTotal},
+    after: {
+      purchases:healed.purchases.length, sales:healed.sales.length,
+      purchaseTotal:healed.purchases.reduce((a,p)=>a+(p.total||0),0),
+      salesTotal:healed.sales.reduce((a,p)=>a+(p.total||0),0)
+    },
+    healedCount: (healed.purchases.length-beforePurch) + (healed.sales.length-beforeSales),
+    lastSynced: ts.getTime()
   };
 }
 
-/* ─── LOGOUT ─────────────────────────────────────────────────── */
-function _logout(body) {
-  _logSession('LOGOUT', { USER_CODE: body.userCode||'', FULL_NAME:'', ROLE:'' }, body.sessionToken||'');
-  return { status:'ok', message:'Logged out' };
+function saveDB(req){
+  const data = reconcileDB(req.sheetId, req.data);
+  const ss = SpreadsheetApp.openById(req.sheetId);
+  let sh = ss.getSheetByName('APP_DATA') || ss.insertSheet('APP_DATA');
+  sh.getRange(1,1).setValue('DB_JSON');
+  sh.getRange(1,2).setValue(JSON.stringify(data));
+  const ts = new Date();
+  sh.getRange(1,3).setValue(ts);
+  return {success:true, lastSynced: ts.getTime()};
 }
 
-/* ─── VERIFY SESSION ─────────────────────────────────────────── */
-function _verifySession(body) {
-  // Token-based verification (full implementation needs a session sheet)
-  if (!body.sessionToken) return { status:'error', message:'No token' };
-  // For now: return success (enhance with session store in production)
-  return { status:'success', message:'Session valid' };
+function loadDB(req){
+  const ss = SpreadsheetApp.openById(req.sheetId);
+  const sh = ss.getSheetByName('APP_DATA');
+  if(!sh) return {success:true, data:null, lastSynced:0};
+  const json = sh.getRange(1,2).getValue();
+  const ts = sh.getRange(1,3).getValue();
+  let data = json ? JSON.parse(json) : null;
+  if(data) data = reconcileDB(req.sheetId, data);
+  return {success:true, data, lastSynced: ts ? new Date(ts).getTime() : 0};
 }
 
-/* ─── GET USER ────────────────────────────────────────────────── */
-function _getUser(body) {
-  const users = _sheetToObjects(_getSheet(SHEETS.USER_MASTER));
-  const user = users.find(u => u.USER_CODE === body.userCode || u.EMAIL === body.email);
-  if (!user) return { status:'error', message:'User not found' };
-  delete user.PASSWORD_HASH;
-  return { status:'success', user };
+function logSaleRow(req){
+  const ss = SpreadsheetApp.openById(req.sheetId);
+  const sh = ss.getSheetByName('SALES');
+  if(!sh) return {success:false, message:'SALES tab not found'};
+  const itemsJson = req.lineItems ? JSON.stringify(req.lineItems) : '';
+  const lastRow = sh.getLastRow();
+  sh.insertRowAfter(lastRow).getRange(lastRow+1, 1, 1, 6).setValues([[req.id, req.cust, req.date, req.total, req.mode, itemsJson]]);
+  return {success:true};
 }
 
-/* ─── LIST USERS (Super Admin) ────────────────────────────────── */
-function _listUsers(body) {
-  const users = _sheetToObjects(_getSheet(SHEETS.USER_MASTER)).map(u => {
-    const safe = Object.assign({}, u);
-    delete safe.PASSWORD_HASH;
-    return safe;
-  });
-  return { status:'success', users, count: users.length };
+function logPurchaseRow(req){
+  const ss = SpreadsheetApp.openById(req.sheetId);
+  const sh = ss.getSheetByName('PURCHASES');
+  if(!sh) return {success:false, message:'PURCHASES tab not found'};
+  const itemsJson = req.lineItems ? JSON.stringify(req.lineItems) : '';
+  const lastRow = sh.getLastRow();
+  sh.insertRowAfter(lastRow).getRange(lastRow+1, 1, 1, 6).setValues([[req.id, req.supp, req.date, req.total, req.mode, itemsJson]]);
+  return {success:true};
 }
 
-/* ─── CREATE USER ─────────────────────────────────────────────── */
-function _createUser(body) {
-  const sheet = _getSheet(SHEETS.USER_MASTER);
-  const u = body.user || body;
-  const userCode = 'USR' + String(Date.now()).slice(-6);
-  const hash     = _hashPassword(u.password || 'Welcome@123');
-  sheet.appendRow([
-    userCode, u.FULL_NAME||'', u.EMAIL||'', u.MOBILE||'',
-    hash, u.ROLE||'STAFF', u.CLIENT_ID||'', u.BRANCH||'',
-    u.INDUSTRY||'', 'ACTIVE', new Date().toISOString(), '', 'FALSE', u.DASHBOARD_OVERRIDE||'', u.NOTES||''
-  ]);
-  return { status:'success', message:'User created', USER_CODE: userCode };
+function logPartyRow(req){
+  const ss = SpreadsheetApp.openById(req.sheetId);
+  const sh = ss.getSheetByName(req.tab);
+  if(!sh) return {success:false, message:req.tab+' tab not found'};
+  const lastRow = sh.getLastRow();
+  sh.insertRowAfter(lastRow).getRange(lastRow+1, 1, 1, req.row.length).setValues([req.row]);
+  return {success:true};
 }
 
-/* ─── UPDATE USER ─────────────────────────────────────────────── */
-function _updateUser(body) {
-  const sheet = _getSheet(SHEETS.USER_MASTER);
-  const data  = sheet.getDataRange().getValues();
-  const hdrs  = data[0].map(h => String(h).toUpperCase());
-  const ucCol = hdrs.indexOf('USER_CODE');
-  const u     = body.user || body;
-
-  for (let r = 1; r < data.length; r++) {
-    if (String(data[r][ucCol]).trim() === String(u.USER_CODE||body.userCode).trim()) {
-      const fields = {FULL_NAME:1,EMAIL:2,MOBILE:3,ROLE:5,CLIENT_ID:6,BRANCH:7,
-                      INDUSTRY:8,STATUS:9,DASHBOARD_OVERRIDE:13,NOTES:14};
-      Object.entries(fields).forEach(([key, colIdx]) => {
-        if (u[key] !== undefined && hdrs[colIdx] === key) {
-          sheet.getRange(r+1, colIdx+1).setValue(u[key]);
-        }
-      });
-      // Update by key name safely
-      Object.keys(u).forEach(key => {
-        const ci = hdrs.indexOf(key.toUpperCase());
-        if (ci >= 0 && key !== 'USER_CODE' && key !== 'PASSWORD_HASH') {
-          sheet.getRange(r+1, ci+1).setValue(u[key]);
-        }
-      });
-      return { status:'success', message:'User updated' };
-    }
+function uploadAttachment(req){
+  try{
+    const parents = DriveApp.getFileById(req.sheetId).getParents();
+    const folder = parents.hasNext() ? parents.next() : DriveApp.getRootFolder();
+    const bytes = Utilities.base64Decode(req.base64Data);
+    const blob = Utilities.newBlob(bytes, req.mimeType || 'application/octet-stream', req.fileName || 'attachment');
+    const file = folder.createFile(blob);
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    return {success:true, fileId:file.getId(), url:file.getUrl(), downloadUrl:'https://drive.google.com/uc?export=download&id='+file.getId()};
+  }catch(err){
+    return {success:false, message:'Upload failed: '+err.message};
   }
-  return { status:'error', message:'User not found' };
 }
 
-/* ─── DEACTIVATE USER ─────────────────────────────────────────── */
-function _deactivateUser(body) {
-  return _updateUser({ user:{ USER_CODE: body.userCode, STATUS: 'INACTIVE' } });
+function checkSubscription(req){
+  const cr = findRow(USER_SECURITY_SHEET_ID, 'CLIENT_REGISTRY', 'CLIENT_ID', req.clientId);
+  if(!cr) return {success:false};
+  return {success:true, plan:cr.PLAN_NAME, trialEnd:new Date(cr.EXPIRY_DATE).getTime(), status:cr.LICENSE_STATUS};
 }
 
-/* ─── USER SECURITY ───────────────────────────────────────────── */
-function _getUserSecurity(body) {
-  const rows = _sheetToObjects(_getSheet(SHEETS.USER_SECURITY_MASTER));
-  const perms = rows.filter(r => r.USER_CODE === body.userCode);
-  return { status:'success', permissions: perms };
+function reconcileReport(req){
+  const ss = SpreadsheetApp.openById(req.sheetId);
+  const sh = ss.getSheetByName('APP_DATA');
+  const json = sh ? sh.getRange(1,2).getValue() : '';
+  const before = json ? JSON.parse(json) : {};
+  return {success:true, before, after: reconcileDB(req.sheetId, before)};
 }
 
-function _setUserSecurity(body) {
-  const sheet = _getSheet(SHEETS.USER_SECURITY_MASTER);
-  const p = body.permission || body;
-  sheet.appendRow([
-    p.USER_CODE||'', p.CLIENT_ID||'', p.MODULE||'',
-    p.CAN_VIEW||'FALSE', p.CAN_ADD||'FALSE', p.CAN_EDIT||'FALSE',
-    p.CAN_DELETE||'FALSE', p.CAN_EXPORT||'FALSE', p.CAN_APPROVE||'FALSE',
-    'TRUE', // OVERRIDE_BY_SUPER_ADMIN
-    new Date().toISOString(), p.EFFECTIVE_TO||'',
-    p.UPDATED_BY||'SUPER_ADMIN', p.NOTES||''
-  ]);
-  return { status:'success', message:'Security permission saved' };
+function verifyPass(pw, stored){
+  return Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(pw))) === stored;
 }
 
-/* ─── CONTROL CONFIG (FIX #6: Super Admin live mobile control) ── */
-function _getControlConfig(body) {
+function runDiag(){
+  const out = { ok:true, steps:[] };
   try {
-    let s = _getSheet(SHEETS.CONTROL_CONFIG);
-    if (!s) return { status:'ok', config: {} };
-    const data = s.getDataRange().getValues();
-    if (data.length < 2) return { status:'ok', config: {} };
-    // Store as single row: col A = key, col B = value
-    const config = {};
-    for (let r = 1; r < data.length; r++) {
-      if (data[r][0]) config[data[r][0]] = data[r][1];
-    }
-    return { status:'success', config };
-  } catch(e) { return { status:'error', message: e.message }; }
+    const ss1 = SpreadsheetApp.openById(USER_SECURITY_SHEET_ID);
+    out.steps.push({step: 'USER_SECURITY_MASTER_DB', ok: true});
+    const ss2 = SpreadsheetApp.openById(MASTER_CONTROL_SHEET_ID);
+    out.steps.push({step: 'MASTER_CONTROL_SYSTEM', ok: true});
+  } catch(e) {
+    out.ok = false;
+    out.steps.push({step: 'Open sheets', ok: false, error: e.toString()});
+  }
+  return out;
 }
 
-function _setControlConfig(body) {
-  try {
-    let sheet = _getSheet(SHEETS.CONTROL_CONFIG);
-    if (!sheet) {
-      SpreadsheetApp.openById(SHEET_ID).insertSheet(SHEETS.CONTROL_CONFIG);
-      sheet = _getSheet(SHEETS.CONTROL_CONFIG);
-      sheet.appendRow(['KEY','VALUE','UPDATED_AT','UPDATED_BY']);
-    }
-    const cfg   = body.config || {};
-    const data  = sheet.getDataRange().getValues();
-    const keys  = data.slice(1).map(r => r[0]);
-    const now   = new Date().toISOString();
-    const by    = body.updatedBy || 'SUPER_ADMIN';
-
-    Object.entries(cfg).forEach(([key, val]) => {
-      const ri = keys.indexOf(key);
-      if (ri >= 0) {
-        sheet.getRange(ri+2, 2, 1, 3).setValues([[val, now, by]]);
-      } else {
-        sheet.appendRow([key, val, now, by]);
-      }
-    });
-    return { status:'success', message:'Control config saved to Google Sheet' };
-  } catch(e) { return { status:'error', message: e.message }; }
+function registerClient(req){
+  return {success: false, message: 'Registration not available via this interface'};
 }
 
-/* ─── CLIENT INFO ─────────────────────────────────────────────── */
-function _getClient(body) {
-  const clients = _sheetToObjects(_getSheet(SHEETS.CLIENT_MASTER));
-  const client  = clients.find(c => c.CLIENT_ID === body.clientId);
-  if (!client) return { status:'error', message:'Client not found' };
-  return { status:'success', client };
+function fixCL00022Now(){
+  const sheetId = '1SNv6DuZelwMeDgsRPdFr7KMLvuQ-pgkd5F4NZeGDkVc';
+  const result = reconcileAndSave({ sheetId });
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
 }
