@@ -410,9 +410,8 @@ function sheet(id, tab){ return SpreadsheetApp.openById(id).getSheetByName(tab);
 // touching. Falls back to ITEM_MASTER then 34_ITEM_MASTER only if
 // RAW_MATERIAL_MASTER is empty (e.g. a client that hasn't migrated yet).
 function readItemMaster(masterId){
-  const raw = readTable(masterId, 'RAW_MATERIAL_MASTER');
-  if (raw.length) {
-    return raw.map(function(r){
+  const normalize = function(rows){
+    return rows.map(function(r){
       return {
         ITEM_ID: r.ITEM_CODE || r.ITEM_ID || '',
         NAME: r.ITEM_NAME || r.NAME || '',
@@ -421,12 +420,15 @@ function readItemMaster(masterId){
         STOCK: r.CURRENT_STOCK !== undefined ? r.CURRENT_STOCK : (r.STOCK || 0),
         MIN_STOCK: r.REORDER_LEVEL !== undefined ? r.REORDER_LEVEL : (r.MIN_STOCK || 0),
         STATUS: r.STATUS || 'ACTIVE',
+        RATE: Number(r.COST_PRICE) || 0,
       };
     });
-  }
+  };
+  const raw = readTable(masterId, 'RAW_MATERIAL_MASTER');
+  if (raw.length) return normalize(raw);
   const itemMaster = readTable(masterId, 'ITEM_MASTER');
-  if (itemMaster.length) return itemMaster;
-  return readTable(masterId, '34_ITEM_MASTER');
+  if (itemMaster.length) return normalize(itemMaster);
+  return normalize(readTable(masterId, '34_ITEM_MASTER'));
 }
 function findRow(id, tab, matchCol, matchVal){
   const sh = sheet(id, tab);
