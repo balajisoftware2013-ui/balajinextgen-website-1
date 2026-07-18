@@ -2280,6 +2280,7 @@ body.mode-accountant .owner-hint{display:none;}
     <div class="stg-tab" onclick="switchStgTab('theme',this)">🎨 Theme</div>
     <div class="stg-tab" onclick="switchStgTab('backup',this)">☁️ Backup</div>
     <div class="stg-tab" onclick="switchStgTab('ai',this)">🤖 AI</div>
+    <div class="stg-tab" id="stgTabReconcile" style="display:none;" onclick="switchStgTab('reconcile',this)">🧮 Reconcile</div>
   </div>
 
   <!-- Business tab -->
@@ -2483,6 +2484,25 @@ body.mode-accountant .owner-hint{display:none;}
     <div class="field"><label>Anthropic API Key</label><input id="setAnthropicKey" type="password" placeholder="sk-ant-..." autocomplete="off"></div>
     <button class="btn btn-outline" onclick="_toggleApiKeyVisibility()">👁️ Show/Hide Key</button>
     <div style="font-size:11px;color:var(--sub);margin-top:8px;">Get a key at <a href="https://console.anthropic.com" target="_blank" style="color:var(--primary);">console.anthropic.com</a> → API Keys.</div>
+  </div>
+
+  <!-- Reconcile tab — OWNER / SUPER_ADMIN only (see openSheet('settingsSheet') gating).
+       Checks whether PURCHASES/SALES/CUSTOMERS/SUPPLIERS/ITEMS sheet tabs hold rows that
+       never made it into the synced DB_JSON blob (the CL00022 class of bug), and lets an
+       owner/admin trigger the server-side healer without needing a developer to run the
+       Apps Script function by hand. -->
+  <div class="stg-panel" id="stg-reconcile" style="display:none;">
+    <div style="font-size:12px;font-weight:800;color:var(--text);margin-bottom:4px;">🧮 Reconcile Check</div>
+    <div style="font-size:11px;color:var(--sub);margin-bottom:10px;line-height:1.6;">
+      Compares what's saved in your synced data against the raw PURCHASES / SALES / CUSTOMERS /
+      SUPPLIERS / ITEMS sheet tabs, and reports any rows that exist in the sheet but are missing
+      from your app's data (a sync gap — not a substitute for checking against your paper invoices).
+      Owner / Super Admin only.
+    </div>
+    <button class="btn btn-outline" id="reconcileCheckBtn" style="width:100%;" onclick="runReconcileCheck()">🔍 Run Reconcile Check</button>
+    <div id="reconcileResult" style="display:none;margin-top:12px;font-size:12px;background:var(--body-bg);border-radius:10px;padding:10px 12px;line-height:1.8;"></div>
+    <button class="btn btn-primary" id="reconcileFixBtn" style="width:100%;margin-top:10px;display:none;" onclick="runReconcileAndSave()">🛠️ Apply Fix (Reconcile &amp; Save)</button>
+    <div style="font-size:10.5px;color:var(--sub);margin-top:8px;">"Apply Fix" only ADDS rows/records that are missing — it never edits or deletes anything already in your data, so it's safe to run more than once.</div>
   </div>
 
   <button class="btn btn-primary" style="margin-top:14px;" onclick="saveBizSettings()">💾 Save All Settings</button>
@@ -2960,6 +2980,75 @@ function persistDB(){
   _pendingSyncPayload = {clientId:SESSION.clientId, sheetId:SESSION.sheetId, data:DB};
   try{ localStorage.setItem('bnos_pending_sync', JSON.stringify(_pendingSyncPayload)); }catch(e){}
   attemptSync();
+}
+// Owner/Super-Admin-only reconcile tools (Settings → 🧮 Reconcile). Calls the
+// same RECONCILE_REPORT / RECONCILE_AND_SAVE backend actions the developer
+// previously had to run by hand from the Apps Script editor.
+async function runReconcileCheck(){
+  if(!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL)){
+    toast('Reconcile Check needs a connected, non-demo account.');
+    return;
+  }
+  const btn = document.getElementById('reconcileCheckBtn');
+  const resultEl = document.getElementById('reconcileResult');
+  const fixBtn = document.getElementById('reconcileFixBtn');
+  if(btn){ btn.disabled = true; btn.textContent = '🔍 Checking…'; }
+  if(fixBtn) fixBtn.style.display = 'none';
+  try{
+    const res = await fetch(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({action:'RECONCILE_REPORT', sheetId:SESSION.sheetId})});
+    const out = await res.json();
+    if(!out.success) throw new Error(out.message || 'Reconcile check failed');
+    const gaps = out.gapsFound || 0;
+    if(resultEl){
+      resultEl.style.display = 'block';
+      resultEl.innerHTML = gaps > 0
+        ? `⚠️ <b>${gaps} row(s)</b> found in your sheet tabs that aren't in your synced data yet.<br>`
+          + `Purchases: ${out.before.purchases} → ${out.after.purchases} · Sales: ${out.before.sales} → ${out.after.sales}<br>`
+          + `Purchase total: ₹${(out.before.purchaseTotal||0).toFixed(2)} → ₹${(out.after.purchaseTotal||0).toFixed(2)}<br>`
+          + `Tap "Apply Fix" below to pull these in — this only adds rows, nothing existing is changed or removed.`
+        : `✅ Everything checks out — no gaps found between your sheet tabs and synced data.`;
+    }
+    if(fixBtn) fixBtn.style.display = gaps > 0 ? 'block' : 'none';
+  }catch(err){
+    if(resultEl){ resultEl.style.display='block'; resultEl.innerHTML = '❌ Reconcile check failed: '+(err.message||err); }
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '🔍 Run Reconcile Check'; }
+  }
+}
+async function runReconcileAndSave(){
+  if(!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL)) return;
+  if(!confirm('This will pull any missing purchases/sales/customers/suppliers/items from your sheet tabs into your synced data, and reload the app with the healed data. Continue?')) return;
+  const fixBtn = document.getElementById('reconcileFixBtn');
+  const resultEl = document.getElementById('reconcileResult');
+  if(fixBtn){ fixBtn.disabled = true; fixBtn.textContent = '🛠️ Applying…'; }
+  try{
+    const res = await fetch(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({action:'RECONCILE_AND_SAVE', sheetId:SESSION.sheetId})});
+    const out = await res.json();
+    if(!out.success) throw new Error(out.message || 'Reconcile & Save failed');
+    if(resultEl){
+      resultEl.innerHTML = `✅ Healed ${out.healedCount||0} row(s). Purchases: ${out.after.purchases} · Sales: ${out.after.sales}. Reloading your data…`;
+    }
+    // Pull the now-healed data back into the app instead of leaving stale
+    // data on screen until the next login — same pattern as pullRemoteUpdates().
+    const loadRes = await fetch(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({action:'SUITE_LOAD_DB', sheetId:SESSION.sheetId})});
+    const loadOut = await loadRes.json();
+    if(loadOut && loadOut.success && loadOut.data){
+      DB = loadOut.data;
+      _lastKnownSync = loadOut.lastSynced || Date.now();
+      normalizeBankAccounts(); normalizeInvoiceSettings();
+      localStorage.setItem('bnos_db', JSON.stringify(DB));
+      renderDashboard(); renderNotifs();
+      if(window._curPage==='inventory') renderInventory();
+      if(window._curPage==='money') moneyTab(window._moneyTab||'customers');
+    }
+    if(fixBtn) fixBtn.style.display = 'none';
+    toast('✅ Reconcile complete — data refreshed');
+  }catch(err){
+    if(resultEl){ resultEl.innerHTML = '❌ Apply Fix failed: '+(err.message||err); }
+    toast('❌ Reconcile & Save failed: '+(err.message||err));
+  }finally{
+    if(fixBtn){ fixBtn.disabled = false; fixBtn.textContent = '🛠️ Apply Fix (Reconcile & Save)'; }
+  }
 }
 // If the app was closed/lost network before a save finished last time, resume it now.
 (function resumePendingSync(){
@@ -3587,6 +3676,16 @@ function openSheet(id){
     // Reset to first tab
     document.querySelectorAll('.stg-tab').forEach((t,i)=>t.classList.toggle('active', i===0));
     document.querySelectorAll('.stg-panel').forEach((p,i)=>{p.classList.toggle('active', i===0); p.style.display=i===0?'block':'none';});
+    // Reconcile tab: Owner / Super Admin only — everyone else never sees it.
+    const reconcileTab = document.getElementById('stgTabReconcile');
+    if(reconcileTab){
+      const canReconcile = !!(SESSION && !SESSION.isDemo && (SESSION.role==='OWNER' || SESSION.role==='SUPER_ADMIN'));
+      reconcileTab.style.display = canReconcile ? '' : 'none';
+    }
+    const reconcileResult = document.getElementById('reconcileResult');
+    const reconcileFixBtn = document.getElementById('reconcileFixBtn');
+    if(reconcileResult){ reconcileResult.style.display='none'; reconcileResult.innerHTML=''; }
+    if(reconcileFixBtn) reconcileFixBtn.style.display='none';
     // Populate fields
     (document.getElementById('setGstRegistered')||{value:''}).value = DB.gstRegistered || 'yes';
     (document.getElementById('setGst')||{value:''}).value = DB.gstin || '';
