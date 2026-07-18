@@ -132,6 +132,13 @@ function route(dbs, req){
     case 'ACK_KITCHEN_INDENT':
       return ackByIdField(dbs.txnId, 'KITCHEN_INDENT', 'IND_ID', req.indentId, {STATUS:'ACKNOWLEDGED'});
 
+    // FIX: was returning {success:true, indents:[...]} — no data
+    // wrapper, inconsistent with GET_ITEMS's own {data:{items:[...]}}
+    // shape. kitchen-indent.html reads res.data.indents everywhere
+    // (History and Pending both), so without this wrapper _historyCache
+    // and _pendingCache were ALWAYS empty regardless of real data —
+    // this is why History/Pending/KPIs showed nothing despite
+    // KITCHEN_INDENT clearly having real rows.
     case 'GET_PENDING_INDENTS': {
       const wantStatus = req.status ? String(req.status).toUpperCase() : null;
       const kitchen = getRowsWhere(dbs.txnId, 'KITCHEN_INDENT', function(r){
@@ -140,7 +147,7 @@ function route(dbs, req){
       const bar = getRowsWhere(dbs.txnId, 'BAR_INDENT', function(r){
         return wantStatus ? String(r.STATUS).toUpperCase() === wantStatus : true;
       }).map(function(r){ r.INDENT_TYPE = 'BAR'; return r; });
-      return { success:true, indents: kitchen.concat(bar) };
+      return { success:true, data: { indents: kitchen.concat(bar) } };
     }
 
     case 'SAVE_BAR_INDENT': {
