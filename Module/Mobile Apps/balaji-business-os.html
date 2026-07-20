@@ -3071,8 +3071,8 @@ function syncSupplierRow(s){
   logRowToSheet('LOG_PARTY', {tab:'SUPPLIERS', row:[s.id, s.name, s.mobile, s.due]});
 }
 function logRowToSheet(action, payload){
-  if(!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL)) return;
-  fetch(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify(Object.assign({action, sheetId:SESSION.sheetId}, payload))}).catch(()=>{});
+  if(!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL)) return Promise.resolve();
+  return fetch(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify(Object.assign({action, sheetId:SESSION.sheetId}, payload))}).catch(()=>{});
 }
 function persistDB(){
   localStorage.setItem('bnos_db', JSON.stringify(DB));
@@ -4327,8 +4327,10 @@ function renderRecentDocs(){
         <span class="mono">${fmtSmart(r.amt)}</span>
       </div>
     </div>`).join('') : `<div class="empty-state"><div class="e-ico">📭</div><div class="e-title">Nothing here yet</div></div>`;
-  // Wire click handlers via closures (avoids escaping issues from inlining functions in HTML)
-  Array.from(box.children).forEach((el,i)=> el.onclick = list[i].go);
+  // Wire click handlers via closures (avoids escaping issues from inlining functions in HTML).
+  // Guarded: when list is empty, box shows a 1-element empty-state div instead —
+  // list[i] would be undefined there, so only wire a handler when one exists.
+  Array.from(box.children).forEach((el,i)=>{ if(list[i]) el.onclick = list[i].go; });
 }
 function drawDashChart(){
   const c = document.getElementById('dashChart');
@@ -10586,41 +10588,73 @@ function renderTxnImportPreview(){
   document.getElementById('txiStep1').style.display='none';
   document.getElementById('txiStep2').style.display='block';
 }
-function confirmTxnImport(){
+async function confirmTxnImport(){
   if(!_txiVouchers.length){ toast('Nothing to import'); return; }
   const isSales = _txiKind==='sales';
+  const canSyncToSheet = !!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL);
+  const newParties = []; // parties created during this import — sync their rows once, after the loop
+  const toSync = []; // {id, supp/cust, date, total, mode, lineItems} — one per voucher, sent to the sheet below
   let count=0;
   _txiVouchers.forEach(v=>{
     let partyId = '';
     if(isSales){
       let cust = v.party ? DB.customers.find(c=>c.name.toLowerCase()===v.party.toLowerCase()) : null;
-      if(!cust && v.party){ cust = {id:_genId('C', DB.customers), name:v.party, mobile:'', due:0, limit:0, lastDate:''}; DB.customers.push(cust); }
+      if(!cust && v.party){ cust = {id:_genId('C', DB.customers), name:v.party, mobile:'', due:0, limit:0, lastDate:''}; DB.customers.push(cust); newParties.push(cust); }
       partyId = cust ? cust.id : '';
     } else {
       let supp = v.party ? DB.suppliers.find(s=>s.name.toLowerCase()===v.party.toLowerCase()) : null;
-      if(!supp && v.party){ supp = {id:_genId('S', DB.suppliers), name:v.party, mobile:'', due:0}; DB.suppliers.push(supp); }
+      if(!supp && v.party){ supp = {id:_genId('S', DB.suppliers), name:v.party, mobile:'', due:0}; DB.suppliers.push(supp); newParties.push(supp); }
       partyId = supp ? supp.id : '';
     }
     const lineItems = v.items.map(li=>{
       let it = DB.items.find(x=>x.name.toLowerCase()===li.name.toLowerCase());
       if(!it){ it = {id:_genItemId(), name:li.name, unit:'Pcs', category:'', hsn:'', pRate:li.rate||0, sRate:li.rate||0, gst:li.gst||18, stock:0, min:5, expiryDate:''}; DB.items.push(it); }
-      return {id:it.id, name:it.name, hsn:it.hsn||'—', qty:li.qty, rate:li.rate, gst:li.gst||it.gst||0};
+      return {id:it.id, name:it.name, unit:it.unit||'Pcs', hsn:it.hsn||'—', qty:li.qty, rate:li.rate, gst:li.gst||it.gst||0};
     });
     if(isSales){
       const id = genDocId('INV', 1042, DB.sales.length+count);
       const total = Math.round(lineItems.reduce((a,li)=>a+li.qty*li.rate,0)*100)/100;
       DB.sales.unshift({id, cust:partyId, date:v.date, total, mode:v.mode, gstType:'gst', lineItems});
+      toSync.push({id, cust:partyId, date:v.date, total, mode:v.mode, lineItems});
     } else {
       const id = genDocId('PB', 220, DB.purchases.length+count);
       const taxable = lineItems.reduce((a,li)=>a+li.qty*li.rate,0);
       const gstTotal = lineItems.reduce((a,li)=>a+(li.qty*li.rate*(li.gst||0)/100),0);
-      DB.purchases.unshift({id, supp:partyId, date:v.date, total:Math.round((taxable+gstTotal)*100)/100, taxable, gstTotal, mode:v.mode, item:lineItems.map(li=>`${li.name} x${li.qty}`).join(', '), invNo:v.invNo||null, invoiceFile:null, invoiceFileUrl:null, lineItems});
+      const total = Math.round((taxable+gstTotal)*100)/100;
+      DB.purchases.unshift({id, supp:partyId, date:v.date, total, taxable, gstTotal, mode:v.mode, item:lineItems.map(li=>`${li.name} x${li.qty}`).join(', '), invNo:v.invNo||null, invoiceFile:null, invoiceFileUrl:null, lineItems});
+      toSync.push({id, supp:partyId, date:v.date, total, mode:v.mode, lineItems});
     }
     count++;
   });
-  persistDB();
+  persistDB(); // saves locally + queues the whole-DB backup blob (APP_DATA tab)
   toast(`Imported ${count} ${isSales?'sales':'purchase'} voucher(s) ✓`);
   closeAllSheets();
+  if(!canSyncToSheet){
+    toast('⚠️ Not signed in to a connected sheet — imported vouchers are saved on this device only.');
+    return;
+  }
+  // Push each voucher to the actual PURCHASES/SALES sheet tab, exactly like a
+  // manually-entered sale/purchase does (see recordPurchase()/recordSale()).
+  // Sequential with a short gap so we don't fire 100+ requests at Apps Script
+  // at once and trip its per-user concurrency limits or row-append lock.
+  const label = isSales ? 'Sales' : 'Purchase';
+  const action = isSales ? 'LOG_SALE' : 'LOG_PURCHASE';
+  const sleep = ms => new Promise(res=>setTimeout(res, ms));
+  toast(`Syncing ${toSync.length} ${label.toLowerCase()} voucher(s) to your Google Sheet…`);
+  let synced = 0, failed = 0;
+  for(const row of toSync){
+    try{
+      const res = await logRowToSheet(action, row);
+      if(res && res.ok) synced++; else failed++;
+    }catch(e){ failed++; }
+    await sleep(180);
+  }
+  newParties.forEach(p=> isSales ? syncCustomerRow(p) : syncSupplierRow(p));
+  if(failed===0){
+    toast(`✅ ${synced} ${label.toLowerCase()} voucher(s) synced to your Google Sheet`);
+  } else {
+    toast(`⚠️ Synced ${synced}/${toSync.length} to Sheets — ${failed} failed. Re-open Import Center → they're still saved locally, retry sync from Settings → Backup.`);
+  }
 }
 function handleBankStatementFile(input){
   const file = input.files && input.files[0];
