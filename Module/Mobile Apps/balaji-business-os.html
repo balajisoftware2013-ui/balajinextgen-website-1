@@ -2575,6 +2575,9 @@ body.mode-accountant .owner-hint{display:none;}
     <button class="btn btn-outline" id="reconcileCheckBtn" style="width:100%;" onclick="runReconcileCheck()">🔍 Run Reconcile Check</button>
     <div id="reconcileResult" style="display:none;margin-top:12px;font-size:12px;background:var(--body-bg);border-radius:10px;padding:10px 12px;line-height:1.8;"></div>
     <button class="btn btn-primary" id="reconcileFixBtn" style="width:100%;margin-top:10px;display:none;" onclick="runReconcileAndSave()">🛠️ Apply Fix (Reconcile &amp; Save)</button>
+    <button class="btn btn-secondary" id="forceSaveBtn" style="width:100%;margin-top:10px;display:none;" onclick="showForceSaveWarning()">
+      ⚡ Force Save (Override Protection)
+    </button>
     <div style="font-size:10.5px;color:var(--sub);margin-top:8px;">"Apply Fix" only ADDS rows/records that are missing — it never edits or deletes anything already in your data, so it's safe to run more than once.</div>
   </div>
 
@@ -2996,22 +2999,132 @@ function updateSyncIndicator(state){
   if(!el) return;
   clearTimeout(el._hideTimer);
   el.onclick = null; el.style.cursor = 'default'; el.title = '';
-  if(state==='saving'){ el.textContent='☁️ Saving…'; el.style.color='#999'; el.style.display='inline'; }
+  
+  if(state==='saving'){
+    el.textContent='☁️ Saving…'; 
+    el.style.color='#999'; 
+    el.style.display='inline';
+  }
   else if(state==='synced'){
-    el.textContent='✅ Synced'; el.style.color='#0a7d34'; el.style.display='inline';
+    el.textContent='✅ Synced'; 
+    el.style.color='#0a7d34'; 
+    el.style.display='inline';
     el._hideTimer = setTimeout(()=>{ el.style.display='none'; }, 2500);
-  } else if(state==='offline'){
-    el.textContent='📴 Offline — will sync when back online'; el.style.color='#999'; el.style.display='inline';
-  } else if(state==='failed'){
+  } 
+  else if(state==='offline'){
+    el.textContent='📴 Offline — will sync when back online'; 
+    el.style.color='#999'; 
+    el.style.display='inline';
+  } 
+  else if(state==='failed'){
+    const isShrinkConflict = _lastSyncError && _lastSyncError.includes('would erase');
     const reason = _lastSyncError ? ` — ${_lastSyncError}` : '';
-    el.textContent = _syncRetryCount>2
-      ? `⚠️ Not synced (${_syncRetryCount} tries)${reason} — tap to retry`
-      : `⚠️ Not synced yet${reason} — retrying…`;
-    el.title = 'Last error: ' + (_lastSyncError || 'unknown');
-    el.style.color='#c00'; el.style.display='inline'; el.style.cursor='pointer';
-    el.onclick = ()=>{ clearTimeout(_syncRetryTimer); attemptSync(); };
+    
+    if(isShrinkConflict){
+      el.innerHTML = `<span style="cursor:pointer;">⚠️ Sync conflict — device has fewer records than cloud. Tap to resolve</span>`;
+      el.style.color='#c00'; 
+      el.style.display='inline'; 
+      el.style.cursor='pointer';
+      el.title = 'Tap to open Settings → Reconcile to resolve this conflict';
+      el.onclick = ()=>{ openSyncConflictResolver(); };
+    } else {
+      el.textContent = _syncRetryCount>2
+        ? `⚠️ Not synced (${_syncRetryCount} tries)${reason} — tap to retry`
+        : `⚠️ Not synced yet${reason} — retrying…`;
+      el.title = 'Last error: ' + (_lastSyncError || 'unknown');
+      el.style.color='#c00'; 
+      el.style.display='inline'; 
+      el.style.cursor='pointer';
+      el.onclick = ()=>{ clearTimeout(_syncRetryTimer); attemptSync(); };
+    }
   }
 }
+function openSyncConflictResolver(){
+  switchPage('settings');
+  setTimeout(()=>{
+    if(document.getElementById('stgTabReconcile')){
+      document.getElementById('stgTabReconcile').click();
+    }
+    toast('👇 Run the Reconcile Check below to find missing data, then Apply Fix to sync it all.');
+  }, 300);
+}
+
+function showForceSaveWarning(){
+  const msg = `⚠️  FORCE SAVE OVERRIDE
+  
+This will bypass the shrink protection and save your local data to the cloud, even though it has fewer records than what's already saved. 
+
+Use this ONLY if:
+✓ You intentionally deleted old purchases/sales
+✓ You're sure the cloud has stale/duplicate data
+✓ You've already backed up important data
+
+If you're unsure, tap "Cancel" and use "Apply Fix (Reconcile & Save)" instead — it's safer and adds missing data without removing anything.
+
+Continue?`;
+  if(confirm(msg)){
+    attemptForceSave();
+  }
+}
+
+function attemptForceSave(){
+  if(!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL)){
+    toast('Force Save needs a connected account.');
+    return;
+  }
+  
+  const btn = document.getElementById('forceSaveBtn');
+  const resultEl = document.getElementById('reconcileResult');
+  
+  if(btn){ btn.disabled = true; btn.textContent = '⚡ Forcing save…'; }
+  if(resultEl){ resultEl.style.display = 'block'; resultEl.innerHTML = '⏳ Sending override…'; }
+  
+  _syncInFlight = true;
+  updateSyncIndicator('saving');
+  
+  fetch(GAS_URL,{
+    method:'POST',
+    headers:{'Content-Type':'text/plain'},
+    body:JSON.stringify(Object.assign({action:'SUITE_SAVE_DB', forceSave:true}, {
+      clientId:SESSION.clientId, 
+      sheetId:SESSION.sheetId, 
+      data:DB
+    }))
+  })
+    .then(r=>{
+      if(!r.ok) throw new Error('Server returned '+r.status);
+      return r.json();
+    })
+    .then(out=>{
+      _syncInFlight = false;
+      if(out && out.success){
+        if(out.lastSynced) _lastKnownSync = out.lastSynced;
+        _pendingSyncPayload = null;
+        _syncRetryCount = 0;
+        _lastSyncError = '';
+        localStorage.removeItem('bnos_pending_sync');
+        updateSyncIndicator('synced');
+        if(resultEl){
+          resultEl.innerHTML = '✅ Force save completed. Your data has been saved to the cloud (shrink protection bypassed). Reloading…';
+        }
+        setTimeout(()=>{ location.reload(); }, 1500);
+      } else {
+        throw new Error(out && (out.error || out.message) ? out.error || out.message : 'Force save failed');
+      }
+    })
+    .catch(err=>{
+      _syncInFlight = false;
+      _lastSyncError = err && err.message ? err.message : 'Network error';
+      updateSyncIndicator('failed');
+      if(resultEl){
+        resultEl.innerHTML = '❌ Force save failed: '+(err.message||err);
+      }
+    })
+    .finally(()=>{
+      if(btn){ btn.disabled = false; btn.textContent = '⚡ Force Save (Override Protection)'; }
+    });
+}
+
 function attemptSync(){
   if(_syncInFlight || !_pendingSyncPayload || !GAS_URL) return;
   if(typeof navigator!=='undefined' && navigator.onLine===false){
@@ -3125,6 +3238,11 @@ async function runReconcileCheck(){
         : `✅ Everything checks out — no gaps found between your sheet tabs and synced data.`;
     }
     if(fixBtn) fixBtn.style.display = gaps > 0 ? 'block' : 'none';
+    const forceSaveBtn = document.getElementById('forceSaveBtn');
+    if(forceSaveBtn){
+      const hasShrinkError = _lastSyncError && _lastSyncError.includes('would erase');
+      forceSaveBtn.style.display = (gaps > 0 || hasShrinkError) ? 'block' : 'none';
+    }
   }catch(err){
     if(resultEl){ resultEl.style.display='block'; resultEl.innerHTML = '❌ Reconcile check failed: '+(err.message||err); }
   }finally{
