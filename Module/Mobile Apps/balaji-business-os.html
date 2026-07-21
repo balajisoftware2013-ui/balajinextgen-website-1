@@ -5702,6 +5702,35 @@ function getPartyLedgerTxns(p, partyType){
   txns.forEach(t=>{ bal += t.debit - t.credit; t.balance = bal; });
   return txns; // ascending order, running balance included
 }
+// The figure printed as "CURRENT BALANCE DUE" (or shared over WhatsApp) must
+// always match the running balance of the transactions listed right above
+// it on the SAME document — otherwise a party reads a ledger with (say) 20
+// unpaid credit purchases listed, yet a bottom-line total that reflects
+// only one of them. party.due is the app-wide figure used to drive
+// stock/cash elsewhere, and normally tracks this — but some paths
+// (e.g. confirmTxnImport()'s historical bulk import, which explicitly does
+// NOT touch party.due) can leave it out of sync with the transaction list.
+// Every report/export/share of a party's CURRENT balance should call this
+// instead of reading party.due directly, so what's shown always reconciles
+// with what's listed. Falls back to party.due only when there are no
+// transactions at all (e.g. a manually-entered opening balance).
+function getPartyDocBalance(p, partyType){
+  const txns = getPartyLedgerTxns(p, partyType);
+  return txns.length ? txns[txns.length-1].balance : (p.due||0);
+}
+// Some historical records can still carry a corrupted date string from
+// before flexible-date parsing was hardened elsewhere in this file (e.g. a
+// raw Excel serial number that leaked through as "+046007-12" instead of a
+// real calendar date — JS misreads a bare numeral as an extended-format
+// year). Never print that on a customer/supplier-facing ledger — show it
+// only if it's a plausible calendar date, otherwise use a neutral
+// placeholder instead of an alarming/nonsensical year.
+function _safeLedgerDate(dateStr){
+  const s = String(dateStr||'');
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if(m){ const y = Number(m[1]); if(y>=2000 && y<=2100) return displayDate(s); }
+  return '(date unavailable)';
+}
 let _docPeriodDays = 30;
 let _docPeriod = 'month';  // 'today', 'month', 'quarter', 'year', 'custom'
 let _docCustomFrom = '';
@@ -5854,10 +5883,10 @@ function renderDocBody(){
         <div class="doc-summary-cell"><div class="lbl">Last Activity</div><div class="val small">${lastDate}</div></div>
       </div>`;
     document.getElementById('docBody').innerHTML = `
-      <div class="doc-row"><span>Account Status</span><span class="mono">${(p.due||0)>0?'⚠️ Outstanding':'✅ No Dues'}</span></div>
+      <div class="doc-row"><span>Account Status</span><span class="mono">${getPartyDocBalance(p,partyType)>0?'⚠️ Outstanding':'✅ No Dues'}</span></div>
       <div class="lc-act" style="justify-content:center;margin-top:10px;" onclick="closeAllSheets();openDoc('ledger','${p.id}','${partyType}')">📒 View Full Transaction History</div>`;
     document.getElementById('docTotalLabel').textContent = 'Outstanding Balance';
-    document.getElementById('docTotalVal').textContent = fmtSmart(p.due||0);
+    document.getElementById('docTotalVal').textContent = fmtSmart(getPartyDocBalance(p,partyType));
   } else { // ledger — Tally-style format with Opening/Closing balances
     document.getElementById('docSummary').innerHTML = '';
     
@@ -5899,7 +5928,7 @@ function renderDocBody(){
     // Add transactions
     txns.forEach(t => {
       tableHtml += `<tr style="border-bottom:1px solid var(--border);cursor:pointer;hover:background:var(--body-bg);">
-        <td style="text-align:left;padding:8px;border:1px solid var(--border);font-size:11px;">${t.date}</td>
+        <td style="text-align:left;padding:8px;border:1px solid var(--border);font-size:11px;">${_safeLedgerDate(t.date)}</td>
         <td style="text-align:left;padding:8px;border:1px solid var(--border);font-size:11px;">${t.label}</td>
         <td style="text-align:right;padding:8px;border:1px solid var(--border);font-size:11px;color:${t.debit?'var(--red)':''};">${t.debit?'₹'+fmt(t.debit):''}</td>
         <td style="text-align:right;padding:8px;border:1px solid var(--border);font-size:11px;color:${t.credit?'var(--green)':''};">${t.credit?'₹'+fmt(t.credit):''}</td>
@@ -5921,7 +5950,7 @@ function renderDocBody(){
     
     document.getElementById('docBody').innerHTML = tableHtml;
     document.getElementById('docTotalLabel').textContent = 'Current Balance Due';
-    document.getElementById('docTotalVal').textContent = fmtSmart(p.due||0);
+    document.getElementById('docTotalVal').textContent = fmtSmart(closingBal);
   }
 }
 /* ── Printable Payment Receipt (money in) / Payment Voucher (money out) ──
@@ -5981,7 +6010,7 @@ function exportDocLedgerCSV(){
   const txns = getPartyLedgerTxns(p, partyType);
   const rows = [['Date','Particulars','Debit','Credit','Balance']];
   txns.forEach(t=> rows.push([t.date, t.label, t.debit||'', t.credit||'', t.balance]));
-  rows.push(['','','','Current Balance Due', p.due||0]);
+  rows.push(['','','','Current Balance Due', getPartyDocBalance(p,partyType)]);
   const blob = new Blob([rows.map(r=>r.join(',')).join('\n')], {type:'text/csv'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -6284,13 +6313,21 @@ async function buildDocPDF(){
       txns = txns.filter(t=> new Date(t.date) >= cutoff);
     }
     if(txns.length){
+      const labelMaxW = 390 - colItem; // stop before the DEBIT column starts
       txns.forEach(t=>{
-        rowBand(16);
-        doc.text(`${t.date} — ${t.label}`.slice(0,58), colItem, y);
-        if(t.debit) doc.text(fmt(t.debit), 400, y, {align:'right'});
-        if(t.credit) doc.text(fmt(t.credit), 475, y, {align:'right'});
-        doc.text(fmt(t.balance), colAmt, y, {align:'right'});
-        y += 16;
+        doc.setFont('helvetica','normal'); doc.setFontSize(9.5); doc.setTextColor(30,30,30);
+        // Wrap instead of hard-truncating — a fixed character cutoff here used to
+        // clip mid-word (e.g. "Credit Purchase" → "Credit Purcha", or dropped
+        // entirely) whenever the date+item description ran long.
+        const labelLines = doc.splitTextToSize(`${_safeLedgerDate(t.date)} — ${t.label}`, labelMaxW).slice(0,2);
+        const rowH = labelLines.length>1 ? 27 : 16;
+        rowBand(rowH);
+        labelLines.forEach((line,i)=> doc.text(line, colItem, y+i*11));
+        const valY = labelLines.length>1 ? y+5.5 : y;
+        if(t.debit) doc.text(fmt(t.debit), 400, valY, {align:'right'});
+        if(t.credit) doc.text(fmt(t.credit), 475, valY, {align:'right'});
+        doc.text(fmt(t.balance), colAmt, valY, {align:'right'});
+        y += rowH;
         pageBreakCheck();
       });
     } else { doc.text('No transactions yet', colItem, y); y += 16; }
@@ -6396,7 +6433,7 @@ async function buildDocPDF(){
   doc.rect(marginX, y-2, rightX-marginX, 26, 'F');
   doc.setFont('helvetica','bold'); doc.setFontSize(12); doc.setTextColor(255,255,255);
   const totalLabel = type==='invoice' ? 'GRAND TOTAL' : (type==='ledger'?'CURRENT BALANCE DUE':'OUTSTANDING BALANCE');
-  const totalVal = type==='invoice' ? _docCtx.invTotal : (party.due||0);
+  const totalVal = type==='invoice' ? _docCtx.invTotal : getPartyDocBalance(party, _docCtx.partyType);
   doc.text(totalLabel, marginX+8, y+16);
   doc.text(fmt(totalVal), rightX-8, y+16, {align:'right'});
   y += 40; doc.setTextColor(20,20,20);
@@ -6483,7 +6520,7 @@ async function shareDocOnWhatsApp(){
     msg = `Hi ${party.name}, this confirms ${bizName()} paid you ${fmt(_docCtx.payment.amount)} via ${_docCtx.payment.mode} on ${_docCtx.payment.date}.`;
   } else {
     const docLabel = type==='ledger' ? 'ledger statement' : 'account statement';
-    msg = `Hi ${party.name}, please find your ${docLabel} from ${bizName()}.\nOutstanding balance: ${fmt(party.due||0)}.`;
+    msg = `Hi ${party.name}, please find your ${docLabel} from ${bizName()}.\nOutstanding balance: ${fmt(getPartyDocBalance(party, _docCtx.partyType))}.`;
   }
 
   const pdf = await buildDocPDF();
