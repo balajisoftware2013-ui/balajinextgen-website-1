@@ -3010,6 +3010,15 @@ function updateSyncIndicator(state){
     el.title = 'Last error: ' + (_lastSyncError || 'unknown');
     el.style.color='#c00'; el.style.display='inline'; el.style.cursor='pointer';
     el.onclick = ()=>{ clearTimeout(_syncRetryTimer); attemptSync(); };
+  } else if(state==='conflict'){
+    // FIX: SUSPICIOUS_SHRINK means the SAME payload will be rejected forever —
+    // retrying it every few seconds was pointless (it can never succeed) and
+    // just buried the real problem under an endless "retrying…" message.
+    // Stop auto-retrying and give the user an explicit choice instead.
+    el.textContent = '⚠️ Sync conflict — device has fewer records than cloud. Tap to resolve';
+    el.title = _lastSyncError || 'This device\'s data has fewer records than what is saved online.';
+    el.style.color='#c00'; el.style.display='inline'; el.style.cursor='pointer';
+    el.onclick = ()=>{ clearTimeout(_syncRetryTimer); resolveSyncConflict(); };
   }
 }
 function attemptSync(){
@@ -3043,6 +3052,15 @@ function attemptSync(){
         _lastSyncError = '';
         localStorage.removeItem('bnos_pending_sync');
         updateSyncIndicator('synced');
+      } else if(out && out.error === 'SUSPICIOUS_SHRINK'){
+        // FIX: this payload is rejected because it looks smaller than what's
+        // already saved — resending the identical payload every 8-60s will
+        // fail identically forever ("Not synced yet — retrying…" looping
+        // indefinitely, as seen with CL00026). Stop burning retries on a
+        // save that can never succeed and surface a real choice instead.
+        _lastSyncError = String(out.message || 'This device has fewer records than the cloud copy');
+        console.error('[sync] shrink conflict:', out);
+        updateSyncIndicator('conflict');
       } else {
         // FIX: backend only ever sends "message" on failure (see Code.gs
         // saveDB/doPost) — it never sets "error". Checking out.error alone
@@ -3061,6 +3079,74 @@ function attemptSync(){
       console.error('[sync] request failed:', err);
       updateSyncIndicator('failed');
       scheduleSyncRetry();
+    });
+}
+// FIX: the only way out of a SUSPICIOUS_SHRINK conflict was previously
+// "keep resending the same rejected payload" — which never resolves anything.
+// Give the user an explicit, one-tap choice: pull the cloud's (larger) copy
+// down, or confirm they really do want to overwrite the cloud with what's
+// on this device right now (e.g. after an intentional data reset).
+function resolveSyncConflict(){
+  if(!_pendingSyncPayload){ updateSyncIndicator('synced'); return; }
+  const wantsForce = confirm(
+    'This device has FEWER records than what is already saved online for this business.\n\n' +
+    'Press OK to KEEP THE ONLINE COPY (recommended — this device will reload the cloud data).\n' +
+    'Press Cancel, then use "Force save this device\'s data" from Settings → Reconcile if you are certain this device is correct and want to overwrite the cloud.'
+  );
+  if(wantsForce){
+    forceSyncOverwrite();
+  } else {
+    _pendingSyncPayload = null;
+    _syncRetryCount = 0;
+    localStorage.removeItem('bnos_pending_sync');
+    if(SESSION && SESSION.sheetId){
+      fetch(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},
+        body:JSON.stringify({action:'SUITE_LOAD_DB', sheetId:SESSION.sheetId})})
+        .then(r=>r.json())
+        .then(out=>{
+          if(out && out.success && out.data){
+            DB = out.data;
+            if(typeof normalizeBankAccounts==='function') normalizeBankAccounts();
+            if(typeof normalizeInvoiceSettings==='function') normalizeInvoiceSettings();
+            localStorage.setItem('bnos_db', JSON.stringify(DB));
+            if(out.lastSynced) _lastKnownSync = out.lastSynced;
+            updateSyncIndicator('synced');
+            toast('☁️ Loaded the cloud copy onto this device — reloading…');
+            setTimeout(()=>window.location.reload(), 800);
+          } else {
+            updateSyncIndicator('failed');
+          }
+        })
+        .catch(()=>{ updateSyncIndicator('failed'); });
+    }
+  }
+}
+// Explicit, rarely-used escape hatch for when the device's smaller dataset
+// really is the correct one (e.g. supplier/customer list was intentionally
+// pruned). Bypasses the shrink guard on the backend for this one save only.
+function forceSyncOverwrite(){
+  if(!_pendingSyncPayload) return;
+  updateSyncIndicator('saving');
+  fetch(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},
+    body:JSON.stringify(Object.assign({action:'SUITE_SAVE_DB', forceSave:true}, _pendingSyncPayload))})
+    .then(r=>r.json())
+    .then(out=>{
+      if(out && out.success){
+        if(out.lastSynced) _lastKnownSync = out.lastSynced;
+        _pendingSyncPayload = null;
+        _syncRetryCount = 0;
+        _lastSyncError = '';
+        localStorage.removeItem('bnos_pending_sync');
+        updateSyncIndicator('synced');
+        toast('☁️ Forced save — cloud data overwritten with this device\'s data');
+      } else {
+        _lastSyncError = (out && (out.error || out.message)) ? String(out.error || out.message) : 'Force save failed';
+        updateSyncIndicator('failed');
+      }
+    })
+    .catch(err=>{
+      _lastSyncError = err && err.message ? err.message : 'Network error';
+      updateSyncIndicator('failed');
     });
 }
 function scheduleSyncRetry(){
