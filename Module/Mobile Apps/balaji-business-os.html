@@ -3025,7 +3025,7 @@ function _applyServerDataGen(out){
     // save push the old, now-stale data back up and undo the reset.
     _pendingSyncPayload = null;
     try{ localStorage.removeItem('bnos_pending_sync'); }catch(e){}
-    _syncRetryCount = 0; _lastSyncError = '';
+    _syncRetryCount = 0; _lastSyncError = ''; _lastSyncErrorCode = '';
     clearTimeout(_syncRetryTimer);
     toast('☁️ Your account data was reset from another device/admin — this device has been refreshed to match.');
   }
@@ -3109,6 +3109,9 @@ let _syncInFlight = false;
 let _syncRetryTimer = null;
 let _syncRetryCount = 0;
 let _lastSyncError = '';
+let _lastSyncErrorCode = ''; // FIX: machine-readable code (e.g. SUSPICIOUS_SHRINK,
+// MISSING_SHEET_ID) kept separate from the human-readable message, so the
+// UI never shows a raw code — see updateSyncIndicator() below.
 const SYNC_RETRY_BASE_MS = 8000;   // first retry after 8s
 const SYNC_RETRY_MAX_MS  = 60000;  // never wait longer than 60s between retries
 function updateSyncIndicator(state){
@@ -3134,7 +3137,10 @@ function updateSyncIndicator(state){
     el.style.display='inline';
   } 
   else if(state==='failed'){
-    const isShrinkConflict = _lastSyncError && _lastSyncError.includes('would erase');
+    // FIX: check the machine code, not a substring match on the display
+    // text — string-matching broke the moment the message text changed,
+    // and silently fell through to showing the raw code to the user.
+    const isShrinkConflict = _lastSyncErrorCode === 'SUSPICIOUS_SHRINK';
     const reason = _lastSyncError ? ` — ${_lastSyncError}` : '';
     
     if(isShrinkConflict){
@@ -3219,7 +3225,7 @@ function attemptForceSave(){
         if(out.dataGen !== undefined){ _lastKnownDataGen = Number(out.dataGen)||0; try{ localStorage.setItem('bnos_data_gen', String(_lastKnownDataGen)); }catch(e){} }
         _pendingSyncPayload = null;
         _syncRetryCount = 0;
-        _lastSyncError = '';
+        _lastSyncError = ''; _lastSyncErrorCode = '';
         localStorage.removeItem('bnos_pending_sync');
         updateSyncIndicator('synced');
         if(resultEl){
@@ -3254,7 +3260,8 @@ function attemptSync(){
   // real problem behind a generic "not synced" message. Fail fast and say why.
   if(!_pendingSyncPayload.sheetId){
     _syncInFlight = false;
-    _lastSyncError = 'No database linked to this session (sheetId missing) — log out and log back in to relink.';
+    _lastSyncErrorCode = 'MISSING_SHEET_ID';
+    _lastSyncError = 'No database linked to this session — log out and log back in to relink.';
     updateSyncIndicator('failed');
     return;
   }
@@ -3271,23 +3278,33 @@ function attemptSync(){
         if(out.lastSynced) _lastKnownSync = out.lastSynced;
         _pendingSyncPayload = null;
         _syncRetryCount = 0;
-        _lastSyncError = '';
+        _lastSyncError = ''; _lastSyncErrorCode = '';
         localStorage.removeItem('bnos_pending_sync');
         updateSyncIndicator('synced');
       } else {
-        // FIX: backend only ever sends "message" on failure (see Code.gs
-        // saveDB/doPost) — it never sets "error". Checking out.error alone
-        // meant this ALWAYS fell through to the generic fallback text,
-        // hiding the real reason (e.g. suspicious-shrink block, bad sheetId,
-        // Apps Script exception). Read whichever field is actually present.
-        _lastSyncError = (out && (out.error || out.message)) ? String(out.error || out.message) : 'Server rejected the save';
+        // FIX: prefer the human-readable "message" for what gets shown to
+        // the user; keep the short machine "error" code (SUSPICIOUS_SHRINK,
+        // MISSING_SHEET_ID, etc.) separately for logic like the shrink-
+        // conflict banner — never surface the raw code itself in the UI.
+        _lastSyncErrorCode = (out && out.error) ? String(out.error) : '';
+        _lastSyncError = (out && out.message) ? String(out.message) : (_lastSyncErrorCode || 'Server rejected the save');
         console.error('[sync] server rejected save:', out);
         updateSyncIndicator('failed');
-        scheduleSyncRetry();
+        // FIX: a SUSPICIOUS_SHRINK rejection means the server is correctly
+        // refusing to overwrite good cloud data with a smaller local
+        // dataset — retrying the SAME payload changes nothing and just
+        // repeats the rejection forever (this was hammering the server
+        // with the exact same "would erase 635 purchases" rejection on a
+        // loop). Stop and wait for the user to explicitly resolve it via
+        // the conflict banner instead of silently retrying.
+        if(_lastSyncErrorCode !== 'SUSPICIOUS_SHRINK'){
+          scheduleSyncRetry();
+        }
       }
     })
     .catch(err=>{
       _syncInFlight = false;
+      _lastSyncErrorCode = '';
       _lastSyncError = err && err.message ? err.message : 'Network error';
       console.error('[sync] request failed:', err);
       updateSyncIndicator('failed');
@@ -3316,6 +3333,63 @@ function syncCustomerRow(c){
 }
 function syncSupplierRow(s){
   logRowToSheet('LOG_PARTY', {tab:'SUPPLIERS', row:[s.id, s.name, s.mobile, s.due]});
+}
+// v29: direct-to-sheet writes for everything that USED to live only in the
+// JSON blob. Each of these fires the moment the record is created — same
+// pattern as syncItemRow/syncCustomerRow/syncSupplierRow above — so an
+// expense, payment, note, or bank transaction is safe in the actual Google
+// Sheet within seconds, not dependent on the next full-DB blob save.
+function syncExpenseRow(e){
+  logRowToSheet('LOG_PARTY', {tab:'EXPENSES', isNew:true,
+    headers:['ID','CATEGORY','AMOUNT','NOTE','DATE','PENDING'],
+    row:[e.id, e.category||'', e.amount||0, e.note||'', e.date||'', !!e.pending]});
+}
+function syncPaymentInRow(p){
+  logRowToSheet('LOG_PARTY', {tab:'PAYMENTS_IN', isNew:true,
+    headers:['ID','CUST','AMOUNT','MODE','BILL_REF','TXN_REF','DATE'],
+    row:[p.id, p.cust||'', p.amount||0, p.mode||'', p.billRef||'', p.txnRef||'', p.date||'']});
+}
+function syncPaymentOutRow(p){
+  logRowToSheet('LOG_PARTY', {tab:'PAYMENTS_OUT', isNew:true,
+    headers:['ID','SUPP','AMOUNT','MODE','BILL_REF','TXN_REF','DATE'],
+    row:[p.id, p.supp||'', p.amount||0, p.mode||'', p.billRef||'', p.txnRef||'', p.date||'']});
+}
+function syncCreditNoteRow(cn){
+  logRowToSheet('LOG_PARTY', {tab:'CREDIT_NOTES', isNew:true,
+    headers:['ID','CUST','BILL_REF','AMOUNT','REASON','DATE','LINE_ITEMS_JSON'],
+    row:[cn.id, cn.cust||'', cn.billRef||'', cn.amount||0, cn.reason||'', cn.date||'', JSON.stringify(cn.lineItems||[])]});
+}
+function syncDebitNoteRow(dn){
+  logRowToSheet('LOG_PARTY', {tab:'DEBIT_NOTES', isNew:true,
+    headers:['ID','SUPP','BILL_REF','AMOUNT','REASON','DATE','LINE_ITEMS_JSON'],
+    row:[dn.id, dn.supp||'', dn.billRef||'', dn.amount||0, dn.reason||'', dn.date||'', JSON.stringify(dn.lineItems||[])]});
+}
+function syncBankAccountRow(b){
+  logRowToSheet('LOG_PARTY', {tab:'BANK_ACCOUNTS',
+    headers:['ID','NAME','BALANCE'],
+    row:[b.id, b.name||'', b.balance||0]});
+}
+function syncBankTxnRow(b){
+  logRowToSheet('LOG_PARTY', {tab:'BANK_TXNS', isNew:true,
+    headers:['ID','TYPE','AMOUNT','DETAIL','CATEGORY','DATE'],
+    row:[b.id, b.type||'', b.amount||0, b.detail||'', b.category||'', b.date||'']});
+}
+// Settings is a single row per business — dedicated action rather than
+// LOG_PARTY, since it upserts one fixed record instead of a growing list.
+function syncSettingsToSheet(){
+  if(!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL)) return Promise.resolve();
+  const s = {
+    bizName: DB.bizName||'', gstRegistered: DB.gstRegistered||'yes', gstin: DB.gstin||'',
+    bizState: DB.bizState||'', bizMobile: DB.bizMobile||'', bizEmail: DB.bizEmail||'',
+    bizAddress: DB.bizAddress||'', bizPan: DB.bizPan||'', upiId: DB.upiId||'', showQr: !!DB.showQr,
+    bankHolder: DB.bankHolder||'', bankName: DB.bankName||'', bankAcc: DB.bankAcc||'',
+    bankIfsc: DB.bankIfsc||'', bankBranch: DB.bankBranch||'', defUnit: DB.defUnit||'Kg',
+    industry: DB.industry||'retail', theme: DB.theme||'theme-icici',
+    einvoiceIrn: DB.einvoiceIrn||'', einvoiceAckNo: DB.einvoiceAckNo||'', einvoiceAckDate: DB.einvoiceAckDate||'',
+    invoiceSettings: DB.invoiceSettings||{}
+  };
+  return fetch(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},
+    body:JSON.stringify({action:'SAVE_SETTINGS', sheetId:SESSION.sheetId, settings:s})}).catch(()=>{});
 }
 function logRowToSheet(action, payload){
   if(!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL)) return Promise.resolve();
@@ -3897,6 +3971,7 @@ function saveBizSettings(){
     pos: !!document.getElementById('ciPos').checked
   };
   persistDB();
+  syncSettingsToSheet();
   toast('Settings saved ✓');
   closeAllSheets();
 }
@@ -3930,9 +4005,35 @@ function previewInvoiceFormat(){
   ];
   openInvoiceDoc('INV-SAMPLE', sampleCust, 520, 'Cash', sampleItems, 'gst');
 }
-function confirmResetClient(){
+async function confirmResetClient(){
   if(!confirm('This will permanently erase all sales, customers, suppliers, items and reset cash to zero — for starting a brand new client. This cannot be undone. Continue?')) return;
+  if(!confirm('Are you absolutely sure? This also clears the data stored in your Google Sheet — there is no undo.')) return;
+
   const bizName_ = document.getElementById('setBizName').value || DB.bizName || 'My Business';
+
+  // FIX: this used to only wipe the in-browser DB and call persistDB() —
+  // which sends a now-tiny dataset to the SAME cloud sheet that still has
+  // all the old purchases/sales, so the shrink guard (correctly) rejected
+  // the save every time. Result: the app *looked* reset locally but the
+  // cloud copy never actually changed, and every sync after that fought
+  // between the two. Reset must clear the CLOUD side first, via the
+  // dedicated RESET_ALL_DATA action, then reset the local copy to match.
+  if(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL){
+    toast('Clearing cloud data…');
+    try{
+      const res = await fetch(GAS_URL, {method:'POST', headers:{'Content-Type':'text/plain'},
+        body: JSON.stringify({action:'RESET_ALL_DATA', sheetId: SESSION.sheetId, clientId: SESSION.clientId})});
+      const out = await res.json();
+      if(!out.success){
+        toast('❌ Reset failed on server: ' + (out.message || 'unknown error') + ' — nothing was changed. Contact support (9832014403).');
+        return;
+      }
+    }catch(err){
+      toast('❌ Could not reach the server to reset — check your connection and try again. Nothing was changed.');
+      return;
+    }
+  }
+
   DB = {
     customers:[{id:'C1',name:'Walk-in Customer',mobile:'',due:0,limit:0,lastDate:''}],
     suppliers:[], items:[], sales:[], purchases:[],
@@ -3941,12 +4042,14 @@ function confirmResetClient(){
     gstRegistered: DB.gstRegistered||'yes', gstin: DB.gstin||'', upiId: DB.upiId||'', industry: DB.industry||'retail',
     theme: DB.theme||'theme-icici'
   };
+  // The cloud side is now genuinely empty too (RESET_ALL_DATA already ran),
+  // so this save has nothing to conflict with — no forceSave needed.
   persistDB();
   normalizeBankAccounts();
   normalizeInvoiceSettings();
   setBizNameEverywhere(bizName_);
   if(SESSION){ SESSION.name = bizName_; localStorage.setItem('bnos_session', JSON.stringify(SESSION)); }
-  toast('Fresh start ready — add your first item and customer');
+  toast('✅ Fresh start ready — add your first item and customer');
   closeAllSheets();
   goPage('dashboard'); renderDashboard();
 }
@@ -9586,6 +9689,7 @@ function recordCollect(){
   if(mode==='Cash') DB.cash += amt; else bankAdjust(amt);
   if(!DB.paymentsIn) DB.paymentsIn = [];
   DB.paymentsIn.unshift({id:'RCT'+Date.now()%100000, cust:c.id, amount:amt, mode, billRef: billRef||null, txnRef: txnRef||null, date:new Date().toISOString().slice(0,10)});
+  syncPaymentInRow(DB.paymentsIn[0]);
   persistDB();
   syncCustomerRow(c);
   document.getElementById('collectRef').value='';
@@ -9602,6 +9706,7 @@ function recordPay(){
   if(mode==='Cash') DB.cash -= amt; else bankAdjust(-amt);
   if(!DB.paymentsOut) DB.paymentsOut = [];
   DB.paymentsOut.unshift({id:'PMT'+Date.now()%100000, supp:s.id, amount:amt, mode, billRef: billRef||null, txnRef: txnRef||null, date:new Date().toISOString().slice(0,10)});
+  syncPaymentOutRow(DB.paymentsOut[0]);
   persistDB();
   syncSupplierRow(s);
   document.getElementById('payRef').value='';
@@ -10305,6 +10410,7 @@ function recordExpense(){
   if(!DB.expenses) DB.expenses = [];
   const isSuspense = cat === SUSPENSE_CAT;
   DB.expenses.unshift({id:'EXP'+Date.now()%100000, category:cat, amount:amt, note, date:new Date().toISOString().slice(0,10), pending: isSuspense});
+  syncExpenseRow(DB.expenses[0]);
   DB.expensesToday = (DB.expensesToday||0)+amt; DB.cash -= amt; persistDB();
   document.getElementById('expAmt').value=''; document.getElementById('expNote').value='';
   toast(isSuspense ? 'Logged to Suspense — clarify it later' : 'Expense added');
@@ -10514,6 +10620,7 @@ function recordReturn(){
     if(!DB.creditNotes) DB.creditNotes = [];
     const cnId = 'CN'+(1000+DB.creditNotes.length+1);
     DB.creditNotes.unshift({id:cnId, cust:partyId, billRef:billRef||null, amount:amt, reason, date:today, lineItems});
+    syncCreditNoteRow(DB.creditNotes[0]);
     c.due = Math.max(0, c.due - amt);
     retCart.forEach(item=>{ const it=DB.items.find(i=>i.id===item.id); if(it) it.stock=(it.stock||0)+item.qty; });
     persistDB();
@@ -10523,6 +10630,7 @@ function recordReturn(){
     if(!DB.debitNotes) DB.debitNotes = [];
     const dnId = 'DN'+(1000+DB.debitNotes.length+1);
     DB.debitNotes.unshift({id:dnId, supp:partyId, billRef:billRef||null, amount:amt, reason, date:today, lineItems});
+    syncDebitNoteRow(DB.debitNotes[0]);
     s.due = Math.max(0, s.due - amt);
     retCart.forEach(item=>{ const it=DB.items.find(i=>i.id===item.id); if(it) it.stock=Math.max(0,(it.stock||0)-item.qty); });
     persistDB();
@@ -10555,6 +10663,7 @@ function quickAddBankAccount(targetSelId){
   if(!name || !name.trim()) return;
   const acct = {id:'BK'+Date.now()%100000, name:name.trim(), balance:0};
   DB.bankAccounts.push(acct);
+  syncBankAccountRow(acct);
   persistDB();
   fillBankAcctSelect('bankTxnAcct'); fillBankAcctSelect('bankTxnFrom'); fillBankAcctSelect('bankTxnTo');
   if(targetSelId) document.getElementById(targetSelId).value = acct.id;
@@ -11128,6 +11237,7 @@ function postBankStatementRows(){
       bankAdjust(-r.dr);
       if(!DB.paymentsOut) DB.paymentsOut = [];
       DB.paymentsOut.unshift({id:'PMT'+Date.now()%100000+i, supp:s.id, amount:r.dr, mode:'Bank', billRef:null, txnRef:r.desc||null, date:r.date});
+      syncPaymentOutRow(DB.paymentsOut[0]);
       posted++;
     } else if(r.action==='receipt'){
       if(!r.ledgerId){ skipped++; return; }
@@ -11136,16 +11246,19 @@ function postBankStatementRows(){
       bankAdjust(r.cr);
       if(!DB.paymentsIn) DB.paymentsIn = [];
       DB.paymentsIn.unshift({id:'RCT'+Date.now()%100000+i, cust:c.id, amount:r.cr, mode:'Bank', billRef:null, txnRef:r.desc||null, date:r.date});
+      syncPaymentInRow(DB.paymentsIn[0]);
       posted++;
     } else if(r.action==='expense'){
       bankAdjust(-r.dr);
       if(!DB.bankTxns) DB.bankTxns = [];
       DB.bankTxns.unshift({id:'BK'+Date.now()%100000+i, type:'expense', amount:r.dr, detail:r.desc, category:r.expCat, date:r.date});
+      syncBankTxnRow(DB.bankTxns[0]);
       posted++;
     } else if(r.action==='other_income'){
       bankAdjust(r.cr);
       if(!DB.bankTxns) DB.bankTxns = [];
       DB.bankTxns.unshift({id:'BK'+Date.now()%100000+i, type:'income', amount:r.cr, detail:r.desc, date:r.date});
+      syncBankTxnRow(DB.bankTxns[0]);
       posted++;
     }
   });
@@ -11191,6 +11304,7 @@ function recordBankTxn(){
   recalcBankTotal();
   if(!DB.bankTxns) DB.bankTxns = [];
   DB.bankTxns.unshift({id:'BK'+Date.now()%100000, type, amount:amt, detail, note, date:new Date().toISOString().slice(0,10)});
+  syncBankTxnRow(DB.bankTxns[0]);
   persistDB();
   document.getElementById('bankTxnAmt').value=''; document.getElementById('bankTxnNote').value='';
   toast('Bank entry saved'); renderBankTxnList(); renderDashboard();
