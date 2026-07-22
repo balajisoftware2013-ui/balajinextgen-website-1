@@ -2853,6 +2853,7 @@ body.mode-accountant .owner-hint{display:none;}
     </div>
     <button class="btn btn-outline" id="refreshCloudBtn" style="width:100%;" onclick="refreshFromCloud()">🔄 Refresh From Cloud</button>
     <div id="reconcileResult" style="display:none;margin-top:12px;font-size:12px;background:var(--body-bg);border-radius:10px;padding:10px 12px;line-height:1.8;"></div>
+    <button class="btn btn-primary" id="forceSaveBtn" style="width:100%;margin-top:10px;display:none;background:var(--red);" onclick="forceSaveAndOverwrite()">⚠️ Force Save (overwrite cloud data)</button>
   </div>
 
   <button class="btn btn-primary" style="margin-top:14px;" onclick="saveBizSettings()">💾 Save All Settings</button>
@@ -3795,6 +3796,68 @@ async function pullRemoteUpdates(){
     }
   }catch(e){ /* silent — next poll will retry */ }
 }
+// v43 FIX: this function was called by the "🔄 Refresh From Cloud" button
+// in Settings but never actually existed anywhere in the file — clicking
+// it threw "refreshFromCloud is not defined" and did nothing. Unlike the
+// silent, conditional pullRemoteUpdates() (used for the background 5s
+// poll), this is an explicit user action: always fetch, always apply,
+// and show a visible result either way.
+async function refreshFromCloud(){
+  if(!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL)){
+    toast('Refresh From Cloud needs a connected, non-demo account.');
+    return;
+  }
+  const btn = document.getElementById('refreshCloudBtn');
+  const resultEl = document.getElementById('reconcileResult');
+  if(btn){ btn.disabled = true; btn.textContent = '🔄 Refreshing…'; }
+  try{
+    const res = await fetch(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({action:'SUITE_LOAD_DB', sheetId:SESSION.sheetId})});
+    const out = await res.json();
+    if(!out.success || !out.data) throw new Error(out.message || 'Load failed');
+    _applyServerDataGen(out);
+    DB = out.data;
+    _lastKnownSync = out.lastSynced || Date.now();
+    normalizeBankAccounts(); normalizeInvoiceSettings();
+    renderDashboard(); renderNotifs();
+    if(window._curPage==='inventory') renderInventory();
+    if(window._curPage==='money') moneyTab(window._moneyTab||'customers');
+    if(resultEl){ resultEl.style.display='block'; resultEl.innerHTML = `✅ Refreshed — ${(DB.purchases||[]).length} purchases, ${(DB.sales||[]).length} sales, ${(DB.customers||[]).length} customers loaded from the Sheet.`; }
+    toast('✅ Refreshed from cloud');
+  }catch(err){
+    if(resultEl){ resultEl.style.display='block'; resultEl.innerHTML = '❌ Refresh failed: '+(err.message||err); }
+    toast('❌ Refresh failed: '+(err.message||err));
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '🔄 Refresh From Cloud'; }
+  }
+}
+// v43 NEW: the escape hatch for a legitimate SUSPICIOUS_SHRINK block. The
+// button that triggers this only ever appears when the server has already
+// refused a save specifically because the local copy has fewer rows than
+// what's safely stored in the Sheet — so this always asks for explicit,
+// informed confirmation before sending force:true, which tells the
+// backend to skip that check and overwrite anyway.
+async function forceSaveAndOverwrite(){
+  if(!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL)) return;
+  const detail = _lastSyncError || 'this device has fewer records than what is currently saved in the cloud';
+  if(!confirm(`⚠️ WARNING: ${detail}\n\nForce Save will overwrite the cloud data with what's on THIS device right now. Only do this if you're certain this device has the correct, complete data (e.g. you just ran Refresh From Cloud and it's still wrong, or you intentionally cleared data).\n\nThis cannot be undone. Continue?`)) return;
+  const btn = document.getElementById('forceSaveBtn');
+  if(btn){ btn.disabled = true; btn.textContent = '⚠️ Saving…'; }
+  try{
+    const res = await fetch(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({action:'SUITE_SAVE_DB', clientId:SESSION.clientId, sheetId:SESSION.sheetId, data:DB, force:true})});
+    const out = await res.json();
+    if(!out.success) throw new Error(out.message || 'Force save failed');
+    _lastKnownSync = out.lastSynced || Date.now();
+    _pendingSyncPayload = null; _syncRetryCount = 0;
+    _lastSyncError = ''; _lastSyncErrorCode = '';
+    updateSyncIndicator('synced');
+    if(btn) btn.style.display = 'none';
+    toast('✅ Force save complete — cloud data overwritten');
+  }catch(err){
+    toast('❌ Force save failed: '+(err.message||err));
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '⚠️ Force Save (overwrite cloud data)'; }
+  }
+}
 function startRealtimeSync(){
   if(_syncIntervalId) clearInterval(_syncIntervalId);
   if(!SESSION || SESSION.isDemo) return;
@@ -3985,6 +4048,13 @@ function switchStgTab(name, el){
   el.classList.add('active');
   const panel = document.getElementById('stg-'+name);
   if(panel){ panel.style.display='block'; panel.classList.add('active'); }
+  // v43: the Force Save button only makes sense to show once a save has
+  // actually been blocked as a suspicious shrink — otherwise it stays
+  // hidden so nobody stumbles into overwriting good cloud data by accident.
+  if(name==='reconcile'){
+    const fsBtn = document.getElementById('forceSaveBtn');
+    if(fsBtn) fsBtn.style.display = (_lastSyncErrorCode==='SUSPICIOUS_SHRINK') ? 'block' : 'none';
+  }
 }
 function toggleGstFields(){
   const reg = document.getElementById('setGstRegistered');
@@ -6668,6 +6738,115 @@ async function loadImageAsDataURL(url){
 /* Thermal/POS receipts (Format 5) need an actual 80mm-wide receipt PDF —
    not a shrunk A4 page — so Show / PDF / WhatsApp all match what a
    receipt printer or a customer expects to see. */
+/* ── v57 FIX: PDF/WhatsApp for documents (invoices, ledgers, statements)
+   used to be hand-drawn from scratch with raw jsPDF text/line primitives
+   (see buildDocPDF()/buildThermalReceiptPDF() below) — a completely
+   separate implementation from the real #docPrintArea HTML/CSS that Print
+   actually uses. That meant PDF/WhatsApp output could never reliably match
+   what Print produced across all 11 bill formats (Tally Classic, e-Invoice,
+   Thermal, Landscape, etc.) — any format-specific layout detail only
+   existed in the CSS, never in the hand-coded PDF path, so they drifted.
+   This instead reuses the exact technique already proven for Reports
+   (rasterizeReportPrintArea → buildReportPDF): screenshot the real,
+   already-styled DOM with html2canvas, then drop that image into a PDF.
+   Print, PDF, and WhatsApp now all originate from the same rendered
+   HTML — they cannot visually diverge. buildDocPDF()/buildThermalReceiptPDF()
+   are left below but no longer called from anywhere; kept only in case
+   something else is found to depend on them. */
+async function rasterizeDocPrintArea(){
+  if(!window.html2canvas) return null;
+  const srcSheet = document.getElementById('docSheet');
+  if(!srcSheet) return null;
+  const sheetClone = srcSheet.cloneNode(true);
+  sheetClone.removeAttribute('id');
+  sheetClone.classList.add('_pdfDocSheet');
+  sheetClone.style.cssText = 'position:static;transform:none;max-height:none;overflow:visible;box-shadow:none;left:auto;top:auto;right:auto;bottom:auto;margin:0;padding:0;background:#fff;border-radius:0;max-width:none;width:100%;';
+  const areaClone = sheetClone.querySelector('#docPrintArea');
+  if(areaClone) areaClone.removeAttribute('id');
+  const wrap = document.createElement('div');
+  wrap.className = '_pdfRenderWrap';
+  wrap.style.cssText = 'position:fixed;left:-9999px;top:0;width:800px;background:#fff;';
+  // v59 FIX: the previous version of this only replicated the @media print
+  // color/border override — it missed every spacing/padding rule that ALSO
+  // only exists under @media print (compact .doc-head/.doc-row/.doc-items-tbl
+  // padding, the pos-format 80mm width, the doc-style-tally padding, etc).
+  // Real browser Print/Save-as-PDF applies the genuine @media print CSS
+  // directly, so it always had these; this html2canvas-based clone never
+  // did, which is exactly why WhatsApp output and the real printed/saved
+  // PDF looked different from EACH OTHER even after the color fix. These
+  // are the same declarations from the @media print block above, just
+  // scoped by ._pdfDocSheet/._pdfRenderArea classes instead of a media
+  // query so they can be applied on demand during a screenshot too.
+  wrap.innerHTML = `<style>
+    ._pdfRenderWrap ._pdfDocSheet .doc-actions,
+    ._pdfRenderWrap ._pdfDocSheet .sheet-handle,
+    ._pdfRenderWrap ._pdfDocSheet .doc-tpl-btn{display:none!important;}
+    ._pdfRenderWrap ._pdfDocSheet #docPeriodRow,
+    ._pdfRenderWrap ._pdfDocSheet #docCustomDates{display:none!important;}
+    ._pdfRenderWrap ._pdfRenderArea{padding:10px!important;}
+    ._pdfRenderWrap ._pdfDocSheet.pos-format ._pdfRenderArea{width:80mm;padding:6px!important;}
+    ._pdfRenderWrap ._pdfDocSheet.doc-style-tally ._pdfRenderArea{padding:8px!important;}
+    ._pdfRenderWrap ._pdfRenderArea .doc-head{padding-bottom:6px!important;margin-bottom:8px!important;}
+    ._pdfRenderWrap ._pdfRenderArea .doc-row{padding:4px 0!important;}
+    ._pdfRenderWrap ._pdfRenderArea .doc-meta-row{padding:5px 0!important;margin-bottom:0!important;}
+    ._pdfRenderWrap ._pdfRenderArea .doc-items-tbl th,
+    ._pdfRenderWrap ._pdfRenderArea .doc-items-tbl td{padding:4px 5px!important;}
+    ._pdfRenderWrap ._pdfRenderArea .doc-total-row{padding:6px 0!important;margin-top:3px!important;}
+    ._pdfRenderWrap ._pdfRenderArea .doc-words{margin-top:5px!important;padding-top:4px!important;}
+    ._pdfRenderWrap ._pdfRenderArea .doc-pay-block{margin-top:6px!important;padding:6px 8px!important;}
+    ._pdfRenderWrap ._pdfRenderArea .doc-bank-block{margin-top:6px!important;padding:6px 8px!important;font-size:10.5px!important;line-height:1.4!important;}
+    ._pdfRenderWrap ._pdfRenderArea .doc-sign-block{margin-top:8px!important;}
+    ._pdfRenderWrap ._pdfRenderArea .doc-sign-line{margin-top:12px!important;}
+    ._pdfRenderWrap ._pdfRenderArea .doc-declaration{margin-top:5px!important;padding-top:4px!important;font-size:9px!important;}
+    ._pdfRenderWrap ._pdfRenderArea .doc-thanks{margin-top:6px!important;}
+    ._pdfRenderWrap ._pdfRenderArea,
+    ._pdfRenderWrap ._pdfRenderArea *{color:#000!important;background:#fff!important;border-color:#000!important;box-shadow:none!important;-webkit-print-color-adjust:exact;print-color-adjust:exact;}
+  </style>`;
+  wrap.appendChild(sheetClone);
+  document.body.appendChild(wrap);
+  if(areaClone) areaClone.classList.add('_pdfRenderArea');
+  let canvas;
+  try{ canvas = await window.html2canvas(areaClone || sheetClone, {scale:2, backgroundColor:'#ffffff', useCORS:true}); }
+  finally { wrap.remove(); }
+  return canvas;
+}
+async function buildDocPDFFromScreenshot(){
+  if(!window.jspdf) return null;
+  const canvas = await rasterizeDocPrintArea();
+  if(!canvas) return null;
+  const { jsPDF } = window.jspdf;
+  // POS/thermal receipts are a narrow 80mm strip, not a page — give them a
+  // matching narrow PDF page instead of a tiny receipt on a huge blank A4 sheet.
+  const isPos = !!(_docCtx && _docCtx.type==='invoice' && getInvoiceFormatConfig().pos);
+  const margin = isPos ? 6 : 24;
+  const doc = isPos
+    ? new jsPDF({unit:'pt', format:[227, Math.max(280, (canvas.height*(227-margin*2))/canvas.width + margin*2)]})
+    : new jsPDF({unit:'pt', format:'a4'});
+  const pageW = doc.internal.pageSize.getWidth();
+  const pageH = doc.internal.pageSize.getHeight();
+  const usableW = pageW - margin*2;
+  const imgH = (canvas.height * usableW) / canvas.width;
+  const pageUsableH = pageH - margin*2;
+  const imgData = canvas.toDataURL('image/jpeg', 0.95);
+  if(imgH <= pageUsableH){
+    doc.addImage(imgData, 'JPEG', margin, margin, usableW, imgH);
+  } else {
+    const pxPerPage = Math.floor((pageUsableH * canvas.width) / usableW);
+    let renderedPx = 0, pageNo = 0;
+    while(renderedPx < canvas.height){
+      const sliceH = Math.min(pxPerPage, canvas.height - renderedPx);
+      const sliceCanvas = document.createElement('canvas');
+      sliceCanvas.width = canvas.width; sliceCanvas.height = sliceH;
+      sliceCanvas.getContext('2d').drawImage(canvas, 0, renderedPx, canvas.width, sliceH, 0, 0, canvas.width, sliceH);
+      const sliceImg = sliceCanvas.toDataURL('image/jpeg', 0.95);
+      const sliceHPt = (sliceH * usableW) / canvas.width;
+      if(pageNo>0) doc.addPage();
+      doc.addImage(sliceImg, 'JPEG', margin, margin, usableW, sliceHPt);
+      renderedPx += sliceH; pageNo++;
+    }
+  }
+  return doc;
+}
 async function buildThermalReceiptPDF(){
   if(!_docCtx || !window.jspdf || _docCtx.type!=='invoice') return null;
   const fmt = fmtPdfMoney; // PDF text can't render ₹ — see fmtPdfMoney note above
@@ -7154,7 +7333,7 @@ async function shareDocOnWhatsApp(){
     msg = `Hi ${party.name}, please find your ${docLabel} from ${bizName()}.\nOutstanding balance: ${fmt(getPartyDocBalance(party, _docCtx.partyType))}.`;
   }
 
-  const pdf = await buildDocPDF();
+  const pdf = await buildDocPDFFromScreenshot();
   const fileName = buildShareFileName();
   if(pdf){
     const blob = pdf.output('blob');
