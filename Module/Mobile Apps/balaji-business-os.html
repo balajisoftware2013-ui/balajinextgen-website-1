@@ -2999,26 +2999,34 @@ const seed = {
   cash:5200, bank:18400, expensesToday:0
 };
 
-let DB = JSON.parse(localStorage.getItem('bnos_db') || 'null') || seed;
+// v31 FIX: removed the 'bnos_db' localStorage cache — DB now lives only
+// in memory and is loaded fresh from the cloud (Google Sheet) on every
+// app entry (see enterApp()). `seed` is used only as placeholder content
+// before a real session's cloud fetch resolves, or for Demo mode, which
+// intentionally has no cloud backing. SESSION itself stays in
+// localStorage — that's login/auth state, not business data, and is
+// what lets a refresh skip re-typing mobile+password.
+let DB = seed;
 let SESSION = JSON.parse(localStorage.getItem('bnos_session') || 'null');
 
 let _lastKnownSync = 0;
 // v29 FIX: DATA_GEN tracking — lets this device detect "the cloud was
 // reset since I last synced" instead of blindly re-pushing (and thereby
 // undoing) an admin's RESET_ALL_DATA. See _applyServerDataGen() below.
-let _lastKnownDataGen = Number(localStorage.getItem('bnos_data_gen') || 0);
+// v31: kept in-memory only (no longer persisted to localStorage) — each
+// fresh page load starts at 0 and gets the current value from the first
+// cloud load, so there's nothing stale to reconcile across reloads.
+let _lastKnownDataGen = 0;
 function _applyServerDataGen(out){
   if(!out || out.dataGen === undefined || out.dataGen === null) return;
   const serverGen = Number(out.dataGen) || 0;
   const wasReset = _lastKnownDataGen && serverGen && serverGen !== _lastKnownDataGen;
   _lastKnownDataGen = serverGen;
-  try{ localStorage.setItem('bnos_data_gen', String(serverGen)); }catch(e){}
   if(wasReset){
     // The cloud data was reset (or restored) since this device last synced.
     // Trust the server's copy completely — do NOT let any pending local
     // save push the old, now-stale data back up and undo the reset.
     _pendingSyncPayload = null;
-    try{ localStorage.removeItem('bnos_pending_sync'); }catch(e){}
     _syncRetryCount = 0; _lastSyncError = ''; _lastSyncErrorCode = '';
     clearTimeout(_syncRetryTimer);
     toast('☁️ Your account data was reset from another device/admin — this device has been refreshed to match.');
@@ -3173,7 +3181,6 @@ function attemptSync(){
         _pendingSyncPayload = null;
         _syncRetryCount = 0;
         _lastSyncError = ''; _lastSyncErrorCode = '';
-        localStorage.removeItem('bnos_pending_sync');
         updateSyncIndicator('synced');
       } else {
         // FIX: prefer the human-readable "message" for what gets shown to
@@ -3290,10 +3297,13 @@ function logRowToSheet(action, payload){
   return fetch(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify(Object.assign({action, sheetId:SESSION.sheetId}, payload))}).catch(()=>{});
 }
 function persistDB(){
-  localStorage.setItem('bnos_db', JSON.stringify(DB));
+  // v31 FIX: no more 'bnos_db' / 'bnos_pending_sync' localStorage writes —
+  // direct-cloud only. _pendingSyncPayload lives in memory for the current
+  // page session (so attemptSync() can retry on a transient failure) but
+  // does NOT survive a reload; a save interrupted by a closed tab or lost
+  // network before the cloud confirms it will need to be re-entered.
   if(!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL)) return;
   _pendingSyncPayload = {clientId:SESSION.clientId, sheetId:SESSION.sheetId, data:DB};
-  try{ localStorage.setItem('bnos_pending_sync', JSON.stringify(_pendingSyncPayload)); }catch(e){}
   attemptSync();
 }
 // Owner/Super-Admin-only reconcile tools (Settings → 🧮 Reconcile). Calls the
@@ -3357,7 +3367,6 @@ async function runReconcileAndSave(){
       DB = loadOut.data;
       _lastKnownSync = loadOut.lastSynced || Date.now();
       normalizeBankAccounts(); normalizeInvoiceSettings();
-      localStorage.setItem('bnos_db', JSON.stringify(DB));
       renderDashboard(); renderNotifs();
       if(window._curPage==='inventory') renderInventory();
       if(window._curPage==='money') moneyTab(window._moneyTab||'customers');
@@ -3371,13 +3380,11 @@ async function runReconcileAndSave(){
     if(fixBtn){ fixBtn.disabled = false; fixBtn.textContent = '🛠️ Apply Fix (Reconcile & Save)'; }
   }
 }
-// If the app was closed/lost network before a save finished last time, resume it now.
-(function resumePendingSync(){
-  try{
-    const pending = localStorage.getItem('bnos_pending_sync');
-    if(pending){ _pendingSyncPayload = JSON.parse(pending); setTimeout(attemptSync, 1500); }
-  }catch(e){}
-})();
+// v31 FIX: resumePendingSync() removed — it used to resurrect a save that
+// was interrupted by a closed tab/lost network from localStorage. Now
+// that saves are direct-cloud-only with no local persistence, an
+// interrupted save simply doesn't survive a reload (by design — see
+// persistDB()).
 
 /* ── ONBOARDING / REGISTER / LOGIN / DEMO ─────────────────────── */
 function obShow(id){
@@ -3533,9 +3540,30 @@ function freshBizDB(bizName, industry){
 }
 
 
-function enterApp(){
+async function enterApp(){
   document.getElementById('onboardGate').style.display = 'none';
   if (_authBgTimer) { clearInterval(_authBgTimer); _authBgTimer = null; }
+  // v31 FIX: direct-cloud-only — a returning session (page refresh, app
+  // reopened) no longer has a local 'bnos_db' cache to show while
+  // waiting. Fetch the real data from the sheet BEFORE bootApp() renders,
+  // so the user never sees stale/seed content flash on screen. Demo mode
+  // has no cloud backing, so it keeps using the in-memory seed as-is.
+  if(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL){
+    try{
+      const res = await fetch(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({action:'SUITE_LOAD_DB', sheetId:SESSION.sheetId})});
+      const out = await res.json();
+      _applyServerDataGen(out);
+      if(out && out.success && out.data){
+        DB = out.data;
+        _lastKnownSync = out.lastSynced || Date.now();
+        normalizeBankAccounts(); normalizeInvoiceSettings();
+      } else {
+        toast('⚠️ Could not load your data from the cloud — check your connection and reload.');
+      }
+    }catch(e){
+      toast('⚠️ Could not reach the server — check your connection and reload.');
+    }
+  }
   bootApp();
   if(SESSION){
     const d = trialDaysLeft();
@@ -3576,7 +3604,6 @@ async function pullRemoteUpdates(){
       _lastKnownSync = out.lastSynced;
       normalizeBankAccounts();
       normalizeInvoiceSettings();
-      localStorage.setItem('bnos_db', JSON.stringify(DB));
       renderDashboard(); renderNotifs();
       if(window._curPage==='inventory') renderInventory();
       if(window._curPage==='money') moneyTab(window._moneyTab||'customers');
