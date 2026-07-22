@@ -2656,25 +2656,19 @@ body.mode-accountant .owner-hint{display:none;}
   </div>
 
   <!-- Reconcile tab — OWNER / SUPER_ADMIN only (see openSheet('settingsSheet') gating).
-       Checks whether PURCHASES/SALES/CUSTOMERS/SUPPLIERS/ITEMS sheet tabs hold rows that
-       never made it into the synced DB_JSON blob (the CL00022 class of bug), and lets an
-       owner/admin trigger the server-side healer without needing a developer to run the
-       Apps Script function by hand. -->
+       v30: the backend now reads/writes the Google Sheet tabs directly (no JSON blob),
+       so there is no more "blob vs sheet" gap to detect or heal — this panel is now just
+       a manual pull of the current cloud data, for when you want to be sure this device
+       matches what's in the sheet right now (e.g. after editing a row directly in Sheets). -->
   <div class="stg-panel" id="stg-reconcile" style="display:none;">
-    <div style="font-size:12px;font-weight:800;color:var(--text);margin-bottom:4px;">🧮 Reconcile Check</div>
+    <div style="font-size:12px;font-weight:800;color:var(--text);margin-bottom:4px;">☁️ Cloud Data</div>
     <div style="font-size:11px;color:var(--sub);margin-bottom:10px;line-height:1.6;">
-      Compares what's saved in your synced data against the raw PURCHASES / SALES / CUSTOMERS /
-      SUPPLIERS / ITEMS sheet tabs, and reports any rows that exist in the sheet but are missing
-      from your app's data (a sync gap — not a substitute for checking against your paper invoices).
-      Owner / Super Admin only.
+      Your data is read directly from the Google Sheet on every save — there's nothing to
+      reconcile. Use this if you edited a row directly in the Sheet and want this device to
+      pick it up immediately, instead of waiting for the next automatic sync.
     </div>
-    <button class="btn btn-outline" id="reconcileCheckBtn" style="width:100%;" onclick="runReconcileCheck()">🔍 Run Reconcile Check</button>
+    <button class="btn btn-outline" id="refreshCloudBtn" style="width:100%;" onclick="refreshFromCloud()">🔄 Refresh From Cloud</button>
     <div id="reconcileResult" style="display:none;margin-top:12px;font-size:12px;background:var(--body-bg);border-radius:10px;padding:10px 12px;line-height:1.8;"></div>
-    <button class="btn btn-primary" id="reconcileFixBtn" style="width:100%;margin-top:10px;display:none;" onclick="runReconcileAndSave()">🛠️ Apply Fix (Reconcile &amp; Save)</button>
-    <button class="btn btn-secondary" id="forceSaveBtn" style="width:100%;margin-top:10px;display:none;" onclick="showForceSaveWarning()">
-      ⚡ Force Save (Override Protection)
-    </button>
-    <div style="font-size:10.5px;color:var(--sub);margin-top:8px;">"Apply Fix" only ADDS rows/records that are missing — it never edits or deletes anything already in your data, so it's safe to run more than once.</div>
   </div>
 
   <button class="btn btn-primary" style="margin-top:14px;" onclick="saveBizSettings()">💾 Save All Settings</button>
@@ -3137,116 +3131,16 @@ function updateSyncIndicator(state){
     el.style.display='inline';
   } 
   else if(state==='failed'){
-    // FIX: check the machine code, not a substring match on the display
-    // text — string-matching broke the moment the message text changed,
-    // and silently fell through to showing the raw code to the user.
-    const isShrinkConflict = _lastSyncErrorCode === 'SUSPICIOUS_SHRINK';
     const reason = _lastSyncError ? ` — ${_lastSyncError}` : '';
-    
-    if(isShrinkConflict){
-      el.innerHTML = `<span style="cursor:pointer;">⚠️ Sync conflict — device has fewer records than cloud. Tap to resolve</span>`;
-      el.style.color='#c00'; 
-      el.style.display='inline'; 
-      el.style.cursor='pointer';
-      el.title = 'Tap to open Settings → Reconcile to resolve this conflict';
-      el.onclick = ()=>{ openSyncConflictResolver(); };
-    } else {
-      el.textContent = _syncRetryCount>2
-        ? `⚠️ Not synced (${_syncRetryCount} tries)${reason} — tap to retry`
-        : `⚠️ Not synced yet${reason} — retrying…`;
-      el.title = 'Last error: ' + (_lastSyncError || 'unknown');
-      el.style.color='#c00'; 
-      el.style.display='inline'; 
-      el.style.cursor='pointer';
-      el.onclick = ()=>{ clearTimeout(_syncRetryTimer); attemptSync(); };
-    }
+    el.textContent = _syncRetryCount>2
+      ? `⚠️ Not synced (${_syncRetryCount} tries)${reason} — tap to retry`
+      : `⚠️ Not synced yet${reason} — retrying…`;
+    el.title = 'Last error: ' + (_lastSyncError || 'unknown');
+    el.style.color='#c00'; 
+    el.style.display='inline'; 
+    el.style.cursor='pointer';
+    el.onclick = ()=>{ clearTimeout(_syncRetryTimer); attemptSync(); };
   }
-}
-function openSyncConflictResolver(){
-  switchPage('settings');
-  setTimeout(()=>{
-    if(document.getElementById('stgTabReconcile')){
-      document.getElementById('stgTabReconcile').click();
-    }
-    toast('👇 Run the Reconcile Check below to find missing data, then Apply Fix to sync it all.');
-  }, 300);
-}
-
-function showForceSaveWarning(){
-  const msg = `⚠️  FORCE SAVE OVERRIDE
-  
-This will bypass the shrink protection and save your local data to the cloud, even though it has fewer records than what's already saved. 
-
-Use this ONLY if:
-✓ You intentionally deleted old purchases/sales
-✓ You're sure the cloud has stale/duplicate data
-✓ You've already backed up important data
-
-If you're unsure, tap "Cancel" and use "Apply Fix (Reconcile & Save)" instead — it's safer and adds missing data without removing anything.
-
-Continue?`;
-  if(confirm(msg)){
-    attemptForceSave();
-  }
-}
-
-function attemptForceSave(){
-  if(!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL)){
-    toast('Force Save needs a connected account.');
-    return;
-  }
-  
-  const btn = document.getElementById('forceSaveBtn');
-  const resultEl = document.getElementById('reconcileResult');
-  
-  if(btn){ btn.disabled = true; btn.textContent = '⚡ Forcing save…'; }
-  if(resultEl){ resultEl.style.display = 'block'; resultEl.innerHTML = '⏳ Sending override…'; }
-  
-  _syncInFlight = true;
-  updateSyncIndicator('saving');
-  
-  fetch(GAS_URL,{
-    method:'POST',
-    headers:{'Content-Type':'text/plain'},
-    body:JSON.stringify(Object.assign({action:'SUITE_SAVE_DB', forceSave:true}, {
-      clientId:SESSION.clientId, 
-      sheetId:SESSION.sheetId, 
-      data:DB
-    }))
-  })
-    .then(r=>{
-      if(!r.ok) throw new Error('Server returned '+r.status);
-      return r.json();
-    })
-    .then(out=>{
-      _syncInFlight = false;
-      if(out && out.success){
-        if(out.lastSynced) _lastKnownSync = out.lastSynced;
-        if(out.dataGen !== undefined){ _lastKnownDataGen = Number(out.dataGen)||0; try{ localStorage.setItem('bnos_data_gen', String(_lastKnownDataGen)); }catch(e){} }
-        _pendingSyncPayload = null;
-        _syncRetryCount = 0;
-        _lastSyncError = ''; _lastSyncErrorCode = '';
-        localStorage.removeItem('bnos_pending_sync');
-        updateSyncIndicator('synced');
-        if(resultEl){
-          resultEl.innerHTML = '✅ Force save completed. Your data has been saved to the cloud (shrink protection bypassed). Reloading…';
-        }
-        setTimeout(()=>{ location.reload(); }, 1500);
-      } else {
-        throw new Error(out && (out.error || out.message) ? out.error || out.message : 'Force save failed');
-      }
-    })
-    .catch(err=>{
-      _syncInFlight = false;
-      _lastSyncError = err && err.message ? err.message : 'Network error';
-      updateSyncIndicator('failed');
-      if(resultEl){
-        resultEl.innerHTML = '❌ Force save failed: '+(err.message||err);
-      }
-    })
-    .finally(()=>{
-      if(btn){ btn.disabled = false; btn.textContent = '⚡ Force Save (Override Protection)'; }
-    });
 }
 
 function attemptSync(){
