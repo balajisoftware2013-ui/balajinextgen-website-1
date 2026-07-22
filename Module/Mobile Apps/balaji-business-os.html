@@ -3555,6 +3555,18 @@ function isUserTyping(){
 async function pullRemoteUpdates(){
   if(!SESSION || SESSION.isDemo || !SESSION.sheetId || !GAS_URL) return;
   if(isUserTyping()) return; // don't yank data from under an active form entry
+  // v2026-07-22 FIX: this used to overwrite DB with whatever the server
+  // returned any time its lastSynced looked newer than ours — with no
+  // check for unsaved local changes. If a save is ever rejected/fails
+  // (see attemptSync()'s "[sync] server rejected save"), _pendingSyncPayload
+  // stays set and _lastKnownSync never advances, so EVERY 5s poll after
+  // that would (a) silently overwrite fresh local entries — purchases,
+  // payments, stock — with the server's older copy, and (b) re-fire the
+  // "synced from another device" toast forever, since the same stale
+  // comparison stays true on every tick. Skip the pull entirely while a
+  // local save is still pending — let it resolve (or the sync-failed
+  // banner get addressed) before accepting anything from the server.
+  if(_pendingSyncPayload) return;
   try{
     const res = await fetch(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({action:'SUITE_LOAD_DB', sheetId:SESSION.sheetId})});
     const out = await res.json();
@@ -5080,7 +5092,14 @@ function saveBill(print, sendWa){
     return {id:c.id, name:c.name||it.name||'Item', hsn:it.hsn||'—', unit:it.unit||'Pcs', qty:c.qty, rate:c.sRate, amt:c.sRate*c.qty, gst: gstType==='gst' ? (c.gst!=null ? c.gst : (it.gst||0)) : 0, imei: (c.imei||'').trim()};
   });
   DB.sales.unshift({id, cust:billCustomer.id, date:today, total, mode, gstType, courierCharge: courier, labourCharge: labour, lineItems: billedItems.map(it=>({id:it.id, name:it.name, hsn:it.hsn, qty:it.qty, rate:it.rate, gst:it.gst, imei:it.imei}))});
-  cart.forEach(c=>{ const it = DB.items.find(x=>x.id===c.id); if(it){ it.stock = Math.max(0, it.stock-c.qty); syncItemRow(it); } });
+  // v2026-07-22 FIX: this used to clamp with Math.max(0, ...), silently
+  // discarding any oversell deficit instead of recording it. That broke
+  // the stock <-> purchase/sale reconciliation forever (Inventory
+  // Movement's "Opening" column is reverse-computed as closing - purchases
+  // + sales, so an erased deficit shows up as a bogus negative Opening).
+  // Let stock go negative — the app already has a Negative Stock Report
+  // built for exactly this, so it should be allowed to happen and be seen.
+  cart.forEach(c=>{ const it = DB.items.find(x=>x.id===c.id); if(it){ it.stock = it.stock-c.qty; syncItemRow(it); } });
   if(mode==='Credit'){ billCustomer.due += total; } else if(mode==='Cash'){ DB.cash += total; } else { bankAdjust(total); }
   persistDB();
   logRowToSheet('LOG_SALE', {id, cust:billCustomer.id, date:today, total, mode, lineItems: billedItems.map(it=>({id:it.id, name:it.name, unit:it.unit, qty:it.qty, rate:it.rate, gst:it.gst||0}))});
@@ -6569,9 +6588,24 @@ async function buildDocPDF(){
     // Statement / Ledger — same combined debit-credit-running-balance trail
     // shown on screen and in the CSV export, so all three always match.
     let txns = getPartyLedgerTxns(party, _docCtx.partyType);
-    if(type==='ledger' && _docPeriodDays>0){
-      const cutoff = new Date(); cutoff.setDate(cutoff.getDate()-_docPeriodDays);
-      txns = txns.filter(t=> new Date(t.date) >= cutoff);
+    // v2026-07-22 FIX: this used to ONLY apply the legacy _docPeriodDays
+    // cutoff (stuck at its 30-day default), completely ignoring the newer
+    // _docPeriod/_getDocDateRange() selection (Quarter/Year/Custom/etc).
+    // That meant the on-screen ledger (renderDocBody, which the real Print
+    // reproduces) correctly showed the period the user picked, while the
+    // PDF built here for the Save-PDF and WhatsApp-share buttons silently
+    // fell back to "last 30 days" and dropped everything older — so
+    // WhatsApp/PDF looked like it was missing most (or all) of the ledger
+    // even though Print looked fine. Mirror renderDocBody()'s resolution
+    // order exactly so Show / Print / PDF / WhatsApp always match.
+    if(type==='ledger'){
+      if(_docPeriod && _docPeriod !== 'month'){
+        const range = _getDocDateRange();
+        if(range) txns = txns.filter(t=> t.date>=range.from && t.date<=range.to);
+      } else if(_docPeriodDays>0){
+        const cutoff = new Date(); cutoff.setDate(cutoff.getDate()-_docPeriodDays);
+        txns = txns.filter(t=> new Date(t.date) >= cutoff);
+      }
     }
     if(txns.length){
       const labelMaxW = 390 - colItem; // stop before the DEBIT column starts
@@ -8867,7 +8901,8 @@ function _applySaleEffect(s, cust){
   if(s.mode==='Credit'){ cust.due = (cust.due||0)+s.total; }
   else if(s.mode==='Cash'){ DB.cash = (DB.cash||0)+s.total; }
   else { bankAdjust(s.total); }
-  (s.lineItems||[]).forEach(li=>{ const it=DB.items.find(i=>i.id===li.id); if(it){ it.stock=Math.max(0,(it.stock||0)-li.qty); syncItemRow(it); } });
+  // v2026-07-22 FIX: same Math.max(0,...) clamp bug as saveBill() — see note there.
+  (s.lineItems||[]).forEach(li=>{ const it=DB.items.find(i=>i.id===li.id); if(it){ it.stock=(it.stock||0)-li.qty; syncItemRow(it); } });
 }
 function editSaleEntry(id){
   const s = DB.sales.find(x=>x.id===id);
@@ -9109,7 +9144,8 @@ function _reversePurchaseEffect(p, supp){
   if(p.mode==='Credit'){ supp.due = Math.max(0, (supp.due||0)-p.total); }
   else if(p.mode==='Cash'){ DB.cash += p.total; }
   else { bankAdjust(p.total); }
-  (p.lineItems||[]).forEach(li=>{ const it=DB.items.find(i=>i.id===li.id); if(it) it.stock = Math.max(0, (it.stock||0)-li.qty); });
+  // v2026-07-22 FIX: same Math.max(0,...) clamp bug as saveBill() — see note there.
+  (p.lineItems||[]).forEach(li=>{ const it=DB.items.find(i=>i.id===li.id); if(it) it.stock = (it.stock||0)-li.qty; });
 }
 function _applyPurchaseEffect(p, supp){
   if(p.mode==='Credit'){ supp.due = (supp.due||0)+p.total; }
@@ -10526,7 +10562,8 @@ function recordReturn(){
     DB.debitNotes.unshift({id:dnId, supp:partyId, billRef:billRef||null, amount:amt, reason, date:today, lineItems});
     syncDebitNoteRow(DB.debitNotes[0]);
     s.due = Math.max(0, s.due - amt);
-    retCart.forEach(item=>{ const it=DB.items.find(i=>i.id===item.id); if(it) it.stock=Math.max(0,(it.stock||0)-item.qty); });
+    // v2026-07-22 FIX: same Math.max(0,...) clamp bug as saveBill() — see note there.
+    retCart.forEach(item=>{ const it=DB.items.find(i=>i.id===item.id); if(it) it.stock=(it.stock||0)-item.qty; });
     persistDB();
     toast(`Debit Note ${dnId} recorded — ${fmt(amt)}`);
   }
