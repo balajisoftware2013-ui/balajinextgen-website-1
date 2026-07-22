@@ -5129,7 +5129,7 @@ function saveBill(print, sendWa){
   cart.forEach(c=>{ const it = DB.items.find(x=>x.id===c.id); if(it){ it.stock = it.stock-c.qty; syncItemRow(it); } });
   if(mode==='Credit'){ billCustomer.due += total; } else if(mode==='Cash'){ DB.cash += total; } else { bankAdjust(total); }
   persistDB();
-  logRowToSheet('LOG_SALE', {id, cust:billCustomer.id, date:today, total, mode, lineItems: billedItems.map(it=>({id:it.id, name:it.name, unit:it.unit, qty:it.qty, rate:it.rate, gst:it.gst||0}))});
+  logRowToSheet('LOG_SALE', {id, cust:billCustomer.id, date:today, total, mode, courierCharge: courier, labourCharge: labour, lineItems: billedItems.map(it=>({id:it.id, name:it.name, unit:it.unit, qty:it.qty, rate:it.rate, gst:it.gst||0}))});
   syncCustomerRow(billCustomer);
   if(sendWa){
     openInvoiceDoc(id, billCustomer, total, mode, billedItems, gstType, courier, labour);
@@ -10874,24 +10874,23 @@ function downloadTxnTemplate(kind){
   if(!window.XLSX){ toast('Excel support is still loading — wait a moment and try again'); return; }
   const isSales = kind==='sales';
   const partyLabel = isSales ? 'Party Name (Customer)' : 'Party Name (Supplier)';
-  const headers = ['Date','','Item Name','Qty','Rate','GST%','Mode','Invoice No.'];
-  headers[1] = partyLabel;
+  const headers = ['Date','Invoice No.', partyLabel, 'Item Name','Qty','Rate','GST%','Mode','Courier Charges'];
   const exampleParty = isSales ? 'Walk-in / Customer Name' : 'BEVCO Distributors';
   const rows = [
     ['HOW TO USE — delete this note and the 2 yellow example rows below before uploading'],
-    ['Required: Item Name, Qty, Rate. Optional: Date, Party Name, GST%, Mode (defaults Cash), Invoice No.'],
+    ['Required: Item Name, Qty, Rate. Optional: Date, Invoice No., Party Name, GST%, Mode (defaults Cash), Courier Charges.'],
     ['Repeat the same Date + Party Name + Invoice No. on multiple rows to group them into ONE multi-item voucher.'],
     [],
     headers,
-    ['2026-07-15', exampleParty, isSales?'Item A':'Old Monk Rum 750ml', 12, 850, 18, 'Cash', 'INV-2026-0451'],
-    ['2026-07-15', exampleParty, isSales?'Item B':'Kingfisher Beer 650ml', 24, 130, 18, 'Cash', 'INV-2026-0451'],
+    ['2026-07-15', 'INV-2026-0451', exampleParty, isSales?'Item A':'Old Monk Rum 750ml', 12, 850, 18, 'Cash', 0],
+    ['2026-07-15', 'INV-2026-0451', exampleParty, isSales?'Item B':'Kingfisher Beer 650ml', 24, 130, 18, 'Cash', 0],
   ];
   const ws = XLSX.utils.aoa_to_sheet(rows);
-  ws['!cols'] = [{wch:12},{wch:26},{wch:26},{wch:8},{wch:10},{wch:8},{wch:10},{wch:20}];
+  ws['!cols'] = [{wch:12},{wch:16},{wch:26},{wch:26},{wch:8},{wch:10},{wch:8},{wch:10},{wch:14}];
   ws['!merges'] = [
-    {s:{r:0,c:0}, e:{r:0,c:7}},
-    {s:{r:1,c:0}, e:{r:1,c:7}},
-    {s:{r:2,c:0}, e:{r:2,c:7}},
+    {s:{r:0,c:0}, e:{r:0,c:8}},
+    {s:{r:1,c:0}, e:{r:1,c:8}},
+    {s:{r:2,c:0}, e:{r:2,c:8}},
   ];
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, isSales ? 'Sales Import' : 'Purchase Import');
@@ -10934,6 +10933,7 @@ function _processTxnImportTable(rows, kind){
   const gstCol = _tiColIndex(hdr, ['gst','tax']);
   const modeCol = _tiColIndex(hdr, ['mode','payment']);
   const invCol = _tiColIndex(hdr, ['invoice','inv no','inv. no','bill no']);
+  const courierCol = _tiColIndex(hdr, ['courier','courier charge','courier charges']);
   if(itemCol<0 || qtyCol<0 || rateCol<0){ toast('Could not find Item/Qty/Rate columns in this file'); return; }
   const cleanNum = v => { const n = Number(String(v||'').replace(/[^0-9.\-]/g,'')); return isNaN(n)?0:n; };
   const dataRows = rows.slice(hdrIdx+1);
@@ -10951,8 +10951,12 @@ function _processTxnImportTable(rows, kind){
     const mode = modeCol>=0 ? (String(r[modeCol]||'').trim()||'Cash') : 'Cash';
     const gst = gstCol>=0 ? cleanNum(r[gstCol]) : 0;
     const invNo = invCol>=0 ? String(r[invCol]||'').trim() : '';
+    // Courier is a bill-level charge, usually only present on one row of a
+    // multi-line voucher in the source file — take whichever row has it.
+    const courier = courierCol>=0 ? cleanNum(r[courierCol]) : 0;
     const key = date+'|'+party+'|'+mode+'|'+invNo;
-    if(!voucherMap[key]){ voucherMap[key] = {date, party, mode, invNo, items:[]}; voucherOrder.push(key); }
+    if(!voucherMap[key]){ voucherMap[key] = {date, party, mode, invNo, courier:0, items:[]}; voucherOrder.push(key); }
+    if(courier) voucherMap[key].courier = courier;
     voucherMap[key].items.push({name:itemName, qty, rate, gst});
   });
   _txiVouchers = voucherOrder.map(k=>voucherMap[k]);
@@ -10997,18 +11001,19 @@ async function confirmTxnImport(){
       if(!it){ it = {id:_genItemId(), name:li.name, unit:'Pcs', category:'', hsn:'', pRate:li.rate||0, sRate:li.rate||0, gst:li.gst||18, stock:0, min:5, expiryDate:''}; DB.items.push(it); }
       return {id:it.id, name:it.name, unit:it.unit||'Pcs', hsn:it.hsn||'—', qty:li.qty, rate:li.rate, gst:li.gst||it.gst||0};
     });
+    const courier = v.courier || 0;
     if(isSales){
       const id = genDocId('INV', 1042, DB.sales.length+count);
-      const total = Math.round(lineItems.reduce((a,li)=>a+li.qty*li.rate,0)*100)/100;
-      DB.sales.unshift({id, cust:partyId, date:v.date, total, mode:v.mode, gstType:'gst', lineItems});
-      toSync.push({id, cust:partyId, date:v.date, total, mode:v.mode, lineItems});
+      const total = Math.round((lineItems.reduce((a,li)=>a+li.qty*li.rate,0)+courier)*100)/100;
+      DB.sales.unshift({id, cust:partyId, date:v.date, total, mode:v.mode, gstType:'gst', invNo:v.invNo||null, courierCharge:courier, lineItems});
+      toSync.push({id, cust:partyId, date:v.date, total, mode:v.mode, invNo:v.invNo||null, courierCharge:courier, lineItems});
     } else {
       const id = genDocId('PB', 220, DB.purchases.length+count);
       const taxable = lineItems.reduce((a,li)=>a+li.qty*li.rate,0);
       const gstTotal = lineItems.reduce((a,li)=>a+(li.qty*li.rate*(li.gst||0)/100),0);
-      const total = Math.round((taxable+gstTotal)*100)/100;
-      DB.purchases.unshift({id, supp:partyId, date:v.date, total, taxable, gstTotal, mode:v.mode, item:lineItems.map(li=>`${li.name} x${li.qty}`).join(', '), invNo:v.invNo||null, invoiceFile:null, invoiceFileUrl:null, lineItems});
-      toSync.push({id, supp:partyId, date:v.date, total, taxable, gstTotal, mode:v.mode, invNo:v.invNo||null, lineItems});
+      const total = Math.round((taxable+gstTotal+courier)*100)/100;
+      DB.purchases.unshift({id, supp:partyId, date:v.date, total, taxable, gstTotal, mode:v.mode, item:lineItems.map(li=>`${li.name} x${li.qty}`).join(', '), invNo:v.invNo||null, courierCharge:courier, invoiceFile:null, invoiceFileUrl:null, lineItems});
+      toSync.push({id, supp:partyId, date:v.date, total, taxable, gstTotal, mode:v.mode, invNo:v.invNo||null, courierCharge:courier, lineItems});
     }
     count++;
   });
