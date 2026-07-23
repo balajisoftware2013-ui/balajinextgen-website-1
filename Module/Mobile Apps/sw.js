@@ -1,48 +1,98 @@
-// Balaji WealthPilot 360 — Service Worker
-// Upload this file to the SAME Netlify folder as Balaji_WealthPilot360.html
-// (e.g. /Module/Mobile Apps/Balaji_WealthPilot360/sw.js) so it's registered same-origin.
-const CACHE = 'wp360-v2';
+/* ════════════════════════════════════════════════════════════════
+   WealthPilot360 — Service Worker
+   Upload this file in the SAME folder as your main HTML file on
+   your server (e.g. Netlify). It must be served from the site's
+   root/app folder, same-origin — that's a browser requirement for
+   service workers, not something that can be fixed from the HTML.
 
-// v2 FIX: script.google.com is the live financial-data sync API (GAS_URL in
-// the app). The old fetch handler cached EVERY successful GET, including
-// those sync calls — so if a request failed offline, it would silently
-// serve an old cached balance/transaction snapshot with no indication it
-// was stale. That's the one place "offline" should mean "fail visibly",
-// not "show possibly-wrong numbers" — the app's own sync-status UI already
-// handles offline/pending state correctly, so we just let those requests
-// pass straight through, uncached, instead of intercepting them.
-const NEVER_CACHE_HOSTS = ['script.google.com', 'script.googleusercontent.com'];
+   What this gives you:
+   - Makes the app "installable" (Chrome/Edge require a registered
+     service worker before showing the install icon in the address
+     bar or firing the beforeinstallprompt banner).
+   - Caches the app shell so the app still opens (and shows the
+     last-loaded data) when there's no internet connection.
+   - Bumping CACHE_VERSION below forces every installed copy to
+     fetch the new files on next load, then auto-reload once
+     (handled by the controllerchange listener already in the HTML).
+   ════════════════════════════════════════════════════════════════ */
 
-self.addEventListener('install', e => {
+const CACHE_VERSION = 'wp360-v1';
+const CACHE_NAME = `wealthpilot360-${CACHE_VERSION}`;
+
+// Files that make up the app shell. Adjust the HTML filename below
+// if yours is named differently than the one you uploaded.
+const APP_SHELL = [
+  './',
+  './Balaji_WealthPilot360.html',
+];
+
+/* ── INSTALL: pre-cache the app shell ── */
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then((cache) => cache.addAll(APP_SHELL))
+      .catch((err) => console.warn('[SW] Pre-cache failed (non-fatal):', err))
+  );
+  // Activate this new service worker as soon as it finishes installing,
+  // instead of waiting for all tabs to close.
   self.skipWaiting();
-  // Precache the app shell itself so a first offline open after at least
-  // one successful online visit still has something to show.
-  e.waitUntil(
-    caches.open(CACHE).then(c => c.addAll([self.registration.scope])).catch(() => {})
-  );
 });
 
-self.addEventListener('activate', e => {
-  e.waitUntil(
-    caches.keys().then(keys =>
-      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
-    ).then(() => self.clients.claim())
+/* ── ACTIVATE: clean up old caches from previous versions ── */
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(
+        keys
+          .filter((key) => key !== CACHE_NAME)
+          .map((key) => caches.delete(key))
+      )
+    )
   );
+  // Take control of any already-open tabs immediately, which is what
+  // triggers the 'controllerchange' event and the one-time auto-reload
+  // in the HTML.
+  self.clients.claim();
 });
 
-self.addEventListener('fetch', e => {
-  if (e.request.method !== 'GET') return;
+/* ── FETCH: network-first for navigation/HTML, cache-first for
+   everything else. This keeps the app itself always up-to-date when
+   online, while still working offline from the last cached version. ── */
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
 
-  const url = new URL(e.request.url);
-  if (NEVER_CACHE_HOSTS.includes(url.hostname)) return; // let it hit the network directly, no cache involved
+  // Only handle GET requests; let everything else (POST syncs to
+  // Google Sheets, etc.) go straight to the network untouched.
+  if (req.method !== 'GET') return;
 
-  e.respondWith(
-    fetch(e.request)
-      .then(res => {
-        const clone = res.clone();
-        caches.open(CACHE).then(c => c.put(e.request, clone));
-        return res;
-      })
-      .catch(() => caches.match(e.request).then(cached => cached || caches.match(self.registration.scope)))
+  const isNavigation = req.mode === 'navigate' ||
+    (req.method === 'GET' && req.headers.get('accept')?.includes('text/html'));
+
+  if (isNavigation) {
+    event.respondWith(
+      fetch(req)
+        .then((res) => {
+          const resClone = res.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(req, resClone));
+          return res;
+        })
+        .catch(() => caches.match(req).then((cached) => cached || caches.match('./')))
+    );
+    return;
+  }
+
+  event.respondWith(
+    caches.match(req).then((cached) => {
+      if (cached) return cached;
+      return fetch(req)
+        .then((res) => {
+          // Don't cache opaque/cross-origin error responses.
+          if (!res || res.status !== 200 || res.type === 'error') return res;
+          const resClone = res.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(req, resClone));
+          return res;
+        })
+        .catch(() => cached);
+    })
   );
 });
