@@ -1926,8 +1926,8 @@ body.mode-accountant .owner-hint{display:none;}
       <button class="btn btn-primary" style="padding:8px 12px;font-size:12px;" onclick="applyCustomDates()">Go</button>
     </div>
 
-    <canvas id="reportChart" height="140"></canvas>
     <div id="reportTableWrap" style="margin-top:10px;"></div>
+    <canvas id="reportChart" height="140" style="margin-top:14px;"></canvas>
     </div>
   </div>
 
@@ -5201,6 +5201,15 @@ function renderDashboard(){
   _setText('pendPay', fmt(pendPay));
   _setText('pendPayN', DB.suppliers.filter(s=>getPartyDocBalance(s,'suppliers')>0).length+' suppliers');
 
+  // v67 fix: dashStockVal/dashStockValN existed in the HTML with a
+  // hardcoded "₹0" / "0 items" placeholder but nothing anywhere in the app
+  // ever updated them — the Dashboard's Stock Value card was permanently
+  // stuck at zero no matter what Inventory actually showed. Same
+  // calculation Inventory's Current Stock total already uses.
+  const dashStockVal = DB.items.reduce((a,i)=>a+((i.pRate||0)*(i.stock||0)),0);
+  _setText('dashStockVal', fmt(dashStockVal));
+  _setText('dashStockValN', DB.items.length+' item'+(DB.items.length===1?'':'s'));
+
   // v52: surface a hint when the selected period (esp. default "Day") shows
   // zero activity but real historical entries exist elsewhere in DB, so an
   // owner doesn't mistake "filtered out" for "missing/not synced".
@@ -8275,6 +8284,27 @@ function _monthKeyLabel(key){
   const [y,m]=key.split('-');
   return names[(+m)-1]+' '+y;
 }
+// v68 NEW: shared bordered-table renderer for the various "By X" breakdown
+// reports (By Customer, By Supplier, By Item, By Category, Month-wise)
+// which previously rendered as plain .cart-row lists — no borders, no
+// column headers, hard to scan. Matches the same table look already used
+// by the Ledger/Trial Balance reports elsewhere in this file.
+// cols: [{label, align}], rows: array of arrays of pre-formatted cell HTML,
+// totalRow (optional): array of pre-formatted cell HTML for a footer row.
+function _renderBreakdownTable(cols, rows, totalRow, emptyMsg, rowClickFn){
+  if(!rows.length) return `<div class="cart-row"><span>${emptyMsg}</span><span></span></div>`;
+  const thead = cols.map(c=>`<th style="text-align:${c.align||'left'};padding:8px;border:1px solid var(--border);">${c.label}</th>`).join('');
+  const body = rows.map((r,idx)=>`<tr${rowClickFn?` style="cursor:pointer;" onclick="${rowClickFn(idx)}"`:''}>${
+    r.map((cell,i)=>`<td style="text-align:${cols[i]&&cols[i].align||'left'};padding:8px;border:1px solid var(--border);font-size:12px;">${cell}</td>`).join('')
+  }</tr>`).join('');
+  const foot = totalRow ? `<tfoot><tr style="font-weight:700;background:var(--body-bg);">${
+    totalRow.map((cell,i)=>`<td style="text-align:${cols[i]&&cols[i].align||'left'};padding:8px;border:1px solid var(--border);">${cell}</td>`).join('')
+  }</tr></tfoot>` : '';
+  return `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;">
+    <thead><tr style="background:var(--body-bg);font-weight:700;">${thead}</tr></thead>
+    <tbody>${body}</tbody>${foot}
+  </table></div>`;
+}
 function renderGroupedRegister(list, granularity, opts){
   if(!list.length) return `<div class="cart-row"><span>${opts.emptyMsg}</span><span></span></div>`;
   const groups={};
@@ -8282,19 +8312,21 @@ function renderGroupedRegister(list, granularity, opts){
   const keys=Object.keys(groups).sort().reverse();
   const grandTotal = list.reduce((a,r)=>a+(opts.amount(r)||0),0);
   const showDec = groupHasDecimal(list.map(opts.amount));
-  const rowsHtml = keys.map(k=>{
+  const rows = keys.map(k=>{
     const items=groups[k];
     const total=items.reduce((a,r)=>a+(opts.amount(r)||0),0);
     const label = granularity==='month' ? _monthKeyLabel(k) : k;
-    return `<div class="cart-row" style="cursor:pointer;" onclick="drillGroupedRegister('${opts.type}','${granularity}','${k}')">
-      <span>${label} <span style="color:var(--sub);font-size:11px;font-weight:400;">(${items.length} ${opts.label})</span></span>
-      <span class="mono" style="font-weight:700;">${fmtSmart(total, showDec)} <span style="color:var(--primary);font-size:10px;">›</span></span>
-    </div>`;
-  }).join('');
-  return `<div class="cart-row"><span>Total ${opts.label} (this FY)</span><span class="mono">${fmtSmart(grandTotal, showDec)}</span></div>
-    <div class="cart-row"><span>Vouchers</span><span class="mono">${list.length}</span></div>
-    ${rowsHtml}
-    <div style="font-size:11px;color:var(--sub);margin-top:6px;">Tap a ${granularity==='month'?'month':'quarter'} to see every voucher in that period.</div>`;
+    return [label, items.length, fmtSmart(total, showDec)+' ›'];
+  });
+  const periodLabel = granularity==='month' ? 'Month' : 'Quarter';
+  const tbl = _renderBreakdownTable(
+    [{label:periodLabel},{label:'Vouchers',align:'right'},{label:'Amount',align:'right'}],
+    rows,
+    ['Total', list.length, fmtSmart(grandTotal, showDec)],
+    opts.emptyMsg,
+    idx=>`drillGroupedRegister('${opts.type}','${granularity}','${keys[idx]}')`
+  );
+  return tbl + `<div style="font-size:11px;color:var(--sub);margin-top:6px;">Tap a ${granularity==='month'?'month':'quarter'} to see every voucher in that period.</div>`;
 }
 function drillGroupedRegister(type, granularity, key){
   let from, to;
@@ -9500,8 +9532,16 @@ function openReport(type, el, forceRefresh){
   // per-day totals in the currently selected period, and is hidden
   // everywhere else rather than showing something misleading.
   const chartEl = document.getElementById('reportChart');
-  if(type==='sales' || type==='purchase'){
-    const rows = type==='sales' ? sales : filterByDateRange(DB.purchases||[], 'date');
+  // v67: this chart used to only appear for the bare 'sales'/'purchase'
+  // Register report — every other report in the same category (Summary,
+  // Month-wise, By Customer/Supplier, By Item, By Category) showed nothing
+  // below the table even though the exact same daily-totals data is
+  // available for all of them. Now shown for the whole Sales/Purchase
+  // category, not just the Register.
+  const SALES_CHART_TYPES = ['sales','salessummary','salesmonthwise','salescustomerwise','salesitemwise','salescategorywise'];
+  const PURCH_CHART_TYPES = ['purchase','purchsummary','purchmonthwise','purchsupplierwise','purchitemwise','purchsuppmonthwise'];
+  if(SALES_CHART_TYPES.includes(type) || PURCH_CHART_TYPES.includes(type)){
+    const rows = SALES_CHART_TYPES.includes(type) ? sales : filterByDateRange(DB.purchases||[], 'date');
     const byDate = {};
     rows.forEach(r=>{ byDate[r.date] = (byDate[r.date]||0) + r.total; });
     const dailyTotals = Object.keys(byDate).sort().map(d=>byDate[d]).slice(-6);
@@ -9809,8 +9849,6 @@ function openReport(type, el, forceRefresh){
      + (Object.keys(byMode).length ? Object.entries(byMode).sort((a,b)=>b[1]-a[1]).map(([m,v])=>`<div class="cart-row"><span>${m}</span><span class="mono">${fmt(v)}</span></div>`).join('') : '<div class="cart-row"><span>No purchases recorded</span><span></span></div>');
   } else if(type==='salesmonthwise'){
     tbl = renderGroupedRegister(DB.sales||[], 'month', {amount:s=>s.total, label:'sales', type:'sales', emptyMsg:'No sales yet'});
-  } else if(type==='purchmonthwise'){
-    tbl = renderGroupedRegister(DB.purchases||[], 'month', {amount:p=>p.total, label:'purchases', type:'purchase', emptyMsg:'No purchases yet'});
   } else if(type==='salescustomerwise'){
     // v54 FIX: same all-time fix — use full DB.sales, not the period-
     // filtered 'sales' var, now that this report's filter bar is hidden.
@@ -9818,39 +9856,47 @@ function openReport(type, el, forceRefresh){
     const byC = {};
     allSalesCW.forEach(s=>{ const name=(DB.customers.find(c=>c.id===s.cust)||{}).name||'Walk-in'; if(!byC[name]) byC[name]={val:0,n:0}; byC[name].val+=s.total; byC[name].n++; });
     const rows = Object.entries(byC).sort((a,b)=>b[1].val-a[1].val);
-    tbl = rows.length ? `<div class="cart-row"><span>Total</span><span class="mono">${fmt(allSalesCW.reduce((a,s)=>a+s.total,0))}</span></div>`
-      + rows.map(([name,d])=>`<div class="cart-row"><span>${name} <span style="color:var(--sub);font-size:11px;">(${d.n} bills)</span></span><span class="mono">${fmt(d.val)}</span></div>`).join('')
-      : '<div class="cart-row"><span>No sales in this period</span><span></span></div>';
+    tbl = _renderBreakdownTable(
+      [{label:'Customer'},{label:'Bills',align:'right'},{label:'Amount',align:'right'}],
+      rows.map(([name,d])=>[name, d.n, fmt(d.val)]),
+      ['Total', allSalesCW.length, fmt(allSalesCW.reduce((a,s)=>a+s.total,0))],
+      'No sales in this period'
+    );
   } else if(type==='purchsupplierwise'){
     // v54 FIX: same all-time fix as Purchase Summary above.
     const periodPurch = DB.purchases||[];
     const byS = {};
     periodPurch.forEach(p=>{ const name=(DB.suppliers.find(s=>s.id===p.supp)||{}).name||'—'; if(!byS[name]) byS[name]={val:0,n:0}; byS[name].val+=p.total; byS[name].n++; });
     const rows = Object.entries(byS).sort((a,b)=>b[1].val-a[1].val);
-    tbl = rows.length ? `<div class="cart-row"><span>Total</span><span class="mono">${fmt(periodPurch.reduce((a,p)=>a+(Number(p.total)||0),0))}</span></div>`
-      + rows.map(([name,d])=>`<div class="cart-row" style="cursor:pointer;" onclick="drillPurchByParty('${name.replace(/'/g,"\\'")}')"><span>${name} <span style="color:var(--sub);font-size:11px;">(${d.n} purchases)</span></span><span class="mono">${fmt(d.val)} ›</span></div>`).join('')
-      : '<div class="cart-row"><span>No purchases recorded</span><span></span></div>';
-  } else if(type==='purchsuppmonthwise'){
-    const bySM = {};
-    (DB.purchases||[]).forEach(p=>{ const m=p.date.slice(0,7); const name=(DB.suppliers.find(s=>s.id===p.supp)||{}).name||'—'; const key=name+'|'+m; if(!bySM[key]) bySM[key]={name,m,val:0,n:0}; bySM[key].val+=(Number(p.total)||0); bySM[key].n++; });
-    const rows = Object.values(bySM).sort((a,b)=> b.m.localeCompare(a.m) || a.name.localeCompare(b.name));
-    const grandTotal = rows.reduce((a,r)=>a+r.val,0);
-    tbl = rows.length ? `<div class="cart-row"><span>Total (all-time)</span><span class="mono">${fmt(grandTotal)}</span></div>`
-      + rows.map(r=>`<div class="cart-row"><span>${r.name} <span style="color:var(--sub);font-size:11px;">· ${_monthKeyLabel(r.m)} (${r.n} purchases)</span></span><span class="mono">${fmt(r.val)}</span></div>`).join('')
-      : '<div class="cart-row"><span>No purchases yet</span><span></span></div>';
+    tbl = _renderBreakdownTable(
+      [{label:'Supplier'},{label:'Purchases',align:'right'},{label:'Amount',align:'right'}],
+      rows.map(([name,d])=>[name, d.n, fmt(d.val)+' ›']),
+      ['Total', periodPurch.length, fmt(periodPurch.reduce((a,p)=>a+(Number(p.total)||0),0))],
+      'No purchases recorded',
+      idx=>`drillPurchByParty('${rows[idx][0].replace(/'/g,"\\'")}')`
+    );
   } else if(type==='custmonthwise'){
     const byCM = {};
     (DB.sales||[]).forEach(s=>{ const m=s.date.slice(0,7); const name=(DB.customers.find(c=>c.id===s.cust)||{}).name||'Walk-in'; const key=name+'|'+m; if(!byCM[key]) byCM[key]={name,m,val:0,n:0}; byCM[key].val+=s.total; byCM[key].n++; });
     const rows = Object.values(byCM).sort((a,b)=> b.m.localeCompare(a.m) || a.name.localeCompare(b.name));
     const grandTotal = rows.reduce((a,r)=>a+r.val,0);
-    tbl = rows.length ? `<div class="cart-row"><span>Total (all-time)</span><span class="mono">${fmt(grandTotal)}</span></div>`
-      + rows.map(r=>`<div class="cart-row"><span>${r.name} <span style="color:var(--sub);font-size:11px;">· ${_monthKeyLabel(r.m)} (${r.n} bills)</span></span><span class="mono">${fmt(r.val)}</span></div>`).join('')
-      : '<div class="cart-row"><span>No sales yet</span><span></span></div>';
+    tbl = _renderBreakdownTable(
+      [{label:'Customer'},{label:'Month'},{label:'Bills',align:'right'},{label:'Amount',align:'right'}],
+      rows.map(r=>[r.name, _monthKeyLabel(r.m), r.n, fmt(r.val)]),
+      ['Total (all-time)', '', rows.reduce((a,r)=>a+r.n,0), fmt(grandTotal)],
+      'No sales yet'
+    );
   } else if(type==='salesitemwise'){
     const itemSales = {};
     sales.forEach(s=>(s.lineItems||[]).forEach(li=>{ const n=resolveItemName(li); if(!itemSales[n]) itemSales[n]={qty:0,val:0}; itemSales[n].qty+=li.qty; itemSales[n].val+=li.qty*li.rate; }));
     const rows = Object.entries(itemSales).sort((a,b)=>b[1].val-a[1].val);
-    tbl = rows.length ? rows.map(([n,d])=>`<div class="cart-row" style="cursor:pointer;" onclick="drillSaleByItem('${n.replace(/'/g,"\\'")}')"><span>${n} <span style="color:var(--sub);font-size:11px;">(${fmtQtyDisplay(d.qty,'')} sold)</span></span><span class="mono">${fmt(d.val)} ›</span></div>`).join('') : '<div class="cart-row"><span>No sales in this period</span><span></span></div>';
+    tbl = _renderBreakdownTable(
+      [{label:'Item'},{label:'Qty Sold',align:'right'},{label:'Amount',align:'right'}],
+      rows.map(([n,d])=>[n, fmtQtyDisplay(d.qty,''), fmt(d.val)+' ›']),
+      ['Total', '', fmt(rows.reduce((a,[,d])=>a+d.val,0))],
+      'No sales in this period',
+      idx=>`drillSaleByItem('${rows[idx][0].replace(/'/g,"\\'")}')`
+    );
   } else if(type==='purchmonthwise'){
     // Tally-style matrix: Items as rows, Months as columns (Quantities)
     tbl = buildPurchaseItemMatrixReport();
@@ -9862,18 +9908,34 @@ function openReport(type, el, forceRefresh){
     const itemPurch = {};
     periodPurch.forEach(p=>(p.lineItems||[]).forEach(li=>{ const n=resolveItemName(li); if(!itemPurch[n]) itemPurch[n]={qty:0,val:0}; itemPurch[n].qty+=li.qty; itemPurch[n].val+=li.qty*li.rate; }));
     const rows = Object.entries(itemPurch).sort((a,b)=>b[1].val-a[1].val);
-    tbl = rows.length ? rows.map(([n,d])=>`<div class="cart-row" style="cursor:pointer;" onclick="drillPurchByItem('${n.replace(/'/g,"\\'")}')"><span>${n} <span style="color:var(--sub);font-size:11px;">(${fmtQtyDisplay(d.qty,'')} purchased)</span></span><span class="mono">${fmt(d.val)} ›</span></div>`).join('') : '<div class="cart-row"><span>No purchases recorded</span><span></span></div>';
+    tbl = _renderBreakdownTable(
+      [{label:'Item'},{label:'Qty Purchased',align:'right'},{label:'Amount',align:'right'}],
+      rows.map(([n,d])=>[n, fmtQtyDisplay(d.qty,''), fmt(d.val)+' ›']),
+      ['Total', '', fmt(rows.reduce((a,[,d])=>a+d.val,0))],
+      'No purchases recorded',
+      idx=>`drillPurchByItem('${rows[idx][0].replace(/'/g,"\\'")}')`
+    );
   } else if(type==='salescategorywise'){
     const catSales = {};
     sales.forEach(s=>(s.lineItems||[]).forEach(li=>{ const it=DB.items.find(x=>x.id===li.id); const cat=(it&&it.category)?it.category:'Uncategorized'; catSales[cat]=(catSales[cat]||0)+li.qty*li.rate; }));
     const rows = Object.entries(catSales).sort((a,b)=>b[1]-a[1]);
-    tbl = rows.length ? rows.map(([c,v])=>`<div class="cart-row"><span>${c}</span><span class="mono">${fmt(v)}</span></div>`).join('') : '<div class="cart-row"><span>No sales in this period</span><span></span></div>';
+    tbl = _renderBreakdownTable(
+      [{label:'Category'},{label:'Amount',align:'right'}],
+      rows.map(([c,v])=>[c, fmt(v)]),
+      ['Total', fmt(rows.reduce((a,[,v])=>a+v,0))],
+      'No sales in this period'
+    );
   } else if(type==='purchcategorywise'){
     const periodPurch = filterByDateRange(DB.purchases||[], 'date');  // v2026-07-19 FIX: was ignoring the selected date range
     const catPurch = {};
     periodPurch.forEach(p=>(p.lineItems||[]).forEach(li=>{ const it=DB.items.find(x=>x.id===li.id); const cat=(it&&it.category)?it.category:'Uncategorized'; catPurch[cat]=(catPurch[cat]||0)+li.qty*li.rate; }));
     const rows = Object.entries(catPurch).sort((a,b)=>b[1]-a[1]);
-    tbl = rows.length ? rows.map(([c,v])=>`<div class="cart-row"><span>${c}</span><span class="mono">${fmt(v)}</span></div>`).join('') : '<div class="cart-row"><span>No purchases recorded</span><span></span></div>';
+    tbl = _renderBreakdownTable(
+      [{label:'Category'},{label:'Amount',align:'right'}],
+      rows.map(([c,v])=>[c, fmt(v)]),
+      ['Total', fmt(rows.reduce((a,[,v])=>a+v,0))],
+      'No purchases recorded'
+    );
   } else if(type==='salesmanwise'){
     const hasField = (DB.sales||[]).some(s=>s.salesman);
     if(!hasField){
