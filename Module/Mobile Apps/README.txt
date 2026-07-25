@@ -1,216 +1,84 @@
-═══════════════════════════════════════════════════════════════════════════════
-BALAJI NEXTGEN BUSINESS OS v17 — QUICK START GUIDE
-═══════════════════════════════════════════════════════════════════════════════
+╔══════════════════════════════════════════════════════════════════════════╗
+║         BALAJI NEXTGEN - COMPLETE APPS PACKAGE                          ║
+║              Business OS v67.2 + WealthPilot360                         ║
+╚══════════════════════════════════════════════════════════════════════════╝
 
-WHAT'S IN THIS PACKAGE?
-─────────────────────────────────────────────────────────────────────────────
-1. Code.gs (v17)                    → Improved Google Apps Script backend
-2. balaji-business-os-v17-improved.html → HTML frontend (reference version)
-3. FIXES_SUMMARY.txt                → Complete list of all v17 fixes
-4. HTML_PATCH_GUIDE.md              → Code snippets for HTML updates
-5. README.txt                       → This file
+🎁 THIS PACKAGE INCLUDES 2 COMPLETE APPS:
 
-KEY IMPROVEMENTS IN v17
-─────────────────────────────────────────────────────────────────────────────
+1️⃣  BALAJI BUSINESS OS v67.2
+    📂 Folder: /BusinessOS/
+    📊 Complete ERP System
+    ✅ Sales, Purchase, Inventory, Ledgers, Reports
+    ⏱️ Setup: 15 minutes
+    📖 See: BusinessOS/SETUP_INSTRUCTIONS.txt
 
-✓ FIX I:  Real-Time Sync to Google Sheets
-           Every purchase/sale/customer/supplier/item now syncs to its sheet
-           tab immediately. If data corrupts, recovery is automatic from sheets.
+2️⃣  BALAJI WEALTHPILOT360
+    📂 Folder: /WealthPilot360/
+    💰 Personal Finance Manager
+    ✅ Income, Expense, Investment, Budget, Reports
+    ⏱️ Setup: 10 minutes
+    📖 See: WealthPilot360/SETUP_INSTRUCTIONS.txt
 
-✓ FIX H:  Purchase/Sale Line Items Persistence
-           Item-level details (qty, rate, GST) now attached to recovered bills.
-           Stock Ledger and Item-wise reports now work correctly.
+🚀 QUICK START:
 
-✓ FIX K:  Purchase & Sales Ledgers (Tally-Style)
-           New endpoints for transaction-by-transaction reporting with item
-           details. Can group by supplier/customer or item.
+Option 1: Deploy Both Apps (30 minutes)
+  1. Read BusinessOS/SETUP_INSTRUCTIONS.txt
+  2. Deploy Business OS (15 min)
+  3. Read WealthPilot360/SETUP_INSTRUCTIONS.txt
+  4. Deploy WealthPilot360 (15 min)
+  5. Go live! 🎉
 
-✓ FIX L:  Stock Ledger
-           Track every purchase/sale movement per item with running balance.
-           Stock Summary shows current stock + min levels.
+Option 2: Deploy One App First
+  1. Choose Business OS OR WealthPilot360
+  2. Follow setup instructions
+  3. Deploy (15 min each)
+  4. Add second app later
 
-✓ FIX M:  Date Range Filtering
-           All reports support TODAY/MONTH/QUARTER/HALF/FY filtering.
-           Dashboard can switch between periods instantly.
+📱 INSTALLATION:
 
-✓ FIX J:  Password Security Hardening
-           All new passwords hashed with per-user salt.
-           Legacy plaintext passwords auto-upgraded on login.
+iPhone:
+  1. Safari → https://YOUR-URL
+  2. Share → Add to Home Screen
+  3. Done! ✅
 
-═══════════════════════════════════════════════════════════════════════════════
-DEPLOYMENT STEPS (5 minutes)
-═══════════════════════════════════════════════════════════════════════════════
+Android:
+  1. Chrome → https://YOUR-URL
+  2. Menu → Add to Home Screen
+  3. Done! ✅
 
-STEP 1: DEPLOY BACKEND (Code.gs)
-───────────────────────────────────
-1. Open your Google Apps Script project for Business OS
-   - Go to script.google.com
-   - Open the current project (BALAJI_NEXTGEN_ERP_V2_CORE)
+📞 SUPPORT:
 
-2. BACKUP current Code.gs:
-   - Select all (Ctrl+A)
-   - Copy to a text file for safekeeping
+For help:
+  📧 Email: balajisoftware2013@gmail.com
+  📞 Phone: 9832014403
+  🌐 Website: www.balajinextgen.in
 
-3. REPLACE Code.gs:
-   - Delete all current content
-   - Paste the new Code.gs v17 from this package
-   - Save (Ctrl+S)
+✨ FEATURES:
 
-4. DEPLOY as NEW VERSION:
-   - Click "Deploy" → "New Deployment"
-   - Type: "Web app"
-   - Execute as: Your account
-   - Who has access: Anyone
-   - Click "Deploy"
-   - Copy the new deployment URL
+Business OS:
+  ✅ Sales & Purchase entry
+  ✅ Inventory management
+  ✅ Customer & Supplier ledgers
+  ✅ Cash & Bank accounting
+  ✅ 11+ Financial reports
+  ✅ Real-time sync
+  ✅ Offline mode
+  ✅ CSV import/export
 
-5. UPDATE FRONTEND:
-   - Open balaji-business-os.html
-   - Find: const API_URL = 'https://script.google.com/macros/s/...'
-   - Replace with new deployment URL from step 4
+WealthPilot360:
+  ✅ Income & Expense tracking
+  ✅ Investment management
+  ✅ Budget planning
+  ✅ Financial reports
+  ✅ Savings goals
+  ✅ Net worth tracking
+  ✅ Real-time sync
+  ✅ Offline mode
 
-TEST BACKEND:
-   - Visit the deployment URL in browser
-   - Should show: "Balaji NextGen Business OS API is live (v17 - ...)"
+🎉 READY TO DEPLOY NOW!
 
-STEP 2: UPDATE FRONTEND (balaji-business-os.html)
-──────────────────────────────────────────────────
-1. Read HTML_PATCH_GUIDE.md carefully
+Each app takes only 15 minutes to setup.
+Total for both: 30 minutes.
 
-2. Add these functions to your HTML:
-   - syncPurchaseRow(), syncSaleRow()
-   - syncCustomerRow(), syncSupplierRow(), syncItemRow()
-   - loadPurchaseLedger(), loadSalesLedger()
-   - loadItemWisePurchase(), loadItemWiseSales()
-   - loadStockLedger(), loadStockSummary()
-   - filterByDateRange()
+Start with the app you need most!
 
-3. Call sync functions:
-   - After recordPurchase() → await syncPurchaseRow(...)
-   - After recordSale() → await syncSaleRow(...)
-   - After addCustomer() → await syncCustomerRow(...)
-   - After addSupplier() → await syncSupplierRow(...)
-   - After addItem() → await syncItemRow(...)
-
-4. Add new pages:
-   - Purchase Ledger (/purchase-ledger)
-   - Sales Ledger (/sales-ledger)
-   - Item-wise Purchase (/item-purchase)
-   - Item-wise Sales (/item-sales)
-   - Stock Ledger (/stock-ledger)
-   - Stock Summary (/stock-summary)
-
-5. Add date range selector to Dashboard
-
-6. Test in browser (mobile & desktop):
-   - Create test purchase → verify PURCHASES sheet updated
-   - Create test sale → verify SALES sheet updated
-   - Open Purchase Ledger → verify bills + items display
-   - Switch date range on dashboard → verify stats update
-
-STEP 3: VERIFY EXISTING CLIENTS
-──────────────────────────────────
-For each client using Business OS:
-
-1. LOGIN TO CLIENT:
-   - Use admin account
-   - Verify successful login with v17 backend
-
-2. CHECK DATA INTEGRITY:
-   - Open DevTools > Console
-   - Run: console.log(CURRENT_DB_DATA.purchases.length)
-   - Note the count
-
-3. VERIFY SHEET SYNC:
-   - Open client's Google Sheet
-   - Check PURCHASES, SALES, CUSTOMERS, SUPPLIERS, ITEMS tabs exist
-   - Check they have data (at least row count matches DB)
-
-4. TEST NEW REPORTS:
-   - Try Purchase Ledger → should load without error
-   - Try Stock Ledger → should show item movements
-   - Try date filters → should refresh
-
-5. PASSWORD CLEANUP (if needed):
-   - In Google Apps Script Apps Script Editor Console
-   - Run: hashAllPlaintextUserPasswords()
-   - Should return: "Hashed 0 plaintext password(s)" if clean
-
-═══════════════════════════════════════════════════════════════════════════════
-WHAT HAPPENS ON FIRST LOGIN AFTER v17 DEPLOY?
-─────────────────────────────────────────────────────────────────────────────
-• loadDB() → reconcileDB() runs automatically
-• reconcileDB() checks NEW markers in APP_DATA!F1/G1/H1
-• If blank (first time), full backfill of customers/suppliers/items from sheets
-• Takes ~1-2 seconds for typical client (1000s of transactions)
-• All subsequent logins are fast
-• One-time, automatic, silent — no user action needed
-
-═══════════════════════════════════════════════════════════════════════════════
-TROUBLESHOOTING
-─────────────────────────────────────────────────────────────────────────────
-
-ISSUE: "Deployment URL not found" or 404
-→ Make sure you've deployed Code.gs and copied the NEW deployment URL
-→ Old v16 URL won't work with new endpoints
-
-ISSUE: "syncPurchaseRow is not defined"
-→ Make sure sync functions are added to your HTML (Section 1 of patch guide)
-
-ISSUE: "PURCHASES sheet not found"
-→ Sheet tabs might not exist yet — run fixCL00022Now() manually
-→ Or wait for auto-creation on next client login
-
-ISSUE: Stock numbers are wrong
-→ This is normal if client has old purchases without lineItems
-→ Stock is calculated from current item.stock, not recovered from old bills
-→ Run physical stock count and update via Inventory page
-
-ISSUE: Offline mode not working
-→ Sync calls are async and non-blocking
-→ App still saves locally if sync fails
-→ On reconnect, sync happens on next save
-
-═══════════════════════════════════════════════════════════════════════════════
-PERFORMANCE & LIMITS
-─────────────────────────────────────────────────────────────────────────────
-• Sync calls: ~500ms per transaction (network dependent)
-• Report generation: ~1-2s for typical client (500-1000 transactions)
-• Google Sheets API: 300 requests/min (should never hit limit in practice)
-• DB_JSON blob: 10MB limit (typical client ~2-3MB)
-
-═══════════════════════════════════════════════════════════════════════════════
-NEXT STEPS AFTER DEPLOYMENT
-─────────────────────────────────────────────────────────────────────────────
-1. ✓ Deploy Code.gs v17
-2. ✓ Update HTML with sync & report functions
-3. ✓ Test with one client
-4. ✓ Verify all clients work
-5. → Monitor ERROR_LOG sheet for any issues
-6. → Collect user feedback on new reports
-7. → Plan UI improvements based on feedback
-
-═══════════════════════════════════════════════════════════════════════════════
-FILE REFERENCE
-─────────────────────────────────────────────────────────────────────────────
-For detailed information, see:
-
-FIXES_SUMMARY.txt
-  └─ Complete technical details on all 6 fixes (H, I, J, K, L, M)
-  └─ Implementation checklist
-  └─ Testing guide
-  └─ API endpoint reference
-
-HTML_PATCH_GUIDE.md
-  └─ Code snippets for all 6 sync functions
-  └─ Code snippets for all 6 report loaders
-  └─ HTML markup for new pages
-  └─ JavaScript for date range filtering
-
-═══════════════════════════════════════════════════════════════════════════════
-SUPPORT & QUESTIONS
-─────────────────────────────────────────────────────────────────────────────
-Contact: balajisoftware2013@gmail.com
-Mobile: 9832014403
-
-═══════════════════════════════════════════════════════════════════════════════
