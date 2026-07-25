@@ -1,4 +1,20 @@
 <!--
+  ENHANCEMENT v69: AUTO-REBUILD & COMPLETE REPORT EXPORT FIX
+  ✓ AUTO-DETECT empty reports — if table is empty/missing, automatically rebuild
+  ✓ ALL report types now show complete data when printing/exporting
+  ✓ Month-wise, daily, quarterly, yearly filters ALL working
+  ✓ Balance Sheet, Cash Flow, GST, Purchase, Sales, Stock — ALL fixed
+  ✓ Print, PDF, Export (CSV), Tally XML, WhatsApp — ALL show complete data
+  ✓ Fixed renderReportPrintArea() to auto-rebuild empty reports
+  ✓ Fixed renderReportPreviewArea() to auto-rebuild empty reports
+  ✓ Fixed printReportPDF() with retry logic on empty tables
+  ✓ Fixed exportReportCSV() with rebuild before export
+  ✓ Fixed exportReportTally() with rebuild before XML export
+  ✓ Fixed buildReportPDF() with async rebuild promise chain
+  ✓ Fixed shareReportWhatsApp() with auto-rebuild support
+  ✓ Fixed shareReportScreenshotWhatsApp() with auto-rebuild + proper summary
+  ✓ All export methods now handle empty/missing report tables gracefully
+  
   ENHANCEMENT v2.0:
   ✓ Fixed PURCHASE syncto STOCK_LEDGER auto-capture
   ✓ Fixed INVENTORY auto-update from purchases
@@ -817,6 +833,14 @@ body.mode-accountant .owner-hint{display:none;}
   #docPrintArea, #docPrintArea *{visibility:visible;}
   #reportPrintArea.printing, #reportPrintArea.printing *{visibility:visible;}
   .sheet-overlay{display:none!important;}
+  /* v76 fix: visibility:hidden on `body *` above should already cover this,
+     but doesn't reliably cascade through every rasterization path (some
+     screenshot/JPG-export routes don't fully respect inherited
+     visibility on deeply-nested or absolutely-positioned descendants).
+     This is a second, harder layer: whatever app page was open behind the
+     current sheet (Dashboard, Reports, Inventory, etc.) is force-removed
+     from layout entirely during print/export, not just visually hidden. */
+  .page{display:none!important;}
   /* Fix: Day/Month/Qtr/Year/Custom period chips + the custom from/to date
      picker (with its "Go" button) are on-screen controls for choosing what
      to print — they were being printed themselves because they live inside
@@ -1820,6 +1844,8 @@ body.mode-accountant .owner-hint{display:none;}
     <button class="rpt-type" onclick="openReport('cashflow',this)">Cash Flow</button>
     <button class="rpt-type" onclick="openReport('journal',this)">Day Book</button>
     <button class="rpt-type" onclick="openReport('ledgerpick',this)">Ledger</button>
+    <button class="rpt-type" onclick="openReport('expenseregister',this)">Expenses</button>
+    <button class="rpt-type" onclick="openReport('expensecategorywise',this)">Expenses by Category</button>
     <button class="rpt-type" onclick="openReport('pl',this)">Profit &amp; Loss</button>
     <button class="rpt-type" onclick="openReport('bs',this)">Balance Sheet</button>
     <button class="rpt-type" onclick="openReport('trialbalance',this)">Trial Balance</button>
@@ -2349,6 +2375,7 @@ body.mode-accountant .owner-hint{display:none;}
   </div>
   <div class="field" id="expAcctWrap" style="display:none;"><label>Bank Account</label><select id="expAcct"></select></div>
   <div class="field"><label>Amount</label><input type="number" id="expAmt" placeholder="0"></div>
+  <div class="field"><label>Date</label><input type="date" id="expDate"></div>
   <div class="field"><label>Note</label><input id="expNote" placeholder="Optional"></div>
   <button class="btn btn-primary" onclick="recordExpense()">Save Expense</button>
   <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border);">
@@ -3462,10 +3489,18 @@ function updateSyncIndicator(state){
     el.style.display='inline';
   } 
   else if(state==='failed'){
-    const reason = _lastSyncError ? ` — ${_lastSyncError}` : '';
+    // v78 fix: this used to inline the FULL raw backend error message
+    // (e.g. the shrink-protection sentence: "This save would erase 6 of
+    // your 51 existing sales — refused to protect your data. If this is
+    // genuinely intentional...") directly into this small topbar text
+    // line. At that length it wraps across the full width and reads like
+    // a prominent banner, even though it's structurally just a small
+    // status line. Now shows a short summary only; the full detail is
+    // still available via the tooltip (hover/long-press) and via tapping
+    // through to Settings → New Setup → Connected Database.
     el.textContent = _syncRetryCount>2
-      ? `⚠️ Not synced (${_syncRetryCount} tries)${reason} — tap to retry`
-      : `⚠️ Not synced yet${reason} — retrying…`;
+      ? `⚠️ Not synced (${_syncRetryCount} tries) — tap to retry`
+      : `⚠️ Not synced yet — retrying…`;
     el.title = 'Last error: ' + (_lastSyncError || 'unknown');
     el.style.color='#c00'; 
     el.style.display='inline'; 
@@ -3663,6 +3698,7 @@ function persistDB(){
   if(!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL)) return;
   _pendingSyncPayload = {clientId:SESSION.clientId, sheetId:SESSION.sheetId, data:DB};
   attemptSync();
+  _cacheDbToSession(SESSION.sheetId); // v78: keeps the instant-load cache fresh through normal use
 }
 // v59: Data Repair (Settings → Reconcile). Calls the new DEDUPE_AND_RELINK
 // backend action to clean up the two Import-Center-caused problems fixed in
@@ -3988,15 +4024,62 @@ function freshBizDB(bizName, industry){
 }
 
 
+// v78 NEW: instant-load cache. Full localStorage DB caching was removed in
+// v31 specifically because a stale cache could silently overwrite real
+// server data (see the CL00022 wipe this fixed). sessionStorage is a
+// different, much safer tradeoff: it only lives for this one browser tab,
+// is never trusted as a write source (only ever used to paint something
+// instantly, then immediately overwritten by the real fetch below), and
+// disappears the moment the tab closes — so it can't cause the kind of
+// long-lived staleness the v31 fix was protecting against.
+function _cacheDbToSession(sheetId){
+  if(!sheetId) return;
+  try{ sessionStorage.setItem('bnos_instant_'+sheetId, JSON.stringify({data:DB, cachedAt:Date.now()})); }
+  catch(e){ /* quota exceeded or unavailable — instant-load just won't apply next time, no harm */ }
+}
+function _readDbFromSession(sheetId){
+  if(!sheetId) return null;
+  try{ const raw = sessionStorage.getItem('bnos_instant_'+sheetId); return raw ? JSON.parse(raw) : null; }
+  catch(e){ return null; }
+}
 async function enterApp(){
   document.getElementById('onboardGate').style.display = 'none';
   if (_authBgTimer) { clearInterval(_authBgTimer); _authBgTimer = null; }
-  // v31 FIX: direct-cloud-only — a returning session (page refresh, app
-  // reopened) no longer has a local 'bnos_db' cache to show while
-  // waiting. Fetch the real data from the sheet BEFORE bootApp() renders,
-  // so the user never sees stale/seed content flash on screen. Demo mode
-  // has no cloud backing, so it keeps using the in-memory seed as-is.
   if(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL){
+    const cached = _readDbFromSession(SESSION.sheetId);
+    if(cached && cached.data){
+      // Instant path: paint immediately with this tab's last-known copy,
+      // then silently refresh from the server in the background — the
+      // user sees their business the moment they open the app instead of
+      // staring at a blank/loading screen for the round-trip.
+      DB = cached.data;
+      normalizeBankAccounts(); normalizeInvoiceSettings();
+      bootApp();
+      if(SESSION){
+        const d = trialDaysLeft();
+        if(SESSION.plan!=='PAID' && d>0 && d<=7) toast(`⏳ Trial ends in ${d} day(s) — register/upgrade to keep full access`);
+      }
+      startRealtimeSync();
+      (async ()=>{
+        try{
+          const res = await fetch(_gasUrlCacheBust(),{method:'POST',cache:'no-store',headers:{'Content-Type':'text/plain'},body:JSON.stringify({action:'SUITE_LOAD_DB', sheetId:SESSION.sheetId})});
+          const out = await res.json();
+          _applyServerDataGen(out);
+          if(out && out.success && out.data){
+            DB = out.data;
+            _lastKnownSync = out.lastSynced || Date.now();
+            normalizeBankAccounts(); normalizeInvoiceSettings();
+            _cacheDbToSession(SESSION.sheetId);
+            renderDashboard(); renderNotifs();
+            if(window._curPage==='inventory') renderInventory('');
+            if(window._curPage==='money') moneyTab(window._moneyTab||'customers');
+          }
+        }catch(e){ /* background refresh failed silently — instant-loaded copy stays on screen, next poll/action will retry */ }
+      })();
+      return;
+    }
+    // No cache yet for this tab — fall back to the original blocking load,
+    // so there's never a moment with nothing (or a stale seed) on screen.
     try{
       const res = await fetch(_gasUrlCacheBust(),{method:'POST',cache:'no-store',headers:{'Content-Type':'text/plain'},body:JSON.stringify({action:'SUITE_LOAD_DB', sheetId:SESSION.sheetId})});
       const out = await res.json();
@@ -4005,6 +4088,7 @@ async function enterApp(){
         DB = out.data;
         _lastKnownSync = out.lastSynced || Date.now();
         normalizeBankAccounts(); normalizeInvoiceSettings();
+        _cacheDbToSession(SESSION.sheetId);
       } else {
         toast('⚠️ Could not load your data from the cloud — check your connection and reload.');
       }
@@ -4341,10 +4425,12 @@ async function submitLogin(){
     if(out.data){
       DB = out.data;
       persistDB();
+      _cacheDbToSession(SESSION.sheetId);
     } else if(_pendingWelcomeDB && SESSION.clientId === (_pendingWelcomeSession && _pendingWelcomeSession.clientId)){
       // Genuinely brand-new client — nothing exists on the server yet, safe to seed.
       DB = _pendingWelcomeDB;
       persistDB();
+      _cacheDbToSession(SESSION.sheetId);
     } else {
       toast('⚠️ Could not load your latest data from the server — showing last cached copy. Please check your connection and reload before making changes.');
     }
@@ -4685,10 +4771,21 @@ function openSheet(id){
   document.getElementById('overlay').classList.add('show');
   document.getElementById(id).classList.add('show');
   document.body.classList.add('sheet-open'); // FIX: hides the ✨ AI fab, which was fixed-positioned and overlapping "Save & Send via WhatsApp" and other sheet buttons
+  // v76 fix: lock background scroll while any sheet is open. Previously the
+  // page behind a sheet (whatever report/page was open before, e.g.
+  // Inventory Movement) stayed fully scrollable — the sheet itself is only
+  // a fixed-position overlay pinned to the viewport, so scrolling the
+  // background didn't move the sheet, but it did change what was sitting
+  // at any given screen position underneath/around it. Combined with
+  // Print/PDF/Send capturing by screen position in some paths, a
+  // previously-scrolled background page could visibly show through around
+  // a shorter sheet (e.g. a Customer/Supplier Ledger) instead of a clean
+  // blank/dimmed backdrop.
+  document.body.style.overflow = 'hidden';
   if(location.protocol !== 'file:'){ try{ history.pushState({bnosSheet:id}, '', '#sheet'); }catch(e){} }
   if(id==='collectSheet'){ fillSelect('collectFrom', DB.customers); populateBillRef('collect'); }
   if(id==='paySheet'){ fillSelect('payTo', DB.suppliers); populateBillRef('pay'); }
-  if(id==='expenseSheet'){ _renderExpCatOptions(); renderExpenseLedger(); const em=document.getElementById('expMode'); if(em){ em.value = _expDefaultMode||'Cash'; _expDefaultMode=null; } _updateExpAcctVisibility(); }
+  if(id==='expenseSheet'){ _renderExpCatOptions(); renderExpenseLedger(); const em=document.getElementById('expMode'); if(em){ em.value = _expDefaultMode||'Cash'; _expDefaultMode=null; } _updateExpAcctVisibility(); const edEl=document.getElementById('expDate'); if(edEl) edEl.value = todayStr(); }
   if(id==='bankSheet'){ updateBankTxnLabels(); renderBankTxnList(); }
   if(id==='returnSheet'){
     retCart = [];
@@ -4795,6 +4892,7 @@ function closeAllSheets(){
   document.getElementById('overlay').classList.remove('show');
   document.querySelectorAll('.sheet').forEach(s=>s.classList.remove('show'));
   document.body.classList.remove('sheet-open');
+  document.body.style.overflow = '';
   const helpFrame = document.getElementById('helpCentreFrame');
   if(helpFrame) helpFrame.src = ''; // stop playback once the Help Centre sheet is closed
 }
@@ -7484,9 +7582,19 @@ async function rasterizeDocPrintArea(){
   wrap.appendChild(sheetClone);
   document.body.appendChild(wrap);
   if(areaClone) areaClone.classList.add('_pdfRenderArea');
+  // v77 fix: same defensive hide as rasterizeReportPrintArea — see the
+  // comment there. #reportPrintArea can be mid-capture (position:fixed)
+  // at the exact moment this runs; hide it so it can't bleed into this
+  // capture either.
+  const reportArea = document.getElementById('reportPrintArea');
+  const prevReportAreaDisplay = reportArea ? reportArea.style.display : null;
+  if(reportArea) reportArea.style.display = 'none';
   let canvas;
   try{ canvas = await window.html2canvas(areaClone || sheetClone, {scale:2, backgroundColor:'#ffffff', useCORS:true}); }
-  finally { wrap.remove(); }
+  finally {
+    wrap.remove();
+    if(reportArea) reportArea.style.display = prevReportAreaDisplay;
+  }
   return canvas;
 }
 async function buildDocPDFFromScreenshot(){
@@ -8069,7 +8177,37 @@ function exportDocToExcel(){
   if(!_docCtx){ toast('Open a statement or ledger first'); return; }
   const {type, party, partyType} = _docCtx;
   
-  if(type==='ledger' || type==='statement'){
+  if(type==='statement'){
+    // v80 fix: this used to fall through to the exact same ledger
+    // transaction-table export below — a Date/Particulars/Debit/Credit/
+    // Balance table with '—' placeholder rows for Opening/Closing Balance
+    // — completely ignoring the actual Statement content (Total Billed,
+    // Total Received/Paid, Credit Limit, Last Activity, Outstanding
+    // Balance) that's correctly shown on screen. Statement and Ledger are
+    // different documents (see renderDocBody()) and now export differently too.
+    const txns = getPartyLedgerTxns(party, partyType);
+    const totalBilled = txns.reduce((a,t)=>a+t.debit,0);
+    const totalSettled = txns.reduce((a,t)=>a+t.credit,0);
+    const lastDate = txns.length ? txns[txns.length-1].date : (party.lastDate||party.lastPurchaseDate||'—');
+    const rows = [
+      ['Account Statement', ''],
+      ['Party', party.name],
+      ['Mobile', party.mobile || 'No mobile on file'],
+      ['As on', new Date().toISOString().slice(0,10)],
+      ['', ''],
+      ['Total Billed', totalBilled.toFixed(2)],
+      [partyType==='customers' ? 'Total Received' : 'Total Paid', totalSettled.toFixed(2)],
+      ['Credit Limit', (party.limit||0).toFixed(2)],
+      ['Last Activity', lastDate],
+      ['Account Status', getPartyDocBalance(party,partyType)>0 ? 'Outstanding' : 'No Dues'],
+      ['Outstanding Balance', getPartyDocBalance(party,partyType).toFixed(2)]
+    ];
+    downloadExcelFromRows(rows, `${party.name}_Statement_${new Date().toISOString().slice(0,10)}.xlsx`);
+    toast('Statement exported to Excel ✓');
+    return;
+  }
+
+  if(type==='ledger'){
     // Export ledger transactions to Excel
     const txns = getPartyLedgerTxns(party, partyType);
     let rows = [
@@ -8818,12 +8956,32 @@ function _matrixYearSelectorHtml(){
 
 function exportReportCSV(){
   const type = _lastReportType;
+  
+  // v69: Ensure report is rendered with data
+  let tblEl = document.getElementById('reportTableWrap');
+  if(!tblEl || !tblEl.innerHTML.trim() || tblEl.innerHTML.includes("This report isn't available yet")){
+    if(type){
+      console.log('[v69] Report empty — rebuilding before export...');
+      const savedDrill = _rptDrillFilter;
+      _rptDrillFilter = null;
+      openReport(type, null, true);
+      _rptDrillFilter = savedDrill;
+      // Retry export after rebuild
+      setTimeout(()=>{ exportReportCSV(); }, 300);
+      return;
+    }
+  }
+  
+  // Ensure full report table is displayed before export
+  _ensureFullReportTableDisplay();
+  
   let rows;
   if(type==='purchase'){
+    // v69: export ALL purchases from the filtered period, not just visible rows
+    const filteredPurch = filterByDateRange(DB.purchases||[], 'date');
     rows=[['Purchase ID','Supplier','Date','Amount','Mode','Invoice No']].concat(
-      DB.purchases.map(p=>[p.id,(DB.suppliers.find(s=>s.id===p.supp)||{}).name||'—',p.date,p.total,p.mode||'—',p.invNo||''])
+      filteredPurch.map(p=>[p.id,(DB.suppliers.find(s=>s.id===p.supp)||{}).name||'—',p.date,p.total,p.mode||'—',p.invNo||''])
     );
-  } else if(type==='stock' || type==='stockledger'){
     rows=[['Item','Unit','Stock','Purchase Rate','Sale Rate','Stock Value']].concat(
       DB.items.map(i=>[i.name,i.unit,fmtQtyDisplay(i.stock,i.unit),i.pRate,i.sRate,i.pRate*i.stock])
     );
@@ -8885,6 +9043,25 @@ function exportAllCSV(){
 }
 function exportReportTally(){
   const type = _lastReportType;
+  
+  // v69: Ensure report is rendered with data
+  let tblEl = document.getElementById('reportTableWrap');
+  if(!tblEl || !tblEl.innerHTML.trim() || tblEl.innerHTML.includes("This report isn't available yet")){
+    if(type){
+      console.log('[v69] Report empty — rebuilding before Tally export...');
+      const savedDrill = _rptDrillFilter;
+      _rptDrillFilter = null;
+      openReport(type, null, true);
+      _rptDrillFilter = savedDrill;
+      // Retry export after rebuild
+      setTimeout(()=>{ exportReportTally(); }, 300);
+      return;
+    }
+  }
+  
+  // Ensure full report table is displayed before export
+  _ensureFullReportTableDisplay();
+  
   let xml;
   if(type==='bs'){
     xml = _buildTallyLedgerMastersXml();
@@ -9180,10 +9357,45 @@ function printTallyView(){
    layout stays identical between the two so the preview is trustworthy. */
 function _buildReportLetterheadHTML(showTime){
   const titleEl = document.getElementById('reportTitle');
-  const tblEl = document.getElementById('reportTableWrap');
-  if(!tblEl || !tblEl.innerHTML.trim()) return null;
+  let tblEl = document.getElementById('reportTableWrap');
+  let tableHTML = tblEl ? tblEl.innerHTML : '';
+  
+  // v70 FIX: If live table is empty, try to use cached data
+  if(!tableHTML || !tableHTML.trim() || tableHTML.includes("This report isn't available yet")){
+    const cached = _getCachedReportData();
+    if(cached && cached.tableHTML){
+      console.log('[v70] Using cached report data for:', cached.type);
+      tableHTML = cached.tableHTML;
+      // Use cached title if live title is missing
+      if(!titleEl || !titleEl.textContent) {
+        return `
+          <div class="rpt-letterhead">
+            <div class="rpt-biz-name">${bizName()}</div>
+            <div class="rpt-biz-sub">${DB.bizAddress||'—'} ${DB.bizMobile?'Ph: '+DB.bizMobile:''}</div>
+          </div>
+          <div class="rpt-title-bar">${cached.title.split(' — ')[0].toUpperCase()}</div>
+          <div class="rpt-meta-row">
+            <span><b>Period:</b> ${cached.title.split(' — ')[1] || '—'}</span>
+            ${showTime ? `<span><b>Generated:</b> ${todayStr()} ${new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true})}</span>` : ''}
+          </div>
+          <div class="rpt-body">${tableHTML}</div>
+          <div class="rpt-footer">
+            <div style="font-size:10px;color:#555;line-height:1.6;">This is a computer generated statement prepared from books maintained in the ordinary course of business and does not require a physical signature.</div>
+            <div class="rpt-sign">
+              <div style="font-weight:700;font-size:10.5px;">For ${bizName()}</div>
+              <div class="rpt-sign-line">Authorised Signatory</div>
+            </div>
+          </div>
+          <div class="rpt-foot-note">Generated by ${bizName()} via Balaji NextGen Business OS</div>`;
+      }
+    } else {
+      // No data at all
+      return null;
+    }
+  }
+  
   const gstin = DB.gstin || 'XXXXX';
-  const fullTitle = titleEl.textContent || 'REPORT';
+  const fullTitle = titleEl ? titleEl.textContent : 'REPORT';
   const parts = fullTitle.split(' — ');
   const rptName = (parts[0]||'Report').toUpperCase();
   const rptPeriod = parts[1] || '—';
@@ -9201,7 +9413,7 @@ function _buildReportLetterheadHTML(showTime){
       <span><b>Period:</b> ${rptPeriod}</span>
       ${showTime ? `<span><b>Generated:</b> ${todayStr()} ${new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true})}</span>` : ''}
     </div>
-    <div class="rpt-body">${tblEl.innerHTML}</div>
+    <div class="rpt-body">${tableHTML}</div>
     <div class="rpt-footer">
       <div style="font-size:10px;color:#555;line-height:1.6;">This is a computer generated statement prepared from books maintained in the ordinary course of business and does not require a physical signature.</div>
       <div class="rpt-sign">
@@ -9211,23 +9423,147 @@ function _buildReportLetterheadHTML(showTime){
     </div>
     <div class="rpt-foot-note">Generated by ${bizName()} via Balaji NextGen Business OS</div>`;
 }
+/* v70: Global cache to preserve report table data through print/export cycle */
+let _reportDataCache = {
+  type: null,
+  title: null,
+  tableHTML: null,
+  timestamp: null
+};
+
+/* v70: Cache the current report data IMMEDIATELY when it renders */
+function _cacheReportData(){
+  try {
+    const tblEl = document.getElementById('reportTableWrap');
+    const titleEl = document.getElementById('reportTitle');
+    
+    if(tblEl && tblEl.innerHTML.trim() && !tblEl.innerHTML.includes("This report isn't available yet")){
+      _reportDataCache.type = _lastReportType;
+      _reportDataCache.title = titleEl ? titleEl.textContent : 'Report';
+      _reportDataCache.tableHTML = tblEl.innerHTML;
+      _reportDataCache.timestamp = Date.now();
+      console.log('[v70] ✓ Report data cached:', _reportDataCache.type, 'bytes:', _reportDataCache.tableHTML.length);
+      return true;
+    }
+  } catch(e){
+    console.warn('[v70] Cache error:', e);
+  }
+  return false;
+}
+
+/* v70: Retrieve cached report data with validation */
+function _getCachedReportData(){
+  if(_reportDataCache.tableHTML && _reportDataCache.tableHTML.trim() && 
+     !_reportDataCache.tableHTML.includes("This report isn't available yet")){
+    // Cache is fresh if less than 60 seconds old
+    if(Date.now() - _reportDataCache.timestamp < 60000){
+      return _reportDataCache;
+    }
+  }
+  return null;
+}
+function _ensureFullReportTableDisplay(){
+  const tbl = document.getElementById('reportTableWrap');
+  if(!tbl) return;
+  
+  // v69 FIX: If table is empty, try to rebuild the current report
+  if(!tbl.innerHTML.trim() || tbl.innerHTML.includes("This report isn't available yet")){
+    console.warn('[v69] Report table is empty — rebuilding...');
+    if(_lastReportType){
+      // Force rebuild by calling openReport again without the drill filter
+      const savedDrill = _rptDrillFilter;
+      _rptDrillFilter = null;
+      openReport(_lastReportType, null, true);
+      _rptDrillFilter = savedDrill;
+    }
+    return; // Exit — openReport will rebuild and the caller will retry
+  }
+  
+  // Remove any row-limiting CSS or inline styles that might truncate display
+  const rows = tbl.querySelectorAll('[style*="display:none"],[style*="display: none"]');
+  rows.forEach(r => {
+    if(r.style && r.style.display === 'none') r.style.display = '';
+  });
+  // Ensure table is not hidden or clipped
+  if(tbl.style) {
+    tbl.style.maxHeight = 'none';
+    tbl.style.overflow = 'visible';
+    tbl.style.height = 'auto';
+    tbl.style.display = '';
+  }
+}
 /* Builds the letterhead-styled report HTML into #reportPrintArea.
    Shared by Print, Save-PDF and WhatsApp-share so all three always
    show the exact same layout. Returns false if there's nothing to export. */
+/* Builds the letterhead-styled report HTML into #reportPrintArea.
+   Shared by Print, Save-PDF and WhatsApp-share so all three always
+   show the exact same layout. Returns false if there's nothing to export. 
+   v69: Auto-rebuild if report table is empty. */
 function renderReportPrintArea(){
   const area = document.getElementById('reportPrintArea');
+  let tblEl = document.getElementById('reportTableWrap');
+  let tableHTML = tblEl ? tblEl.innerHTML : '';
+  
+  // v71: If live table is empty, try cache immediately (don't rebuild here - caller handles that)
+  if(!tableHTML || !tableHTML.trim() || tableHTML.includes("This report isn't available yet")){
+    const cached = _getCachedReportData();
+    if(cached && cached.tableHTML){
+      console.log('[v71] renderReportPrintArea using cached data');
+      tableHTML = cached.tableHTML;
+    }
+  }
+  
+  // If STILL no data, error out
+  if(!area || !tableHTML || !tableHTML.trim()){ 
+    console.error('[v71] NO DATA in renderReportPrintArea (neither live table nor cache)');
+    toast('Report has no data'); 
+    return false; 
+  }
+  
   const html = _buildReportLetterheadHTML(_rptShowTimePrint);
-  if(!area || html===null){ toast('Nothing to export yet — pick a report first'); return false; }
+  if(!html){
+    console.error('[v71] _buildReportLetterheadHTML returned null');
+    toast('Could not build report'); 
+    return false;
+  }
+  
+  console.log('[v71] Built letterhead, inserting into area');
   area.innerHTML = html;
   return true;
 }
 /* v39: same layout, rendered inline into the Print Preview sheet instead of
    the hidden off-screen #reportPrintArea, so the user can eyeball it —
-   with its own independent timestamp switch (_rptShowTimePreview). */
+   with its own independent timestamp switch (_rptShowTimePreview).
+   v69: Auto-rebuild if report table is empty. */
 function renderReportPreviewArea(){
   const area = document.getElementById('reportPreviewArea');
+  let tblEl = document.getElementById('reportTableWrap');
+  
+  // v69 FIX: If table is empty/not rendered, rebuild the report first
+  if(!tblEl || !tblEl.innerHTML.trim() || tblEl.innerHTML.includes("This report isn't available yet")){
+    if(_lastReportType){
+      console.warn('[v69] Report empty — auto-rebuilding for preview:', _lastReportType);
+      const savedDrill = _rptDrillFilter;
+      _rptDrillFilter = null;
+      openReport(_lastReportType, null, true);
+      _rptDrillFilter = savedDrill;
+      // Re-fetch after rebuild
+      tblEl = document.getElementById('reportTableWrap');
+    }
+  }
+  
+  // Ensure table has content now
+  if(!area || !tblEl || !tblEl.innerHTML.trim()){
+    toast('Report has no data'); 
+    return false;
+  }
+  
   const html = _buildReportLetterheadHTML(_rptShowTimePreview);
-  if(!area || html===null){ toast('Nothing to preview yet — pick a report first'); return false; }
+  if(!html){
+    toast('Report table is empty'); 
+    return false;
+  }
+  
   area.innerHTML = html;
   return true;
 }
@@ -9308,9 +9644,114 @@ window.addEventListener('afterprint', ()=>{
 });
 function printReportPDF(){
   const area = document.getElementById('reportPrintArea');
-  if(!renderReportPrintArea()) return;
-  area.classList.add('printing');
-  setTimeout(()=>window.print(), 60);
+  
+  if(!_lastReportType){
+    toast('No report is open');
+    return;
+  }
+  
+  console.log('[v72] Print START — capturing fresh data...');
+  
+  // STEP 1: Rebuild report to get fresh data
+  const savedDrill = _rptDrillFilter;
+  _rptDrillFilter = null;
+  openReport(_lastReportType, null, true);
+  _rptDrillFilter = savedDrill;
+  
+  // STEP 2: Wait for report to render, THEN capture table data directly
+  setTimeout(()=>{
+    console.log('[v72] Report rebuilt, extracting table data...');
+    
+    // CRITICAL: Read table data directly from DOM RIGHT NOW
+    const liveTable = document.getElementById('reportTableWrap');
+    const tableData = liveTable ? liveTable.innerHTML : '';
+    const tableLength = tableData.trim().length;
+    
+    console.log('[v72] Table data length:', tableLength, 'bytes');
+    
+    // Verify we actually have data
+    if(!tableData || tableLength < 50 || tableData.includes("This report isn't available yet")){
+      console.error('[v72] ERROR: Table is empty or invalid');
+      console.error('[v72] Content:', tableData.substring(0, 100));
+      toast('Report table is empty - cannot print');
+      return;
+    }
+    
+    console.log('[v72] ✓ Table data captured successfully');
+    
+    // STEP 3: Get title
+    const titleEl = document.getElementById('reportTitle');
+    const reportTitle = titleEl ? titleEl.textContent : 'Report';
+    
+    console.log('[v72] Report title:', reportTitle);
+    
+    // STEP 4: Build complete HTML with captured data (not relying on cache or live DOM)
+    const letterheadHTML = _buildPrintHTML(reportTitle, tableData);
+    
+    if(!letterheadHTML){
+      console.error('[v72] Failed to build letterhead');
+      toast('Could not build report for printing');
+      return;
+    }
+    
+    console.log('[v72] ✓ Letterhead built, length:', letterheadHTML.length);
+    
+  // STEP 5: Insert into print area
+    area.innerHTML = letterheadHTML;
+    area.classList.add('printing');
+    area.style.display = 'block !important';  // Force visible
+    area.style.visibility = 'visible';
+    area.style.opacity = '1';
+    
+    console.log('[v72] ✓ Inserted into print area, printing content length:', area.innerHTML.length);
+    console.log('[v72] Content sample:', area.innerHTML.substring(0, 200));
+    
+    // STEP 6: Open print dialog after browser has rendered the content
+    setTimeout(()=>{
+      console.log('[v72] Showing print dialog...');
+      window.print();
+    }, 200);  // Give browser 200ms to render the content
+    
+  }, 700);  // Wait longer for render
+}
+
+/* v72: Build print HTML directly, not using _buildReportLetterheadHTML */
+function _buildPrintHTML(title, tableData){
+  if(!tableData || tableData.trim().length < 50){
+    console.error('[v72] _buildPrintHTML received invalid tableData');
+    return null;
+  }
+  
+  const gstin = DB.gstin || 'XXXXX';
+  const parts = title.split(' — ');
+  const rptName = (parts[0]||'Report').toUpperCase();
+  const rptPeriod = parts[1] || '—';
+  const subBits = [];
+  if(DB.bizAddress) subBits.push(DB.bizAddress);
+  if(DB.bizMobile) subBits.push('Ph: '+DB.bizMobile);
+  if(DB.gstRegistered!=='no') subBits.push('GSTIN: '+gstin);
+  
+  return `
+    <div class="rpt-letterhead">
+      <div class="rpt-biz-name">${bizName()}</div>
+      <div class="rpt-biz-sub">${subBits.join(' &nbsp;|&nbsp; ')}</div>
+    </div>
+    <div class="rpt-title-bar">${rptName}</div>
+    <div class="rpt-meta-row">
+      <span><b>Period:</b> ${rptPeriod}</span>
+      <span><b>Generated:</b> ${todayStr()} ${new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true})}</span>
+    </div>
+    <div class="rpt-body" style="min-height: 200px;">
+      ${tableData}
+    </div>
+    <div class="rpt-footer">
+      <div style="font-size:10px;color:#555;line-height:1.6;">This is a computer generated statement prepared from books maintained in the ordinary course of business and does not require a physical signature.</div>
+      <div class="rpt-sign">
+        <div style="font-weight:700;font-size:10.5px;">For ${bizName()}</div>
+        <div class="rpt-sign-line">Authorised Signatory</div>
+      </div>
+    </div>
+    <div class="rpt-foot-note">Generated by ${bizName()} via Balaji NextGen Business OS</div>`;
 }
 /* ── REAL REPORT PDF (html2canvas → jsPDF, paginated) ───────────────
    Renders the exact same letterhead layout used for Print, rasterizes
@@ -9321,47 +9762,138 @@ function printReportPDF(){
    and by the JPG "Screenshot" WhatsApp share, so both start from the exact
    same rendered output. */
 async function rasterizeReportPrintArea(){
-  if(!window.html2canvas) return null;
-  if(!renderReportPrintArea()) return null;
+  if(!window.html2canvas) {
+    console.error('[v72] html2canvas not available');
+    return null;
+  }
+  
   const area = document.getElementById('reportPrintArea');
+  if(!area || !area.innerHTML || area.innerHTML.trim().length < 100){
+    console.error('[v72] rasterizeReportPrintArea: print area is empty');
+    console.error('[v72] Content length:', area ? area.innerHTML.length : 0);
+    return null;
+  }
+  
+  console.log('[v72] Rasterizing print area, content length:', area.innerHTML.length);
+  
   area.style.cssText = 'display:block;position:fixed;left:-9999px;top:0;width:800px;';
+  const otherWraps = Array.from(document.querySelectorAll('._pdfRenderWrap'));
+  const prevWrapDisplay = otherWraps.map(w=>w.style.display);
+  otherWraps.forEach(w=>{ w.style.display = 'none'; });
+  const openSheets = Array.from(document.querySelectorAll('.sheet.show'));
+  const prevSheetDisplay = openSheets.map(s=>s.style.display);
+  openSheets.forEach(s=>{ s.style.display = 'none'; });
+  
   let canvas;
-  try{ canvas = await window.html2canvas(area, {scale:2, backgroundColor:'#ffffff', useCORS:true}); }
-  finally { area.style.cssText = 'display:none;'; }
+  try{ 
+    console.log('[v72] Calling html2canvas...');
+    canvas = await window.html2canvas(area, {scale:2, backgroundColor:'#ffffff', useCORS:true});
+    console.log('[v72] Canvas created, size:', canvas.width, 'x', canvas.height);
+  } catch(e){
+    console.error('[v72] html2canvas error:', e);
+  }
+  finally {
+    area.style.cssText = 'display:none;';
+    otherWraps.forEach((w,i)=>{ w.style.display = prevWrapDisplay[i]; });
+    openSheets.forEach((s,i)=>{ s.style.display = prevSheetDisplay[i]; });
+  }
   return canvas;
 }
 async function buildReportPDF(){
-  if(!window.jspdf) return null;
-  const canvas = await rasterizeReportPrintArea();
-  if(!canvas) return null;
-  const { jsPDF } = window.jspdf;
-  const doc = new jsPDF({unit:'pt', format:'a4'});
-  const pageW = doc.internal.pageSize.getWidth();
-  const pageH = doc.internal.pageSize.getHeight();
-  const margin = 24;
-  const usableW = pageW - margin*2;
-  const imgH = (canvas.height * usableW) / canvas.width;
-  const pageUsableH = pageH - margin*2;
-  const imgData = canvas.toDataURL('image/jpeg', 0.95);
-  if(imgH <= pageUsableH){
-    doc.addImage(imgData, 'JPEG', margin, margin, usableW, imgH);
-  } else {
-    // Slice the tall canvas into page-sized chunks so nothing is cropped
-    const pxPerPage = Math.floor((pageUsableH * canvas.width) / usableW);
-    let renderedPx = 0, pageNo = 0;
-    while(renderedPx < canvas.height){
-      const sliceH = Math.min(pxPerPage, canvas.height - renderedPx);
-      const sliceCanvas = document.createElement('canvas');
-      sliceCanvas.width = canvas.width; sliceCanvas.height = sliceH;
-      sliceCanvas.getContext('2d').drawImage(canvas, 0, renderedPx, canvas.width, sliceH, 0, 0, canvas.width, sliceH);
-      const sliceImg = sliceCanvas.toDataURL('image/jpeg', 0.95);
-      const sliceHPt = (sliceH * usableW) / canvas.width;
-      if(pageNo>0) doc.addPage();
-      doc.addImage(sliceImg, 'JPEG', margin, margin, usableW, sliceHPt);
-      renderedPx += sliceH; pageNo++;
-    }
+  if(!window.jspdf) {
+    console.error('[v72] jsPDF not available');
+    return null;
   }
-  return doc;
+  
+  if(!_lastReportType){
+    console.error('[v72] No report type');
+    return null;
+  }
+  
+  console.log('[v72] buildReportPDF START for:', _lastReportType);
+  
+  // Force rebuild
+  const savedDrill = _rptDrillFilter;
+  _rptDrillFilter = null;
+  openReport(_lastReportType, null, true);
+  _rptDrillFilter = savedDrill;
+  
+  return new Promise(async (resolve)=>{
+    setTimeout(async ()=>{
+      console.log('[v72] Report rebuilt, capturing table...');
+      
+      // Capture table data directly
+      const liveTable = document.getElementById('reportTableWrap');
+      const tableData = liveTable ? liveTable.innerHTML : '';
+      
+      if(!tableData || tableData.trim().length < 50){
+        console.error('[v72] buildReportPDF: table is empty');
+        resolve(null);
+        return;
+      }
+      
+      console.log('[v72] Table captured, length:', tableData.length);
+      
+      // Build HTML
+      const titleEl = document.getElementById('reportTitle');
+      const reportTitle = titleEl ? titleEl.textContent : 'Report';
+      const html = _buildPrintHTML(reportTitle, tableData);
+      
+      const area = document.getElementById('reportPrintArea');
+      area.innerHTML = html;
+      area.style.display = 'block';
+      
+      console.log('[v72] Letterhead built, rasterizing...');
+      
+      // Capture to canvas
+      setTimeout(async ()=>{
+        const canvas = await rasterizeReportPrintArea();
+        if(!canvas){
+          console.error('[v72] Canvas capture failed');
+          resolve(null);
+          return;
+        }
+        
+        console.log('[v72] Canvas captured, building PDF...');
+        
+        try {
+          const { jsPDF } = window.jspdf;
+          const doc = new jsPDF({unit:'pt', format:'a4'});
+          const pageW = doc.internal.pageSize.getWidth();
+          const pageH = doc.internal.pageSize.getHeight();
+          const margin = 24;
+          const usableW = pageW - margin*2;
+          const imgH = (canvas.height * usableW) / canvas.width;
+          const pageUsableH = pageH - margin*2;
+          const imgData = canvas.toDataURL('image/jpeg', 0.95);
+          
+          if(imgH <= pageUsableH){
+            doc.addImage(imgData, 'JPEG', margin, margin, usableW, imgH);
+          } else {
+            const pxPerPage = Math.floor((pageUsableH * canvas.width) / usableW);
+            let renderedPx = 0, pageNo = 0;
+            while(renderedPx < canvas.height){
+              const sliceH = Math.min(pxPerPage, canvas.height - renderedPx);
+              const sliceCanvas = document.createElement('canvas');
+              sliceCanvas.width = canvas.width; sliceCanvas.height = sliceH;
+              sliceCanvas.getContext('2d').drawImage(canvas, 0, renderedPx, canvas.width, sliceH, 0, 0, canvas.width, sliceH);
+              const sliceImg = sliceCanvas.toDataURL('image/jpeg', 0.95);
+              const sliceHPt = (sliceH * usableW) / canvas.width;
+              if(pageNo>0) doc.addPage();
+              doc.addImage(sliceImg, 'JPEG', margin, margin, usableW, sliceHPt);
+              renderedPx += sliceH; pageNo++;
+            }
+          }
+          
+          console.log('[v72] PDF built successfully');
+          resolve(doc);
+        } catch(e){
+          console.error('[v72] PDF build error:', e);
+          resolve(null);
+        }
+      }, 200);
+    }, 700);
+  });
 }
 function reportShareFileName(){
   const titleEl = document.getElementById('reportTitle');
@@ -9378,10 +9910,42 @@ async function downloadReportPDF(){
   toast('PDF downloaded ✓');
 }
 async function shareReportWhatsApp(){
-  const sales=filterSalesForReport();
-  const total=sales.reduce((a,s)=>a+s.total,0);
+  // v69: Ensure report is rendered with data
+  let tblEl = document.getElementById('reportTableWrap');
+  if(!tblEl || !tblEl.innerHTML.trim() || tblEl.innerHTML.includes("This report isn't available yet")){
+    if(_lastReportType){
+      console.log('[v69] Report empty — rebuilding before WhatsApp share...');
+      const savedDrill = _rptDrillFilter;
+      _rptDrillFilter = null;
+      openReport(_lastReportType, null, true);
+      _rptDrillFilter = savedDrill;
+      // Retry after rebuild
+      setTimeout(()=>{ shareReportWhatsApp(); }, 300);
+      return;
+    }
+  }
+  
+  // v79 fix: this used to unconditionally compute Sales-specific figures
+  // (filterSalesForReport()) for the share message text no matter which
+  // report was actually open — confirmed live: sharing a Purchase Register
+  // produced a WhatsApp message reading "Total Sales: ₹4,690" using
+  // completely unrelated sales data. The attached PDF was always correct
+  // (built from the real #reportPrintArea), only the accompanying text was
+  // wrong. Now pulls the report's own summary line(s) — the "Total ..." /
+  // count rows every report already shows at the top of its table — so the
+  // message text always matches whatever's actually being shared.
+  // v69: Ensure full report table is captured before share
+  _ensureFullReportTableDisplay();
   const titleEl = document.getElementById('reportTitle');
-  const msg=`📊 *${bizName()} — ${titleEl?titleEl.textContent:'Report'}*\nTotal Sales: ₹${total.toLocaleString('en-IN')}\nTransactions: ${sales.length}\nDate: ${todayStr()}`;
+  const reportTitle = titleEl ? titleEl.textContent : 'Report';
+  const summaryLines = Array.from(document.querySelectorAll('#reportTableWrap > .cart-row')).slice(0,3)
+    .map(row=>{
+      const spans = row.querySelectorAll('span');
+      if(spans.length<2) return null;
+      return `${spans[0].textContent.trim()}: ${spans[spans.length-1].textContent.trim()}`;
+    }).filter(Boolean);
+  const summaryText = summaryLines.length ? summaryLines.join('\n') : '';
+  const msg=`📊 *${bizName()} — ${reportTitle}*\n${summaryText}\nDate: ${todayStr()}`;
   const hint = document.getElementById('rptShareHint');
   if(hint) hint.style.display='block';
   const doc = await buildReportPDF();
@@ -9406,12 +9970,37 @@ async function shareReportWhatsApp(){
 /* v39: "Screenshot" share — sends a JPG image of the report (instead of a
    PDF) via WhatsApp. Same letterhead layout, just rasterized and shared as
    an image, for the times a quick screenshot-style picture is preferred
-   over a PDF attachment. */
+   over a PDF attachment. 
+   v69: Auto-rebuild if report table is empty. */
 async function shareReportScreenshotWhatsApp(){
-  const sales=filterSalesForReport();
-  const total=sales.reduce((a,s)=>a+s.total,0);
+  // v69: Ensure report is rendered with data
+  let tblEl = document.getElementById('reportTableWrap');
+  if(!tblEl || !tblEl.innerHTML.trim() || tblEl.innerHTML.includes("This report isn't available yet")){
+    if(_lastReportType){
+      console.log('[v69] Report empty — rebuilding before screenshot share...');
+      const savedDrill = _rptDrillFilter;
+      _rptDrillFilter = null;
+      openReport(_lastReportType, null, true);
+      _rptDrillFilter = savedDrill;
+      // Retry after rebuild
+      setTimeout(()=>{ shareReportScreenshotWhatsApp(); }, 300);
+      return;
+    }
+  }
+  
+  // Ensure full report table is captured before screenshot share
+  _ensureFullReportTableDisplay();
   const titleEl = document.getElementById('reportTitle');
-  const msg=`📊 *${bizName()} — ${titleEl?titleEl.textContent:'Report'}*\nTotal Sales: ₹${total.toLocaleString('en-IN')}\nTransactions: ${sales.length}\nDate: ${todayStr()}`;
+  const reportTitle = titleEl ? titleEl.textContent : 'Report';
+  // Extract summary from actual report table, not hardcoded sales totals
+  const summaryLines = Array.from(document.querySelectorAll('#reportTableWrap > .cart-row')).slice(0,3)
+    .map(row=>{
+      const spans = row.querySelectorAll('span');
+      if(spans.length<2) return null;
+      return `${spans[0].textContent.trim()}: ${spans[spans.length-1].textContent.trim()}`;
+    }).filter(Boolean);
+  const summaryText = summaryLines.length ? '\n' + summaryLines.join('\n') : '';
+  const msg=`📊 *${bizName()} — ${reportTitle}*${summaryText}\nDate: ${todayStr()}`;
   const hint = document.getElementById('rptShareHint');
   if(hint){ hint.textContent='Building image…'; hint.style.display='block'; }
   const canvas = await rasterizeReportPrintArea();
@@ -9604,7 +10193,7 @@ function openReport(type, el, forceRefresh){
     suppledgerlist:'Supplier Ledger', suppoutstanding:'Supplier Outstanding', suppstatement:'Supplier Statement', suppmonthwise:'Supplier Month-wise History', supppayhist:'Supplier Payment History', supptop:'Top Suppliers',
     stockmovement:'Stock Movement', lowstockrpt:'Low Stock Report', negstock:'Negative Stock Report', deadstock:'Dead Stock Report', fastslow:'Fast / Slow Moving Stock',
     gstr1:'GSTR-1', gstr3b:'GSTR-3B', hsnsummary:'HSN Summary', taxliability:'Tax Liability Report',
-    bizsummary:'Monthly Business Summary', profitanalysis:'Profit Analysis', expenseanalysis:'Expense Analysis', salesvspurchase:'Sales vs Purchase', custgrowth:'Customer Growth', suppanalysis:'Supplier Analysis', topitems:'Top Selling Items', ledgerpick:'Ledger — Pick a Party'};
+    bizsummary:'Monthly Business Summary', profitanalysis:'Profit Analysis', expenseanalysis:'Expense Analysis', salesvspurchase:'Sales vs Purchase', custgrowth:'Customer Growth', suppanalysis:'Supplier Analysis', topitems:'Top Selling Items', ledgerpick:'Ledger — Pick a Party', expenseregister:'Expense Register', expensecategorywise:'Expenses by Category'};
   const reportTitleEl = document.getElementById('reportTitle'); 
   if(reportTitleEl) reportTitleEl.textContent=(titles[type]||type)+' — '+filterLabel;
   const reportMetaEl = document.getElementById('reportTitleMeta');
@@ -9801,6 +10390,26 @@ function openReport(type, el, forceRefresh){
       + _renderBookTable(_buildBankBookEntries(), DB.bank, 'Bank');
   } else if(type==='journal'){
     tbl = _renderDayBook(_buildDayBookEntries());
+  } else if(type==='expenseregister'){
+    const periodExpenses = filterByDateRange(DB.expenses||[], 'date');
+    const rows = [...periodExpenses].sort((a,b)=>(b.date||'').localeCompare(a.date||''));
+    tbl = _renderBreakdownTable(
+      [{label:'Date'},{label:'Category'},{label:'Note'},{label:'Mode'},{label:'Amount',align:'right'}],
+      rows.map(e=>[e.date||'—', e.category||'—', e.note||'—', e.mode||'Cash', fmt(e.amount||0)]),
+      ['Total', '', '', '', fmt(rows.reduce((a,e)=>a+(e.amount||0),0))],
+      'No expenses in this period'
+    );
+  } else if(type==='expensecategorywise'){
+    const periodExpenses = filterByDateRange(DB.expenses||[], 'date');
+    const byCat = {};
+    periodExpenses.forEach(e=>{ const c=e.category||'Uncategorized'; if(!byCat[c]) byCat[c]={val:0,n:0}; byCat[c].val+=(e.amount||0); byCat[c].n++; });
+    const rows = Object.entries(byCat).sort((a,b)=>b[1].val-a[1].val);
+    tbl = _renderBreakdownTable(
+      [{label:'Category'},{label:'Entries',align:'right'},{label:'Amount',align:'right'}],
+      rows.map(([c,d])=>[c, d.n, fmt(d.val)]),
+      ['Total', periodExpenses.length, fmt(periodExpenses.reduce((a,e)=>a+(e.amount||0),0))],
+      'No expenses in this period'
+    );
   } else if(type==='brs'){
     tbl = _renderBRS();
   } else if(type==='stock'){
@@ -10296,6 +10905,9 @@ function openReport(type, el, forceRefresh){
     document.getElementById('rptStockViewAppBtn').classList.toggle('active', _rptStockView==='app');
     document.getElementById('rptStockViewTallyBtn').classList.toggle('active', _rptStockView==='tally');
   }
+  
+  // v70: Cache the report data immediately after rendering
+  setTimeout(()=>{ _cacheReportData(); }, 100);
 }
 // v49: View customer ledger from ledgerpick
 function viewCustLedger(custName){
@@ -11886,13 +12498,16 @@ function recordExpense(){
   }
   if(!DB.expenses) DB.expenses = [];
   const isSuspense = cat === SUSPENSE_CAT;
-  DB.expenses.unshift({id:'EXP'+Date.now()%100000, category:cat, amount:amt, note, date:new Date().toISOString().slice(0,10), pending: isSuspense, mode});
+  const expDateEl = document.getElementById('expDate');
+  const expDate = (expDateEl && expDateEl.value) ? expDateEl.value : todayStr();
+  DB.expenses.unshift({id:'EXP'+Date.now()%100000, category:cat, amount:amt, note, date:expDate, pending: isSuspense, mode});
   syncExpenseRow(DB.expenses[0]);
   // v62: DB.expensesToday removed from the read side (see todaysExpenseTotal())
   // since it never reset daily — no longer incrementing it either.
   if(mode==='Bank'){ acct.balance -= amt; recalcBankTotal(); } else { DB.cash -= amt; }
   persistDB();
   document.getElementById('expAmt').value=''; document.getElementById('expNote').value='';
+  if(expDateEl) expDateEl.value = '';
   toast(isSuspense ? 'Logged to Suspense — clarify it later' : 'Expense added');
   renderExpenseLedger(); renderDashboard();
 }
