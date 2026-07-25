@@ -5893,12 +5893,29 @@ function validateAndFixPurchaseData() {
     }
   });
   
+  // v73 CRITICAL FIX: this used to reassign DB.purchases = Array.from(seen.values())
+  // right here — a permanent, silent, in-memory shrink of the actual shared
+  // data array. The comment claimed this was safe because it's "not
+  // auto-saved", but that only meant THIS function doesn't call
+  // persistDB() — it did nothing to stop the very next unrelated save
+  // anywhere else in the app (adding an expense, receiving a payment,
+  // anything that syncs the whole DB) from picking up this now-poisoned,
+  // permanently-shrunk DB.purchases and sending it to the server, where
+  // shrink-protection would correctly block it — but from the user's
+  // perspective this looked like an unprovoked, unfixable "not synced"
+  // error that never went away for the rest of the session. Since this
+  // whole function runs on every single Dashboard render, a single
+  // transient duplicate was enough to break every save until a fresh
+  // reload. Now only computes a deduped total for the dashboard display,
+  // and never touches the real DB.purchases array. If genuine duplicates
+  // exist, use Settings → New Setup → Data Repair to remove them properly
+  // (which fixes the Sheet directly, not just this session's memory).
+  const dedupedPurchases = duplicates.length ? Array.from(seen.values()) : DB.purchases;
   if (duplicates.length > 0) {
-    console.warn('Found ' + duplicates.length + ' duplicate purchases (fixed locally for display — not auto-saved, since an auto-save here would fight the shrink-protection safety check every time. Use Settings → Force Save if you want this cleanup to persist to the Sheet.)');
-    DB.purchases = Array.from(seen.values());
+    console.warn('Found ' + duplicates.length + ' duplicate purchase ID(s) — not modifying your data. Use Settings → New Setup → Data Repair to remove real duplicates from the Sheet.');
   }
   
-  const totalPurchase = DB.purchases.reduce((a, p) => a + (Number(p.total) || 0), 0);
+  const totalPurchase = dedupedPurchases.reduce((a, p) => a + (Number(p.total) || 0), 0);
   const el = document.getElementById('dashPurchaseTotal');
   if (el && totalPurchase > 0) {
     el.textContent = '₹' + totalPurchase.toLocaleString('en-IN', {maximumFractionDigits: 2});
@@ -12355,12 +12372,22 @@ function confirmTallyImport(){
   closeAllSheets();
   if(_tiKind==='stock') renderInventory('');
 }
-/* ── TRANSACTION (HISTORICAL VOUCHER) IMPORT (v44) ─────────────────
+/* ── TRANSACTION (HISTORICAL VOUCHER) IMPORT (v72) ─────────────────
    Sales/Purchase history from Tally/Excel/CSV — creates real DB.sales /
    DB.purchases records (so Registers, GST, P&L show the real history)
-   but deliberately does NOT touch current stock, dues, or cash/bank:
-   those are set once via the Master Data opening-balance import, and
-   re-applying them here on top would double-count. */
+   AND now also updates each item's stock as vouchers are processed
+   (+qty for purchases, -qty for sales). Previously this deliberately did
+   NOT touch stock, on the theory that a separate Master Data
+   opening-balance import would set it — but that meant a business that
+   only ever ran the voucher import (no separate Master Data step, the
+   common case) ended up with every item's stock still frozen at 0
+   forever, which made Inventory Movement's Opening figure compute as a
+   confusing negative number to compensate (Opening = Closing - Purchases
+   + Sales, and Closing never moved off 0). Stock now moves with the
+   vouchers like any real purchase/sale would, so a fresh import correctly
+   nets out to Opening = 0. If you separately ran (or still run) a Master
+   Data opening-balance import too, use Settings → New Setup → Recalculate
+   Stock afterward to avoid double-counting between the two. */
 let _txiKind = null, _txiVouchers = [];
 function downloadTxnTemplate(kind){
   if(!window.XLSX){ toast('Excel support is still loading — wait a moment and try again'); return; }
@@ -12493,6 +12520,7 @@ async function confirmTxnImport(){
   const canSyncToSheet = !!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL);
   const newParties = []; // parties created during this import — sync their rows once, after the loop
   const toSync = []; // {id, supp/cust, date, total, mode, lineItems} — one per voucher, sent to the sheet below
+  const changedItems = {}; // v72: items whose stock changed during this import — synced once, after the loop
   let count=0, skippedDupes=0;
   _txiVouchers.forEach(v=>{
     if(_txnVoucherExists(isSales, v)){ skippedDupes++; return; }
@@ -12509,6 +12537,9 @@ async function confirmTxnImport(){
     const lineItems = v.items.map(li=>{
       let it = DB.items.find(x=>x.name.toLowerCase()===li.name.toLowerCase());
       if(!it){ it = {id:_genItemId(), name:li.name, unit:'Pcs', category:'', hsn:'', pRate:li.rate||0, sRate:li.rate||0, gst:(li.gst!=null?li.gst:18), stock:0, min:5, expiryDate:''}; DB.items.push(it); }
+      // v72: move stock with the voucher — see comment above confirmTxnImport.
+      it.stock = Math.round(((it.stock||0) + (isSales ? -li.qty : li.qty))*1000)/1000;
+      changedItems[it.id] = it;
       return {id:it.id, name:it.name, unit:it.unit||'Pcs', hsn:it.hsn||'—', qty:li.qty, rate:li.rate, gst:(li.gst!=null?li.gst:(it.gst||0))};
     });
     const courier = v.courier || 0;
@@ -12571,13 +12602,25 @@ async function confirmTxnImport(){
     if(ok) partySynced++; else partyFailed++;
     await sleep(180);
   }
-  if(failed===0 && partyFailed===0){
+  // v72: sync the stock changes made during this import (see comment above
+  // confirmTxnImport) — same throttled pattern as vouchers/parties above.
+  let itemSynced = 0, itemFailed = 0;
+  const changedItemList = Object.values(changedItems);
+  for(const it of changedItemList){
+    try{
+      const res = await syncItemRow(it);
+      if(res && res.ok !== false) itemSynced++; else itemFailed++;
+    }catch(e){ itemFailed++; }
+    await sleep(150);
+  }
+  if(failed===0 && partyFailed===0 && itemFailed===0){
     toast(`✅ ${synced} ${label.toLowerCase()} voucher(s) synced to your Google Sheet`);
   } else {
     const bits = [];
     if(failed) bits.push(`${synced}/${toSync.length} vouchers`);
     if(partyFailed) bits.push(`${partySynced}/${newParties.length} new ${isSales?'customers':'suppliers'}`);
-    toast(`⚠️ Synced ${bits.join(', ')} — ${failed+partyFailed} failed. Re-open Import Center → they're still saved locally, retry sync from Settings → Backup.`);
+    if(itemFailed) bits.push(`${itemSynced}/${changedItemList.length} item stock updates`);
+    toast(`⚠️ Synced ${bits.join(', ')} — ${failed+partyFailed+itemFailed} failed. Re-open Import Center → they're still saved locally, retry sync from Settings → Backup.`);
   }
 }
 function handleBankStatementFile(input){
