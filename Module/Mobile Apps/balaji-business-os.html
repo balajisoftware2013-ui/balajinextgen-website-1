@@ -3634,10 +3634,24 @@ function attemptSync(){
         // the user; keep the short machine "error" code (SUSPICIOUS_SHRINK,
         // MISSING_SHEET_ID, etc.) separately for logic like the shrink-
         // conflict banner — never surface the raw code itself in the UI.
+        const _wasAlreadyFailed = !!_lastSyncErrorCode || _syncRetryCount>0;
         _lastSyncErrorCode = (out && out.error) ? String(out.error) : '';
         _lastSyncError = (out && out.message) ? String(out.message) : (_lastSyncErrorCode || 'Server rejected the save');
         console.error('[sync] server rejected save:', out);
         updateSyncIndicator('failed');
+        // v79 FIX: the topbar "⚠️ Not synced" badge is small and easy to miss,
+        // especially mid-billing — a blocked/failed save could sit there
+        // unnoticed for a while, which is exactly what "record sometimes
+        // doesn't save" looks like from the user's side. Fire one visible
+        // toast the moment a save first fails (not on every retry, so it
+        // doesn't spam), with a clear next step.
+        if(!_wasAlreadyFailed){
+          if(_lastSyncErrorCode === 'SUSPICIOUS_SHRINK'){
+            toast('⚠️ Save blocked to protect your data — see the red banner / Force Save button in Settings → Connected Database.');
+          } else {
+            toast('⚠️ Could not save to cloud: ' + (_lastSyncError||'unknown error') + ' — will keep retrying.');
+          }
+        }
         // FIX: a SUSPICIOUS_SHRINK rejection means the server is correctly
         // refusing to overwrite good cloud data with a smaller local
         // dataset — retrying the SAME payload changes nothing and just
@@ -9561,9 +9575,21 @@ function _buildBsTwoColHTML(){
   const cr=totalPartyDue(DB.suppliers,'suppliers');
   const susp = getSuspenseTotal();
   const ta=DB.cash+DB.bank+sv+dr; const cap=ta-cr;
+  // v79: cap is still the balancing figure (so the sheet always ties out),
+  // but it's now split so the accumulated Net Profit — the same number the
+  // P&L reports as "Net Profit c/f" once you view All Time — is shown as
+  // its own line, exactly like Tally's Capital Account = Opening Capital +
+  // Reserves & Surplus. Whatever is left over (capIntroduced) is money in
+  // the business NOT explained by trading profit — an owner capital
+  // contribution, a manually-edited Cash/Bank balance, or Opening Stock
+  // that was entered without a matching capital entry.
+  const atPl = _allTimePL();
+  const netProfitTillDate = atPl.net;
+  const capIntroduced = cap - netProfitTillDate;
   const liabTotal = cr+cap, assetTotal = ta;
   const liabRows = [
-    _twoColRow('Capital Account', cap, null),
+    _twoColRow('Capital Introduced', capIntroduced, null),
+    _twoColRow('Net Profit (Till Date)', netProfitTillDate, `openReport('pl')`),
     _twoColRow('Sundry Creditors', cr, `goPage('money');moneyTab('suppliers')`),
   ];
   if(susp>0) liabRows.push(_twoColRow('Suspense A/c', susp, `openReport('suspense')`, '#B45309'));
@@ -9601,12 +9627,16 @@ function showBsTotalDetails(side){
   const cr=totalPartyDue(DB.suppliers,'suppliers');
   const susp = getSuspenseTotal();
   const ta=DB.cash+DB.bank+sv+dr; const cap=ta-cr;
+  const atPl2 = _allTimePL();
+  const netProfitTillDate2 = atPl2.net;
+  const capIntroduced2 = cap - netProfitTillDate2;
   let title, rows, total;
   if(side==='liab'){
     title = 'Liabilities — Total Breakdown';
     total = cr+cap;
     rows = [
-      {label:"Capital Account", amount:cap, nav:null},
+      {label:"Capital Introduced", amount:capIntroduced2, nav:null},
+      {label:"Net Profit (Till Date)", amount:netProfitTillDate2, nav:`openReport('pl')`},
       {label:"Sundry Creditors", amount:cr, nav:`goPage('money');moneyTab('suppliers')`},
     ];
     if(susp>0) rows.push({label:"Suspense A/c", amount:susp, nav:`openReport('suspense')`, color:'#B45309'});
@@ -9645,6 +9675,27 @@ function _plPeriodTotals(){
   const net = gross - exp + otherIncome;
   return {totalSales, totalPurch, exp, otherIncome, gross, net};
 }
+// v79 NEW: the Balance Sheet's "Capital Account" was a pure plug figure
+// (cap = totalAssets - creditors) computed from ALL-TIME cash/bank/stock/
+// debtors, while the P&L's Net Profit (_plPeriodTotals) is scoped to
+// whatever period filter is active (today/this month/etc). Those two
+// numbers were never the same thing, so the Balance Sheet never visibly
+// "showed" a profit figure the way Tally's Capital Account (Opening
+// Capital + Reserves & Surplus, i.e. accumulated P&L) does. This computes
+// the SAME P&L formula with no date filter at all, so it can be shown as
+// an explicit "Net Profit (Till Date)" line inside the Balance Sheet,
+// genuinely linking the two reports instead of leaving Capital as an
+// unexplained residual.
+function _allTimePL(){
+  const totalSales = (DB.sales||[]).reduce((a,s)=>a+(Number(s.total)||0),0);
+  const totalPurch = (DB.purchases||[]).reduce((a,p)=>a+(Number(p.total)||0),0);
+  const exp = (DB.expenses||[]).reduce((a,e)=>a+(Number(e.amount)||0),0)
+            + (DB.bankTxns||[]).filter(t=>t.type==='expense').reduce((a,t)=>a+(Number(t.amount)||0),0);
+  const otherIncome = (DB.bankTxns||[]).filter(t=>t.type==='income').reduce((a,t)=>a+(Number(t.amount)||0),0);
+  const gross = totalSales - totalPurch;
+  const net = gross - exp + otherIncome;
+  return {totalSales, totalPurch, exp, otherIncome, gross, net};
+}
 function _buildPlTwoColHTML(){
   const {totalSales, totalPurch, exp, otherIncome, gross, net} = _plPeriodTotals();
   const susp = getSuspenseTotal();
@@ -9667,7 +9718,8 @@ function _buildPlTwoColHTML(){
         <div style="display:flex;justify-content:space-between;padding:4px 6px;font-weight:700;border-top:1.3px solid #000;cursor:pointer;" onclick="showPlTotalDetails('cr')"><span>Total <span style="font-size:9px;color:var(--primary);">DETAILS ›</span></span><span class="mono">${fmt(crTotal)}</span></div>
       </div>
     </div>
-    ${susp>0?`<div style="font-size:11px;color:#B45309;margin-top:8px;">🕓 ${fmt(susp)} of expenses is still sitting in Suspense — clarify it from the Suspense Register.</div>`:''}`;
+    ${susp>0?`<div style="font-size:11px;color:#B45309;margin-top:8px;">🕓 ${fmt(susp)} of expenses is still sitting in Suspense — clarify it from the Suspense Register.</div>`:''}
+    <div style="font-size:11px;color:#666;margin-top:8px;cursor:pointer;" onclick="openReport('bs',document.querySelector('[onclick*=&quot;bs&quot;].rpt-type'))">ℹ️ This P&amp;L is for the selected period only. The Balance Sheet's "Net Profit (Till Date)" line shows the accumulated total since day one. Tap to view ›</div>`;
 }
 // v40: same drill-through pattern as the Balance Sheet Totals, for the P&L's
 // Dr (Expenses) and Cr (Income) column totals.
@@ -10714,7 +10766,8 @@ function openReport(type, el, forceRefresh){
      <div class="cart-row" style="cursor:pointer;" onclick="openSheet('expenseSheet')"><span>Expenses (incl. Suspense) <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">-${fmt(exp)}</span></div>
      ${otherIncome>0?`<div class="cart-row" style="cursor:pointer;" onclick="openSheet('bankSheet')"><span>Other Income <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(otherIncome)}</span></div>`:''}
      <div class="cart-total"><span>Net Profit</span><span class="mono ${net>=0?'green':'due'}">${fmt(net)}</span></div>
-     ${susp>0?`<div class="cart-row" style="cursor:pointer;margin-top:8px;color:#B45309;" onclick="openReport('suspense',document.querySelector('[onclick*=&quot;suspense&quot;].rpt-type'))"><span>🕓 Includes ${fmt(susp)} still in Suspense <span style="font-size:10px;">CLARIFY ›</span></span><span></span></div>`:''}`;
+     ${susp>0?`<div class="cart-row" style="cursor:pointer;margin-top:8px;color:#B45309;" onclick="openReport('suspense',document.querySelector('[onclick*=&quot;suspense&quot;].rpt-type'))"><span>🕓 Includes ${fmt(susp)} still in Suspense <span style="font-size:10px;">CLARIFY ›</span></span><span></span></div>`:''}
+     <div class="cart-row" style="cursor:pointer;margin-top:8px;font-size:11px;color:#666;" onclick="openReport('bs',document.querySelector('[onclick*=&quot;bs&quot;].rpt-type'))"><span>ℹ️ This is profit for <b>${filterLabel||'the selected period'}</b> only. The Balance Sheet's Capital Account shows accumulated profit since day one. <span style="color:var(--primary);">VIEW BALANCE SHEET ›</span></span><span></span></div>`;
     }
   } else if(type==='bs'){
     if(_rptBsPlView==='normal'){
@@ -10725,6 +10778,12 @@ function openReport(type, el, forceRefresh){
     const cr=totalPartyDue(DB.suppliers,'suppliers');
     const susp=getSuspenseTotal();
     const ta=DB.cash+DB.bank+sv+dr; const cap=ta-cr;
+    // v79: same Capital split as the Tally view — see _allTimePL() — so the
+    // profit figure actually appears here instead of being buried inside an
+    // unlabeled "Owner's Capital" residual.
+    const atPl3 = _allTimePL();
+    const netProfitTillDate3 = atPl3.net;
+    const capIntroduced3 = cap - netProfitTillDate3;
     tbl=`<div class="cart-row" style="font-weight:700;"><span>ASSETS</span><span></span></div>
      <div class="cart-row" style="cursor:pointer;" onclick="openSheet('bankSheet')"><span>Cash in Hand <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(DB.cash)}</span></div>
      <div class="cart-row" style="cursor:pointer;" onclick="openSheet('bankSheet')"><span>Bank Balance <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(DB.bank)}</span></div>
@@ -10733,9 +10792,10 @@ function openReport(type, el, forceRefresh){
      <div class="cart-total"><span>Total Assets</span><span class="mono">${fmt(ta)}</span></div>
      <div class="cart-row" style="font-weight:700;margin-top:8px;"><span>LIABILITIES</span><span></span></div>
      <div class="cart-row" style="cursor:pointer;" onclick="goPage('money');moneyTab('suppliers')"><span>Supplier Dues <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(cr)}</span></div>
-     <div class="cart-row"><span>Owner's Capital</span><span class="mono">${fmt(cap)}</span></div>
+     <div class="cart-row"><span>Capital Introduced</span><span class="mono">${fmt(capIntroduced3)}</span></div>
+     <div class="cart-row" style="cursor:pointer;" onclick="openReport('pl',document.querySelector('[onclick*=&quot;pl&quot;].rpt-type'))"><span>Net Profit (Till Date) <span style="color:var(--primary);font-size:10px;">VIEW P&amp;L ›</span></span><span class="mono ${netProfitTillDate3>=0?'green':'due'}">${fmt(netProfitTillDate3)}</span></div>
      <div class="cart-total"><span>Total Liabilities</span><span class="mono">${fmt(cr+cap)}</span></div>
-     ${susp>0?`<div class="cart-row" style="cursor:pointer;margin-top:8px;color:#B45309;" onclick="openReport('suspense',document.querySelector('[onclick*=&quot;suspense&quot;].rpt-type'))"><span>🕓 Owner's Capital above includes ${fmt(susp)} not yet classified (Suspense) <span style="font-size:10px;">CLARIFY ›</span></span><span></span></div>`:''}`;
+     ${susp>0?`<div class="cart-row" style="cursor:pointer;margin-top:8px;color:#B45309;" onclick="openReport('suspense',document.querySelector('[onclick*=&quot;suspense&quot;].rpt-type'))"><span>🕓 Capital above includes ${fmt(susp)} not yet classified (Suspense) <span style="font-size:10px;">CLARIFY ›</span></span><span></span></div>`:''}`;
     }
   } else if(type==='trialbalance'){
     const accounts = [];
@@ -15916,8 +15976,19 @@ document.addEventListener('keydown', (e) => {
   };
   
   // Stop polling on page unload
-  window.addEventListener('beforeunload', function() {
+  window.addEventListener('beforeunload', function(e) {
     _v67_stopRealTimePolling();
+    // v79 FIX: closing the tab/app while a save was still queued or in-
+    // flight (_pendingSyncPayload / _syncInFlight) silently dropped that
+    // change — persistDB() explicitly does NOT survive a reload, so
+    // whatever bill/customer/item was just entered had to be typed in
+    // again. Warn with the browser's native "leave site?" prompt so the
+    // person gets a chance to wait a few seconds instead of losing data.
+    if(typeof _pendingSyncPayload !== 'undefined' && (_pendingSyncPayload || _syncInFlight)){
+      e.preventDefault();
+      e.returnValue = 'Your latest changes are still saving to the cloud. Leaving now may lose them.';
+      return e.returnValue;
+    }
   });
   
   // Resume polling on page focus
