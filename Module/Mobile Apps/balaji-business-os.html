@@ -3479,10 +3479,32 @@ function yesterdayStr(){ const d=new Date(); d.setDate(d.getDate()-1); return d.
 // like PB221, PB222, ...) but appends a short random base-36 suffix, so
 // two independently-generated IDs can never collide even if the running
 // number matches.
-function genDocId(prefix, base, count){
-  const seq = base + count + 1;
-  const suffix = Math.random().toString(36).slice(2,5).toUpperCase();
-  return prefix + seq + '-' + suffix;
+// FIX: this used to be genDocId(prefix, base, count) → prefix + (base+count+1)
+// + '-' + a random 3-letter suffix (e.g. "INV1505-RTL"). It never looked at
+// DB.invoiceSettings.prefix/startNumber (the Settings → Billing fields the
+// person actually sees and edits), so those inputs were pure decoration, and
+// the random suffix made invoice numbers look broken/non-sequential. Now:
+// takes the real prefix + starting number from Settings, and computes the
+// next number by scanning the existing list for the highest number already
+// used with that prefix — so it self-heals after deletes, works correctly
+// across the bulk-import loop (each new record is unshifted into the list
+// before the next id is generated), and stays consistent across devices
+// once the realtime pull picks up the latest data.
+function genDocId(kind, list){
+  normalizeInvoiceSettings();
+  const cfg = DB.invoiceSettings;
+  const isSales = kind === 'SALES';
+  const prefix = ((isSales ? cfg.prefix : cfg.purchasePrefix) || (isSales ? 'INV' : 'PB')).trim() || (isSales ? 'INV' : 'PB');
+  const startNum = Number(isSales ? cfg.startNumber : cfg.purchaseStartNumber) || (isSales ? 1001 : 201);
+  let maxNum = startNum - 1;
+  const esc = prefix.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const re = new RegExp('^' + esc + '(\\d+)$');
+  (list||[]).forEach(rec=>{
+    const m = String((rec && rec.id) || '').match(re);
+    if(m){ const n = parseInt(m[1],10); if(!isNaN(n) && n > maxNum) maxNum = n; }
+  });
+  const width = Math.max(String(startNum).length, 4);
+  return prefix + String(maxNum + 1).padStart(width, '0');
 }
 
 let _pendingSyncPayload = null;
@@ -4648,6 +4670,14 @@ async function saveBizSettings(){
   normalizeInvoiceSettings();
   DB.invoiceSettings.format = (document.getElementById('setInvFormat')||{}).value || 'formatTally';
   DB.invoiceSettings.declaration = (document.getElementById('setInvDecl')||{}).value || DB.invoiceSettings.declaration;
+  // FIX: these two fields existed in the HTML since v1 but nothing ever read
+  // them — invoices were numbered off a hardcoded base with a random
+  // suffix regardless of what was typed here. Now actually applied by
+  // genDocId() the next time an invoice/purchase voucher is created.
+  const invPrefixVal = ((document.getElementById('setInvPrefix')||{}).value || '').trim();
+  if(invPrefixVal) DB.invoiceSettings.prefix = invPrefixVal;
+  const invStartVal = Number((document.getElementById('setInvStart')||{}).value);
+  if(invStartVal > 0) DB.invoiceSettings.startNumber = invStartVal;
   DB.invoiceSettings.custom = {
     logo: !!document.getElementById('ciLogo').checked,
     hsn: !!document.getElementById('ciHsn').checked,
@@ -4905,6 +4935,8 @@ function openSheet(id){
     normalizeInvoiceSettings();
     (document.getElementById('setInvFormat')||{value:''}).value = DB.invoiceSettings.format || 'formatTally';
     (document.getElementById('setInvDecl')||{value:''}).value = DB.invoiceSettings.declaration || '';
+    (document.getElementById('setInvPrefix')||{value:''}).value = DB.invoiceSettings.prefix || 'INV';
+    (document.getElementById('setInvStart')||{value:''}).value = DB.invoiceSettings.startNumber || 1001;
     (document.getElementById('setEinvIrn')||{value:''}).value = DB.einvoiceIrn || '';
     (document.getElementById('setEinvAckNo')||{value:''}).value = DB.einvoiceAckNo || '';
     (document.getElementById('setEinvAckDate')||{value:''}).value = DB.einvoiceAckDate || '';
@@ -6125,7 +6157,7 @@ function saveBill(print, sendWa){
   const total = Math.round((subtotal + courier + labour)*100)/100;
   const mode = document.getElementById('billMode').value;
   const gstType = (document.getElementById('billGstType')||{}).value || 'gst';
-  const id = genDocId('INV', 1042, DB.sales.length);
+  const id = genDocId('SALES', DB.sales);
   const today = new Date().toISOString().slice(0,10);
   const billedItems = cart.map(c=>{
     const it = DB.items.find(x=>x.id===c.id)||{};
@@ -12452,7 +12484,7 @@ function recordPurchase(){
   const amt = Math.round((subtotal + courierCharge + labourCharge)*100)/100;
   
   const itemSummary = purchCart.map(c=>`${c.name} x${c.qty}`).join(', ');
-  const id = genDocId('PB', 220, DB.purchases.length);
+  const id = genDocId('PURCHASE', DB.purchases);
   const purchRecord = {id, supp:s.id, date:invDate, total:amt, taxable, gstTotal, mode, item:itemSummary,
     invNo: invNo||null, invoiceFile: _purchInvoiceFile ? _purchInvoiceFile.name : null, invoiceFileUrl: null,
     courierCharge, labourCharge,
@@ -13254,12 +13286,12 @@ async function confirmTxnImport(){
     });
     const courier = v.courier || 0;
     if(isSales){
-      const id = genDocId('INV', 1042, DB.sales.length+count);
+      const id = genDocId('SALES', DB.sales);
       const total = Math.round((lineItems.reduce((a,li)=>a+li.qty*li.rate,0)+courier)*100)/100;
       DB.sales.unshift({id, cust:partyId, date:v.date, total, mode:v.mode, gstType:'gst', invNo:v.invNo||null, courierCharge:courier, lineItems});
       toSync.push({id, cust:partyId, custName:v.party||'', date:v.date, total, mode:v.mode, invNo:v.invNo||null, courierCharge:courier, lineItems});
     } else {
-      const id = genDocId('PB', 220, DB.purchases.length+count);
+      const id = genDocId('PURCHASE', DB.purchases);
       const taxable = lineItems.reduce((a,li)=>a+li.qty*li.rate,0);
       const gstTotal = lineItems.reduce((a,li)=>a+(li.qty*li.rate*(li.gst||0)/100),0);
       const total = Math.round((taxable+gstTotal+courier)*100)/100;
@@ -14161,6 +14193,17 @@ function normalizeInvoiceSettings(){
       custom:{logo:true, hsn:true, taxSummary:true, bank:true, qr:true, declaration:true, balance:false, pos:false}
     };
   }
+  // FIX: "Invoice Prefix" / "Invoice Starting Number" in Settings → Billing
+  // used to be pure decoration — no JS anywhere ever read #setInvPrefix or
+  // #setInvStart, so actual invoice numbers (genDocId) ignored them
+  // completely and used a hardcoded base + random 3-letter suffix instead
+  // (e.g. INV1505-RTL). Backfill defaults for existing businesses so this
+  // stays backward-compatible (same starting point as before), and give
+  // purchase vouchers their own prefix/start too.
+  if(DB.invoiceSettings.prefix === undefined) DB.invoiceSettings.prefix = 'INV';
+  if(DB.invoiceSettings.startNumber === undefined) DB.invoiceSettings.startNumber = 1001;
+  if(DB.invoiceSettings.purchasePrefix === undefined) DB.invoiceSettings.purchasePrefix = 'PB';
+  if(DB.invoiceSettings.purchaseStartNumber === undefined) DB.invoiceSettings.purchaseStartNumber = 201;
 }
 function getInvoiceFormatConfig(){
   normalizeInvoiceSettings();
