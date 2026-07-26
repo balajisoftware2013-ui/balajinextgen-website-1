@@ -3749,6 +3749,7 @@ function syncBankTxnRow(b){
 }
 // Settings is a single row per business — dedicated action rather than
 // LOG_PARTY, since it upserts one fixed record instead of a growing list.
+let _settingsSyncInFlight = false;
 function syncSettingsToSheet(){
   if(!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL)) return Promise.resolve({success:false, message:'Not connected to a cloud database.'});
   const s = {
@@ -3761,11 +3762,13 @@ function syncSettingsToSheet(){
     einvoiceIrn: DB.einvoiceIrn||'', einvoiceAckNo: DB.einvoiceAckNo||'', einvoiceAckDate: DB.einvoiceAckDate||'',
     invoiceSettings: DB.invoiceSettings||{}, salesPersonEnabled: !!DB.salesPersonEnabled
   };
+  _settingsSyncInFlight = true;
   return fetch(_gasUrlCacheBust(),{method:'POST',cache:'no-store',headers:{'Content-Type':'text/plain'},
     body:JSON.stringify({action:'SAVE_SETTINGS', sheetId:SESSION.sheetId, settings:s})})
     .then(r=>r.json())
     .then(out=> out && out.success ? {success:true} : {success:false, message:(out&&out.message)||'Server rejected the save.'})
-    .catch(e=> ({success:false, message: e.message||'Could not reach the server — check your connection.'}));
+    .catch(e=> ({success:false, message: e.message||'Could not reach the server — check your connection.'}))
+    .finally(()=>{ _settingsSyncInFlight = false; });
 }
 function logRowToSheet(action, payload){
   // v59 fix: this used to resolve to the raw fetch Response (or undefined on
@@ -4541,7 +4544,41 @@ async function submitLogin(){
     if(btn){ btn.disabled = false; btn.style.opacity = ''; btn.style.pointerEvents = ''; }
   }
 }
-function logoutApp(silent){
+// v79 FIX: "change a setting (e.g. State), then logout — change isn't saved."
+// persistDB()/syncSettingsToSheet() push to the cloud ASYNCHRONOUSLY — the
+// save can still be in-flight, or sitting in retry backoff after a network
+// hiccup, when the user taps Logout. The old logoutApp() didn't check for
+// any of that — it just wiped the local session immediately, abandoning
+// _pendingSyncPayload mid-air. Since that payload only lives in memory (see
+// persistDB()'s comment) and dies with the session, the change never
+// reached the Sheet and was gone on next login. Logout now waits for a
+// pending save to actually finish (forcing it out of retry-backoff if
+// needed) before clearing the session.
+function _flushPendingSyncBeforeLogout(maxWaitMs){
+  return new Promise(resolve=>{
+    if(!_pendingSyncPayload && !_syncInFlight && !_settingsSyncInFlight){ resolve(true); return; }
+    const start = Date.now();
+    (function poll(){
+      if(!_pendingSyncPayload && !_syncInFlight && !_settingsSyncInFlight){ resolve(true); return; }
+      if(Date.now()-start >= maxWaitMs){ resolve(false); return; }
+      // If a prior failure left it waiting out a retry backoff timer, force
+      // it to try right now instead of waiting out the full backoff window.
+      if(!_syncInFlight && _pendingSyncPayload) attemptSync();
+      setTimeout(poll, 300);
+    })();
+  });
+}
+async function logoutApp(silent){
+  if(SESSION && !SESSION.isDemo && (_pendingSyncPayload || _syncInFlight || _settingsSyncInFlight)){
+    if(!silent) toast('Saving your changes before logout…');
+    const saved = await _flushPendingSyncBeforeLogout(8000);
+    if(!saved && !silent){
+      if(!confirm('Your last change could not be confirmed as saved (no internet, or the server is unreachable). Log out anyway? Unsaved changes may be lost.')) return;
+    }
+    // Silent logouts (idle timeout / session expiry) proceed regardless —
+    // we tried our best to save, but must not block an automatic logout
+    // behind a confirm() dialog nobody may be there to answer.
+  }
   localStorage.removeItem('bnos_session');
   SESSION = null;
   document.getElementById('onboardGate').style.display = 'flex';
