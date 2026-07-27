@@ -1957,6 +1957,16 @@ body.mode-accountant .owner-hint{display:none;}
     <div class="rpt-type active" id="rptStockViewAppBtn" onclick="setRptStockView('app')">📋 App View</div>
     <div class="rpt-type" id="rptStockViewTallyBtn" onclick="setRptStockView('tally')">🧾 Tally Style</div>
   </div>
+  <div id="rptStockSearchBar" style="display:none;margin-top:8px;">
+    <input id="rptStockSearch" placeholder="🔍 Search items…" oninput="setRptStockSearch(this.value)" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:8px;font-size:13px;">
+  </div>
+  <div id="rptStockSignToggle" style="display:none;margin-top:8px;gap:8px;align-items:center;">
+    <select id="rptStockSignSelect" onchange="setRptStockSign(this.value)" style="padding:8px 10px;border:1px solid var(--border);border-radius:8px;font-size:13px;background:#fff;margin-left:auto;">
+      <option value="all">All Stock</option>
+      <option value="positive">✅ Positive (In-Hand)</option>
+      <option value="negative">⚠️ Negative (Over-Issued)</option>
+    </select>
+  </div>
 
   <!-- Report content -->
   <div class="panel" style="margin-top:10px;padding:0;overflow:hidden;" id="reportPanel">
@@ -3050,6 +3060,15 @@ body.mode-accountant .owner-hint{display:none;}
       pick it up immediately, instead of waiting for the next automatic sync.
     </div>
     <button class="btn btn-outline" id="refreshCloudBtn" style="width:100%;" onclick="refreshFromCloud()">🔄 Refresh From Cloud</button>
+
+    <div style="font-size:12px;font-weight:800;color:var(--text);margin:14px 0 4px;">🔍 Reconcile</div>
+    <div style="font-size:11px;color:var(--sub);margin-bottom:10px;line-height:1.6;">
+      Checks your Sheet tabs for rows that never made it into your synced data (e.g. from a period when
+      syncing was failing) without changing or deleting anything. If gaps are found, "Apply Fix" pulls them
+      in — this only adds missing rows, it never touches anything that's already correct.
+    </div>
+    <button class="btn btn-outline" id="reconcileCheckBtn" style="width:100%;" onclick="runReconcileCheck()">🔍 Run Reconcile Check</button>
+    <button class="btn btn-primary" id="reconcileFixBtn" style="width:100%;margin-top:8px;display:none;" onclick="runReconcileAndSave()">🛠️ Apply Fix</button>
     <div id="reconcileResult" style="display:none;margin-top:12px;font-size:12px;background:var(--body-bg);border-radius:10px;padding:10px 12px;line-height:1.8;"></div>
     <button class="btn btn-primary" id="forceSaveBtn" style="width:100%;margin-top:10px;display:none;background:var(--red);" onclick="forceSaveAndOverwrite()">⚠️ Force Save (overwrite cloud data)</button>
 
@@ -4505,8 +4524,16 @@ function startRealtimeSync(){
   // focus/visibility, since a poll may have been missed while hidden.
   pullRemoteUpdates();
   _syncIntervalId = setInterval(pullRemoteUpdates, 5000);
-  document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) pullRemoteUpdates(); });
-  window.addEventListener('focus', pullRemoteUpdates);
+  // FIX: this function can run more than once per page load (called from
+  // both the login-success path and the resume path) — without a guard,
+  // each call added ANOTHER 'visibilitychange'/'focus' listener, so after a
+  // logout+login cycle pullRemoteUpdates() would fire multiple times per
+  // tab-focus/visibility event, compounding on every subsequent cycle.
+  if(!window._realtimeListenersAttached){
+    window._realtimeListenersAttached = true;
+    document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) pullRemoteUpdates(); });
+    window.addEventListener('focus', pullRemoteUpdates);
+  }
 }
 function startDemo(){
   SESSION = { isDemo:true, clientId:'DEMO', plan:'TRIAL', trialEnd: Date.now() + 90*86400000, name:'Demo Business' };
@@ -8851,6 +8878,22 @@ function setRptStockView(mode){
   document.getElementById('rptStockViewTallyBtn').classList.toggle('active', mode==='tally');
   if(_lastReportType==='stock') openReport('stock');
 }
+// Current Stock report: Positive (in-hand, category-wise) vs Negative (over-
+// issued — sold/adjusted more than ever recorded as purchased) toggle.
+// Previously the report silently dropped every negative-stock item with no
+// way to see them here at all — only the separate "Negative Stock" report
+// under Inventory Health showed them, and only Positive items ever got a
+// category breakdown.
+let _rptStockSign = 'all';
+function setRptStockSign(mode){
+  _rptStockSign = mode;
+  if(_lastReportType==='stock') openReport('stock');
+}
+let _rptStockSearch = '';
+function setRptStockSearch(q){
+  _rptStockSearch = (q||'').trim().toLowerCase();
+  if(_lastReportType==='stock'||_lastReportType==='stockledger') openReport(_lastReportType);
+}
 function _fmtTallyDate(d){
   const dt = d instanceof Date ? d : new Date(d);
   const months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -11126,37 +11169,58 @@ function openReport(type, el, forceRefresh){
   } else if(type==='brs'){
     tbl = _renderBRS();
   } else if(type==='stock'){
-    // v47 FIX: "current stock need without zero" — items sitting at 0 stock
-    // (never purchased / fully sold out with nothing pending) were cluttering
-    // this report. Filtering to stock>0 here means the totals/row-count below
-    // (which both derive from `items`) automatically match the filtered list too.
-    const items = (DB.items||[]).filter(i=>Number(i.stock)>0);
-    const stockTotal = items.reduce((a,i)=>a+(i.pRate*i.stock||0),0);
+    // v82: per feedback, removed the Positive/Negative/Net summary bar and
+    // By Category breakdown — kept only the All/Positive/Negative filter
+    // dropdown and the search box, with a single Total Stock Value line
+    // matching whichever filter is active.
+    const allPosItems = (DB.items||[]).filter(i=>Number(i.stock)>0);
+    const allNegItems = (DB.items||[]).filter(i=>Number(i.stock)<0);
+
+    const searchFilter = i => !_rptStockSearch || i.name.toLowerCase().includes(_rptStockSearch) || (i.hsn||'').toLowerCase().includes(_rptStockSearch) || (i.category||'').toLowerCase().includes(_rptStockSearch);
+
+    let items;
+    if(_rptStockSign==='negative') items = allNegItems;
+    else if(_rptStockSign==='all') items = [...allPosItems, ...allNegItems].sort((a,b)=>a.name.localeCompare(b.name));
+    else items = allPosItems;
+    const shown = items.filter(searchFilter);
+    const shownTotal = shown.reduce((a,i)=>a+(i.pRate*i.stock||0),0);
     const showDec = groupHasDecimal(items.map(i=>i.pRate*i.stock));
-    if(_rptStockView==='tally'){
-      tbl = _renderTallyStockTable(items, stockTotal, showDec);
+
+    if(_rptStockSign!=='negative' && _rptStockView==='tally'){
+      tbl = _renderTallyStockTable(shown, shownTotal, showDec);
     } else {
-    const bodyHtml = items.length ? items.map((i,idx)=>`
-      <tr onclick="viewItemMovementFromInventory('${i.id}')" style="cursor:pointer;${i.stock<=i.min?'color:var(--red);':''}">
-        <td>${idx+1}</td>
-        <td style="text-align:left;">${i.name}</td>
-        <td style="text-align:center;white-space:nowrap;">${i.hsn||'—'}</td>
-        <td class="mono">${fmtQtyDisplay(i.stock, i.unit)}</td>
-        <td style="text-align:center;">${i.unit||'Pcs'}</td>
-        <td class="mono">${fmtSmart(i.pRate, showDec)}</td>
-        <td class="mono" style="font-weight:700;">${fmtSmart(i.pRate*i.stock, showDec)}</td>
-      </tr>`).join('') : `<tr><td colspan="7" style="text-align:center;color:var(--sub);">No items yet</td></tr>`;
-    tbl = `<div class="cart-row"><span>Total Stock Value</span><span class="mono">${fmtSmart(stockTotal, showDec)}</span></div>
-      <div class="cart-row"><span>Items</span><span class="mono">${items.length}</span></div>
+      const bodyHtml = shown.length ? shown.map((i,idx)=>`
+        <tr onclick="${i.stock<0?`openEditItemSheet('${i.id}')`:`viewItemMovementFromInventory('${i.id}')`}" style="cursor:pointer;${i.stock<0||i.stock<=i.min?'color:var(--red);':''}">
+          <td>${idx+1}</td>
+          <td style="text-align:left;">${i.name}</td>
+          <td style="text-align:center;white-space:nowrap;">${i.hsn||'—'}</td>
+          <td class="mono">${fmtQtyDisplay(i.stock, i.unit)}</td>
+          <td style="text-align:center;">${i.unit||'Pcs'}</td>
+          <td class="mono">${fmtSmart(i.pRate, showDec)}</td>
+          <td class="mono" style="font-weight:700;">${fmtSmart(i.pRate*i.stock, showDec)}</td>
+        </tr>`).join('') : `<tr><td colspan="7" style="text-align:center;color:var(--sub);">${_rptStockSearch?'No items match your search':'No items'}</td></tr>`;
+      tbl = `<div class="cart-row"><span>Total Stock Value</span><span class="mono">${fmtSmart(shownTotal, showDec)}</span></div>
+      <div class="cart-row"><span>Items</span><span class="mono">${shown.length}</span></div>
       <div class="doc-items-wrap"><table class="doc-items-tbl reg-tbl">
         <thead><tr><th>#</th><th>Item</th><th>HSN</th><th>Qty</th><th>Unit</th><th>Rate</th><th>Value</th></tr></thead>
         <tbody>${bodyHtml}</tbody>
-        <tfoot><tr><td colspan="6">Total</td><td class="mono">${fmtSmart(stockTotal, showDec)}</td></tr></tfoot>
+        <tfoot><tr><td colspan="6">Total</td><td class="mono">${fmtSmart(shownTotal, showDec)}</td></tr></tfoot>
       </table></div>
-      <div style="font-size:11px;color:var(--sub);margin-top:6px;">Rows in <span style="color:var(--red);">red</span> are at or below minimum stock. Tap a row for full movement detail →</div>`;
+      <div style="font-size:11px;color:var(--sub);margin-top:6px;">Rows in <span style="color:var(--red);">red</span> are negative or at/below minimum stock. Tap a row for detail →</div>`;
     }
   } else if(type==='stockledger'){
-    const startDate = _invPeriodStartDate(_invMovePeriod);
+    // FIX: this used to read _invMovePeriod / _invPeriodStartDate — state
+    // that belongs to the separate Inventory → Movement page and is only
+    // ever updated by ITS OWN period buttons. Stock Ledger's own Day/Month/
+    // Qtr/Year/Custom buttons (right here on this report) never touched
+    // that variable, so it stayed stuck at its default 'all', which
+    // _invPeriodStartDate() resolves to `null` — making "purchases/sales
+    // before this period" always an empty list, so Opening was always 0
+    // for every item, no matter which period was actually selected. Now
+    // reads the Reports page's own active period (_rptFilter, via
+    // _rptPeriodRange()) — the exact same source the Purchase/Sale columns
+    // on this same report already correctly use.
+    const startDate = _rptPeriodRange().from;
     const periodPurchases = filterByDateRange(DB.purchases||[], 'date');
     const priorPurchases = startDate ? (DB.purchases||[]).filter(p=>p.date < startDate) : [];
     const periodCN = filterByDateRange(DB.creditNotes||[], 'date');
@@ -11180,16 +11244,19 @@ function openReport(type, el, forceRefresh){
       const closingQty = it.stock||0; // authoritative — matches Current Stock tab exactly
       return {id:it.id, name:it.name, hsn:it.hsn||'—', unit:it.unit||'Pcs', openingQty, purQty, purVal, salQty, salVal, adjQty, closingQty, closingRate:it.pRate, closingVal:closingQty*it.pRate};
     }); // Show ALL items, even those with zero movement
+    const shownRows = _rptStockSearch
+      ? summary.filter(r=> r.name.toLowerCase().includes(_rptStockSearch) || (r.hsn||'').toLowerCase().includes(_rptStockSearch))
+      : summary;
     tbl = `<div class="inv-tbl-wrap"><table class="inv-tbl"><thead><tr>
       <th>Item (HSN)</th><th>Unit</th><th class="num">Opening</th><th class="num">Purchase</th><th class="num">Sale</th><th class="num">Adj</th><th class="num">Closing</th><th class="num">Rate</th><th class="num">Value</th>
-    </tr></thead><tbody>${summary.length ? summary.map(r=>`<tr style="cursor:pointer;" onclick="viewStockLedgerDetail('${r.id}')">
+    </tr></thead><tbody>${shownRows.length ? shownRows.map(r=>`<tr style="cursor:pointer;" onclick="viewStockLedgerDetail('${r.id}')">
       <td>${r.name}${r.hsn && r.hsn!=='—' ? '<div style="font-size:9px;color:var(--sub);">HSN '+r.hsn+'</div>' : ''}</td>
       <td>${r.unit||'Pcs'}</td><td class="mono">${fmtQtyDisplay(r.openingQty, r.unit)}</td>
       <td class="mono">${r.purQty ? fmtQtyDisplay(r.purQty, r.unit) : '—'}</td>
       <td class="mono">${r.salQty ? fmtQtyDisplay(r.salQty, r.unit) : '—'}</td>
       <td class="mono">${r.adjQty ? fmtQtyDisplay(r.adjQty, r.unit) : '—'}</td>
       <td class="mono">${fmtQtyDisplay(r.closingQty, r.unit)}</td><td class="mono">${fmt(r.closingRate)}</td>
-      <td class="mono">${fmt(r.closingVal)}</td></tr>`) : '<tr><td colspan="9" style="text-align:center;color:var(--sub);">No items</td></tr>'}
+      <td class="mono">${fmt(r.closingVal)}</td></tr>`).join('') : `<tr><td colspan="9" style="text-align:center;color:var(--sub);">${_rptStockSearch?'No items match your search':'No items'}</td></tr>`}
     </tbody><tfoot><tr><td colspan="7"><b>Total Stock Value</b></td><td></td><td class="mono"><b>${fmt(summary.reduce((a,r)=>a+r.closingVal,0))}</b></td></tr></tfoot></table></div>`;
   } else if(type==='itemwise'){
     const itemSales = {}, itemPurch = {};
@@ -11756,6 +11823,18 @@ function openReport(type, el, forceRefresh){
     stockViewToggle.style.display = (type==='stock') ? 'flex' : 'none';
     document.getElementById('rptStockViewAppBtn').classList.toggle('active', _rptStockView==='app');
     document.getElementById('rptStockViewTallyBtn').classList.toggle('active', _rptStockView==='tally');
+  }
+  const stockSearchBar = document.getElementById('rptStockSearchBar');
+  if(stockSearchBar){
+    stockSearchBar.style.display = (type==='stock'||type==='stockledger') ? 'block' : 'none';
+    const searchBox = document.getElementById('rptStockSearch');
+    if(searchBox && document.activeElement !== searchBox) searchBox.value = _rptStockSearch;
+  }
+  const stockSignToggle = document.getElementById('rptStockSignToggle');
+  if(stockSignToggle){
+    stockSignToggle.style.display = (type==='stock') ? 'flex' : 'none';
+    const signSel = document.getElementById('rptStockSignSelect');
+    if(signSel && signSel.value !== _rptStockSign) signSel.value = _rptStockSign;
   }
   
   // v70: Cache the report data immediately after rendering
@@ -12484,7 +12563,7 @@ function askAI(q){
 
   // ── INFO QUESTIONS ───────────────────────────────────────────
   let ans = "I'm not sure yet — try asking about profit, dues, stock, or cash.";
-  if(ql.includes('profit')) ans = `Today's estimated profit is <b>${document.getElementById('todayProfit').textContent}</b>, margin ${document.getElementById('profitMargin').textContent}.`;
+  if(ql.includes('profit')) ans = `Today's estimated profit is <b>${document.getElementById('todayProfit').textContent}</b>, margin ${(document.getElementById('profitMarginSub')||{}).textContent||'—'}.`;
   else if(ql.includes('not paid')||ql.includes('due')||ql.includes('outstanding')) {
     const due = DB.customers.map(c=>({c, bal:getPartyDocBalance(c,'customers')})).filter(x=>x.bal>0).sort((a,b)=>b.bal-a.bal);
     ans = due.length ? due.map(x=>`${x.c.name} — ${fmt(x.bal)}`).join('<br>') : 'No customer has dues right now 🎉';
