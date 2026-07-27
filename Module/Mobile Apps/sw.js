@@ -1,248 +1,82 @@
-// Service Worker for Balaji WealthPilot360
-// Version 1.0.1
-// Features: Offline support, caching, background sync
+// ════════════════════════════════════════════════════════════════════════
+// Balaji NextGen Business OS — Service Worker
+// ════════════════════════════════════════════════════════════════════════
+// FIX (this version): the old service worker cached the app's own HTML,
+// which is exactly what caused "I uploaded a new balaji-business-os.html
+// but some browsers still show the old one." A frequently-updated app
+// shell must NEVER be cache-first — only truly static sub-resources
+// (logo, icons, manifest) should be cached, and even those go
+// network-first so an updated asset shows promptly. The HTML document
+// itself, and anything talking to the Apps Script backend, always goes
+// straight to the network; a cached copy is only used as an offline
+// fallback if the network request genuinely fails.
 //
-// ⚠️ FILENAME MATTERS: the HTML registers this at
-//   location.pathname's folder + "sw.js"
-// so this file MUST be uploaded/deployed as exactly "sw.js",
-// sitting in the SAME folder as your WealthPilot360.html.
-// (Renaming it "service-worker_wealthpilot360.js" — its old
-// name — means the browser 404s on registration and none of
-// this ever runs.)
+// Bump CACHE_VERSION on every deploy that changes cached static assets
+// (not required for HTML/JS changes inside balaji-business-os.html itself,
+// since those are never cached by this file — only bump when logo/icon/
+// manifest files change). Bumping it also forces old cached entries from
+// any previous version to be dropped on activate.
+// ════════════════════════════════════════════════════════════════════════
 
-const CACHE_VERSION = 'wealthpilot360-v1.0.1';
+const CACHE_VERSION = 'bnos-v1';
 
-// v2 FIX: paths made relative (no leading "/") and pointed at the
-// ACTUAL files that exist next to this one. The old list referenced
-// "/Balaji_WealthPilot360.html" and "/WealthPilot360/..." — filenames/
-// folders that don't match the real deployment, so every one of these
-// silently failed to cache (caught by the .catch() below, but still
-// meant offline mode had nothing to fall back to). Relative paths also
-// mean this works no matter which subfolder the site is deployed into.
-const CACHE_URLS = [
-  './',
-  './WealthPilot360.html',
-  './sw.js'
-];
-
-// Where to send someone when they're offline and the page they asked
-// for isn't cached. Relative, so it resolves correctly under any
-// deployment path.
-const OFFLINE_FALLBACK_URL = './WealthPilot360.html';
-
-// Install Event - Cache essential files
-self.addEventListener('install', event => {
-  console.log('🔧 Service Worker installing...');
-  
-  event.waitUntil(
-    caches.open(CACHE_VERSION)
-      .then(cache => {
-        console.log('✅ Cache opened:', CACHE_VERSION);
-        // Cache essential files
-        return Promise.all(
-          CACHE_URLS.map(url => {
-            return cache.add(url).catch(err => {
-              console.warn('⚠️ Failed to cache:', url, err);
-            });
-          })
-        );
-      })
-      .then(() => {
-        console.log('✅ Service Worker installed');
-        self.skipWaiting();
-      })
-      .catch(err => {
-        console.error('❌ Installation failed:', err);
-      })
-  );
+self.addEventListener('install', () => {
+  // Take over immediately instead of waiting for every open tab to close —
+  // this is what makes a fresh deploy actually take effect, combined with
+  // the app's own 'controllerchange' listener that reloads the page once
+  // this new worker takes control.
+  self.skipWaiting();
 });
 
-// Activate Event - Clean up old caches
-self.addEventListener('activate', event => {
-  console.log('🔄 Service Worker activating...');
-  
+self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys()
-      .then(cacheNames => {
-        return Promise.all(
-          cacheNames.map(cacheName => {
-            if (cacheName !== CACHE_VERSION) {
-              console.log('🗑️ Deleting old cache:', cacheName);
-              return caches.delete(cacheName);
-            }
-          })
-        );
-      })
-      .then(() => {
-        console.log('✅ Service Worker activated');
-        return self.clients.claim();
-      })
+      .then((keys) => Promise.all(
+        keys.filter((k) => k !== CACHE_VERSION).map((k) => caches.delete(k))
+      ))
+      .then(() => self.clients.claim())
   );
 });
 
-// Fetch Event - Serve from cache, fallback to network
-self.addEventListener('fetch', event => {
-  const url = event.request.url;
-  
-  // Skip non-GET requests
-  if (event.request.method !== 'GET') {
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  if (req.method !== 'GET') return; // never intercept POSTs (e.g. Apps Script saves)
+
+  let url;
+  try { url = new URL(req.url); } catch (e) { return; }
+
+  // Only ever handle plain http(s) requests. Caching a "chrome-extension://"
+  // (or any other non-http scheme) request always throws
+  // "Failed to execute 'put' on 'Cache': Request scheme ... is unsupported" —
+  // this guard is what stops those errors from appearing in the console.
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
+
+  const isNavigation = req.mode === 'navigate' ||
+    (req.headers.get('accept') || '').includes('text/html');
+  const isHtmlFile = url.pathname.endsWith('.html');
+  const isBackend = url.hostname === 'script.google.com';
+
+  // App shell (any .html page) and every call to the Apps Script backend:
+  // always network, no caching at all. A stale HTML page or a cached API
+  // response are both worse than a failed request here.
+  if (isNavigation || isHtmlFile || isBackend) {
+    event.respondWith(fetch(req).catch(() => caches.match(req)));
     return;
   }
-  
-  // Skip external URLs
-  if (url.includes('googleapis.com') || url.includes('google.com')) {
-    event.respondWith(fetch(event.request));
-    return;
-  }
-  
+
+  // Everything else (logo, icons, manifest.json, etc.): network-first so an
+  // updated asset is picked up on the very next load, falling back to the
+  // last cached copy only when the network request fails (offline / flaky
+  // connection) — never served stale-while-network-is-fine.
   event.respondWith(
-    caches.match(event.request)
-      .then(response => {
-        // Return cached response if available
-        if (response) {
-          console.log('📦 Serving from cache:', url);
-          return response;
+    fetch(req)
+      .then((res) => {
+        if (res && res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE_VERSION).then((cache) => cache.put(req, copy)).catch(() => {});
         }
-        
-        // Fetch from network
-        return fetch(event.request)
-          .then(response => {
-            // Check if valid response
-            if (!response || response.status !== 200) {
-              return response;
-            }
-            
-            // Clone response for caching
-            const responseToCache = response.clone();
-            
-            // Cache successful responses
-            caches.open(CACHE_VERSION)
-              .then(cache => {
-                cache.put(event.request, responseToCache);
-                console.log('💾 Cached:', url);
-              });
-            
-            return response;
-          })
-          .catch(error => {
-            // Network error - return cached fallback
-            console.log('🔌 Offline - serving cached:', url);
-            return caches.match(OFFLINE_FALLBACK_URL)
-              .then(response => {
-                if (response) {
-                  return response;
-                }
-                // Generic offline response
-                return new Response(
-                  '<html><body><h1>Offline</h1><p>You are offline. Local data is still accessible.</p></body></html>',
-                  {
-                    headers: { 'Content-Type': 'text/html' }
-                  }
-                );
-              });
-          });
+        return res;
       })
+      .catch(() => caches.match(req))
   );
 });
-
-// Background Sync Event - Sync data when online
-self.addEventListener('sync', event => {
-  console.log('🔄 Background sync event:', event.tag);
-  
-  if (event.tag === 'sync-data') {
-    event.waitUntil(
-      // Send queued data to server
-      self.clients.matchAll()
-        .then(clients => {
-          clients.forEach(client => {
-            client.postMessage({
-              type: 'BACKGROUND_SYNC',
-              message: 'Syncing financial data with server...'
-            });
-          });
-        })
-        .catch(err => {
-          console.error('❌ Sync error:', err);
-        })
-    );
-  }
-});
-
-// Push Notification Event
-self.addEventListener('push', event => {
-  console.log('📬 Push notification received');
-  
-  const options = {
-    body: event.data ? event.data.text() : 'New notification',
-    icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192"><rect fill="%23FF7A1A" width="192" height="192" rx="30"/><text x="96" y="110" font-size="80" fill="white" text-anchor="middle" font-family="Arial" font-weight="bold">WP</text></svg>',
-    badge: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><circle fill="%23FF7A1A" cx="48" cy="48" r="48"/></svg>',
-    tag: 'wealthpilot360-notification',
-    requireInteraction: false,
-    vibrate: [200, 100, 200],
-    actions: [
-      {
-        action: 'open',
-        title: 'Open',
-        icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><text x="48" y="60" font-size="50" text-anchor="middle">➜</text></svg>'
-      },
-      {
-        action: 'dismiss',
-        title: 'Dismiss',
-        icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><text x="48" y="60" font-size="50" text-anchor="middle">✕</text></svg>'
-      }
-    ]
-  };
-  
-  event.waitUntil(
-    self.registration.showNotification('WealthPilot360', options)
-  );
-});
-
-// Notification Click Event
-self.addEventListener('notificationclick', event => {
-  console.log('👆 Notification clicked:', event.action);
-  
-  event.notification.close();
-  
-  if (event.action === 'open' || !event.action) {
-    event.waitUntil(
-      clients.matchAll({ type: 'window' })
-        .then(clientList => {
-          // Look for already open window
-          for (let i = 0; i < clientList.length; i++) {
-            if (clientList[i].url.endsWith('WealthPilot360.html') && 'focus' in clientList[i]) {
-              return clientList[i].focus();
-            }
-          }
-          // Open new window if not found
-          if (clients.openWindow) {
-            return clients.openWindow(OFFLINE_FALLBACK_URL);
-          }
-        })
-    );
-  }
-});
-
-// Message Handler - Receive messages from app
-self.addEventListener('message', event => {
-  console.log('📨 Message from app:', event.data);
-  
-  if (event.data.action === 'SKIP_WAITING') {
-    self.skipWaiting();
-  }
-  
-  if (event.data.action === 'CLEAR_CACHE') {
-    caches.delete(CACHE_VERSION).then(() => {
-      console.log('🗑️ Cache cleared');
-    });
-  }
-  
-  if (event.data.action === 'CACHE_URLS') {
-    caches.open(CACHE_VERSION)
-      .then(cache => {
-        cache.addAll(event.data.urls || []);
-      });
-  }
-});
-
-console.log('✅ WealthPilot360 Service Worker loaded and ready');
