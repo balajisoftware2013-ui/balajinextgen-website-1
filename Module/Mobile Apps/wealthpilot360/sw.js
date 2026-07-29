@@ -22,7 +22,7 @@
 // file, since those are never cached by this worker at all.
 // ════════════════════════════════════════════════════════════════════════
 
-const CACHE_VERSION = 'balaji-apps-v1';
+const CACHE_VERSION = 'balaji-apps-v2';
 
 self.addEventListener('install', () => {
   // Take over immediately instead of waiting for every open tab to close —

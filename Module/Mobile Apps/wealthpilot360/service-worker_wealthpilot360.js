@@ -1,228 +1,61 @@
-// Service Worker for Balaji WealthPilot360
-// Version 1.0
-// Features: Offline support, caching, background sync
+// ════════════════════════════════════════════════════════════════════════
+// service-worker_wealthpilot360.js — KILL SWITCH
+// ════════════════════════════════════════════════════════════════════════
+// This file used to be a CACHE-FIRST service worker for the whole app
+// shell (it served /Balaji_WealthPilot360.html straight from cache before
+// ever asking the network). Any device that installed it is permanently
+// stuck showing whatever HTML was cached on the day it was installed —
+// that device never even requests a newer page, because this worker
+// intercepts the request and answers from its own cache first.
+//
+// The current app registers a different, correct worker (sw.js, network-
+// first for the app shell) — but a device already running THIS worker
+// never sees that change, because it's still being served by this one.
+//
+// Fix: browsers periodically re-fetch a registered service worker's own
+// script to check whether its bytes changed. Overwriting this exact file
+// with the code below means any device still running the old cache-first
+// version will, on its next check-in:
+//   1. Install this version instead (skipWaiting — immediate).
+//   2. Delete every cache this worker ever created (wipes the trapped
+//      stale HTML/JS so it can never be served again).
+//   3. Unregister itself entirely, so from that point on this scope has
+//      NO service worker at all, and every request goes straight to the
+//      network like a normal page — which is exactly where the current
+//      app's own sw.js registration (from a normal, non-cached page load)
+//      can take over cleanly.
+//   4. Tell every open tab/window it controls to hard-reload immediately.
+// ════════════════════════════════════════════════════════════════════════
 
-const CACHE_VERSION = 'wealthpilot360-v1.0.0';
-const CACHE_URLS = [
-  '/WealthPilot360/',
-  '/WealthPilot360/index.html',
-  '/WealthPilot360/manifest_wealthpilot360.json',
-  '/WealthPilot360/service-worker_wealthpilot360.js'
-];
-
-// Install Event - Cache essential files
-self.addEventListener('install', event => {
-  console.log('🔧 Service Worker installing...');
-  
-  event.waitUntil(
-    caches.open(CACHE_VERSION)
-      .then(cache => {
-        console.log('✅ Cache opened:', CACHE_VERSION);
-        // Cache essential files
-        return Promise.all(
-          CACHE_URLS.map(url => {
-            return cache.add(url).catch(err => {
-              console.warn('⚠️ Failed to cache:', url, err);
-            });
-          })
-        );
-      })
-      .then(() => {
-        console.log('✅ Service Worker installed');
-        self.skipWaiting();
-      })
-      .catch(err => {
-        console.error('❌ Installation failed:', err);
-      })
-  );
+self.addEventListener('install', () => {
+  self.skipWaiting();
 });
 
-// Activate Event - Clean up old caches
-self.addEventListener('activate', event => {
-  console.log('🔄 Service Worker activating...');
-  
-  event.waitUntil(
-    caches.keys()
-      .then(cacheNames => {
-        return Promise.all(
-          cacheNames.map(cacheName => {
-            if (cacheName !== CACHE_VERSION) {
-              console.log('🗑️ Deleting old cache:', cacheName);
-              return caches.delete(cacheName);
-            }
-          })
-        );
-      })
-      .then(() => {
-        console.log('✅ Service Worker activated');
-        return self.clients.claim();
-      })
-  );
-});
+self.addEventListener('activate', (event) => {
+  event.waitUntil((async () => {
+    // Delete every cache this worker (or its predecessor) ever created.
+    const cacheNames = await caches.keys();
+    await Promise.all(cacheNames.map((name) => caches.delete(name)));
 
-// Fetch Event - Serve from cache, fallback to network
-self.addEventListener('fetch', event => {
-  const url = event.request.url;
-  
-  // Skip non-GET requests
-  if (event.request.method !== 'GET') {
-    return;
-  }
-  
-  // Skip external URLs
-  if (url.includes('googleapis.com') || url.includes('google.com')) {
-    event.respondWith(fetch(event.request));
-    return;
-  }
-  
-  event.respondWith(
-    caches.match(event.request)
-      .then(response => {
-        // Return cached response if available
-        if (response) {
-          console.log('📦 Serving from cache:', url);
-          return response;
-        }
-        
-        // Fetch from network
-        return fetch(event.request)
-          .then(response => {
-            // Check if valid response
-            if (!response || response.status !== 200) {
-              return response;
-            }
-            
-            // Clone response for caching
-            const responseToCache = response.clone();
-            
-            // Cache successful responses
-            caches.open(CACHE_VERSION)
-              .then(cache => {
-                cache.put(event.request, responseToCache);
-                console.log('💾 Cached:', url);
-              });
-            
-            return response;
-          })
-          .catch(error => {
-            // Network error - return cached fallback
-            console.log('🔌 Offline - serving cached:', url);
-            return caches.match('/WealthPilot360/index.html')
-              .then(response => {
-                if (response) {
-                  return response;
-                }
-                // Generic offline response
-                return new Response(
-                  '<html><body><h1>Offline</h1><p>You are offline. Local data is still accessible.</p></body></html>',
-                  {
-                    headers: { 'Content-Type': 'text/html' }
-                  }
-                );
-              });
-          });
-      })
-  );
-});
+    // Unregister this worker entirely — no service worker controls this
+    // scope after this point, so every future request just hits the
+    // network normally.
+    await self.registration.unregister();
 
-// Background Sync Event - Sync data when online
-self.addEventListener('sync', event => {
-  console.log('🔄 Background sync event:', event.tag);
-  
-  if (event.tag === 'sync-data') {
-    event.waitUntil(
-      // Send queued data to server
-      self.clients.matchAll()
-        .then(clients => {
-          clients.forEach(client => {
-            client.postMessage({
-              type: 'BACKGROUND_SYNC',
-              message: 'Syncing financial data with server...'
-            });
-          });
-        })
-        .catch(err => {
-          console.error('❌ Sync error:', err);
-        })
-    );
-  }
-});
-
-// Push Notification Event
-self.addEventListener('push', event => {
-  console.log('📬 Push notification received');
-  
-  const options = {
-    body: event.data ? event.data.text() : 'New notification',
-    icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192"><rect fill="%23FF7A1A" width="192" height="192" rx="30"/><text x="96" y="110" font-size="80" fill="white" text-anchor="middle" font-family="Arial" font-weight="bold">WP</text></svg>',
-    badge: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><circle fill="%23FF7A1A" cx="48" cy="48" r="48"/></svg>',
-    tag: 'wealthpilot360-notification',
-    requireInteraction: false,
-    vibrate: [200, 100, 200],
-    actions: [
-      {
-        action: 'open',
-        title: 'Open',
-        icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><text x="48" y="60" font-size="50" text-anchor="middle">➜</text></svg>'
-      },
-      {
-        action: 'dismiss',
-        title: 'Dismiss',
-        icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><text x="48" y="60" font-size="50" text-anchor="middle">✕</text></svg>'
-      }
-    ]
-  };
-  
-  event.waitUntil(
-    self.registration.showNotification('WealthPilot360', options)
-  );
-});
-
-// Notification Click Event
-self.addEventListener('notificationclick', event => {
-  console.log('👆 Notification clicked:', event.action);
-  
-  event.notification.close();
-  
-  if (event.action === 'open' || !event.action) {
-    event.waitUntil(
-      clients.matchAll({ type: 'window' })
-        .then(clientList => {
-          // Look for already open window
-          for (let i = 0; i < clientList.length; i++) {
-            if (clientList[i].url === '/WealthPilot360/index.html' && 'focus' in clientList[i]) {
-              return clientList[i].focus();
-            }
-          }
-          // Open new window if not found
-          if (clients.openWindow) {
-            return clients.openWindow('/WealthPilot360/index.html');
-          }
-        })
-    );
-  }
-});
-
-// Message Handler - Receive messages from app
-self.addEventListener('message', event => {
-  console.log('📨 Message from app:', event.data);
-  
-  if (event.data.action === 'SKIP_WAITING') {
-    self.skipWaiting();
-  }
-  
-  if (event.data.action === 'CLEAR_CACHE') {
-    caches.delete(CACHE_VERSION).then(() => {
-      console.log('🗑️ Cache cleared');
-    });
-  }
-  
-  if (event.data.action === 'CACHE_URLS') {
-    caches.open(CACHE_VERSION)
-      .then(cache => {
-        cache.addAll(event.data.urls || []);
+    // Force every open tab/window this worker controls to reload right
+    // now, so people don't have to know to do it themselves.
+    const clientsList = await self.clients.matchAll({ type: 'window' });
+    clientsList.forEach((client) => {
+      client.navigate(client.url).catch(() => {
+        // navigate() can be unsupported in some contexts — fall back to
+        // asking the page itself to reload via postMessage.
+        client.postMessage({ type: 'FORCE_RELOAD' });
       });
-  }
+    });
+  })());
 });
 
-console.log('✅ WealthPilot360 Service Worker loaded and ready');
+// No fetch handler at all — while this version is briefly active during
+// the transition, every request passes straight through untouched rather
+// than being intercepted, which is the safest possible behavior for a
+// worker that's in the process of decommissioning itself.
