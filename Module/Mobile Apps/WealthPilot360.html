@@ -3250,8 +3250,36 @@ async function _gasSaveDB(uid, data) {
   await _gasPost({ action: 'SAVE_DB', uid, data: typeof data === 'string' ? data : JSON.stringify(data) });
 }
 async function _gasLoadDB(uid) {
-  const d = await _gasPost({ action: 'LOAD_DB', uid });
-  try { return d ? JSON.parse(d) : null; } catch(e) { return null; }
+  if (!GAS_URL) {
+    console.warn('[v23] _gasLoadDB: GAS_URL not set');
+    return null;
+  }
+  if (!uid) {
+    console.warn('[v23] _gasLoadDB: No UID provided');
+    return null;
+  }
+  
+  console.log('[v23] _gasLoadDB: Loading from Google Sheets for UID:', uid);
+  
+  try {
+    const d = await _gasPost({ action: 'LOAD_DB', uid });
+    if (!d) {
+      console.warn('[v23] _gasLoadDB: No data returned from backend');
+      return null;
+    }
+    
+    try {
+      const parsed = JSON.parse(d);
+      console.log('[v23] _gasLoadDB: Successfully loaded', Object.keys(parsed).length, 'data sections');
+      return parsed;
+    } catch(parseErr) {
+      console.error('[v23] _gasLoadDB: JSON parse error:', parseErr.message, '| Response:', d.substring(0, 100));
+      return null;
+    }
+  } catch(e) {
+    console.error('[v23] _gasLoadDB: Fetch error:', e.message);
+    return null;
+  }
 }
 async function _gasSaveUsers(users) {
   await _gasPost({ action: 'SAVE_USERS', data: JSON.stringify(users) });
@@ -3281,20 +3309,30 @@ async function _gasUpdateProfile(uid, profileData) {
 
 // ── loadDB: GAS → window.storage → localStorage ─────────────
 async function loadDB(uid) {
+  console.log('[v23] loadDB: Starting data load for UID:', uid);
+  
   // Try GAS first
   if (GAS_URL && uid) {
+    console.log('[v23] loadDB: Attempting to load from GAS backend...');
     const d = await _gasLoadDB(uid);
     if (d) {
+      console.log('[v23] loadDB: Successfully loaded from GAS backend');
       Object.keys(DB).forEach(k => { if(d[k]!==undefined) DB[k]=d[k]; });
       _storageSet(STORE_DB_KEY + '_' + uid, d);   // cache locally
       return;
     }
   }
   // Fallback: window.storage / localStorage
+  console.log('[v23] loadDB: GAS backend failed or not available, trying localStorage...');
   const key = uid ? (STORE_DB_KEY + '_' + uid) : STORE_DB_KEY;
   const d = await _storageGet(key);
-  if (d) { Object.keys(DB).forEach(k => { if(d[k]!==undefined) DB[k]=d[k]; }); return; }
+  if (d) {
+    console.log('[v23] loadDB: Found cached data in localStorage');
+    Object.keys(DB).forEach(k => { if(d[k]!==undefined) DB[k]=d[k]; });
+    return;
+  }
   // Legacy key
+  console.log('[v23] loadDB: Checking legacy storage key...');
   const s = localStorage.getItem('wp360');
   if (s) { try { const d2=JSON.parse(s); Object.keys(DB).forEach(k=>{if(d2[k]!==undefined)DB[k]=d2[k];}); } catch(e) {} }
 }
@@ -3390,30 +3428,92 @@ function _startBackgroundSync() {
 // a manual logout/login. Only pulls — never overwrites a more-recent local
 // save (same freshness check used at login).
 let _liveSyncInterval = null;
+let _liveSyncCount = 0;
+
 async function _liveSyncPullOnce() {
-  if (!navigator.onLine || !GAS_URL || !currentUser || isSuperAdmin) return;
-  if (document.hidden) return; // skip while tab/app is backgrounded
+  _liveSyncCount++;
+  
+  // v23: Early exit checks with logging
+  if (!navigator.onLine) {
+    console.log('[v23] _liveSyncPullOnce #' + _liveSyncCount + ': Offline - skipping');
+    return;
+  }
+  
+  if (!GAS_URL) {
+    console.warn('[v23] _liveSyncPullOnce #' + _liveSyncCount + ': GAS_URL not configured');
+    return;
+  }
+  
+  if (!currentUser) {
+    console.log('[v23] _liveSyncPullOnce #' + _liveSyncCount + ': No user logged in');
+    return;
+  }
+  
+  if (isSuperAdmin) {
+    console.log('[v23] _liveSyncPullOnce #' + _liveSyncCount + ': Super admin - skipping');
+    return;
+  }
+  
+  if (document.hidden) {
+    console.log('[v23] _liveSyncPullOnce #' + _liveSyncCount + ': Tab hidden - skipping');
+    return;
+  }
+  
   const uid = currentUser.uid;
+  console.log('[v23] _liveSyncPullOnce #' + _liveSyncCount + ': Pulling data from Google Sheets...');
+  
   try {
     const cloudData = await _gasLoadDB(uid);
-    if (!cloudData || typeof cloudData !== 'object') return;
+    if (!cloudData) {
+      console.warn('[v23] _liveSyncPullOnce #' + _liveSyncCount + ': No cloud data returned');
+      return;
+    }
+    
+    if (typeof cloudData !== 'object') {
+      console.warn('[v23] _liveSyncPullOnce #' + _liveSyncCount + ': Cloud data not an object:', typeof cloudData);
+      return;
+    }
+    
     const cloudTs = cloudData._savedAt || 0;
     const localTs = DB._savedAt || 0;
+    console.log('[v23] _liveSyncPullOnce #' + _liveSyncCount + ': Cloud timestamp:', cloudTs, 'Local:', localTs);
+    
     if (cloudTs > localTs) {
+      console.log('[v23] _liveSyncPullOnce #' + _liveSyncCount + ': Cloud data is newer - updating...');
       Object.keys(DB).forEach(k => { if (cloudData[k] !== undefined) DB[k] = cloudData[k]; });
-      try { _storageSet('wp360_data_' + uid, DB); } catch(e) {}
-      try { localStorage.setItem('wp360_data_' + uid, JSON.stringify(DB)); } catch(e) {}
-      try { localStorage.setItem('wp360_db_'   + uid, JSON.stringify(DB)); } catch(e) {}
+      try { _storageSet('wp360_data_' + uid, DB); } catch(e) { console.error('[v23] Storage set error:', e.message); }
+      try { localStorage.setItem('wp360_data_' + uid, JSON.stringify(DB)); } catch(e) { console.error('[v23] localStorage set error:', e.message); }
+      try { localStorage.setItem('wp360_db_'   + uid, JSON.stringify(DB)); } catch(e) { console.error('[v23] localStorage db_ set error:', e.message); }
       renderSection(currentSection);
+      console.log('[v23] _liveSyncPullOnce #' + _liveSyncCount + ': Data updated and re-rendered');
+    } else {
+      console.log('[v23] _liveSyncPullOnce #' + _liveSyncCount + ': Local data is current - no update needed');
     }
-  } catch(e) {}
+  } catch(e) {
+    console.error('[v23] _liveSyncPullOnce #' + _liveSyncCount + ' ERROR:', e.message);
+  }
 }
+
 function _startLiveSync() {
-  if (_liveSyncInterval) return;
+  if (_liveSyncInterval) {
+    console.log('[v23] _startLiveSync: Already running');
+    return;
+  }
+  
+  console.log('[v23] _startLiveSync: Starting real-time Google Sheets sync...');
+  console.log('[v23] Config:', {
+    GAS_URL: GAS_URL ? 'Set' : 'NOT SET',
+    currentUser: currentUser ? currentUser.uid : 'Not logged in',
+    online: navigator.onLine,
+    interval: '8 seconds'
+  });
+  
   // Pull once immediately instead of waiting for the first 8s tick, so
   // updates made from another device/tab show up right when the app opens.
   _liveSyncPullOnce();
   _liveSyncInterval = setInterval(_liveSyncPullOnce, 8000); // pull latest cloud data every 8 seconds (near real-time)
+  
+  console.log('[v23] _startLiveSync: Real-time sync started! Data will sync every 8 seconds');
 }
 function _stopLiveSync() { if (_liveSyncInterval) { clearInterval(_liveSyncInterval); _liveSyncInterval = null; } }
 // Re-pull whenever the tab regains focus/visibility — a poll may have
