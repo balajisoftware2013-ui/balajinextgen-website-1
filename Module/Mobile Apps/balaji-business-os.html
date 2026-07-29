@@ -851,7 +851,7 @@ body.mode-accountant .owner-hint{display:none;}
   body *{visibility:hidden !important;}
   #docSheet.show #docPrintArea, #docSheet.show #docPrintArea *{visibility:visible !important;}
   #reportPrintArea.printing{visibility:visible !important; display:block !important;}
-  #reportPrintArea.printing *{visibility:visible !important; display:inherit !important;}
+  #reportPrintArea.printing *{visibility:visible !important;}
   .sheet-overlay{display:none!important;}
   /* v76 fix: visibility:hidden on `body *` above should already cover this,
      but doesn't reliably cascade through every rasterization path (some
@@ -9709,12 +9709,15 @@ function _extractReportTableAsCSVRows(){
   const rows = [];
   const walker = document.createTreeWalker(wrap, NodeFilter.SHOW_ELEMENT, {
     acceptNode(el){
-      // v84: register rows now have an inline expand panel (item/qty/rate
-      // breakdown) tagged .reg-detail-row — always skip it here, expanded
-      // or not, so CSV export stays the clean voucher-level register
-      // (Sr#/Date/Voucher/Party/Mode/Amount) rather than a jumbled mix of
-      // 6-column voucher rows and 4-column item sub-rows.
-      if(el.classList && (el.classList.contains('reg-detail-row') || el.classList.contains('reg-view-toggle'))) return NodeFilter.FILTER_REJECT;
+      // v86: register rows have an inline expand panel (.reg-detail-row —
+      // item/qty/rate breakdown). Mirror what's on screen: if the panel is
+      // currently collapsed (display:none), skip its entire subtree so CSV
+      // stays the clean voucher-level register; if it's expanded, don't
+      // record the wrapper <tr> itself (colspan cell isn't a real column)
+      // but keep descending so the nested item rows get captured as their
+      // own CSV lines. The toggle button is always a screen-only control.
+      if(el.classList && el.classList.contains('reg-view-toggle')) return NodeFilter.FILTER_REJECT;
+      if(el.classList && el.classList.contains('reg-detail-row')) return el.style.display==='none' ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP;
       if(el.tagName==='TR') return NodeFilter.FILTER_ACCEPT;
       if(el.classList && (el.classList.contains('cart-row') || el.classList.contains('cart-total') || el.classList.contains('section-label'))) return NodeFilter.FILTER_ACCEPT;
       return NodeFilter.FILTER_SKIP; // still descends into children — just doesn't record this element itself
@@ -9741,16 +9744,23 @@ function _csvEscape(v){
   const s = String(v==null?'':v);
   return /[",\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s;
 }
-// v84: strips inline register expand-panels (.reg-detail-row — the item/qty/
-// rate breakdown shown when a Sales/Purchase Register row is tapped) out of
-// captured report HTML before it's cached, printed, PDF'd, or shared — so
-// those exports always show the clean voucher-level register + Total,
-// regardless of which rows happen to be expanded on screen at that moment.
+// v86: cleans captured register HTML before it's cached, printed, PDF'd, or
+// shared. Mirrors whatever's actually on screen — a row's item-details
+// panel is kept in the export if it's currently expanded (so "View All Item
+// Details" ON means the printed/exported report includes the item
+// breakdown too), and removed if collapsed. The "View All Item Details"
+// toggle button and the "Open Full Invoice ›" links are on-screen-only
+// controls with no meaning on paper/PDF/WhatsApp, so those are always
+// stripped regardless of expand state.
 function _stripRegDetailRows(html){
   if(!html) return html;
   const tmp = document.createElement('div');
   tmp.innerHTML = html;
-  tmp.querySelectorAll('.reg-detail-row, .reg-view-toggle').forEach(el=>el.remove());
+  tmp.querySelectorAll('.reg-view-toggle, .reg-invoice-link').forEach(el=>el.remove());
+  tmp.querySelectorAll('.reg-detail-row').forEach(el=>{
+    if(el.style.display === 'none') el.remove();
+    else el.style.background = 'transparent'; // drop the on-screen highlight tint, keep plain for print/PDF
+  });
   return tmp.innerHTML;
 }
 /* ════════════════════════════════════════════════════════════════
@@ -11033,15 +11043,28 @@ async function buildReportPDF(){
   
   console.log('[v72] buildReportPDF START for:', _lastReportType);
   
-  // Force rebuild
-  const savedDrill = _rptDrillFilter;
-  _rptDrillFilter = null;
-  openReport(_lastReportType, null, true);
-  _rptDrillFilter = savedDrill;
+  // v2026-07-29 FIX: this used to UNCONDITIONALLY call openReport(...,true)
+  // here, which rebuilds the register table from scratch — every row's
+  // item-detail panel (.reg-detail-row) comes back freshly collapsed
+  // (display:none) no matter what the user had expanded on screen a
+  // second earlier. _stripRegDetailRows() then correctly drops collapsed
+  // panels, so the PDF/WhatsApp output silently lost any "View Details"
+  // the user had opened, even though Print (which skips this forced
+  // rebuild when data is already present) showed it fine. Only rebuild
+  // when the table is actually missing/empty/stale — otherwise capture
+  // exactly what's on screen right now, expanded rows included.
+  const _tblForPdf = document.getElementById('reportTableWrap');
+  const _needsRebuild = !_tblForPdf || !_tblForPdf.innerHTML.trim() || _tblForPdf.innerHTML.includes("This report isn't available yet");
+  if(_needsRebuild){
+    const savedDrill = _rptDrillFilter;
+    _rptDrillFilter = null;
+    openReport(_lastReportType, null, true);
+    _rptDrillFilter = savedDrill;
+  }
   
   return new Promise(async (resolve)=>{
     setTimeout(async ()=>{
-      console.log('[v72] Report rebuilt, capturing table...');
+      console.log('[v72] Capturing table...');
       
       // v81: Capture table data - filter by checked items if any selected
       let tableData = '';
@@ -11247,6 +11270,18 @@ async function shareReportScreenshotWhatsApp(){
   const msg=`📊 *${bizName()} — ${reportTitle}*${summaryText}\nDate: ${todayStr()}`;
   const hint = document.getElementById('rptShareHint');
   if(hint){ hint.textContent='Building image…'; hint.style.display='block'; }
+  // v2026-07-29 FIX: #reportPrintArea is a hidden off-screen element that
+  // only ever gets content when something explicitly builds it (Print /
+  // Save-PDF). This function used to skip straight to rasterizing it
+  // without building it first, so on a fresh report it rasterized an
+  // empty div, got a null canvas back, and silently sent a text-only
+  // WhatsApp message with no image attached. Build it first, same as
+  // Print and PDF already do, so there's always something to capture.
+  if(!renderReportPrintArea()){
+    if(hint) hint.style.display='none';
+    toast('Report has no data to screenshot');
+    return;
+  }
   const canvas = await rasterizeReportPrintArea();
   if(hint) hint.style.display='none';
   const fileName = reportShareFileName().replace(/\.pdf$/,'.jpg');
@@ -11348,7 +11383,7 @@ function _renderRegisterTable(rows, cfg){
           <thead><tr style="opacity:.7;"><th style="text-align:left;padding-left:18px;">Item</th><th style="text-align:center;">Qty</th><th style="text-align:right;">Rate</th><th style="text-align:right;">Amount</th></tr></thead>
           <tbody>${itemRowsHtml}</tbody>
         </table>
-        ${cfg.onClick ? `<div style="text-align:right;margin-top:6px;"><span style="color:var(--primary);font-weight:700;cursor:pointer;" onclick="event.stopPropagation();${cfg.onClick(r)}">Open Full Invoice ›</span></div>` : ''}
+        ${cfg.onClick ? `<div class="reg-invoice-link" style="text-align:right;margin-top:6px;"><span style="color:var(--primary);font-weight:700;cursor:pointer;" onclick="event.stopPropagation();${cfg.onClick(r)}">Open Full Invoice ›</span></div>` : ''}
       </td>
     </tr>`;
   }).join('') : `<tr><td colspan="6" style="text-align:center;color:var(--sub);">${cfg.emptyMsg}</td></tr>`;
