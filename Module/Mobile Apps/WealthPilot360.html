@@ -3401,6 +3401,12 @@ let _liveSyncInterval = null;
 async function _liveSyncPullOnce() {
   if (!navigator.onLine || !GAS_URL || !currentUser || isSuperAdmin) return;
   if (document.hidden) return; // skip while tab/app is backgrounded
+  // v25: never pull while a local save is still on the wire — the cloud
+  // hasn't seen that change yet, so pulling now would fetch a response
+  // that predates it and merge it in, effectively undoing an edit that's
+  // about to be confirmed a moment later anyway. Once _saveInFlight
+  // clears, the next poll tick (at most 2.5s later) picks up correctly.
+  if (typeof _saveInFlight !== 'undefined' && _saveInFlight) return;
   const uid = currentUser.uid;
   const dk  = currentUser.dataKey || ('wp360_data_' + uid);
   try {
@@ -3547,38 +3553,78 @@ let _autoSaveTimer = null;
 let _clientSheetUrl = '';
 let _clientSheetId  = '';
 
+// v25 FIX ("new entries overwrite the previous one instead of adding a
+// new row"): with the debounce tightened to 400ms and the live-sync poll
+// to 2.5s, two SAVE_DB calls could end up in flight to GAS at the same
+// time — and since GAS doesn't guarantee response order matches request
+// order, whichever one happened to finish LAST would win and overwrite
+// the sheet with ITS snapshot, silently discarding data the other request
+// had that this one didn't (e.g. a transaction added in between the two
+// calls being fired). _saveInFlight tracks whether a SAVE_DB is currently
+// out on the wire; if the debounce timer fires again while one is still
+// in flight, it no longer fires a second overlapping request — it just
+// remembers that another save is needed and fires it the moment the
+// current one finishes, always with the freshest DB snapshot at that
+// point. Combined with the server-side lock now added to SAVE_DB itself,
+// two saves can no longer race each other from either side.
+let _saveInFlight = false;
+let _saveAgainNeeded = false;
+
 function _debouncedAutoSave(uid) {
   clearTimeout(_autoSaveTimer);
   _setSyncStatus('pending');
   // v25: tightened from 800ms to 400ms — still coalesces rapid-fire input
   // (typing, quick successive taps) into one write instead of one per
   // keystroke, but gets the save to the cloud noticeably faster.
-  _autoSaveTimer = setTimeout(() => {
-    if (!uid || uid === '__superadmin__') return;
-    // Re-read DB snapshot at fire time (most current data)
-    const snapshot = JSON.parse(JSON.stringify(DB)); // deep clone
-    delete snapshot._savedAt; // don't send internal timestamp field to GAS
-    const data = JSON.stringify(snapshot);
-    // Always update localStorage with latest
-    try { localStorage.setItem('wp360_data_' + uid, JSON.stringify(DB)); } catch(e) {}
-    if (GAS_URL) {
-      _setSyncStatus('syncing');
-      _gasSaveDB(uid, snapshot)
-        .then(result => {
-          _clearPendingSync();
-          _setSyncStatus('ok');
-          console.log('✅ GAS SAVE_DB ok for', uid);
-        })
-        .catch(err => {
-          _markPendingSync(uid);
-          _setSyncStatus('offline');
-          console.warn('❌ GAS SAVE_DB failed:', err);
-        });
-    } else {
-      _setSyncStatus('offline');
-    }
-  }, 400);
+  _autoSaveTimer = setTimeout(() => _wp360FireSave(uid), 400);
 }
+
+function _wp360FireSave(uid) {
+  if (!uid || uid === '__superadmin__') return;
+
+  if (_saveInFlight) {
+    // A save is already out on the wire — don't fire a second one that
+    // could race it. Just note that another save is needed once this
+    // one comes back, so nothing gets lost.
+    _saveAgainNeeded = true;
+    return;
+  }
+
+  // Re-read DB snapshot at fire time (most current data)
+  const snapshot = JSON.parse(JSON.stringify(DB)); // deep clone
+  delete snapshot._savedAt; // don't send internal timestamp field to GAS
+  const data = JSON.stringify(snapshot);
+  // Always update localStorage with latest
+  try { localStorage.setItem('wp360_data_' + uid, JSON.stringify(DB)); } catch(e) {}
+  if (GAS_URL) {
+    _saveInFlight = true;
+    _saveAgainNeeded = false;
+    _setSyncStatus('syncing');
+    _gasSaveDB(uid, snapshot)
+      .then(result => {
+        _clearPendingSync();
+        _setSyncStatus('ok');
+        console.log('✅ GAS SAVE_DB ok for', uid);
+      })
+      .catch(err => {
+        _markPendingSync(uid);
+        _setSyncStatus('offline');
+        console.warn('❌ GAS SAVE_DB failed:', err);
+      })
+      .finally(() => {
+        _saveInFlight = false;
+        if (_saveAgainNeeded) {
+          // Something changed while this save was in flight — fire once
+          // more immediately with the latest snapshot, rather than
+          // waiting for the next unrelated edit to trigger a save.
+          _wp360FireSave(uid);
+        }
+      });
+  } else {
+    _setSyncStatus('offline');
+  }
+}
+
 
 // ── Convert any Drive URL to a proper Google Sheets editor URL ──
 function _toSheetsUrl(rawUrl, sheetId) {
@@ -9942,7 +9988,7 @@ document.addEventListener('keydown', function(e){
   else if (e.key === 'F5') { e.preventDefault(); renderSection(currentSection); toast('🔄 Refreshed', 'info'); }
   else if (e.key === 'F10') { e.preventDefault(); navigate('reports', document.querySelector('[data-section="reports"]')); }
   else if (e.key === 'F11') { navigate('settings', document.querySelector('[data-section="settings"]')); }
-  else if (e.key === 'F') { e.preventDefault(); printReport(); }
+  else if (e.key === 'F12') { e.preventDefault(); printReport(); }
   // Ctrl combos
   else if (e.ctrlKey && (e.key === 'n' || e.key === 'N')) { e.preventDefault(); openModal('incomeModal'); }
   else if (e.ctrlKey && (e.key === 's' || e.key === 'S')) { e.preventDefault(); saveDB(); toast('💾 Saved', 'success'); }
