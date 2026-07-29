@@ -1,140 +1,99 @@
-/* ═══════════════════════════════════════════════════════════════
-   Balaji WealthPilot 360 — Service Worker
-   Upload this file next to your index.html on Netlify (same folder).
-   The app's install code already looks for it at: <yourpath>/sw.js
-═══════════════════════════════════════════════════════════════ */
+// ════════════════════════════════════════════════════════════════════════
+// Balaji NextGen — Shared Service Worker (Mobile Apps folder)
+// ════════════════════════════════════════════════════════════════════════
+// Serves BOTH balaji-business-os.html and WealthPilot360.html — they live
+// in the same folder and both register 'sw.js' at that same folder path,
+// so there is only ever one service worker/cache scope covering both apps
+// regardless of which HTML file the person currently has open. This file
+// merges the two previously-separate copies (which had drifted slightly
+// out of sync) back into one source of truth.
+//
+// A frequently-updated app shell must NEVER be cache-first — only truly
+// static sub-resources (logo, icons, manifest) should be cached, and even
+// those go network-first so an updated asset shows promptly. The HTML
+// document itself (any .html file, so this works for BOTH apps without
+// naming either one specifically), and anything talking to the Apps
+// Script backend, always goes straight to the network; a cached copy is
+// only used as an offline fallback if the network request genuinely fails.
+//
+// Bump CACHE_VERSION whenever you want to force every open tab/PWA of
+// EITHER app to drop its cached static assets and refetch them fresh —
+// not required for ordinary HTML/JS changes inside either app's own
+// file, since those are never cached by this worker at all.
+// ════════════════════════════════════════════════════════════════════════
 
-// Bump this string on every deploy that should force a cache refresh.
-const CACHE_VERSION = 'v1';
-const CACHE_NAME = `wealthpilot360-${CACHE_VERSION}`;
+const CACHE_VERSION = 'balaji-apps-v1';
 
-/* ── INSTALL: pre-cache the app shell, activate immediately ────── */
-self.addEventListener('install', (event) => {
-  self.skipWaiting(); // don't wait for old tabs to close
-  event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) =>
-      cache.addAll([self.registration.scope]).catch(() => {})
-    )
-  );
+self.addEventListener('install', () => {
+  // Take over immediately instead of waiting for every open tab to close —
+  // this is what makes a fresh deploy actually take effect, combined with
+  // each app's own 'controllerchange' listener that reloads the page once
+  // this new worker takes control.
+  self.skipWaiting();
 });
 
-/* ── ACTIVATE: drop old caches, take control of open tabs ──────── */
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    (async () => {
-      const keys = await caches.keys();
-      await Promise.all(
-        keys
-          .filter((k) => k.startsWith('wealthpilot360-') && k !== CACHE_NAME)
-          .map((k) => caches.delete(k))
-      );
-      await self.clients.claim();
-      // Your page's controllerchange listener will now fire and
-      // auto-reload the app to the fresh version — no code needed there.
-    })()
+    caches.keys()
+      .then((keys) => Promise.all(
+        keys.filter((k) => k !== CACHE_VERSION).map((k) => caches.delete(k))
+      ))
+      .then(() => self.clients.claim())
   );
 });
 
-/* ── FETCH: offline-first strategy ──────────────────────────────
-   - App navigation (the HTML itself): network-first, cached fallback
-     so you always get the latest deploy when online, and the last
-     cached version when offline.
-   - Same-origin assets: cache-first, refreshed in the background.
-   - Cross-origin calls (currency rates, Google Apps Script, etc.):
-     network-first, cached fallback so a flaky connection doesn't
-     hard-fail requests that were previously successful.
-────────────────────────────────────────────────────────────────── */
+// Explicit handshake some pages' registration code sends: forces an
+// already-installed-but-waiting worker to activate right now, instead of
+// sitting idle until every open tab/PWA instance of either app closes —
+// on mobile, apps are usually backgrounded rather than actually closed,
+// so without this a fresh deploy could sit waiting indefinitely.
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
+});
+
 self.addEventListener('fetch', (event) => {
   const req = event.request;
-  if (req.method !== 'GET') return;
+  if (req.method !== 'GET') return; // never intercept POSTs (e.g. Apps Script saves)
 
-  if (req.mode === 'navigate') {
-    event.respondWith(
-      fetch(req)
-        .then((res) => {
-          const copy = res.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(req, copy));
-          return res;
-        })
-        .catch(
-          () =>
-            caches.match(req).then((cached) => cached) ||
-            caches.match(self.registration.scope)
-        )
-    );
+  let url;
+  try { url = new URL(req.url); } catch (e) { return; }
+
+  // Only ever handle plain http(s) requests. Caching a "chrome-extension://"
+  // (or any other non-http scheme) request always throws
+  // "Failed to execute 'put' on 'Cache': Request scheme ... is unsupported" —
+  // this guard is what stops those errors from appearing in the console.
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
+
+  const isNavigation = req.mode === 'navigate' ||
+    (req.headers.get('accept') || '').includes('text/html');
+  const isHtmlFile = url.pathname.endsWith('.html');
+  const isBackend = url.hostname === 'script.google.com';
+
+  // App shell (ANY .html page — covers both apps without naming either
+  // one) and every call to the Apps Script backend: always network, no
+  // caching at all. A stale HTML page or a cached API response are both
+  // worse than a failed request here.
+  if (isNavigation || isHtmlFile || isBackend) {
+    event.respondWith(fetch(req).catch(() => caches.match(req)));
     return;
   }
 
-  const url = new URL(req.url);
-  if (url.origin === self.location.origin) {
-    event.respondWith(
-      caches.match(req).then((cached) => {
-        const fetchPromise = fetch(req)
-          .then((res) => {
-            const copy = res.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(req, copy));
-            return res;
-          })
-          .catch(() => cached);
-        return cached || fetchPromise;
-      })
-    );
-    return;
-  }
-
+  // Everything else (logos, icons, manifest.json, etc., for either app):
+  // network-first so an updated asset is picked up on the very next load,
+  // falling back to the last cached copy only when the network request
+  // fails (offline / flaky connection) — never served stale-while-
+  // network-is-fine.
   event.respondWith(
     fetch(req)
       .then((res) => {
-        const copy = res.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(req, copy));
+        if (res && res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE_VERSION).then((cache) => cache.put(req, copy)).catch(() => {});
+        }
         return res;
       })
       .catch(() => caches.match(req))
-  );
-});
-
-/* ── PUSH: display a notification when the server sends one ────
-   This handles RECEIVING and SHOWING a push once one arrives — it's
-   the piece that has to live in the service worker. To actually send
-   notifications you still need, separately from this file:
-     1. A VAPID key pair (public key goes in the page,
-        private key stays on your backend).
-     2. Client code calling pushManager.subscribe() and saving the
-        subscription (e.g. to your Google Apps Script backend).
-     3. Backend code that POSTs to that subscription via the Web Push
-        protocol when you want to notify a user.
-   None of that exists yet in your app — this only wires up the
-   receiving half so it's ready once you add the above.
-────────────────────────────────────────────────────────────────── */
-self.addEventListener('push', (event) => {
-  let data = {};
-  try {
-    data = event.data ? event.data.json() : {};
-  } catch (e) {
-    data = { title: 'Balaji WealthPilot 360', body: event.data ? event.data.text() : '' };
-  }
-
-  const title = data.title || 'Balaji WealthPilot 360';
-  const options = {
-    body: data.body || 'You have a new update.',
-    icon: data.icon,
-    badge: data.badge,
-    data: data.url ? { url: data.url } : {},
-  };
-
-  event.waitUntil(self.registration.showNotification(title, options));
-});
-
-self.addEventListener('notificationclick', (event) => {
-  event.notification.close();
-  const targetUrl = (event.notification.data && event.notification.data.url) || self.registration.scope;
-
-  event.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
-      for (const client of clientList) {
-        if (client.url === targetUrl && 'focus' in client) return client.focus();
-      }
-      if (self.clients.openWindow) return self.clients.openWindow(targetUrl);
-    })
   );
 });
