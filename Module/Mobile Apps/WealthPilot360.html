@@ -2890,15 +2890,21 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--body-bg);color
     <input type="hidden" id="acct-type-val" value="debtor">
     <div class="form-row">
       <div class="form-group"><label class="form-label">Party Name *</label>
-        <select class="form-input form-select" id="acct-name-picker" onchange="_onAcctPartyPick()" style="margin-bottom:6px"></select>
-        <input class="form-input" id="acct-name" placeholder="Customer / Supplier name" autocomplete="off">
+        <div class="cat-combo" id="acct-name-combo">
+          <input class="form-input" id="acct-name" placeholder="🔍 Search existing, or type a new party name…" autocomplete="off"
+                 onfocus="_simpleComboOpen('acct-name')" oninput="_simpleComboFilter('acct-name')" onkeydown="_simpleComboKeydown(event,'acct-name')">
+          <div class="cat-combo-panel" id="acct-name-panel"></div>
+        </div>
       </div>
       <div class="form-group"><label class="form-label">Amount (₹) *</label><input class="form-input" id="acct-amount" type="number" placeholder="50000" min="0"></div>
     </div>
     <div class="form-row">
       <div class="form-group"><label class="form-label">Head / Category</label>
-        <input class="form-input" id="acct-head" list="acctHeadSuggestions" placeholder="Pick a suggestion or type a new one" autocomplete="off">
-        <datalist id="acctHeadSuggestions"></datalist>
+        <div class="cat-combo" id="acct-head-combo">
+          <input class="form-input" id="acct-head" placeholder="🔍 Search existing, or type a new head/category…" autocomplete="off"
+                 onfocus="_simpleComboOpen('acct-head')" oninput="_simpleComboFilter('acct-head')" onkeydown="_simpleComboKeydown(event,'acct-head')">
+          <div class="cat-combo-panel" id="acct-head-panel"></div>
+        </div>
       </div>
       <div class="form-group"><label class="form-label" style="visibility:hidden">.</label><div style="font-size:13px;color:var(--muted);padding-top:8px">Auto-suggested from Debtor/Creditor — type a new one to add it as an option.</div></div>
     </div>
@@ -3484,18 +3490,44 @@ function _setSyncStatus(state) {
     btn.style.animation = '';
   }
 }
+// v25 FIX: this used to only PUSH local changes to the cloud — tapping
+// it never actually showed you what someone else just entered on another
+// device, which is the one thing "sync now, instantly, from anywhere"
+// most needs. Now it pushes first (so nothing local is ever lost), then
+// immediately pulls the freshest cloud copy and merges it in — a true
+// on-demand, bidirectional "sync right now" that doesn't require waiting
+// for the next background poll tick (up to 2.5s away).
 async function manualSync() {
   if (!currentUser || currentUser.uid === '__superadmin__') return;
   if (!navigator.onLine) { toast('📵 No internet – data is safely stored locally','info'); return; }
   if (!GAS_URL) { toast('Cloud sync isn\'t set up on this app yet — your data is safe and saved on this device.','error'); return; }
   _setSyncStatus('syncing');
-  toast('☁️ Syncing to Google Drive...','info');
+  toast('☁️ Syncing…','info');
   try {
+    // 1. Push anything local first, so a pending edit can never be lost.
     await _gasSaveDB(currentUser.uid, DB);
     await _gasSaveUsers(getUsers());
     _clearPendingSync();
+
+    // 2. Immediately pull the freshest cloud copy — picks up anything
+    // saved from another device/browser right now, not on the next poll.
+    const uid = currentUser.uid;
+    const cloudData = await _gasLoadDB(uid);
+    if (cloudData && typeof cloudData === 'object') {
+      const cloudTs = cloudData._savedAt || 0;
+      const localTs = DB._savedAt || 0;
+      if (cloudTs >= localTs) {
+        Object.keys(DB).forEach(k => { if (cloudData[k] !== undefined) DB[k] = cloudData[k]; });
+        try { _storageSet('wp360_data_' + uid, DB); } catch(e) {}
+        try { localStorage.setItem('wp360_data_' + uid, JSON.stringify(DB)); } catch(e) {}
+        try { localStorage.setItem('wp360_db_'   + uid, JSON.stringify(DB)); } catch(e) {}
+        renderSection(currentSection);
+        _refreshLiveWidgets();
+      }
+    }
+
     _setSyncStatus('ok');
-    toast('✅ Synced to Google Drive!', 'success');
+    toast('✅ Synced — showing the latest from every device', 'success');
   } catch(e) {
     _markPendingSync(currentUser.uid);
     _setSyncStatus('offline');
@@ -8303,6 +8335,76 @@ document.addEventListener('click', (e)=>{
   if (!e.target.closest('.cat-combo')) _closeAllCatCombos();
 });
 
+// ════════════════════════════════════════════════════════════════
+// v26: GENERIC SINGLE-FIELD SEARCHABLE COMBO
+// Reused for Accounting's Party Name and Head/Category fields (see
+// _SIMPLE_COMBO_SOURCES below). Unlike the Transaction Category combo
+// above — which only ever picks from a fixed hidden <select> — this one
+// has NO hidden select at all: the visible input IS the source of truth.
+// Typing something that isn't in the suggestion list is simply accepted
+// as-is when the form saves — one field does both jobs (pick an existing
+// value, or type a brand-new one) instead of two separate controls.
+// Shares the same .cat-combo-panel styling and the same outside-click
+// close handler above, so both combo types behave identically.
+// ════════════════════════════════════════════════════════════════
+const _SIMPLE_COMBO_SOURCES = {
+  'acct-name': () => Array.from(new Set((DB.accounting||[]).map(e=>(e.name||'').trim()).filter(Boolean))).sort(),
+  'acct-head': () => {
+    _ensureCustomAcctHeads();
+    const typeEl = document.getElementById('acct-type-val');
+    const type = typeEl ? typeEl.value : 'debtor';
+    const base = type === 'debtor' ? ACCT_HEADS_DEBTOR : ACCT_HEADS_CREDITOR;
+    const custom = (DB.customAcctHeads && DB.customAcctHeads[type]) || [];
+    return base.concat(custom);
+  }
+};
+function _simpleComboBuildPanel(prefix){
+  const panel = document.getElementById(prefix+'-panel');
+  const input = document.getElementById(prefix);
+  const source = _SIMPLE_COMBO_SOURCES[prefix];
+  if (!panel || !input || !source) return;
+  const query = input.value.trim().toLowerCase();
+  const opts = source().filter(v => !query || v.toLowerCase().includes(query));
+  if (!opts.length) {
+    panel.innerHTML = query
+      ? `<div class="cat-combo-empty">No match — keep typing, this will be saved as a new entry</div>`
+      : '<div class="cat-combo-empty">Start typing to add a new one</div>';
+    return;
+  }
+  panel.innerHTML = opts.map(v =>
+    `<div class="cat-combo-item" onmousedown="event.preventDefault();_simpleComboPick('${prefix}','${String(v).replace(/'/g,"\\'")}')">${String(v).replace(/</g,'&lt;')}</div>`
+  ).join('');
+}
+function _simpleComboOpen(prefix){
+  _closeAllCatCombos();
+  _simpleComboBuildPanel(prefix);
+  const panel = document.getElementById(prefix+'-panel');
+  if (panel) panel.classList.add('open');
+  const input = document.getElementById(prefix);
+  if (input) input.select();
+}
+function _simpleComboFilter(prefix){
+  _simpleComboBuildPanel(prefix);
+  const panel = document.getElementById(prefix+'-panel');
+  if (panel) panel.classList.add('open');
+}
+function _simpleComboPick(prefix, value){
+  const input = document.getElementById(prefix);
+  if (!input) return;
+  input.value = value;
+  _closeAllCatCombos();
+}
+function _simpleComboKeydown(e, prefix){
+  if (e.key === 'Escape') { _closeAllCatCombos(); e.target.blur(); return; }
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    const panel = document.getElementById(prefix+'-panel');
+    const first = panel && panel.querySelector('.cat-combo-item');
+    if (first) first.dispatchEvent(new MouseEvent('mousedown'));
+    else _closeAllCatCombos(); // no suggestion matched — keep the typed text as a new entry
+  }
+}
+
 // ── Save transaction with priority + notes + custom category ──
 // v23: quick-add shortcuts from Cash & Bank — opens the normal
 // transaction modal but pre-selects Cash as the payment mode, so
@@ -8438,36 +8540,23 @@ function _ensureCustomAcctHeads(){
   if (!Array.isArray(DB.customAcctHeads.debtor)) DB.customAcctHeads.debtor = [];
   if (!Array.isArray(DB.customAcctHeads.creditor)) DB.customAcctHeads.creditor = [];
 }
-// v33: Head/Category is now a type-to-add field (same pattern as the Cash
-// & Bank "Head/Account" input) instead of a fixed 8-option dropdown — the
-// built-ins still show as suggestions, but typing anything else and saving
-// adds it as a real option for next time.
+// v26 FIX ("two place party name / head give one place"): both Party
+// Name and Head/Category used to be a dropdown PLUS a separate text
+// input stacked underneath — two controls doing one job. Replaced with
+// the single searchable-combo pattern already used for Transaction
+// Category (see _simpleComboOpen/_simpleComboFilter/_simpleComboPick
+// below): one input that shows a filterable list of existing values on
+// focus, and also accepts freely typing a brand-new value directly —
+// no second field needed either way.
 function _populateAcctHeadOptions(type, selected) {
   _ensureCustomAcctHeads();
-  const dl = document.getElementById('acctHeadSuggestions');
   const input = document.getElementById('acct-head');
-  if (!dl) {
-    console.warn('[v82] acctHeadSuggestions datalist not found');
-    return;
-  }
   if (!input) {
     console.warn('[v82] acct-head input not found');
     return;
   }
-  
   const base = type === 'debtor' ? ACCT_HEADS_DEBTOR : ACCT_HEADS_CREDITOR;
-  const custom = (DB.customAcctHeads && DB.customAcctHeads[type]) || [];
-  const allHeads = base.concat(custom);
-  
-  console.log('[v82] Populating head options for', type, '- total:', allHeads.length);
-  
-  dl.innerHTML = allHeads.map(h => `<option value="${h.replace(/"/g,'&quot;')}"></option>`).join('');
   input.value = selected || base[0];
-  
-  if (input.style.display === 'none') {
-    input.style.display = 'block';
-    console.log('[v82] Made acct-head input visible');
-  }
 }
 function setAcctType(type, keepHead) {
   // v82: Ensure custom heads exist
@@ -8540,42 +8629,10 @@ function _populateAcctBankAccountOptions(selected){
   
   sel.value = (selected && DB.bankAccounts[selected]) ? selected : (ids.includes(_activeBankAccountId) ? _activeBankAccountId : (ids[0]||''));
 }
-// v33: Party Name dropdown — lists everyone already used in Accounting,
-// with "Add New Party" to clear the field for a fresh name. The text
-// input underneath stays the source of truth (still freely editable).
-function _populateAcctPartyList() {
-  const sel = document.getElementById('acct-name-picker');
-  if (!sel) {
-    console.warn('[v82] acct-name-picker element not found');
-    return;
-  }
-  
-  // v82: Ensure DB.accounting exists
-  if (!DB.accounting) {
-    DB.accounting = [];
-    console.log('[v82] Initialized DB.accounting');
-  }
-  
-  const names = Array.from(new Set((DB.accounting || []).map(e => (e.name || '').trim()).filter(Boolean))).sort();
-  console.log('[v82] Populating party list with', names.length, 'names');
-  
-  sel.innerHTML = '<option value="">— Select existing party —</option>' +
-    names.map(n => `<option value="${n.replace(/"/g,'&quot;')}">${n}</option>`).join('') +
-    '<option value="__new__">➕ Add New Party</option>';
-  
-  // v82: Ensure dropdown is visible
-  if (sel.style.display === 'none') {
-    sel.style.display = 'block';
-    console.log('[v82] Made acct-name-picker visible');
-  }
-}
-function _onAcctPartyPick(){
-  const sel = document.getElementById('acct-name-picker');
-  const input = document.getElementById('acct-name');
-  if (!sel || !input) return;
-  if (sel.value === '' || sel.value === '__new__') { input.value = ''; input.focus(); }
-  else { input.value = sel.value; }
-}
+// v26: Party Name is now the single searchable-combo field above (see
+// _simpleComboOpen etc. below) instead of a separate dropdown + text
+// input — nothing to populate ahead of time, the combo builds its
+// suggestion list live from DB.accounting whenever it's opened/filtered.
 function openAcctEntryModal(id) {
   // v82: Ensure all required data structures exist
   if (!DB.accounting) DB.accounting = [];
@@ -8586,7 +8643,6 @@ function openAcctEntryModal(id) {
   
   const titleEl = document.getElementById('acctModalTitle');
   const editIdEl = document.getElementById('acct-edit-id');
-  const namePickerEl = document.getElementById('acct-name-picker');
   const nameEl = document.getElementById('acct-name');
   const amountEl = document.getElementById('acct-amount');
   const dateEl = document.getElementById('acct-date');
@@ -8597,7 +8653,7 @@ function openAcctEntryModal(id) {
   const notesEl = document.getElementById('acct-notes');
   
   // v82: Verify all elements exist
-  if (!titleEl || !editIdEl || !namePickerEl || !nameEl || !amountEl || !dateEl || !dueEl || !statusEl || !paidAmtEl || !paidModeEl || !notesEl) {
+  if (!titleEl || !editIdEl || !nameEl || !amountEl || !dateEl || !dueEl || !statusEl || !paidAmtEl || !paidModeEl || !notesEl) {
     console.error('[v82] Missing accounting form elements');
     toast('Error loading form', 'error');
     return;
@@ -8606,10 +8662,6 @@ function openAcctEntryModal(id) {
   titleEl.textContent = id ? '📒 Edit Entry' : '📒 Add Accounting Entry';
   editIdEl.value = id || '';
   
-  // v82: Populate lists first
-  _populateAcctPartyList();
-  
-  namePickerEl.value = '';
   // reset
   nameEl.value = '';
   amountEl.value = '';
@@ -8624,8 +8676,6 @@ function openAcctEntryModal(id) {
     const e = (DB.accounting || []).find(x => x.id === id);
     if (e) {
       document.getElementById('acct-name').value = e.name || '';
-      const picker = document.getElementById('acct-name-picker');
-      if (picker) picker.value = Array.from(picker.options).some(o => o.value === e.name) ? e.name : '';
       document.getElementById('acct-amount').value = e.amount || '';
       document.getElementById('acct-date').value = e.date || '';
       document.getElementById('acct-due').value = e.due || '';
