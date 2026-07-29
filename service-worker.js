@@ -6,7 +6,11 @@ const STATIC_ASSETS = [
   '/',
   '/index.html',
   '/login.html',
-  '/manifest.json'
+  '/manifest.json',
+  '/assets/Logos/logo.png',
+  '/assets/Logos/icon-192.png',
+  '/assets/Logos/icon-512.png',
+  '/assets/Logos/apple-touch-icon.png'
 ];
 
 // ============================================
