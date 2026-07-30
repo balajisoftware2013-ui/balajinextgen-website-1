@@ -3984,22 +3984,31 @@ async function runDataRepair(){
 // update it.stock by design (comment in confirmTxnImport), so if an item's
 // stock was never separately set via a real Opening Stock entry, it stays 0
 // and the formula above goes negative as soon as sales exceed purchases.
-// This recomputes it.stock = (all purchase qty) - (all sale qty) + (credit
-// note qty) - (debit note qty), i.e. assumes a 0 baseline and every
-// transaction for the item has been entered/imported — the same assumption
-// the Movement report already makes, just applied to the stored value too.
+// This recomputes it.stock = Opening Stock + (all purchase qty) − (all sale
+// qty) + (credit note qty) − (debit note qty) — the same baseline and
+// formula Stock Ledger/Inventory Movement already use to reconstruct
+// Closing, so recalculating here can no longer create a fresh mismatch
+// against what those reports show.
 async function runRecalcStock(){
   if(!(SESSION && !SESSION.isDemo && SESSION.sheetId && GAS_URL)){
     toast('Recalculate Stock needs a connected, non-demo account.');
     return;
   }
-  if(!confirm('This will set every item\'s current stock to (total purchased − total sold + note adjustments), based on all Purchase/Sale/Credit-Note/Debit-Note records currently in your data. Use this only if all your historical purchases and sales have been entered/imported — otherwise your real physical stock may differ. Continue?')) return;
+  if(!confirm('This will set every item\'s current stock to (Opening Stock + total purchased − total sold + note adjustments), based on all Purchase/Sale/Credit-Note/Debit-Note records currently in your data. Use this only if all your historical purchases and sales have been entered/imported — otherwise your real physical stock may differ. Continue?')) return;
   const btn = document.getElementById('recalcStockBtn');
   const resultEl = document.getElementById('recalcStockResult');
   if(btn){ btn.disabled = true; btn.textContent = '📦 Recalculating…'; }
   try{
     const totals = {};
-    (DB.items||[]).forEach(it=>{ totals[it.id] = 0; });
+    // v2026-07-30 FIX: this started every item at a hardcoded 0 baseline —
+    // completely ignoring the item's own Opening Stock (Edit Item →
+    // Opening Stock), which Stock Ledger and Inventory Movement's own
+    // reconstruction DO include. Running this tool on any item that had a
+    // non-zero Opening Stock would silently set it.stock to a figure
+    // permanently short by exactly that amount — a real, hard-to-spot gap
+    // between live Current Stock and what Stock Ledger reconstructs for
+    // the same item. Now starts from the same baseline those reports use.
+    (DB.items||[]).forEach(it=>{ totals[it.id] = it.openingStock||0; });
     (DB.purchases||[]).forEach(p=>(p.lineItems||[]).forEach(li=>{ if(totals[li.id]!==undefined) totals[li.id]+=Number(li.qty)||0; }));
     (DB.sales||[]).forEach(s=>(s.lineItems||[]).forEach(li=>{ if(totals[li.id]!==undefined) totals[li.id]-=Number(li.qty)||0; }));
     (DB.creditNotes||[]).forEach(cn=>(cn.lineItems||[]).forEach(li=>{ if(totals[li.id]!==undefined) totals[li.id]+=Number(li.qty)||0; }));
@@ -5741,22 +5750,17 @@ function renderDashboard(){
   _setText('pendPay', fmt(pendPay));
   _setText('pendPayN', DB.suppliers.filter(s=>getPartyDocBalance(s,'suppliers')>0).length+' suppliers');
 
-  // v67 fix: dashStockVal/dashStockValN existed in the HTML with a
-  // hardcoded "₹0" / "0 items" placeholder but nothing anywhere in the app
-  // ever updated them — the Dashboard's Stock Value card was permanently
-  // stuck at zero no matter what Inventory actually showed. Same
-  // calculation Inventory's Current Stock total already uses.
-  // v72 FIX: this summed pRate*stock across EVERY item including
-  // negative-stock ones, and counted every item regardless of stock — so
-  // the Dashboard KPI never matched Inventory's "Stock Value" card or
-  // Reports → Current Stock, which both only count items with stock>0
-  // (see renderInvStats()). Aligned to the same positive-stock-only rule
-  // so all three show the identical figure.
-  const dashStockItems = DB.items.filter(i=>Number(i.stock)>0);
-  const _dashStockRates = _computeStockAvgRates();
-  const dashStockVal = dashStockItems.reduce((a,i)=>a+((_dashStockRates[i.id] ?? i.pRate ?? 0)*(i.stock||0)),0);
+  // v2026-07-30 FIX: this summed positive-stock items only, which
+  // disagreed with Balance Sheet/P&L/Trial Balance's headline "Stock
+  // Value" (they net Positive − Negative together via
+  // _liveStockValueTotal). Now calls that same shared function so the
+  // Dashboard, Balance Sheet, P&L, and Inventory Center's "All" view can
+  // never show four different numbers for one concept again.
+  const dashStockVal = _liveStockValueTotal();
+  const dashStockItemsCount = DB.items.filter(i=>Math.abs(snapQty(i.stock))>0.005).length;
   _setText('dashStockVal', fmt(dashStockVal));
-  _setText('dashStockValN', dashStockItems.length+' item'+(dashStockItems.length===1?'':'s'));
+  _setStyle('dashStockVal', 'color', dashStockVal<0 ? 'var(--red)' : '');
+  _setText('dashStockValN', dashStockItemsCount+' item'+(dashStockItemsCount===1?'':'s'));
 
   // v52: surface a hint when the selected period (esp. default "Day") shows
   // zero activity but real historical entries exist elsewhere in DB, so an
@@ -7137,37 +7141,58 @@ function filterInvByPeriod(arr, dateField, period){
   }
   return arr; // 'all'
 }
+// All/Positive/Negative filter for the Inventory Center's Stock Value
+// card — same convention as Reports → Stock's dropdown. Defaults to
+// 'all' (net Positive − Negative), matching Balance Sheet/P&L/Trial
+// Balance's _liveStockValueTotal().
+let _invStockSign = 'all';
+function setInvStockSign(mode){
+  _invStockSign = mode;
+  renderInvStats();
+}
 function renderInvStats(){
   const grid = document.getElementById('invStatGrid');
   if(!grid) return;
   const totalItems = DB.items.length;
-  // FIX: this used to sum pRate*stock across EVERY item, including items
-  // with negative stock (more sold/issued than ever recorded as
-  // purchased — a data problem, see "Recalculate Stock From Vouchers" in
-  // Settings). That produced a large negative total here while Reports →
-  // Stock (which deliberately excludes stock<=0 items) showed a small
-  // positive total for the "same" figure — two numbers for one concept,
-  // with no explanation. Now: the headline Stock Value matches Reports →
-  // Stock exactly (positive-stock items only), and any negative-stock
-  // value is called out separately instead of silently dragging the
-  // headline number negative.
-  // v82 FIX: value now uses the same moving-average cost as Reports →
-  // Stock/Stock Ledger (was today's live pRate — disagreed with them). An
-  // epsilon excludes near-zero rounding noise from counting as negative
-  // stock, and Low Stock only counts items with an actual minimum
-  // configured (min>0), matching the Low Stock report's own fix.
+  // v2026-07-30 FIX: this card used to hardcode "positive-stock items
+  // only" as the headline Stock Value figure — while Balance Sheet, P&L,
+  // and Trial Balance (via _liveStockValueTotal / _stockValueAsOf) net
+  // POSITIVE and NEGATIVE stock together into a single "All" figure. Two
+  // different numbers for the same "Stock Value" concept depending which
+  // screen you looked at. Now defaults to that same net "All" figure
+  // (Positive − Negative) everywhere, with a dropdown right on this card
+  // to switch to Positive-only or Negative-only — the same All/Positive/
+  // Negative convention Reports → Stock already uses.
+  // v82 FIX (carried over): value uses the same moving-average cost as
+  // Reports → Stock/Stock Ledger (was today's live pRate). An epsilon
+  // excludes near-zero rounding noise from counting as negative stock,
+  // and Low Stock only counts items with an actual minimum configured
+  // (min>0), matching the Low Stock report's own fix.
   const invRates = _computeStockAvgRates();
-  const invItemVal = i => (Number(i.stock)||0) * (invRates[i.id] ?? i.pRate ?? 0);
+  const invItemVal = i => snapQty(i.stock) * (invRates[i.id] ?? i.pRate ?? 0);
   const INV_EPS = 0.005;
-  const positiveItems = DB.items.filter(i=>Number(i.stock)>INV_EPS);
-  const negativeItems = DB.items.filter(i=>Number(i.stock)<-INV_EPS);
-  const totalVal = positiveItems.reduce((a,i)=>a+invItemVal(i),0);
+  const positiveItems = DB.items.filter(i=>snapQty(i.stock)>INV_EPS);
+  const negativeItems = DB.items.filter(i=>snapQty(i.stock)<-INV_EPS);
+  const positiveVal = positiveItems.reduce((a,i)=>a+invItemVal(i),0);
   const negativeVal = negativeItems.reduce((a,i)=>a+invItemVal(i),0); // already negative
-  const lowCount = DB.items.filter(i=>Number(i.min)>0 && Number(i.stock)<=Number(i.min)).length;
+  const shownVal = _invStockSign==='positive' ? positiveVal
+    : _invStockSign==='negative' ? negativeVal
+    : positiveVal + negativeVal; // 'all' = net, matches _liveStockValueTotal()
+  const lowCount = DB.items.filter(i=>Number(i.min)>0 && snapQty(i.stock)<=Number(i.min)).length;
   const expCount = countExpiringSoon();
   grid.innerHTML = `
     <div class="stat-card" style="cursor:pointer;" onclick="filterInv('all')"><div class="st-label">Total Items</div><div class="st-val mono">${totalItems}</div></div>
-    <div class="stat-card" style="cursor:pointer;" onclick="openReport('stock',document.querySelector('[onclick*=&quot;stock&quot;].rpt-type'))"><div class="st-label">Stock Value</div><div class="st-val mono">${fmt(totalVal)}</div></div>
+    <div class="stat-card">
+      <div class="st-label" style="display:flex;align-items:center;justify-content:space-between;gap:4px;">
+        <span style="cursor:pointer;" onclick="openReport('stock',document.querySelector('[onclick*=&quot;stock&quot;].rpt-type'))">Stock Value</span>
+        <select onmousedown="event.stopPropagation()" onclick="event.stopPropagation()" onchange="setInvStockSign(this.value)" style="font-size:9px;padding:1px 3px;border:1px solid var(--border);border-radius:5px;background:#fff;">
+          <option value="all" ${_invStockSign==='all'?'selected':''}>All</option>
+          <option value="positive" ${_invStockSign==='positive'?'selected':''}>✅ Pos</option>
+          <option value="negative" ${_invStockSign==='negative'?'selected':''}>⚠️ Neg</option>
+        </select>
+      </div>
+      <div class="st-val mono ${shownVal<0?'red':''}" style="cursor:pointer;" onclick="openReport('stock',document.querySelector('[onclick*=&quot;stock&quot;].rpt-type'))">${fmt(shownVal)}</div>
+    </div>
     <div class="stat-card" style="cursor:pointer;" onclick="filterInv('low')"><div class="st-label">Low Stock</div><div class="st-val mono ${lowCount?'red':''}">${lowCount}</div></div>
     <div class="stat-card" style="cursor:pointer;" onclick="filterInv('expiry')"><div class="st-label">Expiring Soon</div><div class="st-val mono ${expCount?'red':''}">${expCount}</div></div>
     ${negativeItems.length ? `<div class="stat-card" style="cursor:pointer;" onclick="filterInv('negative')"><div class="st-label">⚠️ Negative Stock</div><div class="st-val mono red">${negativeItems.length} item(s) · ${fmt(negativeVal)}</div></div>` : ''}`;
@@ -7450,33 +7475,43 @@ function computeInvMovementSummary(q){
   const priorSales = startDate ? (DB.sales||[]).filter(s=>s.date < startDate) : [];
   const priorCN = startDate ? (DB.creditNotes||[]).filter(cn=>cn.date < startDate) : [];
   const priorDN = startDate ? (DB.debitNotes||[]).filter(dn=>dn.date < startDate) : [];
+  const _stockAvgRatesMove2 = _computeStockAvgRates();
   return DB.items.filter(i=>i.name.toLowerCase().includes(q)).map(it=>{
-    let purQty=0, purVal=0, salQty=0, salVal=0, adjQty=0;
+    let purQty=0, purVal=0, salQty=0, salVal=0, salesRetQty=0, purchRetQty=0;
     periodPurchases.forEach(p=>(p.lineItems||[]).forEach(li=>{ if(li.id===it.id){ purQty+=li.qty; purVal+=li.qty*li.rate; }}));
     periodSales.forEach(s=>(s.lineItems||[]).forEach(li=>{ if(li.id===it.id){ salQty+=li.qty; salVal+=li.qty*li.rate; }}));
-    periodCN.forEach(cn=>(cn.lineItems||[]).forEach(li=>{ if(li.id===it.id) adjQty+=li.qty; }));
-    periodDN.forEach(dn=>(dn.lineItems||[]).forEach(li=>{ if(li.id===it.id) adjQty-=li.qty; }));
+    periodCN.forEach(cn=>(cn.lineItems||[]).forEach(li=>{ if(li.id===it.id) salesRetQty+=li.qty; }));
+    periodDN.forEach(dn=>(dn.lineItems||[]).forEach(li=>{ if(li.id===it.id) purchRetQty+=li.qty; }));
+    const adjQty = salesRetQty - purchRetQty;
     let priorQty = 0;
     priorPurchases.forEach(p=>(p.lineItems||[]).forEach(li=>{ if(li.id===it.id) priorQty+=li.qty; }));
     priorSales.forEach(s=>(s.lineItems||[]).forEach(li=>{ if(li.id===it.id) priorQty-=li.qty; }));
     priorCN.forEach(cn=>(cn.lineItems||[]).forEach(li=>{ if(li.id===it.id) priorQty+=li.qty; }));
     priorDN.forEach(dn=>(dn.lineItems||[]).forEach(li=>{ if(li.id===it.id) priorQty-=li.qty; }));
     const openingQty = Math.round(((it.openingStock||0) + priorQty)*1000)/1000;
-    // v75 fix: it.stock accumulates via repeated +=/-= float arithmetic across
-    // many purchases/sales, so a fully sold-out item often lands on something
-    // like 0.00099999999 instead of exactly 0 — which then displayed as a
-    // bogus "0.001" closing qty and, worse, a nonzero closing value (qty × rate)
-    // for stock that's actually zero. Snap true floating-point noise (anything
-    // under 0.0005) to a clean 0, and round everything else to 3dp so it's
-    // consistent with how quantities are entered/displayed everywhere else.
-    // v2026-07-30 FIX: had its own separate copy of the noise-snap logic
-    // hardcoded at 0.0005, instead of calling the shared snapQty() — so
-    // it stayed stuck on the old, too-tight threshold even after snapQty
-    // itself was widened, still showing a phantom "0.001" closing qty
-    // (and a nonzero closing value) for stock that's actually zero. Now
-    // uses the shared helper so this page can't drift out of sync again.
-    const closingQty = snapQty(it.stock);
-    return {id:it.id, name:it.name, unit:it.unit, openingQty, purQty, purVal, salQty, salVal, adjQty, closingQty, closingVal: closingQty*it.pRate};
+    // v2026-07-30 FIX: this was the core bug — Closing Qty/Val read
+    // TODAY's live stock (at today's live purchase rate) directly,
+    // completely ignoring the period's own Opening/Purchase/Sale/Returns
+    // figures shown right next to it in the same row. For any period that
+    // doesn't run all the way to today (or whenever it.stock has drifted
+    // from what the voucher history for THIS item actually says), the
+    // numbers on screen didn't add up — e.g. Opening 0 + Purchase 399.1 −
+    // Sale 426.54 should read Closing ≈ −27.44, but it was showing 0.000
+    // because that field was reading something else entirely. Now
+    // reconstructed the same way Reports → Stock Ledger already does it:
+    // Closing = Opening + Purchase − Sale + Sales Return − Purchase
+    // Return, for the exact period selected, and valued at the same
+    // period's moving-average cost (was today's live pRate).
+    const closingQty = snapQty(openingQty + purQty - salQty + adjQty);
+    // v2026-07-30 FIX: this priced Closing at a period-scoped average
+    // recomputed independently per Day/Month/Qtr/Year filter — same bug
+    // as Stock Ledger had (see that report's fix note). Same real Closing
+    // Qty showed a different ₹ Value depending only on which period
+    // filter was active. Now uses the shared all-time moving-average
+    // rate so this page's Closing Val always agrees with Stock Ledger,
+    // Current Stock, and Inventory Center's Stock Value card.
+    const avgRate = _stockAvgRatesMove2[it.id] ?? it.pRate ?? 0;
+    return {id:it.id, name:it.name, unit:it.unit, openingQty, purQty, purVal, salQty, salVal, salesRetQty, purchRetQty, closingQty, closingVal: closingQty*avgRate};
   });
 }
 /* Movement (Sale/Purchase) Excel-style table for the Inventory Center */
@@ -7484,28 +7519,29 @@ function renderInvMovement(q){
   const summary = computeInvMovementSummary(q);
   const totals = summary.reduce((a,r)=>({purVal:a.purVal+r.purVal, salVal:a.salVal+r.salVal, closingVal:a.closingVal+r.closingVal}), {purVal:0, salVal:0, closingVal:0});
   const rowsHtml = summary.length ? summary.map(r=>`
-    <tr style="cursor:pointer;" onclick="viewItemMovementFromInventory('${r.id}')">
+    <tr style="cursor:pointer;${r.closingQty<-0.005?'color:var(--red);':''}" onclick="viewItemMovementFromInventory('${r.id}')">
       <td>${r.name}<div style="font-size:9.5px;color:var(--sub);font-weight:400;">${r.unit}</div></td>
       <td class="mono">${fmtQtyDisplay(r.openingQty, r.unit)}</td>
       <td class="mono">${r.purQty ? '+'+fmtQtyDisplay(r.purQty, r.unit) : '—'}</td>
       <td class="mono">${fmt(r.purVal)}</td>
       <td class="mono">${r.salQty ? '−'+fmtQtyDisplay(r.salQty, r.unit) : '—'}</td>
       <td class="mono">${fmt(r.salVal)}</td>
-      <td class="mono">${r.adjQty ? (r.adjQty>0?'+':'')+fmtQtyDisplay(r.adjQty, r.unit) : '—'}</td>
+      <td class="mono">${r.salesRetQty ? '+'+fmtQtyDisplay(r.salesRetQty, r.unit) : '—'}</td>
+      <td class="mono">${r.purchRetQty ? '−'+fmtQtyDisplay(r.purchRetQty, r.unit) : '—'}</td>
       <td class="mono" style="font-weight:700;">${fmtQtyDisplay(r.closingQty, r.unit)}</td>
       <td class="mono">${fmt(r.closingVal)}</td>
-    </tr>`).join('') : `<tr><td colspan="9" style="text-align:center;color:var(--sub);">No items found</td></tr>`;
+    </tr>`).join('') : `<tr><td colspan="10" style="text-align:center;color:var(--sub);">No items found</td></tr>`;
   const moveLabel = {all:'All Time', today:'Today', month:'This Month', qtr:'This Quarter', year:'This FY', custom:(_invMoveFrom&&_invMoveTo)?(fmtDateShort(_invMoveFrom)+' – '+fmtDateShort(_invMoveTo)):'Custom'}[_invMovePeriod] || 'All Time';
   document.getElementById('inventoryList').innerHTML = `
     <div class="inv-tbl-title">📦 Inventory Movement — ${moveLabel}</div>
     <div class="inv-tbl-wrap"><table class="inv-tbl">
       <thead><tr>
-        <th>Item</th><th class="num">Opening</th><th class="num">Purchase Qty</th><th class="num">Purchase Val</th><th class="num">Sale Qty</th><th class="num">Sale Val</th><th class="num">Returns Adj</th><th class="num">Closing Qty</th><th class="num">Closing Val</th>
+        <th>Item</th><th class="num">Opening</th><th class="num">Purchase Qty</th><th class="num">Purchase Val</th><th class="num">Sale Qty</th><th class="num">Sale Val</th><th class="num">Sales Return</th><th class="num">Purchase Return</th><th class="num">Closing Qty</th><th class="num">Closing Val</th>
       </tr></thead>
       <tbody>${rowsHtml}</tbody>
-      <tfoot><tr><td colspan="3">Total</td><td class="mono">${fmt(totals.purVal)}</td><td></td><td class="mono">${fmt(totals.salVal)}</td><td></td><td></td><td class="mono">${fmt(totals.closingVal)}</td></tr></tfoot>
+      <tfoot><tr><td colspan="3">Total</td><td class="mono">${fmt(totals.purVal)}</td><td></td><td class="mono">${fmt(totals.salVal)}</td><td></td><td></td><td></td><td class="mono">${fmt(totals.closingVal)}</td></tr></tfoot>
     </table></div>
-    <div style="font-size:11px;color:var(--sub);margin-top:6px;">Tap a row to see full transaction-wise ledger detail →</div>`;
+    <div style="font-size:11px;color:var(--sub);margin-top:6px;">Closing Qty/Val are as of the end of the selected period (Opening + Purchase − Sale + Sales Return − Purchase Return), priced at the same moving-average cost as Current Stock — matches Reports → Stock Ledger for the same period. If Closing here disagrees with Current Stock (the live figure), that live figure is correct; the gap means stock was adjusted at some point without a matching voucher — Settings → Recalculate Stock From Vouchers can resync it. Rows in <span style="color:var(--red);">red</span> are negative stock. Tap a row to see full transaction-wise ledger detail →</div>`;
 }
 /* Small helper: format YYYY-MM-DD as DD/MM for compact custom-range labels */
 function fmtDateShort(d){
@@ -7527,8 +7563,8 @@ function exportInventoryCSV(){
   if(_invTab==='movement'){
     const q = (document.getElementById('invMoveFilter')||{}).value || '';
     const summary = computeInvMovementSummary(q);
-    rows=[['Item','Unit','Opening Qty','Purchase Qty','Purchase Value','Sale Qty','Sale Value','Returns Adj','Closing Qty','Closing Value']].concat(
-      summary.map(r=>[r.name, r.unit, fmtQtyDisplay(r.openingQty,r.unit), fmtQtyDisplay(r.purQty,r.unit), r.purVal, fmtQtyDisplay(r.salQty,r.unit), r.salVal, fmtQtyDisplay(r.adjQty,r.unit), fmtQtyDisplay(r.closingQty,r.unit), r.closingVal])
+    rows=[['Item','Unit','Opening Qty','Purchase Qty','Purchase Value','Sale Qty','Sale Value','Sales Return','Purchase Return','Closing Qty','Closing Value']].concat(
+      summary.map(r=>[r.name, r.unit, fmtQtyDisplay(r.openingQty,r.unit), fmtQtyDisplay(r.purQty,r.unit), r.purVal, fmtQtyDisplay(r.salQty,r.unit), r.salVal, fmtQtyDisplay(r.salesRetQty,r.unit), fmtQtyDisplay(r.purchRetQty,r.unit), fmtQtyDisplay(r.closingQty,r.unit), r.closingVal])
     );
     const blob=new Blob(['\uFEFF'+rows.map(r=>r.join(',')).join('\n')],{type:'text/csv'});
     const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
@@ -10297,8 +10333,17 @@ function _bsPartyBreakdown(list, tab){
     .map(x=>({label:x.p.name||x.p.id, amount:x.bal, nav:`goPage('money');moneyTab('${tab}','${String(x.p.name||'').replace(/'/g,"\\'")}')`}));
 }
 function _bsStockBreakdown(){
+  // v2026-07-30 FIX: this valued every item at today's live Purchase Rate
+  // (it.pRate), while the headline "Stock Value" figure directly above it
+  // (_liveStockValueTotal) prices the same items at the shared
+  // moving-average cost — so expanding "FULL LIST" under Stock Value
+  // showed itemized rows that didn't add up to the total being broken
+  // down. Also wasn't snapping floating-point noise like every other
+  // stock screen now does. Now uses the exact same rate source and
+  // epsilon as Current Stock / Stock Ledger / Inventory Center.
+  const rates = _computeStockAvgRates();
   return (DB.items||[])
-    .map(it=>({label:it.name||it.id, amount:(it.pRate||0)*(it.stock||0)}))
+    .map(it=>({label:it.name||it.id, amount:snapQty(it.stock)*(rates[it.id] ?? it.pRate ?? 0)}))
     .filter(x=>Math.abs(x.amount) > 0.004)
     .sort((a,b)=>b.amount-a.amount)
     .map(x=>({label:x.label, amount:x.amount, nav:null}));
@@ -10549,7 +10594,7 @@ function _computeStockAvgRates(){
 // independently, so they can't drift apart from what Current Stock shows.
 function _liveStockValueTotal(){
   const rates = _computeStockAvgRates();
-  return (DB.items||[]).reduce((a,i)=>a+(Number(i.stock)||0)*(rates[i.id] ?? i.pRate ?? 0),0);
+  return (DB.items||[]).reduce((a,i)=>a+snapQty(i.stock)*(rates[i.id] ?? i.pRate ?? 0),0);
 }
 // v82 FIX: this used to value historical stock at TODAY's live Purchase
 // Rate (it.pRate) regardless of what was actually paid at the time — so
@@ -10577,7 +10622,7 @@ function _stockValueAsOf(dateStr){
     const purQty = purQtyById[it.id]||0, purVal = purValById[it.id]||0;
     const availQty = openingQty+purQty;
     const avgRate = availQty>0.0001 ? (openingVal+purVal)/availQty : (it.pRate||0);
-    total += (qtyByItem[it.id]||0) * avgRate;
+    total += snapQty(qtyByItem[it.id]||0) * avgRate;
   });
   return total;
 }
@@ -12321,7 +12366,7 @@ function openReport(type, el, forceRefresh){
     // total purchased qty). Shared via _computeStockAvgRates() so Low
     // Stock/Negative Stock/Dead Stock use the exact same figures too.
     const _stockAvgRates = _computeStockAvgRates();
-    const itemVal = i => (Number(i.stock)||0) * (_stockAvgRates[i.id] ?? i.pRate ?? 0);
+    const itemVal = i => snapQty(i.stock) * (_stockAvgRates[i.id] ?? i.pRate ?? 0);
     // v82: zero/near-zero stock items excluded from Current Stock entirely
     // (per feedback — no need to see them here); a tiny rounding residue
     // (e.g. 0.001kg) is treated as zero for this >/< test either way, so it
@@ -12390,12 +12435,20 @@ function openReport(type, el, forceRefresh){
     const priorCN = startDate ? (DB.creditNotes||[]).filter(cn=>cn.date < startDate) : [];
     const periodDN = filterByDateRange(DB.debitNotes||[], 'date');
     const priorDN = startDate ? (DB.debitNotes||[]).filter(dn=>dn.date < startDate) : [];
+    const _stockAvgRatesLedger = _computeStockAvgRates();
     const summary = DB.items.map(it=>{
-      let purQty=0, purVal=0, salQty=0, salVal=0, adjQty=0;
+      // v2026-07-30 FIX: Sales Returns (Credit Notes) and Purchase Returns
+      // (Debit Notes) were already included in the closing-stock math, but
+      // only as a single merged "Adj" figure — no way to tell from this
+      // table how much of a swing was a return vs. some other adjustment.
+      // Now tracked and shown as their own explicit columns, same as the
+      // per-item Movement Detail drill-down already labels them.
+      let purQty=0, purVal=0, salQty=0, salVal=0, salesRetQty=0, purchRetQty=0;
       periodPurchases.forEach(p=>(p.lineItems||[]).forEach(li=>{ if(li.id===it.id){ purQty+=li.qty; purVal+=li.qty*li.rate; }}));
       sales.forEach(s=>(s.lineItems||[]).forEach(li=>{ if(li.id===it.id){ salQty+=li.qty; salVal+=li.qty*li.rate; }}));
-      periodCN.forEach(cn=>(cn.lineItems||[]).forEach(li=>{ if(li.id===it.id) adjQty+=li.qty; }));
-      periodDN.forEach(dn=>(dn.lineItems||[]).forEach(li=>{ if(li.id===it.id) adjQty-=li.qty; }));
+      periodCN.forEach(cn=>(cn.lineItems||[]).forEach(li=>{ if(li.id===it.id) salesRetQty+=li.qty; }));
+      periodDN.forEach(dn=>(dn.lineItems||[]).forEach(li=>{ if(li.id===it.id) purchRetQty+=li.qty; }));
+      const adjQty = salesRetQty - purchRetQty;
       // Calculate prior qty movement for correct opening stock
       let priorQty = 0;
       priorPurchases.forEach(p=>(p.lineItems||[]).forEach(li=>{ if(li.id===it.id) priorQty+=li.qty; }));
@@ -12418,22 +12471,25 @@ function openReport(type, el, forceRefresh){
       // Now both views agree, since Closing here is genuinely "as of the
       // end of the selected period" instead of "as of right now."
       const closingQty = snapQty(openingQty + purQty - salQty + adjQty);
-      // v82 FIX: this used to value closing stock at it.pRate (today's live
-      // Purchase Rate on the item master) regardless of what was actually
-      // paid during the period. Since imports/edits constantly change
-      // pRate going forward, re-pricing the WHOLE closing balance at
-      // "today's rate" made the ledger's Value column disagree with the
-      // real ₹ amount spent on Purchases (purVal) — the exact mismatch
-      // reported (Rs.20,76,769 actually purchased vs Rs.20,89,997 shown).
-      // Now uses a moving-average cost: (opening value + purchase value
-      // this period) ÷ (opening qty + purchase qty), which keeps the
-      // ledger's Value column reconciled to what was actually paid.
-      const openingVal = openingQty * (it.pRate||0);
-      const availQty = openingQty + purQty;
-      const avgRate = availQty > 0 ? (openingVal + purVal) / availQty : (it.pRate||0);
+      // v2026-07-30 FIX: this priced Closing at a PERIOD-SCOPED average —
+      // (this period's opening value at today's pRate + this period's own
+      // purchase value) ÷ (this period's opening+purchase qty) — recomputed
+      // independently for whichever Day/Month/Qtr/Year/Custom filter was
+      // active. Since Closing Qty for any period ending today is the same
+      // real quantity, but each period window priced it differently, the
+      // exact same stock showed a different ₹ Value depending only on
+      // which period filter happened to be selected (e.g. ₹1,54,120.64 on
+      // "Day" vs ₹1,50,730.83 on "Qtr" for the identical real position) —
+      // no way to tell which was "correct" because neither was meant to be
+      // the canonical figure. Now uses the shared all-time moving-average
+      // rate (_computeStockAvgRates, computed once above) — the same
+      // single rate Current Stock, Balance Sheet, Dashboard, and Inventory
+      // Center already price stock at — so Closing Value is now identical
+      // across every period filter for the same real closing quantity.
+      const avgRate = _stockAvgRatesLedger[it.id] ?? it.pRate ?? 0;
       const closingRate = Math.round(avgRate*100)/100;
       const closingVal = Math.round(closingQty * avgRate * 100)/100;
-      return {id:it.id, name:it.name, hsn:it.hsn||'—', unit:it.unit||'Pcs', openingQty, purQty, purVal, salQty, salVal, adjQty, closingQty, closingRate, closingVal};
+      return {id:it.id, name:it.name, hsn:it.hsn||'—', unit:it.unit||'Pcs', openingQty, purQty, purVal, salQty, salVal, salesRetQty, purchRetQty, closingQty, closingRate, closingVal};
     }); // Show ALL items, even those with zero movement
     // FIX: _rptStockSign (the All/Positive/Negative dropdown, shown for
     // this report too — see rptStockSignToggle display logic below) was
@@ -12461,16 +12517,18 @@ function openReport(type, el, forceRefresh){
       ? `<div class="cart-row" style="cursor:pointer;color:var(--red);font-weight:700;" onclick="closeAllSheets();openReport('negstock')"><span>⚠️ ${negRows.length} item${negRows.length===1?'':'s'} showing negative stock — check for missed purchase entries <span style="font-size:10px;">VIEW ›</span></span><span class="mono">${fmtQtyDisplay(negQtyTotal,'')} qty · ${fmt(negValTotal)}</span></div>`
       : '';
     tbl = negBanner + `<div class="inv-tbl-wrap"><table class="inv-tbl"><thead><tr>
-      <th>Item (HSN)</th><th>Unit</th><th class="num">Opening</th><th class="num">Purchase</th><th class="num">Sale</th><th class="num">Adj</th><th class="num">Closing</th><th class="num">Avg Rate</th><th class="num">Value</th>
+      <th>Item (HSN)</th><th>Unit</th><th class="num">Opening</th><th class="num">Purchase</th><th class="num">Sale</th><th class="num">Sales Return</th><th class="num">Purchase Return</th><th class="num">Closing</th><th class="num">Avg Rate</th><th class="num">Value</th>
     </tr></thead><tbody>${shownRows.length ? shownRows.map(r=>`<tr style="cursor:pointer;${r.closingQty<0?'color:var(--red);':''}" onclick="viewStockLedgerDetail('${r.id}')">
       <td>${r.name}${r.hsn && r.hsn!=='—' ? '<div style="font-size:9px;color:var(--sub);">HSN '+r.hsn+'</div>' : ''}</td>
       <td>${r.unit||'Pcs'}</td><td class="mono">${fmtQtyDisplay(r.openingQty, r.unit)}</td>
       <td class="mono">${r.purQty ? fmtQtyDisplay(r.purQty, r.unit) : '—'}</td>
       <td class="mono">${r.salQty ? fmtQtyDisplay(r.salQty, r.unit) : '—'}</td>
-      <td class="mono">${r.adjQty ? fmtQtyDisplay(r.adjQty, r.unit) : '—'}</td>
+      <td class="mono" style="${r.salesRetQty?'color:var(--red);':''}">${r.salesRetQty ? '+'+fmtQtyDisplay(r.salesRetQty, r.unit) : '—'}</td>
+      <td class="mono" style="${r.purchRetQty?'color:var(--red);':''}">${r.purchRetQty ? '−'+fmtQtyDisplay(r.purchRetQty, r.unit) : '—'}</td>
       <td class="mono">${fmtQtyDisplay(r.closingQty, r.unit)}</td><td class="mono">${fmt(r.closingRate)}</td>
-      <td class="mono">${fmt(r.closingVal)}</td></tr>`).join('') : `<tr><td colspan="9" style="text-align:center;color:var(--sub);">${_rptStockSearch?'No items match your search':(_rptStockSign==='negative'?'No negative-stock items in this period':_rptStockSign==='positive'?'No positive-stock items':'No items')}</td></tr>`}
-    </tbody><tfoot><tr><td colspan="6"><b>Total</b></td><td class="mono"><b>${fmtQtyDisplay(totalClosingQty,'')}</b></td><td></td><td class="mono"><b>${fmt(shownRows.reduce((a,r)=>a+r.closingVal,0))}</b></td></tr>${negRows.length?`<tr style="color:var(--red);"><td colspan="6">Of which: Negative Stock (${negRows.length} item${negRows.length===1?'':'s'})</td><td class="mono">${fmtQtyDisplay(negQtyTotal,'')}</td><td></td><td class="mono">${fmt(negValTotal)}</td></tr>`:''}</tfoot></table></div>`;
+      <td class="mono">${fmt(r.closingVal)}</td></tr>`).join('') : `<tr><td colspan="10" style="text-align:center;color:var(--sub);">${_rptStockSearch?'No items match your search':(_rptStockSign==='negative'?'No negative-stock items in this period':_rptStockSign==='positive'?'No positive-stock items':'No items')}</td></tr>`}
+    </tbody><tfoot><tr><td colspan="7"><b>Total</b></td><td class="mono"><b>${fmtQtyDisplay(totalClosingQty,'')}</b></td><td></td><td class="mono"><b>${fmt(shownRows.reduce((a,r)=>a+r.closingVal,0))}</b></td></tr>${negRows.length?`<tr style="color:var(--red);"><td colspan="7">Of which: Negative Stock (${negRows.length} item${negRows.length===1?'':'s'})</td><td class="mono">${fmtQtyDisplay(negQtyTotal,'')}</td><td></td><td class="mono">${fmt(negValTotal)}</td></tr>`:''}</tfoot></table></div>
+    <div style="font-size:11px;color:var(--sub);margin-top:6px;">Sales Return = Credit Notes issued to customers (goods back in stock). Purchase Return = Debit Notes issued to suppliers (goods sent back out). Both are already reflected in Closing. Closing here is reconstructed from Opening Stock + these vouchers for the selected period — if it disagrees with Current Stock/Inventory (the live figure), that live figure is the correct one; the gap means stock was adjusted at some point without a matching voucher. Settings → Recalculate Stock From Vouchers can resync it.</div>`;
   } else if(type==='itemwise'){
     const itemSales = {}, itemPurch = {};
     sales.forEach(s=>(s.lineItems||[]).forEach(li=>{ const n=resolveItemName(li); itemSales[n]=(itemSales[n]||0)+li.qty*li.rate; }));
@@ -12853,31 +12911,44 @@ function openReport(type, el, forceRefresh){
   } else if(type==='stockmovement'){
     const periodPurchases = filterByDateRange(DB.purchases||[], 'date');
     const MOVE_EPS = 0.005;
-    // FIX: this used to filter to r.inQty||r.outQty only — i.e. it showed
-    // an item ONLY if it had a purchase/sale row inside the currently
-    // selected period. An item that went negative in an EARLIER period
-    // (no fresh purchase/sale this period) had inQty=outQty=0 and got
-    // silently dropped, even though it's still sitting at a real negative
-    // balance right now — that's why negative stock "existed but showed
-    // blank" here. Now also keeps any item whose current balance is
-    // nonzero, and carries the live balance (Bal) on every row.
+    // v2026-07-30 FIX: this report used to render as a bare list of
+    // unlabeled cart-rows — no column headers, no HSN, no Value, no
+    // totals footer — which looked broken next to every other report on
+    // this page (Stock, Stock Ledger, Low Stock, Negative Stock all use a
+    // proper table). Rebuilt to the same table format and the same
+    // shared moving-average valuation (_computeStockAvgRates) as those.
+    const _stockAvgRatesMove = _computeStockAvgRates();
     const allRows = DB.items.map(it=>{
       let inQty=0, outQty=0;
       periodPurchases.forEach(p=>(p.lineItems||[]).forEach(li=>{ if(li.id===it.id) inQty+=li.qty; }));
       sales.forEach(s=>(s.lineItems||[]).forEach(li=>{ if(li.id===it.id) outQty+=li.qty; }));
-      return {id:it.id, name:it.name, hsn:it.hsn||'—', unit:it.unit, inQty, outQty, stock:snapQty(it.stock)};
+      const bal = snapQty(it.stock);
+      const rate = _stockAvgRatesMove[it.id] ?? it.pRate ?? 0;
+      return {id:it.id, name:it.name, hsn:it.hsn||'—', unit:it.unit, inQty, outQty, stock:bal, val:bal*rate};
+    // Keeps any item with in/out activity this period OR a nonzero
+    // current balance — an item that went negative in an earlier period
+    // (no fresh movement now) still needs to show up here.
     }).filter(r=>r.inQty||r.outQty||Math.abs(r.stock)>MOVE_EPS);
-    // FIX: the All/Positive/Negative dropdown (rptStockSignToggle) is now
-    // shown for this report too (see display-toggle logic below) — it
-    // filters on the item's current live balance, same convention as the
-    // Current Stock report.
     const signFiltered = _rptStockSign==='positive' ? allRows.filter(r=>r.stock>MOVE_EPS)
       : _rptStockSign==='negative' ? allRows.filter(r=>r.stock<-MOVE_EPS)
       : allRows;
     const rows = _rptStockSearch
       ? signFiltered.filter(r=>r.name.toLowerCase().includes(_rptStockSearch) || (r.hsn||'').toLowerCase().includes(_rptStockSearch))
       : signFiltered;
-    tbl = rows.length ? rows.map(r=>`<div class="cart-row" style="cursor:pointer;${r.stock<-MOVE_EPS?'color:var(--red);':''}" onclick="viewStockLedgerDetail('${r.id}')"><span>${r.name}${r.stock<-MOVE_EPS?' ⚠️':''}</span><span class="mono">In ${fmtQtyDisplay(r.inQty,r.unit)} · Out ${fmtQtyDisplay(r.outQty,r.unit)} · Bal ${fmtQtyDisplay(r.stock,r.unit)}</span></div>`).join('') : `<div class="cart-row"><span>${_rptStockSearch?'No items match your search':(_rptStockSign==='negative'?'No negative-stock items':_rptStockSign==='positive'?'No positive-stock items':'No stock movement in this period')}</span><span></span></div>`;
+    const totalBal = rows.reduce((a,r)=>a+r.stock,0);
+    const totalVal = rows.reduce((a,r)=>a+r.val,0);
+    const emptyMsg = _rptStockSearch ? 'No items match your search' : (_rptStockSign==='negative' ? 'No negative-stock items' : _rptStockSign==='positive' ? 'No positive-stock items' : 'No stock movement in this period');
+    tbl = `<div class="inv-tbl-wrap"><table class="inv-tbl"><thead><tr>
+      <th>Item (HSN)</th><th>Unit</th><th class="num">In</th><th class="num">Out</th><th class="num">Balance</th><th class="num">Value</th>
+    </tr></thead><tbody>${rows.length ? rows.map(r=>`<tr style="cursor:pointer;${r.stock<-MOVE_EPS?'color:var(--red);':''}" onclick="viewStockLedgerDetail('${r.id}')">
+      <td>${r.name}${r.hsn && r.hsn!=='—' ? '<div style="font-size:9px;color:var(--sub);">HSN '+r.hsn+'</div>' : ''}</td>
+      <td>${r.unit||'Pcs'}</td>
+      <td class="mono">${r.inQty ? '+'+fmtQtyDisplay(r.inQty, r.unit) : '—'}</td>
+      <td class="mono">${r.outQty ? '−'+fmtQtyDisplay(r.outQty, r.unit) : '—'}</td>
+      <td class="mono">${fmtQtyDisplay(r.stock, r.unit)}</td>
+      <td class="mono">${fmt(r.val)}</td></tr>`).join('') : `<tr><td colspan="6" style="text-align:center;color:var(--sub);">${emptyMsg}</td></tr>`}
+    </tbody><tfoot><tr><td colspan="4"><b>Total</b></td><td class="mono"><b>${fmtQtyDisplay(totalBal,'')}</b></td><td class="mono"><b>${fmt(totalVal)}</b></td></tr></tfoot></table></div>
+    <div style="font-size:11px;color:var(--sub);margin-top:6px;">In/Out are this period's purchases/sales. Balance &amp; Value are as of right now (not period-end). Rows in <span style="color:var(--red);">red</span> are negative stock. Tap a row for full movement detail →</div>`;
   } else if(type==='lowstockrpt'){
     // v82 FIX: was a raw `i.stock<=i.min` comparison with no Number()
     // coercion — if either field ever comes back as a string (e.g. after a
@@ -12919,7 +12990,7 @@ function openReport(type, el, forceRefresh){
     // (e.g. −0.001kg) doesn't show up here as if it were real negative
     // stock needing investigation.
     const stockAvgRatesNeg = _computeStockAvgRates();
-    const itemValNeg = i => (Number(i.stock)||0) * (stockAvgRatesNeg[i.id] ?? i.pRate ?? 0);
+    const itemValNeg = i => snapQty(i.stock) * (stockAvgRatesNeg[i.id] ?? i.pRate ?? 0);
     const items = (DB.items||[]).filter(i=>Number(i.stock)<-0.005);
     const negTotal = items.reduce((a,i)=>a+itemValNeg(i),0);
     const showDecNeg = groupHasDecimal(items.map(itemValNeg));
@@ -12945,7 +13016,7 @@ function openReport(type, el, forceRefresh){
   } else if(type==='deadstock'){
     // v82 FIX: same epsilon + shared-valuation fixes as Low/Negative Stock.
     const stockAvgRatesDead = _computeStockAvgRates();
-    const itemValDead = i => (Number(i.stock)||0) * (stockAvgRatesDead[i.id] ?? i.pRate ?? 0);
+    const itemValDead = i => snapQty(i.stock) * (stockAvgRatesDead[i.id] ?? i.pRate ?? 0);
     const soldIds = new Set();
     (DB.sales||[]).forEach(s=>(s.lineItems||[]).forEach(li=>soldIds.add(li.id)));
     const dead = (DB.items||[]).filter(i=>Number(i.stock)>0.005 && !soldIds.has(i.id));
@@ -13802,7 +13873,16 @@ function viewStockLedgerDetail(itemId){
   // from everything before the period start (same pattern the Stock Ledger
   // summary and Cash/Bank Book already use).
   const range = _rptPeriodRange();
-  let openingBal = 0;
+  // v2026-07-30 FIX: this used to start openingBal at 0 and only sum
+  // transactions dated before the period — completely ignoring the
+  // item's manually-entered Opening Stock (see Edit Item → Opening
+  // Stock). Stock Ledger's own summary table already anchors on
+  // it.openingStock + prior movements (same fix applied there earlier);
+  // this per-item drill-down had the identical bug independently, so
+  // tapping into an item's detail from the Stock Ledger summary could
+  // show a Closing Balance that disagreed with the summary row you just
+  // tapped, off by exactly that item's Opening Stock value.
+  let openingBal = it.openingStock||0;
   const shownRows = [];
   allRows.forEach(r=>{
     if(r.date < range.from){ openingBal += r.inQty - r.outQty; }
