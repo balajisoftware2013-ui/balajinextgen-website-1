@@ -9314,6 +9314,8 @@ function drillGroupedRegister(type, granularity, key){
   }
   _rptFilter='custom';
   document.querySelectorAll('.rpt-chip').forEach(c=>c.classList.remove('active'));
+  const customChip=Array.from(document.querySelectorAll('.rpt-chip')).find(c=>c.getAttribute('onclick')===`setRptFilter('custom',this)`);
+  if(customChip) customChip.classList.add('active');
   const cdRow=document.getElementById('rptCustomDates'); if(cdRow) cdRow.style.display='flex';
   const fromEl=document.getElementById('rptFrom'), toEl=document.getElementById('rptTo');
   if(fromEl) fromEl.value=from; if(toEl) toEl.value=to;
@@ -10186,12 +10188,45 @@ function _bsGroupRow(label, amount, key, moreNav){
   const style = `display:flex;justify-content:space-between;padding:4px 6px;border-bottom:1px solid #ccc;cursor:pointer;`;
   return `<div style="${style}" onclick="toggleBsRow('${key}')"><span>${label} <span style="font-size:9px;color:var(--primary);">${expanded?'▲':'▼'}</span></span><span class="mono">${fmt(amount)}</span></div>`;
 }
+// v82 NEW: Balance Sheet used to be hardcoded to "as of today" — the Day/
+// Month/Qtr/Year/Custom filter bar was hidden for it entirely. Per request,
+// it can now show the balance sheet as of the END of whichever period is
+// selected (e.g. "as of 31-Mar-2026" for a custom range ending there), by
+// reconstructing each figure from the underlying ledgers up to that date
+// instead of reading today's live totals. Also switched Cash/Bank to the
+// same reconciled-from-ledger figure used by the Cash Book/Bank Book fix,
+// so the Balance Sheet can never show a different Cash-in-Hand than the
+// Cash Book does for the same date.
+function _bsAsOfDate(){
+  if(!['month','qtr','year','custom','today'].includes(_rptFilter)) return todayStr();
+  const {to} = _rptPeriodRange();
+  return (to && to < todayStr()) ? to : todayStr();
+}
+function _bsSnapshotAsOf(asOfDate){
+  const isToday = asOfDate >= todayStr();
+  const cashRows = _buildCashBookEntries().filter(r=>r.date<=asOfDate);
+  const bankRows = _buildBankBookEntries().filter(r=>r.date<=asOfDate);
+  const cash = cashRows.length ? cashRows[cashRows.length-1].bal : 0;
+  const bank = bankRows.length ? bankRows[bankRows.length-1].bal : 0;
+  const nextDay = new Date(new Date(asOfDate).getTime()+86400000).toISOString().slice(0,10);
+  const sv = isToday ? DB.items.reduce((a,i)=>a+(i.pRate||0)*(i.stock||0),0) : _stockValueAsOf(nextDay);
+  const dr = isToday ? totalPartyDue(DB.customers,'customers') : (DB.customers||[]).reduce((a,c)=>a+_partyDueAsOf(c,'customers',asOfDate),0);
+  const cr = isToday ? totalPartyDue(DB.suppliers,'suppliers') : (DB.suppliers||[]).reduce((a,s)=>a+_partyDueAsOf(s,'suppliers',asOfDate),0);
+  const susp = isToday ? getSuspenseTotal() : 0; // suspense resolution history isn't tracked, so only shown for "today"
+  const netProfitTillDate = _tradingPLForPeriod('2000-01-01', asOfDate).netProfit;
+  const ta = cash+bank+sv+dr;
+  const cap = ta-cr;
+  const capIntroduced = cap - netProfitTillDate;
+  return {asOfDate, isToday, cash, bank, sv, dr, cr, susp, netProfitTillDate, ta, cap, capIntroduced, liabTotal: cr+cap, assetTotal: ta};
+}
+function _partyDueAsOf(p, partyType, asOfDate){
+  const txns = getPartyLedgerTxns(p, partyType).filter(t=>t.date<=asOfDate);
+  return txns.length ? txns[txns.length-1].balance : 0;
+}
 function _buildBsTwoColHTML(){
-  const sv=DB.items.reduce((a,i)=>a+i.pRate*i.stock,0);
-  const dr=totalPartyDue(DB.customers,'customers');
-  const cr=totalPartyDue(DB.suppliers,'suppliers');
-  const susp = getSuspenseTotal();
-  const ta=DB.cash+DB.bank+sv+dr; const cap=ta-cr;
+  const asOfDate = _bsAsOfDate();
+  const snap = _bsSnapshotAsOf(asOfDate);
+  const {cash, bank, sv, dr, cr, susp, netProfitTillDate, capIntroduced, liabTotal, assetTotal, isToday} = snap;
   // v79: cap is still the balancing figure (so the sheet always ties out),
   // but it's now split so the accumulated Net Profit — the same number the
   // P&L reports as "Net Profit c/f" once you view All Time — is shown as
@@ -10200,37 +10235,41 @@ function _buildBsTwoColHTML(){
   // the business NOT explained by trading profit — an owner capital
   // contribution, a manually-edited Cash/Bank balance, or Opening Stock
   // that was entered without a matching capital entry.
-  const atPl = _allTimePL();
-  const netProfitTillDate = atPl.net;
-  const capIntroduced = cap - netProfitTillDate;
-  const liabTotal = cr+cap, assetTotal = ta;
-  const bankBreakdown = _bsBankBreakdown();
+  const bankBreakdown = isToday ? _bsBankBreakdown() : [];
   const hasNamedBankAccounts = bankBreakdown.length > 0;
 
-  const creditorRows = _bsPartyBreakdown(DB.suppliers,'suppliers');
-  const debtorRows = _bsPartyBreakdown(DB.customers,'customers');
-  const stockRows = _bsStockBreakdown();
+  const creditorRows = isToday ? _bsPartyBreakdown(DB.suppliers,'suppliers') : [];
+  const debtorRows = isToday ? _bsPartyBreakdown(DB.customers,'customers') : [];
+  const stockRows = isToday ? _bsStockBreakdown() : [];
 
   const liabRowsHTML = [
     _twoColRow('Capital Introduced', capIntroduced, null),
-    _bsGroupRow('Sundry Creditors', cr, 'creditors', `goPage('money');moneyTab('suppliers')`)
-      + (_bsRowExpanded.creditors ? _inlineBsRowBreakdown(creditorRows, `goPage('money');moneyTab('suppliers')`) : ''),
+    isToday
+      ? _bsGroupRow('Sundry Creditors', cr, 'creditors', `goPage('money');moneyTab('suppliers')`)
+        + (_bsRowExpanded.creditors ? _inlineBsRowBreakdown(creditorRows, `goPage('money');moneyTab('suppliers')`) : '')
+      : _twoColRow('Sundry Creditors', cr, null),
   ];
   if(susp>0) liabRowsHTML.push(_twoColRow('Suspense A/c', susp, `openReport('suspense')`, '#B45309'));
   // v71 FIX: Move Net Profit to appear LAST before Total (standard accounting format)
   liabRowsHTML.push(_twoColRow('Net Profit (Till Date)', netProfitTillDate, `openReport('pl')`));
   const assetRowsHTML = [
-    _twoColRow('Cash-in-Hand', DB.cash, `openSheet('bankSheet')`),
-    hasNamedBankAccounts
-      ? _bsGroupRow('Bank Accounts', DB.bank, 'bank', `openSheet('bankSheet')`)
+    _twoColRow('Cash-in-Hand', cash, isToday?`openSheet('bankSheet')`:`openReport('cashbook')`),
+    !isToday ? _twoColRow('Bank Accounts', bank, `openReport('bankbook')`)
+    : hasNamedBankAccounts
+      ? _bsGroupRow('Bank Accounts', bank, 'bank', `openSheet('bankSheet')`)
         + (_bsRowExpanded.bank ? _inlineBsRowBreakdown(bankBreakdown, `openSheet('bankSheet')`) : '')
-      : _twoColRow('Bank Accounts', DB.bank, `openSheet('bankSheet')`),
-    _bsGroupRow('Stock-in-Hand', sv, 'stock', `openReport('stock')`)
-      + (_bsRowExpanded.stock ? _inlineBsRowBreakdown(stockRows, `openReport('stock')`) : ''),
-    _bsGroupRow('Sundry Debtors', dr, 'debtors', `goPage('money');moneyTab('customers')`)
-      + (_bsRowExpanded.debtors ? _inlineBsRowBreakdown(debtorRows, `goPage('money');moneyTab('customers')`) : ''),
+      : _twoColRow('Bank Accounts', bank, `openSheet('bankSheet')`),
+    isToday
+      ? _bsGroupRow('Stock-in-Hand', sv, 'stock', `openReport('stock')`)
+        + (_bsRowExpanded.stock ? _inlineBsRowBreakdown(stockRows, `openReport('stock')`) : '')
+      : _twoColRow('Stock-in-Hand', sv, null),
+    isToday
+      ? _bsGroupRow('Sundry Debtors', dr, 'debtors', `goPage('money');moneyTab('customers')`)
+        + (_bsRowExpanded.debtors ? _inlineBsRowBreakdown(debtorRows, `goPage('money');moneyTab('customers')`) : '')
+      : _twoColRow('Sundry Debtors', dr, null),
   ];
   return `
+    ${!isToday?`<div style="font-size:11px;color:#B45309;margin-bottom:8px;">📅 Showing the Balance Sheet as of <b>${displayDate(asOfDate)}</b> — itemized breakdowns (which suppliers/items make up each total) aren't available for a past date, only the reconciled totals. Switch to "as of today" for the full drill-down.</div>`:''}
     <div style="display:flex;gap:0;border:1.3px solid #000;font-family:Georgia,'Times New Roman',serif;font-size:12px;min-height:300px;">
       <div style="flex:1;border-right:1.3px solid #000;display:flex;flex-direction:column;">
         <div style="font-weight:700;text-align:center;border-bottom:1.3px solid #000;padding:4px;">Liabilities</div>
@@ -10285,14 +10324,15 @@ function _plPeriodTotals(){
 // genuinely linking the two reports instead of leaving Capital as an
 // unexplained residual.
 function _allTimePL(){
-  const totalSales = (DB.sales||[]).reduce((a,s)=>a+(Number(s.total)||0),0);
-  const totalPurch = (DB.purchases||[]).reduce((a,p)=>a+(Number(p.total)||0),0);
-  const exp = (DB.expenses||[]).reduce((a,e)=>a+(Number(e.amount)||0),0)
-            + (DB.bankTxns||[]).filter(t=>t.type==='expense').reduce((a,t)=>a+(Number(t.amount)||0),0);
-  const otherIncome = (DB.bankTxns||[]).filter(t=>t.type==='income').reduce((a,t)=>a+(Number(t.amount)||0),0);
-  const gross = totalSales - totalPurch;
-  const net = gross - exp + otherIncome;
-  return {totalSales, totalPurch, exp, otherIncome, gross, net};
+  // v82 FIX: this used gross = totalSales − totalPurch with NO stock
+  // adjustment at all — while the P&L reports (Tally-Style, Vertical,
+  // Month-wise) had already been fixed to use the proper Opening+Purchase
+  // −Closing Stock trading formula. That mismatch is exactly why the
+  // Balance Sheet's "Net Profit (Till Date)" disagreed with the P&L's own
+  // Net Profit for the same all-time range by precisely the Closing Stock
+  // value. Now both use _tradingPLForPeriod so they always reconcile.
+  const t = _tradingPLForPeriod('2000-01-01', todayStr());
+  return {totalSales: t.salesTotal, totalPurch: t.purchTotal, exp: t.indirectExp, otherIncome: t.indirectInc, gross: t.grossProfit, net: t.netProfit};
 }
 // Category-wise breakdown of Indirect Expenses for the P&L's current period
 // filter — same idea as _bsPartyBreakdown/_bsStockBreakdown on the Balance
@@ -10432,6 +10472,10 @@ function _plVerticalTallyHTML(){
 // picker currently shows) — sets a custom range and opens the target.
 function _plDrillToRange(reportType, from, to){
   _rptFilter = 'custom';
+  document.querySelectorAll('.rpt-chip').forEach(c=>c.classList.remove('active'));
+  const customChip2 = Array.from(document.querySelectorAll('.rpt-chip')).find(c=>c.getAttribute('onclick')===`setRptFilter('custom',this)`);
+  if(customChip2) customChip2.classList.add('active');
+  const cdRow2 = document.getElementById('rptCustomDates'); if(cdRow2) cdRow2.style.display = 'flex';
   const fromEl = document.getElementById('rptFrom'), toEl = document.getElementById('rptTo');
   if(fromEl) fromEl.value = from;
   if(toEl) toEl.value = to;
@@ -10538,18 +10582,33 @@ function _plMonthwiseHTML(){
     </tr>`;
   }).join('');
   const totalNet = rows.reduce((a,r)=>a+r.net,0);
+  const totalSales = rows.reduce((a,r)=>a+r.sales,0);
+  const totalPurch = rows.reduce((a,r)=>a+r.purch,0);
+  const totalGross = rows.reduce((a,r)=>a+r.gross,0);
+  const totalExp = rows.reduce((a,r)=>a+r.exp,0);
   return `<div class="doc-items-wrap"><table class="doc-items-tbl reg-tbl">
     <thead><tr><th>Month</th><th>Sales</th><th>Purchases</th><th>Gross Profit</th><th>Expenses</th><th>Net Profit</th></tr></thead>
     <tbody>${body}</tbody>
-    <tfoot><tr><td colspan="5">Total (all months shown)</td><td class="mono" style="color:${totalNet>=0?'var(--green)':'var(--red)'};">${fmt(totalNet)}</td></tr></tfoot>
+    <tfoot><tr><td>Total (all months shown)</td><td class="mono">${fmt(totalSales)}</td><td class="mono">${fmt(totalPurch)}</td><td class="mono">${fmt(totalGross)}</td><td class="mono">${fmt(totalExp)}</td><td class="mono" style="color:${totalNet>=0?'var(--green)':'var(--red)'};">${fmt(totalNet)}</td></tr></tfoot>
   </table></div>
   <div style="font-size:11px;color:var(--sub);margin-top:6px;">▲ green = profit up vs. the previous month · ▼ red = profit down. Tap a row to open that month in the normal P&L view →</div>`;
 }
 // Jump from a Month-wise P&L row into that specific month's normal (Tally
 // ledger style) P&L view.
 function _plDrillToMonth(key){
+  // v82 FIX: this used to set _rptFilter/_rptMonth directly without ever
+  // touching the Day/Month/Qtr/Year/Custom chip UI — so the "Month" chip
+  // never visually activated and the "Custom" chip (if it had been active
+  // before) stayed highlighted with its old date range showing, even
+  // though the report filter had silently switched to this one month.
+  // Navigating back to any other report (Business Summary, Profit
+  // Analysis, Sales vs Purchase, etc.) then kept showing just this single
+  // month's figures — looking like "wrong"/stuck totals with no visible
+  // explanation. Now drives the same chip-sync logic setRptFilter() uses.
   _rptBsPlView = 'normal';
-  _rptFilter = 'month';
+  const monthChip = Array.from(document.querySelectorAll('.rpt-chip')).find(c=>c.getAttribute('onclick')===`setRptFilter('month',this)`);
+  if(monthChip) setRptFilter('month', monthChip);
+  else { _rptFilter = 'month'; }
   _rptMonth = key;
   const monthSel = document.getElementById('rptMonthSelector');
   if(monthSel) monthSel.value = key;
@@ -11659,7 +11718,12 @@ function openReport(type, el, forceRefresh){
   // were scoped to whatever period was picked (e.g. "Balance Sheet — Jul
   // 2026" while still showing today's numbers). Hide the inert filter bar
   // for these two and label them honestly instead.
-  const isSnapshotReport = ['bs','trialbalance','stock','lowstockrpt','negstock','deadstock','custoutstanding','suppoutstanding','ledgerpick'].includes(type);
+  const isSnapshotReport = ['trialbalance','stock','lowstockrpt','negstock','deadstock','custoutstanding','suppoutstanding','ledgerpick'].includes(type);
+  // v82 FIX: Balance Sheet used to be in the list above (permanently "as of
+  // today", filter bar hidden) per the v49 fix note — now that it actually
+  // reads the period filter (see _bsAsOfDate/_bsSnapshotAsOf), the filter
+  // bar is shown for it and the title reflects the real as-of date.
+  const isBsReport = type==='bs';
   // v49: Month-wise breakdowns are all-time by design (that's what "month-
   // wise" means — every month, grouped) so the Day/Month/Qtr/Year/Custom
   // chips did nothing here either, same issue as the snapshot reports above.
@@ -11680,6 +11744,7 @@ function openReport(type, el, forceRefresh){
     });
     filterLabel = isAllTimeReport ? 'all periods' : 'as of today';
   }
+  if(isBsReport) filterLabel = 'as of ' + _fmtTallyDate(_bsAsOfDate());
   const titles={sales:'Sales Register',purchase:'Purchase Register',profit:'Profit',stock:'Stock Summary',stockledger:'Stock Ledger',itemwise:'Item-wise Sales/Purchase',partywise:'Party-wise Monthly',returns:'Returns (CN/DN)',gst:'GST Summary',pl:'P&L',bs:'Balance Sheet',cashflow:'Cash Flow',cashbook:'Cash Book',bankbook:'Bank Book',ledger:'Ledger',journal:'Day Book / Journal',trialbalance:'Trial Balance',brs:'Bank Reconciliation',ageing:'Ageing — Who Owes / Who To Pay',suspense:'Suspense Register',
     salessummary:'Sales Summary', salesmonthwise:'Month-wise Sales', salescustomerwise:'Customer-wise Sales', salesitemwise:'Item-wise Sales', salescategorywise:'Category-wise Sales', salesmanwise:'Salesman-wise Sales', salescompare:'Sales Comparison', salesorders:'Pending Sales Orders', salesreturn:'Sales Return Report', itemprofit:'Item-wise Profit',
     purchsummary:'Purchase Summary', purchmonthwise:'Month-wise Purchase', purchsupplierwise:'Supplier-wise Purchase', purchsuppmonthwise:'Supplier Month-wise Purchase', purchitemwise:'Item-wise Purchase', purchcategorywise:'Category-wise Purchase', purchorders:'Pending Purchase Orders', purchreturn:'Purchase Return Report',
@@ -11802,28 +11867,21 @@ function openReport(type, el, forceRefresh){
     if(_rptBsPlView==='normal'){
       tbl = _buildBsTwoColHTML();
     } else {
-    const sv=DB.items.reduce((a,i)=>a+i.pRate*i.stock,0);
-    const dr=totalPartyDue(DB.customers,'customers');
-    const cr=totalPartyDue(DB.suppliers,'suppliers');
-    const susp=getSuspenseTotal();
-    const ta=DB.cash+DB.bank+sv+dr; const cap=ta-cr;
-    // v79: same Capital split as the Tally view — see _allTimePL() — so the
-    // profit figure actually appears here instead of being buried inside an
-    // unlabeled "Owner's Capital" residual.
-    const atPl3 = _allTimePL();
-    const netProfitTillDate3 = atPl3.net;
-    const capIntroduced3 = cap - netProfitTillDate3;
-    tbl=`<div class="cart-row" style="font-weight:700;"><span>ASSETS</span><span></span></div>
-     <div class="cart-row" style="cursor:pointer;" onclick="openSheet('bankSheet')"><span>Cash in Hand <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(DB.cash)}</span></div>
-     <div class="cart-row" style="cursor:pointer;" onclick="openSheet('bankSheet')"><span>Bank Balance <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(DB.bank)}</span></div>
-     <div class="cart-row" style="cursor:pointer;" onclick="toggleBsRow('stock')"><span>Stock Value <span style="color:var(--primary);font-size:10px;">${_bsRowExpanded.stock?'HIDE ▲':'FULL LIST ▼'}</span></span><span class="mono">${fmt(sv)}</span></div>
-     ${_bsRowExpanded.stock ? _inlineBsRowBreakdown(_bsStockBreakdown(), `openReport('stock')`) : ''}
-     <div class="cart-row" style="cursor:pointer;" onclick="toggleBsRow('debtors')"><span>Customer Dues <span style="color:var(--primary);font-size:10px;">${_bsRowExpanded.debtors?'HIDE ▲':'FULL LIST ▼'}</span></span><span class="mono">${fmt(dr)}</span></div>
-     ${_bsRowExpanded.debtors ? _inlineBsRowBreakdown(_bsPartyBreakdown(DB.customers,'customers'), `goPage('money');moneyTab('customers')`) : ''}
+    const asOfDate3 = _bsAsOfDate();
+    const snap3 = _bsSnapshotAsOf(asOfDate3);
+    const {cash:cash3, bank:bank3, sv, dr, cr, susp, netProfitTillDate:netProfitTillDate3, capIntroduced:capIntroduced3, ta, cap, isToday:isToday3} = snap3;
+    tbl=`${!isToday3?`<div class="cart-row" style="font-size:11px;color:#B45309;"><span>📅 As of ${displayDate(asOfDate3)} — itemized breakdowns aren't available for a past date, only totals.</span></div>`:''}
+     <div class="cart-row" style="font-weight:700;"><span>ASSETS</span><span></span></div>
+     <div class="cart-row" style="cursor:pointer;" onclick="${isToday3?`openSheet('bankSheet')`:`openReport('cashbook')`}"><span>Cash in Hand <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(cash3)}</span></div>
+     <div class="cart-row" style="cursor:pointer;" onclick="${isToday3?`openSheet('bankSheet')`:`openReport('bankbook')`}"><span>Bank Balance <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(bank3)}</span></div>
+     <div class="cart-row" style="cursor:pointer;" onclick="${isToday3?`toggleBsRow('stock')`:`openReport('stock')`}"><span>Stock Value ${isToday3?`<span style="color:var(--primary);font-size:10px;">${_bsRowExpanded.stock?'HIDE ▲':'FULL LIST ▼'}</span>`:''}</span><span class="mono">${fmt(sv)}</span></div>
+     ${isToday3 && _bsRowExpanded.stock ? _inlineBsRowBreakdown(_bsStockBreakdown(), `openReport('stock')`) : ''}
+     <div class="cart-row" style="cursor:pointer;" onclick="${isToday3?`toggleBsRow('debtors')`:`goPage('money');moneyTab('customers')`}"><span>Customer Dues ${isToday3?`<span style="color:var(--primary);font-size:10px;">${_bsRowExpanded.debtors?'HIDE ▲':'FULL LIST ▼'}</span>`:''}</span><span class="mono">${fmt(dr)}</span></div>
+     ${isToday3 && _bsRowExpanded.debtors ? _inlineBsRowBreakdown(_bsPartyBreakdown(DB.customers,'customers'), `goPage('money');moneyTab('customers')`) : ''}
      <div class="cart-total"><span>Total Assets</span><span class="mono">${fmt(ta)}</span></div>
      <div class="cart-row" style="font-weight:700;margin-top:8px;"><span>LIABILITIES</span><span></span></div>
-     <div class="cart-row" style="cursor:pointer;" onclick="toggleBsRow('creditors')"><span>Supplier Dues <span style="color:var(--primary);font-size:10px;">${_bsRowExpanded.creditors?'HIDE ▲':'FULL LIST ▼'}</span></span><span class="mono">${fmt(cr)}</span></div>
-     ${_bsRowExpanded.creditors ? _inlineBsRowBreakdown(_bsPartyBreakdown(DB.suppliers,'suppliers'), `goPage('money');moneyTab('suppliers')`) : ''}
+     <div class="cart-row" style="cursor:pointer;" onclick="${isToday3?`toggleBsRow('creditors')`:`goPage('money');moneyTab('suppliers')`}"><span>Supplier Dues ${isToday3?`<span style="color:var(--primary);font-size:10px;">${_bsRowExpanded.creditors?'HIDE ▲':'FULL LIST ▼'}</span>`:''}</span><span class="mono">${fmt(cr)}</span></div>
+     ${isToday3 && _bsRowExpanded.creditors ? _inlineBsRowBreakdown(_bsPartyBreakdown(DB.suppliers,'suppliers'), `goPage('money');moneyTab('suppliers')`) : ''}
      <div class="cart-row"><span>Capital Introduced</span><span class="mono">${fmt(capIntroduced3)}</span></div>
      <div class="cart-row" style="cursor:pointer;" onclick="openReport('pl',document.querySelector('[onclick*=&quot;pl&quot;].rpt-type'))"><span>Net Profit (Till Date) <span style="color:var(--primary);font-size:10px;">VIEW P&amp;L ›</span></span><span class="mono ${netProfitTillDate3>=0?'green':'due'}">${fmt(netProfitTillDate3)}</span></div>
      <div class="cart-total"><span>Total Liabilities</span><span class="mono">${fmt(cr+cap)}</span></div>
@@ -12053,9 +12111,19 @@ function openReport(type, el, forceRefresh){
       ? summary.filter(r=> r.name.toLowerCase().includes(_rptStockSearch) || (r.hsn||'').toLowerCase().includes(_rptStockSearch))
       : summary;
     const totalClosingQty = shownRows.reduce((a,r)=>a+r.closingQty,0);
-    tbl = `<div class="inv-tbl-wrap"><table class="inv-tbl"><thead><tr>
+    // v82 FIX: negative-stock items (oversold beyond recorded purchases)
+    // showed correctly per-row, but there was no total anywhere flagging
+    // how much stock/value is negative — easy to miss buried in a long
+    // list. Added a summary line + red highlight on the affected rows.
+    const negRows = shownRows.filter(r=>r.closingQty<0);
+    const negQtyTotal = negRows.reduce((a,r)=>a+r.closingQty,0);
+    const negValTotal = negRows.reduce((a,r)=>a+r.closingVal,0);
+    const negBanner = negRows.length
+      ? `<div class="cart-row" style="cursor:pointer;color:var(--red);font-weight:700;" onclick="closeAllSheets();openReport('negstock')"><span>⚠️ ${negRows.length} item${negRows.length===1?'':'s'} showing negative stock — check for missed purchase entries <span style="font-size:10px;">VIEW ›</span></span><span class="mono">${fmtQtyDisplay(negQtyTotal,'')} qty · ${fmt(negValTotal)}</span></div>`
+      : '';
+    tbl = negBanner + `<div class="inv-tbl-wrap"><table class="inv-tbl"><thead><tr>
       <th>Item (HSN)</th><th>Unit</th><th class="num">Opening</th><th class="num">Purchase</th><th class="num">Sale</th><th class="num">Adj</th><th class="num">Closing</th><th class="num">Avg Rate</th><th class="num">Value</th>
-    </tr></thead><tbody>${shownRows.length ? shownRows.map(r=>`<tr style="cursor:pointer;" onclick="viewStockLedgerDetail('${r.id}')">
+    </tr></thead><tbody>${shownRows.length ? shownRows.map(r=>`<tr style="cursor:pointer;${r.closingQty<0?'color:var(--red);':''}" onclick="viewStockLedgerDetail('${r.id}')">
       <td>${r.name}${r.hsn && r.hsn!=='—' ? '<div style="font-size:9px;color:var(--sub);">HSN '+r.hsn+'</div>' : ''}</td>
       <td>${r.unit||'Pcs'}</td><td class="mono">${fmtQtyDisplay(r.openingQty, r.unit)}</td>
       <td class="mono">${r.purQty ? fmtQtyDisplay(r.purQty, r.unit) : '—'}</td>
@@ -12063,7 +12131,7 @@ function openReport(type, el, forceRefresh){
       <td class="mono">${r.adjQty ? fmtQtyDisplay(r.adjQty, r.unit) : '—'}</td>
       <td class="mono">${fmtQtyDisplay(r.closingQty, r.unit)}</td><td class="mono">${fmt(r.closingRate)}</td>
       <td class="mono">${fmt(r.closingVal)}</td></tr>`).join('') : `<tr><td colspan="9" style="text-align:center;color:var(--sub);">${_rptStockSearch?'No items match your search':'No items'}</td></tr>`}
-    </tbody><tfoot><tr><td colspan="6"><b>Total</b></td><td class="mono"><b>${fmtQtyDisplay(totalClosingQty,'')}</b></td><td></td><td class="mono"><b>${fmt(summary.reduce((a,r)=>a+r.closingVal,0))}</b></td></tr></tfoot></table></div>`;
+    </tbody><tfoot><tr><td colspan="6"><b>Total</b></td><td class="mono"><b>${fmtQtyDisplay(totalClosingQty,'')}</b></td><td></td><td class="mono"><b>${fmt(summary.reduce((a,r)=>a+r.closingVal,0))}</b></td></tr>${negRows.length?`<tr style="color:var(--red);"><td colspan="6">Of which: Negative Stock (${negRows.length} item${negRows.length===1?'':'s'})</td><td class="mono">${fmtQtyDisplay(negQtyTotal,'')}</td><td></td><td class="mono">${fmt(negValTotal)}</td></tr>`:''}</tfoot></table></div>`;
   } else if(type==='itemwise'){
     const itemSales = {}, itemPurch = {};
     sales.forEach(s=>(s.lineItems||[]).forEach(li=>{ const n=resolveItemName(li); itemSales[n]=(itemSales[n]||0)+li.qty*li.rate; }));
@@ -12191,12 +12259,17 @@ function openReport(type, el, forceRefresh){
     const uniqCust = new Set(allSales.map(s=>s.cust||'walkin')).size;
     const byMode = {};
     allSales.forEach(s=>{ byMode[s.mode]=(byMode[s.mode]||0)+s.total; });
-    tbl = `<div class="cart-row"><span>Total Sales Value</span><span class="mono">${fmt(totalVal)}</span></div>
-     <div class="cart-row"><span>Number of Bills</span><span class="mono">${billCount}</span></div>
-     <div class="cart-row"><span>Average Bill Value</span><span class="mono">${fmt(avgBill)}</span></div>
-     <div class="cart-row"><span>Unique Customers Billed</span><span class="mono">${uniqCust}</span></div>
-     <div class="cart-row" style="font-weight:700;margin-top:8px;"><span>By Payment Mode</span><span></span></div>`
-     + (Object.keys(byMode).length ? Object.entries(byMode).sort((a,b)=>b[1]-a[1]).map(([m,v])=>`<div class="cart-row"><span>${m}</span><span class="mono">${fmt(v)}</span></div>`).join('') : '<div class="cart-row"><span>No sales in this period</span><span></span></div>');
+    // v82 FIX: was plain div rows — proper bordered table now.
+    tbl = _renderBreakdownTable([{label:'Particulars'},{label:'Value',align:'right'}], [
+      ['Total Sales Value', fmt(totalVal)],
+      ['Number of Bills', billCount],
+      ['Average Bill Value', fmt(avgBill)],
+      ['Unique Customers Billed', uniqCust]
+    ], null, 'No sales yet');
+    tbl += `<div class="section-label" style="margin-top:14px;">By Payment Mode</div>`;
+    tbl += Object.keys(byMode).length
+      ? _renderBreakdownTable([{label:'Mode'},{label:'Amount',align:'right'}], Object.entries(byMode).sort((a,b)=>b[1]-a[1]).map(([m,v])=>[m, fmt(v)]), ['Total', fmt(totalVal)], 'No sales in this period')
+      : '<div class="cart-row"><span>No sales in this period</span><span></span></div>';
   } else if(type==='purchsummary'){
     // v54 FIX: same all-time fix as Sales Summary above — was scoped to
     // the Day/Month/Qtr/Year filter (default 'This Month') and looked
@@ -12208,12 +12281,17 @@ function openReport(type, el, forceRefresh){
     const uniqSupp = new Set(periodPurch.map(p=>p.supp||'—')).size;
     const byMode = {};
     periodPurch.forEach(p=>{ byMode[p.mode]=(byMode[p.mode]||0)+p.total; });
-    tbl = `<div class="cart-row"><span>Total Purchase Value</span><span class="mono">${fmt(totalVal)}</span></div>
-     <div class="cart-row"><span>Number of Purchases</span><span class="mono">${billCount}</span></div>
-     <div class="cart-row"><span>Average Purchase Value</span><span class="mono">${fmt(avgBill)}</span></div>
-     <div class="cart-row"><span>Suppliers Involved</span><span class="mono">${uniqSupp}</span></div>
-     <div class="cart-row" style="font-weight:700;margin-top:8px;"><span>By Payment Mode</span><span></span></div>`
-     + (Object.keys(byMode).length ? Object.entries(byMode).sort((a,b)=>b[1]-a[1]).map(([m,v])=>`<div class="cart-row"><span>${m}</span><span class="mono">${fmt(v)}</span></div>`).join('') : '<div class="cart-row"><span>No purchases recorded</span><span></span></div>');
+    // v82 FIX: was plain div rows — proper bordered table now.
+    tbl = _renderBreakdownTable([{label:'Particulars'},{label:'Value',align:'right'}], [
+      ['Total Purchase Value', fmt(totalVal)],
+      ['Number of Purchases', billCount],
+      ['Average Purchase Value', fmt(avgBill)],
+      ['Suppliers Involved', uniqSupp]
+    ], null, 'No purchases recorded');
+    tbl += `<div class="section-label" style="margin-top:14px;">By Payment Mode</div>`;
+    tbl += Object.keys(byMode).length
+      ? _renderBreakdownTable([{label:'Mode'},{label:'Amount',align:'right'}], Object.entries(byMode).sort((a,b)=>b[1]-a[1]).map(([m,v])=>[m, fmt(v)]), ['Total', fmt(totalVal)], 'No purchases recorded')
+      : '<div class="cart-row"><span>No purchases recorded</span><span></span></div>';
   } else if(type==='salesmonthwise'){
     const yearFilteredSales = (_matrixReportYear && _matrixReportYear!=='last12') ? (DB.sales||[]).filter(s=>s.date && s.date.slice(0,4)===_matrixReportYear) : (DB.sales||[]);
     tbl = _matrixYearSelectorHtml() + renderGroupedRegister(yearFilteredSales, 'month', {amount:s=>s.total, label:'sales', type:'sales', emptyMsg:'No sales yet'});
@@ -12398,10 +12476,12 @@ function openReport(type, el, forceRefresh){
   } else if(type==='suppledgerlist' || type==='suppstatement'){
     tbl = _renderPartyLedgerTable(DB.suppliers||[], 'suppliers', {onlyOutstanding:false});
   } else if(type==='ledgerpick'){
-    tbl = `<div class="cart-row" style="font-weight:700;"><span>Customers</span><span></span></div>`
-      + (DB.customers.length ? DB.customers.map(c=>`<div class="cart-row" style="cursor:pointer;" onclick="openDoc('ledger','${c.id}','customers')"><span>${c.name} <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(getPartyDocBalance(c,'customers'))}</span></div>`).join('') : '<div class="cart-row"><span>None yet</span><span></span></div>')
-      + `<div class="cart-row" style="font-weight:700;margin-top:8px;"><span>Suppliers</span><span></span></div>`
-      + (DB.suppliers.length ? DB.suppliers.map(s=>`<div class="cart-row" style="cursor:pointer;" onclick="openDoc('ledger','${s.id}','suppliers')"><span>${s.name} <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(getPartyDocBalance(s,'suppliers'))}</span></div>`).join('') : '<div class="cart-row"><span>None yet</span><span></span></div>');
+    // v82 FIX: was plain div.cart-row lines with no table — reuses the same
+    // proper-table renderer already built for Customer/Supplier Ledger.
+    tbl = `<div class="section-label">Customers</div>`
+      + _renderPartyLedgerTable(DB.customers||[], 'customers', {onlyOutstanding:false})
+      + `<div class="section-label" style="margin-top:14px;">Suppliers</div>`
+      + _renderPartyLedgerTable(DB.suppliers||[], 'suppliers', {onlyOutstanding:false});
   } else if(type==='custoutstanding' || type==='suppoutstanding'){
     const pType = type==='custoutstanding' ? 'customers' : 'suppliers';
     const list = type==='custoutstanding' ? DB.customers : DB.suppliers;
@@ -12584,9 +12664,9 @@ function openReport(type, el, forceRefresh){
       ['Purchases', fmt(tp.purchTotal)],
       ['Opening Stock', fmt(tp.openingStockVal)],
       ['Closing Stock', fmt(tp.closingStockVal)],
-      ['Gross Profit', fmt(tp.grossProfit)],
+      ['Gross Profit', '<b>'+fmt(tp.grossProfit)+'</b>'],
       ['Expenses', fmt(tp.indirectExp)],
-      ['Net Profit', fmt(tp.netProfit)],
+      ['Net Profit', '<b>'+fmt(tp.netProfit)+'</b>'],
       ['Pending Collection', fmt(pendColl)],
       ['Pending Payment', fmt(pendPay)],
       ['Cash + Bank', fmt(DB.cash+DB.bank)]
@@ -12598,15 +12678,16 @@ function openReport(type, el, forceRefresh){
     const tp = _tradingPLForPeriod(from, to);
     const margin = tp.salesTotal ? Math.round(tp.netProfit/tp.salesTotal*100) : 0;
     const grossMargin = tp.salesTotal ? Math.round(tp.grossProfit/tp.salesTotal*100) : 0;
+    // v82 FIX: Revenue enlarged+bold, Gross Profit/Net Profit bold, per request.
     const rows = [
-      ['Revenue', fmt(tp.salesTotal)],
+      ['Revenue', '<b style="font-size:15px;">'+fmt(tp.salesTotal)+'</b>'],
       ['Opening Stock', fmt(tp.openingStockVal)],
       ['Add: Purchases', fmt(tp.purchTotal)],
       ['Less: Closing Stock', '−'+fmt(tp.closingStockVal)],
       ['Cost of Goods Sold', fmt(tp.costOfSales)],
-      ['Gross Profit', fmt(tp.grossProfit)+' ('+grossMargin+'%)'],
+      ['Gross Profit', '<b>'+fmt(tp.grossProfit)+' ('+grossMargin+'%)</b>'],
       ['Expenses', '−'+fmt(tp.indirectExp)],
-      ['Net Profit', fmt(tp.netProfit)+' ('+margin+'%)']
+      ['Net Profit', '<b>'+fmt(tp.netProfit)+' ('+margin+'%)</b>']
     ];
     tbl = _renderBreakdownTable([{label:'Particulars'},{label:'Amount',align:'right'}], rows, null, 'No data');
     tbl += `<div class="section-label" style="margin-top:14px;">Month-wise Profit Trend</div>` + _plMonthwiseHTML();
@@ -12622,14 +12703,15 @@ function openReport(type, el, forceRefresh){
     // v82 FIX: was plain div rows with a raw purchases figure. Now a
     // proper table plus a month-wise Sales vs Purchase comparison table
     // (as explicitly requested), reusing the same trading-account numbers
-    // the P&L reports use so every screen agrees.
+    // the P&L reports use so every screen agrees. Grand total (Difference)
+    // row bolded per request.
     const {from, to} = _rptPeriodRange();
     const tp = _tradingPLForPeriod(from, to);
     const diff = tp.salesTotal - tp.purchTotal;
     const rows = [
       ['Sales', fmt(tp.salesTotal)],
       ['Purchases', fmt(tp.purchTotal)],
-      ['Difference (Sales − Purchases)', fmt(diff)]
+      ['Difference (Sales − Purchases)', '<b>'+fmt(diff)+'</b>']
     ];
     tbl = _renderBreakdownTable([{label:'Particulars'},{label:'Amount',align:'right'}], rows, null, 'No data');
     tbl += `<div class="section-label" style="margin-top:14px;">Month-wise Sales vs Purchase</div>` + _plMonthwiseHTML();
