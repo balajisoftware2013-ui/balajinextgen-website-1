@@ -5799,7 +5799,18 @@ function renderDashboard(){
   if(lowStockItems.length) sugg.push(`Reorder <b>${lowStockItems[0].name}</b> — only ${lowStockItems[0].stock} left`);
   const topDue = [...DB.customers].map(c=>({c, bal:getPartyDocBalance(c,'customers')})).sort((a,b)=>b.bal-a.bal)[0];
   if(topDue && topDue.bal>0) sugg.push(`Remind <b>${topDue.c.name}</b> — ₹${topDue.bal} due since ${topDue.c.lastDate}`);
-  if(DB.items && DB.items.length) sugg.push(`Your best seller this week: <b>${DB.items[0].name}</b>`);
+  // v2026-07-30 FIX: this used to be `DB.items[0].name` — literally
+  // whichever item happens to sit first in the items array, completely
+  // unrelated to sales. Now genuinely the highest-revenue item across the
+  // last 7 days of actual sales, so it says something true or nothing at all.
+  const last7 = (()=>{ const d=new Date(); d.setDate(d.getDate()-7); return d.toISOString().slice(0,10); })();
+  const itemRevenue = {};
+  (DB.sales||[]).filter(s=>s.date>=last7).forEach(s=>(s.lineItems||[]).forEach(li=>{
+    const nm = resolveItemName(li); if(!nm) return;
+    itemRevenue[nm] = (itemRevenue[nm]||0) + (li.qty*li.rate);
+  }));
+  const topSellerEntry = Object.entries(itemRevenue).sort((a,b)=>b[1]-a[1])[0];
+  if(topSellerEntry) sugg.push(`Your best seller this week: <b>${topSellerEntry[0]}</b> (${fmt(topSellerEntry[1])})`);
   const aiSuggEl = document.getElementById('aiSuggestList');
   if(aiSuggEl) aiSuggEl.innerHTML = sugg.map(s=>`<div style="padding:8px 0;border-bottom:1px solid var(--border);font-size:13px;">💡 ${s}</div>`).join('');
 
@@ -11663,10 +11674,30 @@ function runAiFeature(feat){
     case 'bestseller': msg=`<b>🏆 Best Selling Products:</b><br>`+DB.items.slice(0,3).map((i,n)=>`${n+1}. ${i.name} (₹${i.sRate}/unit)`).join('<br>'); break;
     case 'deadstock': msg=dead.length?`<b>💀 Dead Stock Alert:</b><br>`+dead.map(i=>`${i.name} — ${i.stock} ${i.unit} (overstock)`).join('<br>'):'✅ No dead stock.'; break;
     case 'profitimprove': msg=`<b>📈 Profit Tips:</b><br>• Collect ${fmt(totalPartyDue(DB.customers,'customers'))} outstanding<br>• Clear dead stock — ${dead.length} items overstocked<br>• Restock ${low.length} low items before lost sales`; break;
-    case 'gstcheck': msg=DB.gstin?`<b>🏛️ GST OK</b><br>GSTIN: ${DB.gstin}<br>GSTR-1 due: 11th<br>GSTR-3B due: 20th<br>Est. payable: ₹2,800`:'⚠️ GSTIN not set — go to Settings → GST'; break;
+    case 'gstcheck':{
+      // v2026-07-30 FIX: was a hardcoded "Est. payable: ₹2,800" regardless
+      // of any real data — now computed the same way the GST Summary report
+      // computes it, for the current month, so it can't contradict that report.
+      const gcFrom = todayStr().slice(0,7)+'-01';
+      const {gstSales:gcOut, gstPurch:gcIn} = computeGSTTotals((DB.sales||[]).filter(s=>s.date>=gcFrom), (DB.purchases||[]).filter(p=>p.date>=gcFrom));
+      msg=DB.gstin?`<b>🏛️ GST OK</b><br>GSTIN: ${DB.gstin}<br>GSTR-1 due: 11th<br>GSTR-3B due: 20th<br>Est. payable (this month): ${fmt(Math.max(0,gcOut-gcIn))}`:'⚠️ GSTIN not set — go to Settings → GST'; break;
+    }
     case 'dupcust':{ const ns=DB.customers.map(c=>c.name.toLowerCase()); const d=DB.customers.filter((c,i)=>ns.indexOf(c.name.toLowerCase())!==i); msg=d.length?`<b>⚠️ Duplicate Customers:</b><br>`+d.map(c=>c.name).join('<br>'):'✅ No duplicates.'; break;}
     case 'dupitem':{ const ns=DB.items.map(i=>i.name.toLowerCase()); const d=DB.items.filter((i,idx)=>ns.indexOf(i.name.toLowerCase())!==idx); msg=d.length?`<b>⚠️ Duplicate Items:</b><br>`+d.map(i=>i.name).join('<br>'):'✅ No duplicates.'; break;}
-    case 'expenseanalysis':{ const exp=todaysExpenseTotal(); const sal=DB.sales.reduce((a,s)=>a+s.total,0); msg=`<b>💸 Expense Analysis:</b><br>Today's expenses: ${fmt(exp)}<br>Sales: ${fmt(sal)}<br>Ratio: ${sal>0?Math.round(exp/sal*100):0}%<br>${exp/sal>0.3?'⚠️ Expenses high — review':'✅ Within healthy range'}`; break;}
+    case 'expenseanalysis':{
+      // v2026-07-30 FIX: was comparing TODAY's expenses against ALL-TIME
+      // sales ever recorded — two different periods, so the ratio meant
+      // nothing (e.g. one slow morning against a year of history always
+      // looked "healthy" no matter what). Also divided exp/sal with no
+      // zero-guard on the warning line specifically, so on a day with zero
+      // sales so far it read exp/0 = Infinity > 0.3 → falsely flagged
+      // "Expenses high" even with a single small expense and no sales yet.
+      const exp=todaysExpenseTotal();
+      const sal=(DB.sales||[]).filter(s=>s.date===todayStr()).reduce((a,s)=>a+s.total,0);
+      const ratioPct = sal>0 ? Math.round(exp/sal*100) : 0;
+      msg=`<b>💸 Expense Analysis:</b><br>Today's expenses: ${fmt(exp)}<br>Today's sales: ${fmt(sal)}<br>Ratio: ${sal>0?ratioPct+'%':'—'}<br>${sal>0 ? (exp/sal>0.3?'⚠️ Expenses high — review':'✅ Within healthy range') : (exp>0?'ℹ️ No sales yet today to compare against':'✅ No expenses logged yet today')}`;
+      break;
+    }
   }
   setTimeout(()=>addAiMsg('bot',msg),200);
 }
@@ -13843,8 +13874,28 @@ function askAI(q){
     ans = low.length ? low.map(i=>`${i.name} — ${i.stock} ${i.unit} left`).join('<br>') : 'All items are well stocked.';
   }
   else if(ql.includes('cash')) ans = `You have <b>${fmt(_reconciledCashBalance())}</b> cash in hand and <b>${fmt(_reconciledBankBalance())}</b> in bank.`;
-  else if(ql.includes('sells most')||ql.includes('best')) ans = `<b>${DB.items[0].name}</b> is your top mover this week.`;
-  else if(ql.includes('gst')) ans = `Estimated GST payable this month is <b>${fmt(2800)}</b>.`;
+  else if(ql.includes('sells most')||ql.includes('best')) {
+    // v2026-07-30 FIX: was a hardcoded `DB.items[0].name`, unrelated to any
+    // actual sales — same issue as the Dashboard suggestion, fixed the same way.
+    const last7b = (()=>{ const d=new Date(); d.setDate(d.getDate()-7); return d.toISOString().slice(0,10); })();
+    const rev = {};
+    (DB.sales||[]).filter(s=>s.date>=last7b).forEach(s=>(s.lineItems||[]).forEach(li=>{
+      const nm = resolveItemName(li); if(!nm) return; rev[nm] = (rev[nm]||0) + (li.qty*li.rate);
+    }));
+    const top = Object.entries(rev).sort((a,b)=>b[1]-a[1])[0];
+    ans = top ? `<b>${top[0]}</b> is your top seller this week (${fmt(top[1])} in sales).` : 'No sales recorded in the last 7 days yet.';
+  }
+  else if(ql.includes('gst')) {
+    // v2026-07-30 FIX: was a hardcoded fmt(2800) regardless of any real data
+    // — guaranteed to disagree with the actual GST Summary report. Now uses
+    // the same computeGSTTotals() the GST Summary report itself uses, for
+    // the current month, so this answer can never contradict that report.
+    const gstFrom = todayStr().slice(0,7)+'-01';
+    const gstSalesArr = (DB.sales||[]).filter(s=>s.date>=gstFrom);
+    const gstPurchArr = (DB.purchases||[]).filter(p=>p.date>=gstFrom);
+    const {gstSales:gOut, gstPurch:gIn} = computeGSTTotals(gstSalesArr, gstPurchArr);
+    ans = `Estimated GST payable this month is <b>${fmt(Math.max(0,gOut-gIn))}</b> (Output ${fmt(gOut)} − Input ${fmt(gIn)}). See the full GST Summary report for details.`;
+  }
   else if(ql.includes('pending payment')) ans = DB.suppliers.map(s=>({s, bal:getPartyDocBalance(s,'suppliers')})).filter(x=>x.bal>0).map(x=>`${x.s.name} — ${fmt(x.bal)}`).join('<br>') || 'No pending supplier payments.';
   setTimeout(()=>addAiMsg('bot', ans), 280);
 }
