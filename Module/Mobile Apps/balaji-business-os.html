@@ -7381,23 +7381,26 @@ function renderInventoryStockTable(list){
 // call, but the markup/styling is intentionally identical.
 function renderInventoryTallyTable(list){
   // v82 FIX: same moving-average valuation + min>0 fix as the App View table.
+  // v83 FIX: also snap near-zero floating-point residue (e.g. 0.001 left over
+  // from qty arithmetic across many bills) to a clean 0, same as the App View
+  // table already does — this Tally-style table was still reading i.stock raw.
   const invRatesTallyTbl = _computeStockAvgRates();
-  const stockTotal = list.reduce((a,i)=>a+((Number(i.stock)||0)*(invRatesTallyTbl[i.id] ?? i.pRate ?? 0)),0);
-  const showDec = groupHasDecimal(list.map(i=>(Number(i.stock)||0)*(invRatesTallyTbl[i.id] ?? i.pRate ?? 0)));
+  const stockTotal = list.reduce((a,i)=>a+(snapQty(i.stock)*(invRatesTallyTbl[i.id] ?? i.pRate ?? 0)),0);
+  const showDec = groupHasDecimal(list.map(i=>snapQty(i.stock)*(invRatesTallyTbl[i.id] ?? i.pRate ?? 0)));
   const bizAddr = DB.bizAddress || '';
   const sameUnit = list.length && list.every(i=>(i.unit||'Pcs')===(list[0].unit||'Pcs'));
   const rows = list.length ? list.map(i=>{
-    const isLow = Number(i.min)>0 && Number(i.stock)<=Number(i.min);
+    const isLow = Number(i.min)>0 && snapQty(i.stock)<=Number(i.min);
     const rate = invRatesTallyTbl[i.id] ?? i.pRate ?? 0;
     return `
     <tr onclick="viewItemMovementFromInventory('${i.id}')" style="cursor:pointer;${isLow?'color:var(--red);':''}">
       <td style="text-align:left;">${i.name}${isLow?' ⚠️':''}</td>
-      <td class="mono">${fmtQtyDisplay(i.stock, i.unit)} ${i.unit||'Pcs'}</td>
+      <td class="mono">${fmtQtyDisplay(snapQty(i.stock), i.unit)} ${i.unit||'Pcs'}</td>
       <td class="mono">${fmtSmart(rate, showDec)}</td>
-      <td class="mono" style="font-weight:700;">${fmtSmart(rate*(Number(i.stock)||0), showDec)}</td>
+      <td class="mono" style="font-weight:700;">${fmtSmart(rate*snapQty(i.stock), showDec)}</td>
     </tr>`;
   }).join('') : `<tr><td colspan="4" style="text-align:center;color:var(--sub);">No items found</td></tr>`;
-  const grandQty = sameUnit ? `${fmtQtyDisplay(list.reduce((a,i)=>a+(Number(i.stock)||0),0), list[0].unit)} ${list[0].unit||'Pcs'}` : '—';
+  const grandQty = sameUnit ? `${fmtQtyDisplay(list.reduce((a,i)=>a+snapQty(i.stock),0), list[0].unit)} ${list[0].unit||'Pcs'}` : '—';
   document.getElementById('inventoryList').innerHTML = `
     <div style="text-align:center;font-family:Georgia,'Times New Roman',serif;margin-bottom:10px;">
       <div style="font-weight:800;font-size:14px;">${bizName()}</div>
@@ -7459,7 +7462,20 @@ function computeInvMovementSummary(q){
     priorCN.forEach(cn=>(cn.lineItems||[]).forEach(li=>{ if(li.id===it.id) priorQty+=li.qty; }));
     priorDN.forEach(dn=>(dn.lineItems||[]).forEach(li=>{ if(li.id===it.id) priorQty-=li.qty; }));
     const openingQty = Math.round(((it.openingStock||0) + priorQty)*1000)/1000;
-    const closingQty = it.stock||0; // always authoritative — matches the Current Stock tab exactly
+    // v75 fix: it.stock accumulates via repeated +=/-= float arithmetic across
+    // many purchases/sales, so a fully sold-out item often lands on something
+    // like 0.00099999999 instead of exactly 0 — which then displayed as a
+    // bogus "0.001" closing qty and, worse, a nonzero closing value (qty × rate)
+    // for stock that's actually zero. Snap true floating-point noise (anything
+    // under 0.0005) to a clean 0, and round everything else to 3dp so it's
+    // consistent with how quantities are entered/displayed everywhere else.
+    // v2026-07-30 FIX: had its own separate copy of the noise-snap logic
+    // hardcoded at 0.0005, instead of calling the shared snapQty() — so
+    // it stayed stuck on the old, too-tight threshold even after snapQty
+    // itself was widened, still showing a phantom "0.001" closing qty
+    // (and a nonzero closing value) for stock that's actually zero. Now
+    // uses the shared helper so this page can't drift out of sync again.
+    const closingQty = snapQty(it.stock);
     return {id:it.id, name:it.name, unit:it.unit, openingQty, purQty, purVal, salQty, salVal, adjQty, closingQty, closingVal: closingQty*it.pRate};
   });
 }
@@ -9122,12 +9138,17 @@ function setRptStockView(mode){
 let _rptStockSign = 'all';
 function setRptStockSign(mode){
   _rptStockSign = mode;
-  if(_lastReportType==='stock') openReport('stock');
+  // FIX: this used to only re-render when _lastReportType==='stock' — so
+  // changing the dropdown while viewing Stock Ledger or Stock Movement
+  // updated the variable but never refreshed the screen, making the
+  // filter look completely broken on those two reports (on top of the
+  // filtering itself not being applied there — fixed separately below).
+  if(_lastReportType==='stock'||_lastReportType==='stockledger'||_lastReportType==='stockmovement') openReport(_lastReportType);
 }
 let _rptStockSearch = '';
 function setRptStockSearch(q){
   _rptStockSearch = (q||'').trim().toLowerCase();
-  if(_lastReportType==='stock'||_lastReportType==='stockledger') openReport(_lastReportType);
+  if(_lastReportType==='stock'||_lastReportType==='stockledger'||_lastReportType==='stockmovement') openReport(_lastReportType);
 }
 function _fmtTallyDate(d){
   const dt = d instanceof Date ? d : new Date(d);
@@ -12396,7 +12417,7 @@ function openReport(type, el, forceRefresh){
       // (that view correctly computes Opening+In-Out=period-end Closing).
       // Now both views agree, since Closing here is genuinely "as of the
       // end of the selected period" instead of "as of right now."
-      const closingQty = Math.round((openingQty + purQty - salQty + adjQty)*1000)/1000;
+      const closingQty = snapQty(openingQty + purQty - salQty + adjQty);
       // v82 FIX: this used to value closing stock at it.pRate (today's live
       // Purchase Rate on the item master) regardless of what was actually
       // paid during the period. Since imports/edits constantly change
@@ -12414,9 +12435,20 @@ function openReport(type, el, forceRefresh){
       const closingVal = Math.round(closingQty * avgRate * 100)/100;
       return {id:it.id, name:it.name, hsn:it.hsn||'—', unit:it.unit||'Pcs', openingQty, purQty, purVal, salQty, salVal, adjQty, closingQty, closingRate, closingVal};
     }); // Show ALL items, even those with zero movement
-    const shownRows = _rptStockSearch
-      ? summary.filter(r=> r.name.toLowerCase().includes(_rptStockSearch) || (r.hsn||'').toLowerCase().includes(_rptStockSearch))
+    // FIX: _rptStockSign (the All/Positive/Negative dropdown, shown for
+    // this report too — see rptStockSignToggle display logic below) was
+    // being read and written by setRptStockSign() but never actually
+    // applied to the Stock Ledger's rows, so picking "Negative" or
+    // "Positive" from the dropdown silently did nothing — it always kept
+    // showing every item. Now filtered the same way the Current Stock
+    // report already does it, using this period's closing balance.
+    const LEDGER_EPS = 0.005;
+    const signFiltered = _rptStockSign==='positive' ? summary.filter(r=>r.closingQty>LEDGER_EPS)
+      : _rptStockSign==='negative' ? summary.filter(r=>r.closingQty<-LEDGER_EPS)
       : summary;
+    const shownRows = _rptStockSearch
+      ? signFiltered.filter(r=> r.name.toLowerCase().includes(_rptStockSearch) || (r.hsn||'').toLowerCase().includes(_rptStockSearch))
+      : signFiltered;
     const totalClosingQty = shownRows.reduce((a,r)=>a+r.closingQty,0);
     // v82 FIX: negative-stock items (oversold beyond recorded purchases)
     // showed correctly per-row, but there was no total anywhere flagging
@@ -12437,8 +12469,8 @@ function openReport(type, el, forceRefresh){
       <td class="mono">${r.salQty ? fmtQtyDisplay(r.salQty, r.unit) : '—'}</td>
       <td class="mono">${r.adjQty ? fmtQtyDisplay(r.adjQty, r.unit) : '—'}</td>
       <td class="mono">${fmtQtyDisplay(r.closingQty, r.unit)}</td><td class="mono">${fmt(r.closingRate)}</td>
-      <td class="mono">${fmt(r.closingVal)}</td></tr>`).join('') : `<tr><td colspan="9" style="text-align:center;color:var(--sub);">${_rptStockSearch?'No items match your search':'No items'}</td></tr>`}
-    </tbody><tfoot><tr><td colspan="6"><b>Total</b></td><td class="mono"><b>${fmtQtyDisplay(totalClosingQty,'')}</b></td><td></td><td class="mono"><b>${fmt(summary.reduce((a,r)=>a+r.closingVal,0))}</b></td></tr>${negRows.length?`<tr style="color:var(--red);"><td colspan="6">Of which: Negative Stock (${negRows.length} item${negRows.length===1?'':'s'})</td><td class="mono">${fmtQtyDisplay(negQtyTotal,'')}</td><td></td><td class="mono">${fmt(negValTotal)}</td></tr>`:''}</tfoot></table></div>`;
+      <td class="mono">${fmt(r.closingVal)}</td></tr>`).join('') : `<tr><td colspan="9" style="text-align:center;color:var(--sub);">${_rptStockSearch?'No items match your search':(_rptStockSign==='negative'?'No negative-stock items in this period':_rptStockSign==='positive'?'No positive-stock items':'No items')}</td></tr>`}
+    </tbody><tfoot><tr><td colspan="6"><b>Total</b></td><td class="mono"><b>${fmtQtyDisplay(totalClosingQty,'')}</b></td><td></td><td class="mono"><b>${fmt(shownRows.reduce((a,r)=>a+r.closingVal,0))}</b></td></tr>${negRows.length?`<tr style="color:var(--red);"><td colspan="6">Of which: Negative Stock (${negRows.length} item${negRows.length===1?'':'s'})</td><td class="mono">${fmtQtyDisplay(negQtyTotal,'')}</td><td></td><td class="mono">${fmt(negValTotal)}</td></tr>`:''}</tfoot></table></div>`;
   } else if(type==='itemwise'){
     const itemSales = {}, itemPurch = {};
     sales.forEach(s=>(s.lineItems||[]).forEach(li=>{ const n=resolveItemName(li); itemSales[n]=(itemSales[n]||0)+li.qty*li.rate; }));
@@ -12820,13 +12852,32 @@ function openReport(type, el, forceRefresh){
     tbl = rows.length ? rows.map(([n,v],i)=>`<div class="cart-row"><span>#${i+1} ${n}</span><span class="mono">${fmt(v)}</span></div>`).join('') : '<div class="cart-row"><span>No purchases in this period</span><span></span></div>';
   } else if(type==='stockmovement'){
     const periodPurchases = filterByDateRange(DB.purchases||[], 'date');
-    const rows = DB.items.map(it=>{
+    const MOVE_EPS = 0.005;
+    // FIX: this used to filter to r.inQty||r.outQty only — i.e. it showed
+    // an item ONLY if it had a purchase/sale row inside the currently
+    // selected period. An item that went negative in an EARLIER period
+    // (no fresh purchase/sale this period) had inQty=outQty=0 and got
+    // silently dropped, even though it's still sitting at a real negative
+    // balance right now — that's why negative stock "existed but showed
+    // blank" here. Now also keeps any item whose current balance is
+    // nonzero, and carries the live balance (Bal) on every row.
+    const allRows = DB.items.map(it=>{
       let inQty=0, outQty=0;
       periodPurchases.forEach(p=>(p.lineItems||[]).forEach(li=>{ if(li.id===it.id) inQty+=li.qty; }));
       sales.forEach(s=>(s.lineItems||[]).forEach(li=>{ if(li.id===it.id) outQty+=li.qty; }));
-      return {name:it.name, unit:it.unit, inQty, outQty};
-    }).filter(r=>r.inQty||r.outQty);
-    tbl = rows.length ? rows.map(r=>`<div class="cart-row"><span>${r.name}</span><span class="mono">In ${fmtQtyDisplay(r.inQty,r.unit)} · Out ${fmtQtyDisplay(r.outQty,r.unit)}</span></div>`).join('') : '<div class="cart-row"><span>No stock movement in this period</span><span></span></div>';
+      return {id:it.id, name:it.name, hsn:it.hsn||'—', unit:it.unit, inQty, outQty, stock:snapQty(it.stock)};
+    }).filter(r=>r.inQty||r.outQty||Math.abs(r.stock)>MOVE_EPS);
+    // FIX: the All/Positive/Negative dropdown (rptStockSignToggle) is now
+    // shown for this report too (see display-toggle logic below) — it
+    // filters on the item's current live balance, same convention as the
+    // Current Stock report.
+    const signFiltered = _rptStockSign==='positive' ? allRows.filter(r=>r.stock>MOVE_EPS)
+      : _rptStockSign==='negative' ? allRows.filter(r=>r.stock<-MOVE_EPS)
+      : allRows;
+    const rows = _rptStockSearch
+      ? signFiltered.filter(r=>r.name.toLowerCase().includes(_rptStockSearch) || (r.hsn||'').toLowerCase().includes(_rptStockSearch))
+      : signFiltered;
+    tbl = rows.length ? rows.map(r=>`<div class="cart-row" style="cursor:pointer;${r.stock<-MOVE_EPS?'color:var(--red);':''}" onclick="viewStockLedgerDetail('${r.id}')"><span>${r.name}${r.stock<-MOVE_EPS?' ⚠️':''}</span><span class="mono">In ${fmtQtyDisplay(r.inQty,r.unit)} · Out ${fmtQtyDisplay(r.outQty,r.unit)} · Bal ${fmtQtyDisplay(r.stock,r.unit)}</span></div>`).join('') : `<div class="cart-row"><span>${_rptStockSearch?'No items match your search':(_rptStockSign==='negative'?'No negative-stock items':_rptStockSign==='positive'?'No positive-stock items':'No stock movement in this period')}</span><span></span></div>`;
   } else if(type==='lowstockrpt'){
     // v82 FIX: was a raw `i.stock<=i.min` comparison with no Number()
     // coercion — if either field ever comes back as a string (e.g. after a
@@ -12839,8 +12890,8 @@ function openReport(type, el, forceRefresh){
     // Value column now uses the same moving-average cost as Stock Ledger/
     // Current Stock (was today's live Purchase Rate, which disagreed).
     const stockAvgRatesLow = _computeStockAvgRates();
-    const itemValLow = i => (Number(i.stock)||0) * (stockAvgRatesLow[i.id] ?? i.pRate ?? 0);
-    const items = (DB.items||[]).filter(i=>Number(i.min)>0 && Number(i.stock)<=Number(i.min));
+    const itemValLow = i => snapQty(i.stock) * (stockAvgRatesLow[i.id] ?? i.pRate ?? 0);
+    const items = (DB.items||[]).filter(i=>Number(i.min)>0 && snapQty(i.stock)<=Number(i.min));
     const lowTotal = items.reduce((a,i)=>a+itemValLow(i),0);
     const showDecLow = groupHasDecimal(items.map(itemValLow));
     const lowBody = items.length ? items.map((i,idx)=>`
@@ -12848,7 +12899,7 @@ function openReport(type, el, forceRefresh){
         <td>${idx+1}</td>
         <td style="text-align:left;">${i.name}</td>
         <td style="text-align:center;white-space:nowrap;">${i.hsn||'—'}</td>
-        <td class="mono">${fmtQtyDisplay(i.stock, i.unit)}</td>
+        <td class="mono">${fmtQtyDisplay(snapQty(i.stock), i.unit)}</td>
         <td style="text-align:center;">${i.unit||'Pcs'}</td>
         <td class="mono">${fmtQtyDisplay(i.min, i.unit)}</td>
         <td class="mono" style="font-weight:700;">${fmtSmart(itemValLow(i), showDecLow)}</td>
@@ -13106,13 +13157,13 @@ function openReport(type, el, forceRefresh){
   }
   const stockSearchBar = document.getElementById('rptStockSearchBar');
   if(stockSearchBar){
-    stockSearchBar.style.display = (type==='stock'||type==='stockledger') ? 'block' : 'none';
+    stockSearchBar.style.display = (type==='stock'||type==='stockledger'||type==='stockmovement') ? 'block' : 'none';
     const searchBox = document.getElementById('rptStockSearch');
     if(searchBox && document.activeElement !== searchBox) searchBox.value = _rptStockSearch;
   }
   const stockSignToggle = document.getElementById('rptStockSignToggle');
   if(stockSignToggle){
-    stockSignToggle.style.display = (type==='stock') ? 'flex' : 'none';
+    stockSignToggle.style.display = (type==='stock'||type==='stockledger'||type==='stockmovement') ? 'flex' : 'none';
     const signSel = document.getElementById('rptStockSignSelect');
     if(signSel && signSel.value !== _rptStockSign) signSel.value = _rptStockSign;
   }
@@ -16573,6 +16624,22 @@ function isWeightUnit(u){ return u==='Kg' || u==='Gram' || u==='Litre'; }
 // precision the qty inputs allow for weight units), so stock always lands
 // on a clean number and near-zero noise actually reads as 0.
 function roundQty(v){ v = Number(v)||0; return Math.round(v*1000)/1000; }
+// v76: shared helper — it.stock is built up via many separate +=/-= float
+// operations over time (each purchase/sale nudges it individually), so a
+// fully sold-out or fully-consumed item routinely lands on something like
+// 0.00099999999 instead of a clean 0. Any report/screen that reads it.stock
+// directly (Low Stock, Negative Stock, etc.) should run it through this
+// first so it doesn't show a bogus "0.001" qty or a nonzero ₹ value for
+// stock that's actually zero.
+// v2026-07-30 FIX: 0.0005 was too tight — it.stock drifts by more than
+// that after hundreds of small +=/-= purchase/sale operations, so a fully
+// sold-out item was landing on something like 0.0009 (just above the old
+// threshold) instead of a clean 0, which then displayed as a bogus
+// "0.001" everywhere (Low Stock report, Inventory → Movement page — both
+// showed dozens of items sitting at exactly 0.001). Widened to 0.005 to
+// match the epsilon already used everywhere else in the app (STOCK_EPS /
+// LEDGER_EPS / MOVE_EPS), so real noise actually collapses to 0.
+function snapQty(v){ v = Number(v)||0; return Math.abs(v) < 0.005 ? 0 : Math.round(v*1000)/1000; }
 // FIX: non-weight units (Pcs, Box, Litre, Dozen...) were hard-locked to whole
 // numbers — typing "2.5" got silently rounded to "3" (or "2"), which broke
 // any purchase/sale genuinely done in fractional quantities (e.g. 2.5 Litre,
@@ -16588,9 +16655,16 @@ function qtyStepAttrs(u){ return isWeightUnit(u) ? 'step="0.001" min="0.001"' : 
 // units so what's on screen matches what was entered/expected. Non-weight
 // units show as a plain whole number unless there's an actual fractional
 // part, in which case up to 2dp are shown.
+// v2026-07-30 FIX: this used to run toFixed(3) directly on whatever raw
+// number it was handed — it never snapped near-zero floating-point noise,
+// so any caller that forgot to pre-snap (or, like the Inventory Movement
+// page, kept its own separate un-synced epsilon check) still printed a
+// bogus "0.001" for stock that's actually zero. Snapping here means every
+// call site gets the fix for free, and there's now one single place
+// (snapQty) that defines what counts as "noise".
 function fmtQtyDisplay(q, u){
-  if(isWeightUnit(u)) return Number(q).toFixed(3);
-  const n = Number(q);
+  if(isWeightUnit(u)) return snapQty(q).toFixed(3);
+  const n = snapQty(q);
   return Number.isInteger(n) ? String(n) : n.toFixed(2);
 }
 /* FIX (item-name resolution): older/reconciled purchase & sale lineItems
