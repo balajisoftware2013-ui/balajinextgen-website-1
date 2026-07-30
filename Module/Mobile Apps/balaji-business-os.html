@@ -865,6 +865,20 @@ body.mode-accountant .owner-hint{display:none;}
      current sheet (Dashboard, Reports, Inventory, etc.) is force-removed
      from layout entirely during print/export, not just visually hidden. */
   .page{display:none!important;}
+  /* v82 FIX: the rule above hides EVERY .page div during print — including
+     the Reports page, which is where #reportPrintArea actually lives in
+     the DOM (see markup: #reportPrintArea sits inside #page-reports). A
+     display:none ancestor makes all descendants unrenderable regardless of
+     their own display value, so #reportPrintArea.printing's
+     "display:block!important" a few lines below this was never actually
+     taking effect — the print area was building correctly (content length
+     logged fine) but physically couldn't render because its own parent was
+     display:none. This is the actual cause of "Print shows a blank page"
+     while Export/Send worked fine (they capture the table through a
+     different path, not through this print stylesheet). Re-allow the one
+     .page that currently contains an active print area.
+  */
+  .page:has(#reportPrintArea.printing){display:block!important;}
   /* Fix: Day/Month/Qtr/Year/Custom period chips + the custom from/to date
      picker (with its "Go" button) are on-screen controls for choosing what
      to print — they were being printed themselves because they live inside
@@ -3481,12 +3495,21 @@ const seed = {
     {id:'S2',name:'North Bengal Distributors',mobile:'9831100222',due:1200},
   ],
   items:[
-    {id:'I1',name:'A4 Paper Ream',unit:'Ream',hsn:'4802',pRate:220,sRate:320,gst:12,stock:42,min:10},
-    {id:'I2',name:'Ball Pen (Box)',unit:'Box',hsn:'9608',pRate:80,sRate:130,gst:12,stock:8,min:10},
-    {id:'I3',name:'USB-C Cable',unit:'Pcs',hsn:'8544',pRate:80,sRate:180,gst:18,stock:3,min:5},
-    {id:'I4',name:'Notebook 200pg',unit:'Pcs',hsn:'4820',pRate:22,sRate:40,gst:12,stock:60,min:15},
-    {id:'I5',name:'Stapler',unit:'Pcs',hsn:'8305',pRate:45,sRate:80,gst:18,stock:2,min:5},
-    {id:'I6',name:'Whiteboard Marker',unit:'Pcs',hsn:'9608',pRate:10,sRate:20,gst:12,stock:90,min:20},
+    // v82 FIX: stock here used to be a hardcoded number with no relation to
+    // the seeded purchases/sales below — so Stock Ledger (which rebuilds
+    // quantity from openingStock + purchases − sales) could never agree
+    // with Current Stock (which just reads this stock field directly).
+    // openingStock is now set so each item's own transaction history
+    // nets out to exactly this stock figure. USB-C Cable's stock was
+    // dropped from 3 (with 12 purchased and zero sales recorded — an
+    // unexplainable gap no matter what opening balance you pick) to 12,
+    // matching what was actually purchased.
+    {id:'I1',name:'A4 Paper Ream',unit:'Ream',hsn:'4802',pRate:220,sRate:320,gst:12,stock:42,openingStock:32,min:10},
+    {id:'I2',name:'Ball Pen (Box)',unit:'Box',hsn:'9608',pRate:80,sRate:130,gst:12,stock:8,openingStock:8,min:10},
+    {id:'I3',name:'USB-C Cable',unit:'Pcs',hsn:'8544',pRate:80,sRate:180,gst:18,stock:12,openingStock:0,min:5},
+    {id:'I4',name:'Notebook 200pg',unit:'Pcs',hsn:'4820',pRate:22,sRate:40,gst:12,stock:60,openingStock:91,min:15},
+    {id:'I5',name:'Stapler',unit:'Pcs',hsn:'8305',pRate:45,sRate:80,gst:18,stock:2,openingStock:2,min:5},
+    {id:'I6',name:'Whiteboard Marker',unit:'Pcs',hsn:'9608',pRate:10,sRate:20,gst:12,stock:90,openingStock:102,min:20},
   ],
   sales:[
     // FIX: previously these had no lineItems at all — every item-level
@@ -5722,7 +5745,8 @@ function renderDashboard(){
   // (see renderInvStats()). Aligned to the same positive-stock-only rule
   // so all three show the identical figure.
   const dashStockItems = DB.items.filter(i=>Number(i.stock)>0);
-  const dashStockVal = dashStockItems.reduce((a,i)=>a+((i.pRate||0)*(i.stock||0)),0);
+  const _dashStockRates = _computeStockAvgRates();
+  const dashStockVal = dashStockItems.reduce((a,i)=>a+((_dashStockRates[i.id] ?? i.pRate ?? 0)*(i.stock||0)),0);
   _setText('dashStockVal', fmt(dashStockVal));
   _setText('dashStockValN', dashStockItems.length+' item'+(dashStockItems.length===1?'':'s'));
 
@@ -5896,9 +5920,10 @@ function renderMonthGlance(){
 function renderNeedsAttention(){
   const grid = document.getElementById('needsAttentionGrid');
   if(!grid) return;
-  const lowStock = (DB.items||[]).filter(i=>Number(i.stock)<=i.min && Number(i.stock)>0).length;
-  const negStock = (DB.items||[]).filter(i=>Number(i.stock)<0);
-  const negVal = negStock.reduce((a,i)=>a+(i.pRate*i.stock||0),0);
+  const lowStock = (DB.items||[]).filter(i=>Number(i.min)>0 && Number(i.stock)<=Number(i.min) && Number(i.stock)>0).length;
+  const negStock = (DB.items||[]).filter(i=>Number(i.stock)<-0.005);
+  const _naStockRates = _computeStockAvgRates();
+  const negVal = negStock.reduce((a,i)=>a+((Number(i.stock)||0)*(_naStockRates[i.id] ?? i.pRate ?? 0)),0);
   const custDue = totalPartyDue(DB.customers,'customers');
   const suppDue = totalPartyDue(DB.suppliers,'suppliers');
   const chips = [];
@@ -7107,11 +7132,19 @@ function renderInvStats(){
   // Stock exactly (positive-stock items only), and any negative-stock
   // value is called out separately instead of silently dragging the
   // headline number negative.
-  const positiveItems = DB.items.filter(i=>Number(i.stock)>0);
-  const negativeItems = DB.items.filter(i=>Number(i.stock)<0);
-  const totalVal = positiveItems.reduce((a,i)=>a+i.pRate*i.stock,0);
-  const negativeVal = negativeItems.reduce((a,i)=>a+i.pRate*i.stock,0); // already negative
-  const lowCount = DB.items.filter(i=>i.stock<=i.min).length;
+  // v82 FIX: value now uses the same moving-average cost as Reports →
+  // Stock/Stock Ledger (was today's live pRate — disagreed with them). An
+  // epsilon excludes near-zero rounding noise from counting as negative
+  // stock, and Low Stock only counts items with an actual minimum
+  // configured (min>0), matching the Low Stock report's own fix.
+  const invRates = _computeStockAvgRates();
+  const invItemVal = i => (Number(i.stock)||0) * (invRates[i.id] ?? i.pRate ?? 0);
+  const INV_EPS = 0.005;
+  const positiveItems = DB.items.filter(i=>Number(i.stock)>INV_EPS);
+  const negativeItems = DB.items.filter(i=>Number(i.stock)<-INV_EPS);
+  const totalVal = positiveItems.reduce((a,i)=>a+invItemVal(i),0);
+  const negativeVal = negativeItems.reduce((a,i)=>a+invItemVal(i),0); // already negative
+  const lowCount = DB.items.filter(i=>Number(i.min)>0 && Number(i.stock)<=Number(i.min)).length;
   const expCount = countExpiringSoon();
   grid.innerHTML = `
     <div class="stat-card" style="cursor:pointer;" onclick="filterInv('all')"><div class="st-label">Total Items</div><div class="st-val mono">${totalItems}</div></div>
@@ -7284,16 +7317,31 @@ function bulkDeleteItems(){
 }
 /* Tally-style Current Stock table (Item · Unit · Qty · Buy/Sale Rate · Stock Value) */
 function renderInventoryStockTable(list){
-  const totalVal = list.reduce((a,i)=>a+i.pRate*i.stock,0);
-  const rowsHtml = list.length ? list.map(i=>`
+  // v82 FIX: valuation now uses the shared moving-average cost (was
+  // today's live pRate — disagreed with Reports → Stock/Stock Ledger).
+  // Near-zero rounding noise (e.g. 0.001 left over from qty arithmetic
+  // across many bills) now displays as exactly zero instead of looking
+  // like real leftover stock, and the low-stock ⚠️ only fires for items
+  // with an actual minimum configured (min>0).
+  const invRatesTbl = _computeStockAvgRates();
+  const invValTbl = i => (Number(i.stock)||0) * (invRatesTbl[i.id] ?? i.pRate ?? 0);
+  const INV_EPS2 = 0.005;
+  const totalVal = list.reduce((a,i)=>a+invValTbl(i),0);
+  const rowsHtml = list.length ? list.map(i=>{
+    const isLow = Number(i.min)>0 && Number(i.stock)<=Number(i.min);
+    const isNearZero = Math.abs(Number(i.stock)||0) <= INV_EPS2;
+    const dispQty = isNearZero ? 0 : i.stock;
+    const dispVal = isNearZero ? 0 : invValTbl(i);
+    return `
     <tr style="cursor:pointer;" onclick="viewItemMovementFromInventory('${i.id}')">
-      <td>${i.name}${i.stock<=i.min?' ⚠️':''}<div style="font-size:9.5px;color:var(--sub);font-weight:400;">HSN ${i.hsn||'—'} · GST ${i.gst}%${i.expiryDate?' · '+expiryBadge(i.expiryDate):''}</div></td>
+      <td>${i.name}${isLow?' ⚠️':''}<div style="font-size:9.5px;color:var(--sub);font-weight:400;">HSN ${i.hsn||'—'} · GST ${i.gst}%${i.expiryDate?' · '+expiryBadge(i.expiryDate):''}</div></td>
       <td style="text-align:center;">${i.unit}</td>
-      <td class="mono ${i.stock<=i.min?'due':''}">${fmtQtyDisplay(i.stock, i.unit)}</td>
-      <td class="mono">${fmt(i.pRate)}</td>
+      <td class="mono ${isLow?'due':''}">${fmtQtyDisplay(dispQty, i.unit)}</td>
+      <td class="mono">${fmt(invRatesTbl[i.id] ?? i.pRate)}</td>
       <td class="mono">${fmt(i.sRate)}</td>
-      <td class="mono" style="font-weight:700;">${fmt(i.pRate*i.stock)}</td>
-    </tr>`).join('') : `<tr><td colspan="6" style="text-align:center;color:var(--sub);">No items found</td></tr>`;
+      <td class="mono" style="font-weight:700;">${fmt(dispVal)}</td>
+    </tr>`;
+  }).join('') : `<tr><td colspan="6" style="text-align:center;color:var(--sub);">No items found</td></tr>`;
   document.getElementById('inventoryList').innerHTML = `
     <div class="inv-tbl-title">📋 Current Stock</div>
     <div class="inv-tbl-wrap"><table class="inv-tbl">
@@ -7313,17 +7361,23 @@ function renderInventoryStockTable(list){
 // on today"), so it's a simpler standalone renderer rather than a shared
 // call, but the markup/styling is intentionally identical.
 function renderInventoryTallyTable(list){
-  const stockTotal = list.reduce((a,i)=>a+(i.pRate*i.stock||0),0);
-  const showDec = groupHasDecimal(list.map(i=>i.pRate*i.stock));
+  // v82 FIX: same moving-average valuation + min>0 fix as the App View table.
+  const invRatesTallyTbl = _computeStockAvgRates();
+  const stockTotal = list.reduce((a,i)=>a+((Number(i.stock)||0)*(invRatesTallyTbl[i.id] ?? i.pRate ?? 0)),0);
+  const showDec = groupHasDecimal(list.map(i=>(Number(i.stock)||0)*(invRatesTallyTbl[i.id] ?? i.pRate ?? 0)));
   const bizAddr = DB.bizAddress || '';
   const sameUnit = list.length && list.every(i=>(i.unit||'Pcs')===(list[0].unit||'Pcs'));
-  const rows = list.length ? list.map(i=>`
-    <tr onclick="viewItemMovementFromInventory('${i.id}')" style="cursor:pointer;${i.stock<=i.min?'color:var(--red);':''}">
-      <td style="text-align:left;">${i.name}${i.stock<=i.min?' ⚠️':''}</td>
+  const rows = list.length ? list.map(i=>{
+    const isLow = Number(i.min)>0 && Number(i.stock)<=Number(i.min);
+    const rate = invRatesTallyTbl[i.id] ?? i.pRate ?? 0;
+    return `
+    <tr onclick="viewItemMovementFromInventory('${i.id}')" style="cursor:pointer;${isLow?'color:var(--red);':''}">
+      <td style="text-align:left;">${i.name}${isLow?' ⚠️':''}</td>
       <td class="mono">${fmtQtyDisplay(i.stock, i.unit)} ${i.unit||'Pcs'}</td>
-      <td class="mono">${fmtSmart(i.pRate, showDec)}</td>
-      <td class="mono" style="font-weight:700;">${fmtSmart(i.pRate*i.stock, showDec)}</td>
-    </tr>`).join('') : `<tr><td colspan="4" style="text-align:center;color:var(--sub);">No items found</td></tr>`;
+      <td class="mono">${fmtSmart(rate, showDec)}</td>
+      <td class="mono" style="font-weight:700;">${fmtSmart(rate*(Number(i.stock)||0), showDec)}</td>
+    </tr>`;
+  }).join('') : `<tr><td colspan="4" style="text-align:center;color:var(--sub);">No items found</td></tr>`;
   const grandQty = sameUnit ? `${fmtQtyDisplay(list.reduce((a,i)=>a+(Number(i.stock)||0),0), list[0].unit)} ${list[0].unit||'Pcs'}` : '—';
   document.getElementById('inventoryList').innerHTML = `
     <div style="text-align:center;font-family:Georgia,'Times New Roman',serif;margin-bottom:10px;">
@@ -7455,7 +7509,7 @@ function exportInventoryCSV(){
     if(invFilterMode==='positive') list = list.filter(i=>Number(i.stock)>0);
     else if(invFilterMode==='all') list = list.filter(i=>Number(i.stock)!==0);
     rows=[['Item','HSN','Unit','Qty','GST %','Buy Rate','Sale Rate','Stock Value','Expiry Date']].concat(
-      list.map(i=>[i.name, i.hsn||'—', i.unit, fmtQtyDisplay(i.stock,i.unit), i.gst, i.pRate, i.sRate, i.pRate*i.stock, i.expiryDate||''])
+      (()=>{ const r=_computeStockAvgRates(); return list.map(i=>[i.name, i.hsn||'—', i.unit, fmtQtyDisplay(i.stock,i.unit), i.gst, i.pRate, i.sRate, (Number(i.stock)||0)*(r[i.id] ?? i.pRate ?? 0), i.expiryDate||'']); })()
     );
     const blob=new Blob(['\uFEFF'+rows.map(r=>r.join(',')).join('\n')],{type:'text/csv'});
     const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
@@ -10063,10 +10117,10 @@ function exportReportTally(){
 // grouped under Tally's own standard group names, with opening balances set
 // to the current balances so the books tie out on first import.
 function _buildTallyLedgerMastersXml(){
-  const sv=DB.items.reduce((a,i)=>a+i.pRate*i.stock,0);
+  const sv=_liveStockValueTotal();
   const dr=totalPartyDue(DB.customers,'customers');
   const cr=totalPartyDue(DB.suppliers,'suppliers');
-  const ta=DB.cash+DB.bank+sv+dr; const cap=ta-cr;
+  const ta=_reconciledCashBalance()+_reconciledBankBalance()+sv+dr; const cap=ta-cr;
   const susp=getSuspenseTotal();
   const ledger=(name,parent,bal)=>`<TALLYMESSAGE><LEDGER NAME="${name}" ACTION="Create">
   <PARENT>${parent}</PARENT>
@@ -10152,6 +10206,15 @@ function _twoColBlankRow(){
 // Debtors into every customer, Stock-in-Hand into every item with value.
 // Each of those rows is now independently expandable right where it sits.
 let _bsRowExpanded = {creditors:false, debtors:false, stock:false, bank:false};
+// v82 NEW: GST reports (GST Summary, GSTR-1, GSTR-3B, HSN Summary, Tax
+// Liability) had no click-through anywhere — every figure was a dead
+// number. Rate/HSN groups now expand inline to show the individual sale
+// line items behind them, same pattern as the Balance Sheet's group rows.
+let _gstRowExpanded = {};
+function toggleGstRateRow(key){
+  _gstRowExpanded[key] = !_gstRowExpanded[key];
+  openReport(_lastReportType, null, true);
+}
 function _bsPartyBreakdown(list, tab){
   return (list||[])
     .map(p=>({p, bal: getPartyDocBalance(p, tab)}))
@@ -10226,7 +10289,7 @@ function _bsSnapshotAsOf(asOfDate){
   const cash = cashRows.length ? cashRows[cashRows.length-1].bal : 0;
   const bank = bankRows.length ? bankRows[bankRows.length-1].bal : 0;
   const nextDay = new Date(new Date(asOfDate).getTime()+86400000).toISOString().slice(0,10);
-  const sv = isToday ? DB.items.reduce((a,i)=>a+(i.pRate||0)*(i.stock||0),0) : _stockValueAsOf(nextDay);
+  const sv = isToday ? _liveStockValueTotal() : _stockValueAsOf(nextDay);
   const dr = isToday ? totalPartyDue(DB.customers,'customers') : (DB.customers||[]).reduce((a,c)=>a+_partyDueAsOf(c,'customers',asOfDate),0);
   const cr = isToday ? totalPartyDue(DB.suppliers,'suppliers') : (DB.suppliers||[]).reduce((a,s)=>a+_partyDueAsOf(s,'suppliers',asOfDate),0);
   const susp = isToday ? getSuspenseTotal() : 0; // suspense resolution history isn't tracked, so only shown for "today"
@@ -10403,15 +10466,45 @@ function _computeStockAvgRates(){
   });
   return rates;
 }
+// v82 NEW: the "as of today" stock value total using the LIVE stock
+// quantity (item.stock, the same field Current Stock reads) priced at the
+// moving-average cost — i.e. exactly Current Stock's own grand total. Any
+// other screen that needs a headline "Stock Value as of today" (Balance
+// Sheet, Trial Balance, Dashboard, P&L's Closing Stock when the period runs
+// through today) should use this instead of recomputing pRate×stock
+// independently, so they can't drift apart from what Current Stock shows.
+function _liveStockValueTotal(){
+  const rates = _computeStockAvgRates();
+  return (DB.items||[]).reduce((a,i)=>a+(Number(i.stock)||0)*(rates[i.id] ?? i.pRate ?? 0),0);
+}
+// v82 FIX: this used to value historical stock at TODAY's live Purchase
+// Rate (it.pRate) regardless of what was actually paid at the time — so
+// P&L's Opening Stock (which calls this) could never agree with Stock
+// Ledger/Current Stock, which price stock at a moving-average cost. Now
+// uses the same moving-average-as-of-this-date logic: quantity is
+// reconstructed from opening balance + every purchase/sale/note before the
+// date (same as before), but priced at the average cost of everything
+// bought up to that point instead of today's rate.
 function _stockValueAsOf(dateStr){
-  const qtyByItem = {};
+  const qtyByItem = {}, purQtyById = {}, purValById = {};
   DB.items.forEach(it=>{ qtyByItem[it.id] = it.openingStock||0; });
-  (DB.purchases||[]).forEach(p=>{ if(p.date < dateStr) (p.lineItems||[]).forEach(li=>{ if(qtyByItem[li.id]!==undefined) qtyByItem[li.id]+=li.qty; }); });
-  (DB.sales||[]).forEach(s=>{ if(s.date < dateStr) (s.lineItems||[]).forEach(li=>{ if(qtyByItem[li.id]!==undefined) qtyByItem[li.id]-=li.qty; }); });
-  (DB.creditNotes||[]).forEach(cn=>{ if(cn.date < dateStr) (cn.lineItems||[]).forEach(li=>{ if(qtyByItem[li.id]!==undefined) qtyByItem[li.id]+=li.qty; }); });
-  (DB.debitNotes||[]).forEach(dn=>{ if(dn.date < dateStr) (dn.lineItems||[]).forEach(li=>{ if(qtyByItem[li.id]!==undefined) qtyByItem[li.id]-=li.qty; }); });
+  (DB.purchases||[]).forEach(p=>{ if(p.date < dateStr) (p.lineItems||[]).forEach(li=>{
+    if(qtyByItem[li.id]===undefined) return;
+    qtyByItem[li.id]+=Number(li.qty)||0;
+    purQtyById[li.id]=(purQtyById[li.id]||0)+(Number(li.qty)||0);
+    purValById[li.id]=(purValById[li.id]||0)+(Number(li.qty)||0)*(Number(li.rate)||0);
+  }); });
+  (DB.sales||[]).forEach(s=>{ if(s.date < dateStr) (s.lineItems||[]).forEach(li=>{ if(qtyByItem[li.id]!==undefined) qtyByItem[li.id]-=Number(li.qty)||0; }); });
+  (DB.creditNotes||[]).forEach(cn=>{ if(cn.date < dateStr) (cn.lineItems||[]).forEach(li=>{ if(qtyByItem[li.id]!==undefined) qtyByItem[li.id]+=Number(li.qty)||0; }); });
+  (DB.debitNotes||[]).forEach(dn=>{ if(dn.date < dateStr) (dn.lineItems||[]).forEach(li=>{ if(qtyByItem[li.id]!==undefined) qtyByItem[li.id]-=Number(li.qty)||0; }); });
   let total = 0;
-  DB.items.forEach(it=>{ total += (qtyByItem[it.id]||0) * (it.pRate||0); });
+  DB.items.forEach(it=>{
+    const openingQty = it.openingStock||0, openingVal = openingQty*(it.pRate||0);
+    const purQty = purQtyById[it.id]||0, purVal = purValById[it.id]||0;
+    const availQty = openingQty+purQty;
+    const avgRate = availQty>0.0001 ? (openingVal+purVal)/availQty : (it.pRate||0);
+    total += (qtyByItem[it.id]||0) * avgRate;
+  });
   return total;
 }
 // Proper Trading Account + Income Statement for one date range — this is
@@ -10421,22 +10514,25 @@ function _stockValueAsOf(dateStr){
 // deliberate simplification). Gross Profit = Sales − Cost of Sales; Net
 // Profit = Gross Profit + Indirect Income − Indirect Expenses.
 function _tradingPLForPeriod(from, to){
-  const itemsById = {}; DB.items.forEach(it=>{ itemsById[it.id]=it; });
   const periodPurchases = (DB.purchases||[]).filter(p=>p.date>=from && p.date<=to);
   const periodSales = (DB.sales||[]).filter(s=>s.date>=from && s.date<=to);
-  const periodCN = (DB.creditNotes||[]).filter(cn=>cn.date>=from && cn.date<=to);
-  const periodDN = (DB.debitNotes||[]).filter(dn=>dn.date>=from && dn.date<=to);
 
   const salesTotal = periodSales.reduce((a,s)=>a+(Number(s.total)||0),0);
   const purchTotal = periodPurchases.reduce((a,p)=>a+(Number(p.total)||0),0);
 
   const openingStockVal = _stockValueAsOf(from);
-  let stockMoveVal = 0;
-  periodPurchases.forEach(p=>(p.lineItems||[]).forEach(li=>{ const it=itemsById[li.id]; if(it) stockMoveVal += li.qty*it.pRate; }));
-  periodSales.forEach(s=>(s.lineItems||[]).forEach(li=>{ const it=itemsById[li.id]; if(it) stockMoveVal -= li.qty*it.pRate; }));
-  periodCN.forEach(cn=>(cn.lineItems||[]).forEach(li=>{ const it=itemsById[li.id]; if(it) stockMoveVal += li.qty*it.pRate; }));
-  periodDN.forEach(dn=>(dn.lineItems||[]).forEach(li=>{ const it=itemsById[li.id]; if(it) stockMoveVal -= li.qty*it.pRate; }));
-  const closingStockVal = openingStockVal + stockMoveVal;
+  // v82 FIX: closing stock used to be openingStockVal + this period's
+  // purchase/sale movement valued at today's live pRate — an inconsistent
+  // basis from openingStockVal (which is now moving-average) AND from
+  // Current Stock (live qty × moving-average rate). Whenever the period
+  // runs through today, closing stock is now exactly _liveStockValueTotal()
+  // — the same number Current Stock shows — so P&L, Balance Sheet, and
+  // Current Stock can never disagree for "as of today" again. Only a
+  // period ending strictly in the past falls back to the reconstructed
+  // (moving-average-as-of-that-date) figure, since there's no live
+  // snapshot for a past date.
+  const nextDayAfterTo = new Date(new Date(to).getTime()+86400000).toISOString().slice(0,10);
+  const closingStockVal = (to >= todayStr()) ? _liveStockValueTotal() : _stockValueAsOf(nextDayAfterTo);
   const costOfSales = openingStockVal + purchTotal - closingStockVal;
   const grossProfit = salesTotal - costOfSales;
 
@@ -11015,7 +11111,15 @@ window.addEventListener('afterprint', ()=>{
   const landscapeEl = document.getElementById('docLandscapePageRule');
   if(landscapeEl) landscapeEl.remove();
   const area = document.getElementById('reportPrintArea');
-  if(area){ area.classList.remove('printing'); area.innerHTML=''; }
+  if(area){
+    area.classList.remove('printing');
+    area.innerHTML='';
+    // v82: undo the JS fallback that forced the containing .page visible
+    // for print (see _executeActualPrint) — otherwise it would stay
+    // display:block even when the Reports page isn't the active one.
+    const pageAncestor = area.closest('.page');
+    if(pageAncestor) pageAncestor.style.removeProperty('display');
+  }
 });
 function printReportPDF(){
   const area = document.getElementById('reportPrintArea');
@@ -11123,6 +11227,16 @@ function _executeActualPrint(area){
   area.style.setProperty('display', 'block', 'important');
   area.style.visibility = 'visible';
   area.style.opacity = '1';
+  // v82 FIX: #reportPrintArea lives inside the Reports .page container,
+  // and the print stylesheet's `.page{display:none!important;}` was
+  // silently hiding this whole element (a display:none ancestor makes
+  // every descendant unrenderable, no matter what that descendant's own
+  // display says) — this is the actual reason Print showed a blank page.
+  // Fixed at the CSS level with a `.page:has(#reportPrintArea.printing)`
+  // exception, but also forced directly here via inline style as a
+  // fallback in case the specific print/PDF engine doesn't support :has().
+  let _printPageAncestor = area.closest('.page');
+  if(_printPageAncestor) _printPageAncestor.style.setProperty('display', 'block', 'important');
   
   // Force multiple reflows
   void area.offsetHeight;
@@ -11882,9 +11996,11 @@ function openReport(type, el, forceRefresh){
       onClick: s=>`viewSaleEntry('${s.id}')`, label:'Sale', emptyMsg:'No sales match this filter'
     });
   } else if(type==='gst'){
+    // v82 FIX: every row here was a dead number — tapping "Output GST" or
+    // "Input GST" did nothing. Now drills into the underlying register.
     const {gstSales, gstPurch} = computeGSTTotals(sales, filterByDateRange(DB.purchases||[], 'date'));
-    tbl=`<div class="cart-row"><span>Output GST (Sales)</span><span class="mono">${fmt(gstSales)}</span></div>
-     <div class="cart-row"><span>Input GST (Purchase)</span><span class="mono">${fmt(gstPurch)}</span></div>
+    tbl=`<div class="cart-row" style="cursor:pointer;" onclick="closeAllSheets();openReport('sales')"><span>Output GST (Sales) <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(gstSales)}</span></div>
+     <div class="cart-row" style="cursor:pointer;" onclick="closeAllSheets();openReport('purchase')"><span>Input GST (Purchase) <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(gstPurch)}</span></div>
      <div class="cart-total"><span>Net GST Payable</span><span class="mono">${fmt(Math.max(0,gstSales-gstPurch))}</span></div>`;
   } else if(type==='pl'){
     if(_rptBsPlView==='monthwise'){
@@ -11928,9 +12044,15 @@ function openReport(type, el, forceRefresh){
   } else if(type==='trialbalance'){
     const accounts = [];
     // Debit accounts
-    accounts.push({name:'Cash in Hand', balance: DB.cash, type:'Dr', nav:`closeAllSheets();openSheet('bankSheet')`});
-    accounts.push({name:'Bank Balance', balance: DB.bank, type:'Dr', nav:`closeAllSheets();openSheet('bankSheet')`});
-    const stockVal = DB.items.reduce((a,i)=>a+i.pRate*i.stock,0);
+    // v82 FIX: was DB.cash/DB.bank directly (can drift from the real
+    // ledger, same issue the Cash Book/Bank Book fix addressed) and Stock
+    // Value at today's live pRate (disagreed with Current Stock/Stock
+    // Ledger/Balance Sheet). All three now use the same reconciled figures
+    // those reports use.
+    const tbCash = _reconciledCashBalance(), tbBank = _reconciledBankBalance();
+    accounts.push({name:'Cash in Hand', balance: tbCash, type:'Dr', nav:`closeAllSheets();openReport('cashbook')`});
+    accounts.push({name:'Bank Balance', balance: tbBank, type:'Dr', nav:`closeAllSheets();openReport('bankbook')`});
+    const stockVal = _liveStockValueTotal();
     accounts.push({name:'Stock Value', balance: stockVal, type:'Dr', nav:`closeAllSheets();openReport('stock')`});
     // FIX: this used to call getPartyDocBalance() per customer AND per
     // supplier — a full ledger reconstruction (rescanning every sale/
@@ -12695,44 +12817,63 @@ function openReport(type, el, forceRefresh){
       + fsTable(slow, 'No items yet')
       + `<div style="font-size:11px;color:var(--sub);margin-top:6px;">Tap a row to open &amp; edit that item →</div>`;
   } else if(type==='gstr1'){
+    // v82 FIX: rate rows were dead — now expand inline to show the actual
+    // sale line items behind each rate bucket, tap-through to the invoice.
     const rateGroups = {};
     sales.forEach(s=>(s.lineItems||[]).forEach(li=>{
       const rate = li.gst!=null ? li.gst : 0;
       const taxable = li.qty*li.rate/(1+rate/100);
       const tax = li.qty*li.rate - taxable;
-      if(!rateGroups[rate]) rateGroups[rate]={taxable:0,tax:0};
+      if(!rateGroups[rate]) rateGroups[rate]={taxable:0,tax:0,items:[]};
       rateGroups[rate].taxable += taxable; rateGroups[rate].tax += tax;
+      rateGroups[rate].items.push({name:resolveItemName(li), saleId:s.id, date:s.date, tax});
     }));
     const rates = Object.keys(rateGroups).sort((a,b)=>a-b);
+    const gstr1Rows = rates.map(r=>{
+      const key = 'gstr1_'+r, expanded = _gstRowExpanded[key];
+      return `<div class="cart-row" style="cursor:pointer;" onclick="toggleGstRateRow('${key}')"><span>${r}% <span style="font-size:9px;color:var(--primary);">${expanded?'▲':'▼'}</span></span><span class="mono">${fmt(rateGroups[r].taxable)} · ${fmt(rateGroups[r].tax)}</span></div>`
+        + (expanded ? _inlineBsRowBreakdown(rateGroups[r].items.map(it=>({label:`${it.name} · ${it.date}`, amount:it.tax, nav:`closeAllSheets();viewSaleEntry('${it.saleId}')`})), `closeAllSheets();openReport('sales')`) : '');
+    }).join('');
     tbl = rates.length ? `<div class="cart-row" style="font-weight:700;font-size:11px;color:var(--sub);"><span>GST Rate</span><span>Taxable · Tax</span></div>`
-      + rates.map(r=>`<div class="cart-row"><span>${r}%</span><span class="mono">${fmt(rateGroups[r].taxable)} · ${fmt(rateGroups[r].tax)}</span></div>`).join('')
+      + gstr1Rows
       + `<div class="cart-total"><span>Total Outward Tax</span><span class="mono">${fmt(rates.reduce((a,r)=>a+rateGroups[r].tax,0))}</span></div>`
-      + `<div style="font-size:11px;color:var(--sub);margin-top:6px;">A simplified outward-supply summary by tax rate, built from your Sales Register — use alongside your GSTIN-wise B2B invoices for the actual GSTN filing.</div>`
+      + `<div style="font-size:11px;color:var(--sub);margin-top:6px;">Tap a rate to see the sale line items behind it. A simplified outward-supply summary by tax rate, built from your Sales Register — use alongside your GSTIN-wise B2B invoices for the actual GSTN filing.</div>`
       : '<div class="cart-row"><span>No sales in this period</span><span></span></div>';
   } else if(type==='gstr3b'){
+    // v82 FIX: both rows were dead — now drill into the underlying register.
     const outTax = sales.reduce((a,s)=>a+(s.lineItems||[]).reduce((b,li)=>{ const rate=li.gst!=null?li.gst:0; const taxable=li.qty*li.rate/(1+rate/100); return b+(li.qty*li.rate-taxable); },0),0);
     const periodPurch = filterByDateRange(DB.purchases||[], 'date');
     const inTax = periodPurch.reduce((a,p)=>a+(p.lineItems||[]).reduce((b,li)=>{ const rate=li.gst!=null?li.gst:0; const taxable=li.qty*li.rate/(1+rate/100); return b+(li.qty*li.rate-taxable); },0),0);
     const net = Math.max(0, outTax-inTax);
-    tbl = `<div class="cart-row" style="font-weight:700;"><span>3.1 Outward Supplies — Tax</span><span class="mono">${fmt(outTax)}</span></div>
-     <div class="cart-row" style="font-weight:700;margin-top:8px;"><span>4. Eligible ITC (Input Tax Credit)</span><span class="mono">${fmt(inTax)}</span></div>
+    tbl = `<div class="cart-row" style="font-weight:700;cursor:pointer;" onclick="closeAllSheets();openReport('sales')"><span>3.1 Outward Supplies — Tax <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(outTax)}</span></div>
+     <div class="cart-row" style="font-weight:700;margin-top:8px;cursor:pointer;" onclick="closeAllSheets();openReport('purchase')"><span>4. Eligible ITC (Input Tax Credit) <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(inTax)}</span></div>
      <div class="cart-total" style="margin-top:8px;"><span>Net GST Payable</span><span class="mono">${fmt(net)}</span></div>
      <div style="font-size:11px;color:var(--sub);margin-top:6px;">A simplified GSTR-3B style summary from your recorded Sales and Purchase GST. Reconcile against your books before filing.</div>`;
   } else if(type==='hsnsummary'){
+    // v82 FIX: HSN rows were dead — now expand inline to the sale line
+    // items filed under each HSN code, tap-through to the invoice.
     const byHsn = {};
     sales.forEach(s=>(s.lineItems||[]).forEach(li=>{
       const it=DB.items.find(x=>x.id===li.id); const hsn=li.hsn||(it&&it.hsn)||'—';
-      if(!byHsn[hsn]) byHsn[hsn]={qty:0,val:0};
+      if(!byHsn[hsn]) byHsn[hsn]={qty:0,val:0,items:[]};
       byHsn[hsn].qty+=li.qty; byHsn[hsn].val+=li.qty*li.rate;
+      byHsn[hsn].items.push({name:resolveItemName(li), saleId:s.id, date:s.date, val:li.qty*li.rate});
     }));
     const rows = Object.entries(byHsn).sort((a,b)=>b[1].val-a[1].val);
+    const hsnRows = rows.map(([h,d])=>{
+      const key = 'hsn_'+h, expanded = _gstRowExpanded[key];
+      return `<div class="cart-row" style="cursor:pointer;" onclick="toggleGstRateRow('${key}')"><span>${h} <span style="font-size:9px;color:var(--primary);">${expanded?'▲':'▼'}</span></span><span class="mono">${fmt(d.qty)} · ${fmt(d.val)}</span></div>`
+        + (expanded ? _inlineBsRowBreakdown(d.items.map(it=>({label:`${it.name} · ${it.date}`, amount:it.val, nav:`closeAllSheets();viewSaleEntry('${it.saleId}')`})), `closeAllSheets();openReport('sales')`) : '');
+    }).join('');
     tbl = rows.length ? `<div class="cart-row" style="font-weight:700;font-size:11px;color:var(--sub);"><span>HSN</span><span>Qty · Value</span></div>`
-      + rows.map(([h,d])=>`<div class="cart-row"><span>${h}</span><span class="mono">${fmt(d.qty)} · ${fmt(d.val)}</span></div>`).join('')
+      + hsnRows
+      + `<div style="font-size:11px;color:var(--sub);margin-top:6px;">Tap an HSN code to see the sale line items behind it.</div>`
       : '<div class="cart-row"><span>No sales in this period</span><span></span></div>';
   } else if(type==='taxliability'){
+    // v82 FIX: same dead-row fix as GST Summary above.
     const {gstSales, gstPurch} = computeGSTTotals(sales, filterByDateRange(DB.purchases||[], 'date'));
-    tbl=`<div class="cart-row"><span>Output GST (Sales)</span><span class="mono">${fmt(gstSales)}</span></div>
-     <div class="cart-row"><span>Input GST (Purchase)</span><span class="mono">${fmt(gstPurch)}</span></div>
+    tbl=`<div class="cart-row" style="cursor:pointer;" onclick="closeAllSheets();openReport('sales')"><span>Output GST (Sales) <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(gstSales)}</span></div>
+     <div class="cart-row" style="cursor:pointer;" onclick="closeAllSheets();openReport('purchase')"><span>Input GST (Purchase) <span style="color:var(--primary);font-size:10px;">VIEW ›</span></span><span class="mono">${fmt(gstPurch)}</span></div>
      <div class="cart-total"><span>Net GST Payable</span><span class="mono">${fmt(Math.max(0,gstSales-gstPurch))}</span></div>`;
   } else if(type==='bizsummary'){
     // v82 FIX: was plain div.cart-row lines with no table borders, and
