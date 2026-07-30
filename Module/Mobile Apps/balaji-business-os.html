@@ -1848,6 +1848,7 @@ body.mode-accountant .owner-hint{display:none;}
       <optgroup label="📦 Stock">
         <option value="stock">Current Stock</option>
         <option value="stockledger">Stock Ledger</option>
+        <option value="stockmovement">Stock Movement</option>
         <option value="lowstockrpt">Low Stock</option>
         <option value="deadstock">Dead Stock</option>
         <option value="negstock">Negative Stock</option>
@@ -1873,6 +1874,7 @@ body.mode-accountant .owner-hint{display:none;}
         <option value="bizsummary">Business Summary</option>
         <option value="profitanalysis">Profit Analysis</option>
         <option value="salesvspurchase">Sales vs Purchase</option>
+        <option value="itemwise">Item-wise Sales/Purchase</option>
       </optgroup>
     </select>
   </div>
@@ -1926,6 +1928,11 @@ body.mode-accountant .owner-hint{display:none;}
   <div class="report-buttons-row" id="reportButtons-inventory" style="display:none;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin:12px 0;">
     <button class="rpt-type" onclick="openReport('stock',this)">Current Stock</button>
     <button class="rpt-type" onclick="openReport('stockledger',this)">Stock Ledger</button>
+    <!-- v2026-07-30 FIX: stockmovement was fully implemented in openReport()
+    (and in the Jump to Report dropdown) but had no button here — completely
+    unreachable from the Inventory tab, same class of gap as negstock/fastslow
+    below. -->
+    <button class="rpt-type" onclick="openReport('stockmovement',this)">Stock Movement</button>
     <button class="rpt-type" onclick="openReport('lowstockrpt',this)">Low Stock</button>
     <button class="rpt-type" onclick="openReport('deadstock',this)">Dead Stock</button>
     <!-- FIX: negstock (Negative Stock Report) and fastslow (Fast/Slow Moving
@@ -1960,6 +1967,11 @@ body.mode-accountant .owner-hint{display:none;}
     <button class="rpt-type" onclick="openReport('bizsummary',this)">Business Summary</button>
     <button class="rpt-type" onclick="openReport('profitanalysis',this)">Profit Analysis</button>
     <button class="rpt-type" onclick="openReport('salesvspurchase',this)">Sales vs Purchase</button>
+    <!-- v2026-07-30 FIX: itemwise (Purchase Qty/Value vs Sale Qty/Value vs
+    Diff Qty per item, the exact month-end reconciliation report requested)
+    was fully implemented but had no button anywhere — completely
+    unreachable. -->
+    <button class="rpt-type" onclick="openReport('itemwise',this)">Item-wise Sales/Purchase</button>
   </div>
 
 
@@ -12008,7 +12020,7 @@ function openReport(type, el, forceRefresh){
     stock:'inventory', stockledger:'inventory', lowstockrpt:'inventory', deadstock:'inventory', negstock:'inventory', fastslow:'inventory', stockmovement:'inventory',
     cashbook:'accounts', bankbook:'accounts', cashflow:'accounts', journal:'accounts', ledgerpick:'accounts', pl:'accounts', bs:'accounts', trialbalance:'accounts', brs:'accounts', ageing:'accounts', suspense:'accounts',
     gst:'gst', gstr1:'gst', gstr3b:'gst', hsnsummary:'gst', taxliability:'gst',
-    bizsummary:'analysis', profitanalysis:'analysis', salesvspurchase:'analysis', expenseanalysis:'analysis', custgrowth:'analysis', suppanalysis:'analysis', topitems:'analysis'
+    bizsummary:'analysis', profitanalysis:'analysis', salesvspurchase:'analysis', itemwise:'analysis', expenseanalysis:'analysis', custgrowth:'analysis', suppanalysis:'analysis', topitems:'analysis'
   };
   const rptCategory = TYPE_TO_RPT_CATEGORY[type];
   if(rptCategory){
@@ -12530,12 +12542,47 @@ function openReport(type, el, forceRefresh){
     </tbody><tfoot><tr><td colspan="7"><b>Total</b></td><td class="mono"><b>${fmtQtyDisplay(totalClosingQty,'')}</b></td><td></td><td class="mono"><b>${fmt(shownRows.reduce((a,r)=>a+r.closingVal,0))}</b></td></tr>${negRows.length?`<tr style="color:var(--red);"><td colspan="7">Of which: Negative Stock (${negRows.length} item${negRows.length===1?'':'s'})</td><td class="mono">${fmtQtyDisplay(negQtyTotal,'')}</td><td></td><td class="mono">${fmt(negValTotal)}</td></tr>`:''}</tfoot></table></div>
     <div style="font-size:11px;color:var(--sub);margin-top:6px;">Sales Return = Credit Notes issued to customers (goods back in stock). Purchase Return = Debit Notes issued to suppliers (goods sent back out). Both are already reflected in Closing. Closing here is reconstructed from Opening Stock + these vouchers for the selected period — if it disagrees with Current Stock/Inventory (the live figure), that live figure is the correct one; the gap means stock was adjusted at some point without a matching voucher. Settings → Recalculate Stock From Vouchers can resync it.</div>`;
   } else if(type==='itemwise'){
-    const itemSales = {}, itemPurch = {};
-    sales.forEach(s=>(s.lineItems||[]).forEach(li=>{ const n=resolveItemName(li); itemSales[n]=(itemSales[n]||0)+li.qty*li.rate; }));
-    DB.purchases.forEach(p=>(p.lineItems||[]).forEach(li=>{ const n=resolveItemName(li); itemPurch[n]=(itemPurch[n]||0)+li.qty*li.rate; }));
-    const names = [...new Set([...Object.keys(itemSales), ...Object.keys(itemPurch)])];
-    tbl = names.length ? `<div class="cart-row" style="font-weight:700;font-size:11px;color:var(--sub);"><span>Item</span><span>Sold · Purchased</span></div>`
-      + names.map(n=>`<div class="cart-row"><span>${n}</span><span class="mono">${fmt(itemSales[n]||0)} · ${fmt(itemPurch[n]||0)}</span></div>`).join('')
+    // v2026-07-30 REBUILT: this used to be a bare "Sold · Purchased" VALUE
+    // list — no quantities, no diff column — and read purchases from
+    // DB.purchases directly (ALL-TIME, ignoring whatever period was
+    // selected) while sales was already correctly period-filtered. So the
+    // Day/Month/Qtr/Year chips silently did nothing to the Purchase side
+    // of this report. Rebuilt as a proper table — Purchase Qty/Value,
+    // Sale Qty/Value, Diff Qty — matching the month-end reconciliation
+    // sheet format already used outside the app, with both sides now
+    // correctly scoped to the same selected period.
+    const periodPurchasesIW = filterByDateRange(DB.purchases||[], 'date');
+    const itemStatsIW = {};
+    periodPurchasesIW.forEach(p=>(p.lineItems||[]).forEach(li=>{
+      const n = resolveItemName(li), u = resolveItemUnit(li);
+      if(!itemStatsIW[n]) itemStatsIW[n] = {unit:u, purQty:0, purVal:0, salQty:0, salVal:0};
+      itemStatsIW[n].purQty += Number(li.qty)||0; itemStatsIW[n].purVal += (Number(li.qty)||0)*(Number(li.rate)||0);
+    }));
+    sales.forEach(s=>(s.lineItems||[]).forEach(li=>{
+      const n = resolveItemName(li), u = resolveItemUnit(li);
+      if(!itemStatsIW[n]) itemStatsIW[n] = {unit:u, purQty:0, purVal:0, salQty:0, salVal:0};
+      itemStatsIW[n].salQty += Number(li.qty)||0; itemStatsIW[n].salVal += (Number(li.qty)||0)*(Number(li.rate)||0);
+    }));
+    const namesIW = Object.keys(itemStatsIW).sort((a,b)=>a.localeCompare(b));
+    const totalPurValIW = namesIW.reduce((a,n)=>a+itemStatsIW[n].purVal,0);
+    const totalSalValIW = namesIW.reduce((a,n)=>a+itemStatsIW[n].salVal,0);
+    tbl = namesIW.length ? `<div class="inv-tbl-wrap"><table class="inv-tbl"><thead><tr>
+      <th>Item</th><th class="num">Purchase Qty</th><th class="num">Purchase Value</th><th class="num">Sale Qty</th><th class="num">Sale Value</th><th class="num">Diff Qty</th>
+    </tr></thead><tbody>${namesIW.map(n=>{
+      const d = itemStatsIW[n];
+      const diff = snapQty(d.salQty - d.purQty);
+      return `<tr style="${diff>0.005?'color:var(--red);':''}">
+        <td>${n}</td>
+        <td class="mono">${d.purQty?fmtQtyDisplay(d.purQty,d.unit):'—'}</td>
+        <td class="mono">${fmt(d.purVal)}</td>
+        <td class="mono">${d.salQty?fmtQtyDisplay(d.salQty,d.unit):'—'}</td>
+        <td class="mono">${fmt(d.salVal)}</td>
+        <td class="mono">${(diff>0?'+':'')+fmtQtyDisplay(diff,d.unit)}</td>
+      </tr>`;
+    }).join('')}</tbody>
+    <tfoot><tr><td>Total</td><td></td><td class="mono"><b>${fmt(totalPurValIW)}</b></td><td></td><td class="mono"><b>${fmt(totalSalValIW)}</b></td><td></td></tr></tfoot>
+    </table></div>
+    <div style="font-size:11px;color:var(--sub);margin-top:6px;">Diff Qty = Sale Qty − Purchase Qty for this period alone (doesn't carry forward opening/closing stock). Rows in <span style="color:var(--red);">red</span> sold more than was purchased in this period. For the full running-balance picture including opening stock, see Stock Ledger.</div>`
       : '<div class="cart-row"><span>No item-wise data for this period yet</span><span></span></div>';
   } else if(type==='partywise'){
     const custByMonth = {};
