@@ -9109,17 +9109,18 @@ function _rptPeriodRange(){
 // Closing stock only (this report has no opening/movement columns) — that's
 // exactly what Tally's own Stock Group Summary shows too when no columnar
 // period breakup is requested.
-function _renderTallyStockTable(items, stockTotal, showDec){
+function _renderTallyStockTable(items, stockTotal, showDec, avgRates){
   const range = _rptPeriodRange();
   const periodLabel = `${_fmtTallyDate(range.from)} to ${_fmtTallyDate(range.to)}`;
   const bizAddr = DB.bizAddress || '';
+  const rate = i => (avgRates && avgRates[i.id]!=null) ? avgRates[i.id] : (i.pRate||0);
   const sameUnit = items.length && items.every(i=>(i.unit||'Pcs')===(items[0].unit||'Pcs'));
   const rows = items.map(i=>`
     <tr onclick="viewItemMovementFromInventory('${i.id}')" style="cursor:pointer;${i.stock<=i.min?'color:var(--red);':''}">
       <td style="text-align:left;">${i.name}</td>
       <td class="mono">${fmtQtyDisplay(i.stock, i.unit)} ${i.unit||'Pcs'}</td>
-      <td class="mono">${fmtSmart(i.pRate, showDec)}</td>
-      <td class="mono" style="font-weight:700;">${fmtSmart(i.pRate*i.stock, showDec)}</td>
+      <td class="mono">${fmtSmart(rate(i), showDec)}</td>
+      <td class="mono" style="font-weight:700;">${fmtSmart(rate(i)*(Number(i.stock)||0), showDec)}</td>
     </tr>`).join('');
   const grandQty = sameUnit ? `${fmtQtyDisplay(items.reduce((a,i)=>a+(Number(i.stock)||0),0), items[0].unit)} ${items[0].unit||'Pcs'}` : '—';
   return `
@@ -10381,6 +10382,27 @@ function _plGroupRow(label, amount, key){
 // given date — i.e. the opening balance for a period starting on that date.
 // One pass per voucher array (not nested per-item), so it stays fast even
 // with hundreds of vouchers.
+// v82 NEW: shared moving-average cost per item — (opening value + total
+// purchased value) ÷ (opening qty + total purchased qty), all-time. Used by
+// every report that shows a stock Value column (Current Stock, Low Stock,
+// Negative Stock, Dead Stock) so they can never disagree with each other or
+// with Stock Ledger the way they used to when each computed its own value
+// as (today's live Purchase Rate × qty).
+function _computeStockAvgRates(){
+  const purQtyById={}, purValById={};
+  (DB.purchases||[]).forEach(p=>(p.lineItems||[]).forEach(li=>{
+    purQtyById[li.id]=(purQtyById[li.id]||0)+(Number(li.qty)||0);
+    purValById[li.id]=(purValById[li.id]||0)+(Number(li.qty)||0)*(Number(li.rate)||0);
+  }));
+  const rates={};
+  (DB.items||[]).forEach(it=>{
+    const openingQty = it.openingStock||0, openingVal = openingQty*(it.pRate||0);
+    const purQty = purQtyById[it.id]||0, purVal = purValById[it.id]||0;
+    const availQty = openingQty+purQty;
+    rates[it.id] = availQty>0.0001 ? (openingVal+purVal)/availQty : (it.pRate||0);
+  });
+  return rates;
+}
 function _stockValueAsOf(dateStr){
   const qtyByItem = {};
   DB.items.forEach(it=>{ qtyByItem[it.id] = it.openingStock||0; });
@@ -12023,41 +12045,57 @@ function openReport(type, el, forceRefresh){
     // By Category breakdown — kept only the All/Positive/Negative filter
     // dropdown and the search box, with a single Total Stock Value line
     // matching whichever filter is active.
-    // v82 FIX: a strict stock>0/stock<0 test let a tiny floating-point
-    // residue (e.g. 0.001kg left over from summing/subtracting qty across
-    // hundreds of purchase/sale line items) show up as if the item still
-    // had stock, even though its own Movement Detail correctly nets to
-    // 0.000 (nothing left to round away). Anything within 0.005 of zero is
-    // now treated as zero here — below the 3-decimal precision this app
-    // already rounds weight quantities to, so it can only ever suppress
-    // rounding noise, never a real small quantity.
+    // v82 FIX (2): Current Stock valued every item at today's live
+    // Purchase Rate (it.pRate), while Stock Ledger valued the same item at
+    // a moving-average cost — so the two reports' Value columns could
+    // never agree for an item whose rate had changed since it was last
+    // purchased. Now both use the identical all-time moving-average
+    // formula: (opening value + total purchased value) ÷ (opening qty +
+    // total purchased qty). Shared via _computeStockAvgRates() so Low
+    // Stock/Negative Stock/Dead Stock use the exact same figures too.
+    const _stockAvgRates = _computeStockAvgRates();
+    const itemVal = i => (Number(i.stock)||0) * (_stockAvgRates[i.id] ?? i.pRate ?? 0);
+    // v82 FIX (1): a strict stock>0/stock<0 test made near-zero items (e.g.
+    // 0.001kg of rounding residue from summing/subtracting qty across
+    // hundreds of purchase/sale line items) vanish from "All Stock"
+    // entirely, instead of showing correctly as zero. Now they stay in the
+    // "All Stock" list — treated as exactly zero qty/value — so nothing
+    // that's actually in your item master silently disappears; only the
+    // Positive/Negative filtered views (used for reordering/audit) exclude
+    // them, since they're neither meaningfully positive nor negative.
     const STOCK_EPS = 0.005;
     const allPosItems = (DB.items||[]).filter(i=>Number(i.stock)>STOCK_EPS);
     const allNegItems = (DB.items||[]).filter(i=>Number(i.stock)<-STOCK_EPS);
+    const allNearZeroItems = (DB.items||[]).filter(i=>{ const s=Number(i.stock)||0; return s!==0 && Math.abs(s)<=STOCK_EPS; });
 
     const searchFilter = i => !_rptStockSearch || i.name.toLowerCase().includes(_rptStockSearch) || (i.hsn||'').toLowerCase().includes(_rptStockSearch) || (i.category||'').toLowerCase().includes(_rptStockSearch);
 
     let items;
     if(_rptStockSign==='negative') items = allNegItems;
-    else if(_rptStockSign==='all') items = [...allPosItems, ...allNegItems].sort((a,b)=>a.name.localeCompare(b.name));
+    else if(_rptStockSign==='all') items = [...allPosItems, ...allNegItems, ...allNearZeroItems].sort((a,b)=>a.name.localeCompare(b.name));
     else items = allPosItems;
     const shown = items.filter(searchFilter);
-    const shownTotal = shown.reduce((a,i)=>a+(i.pRate*i.stock||0),0);
-    const showDec = groupHasDecimal(items.map(i=>i.pRate*i.stock));
+    const shownTotal = shown.reduce((a,i)=>a+itemVal(i),0);
+    const showDec = groupHasDecimal(items.map(itemVal));
 
     if(_rptStockSign!=='negative' && _rptStockView==='tally'){
-      tbl = _renderTallyStockTable(shown, shownTotal, showDec);
+      tbl = _renderTallyStockTable(shown, shownTotal, showDec, _stockAvgRates);
     } else {
-      const bodyHtml = shown.length ? shown.map((i,idx)=>`
+      const bodyHtml = shown.length ? shown.map((i,idx)=>{
+        const isNearZero = Math.abs(Number(i.stock)||0) <= STOCK_EPS;
+        const dispQty = isNearZero ? 0 : i.stock;
+        const dispVal = isNearZero ? 0 : itemVal(i);
+        return `
         <tr onclick="${i.stock<0?`openEditItemSheet('${i.id}')`:`viewItemMovementFromInventory('${i.id}')`}" style="cursor:pointer;${i.stock<0||i.stock<=i.min?'color:var(--red);':''}">
           <td>${idx+1}</td>
           <td style="text-align:left;">${i.name}</td>
           <td style="text-align:center;white-space:nowrap;">${i.hsn||'—'}</td>
-          <td class="mono">${fmtQtyDisplay(i.stock, i.unit)}</td>
+          <td class="mono">${fmtQtyDisplay(dispQty, i.unit)}</td>
           <td style="text-align:center;">${i.unit||'Pcs'}</td>
-          <td class="mono">${fmtSmart(i.pRate, showDec)}</td>
-          <td class="mono" style="font-weight:700;">${fmtSmart(i.pRate*i.stock, showDec)}</td>
-        </tr>`).join('') : `<tr><td colspan="7" style="text-align:center;color:var(--sub);">${_rptStockSearch?'No items match your search':'No items'}</td></tr>`;
+          <td class="mono">${fmtSmart(_stockAvgRates[i.id] ?? i.pRate, showDec)}</td>
+          <td class="mono" style="font-weight:700;">${fmtSmart(dispVal, showDec)}</td>
+        </tr>`;
+      }).join('') : `<tr><td colspan="7" style="text-align:center;color:var(--sub);">${_rptStockSearch?'No items match your search':'No items'}</td></tr>`;
       tbl = `<div class="cart-row"><span>Total Stock Value</span><span class="mono">${fmtSmart(shownTotal, showDec)}</span></div>
       <div class="cart-row"><span>Items</span><span class="mono">${shown.length}</span></div>
       <div class="doc-items-wrap"><table class="doc-items-tbl reg-tbl">
@@ -12065,7 +12103,7 @@ function openReport(type, el, forceRefresh){
         <tbody>${bodyHtml}</tbody>
         <tfoot><tr><td colspan="6">Total</td><td class="mono">${fmtSmart(shownTotal, showDec)}</td></tr></tfoot>
       </table></div>
-      <div style="font-size:11px;color:var(--sub);margin-top:6px;">Rows in <span style="color:var(--red);">red</span> are negative or at/below minimum stock. Tap a row for detail →</div>`;
+      <div style="font-size:11px;color:var(--sub);margin-top:6px;">Rows in <span style="color:var(--red);">red</span> are negative or at/below minimum stock. Rate shown is the moving-average cost (matches Stock Ledger), not necessarily today's Purchase Rate on the item master. Tap a row for detail →</div>`;
     }
   } else if(type==='stockledger'){
     // FIX: this used to read _invMovePeriod / _invPeriodStartDate — state
@@ -12546,8 +12584,21 @@ function openReport(type, el, forceRefresh){
     }).filter(r=>r.inQty||r.outQty);
     tbl = rows.length ? rows.map(r=>`<div class="cart-row"><span>${r.name}</span><span class="mono">In ${fmtQtyDisplay(r.inQty,r.unit)} · Out ${fmtQtyDisplay(r.outQty,r.unit)}</span></div>`).join('') : '<div class="cart-row"><span>No stock movement in this period</span><span></span></div>';
   } else if(type==='lowstockrpt'){
-    const items = (DB.items||[]).filter(i=>i.stock<=i.min);
-    const showDecLow = groupHasDecimal(items.map(i=>i.pRate*i.stock));
+    // v82 FIX: was a raw `i.stock<=i.min` comparison with no Number()
+    // coercion — if either field ever comes back as a string (e.g. after a
+    // sheet sync), JS compares strings lexicographically, not numerically,
+    // giving wrong results (e.g. "9" <= "10" is false as strings). Also:
+    // items with no Min Stock ever set (min defaults to 0) were flagged as
+    // "low stock" the instant they hit zero, same as a real minimum
+    // breach — now only items with an actual minimum configured (min>0)
+    // are checked, so a never-configured item doesn't clutter this report.
+    // Value column now uses the same moving-average cost as Stock Ledger/
+    // Current Stock (was today's live Purchase Rate, which disagreed).
+    const stockAvgRatesLow = _computeStockAvgRates();
+    const itemValLow = i => (Number(i.stock)||0) * (stockAvgRatesLow[i.id] ?? i.pRate ?? 0);
+    const items = (DB.items||[]).filter(i=>Number(i.min)>0 && Number(i.stock)<=Number(i.min));
+    const lowTotal = items.reduce((a,i)=>a+itemValLow(i),0);
+    const showDecLow = groupHasDecimal(items.map(itemValLow));
     const lowBody = items.length ? items.map((i,idx)=>`
       <tr onclick="openEditItemSheet('${i.id}')" style="cursor:pointer;color:var(--red);">
         <td>${idx+1}</td>
@@ -12556,19 +12607,27 @@ function openReport(type, el, forceRefresh){
         <td class="mono">${fmtQtyDisplay(i.stock, i.unit)}</td>
         <td style="text-align:center;">${i.unit||'Pcs'}</td>
         <td class="mono">${fmtQtyDisplay(i.min, i.unit)}</td>
-        <td class="mono" style="font-weight:700;">${fmtSmart(i.pRate*i.stock, showDecLow)}</td>
+        <td class="mono" style="font-weight:700;">${fmtSmart(itemValLow(i), showDecLow)}</td>
       </tr>`).join('') : '';
     tbl = items.length ? `<div class="cart-row"><span>Items Below Minimum</span><span class="mono">${items.length}</span></div>
       <div class="doc-items-wrap"><table class="doc-items-tbl reg-tbl">
         <thead><tr><th>#</th><th>Item</th><th>HSN</th><th>Qty</th><th>Unit</th><th>Min</th><th>Value</th></tr></thead>
         <tbody>${lowBody}</tbody>
+        <tfoot><tr><td colspan="6">Total</td><td class="mono">${fmtSmart(lowTotal, showDecLow)}</td></tr></tfoot>
       </table></div>
       <div style="font-size:11px;color:var(--sub);margin-top:6px;">Tap a row to open &amp; edit that item →</div>`
       : '<div class="empty-state"><div class="e-ico">✅</div><div class="e-title">All stocked up</div><div class="e-sub">No items below minimum level</div></div>';
   } else if(type==='negstock'){
-    const items = (DB.items||[]).filter(i=>i.stock<0);
-    const negTotal = items.reduce((a,i)=>a+(i.pRate*i.stock||0),0);
-    const showDecNeg = groupHasDecimal(items.map(i=>i.pRate*i.stock));
+    // v82 FIX: same two issues as Low Stock — value now uses the shared
+    // moving-average cost (was today's live Purchase Rate), and a strict
+    // stock<0 test is replaced with an epsilon so a tiny rounding residue
+    // (e.g. −0.001kg) doesn't show up here as if it were real negative
+    // stock needing investigation.
+    const stockAvgRatesNeg = _computeStockAvgRates();
+    const itemValNeg = i => (Number(i.stock)||0) * (stockAvgRatesNeg[i.id] ?? i.pRate ?? 0);
+    const items = (DB.items||[]).filter(i=>Number(i.stock)<-0.005);
+    const negTotal = items.reduce((a,i)=>a+itemValNeg(i),0);
+    const showDecNeg = groupHasDecimal(items.map(itemValNeg));
     const negBody = items.length ? items.map((i,idx)=>`
       <tr onclick="openEditItemSheet('${i.id}')" style="cursor:pointer;color:var(--red);">
         <td>${idx+1}</td>
@@ -12576,8 +12635,8 @@ function openReport(type, el, forceRefresh){
         <td style="text-align:center;white-space:nowrap;">${i.hsn||'—'}</td>
         <td class="mono">${fmtQtyDisplay(i.stock, i.unit)}</td>
         <td style="text-align:center;">${i.unit||'Pcs'}</td>
-        <td class="mono">${fmtSmart(i.pRate, showDecNeg)}</td>
-        <td class="mono" style="font-weight:700;">${fmtSmart(i.pRate*i.stock, showDecNeg)}</td>
+        <td class="mono">${fmtSmart(stockAvgRatesNeg[i.id] ?? i.pRate, showDecNeg)}</td>
+        <td class="mono" style="font-weight:700;">${fmtSmart(itemValNeg(i), showDecNeg)}</td>
       </tr>`).join('') : '';
     tbl = items.length ? `<div class="cart-row"><span>Negative Stock Value</span><span class="mono">${fmtSmart(negTotal, showDecNeg)}</span></div>
       <div class="cart-row"><span>Items</span><span class="mono">${items.length}</span></div>
@@ -12589,11 +12648,14 @@ function openReport(type, el, forceRefresh){
       <div style="font-size:11px;color:var(--sub);margin-top:6px;">More sold/issued than ever recorded as purchased. Tap a row to open &amp; edit that item →</div>`
       : `<div class="empty-state"><div class="e-ico">✅</div><div class="e-title">No negative stock</div><div class="e-sub">Every item's stock is zero or above</div></div>`;
   } else if(type==='deadstock'){
+    // v82 FIX: same epsilon + shared-valuation fixes as Low/Negative Stock.
+    const stockAvgRatesDead = _computeStockAvgRates();
+    const itemValDead = i => (Number(i.stock)||0) * (stockAvgRatesDead[i.id] ?? i.pRate ?? 0);
     const soldIds = new Set();
     (DB.sales||[]).forEach(s=>(s.lineItems||[]).forEach(li=>soldIds.add(li.id)));
-    const dead = (DB.items||[]).filter(i=>i.stock>0 && !soldIds.has(i.id));
-    const deadTotal = dead.reduce((a,i)=>a+(i.pRate*i.stock||0),0);
-    const showDecDead = groupHasDecimal(dead.map(i=>i.pRate*i.stock));
+    const dead = (DB.items||[]).filter(i=>Number(i.stock)>0.005 && !soldIds.has(i.id));
+    const deadTotal = dead.reduce((a,i)=>a+itemValDead(i),0);
+    const showDecDead = groupHasDecimal(dead.map(itemValDead));
     const deadBody = dead.length ? dead.map((i,idx)=>`
       <tr onclick="openEditItemSheet('${i.id}')" style="cursor:pointer;">
         <td>${idx+1}</td>
@@ -12601,8 +12663,8 @@ function openReport(type, el, forceRefresh){
         <td style="text-align:center;white-space:nowrap;">${i.hsn||'—'}</td>
         <td class="mono">${fmtQtyDisplay(i.stock, i.unit)}</td>
         <td style="text-align:center;">${i.unit||'Pcs'}</td>
-        <td class="mono">${fmtSmart(i.pRate, showDecDead)}</td>
-        <td class="mono" style="font-weight:700;">${fmtSmart(i.pRate*i.stock, showDecDead)}</td>
+        <td class="mono">${fmtSmart(stockAvgRatesDead[i.id] ?? i.pRate, showDecDead)}</td>
+        <td class="mono" style="font-weight:700;">${fmtSmart(itemValDead(i), showDecDead)}</td>
       </tr>`).join('') : '';
     tbl = dead.length ? `<div class="cart-row"><span>Dead Stock Value</span><span class="mono">${fmtSmart(deadTotal, showDecDead)}</span></div>
       <div class="cart-row"><span>Items</span><span class="mono">${dead.length}</span></div>
