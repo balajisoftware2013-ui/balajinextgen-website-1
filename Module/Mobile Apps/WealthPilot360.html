@@ -1425,9 +1425,10 @@ function editEntry(type, index) {
 
 function deleteEntry(type, index) {
   if (!confirm('Delete this entry?')) return;
-  if (type === 'transactions' && DB.transactions[index]) DB.transactions.splice(index, 1);
-  else if (type === 'bills' && DB.bills[index]) DB.bills.splice(index, 1);
-  else if (type === 'loans' && DB.loans[index]) DB.loans.splice(index, 1);
+  const _uidForTomb = (typeof currentUser !== 'undefined' && currentUser && currentUser.uid) || null;
+  if (type === 'transactions' && DB.transactions[index]) { if (_uidForTomb) _addTombstone(_uidForTomb, DB.transactions[index]); DB.transactions.splice(index, 1); }
+  else if (type === 'bills' && DB.bills[index]) { if (_uidForTomb) _addTombstone(_uidForTomb, DB.bills[index]); DB.bills.splice(index, 1); }
+  else if (type === 'loans' && DB.loans[index]) { if (_uidForTomb) _addTombstone(_uidForTomb, DB.loans[index]); DB.loans.splice(index, 1); }
   saveDB();
   syncBankBalance();
   toast('Entry deleted', 'success');
@@ -3997,6 +3998,93 @@ async function loadDB(uid) {
 // ── OFFLINE-FIRST SAVE with pending sync queue ───────────────
 const PENDING_SYNC_KEY = 'wp360_pending_sync';
 
+// v83 FIX ("laptop entry disappears after mobile saves, and vice versa"):
+// SAVE_DB has always sent this device's ENTIRE local array for every
+// tracked collection, and the backend does a full-replace on that tab.
+// That's safe for one device at a time, but with two devices editing
+// the same account, whichever device saves LAST silently wins and wipes
+// out anything the OTHER device added in between — confirmed directly:
+// laptop added a ₹95,150 income row, it landed in the Sheet, then mobile
+// (which had loaded its copy BEFORE the laptop's save) added its own
+// ₹6,000 expense and saved — and the laptop's row was gone, because
+// mobile's save replaced the whole tab with mobile's own (incomplete)
+// local snapshot. Records here have no stable unique ID, so a proper
+// per-row upsert isn't possible without a bigger schema change across
+// every module — but the overwhelming majority of real conflicts are
+// two devices independently ADDING new rows (not editing the exact same
+// row at the exact same instant), and that case IS fixable now: pull
+// the freshest cloud copy immediately before every save, and union it
+// with this device's local array (de-duplicating identical records)
+// instead of overwriting outright. Deletes are protected separately via
+// a short-lived local tombstone list (see deleteItem()) so a record you
+// just removed on this device doesn't get silently re-added by the
+// merge just because another device's cloud copy still has it.
+const MERGE_ARRAY_KEYS = ['loans','bills','insurance','investments','assets','creditCards','subscriptions','transactions','goals','documents','family','budgets','accounting'];
+const TOMBSTONE_KEY_PREFIX = 'wp360_tombstones_';
+const TOMBSTONE_TTL_MS = 48 * 60 * 60 * 1000; // 48h — long enough to cover any realistic sync delay
+
+function _recordSignature(rec) {
+  // Deliberately excludes nothing — two records are only "the same" if
+  // every field matches exactly. This is intentionally conservative: a
+  // false "different record" (rare, harmless — just a duplicate row you
+  // can delete) is far safer than a false "same record" (which could
+  // hide a real edit).
+  try { return JSON.stringify(rec); } catch(e) { return String(Math.random()); }
+}
+
+function _getTombstones(uid) {
+  try {
+    const raw = localStorage.getItem(TOMBSTONE_KEY_PREFIX + uid);
+    if (!raw) return [];
+    const list = JSON.parse(raw);
+    const cutoff = Date.now() - TOMBSTONE_TTL_MS;
+    const fresh = Array.isArray(list) ? list.filter(t => t.ts > cutoff) : [];
+    if (fresh.length !== (list || []).length) {
+      localStorage.setItem(TOMBSTONE_KEY_PREFIX + uid, JSON.stringify(fresh));
+    }
+    return fresh;
+  } catch(e) { return []; }
+}
+
+function _addTombstone(uid, rec) {
+  if (!uid) return;
+  try {
+    const list = _getTombstones(uid);
+    list.push({ sig: _recordSignature(rec), ts: Date.now() });
+    localStorage.setItem(TOMBSTONE_KEY_PREFIX + uid, JSON.stringify(list));
+  } catch(e) {}
+}
+
+// Merges freshly-pulled cloud arrays with this device's local arrays,
+// key by key, de-duplicating exact-match records and respecting local
+// deletion tombstones. Mutates and returns localDB in place so the
+// current device's own view immediately reflects anything another
+// device added that this device hadn't seen yet.
+function _mergeCloudIntoLocal(cloudDB, localDB, uid) {
+  if (!cloudDB) return localDB;
+  const tombstones = new Set(_getTombstones(uid).map(t => t.sig));
+  MERGE_ARRAY_KEYS.forEach(key => {
+    const cloudArr = Array.isArray(cloudDB[key]) ? cloudDB[key] : [];
+    const localArr = Array.isArray(localDB[key]) ? localDB[key] : [];
+    const seen = new Set();
+    const merged = [];
+    cloudArr.forEach(rec => {
+      const sig = _recordSignature(rec);
+      if (tombstones.has(sig) || seen.has(sig)) return;
+      seen.add(sig);
+      merged.push(rec);
+    });
+    localArr.forEach(rec => {
+      const sig = _recordSignature(rec);
+      if (tombstones.has(sig) || seen.has(sig)) return;
+      seen.add(sig);
+      merged.push(rec);
+    });
+    localDB[key] = merged;
+  });
+  return localDB;
+}
+
 function _markPendingSync(uid) {
   try { localStorage.setItem(PENDING_SYNC_KEY, JSON.stringify({ uid, ts: Date.now() })); } catch(e) {}
 }
@@ -4009,8 +4097,17 @@ function _getPendingSync() {
 
 function saveDB(uid) {
   const u = uid || (currentUser && currentUser.uid);
+
   // ✅ FIX: Always stamp _savedAt so cloud merge can compare which copy is newer
   DB._savedAt = Date.now();
+
+  // v83 FIX: local save happens FIRST and stays fully synchronous —
+  // this device's own edit must never be at risk just because a network
+  // call is slow or the tab gets closed a moment later. Only the CLOUD
+  // side (which was already async/fire-and-forget) additionally pulls
+  // + merges the freshest cloud copy before pushing, closing the
+  // multi-device data-loss hole described above without weakening the
+  // original "local save always completes immediately" guarantee.
   const data = JSON.stringify(DB);
   // v34 FIX: this used to also write to a global, non-uid-scoped
   // 'wp360' key on every save ("always save locally first"). On a
@@ -4024,15 +4121,33 @@ function saveDB(uid) {
     try { localStorage.setItem(STORE_DB_KEY + '_' + u, data); } catch(e) {}
     _storageSet(STORE_DB_KEY + '_' + u, DB);
     // Try cloud; mark pending if fails
-    if (GAS_URL && u !== '__superadmin__') {
+    if (GAS_URL && u !== '__superadmin__' && !(typeof currentUser !== 'undefined' && currentUser && currentUser.isDemo)) {
       _setSyncStatus('syncing');
-      _gasSaveDB(u, DB).then(() => {
-        _clearPendingSync();
-        _setSyncStatus('ok');
-      }).catch(() => {
-        _markPendingSync(u);
-        _setSyncStatus('offline');
-      });
+      (async () => {
+        try {
+          // Pull-merge-push: never trust this device's local snapshot
+          // as the sole truth for a shared account. If the pull fails
+          // (offline, slow cloud, etc.) fall back to the old behavior
+          // of pushing local as-is rather than blocking the save.
+          try {
+            const fresh = await _gasLoadDB(u);
+            if (fresh) {
+              _mergeCloudIntoLocal(fresh, DB, u);
+              DB._savedAt = Date.now();
+              try { localStorage.setItem(STORE_DB_KEY + '_' + u, JSON.stringify(DB)); } catch(e) {}
+              _storageSet(STORE_DB_KEY + '_' + u, DB);
+              _refreshLiveWidgets(); // reflect anything merged in from another device right away
+            }
+          } catch(e) { console.warn('[v83] Pre-save cloud merge skipped:', e && e.message); }
+
+          await _gasSaveDB(u, DB);
+          _clearPendingSync();
+          _setSyncStatus('ok');
+        } catch(e) {
+          _markPendingSync(u);
+          _setSyncStatus('offline');
+        }
+      })();
     }
   }
   // v19: Data Consistency — every save keeps the dashboard, due badges and
@@ -11305,7 +11420,7 @@ async function saveProfile(){
   }
 }
 
-function deleteItem(collection,index){if(!confirm('Remove this item?'))return;const removed=DB[collection][index];if(collection==='transactions'&&removed&&removed._txRef){_unlinkTxFromBankLedger(removed._txRef);}DB[collection].splice(index,1);logAudit('delete',collection,removed&&(removed.name||removed.desc)||'');saveDB();toast('Removed','info');renderSection(currentSection);}
+function deleteItem(collection,index){if(!confirm('Remove this item?'))return;const removed=DB[collection][index];if(collection==='transactions'&&removed&&removed._txRef){_unlinkTxFromBankLedger(removed._txRef);}if(removed&&typeof currentUser!=='undefined'&&currentUser&&currentUser.uid){_addTombstone(currentUser.uid,removed);}DB[collection].splice(index,1);logAudit('delete',collection,removed&&(removed.name||removed.desc)||'');saveDB();toast('Removed','info');renderSection(currentSection);}
 
 // ── Edit Transaction ──────────────────────────────────────────
 function openEditTx(idx) {
@@ -13112,7 +13227,15 @@ async function init(){
 
   const _syncPromise = Promise.race([
     _syncUsersFromStorage().then(() => 'ok').catch(() => 'error'),
-    new Promise(resolve => setTimeout(() => { _userSyncTimedOut = true; resolve('timeout'); }, 8000))
+    // v83 FIX ("Cloud backend not responding" banner shown even though
+    // SAVE_DB/LOAD_DB calls right after it succeeded fine): this race
+    // was cutting LOAD_USERS off at a hard 8s, well before Apps
+    // Script's own cold-start + execution time reliably finishes —
+    // shorter than even _gasPost's own internal 15s default timeout for
+    // this same call. That made the banner fire on ordinary GAS cold
+    // starts, not just genuine outages. Bumped to 20s to give it a fair
+    // chance while still surfacing a real, prolonged outage.
+    new Promise(resolve => setTimeout(() => { _userSyncTimedOut = true; resolve('timeout'); }, 20000))
   ]).then((result) => {
     if (_loginBtn) { _loginBtn.disabled = false; _loginBtn.textContent = '🔑 Login'; }
     const banner = document.getElementById('cloudSyncBanner');
