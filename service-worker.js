@@ -1,7 +1,12 @@
 // Balaji NextGen ERP - Service Worker
 // Enables offline functionality, caching, and background sync
 
-const CACHE_NAME = 'balaji-erp-v1';
+// BUMPED: v1 -> v2. This forces every visitor's browser to throw away the
+// old cache (which was serving the stale index.html on "/") and re-fetch
+// everything fresh once. Bump this version string again on every future
+// deploy where you want to force-refresh cached pages.
+const CACHE_NAME = 'balaji-erp-v2';
+
 const STATIC_ASSETS = [
   '/',
   '/index.html',
@@ -49,7 +54,19 @@ self.addEventListener('activate', event => {
 });
 
 // ============================================
-// FETCH EVENT - Network-first strategy
+// FETCH EVENT
+//
+// FIX: the old version was cache-first for EVERYTHING, including page
+// navigations ("/" and "/index.html"). That's why balajinextgen.in (root)
+// kept showing the old page while /index.html looked updated — the root
+// request was being answered straight from the old cached copy without
+// ever checking the network.
+//
+// Now:
+//   - Navigations (HTML pages) -> NETWORK-FIRST, falling back to cache
+//     only if offline. Visitors always get the latest page when online.
+//   - Real static assets (images/icons/manifest) -> CACHE-FIRST, since
+//     those don't need to be re-validated on every load.
 // ============================================
 self.addEventListener('fetch', event => {
   const { request } = event;
@@ -65,15 +82,13 @@ self.addEventListener('fetch', event => {
     event.respondWith(
       fetch(request)
         .then(response => {
-          // Cache successful responses
-          if (response.ok && request.method === 'GET') {
+          if (response.ok) {
             const clone = response.clone();
             caches.open(CACHE_NAME).then(cache => cache.put(request, clone));
           }
           return response;
         })
         .catch(() => {
-          // Fall back to cache if network fails
           return caches.match(request).then(cached => {
             return cached || createOfflineResponse();
           });
@@ -82,7 +97,35 @@ self.addEventListener('fetch', event => {
     return;
   }
 
-  // Cache-first for static assets
+  // NETWORK-FIRST for page navigations (this is the key fix — covers "/",
+  // "/index.html", and any other HTML page request like a link click or
+  // typed URL).
+  const isNavigation =
+    request.mode === 'navigate' ||
+    (request.method === 'GET' && request.headers.get('accept')?.includes('text/html'));
+
+  if (isNavigation) {
+    event.respondWith(
+      fetch(request)
+        .then(response => {
+          if (response && response.status === 200) {
+            const clone = response.clone();
+            caches.open(CACHE_NAME).then(cache => cache.put(request, clone));
+          }
+          return response;
+        })
+        .catch(() => {
+          // Offline (or network failed) -> serve the cached page if we
+          // have one, otherwise the offline fallback screen.
+          return caches.match(request).then(cached => {
+            return cached || caches.match('/index.html').then(idx => idx || createOfflineResponse());
+          });
+        })
+    );
+    return;
+  }
+
+  // CACHE-FIRST for everything else (CSS, JS, images, fonts, manifest...)
   event.respondWith(
     caches.match(request)
       .then(response => {
@@ -90,11 +133,9 @@ self.addEventListener('fetch', event => {
           return response;
         }
         return fetch(request).then(response => {
-          // Don't cache if not OK
           if (!response || response.status !== 200) {
             return response;
           }
-          // Don't cache POST requests or responses with no-store
           if (request.method === 'POST' || response.headers.get('Cache-Control')?.includes('no-store')) {
             return response;
           }
@@ -106,7 +147,6 @@ self.addEventListener('fetch', event => {
         });
       })
       .catch(() => {
-        // Offline fallback
         if (request.destination === 'document') {
           return createOfflineResponse();
         }
