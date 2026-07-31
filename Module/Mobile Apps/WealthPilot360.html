@@ -3738,7 +3738,7 @@ const GAS_URL = 'https://script.google.com/macros/s/AKfycbyDYQZs-Sn8viF0QYuRm1bl
 // ════════════════════════════════════════════════════════════════════════════════
 //  ★ v26: SESSION & CONFIGURATION
 // ════════════════════════════════════════════════════════════════════════════════
-const WP360_SESSION_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
+const WP360_SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes (increased from 15 to allow cloud sync time)
 const WP360_SESSION_WARNING_THRESHOLD = 60000; // Warn at 1 minute remaining
 let WP360_sessionTimer = null;
 let WP360_sessionWarningShown = false;
@@ -3937,9 +3937,26 @@ async function _gasPost(payload, timeoutMs) {
 async function _gasSaveDB(uid, data) {
   await _gasPost({ action: 'SAVE_DB', uid, data: typeof data === 'string' ? data : JSON.stringify(data) });
 }
-async function _gasLoadDB(uid) {
+async function _gasLoadDB(uid, retryCount = 0) {
   const d = await _gasPost({ action: 'LOAD_DB', uid });
-  try { return d ? JSON.parse(d) : null; } catch(e) { return null; }
+  try { 
+    if (!d) {
+      console.warn('[v27 FIX] _gasLoadDB returned null for uid:', uid ? uid.substring(0, 8) + '...' : 'unknown');
+      // Auto-retry once if first attempt failed
+      if (retryCount === 0) {
+        console.log('[v27 FIX] Retrying LOAD_DB after 2 seconds...');
+        await new Promise(r => setTimeout(r, 2000));
+        return _gasLoadDB(uid, 1);
+      }
+      return null;
+    }
+    const parsed = JSON.parse(d);
+    console.log('[v27 FIX] _gasLoadDB parsed successfully, got', Object.keys(parsed || {}).length, 'top-level keys');
+    return parsed;
+  } catch(e) { 
+    console.error('[v27 FIX] _gasLoadDB parse error:', e.message, 'data was:', typeof d, d ? d.substring(0, 100) : 'null');
+    return null; 
+  }
 }
 async function _gasSaveUsers(users) {
   await _gasPost({ action: 'SAVE_USERS', data: JSON.stringify(users) });
@@ -3971,21 +3988,26 @@ async function _gasUpdateProfile(uid, profileData) {
 async function loadDB(uid) {
   // Try GAS first
   if (GAS_URL && uid) {
-    console.log('[WP360 v27] loadDB: attempting cloud fetch for uid:', uid.substring(0, 8) + '...');
+    console.log('[v27 FIX] loadDB: attempting cloud fetch for uid:', uid.substring(0, 8) + '...');
     const d = await _gasLoadDB(uid);
     if (d) {
-      console.log('[WP360 v27] loadDB: cloud fetch succeeded, got', Object.keys(d).length, 'keys');
+      console.log('[v27 FIX] loadDB: cloud fetch succeeded, loading', Object.keys(d).length, 'keys');
       Object.keys(DB).forEach(k => { if(d[k]!==undefined) DB[k]=d[k]; });
       _storageSet(STORE_DB_KEY + '_' + uid, d);   // cache locally
       return;
     } else {
-      console.log('[WP360 v27] loadDB: cloud fetch returned null/empty');
+      console.warn('[v27 FIX] loadDB: cloud fetch returned null, falling back to localStorage');
     }
   }
   // Fallback: window.storage / localStorage
   const key = uid ? (STORE_DB_KEY + '_' + uid) : STORE_DB_KEY;
   const d = await _storageGet(key);
-  if (d) { Object.keys(DB).forEach(k => { if(d[k]!==undefined) DB[k]=d[k]; }); return; }
+  if (d) { 
+    console.log('[v27 FIX] loadDB: using cached localStorage data for uid:', uid ? uid.substring(0, 8) + '...' : 'unknown');
+    Object.keys(DB).forEach(k => { if(d[k]!==undefined) DB[k]=d[k]; }); 
+    return; 
+  }
+  console.warn('[v27 FIX] loadDB: no local cache either, will use empty DB or seed demo');
   // v34 ROOT-CAUSE FIX: this used to fall back to a single GLOBAL,
   // non-uid-scoped localStorage key ('wp360') as a last resort. On a
   // shared/test device where more than one client account is used —
@@ -13019,11 +13041,11 @@ function enterApp() {
     // v25 NEW ("wrong data on open" fix): keep the splash screen up
     // until the cloud fetch actually answers, so the app opens straight
     // to the real/current numbers instead of flashing stale local data
-    // first. Bounded to 12s (increased from 8s for mobile networks) so a slow/offline connection still reveals
+    // first. Bounded to 8s so a slow/offline connection still reveals
     // the (best-effort local) dashboard instead of getting stuck.
     Promise.race([
       _cloudFetchPromise,
-      new Promise(resolve => setTimeout(() => resolve('__splash_timeout__'), 12000))
+      new Promise(resolve => setTimeout(() => resolve('__splash_timeout__'), 8000))
     ]).finally(() => _hideSplash());
 
     // v24 FIX: 10s was too tight on slower mobile connections (common on
@@ -13033,16 +13055,13 @@ function enterApp() {
     // browser data, etc.) would show the "Set Up Opening Cash" form again
     // even though it was already saved — and briefly show stale/blank data
     // elsewhere too. Giving it more room to actually hear back fixes both.
-    // v27 FIX: increased from 25s to 35s for consistent mobile network performance
     Promise.race([
       _cloudFetchPromise,
-      new Promise(resolve => setTimeout(() => resolve(null), 35000))
+      new Promise(resolve => setTimeout(() => resolve(null), 25000))
     ]).then(cloudData => {
       // ── CLOUD MERGE LOGIC ──────────────────────────────────────
       const _cuid = currentUser ? currentUser.uid : null;
-      console.log('[WP360 v27] Cloud merge starting | uid:', _cuid, 'cloudData keys:', cloudData ? Object.keys(cloudData).length : 0);
       if (!cloudData || typeof cloudData !== 'object') {
-        console.warn('[WP360 v27] Cloud fetch returned invalid data:', typeof cloudData);
         _setSyncStatus('offline'); return;
       }
 
@@ -13077,7 +13096,6 @@ function enterApp() {
         // DB._savedAt is set on every saveDB() call. If local is newer, keep local.
         const localTs  = DB._savedAt  || 0;
         const cloudTs  = cloudData._savedAt || 0;
-        console.log('[WP360 v27] Data merge check | localTs:', new Date(localTs).toISOString(), 'cloudTs:', new Date(cloudTs).toISOString());
 
         // v34 FIX ("mobile shows ₹0, desktop has real data" bug): the old
         // check below only compared TIMESTAMPS (cloudTs >= localTs), never
@@ -13100,7 +13118,6 @@ function enterApp() {
 
         if (cloudTs >= localTs || !localHasData) {
           // Cloud is same age or newer — use it
-          console.log('[WP360 v27] Using cloud data | reason:', !localHasData ? 'local is empty' : 'cloud is newer', '| transactions:', cloudData.transactions ? cloudData.transactions.length : 0);
           // v28 FIX: "already set up Opening Cash but the app asks again" —
           // if this browser already had a CONFIRMED Opening Cash (DB.cashSettings.set
           // true) and the incoming cloud copy for this key is missing/unset (a stale
@@ -13121,12 +13138,17 @@ function enterApp() {
         } else {
           // Local is genuinely newer AND actually has real data — keep local.
           // Push local to cloud so it catches up.
-          console.log('[WP360 v27] Local is newer, keeping local | will push to cloud');
           _setSyncStatus('ok');
           _gasSaveDB(_cuid, DB).catch(() => _markPendingSync(_cuid));
         }
       } else {
+        console.warn('[v27 FIX] Cloud returned NO financial data — using local cache or empty DB. Backend may not have this user registered or sheets not synced yet.');
         _setSyncStatus('ok'); // cloud is empty, local wins
+        // Show warning if local is also empty — backend issue likely
+        if (!cloudHasData && !localHasData) {
+          console.error('[v27 FIX] ⚠️ CRITICAL: Both cloud AND local are empty! Backend UID may not be registered or sheets not set up for:', _cuid);
+          toast('⚠️ Data loading issue — backend not returning data. Check backend configuration.', 'warning');
+        }
       }
     }).catch(() => _setSyncStatus('offline'))
       .finally(() => {
