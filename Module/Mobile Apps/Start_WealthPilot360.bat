@@ -23,7 +23,7 @@ REM ── Try Python first (most machines have it) ──
 where python >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
     echo Starting server with Python on port %PORT% ...
-    start "" http://localhost:%PORT%/Balaji_WealthPilot360.html
+    start "" http://localhost:%PORT%/WealthPilot360.html
     python -m http.server %PORT%
     goto :eof
 )
