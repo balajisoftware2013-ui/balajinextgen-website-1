@@ -50,7 +50,7 @@
 // which is what you want for API calls. Every branch that DOES call
 // respondWith is wrapped so it can only ever resolve to a Response.
 
-const CACHE_VERSION = 'wealthpilot360-v1.2.0';
+const CACHE_VERSION = 'wealthpilot360-v1.3.0';
 const APP_SHELL_URL = 'WealthPilot360.html'; // relative to SW scope — matches the real deployed filename
 const CACHE_URLS = [
   './',
@@ -139,6 +139,48 @@ self.addEventListener('fetch', event => {
   try { reqUrl = new URL(req.url); } catch (e) { return; }
   if (reqUrl.protocol !== 'http:' && reqUrl.protocol !== 'https:') return; // chrome-extension:, data:, blob:, etc — leave alone
   if (reqUrl.origin !== self.location.origin) return; // cross-origin (Apps Script, Google Fonts, CDNs, etc) — always go straight to network, never cached
+
+  // v1.3 FIX ("website shows old file after I upload a new one"): the
+  // app shell (this HTML file, and page navigations) used to be
+  // cache-first with no revalidation — once cached, a browser would
+  // keep serving that exact bundle forever, even after a new file was
+  // uploaded to the server, because nothing here ever re-checked the
+  // network. The only way an update ever reached anyone was if sw.js
+  // itself changed bytes too (a separate, easy-to-forget step). The
+  // app shell now goes network-first: try the network for the latest
+  // file every time, cache it for offline use, and only fall back to
+  // the cache if the network genuinely fails (offline). Non-shell
+  // same-origin assets (if any get added later) keep the original
+  // cache-first behavior — no change there.
+  const isAppShell = req.mode === 'navigate' ||
+    reqUrl.pathname.endsWith('/' + APP_SHELL_URL) ||
+    reqUrl.pathname === '/' || reqUrl.pathname.endsWith('/');
+
+  if (isAppShell) {
+    event.respondWith(
+      (async () => {
+        try {
+          const netResponse = await fetch(req, { cache: 'no-store' });
+          if (netResponse && netResponse.ok) {
+            try {
+              const cache = await caches.open(CACHE_VERSION);
+              await cache.put(req, netResponse.clone());
+            } catch (cacheErr) {
+              console.warn('⚠️ Cache put skipped:', cacheErr && cacheErr.message);
+            }
+            return netResponse;
+          }
+          const cached = await caches.match(req);
+          return cached || netResponse || await offlineFallbackResponse();
+        } catch (err) {
+          console.log('🔌 Offline or fetch failed, serving cached app shell for:', req.url);
+          const cached = await caches.match(req);
+          return cached || await offlineFallbackResponse();
+        }
+      })()
+    );
+    return;
+  }
 
   event.respondWith(
     (async () => {
