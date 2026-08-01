@@ -1,6 +1,19 @@
 // Service Worker for Balaji WealthPilot360
-// Version 1.1 — fixes "Uncaught (in promise) TypeError: Failed to
-// convert value to 'Response'" and wrong cached-filename fallback.
+// Version 1.2 — fixes the SKIP_WAITING message field-name mismatch that
+// let a broken/outdated service worker get stuck in control indefinitely
+// (root cause of "blank screen/error after Install"), plus everything
+// from v1.1 below.
+//
+// v1.2 ROOT CAUSE FIXED:
+//  The page's own auto-update logic posts { type: 'SKIP_WAITING' } to
+//  force an updated worker to activate immediately instead of waiting
+//  for every open tab to close (the normal, much slower default
+//  behavior). This file was only listening for event.data.action —
+//  a different field entirely — so that message did nothing, every
+//  time, on every device. A fixed deploy could sit "waiting" forever
+//  while the phone kept the old, broken worker in control — which is
+//  exactly what caused "I uploaded the fix but still get a blank
+//  screen/error." Now accepts both `type` and the legacy `action` field.
 //
 // v1.1 ROOT CAUSES FIXED (from v1.0):
 //  1. CACHE_URLS pointed at '/Balaji_WealthPilot360.html', but the file
@@ -37,13 +50,12 @@
 // which is what you want for API calls. Every branch that DOES call
 // respondWith is wrapped so it can only ever resolve to a Response.
 
-const CACHE_VERSION = 'wealthpilot360-v1.1.0';
+const CACHE_VERSION = 'wealthpilot360-v1.2.0';
 const APP_SHELL_URL = 'WealthPilot360.html'; // relative to SW scope — matches the real deployed filename
 const CACHE_URLS = [
   './',
   APP_SHELL_URL,
-  'manifest_wealthpilot360.json',
-  'service-worker_wealthpilot360.js'
+  'sw.js' // v1.2 FIX: must be deployed AS sw.js (that's the literal filename the page registers) — caching it under its old name was never actually reachable
 ];
 
 // Install Event - Cache essential files
@@ -235,23 +247,34 @@ self.addEventListener('notificationclick', event => {
 self.addEventListener('message', event => {
   console.log('📨 Message from app:', event.data);
 
-  if (!event.data) return; // v1.1 FIX: guard against postMessage(undefined/null)
+  if (!event.data) return; // guard against postMessage(undefined/null)
 
-  if (event.data.action === 'SKIP_WAITING') {
+  // v1.2 FIX ("stuck old service worker → blank screen after install"):
+  // the page's own auto-update logic posts { type: 'SKIP_WAITING' } to
+  // force-activate a waiting worker immediately (see the registration
+  // code in the HTML). This handler was only checking event.data.action
+  // — a different field — so that message was silently ignored every
+  // single time, and a broken/outdated service worker could stay in
+  // control indefinitely with no way to self-heal. Accepts both `type`
+  // and the legacy `action` field now, so the page's update mechanism
+  // actually works.
+  const cmd = event.data.type || event.data.action;
+
+  if (cmd === 'SKIP_WAITING') {
     self.skipWaiting();
   }
 
-  if (event.data.action === 'CLEAR_CACHE') {
+  if (cmd === 'CLEAR_CACHE') {
     caches.delete(CACHE_VERSION)
       .then(() => console.log('🗑️ Cache cleared'))
       .catch(err => console.error('❌ Cache clear failed:', err && err.message));
   }
 
-  if (event.data.action === 'CACHE_URLS' && Array.isArray(event.data.urls)) {
+  if (cmd === 'CACHE_URLS' && Array.isArray(event.data.urls)) {
     caches.open(CACHE_VERSION)
       .then(cache => cache.addAll(event.data.urls))
       .catch(err => console.warn('⚠️ CACHE_URLS addAll failed:', err && err.message));
   }
 });
 
-console.log('✅ WealthPilot360 Service Worker v1.1 loaded and ready');
+console.log('✅ WealthPilot360 Service Worker v1.2 loaded and ready');
