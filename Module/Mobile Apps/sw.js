@@ -1,7 +1,7 @@
-// Service Worker for WealthPilot360 v1.3
+// Service Worker for WealthPilot360 v1.4
 // Handles offline support, caching, and auto-updates
 
-const CACHE_VERSION = 'wealthpilot360-v25';
+const CACHE_VERSION = 'wealthpilot360-v26';
 const APP_SHELL_URL = 'WealthPilot360.html';
 const CACHE_URLS = [
   './',
@@ -156,4 +156,4 @@ self.addEventListener('message', event => {
   }
 });
 
-console.log('✅ WealthPilot360 Service Worker v1.3 loaded');
+console.log('✅ WealthPilot360 Service Worker v1.4 loaded');
