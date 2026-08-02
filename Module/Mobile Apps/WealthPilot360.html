@@ -2,7 +2,7 @@
 <html lang="en" data-theme="orange-light">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>Balaji WealthPilot360 v25 STABLE – Personal Finance Manager</title>
 <!-- 
   ═══════════════════════════════════════════════════════════════════════════════
@@ -63,7 +63,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#FF7A1A">
 <meta name="description" content="Personal Finance Manager by Balaji NextGen Solutions">
-<link rel="manifest" id="pwa-manifest-link" href="manifest.json">
+<link rel="manifest" id="pwa-manifest-link" href="manifest_wealthpilot360.json">
 <!-- Apple Touch Icons (inline SVG → data URI set via JS) -->
 <link rel="apple-touch-icon" id="apple-touch-icon">
 <link rel="icon" id="pwa-favicon" type="image/png">
@@ -3353,15 +3353,19 @@ console.log('✅ Reports with Date Range Dropdown Loaded');
           <div id="planCardContent"></div>
         </div>
       </div>
-      <!-- OPENING BALANCES CARD (v43: separated out of Subscription Plan, where it didn't belong) -->
-      <div class="card" style="margin-top:16px" id="openingBalancesCard">
-        <div class="card-title">🌅 Opening Balances</div>
-        <div id="openingBalancesContent"></div>
-      </div>
-      <!-- EXPORT CARD (v43: separated out of Subscription Plan) -->
-      <div class="card" style="margin-top:16px" id="settingsExportCard">
-        <div class="card-title">📤 Export</div>
-        <div id="settingsExportContent"></div>
+      <!-- OPENING BALANCES + EXPORT — side by side, matching the
+           Profile/Appearance layout above (v94 FIX: these were stacked
+           full-width one under the other, pushing Export further down
+           the page than necessary). -->
+      <div class="grid-2" style="margin-top:16px">
+        <div class="card" id="openingBalancesCard">
+          <div class="card-title">🌅 Opening Balances</div>
+          <div id="openingBalancesContent"></div>
+        </div>
+        <div class="card" id="settingsExportCard">
+          <div class="card-title">📤 Export</div>
+          <div id="settingsExportContent"></div>
+        </div>
       </div>
       <!-- CLOUD SHEET INFO CARD -->
       <div class="card" style="margin-top:16px">
@@ -6026,12 +6030,22 @@ function _computeCashBalance(){
     // transactions so the dashboard still shows something meaningful.
     return DB.transactions.filter(t=>(t.mode||'Cash')==='Cash').reduce((s,t)=>s+(t.type==='income'?1:-1)*(Number(t.amount)||0),0);
   }
+  // v94 FIX: this used to skip any cash transaction dated before
+  // cs.openingDate ("if (new Date(t.date) < fromDate) return;"). If the
+  // opening date defaults to today while real transaction history goes
+  // back further (very common — the opening-balance step is often set
+  // up after transactions already exist), this silently threw away all
+  // that history and returned a far-too-low balance (often ₹0), while
+  // the detailed Cash Book statement (_stmtDayBook) — which sums ALL
+  // cash transactions plus the opening amount, with no date cutoff —
+  // showed the correct number. That mismatch was the root cause behind
+  // the wrong/negative Opening Balance on the Yearly/Custom Cash Report,
+  // "Monthly shows ₹0", and Cash in Hand disagreeing with the real
+  // ledger. Now matches _stmtDayBook's logic exactly.
   let bal = Number(cs.openingAmount)||0;
-  const fromDate = new Date(cs.openingDate);
   DB.transactions.forEach(t=>{
     if ((t.mode||'Cash') !== 'Cash') return;
     if (!t.date) return;
-    if (new Date(t.date) < fromDate) return;
     bal += (t.type==='income'?1:-1)*(Number(t.amount)||0);
   });
   // Fold in any past reconciliation differences recorded at closing time
@@ -14124,6 +14138,39 @@ async function saveProfile(){
   if (acctCoImmediate) { acctCoImmediate.textContent = company ? '🏢 ' + company : ''; acctCoImmediate.style.display = company ? 'block' : 'none'; }
   if (currentUser) currentUser.company = company;
 
+  // v94 FIX ("profile name/password not updating"): currentUser.name/
+  // mobile/email and the local 'users' registry (localStorage — what
+  // checkAutoLogin() reads on every reload/re-login) used to only get
+  // updated far below, inside the `parsed.status === 'ok'` branch, which
+  // only runs if the server call succeeds. The backend has no handler
+  // for the 'UPDATE_PROFILE' action this function calls (falls through
+  // to its default "Unknown action" case), so that branch never ran —
+  // meaning name/email/password changes never persisted locally either,
+  // and reverted on the next reload/login even though a "Profile saved!"
+  // toast showed. Now these are updated immediately, same as company
+  // already was, independent of whether the server call succeeds — a
+  // real cloud sync still happens below when possible, but local
+  // persistence no longer depends on it.
+  if (currentUser) {
+    currentUser.name = name;
+    currentUser.email = email;
+    const acctNameEl = document.getElementById('acctHdrName');
+    if (acctNameEl) acctNameEl.textContent = name;
+    const users = getUsers();
+    if (users[currentUser.uid]) {
+      users[currentUser.uid].name = name;
+      users[currentUser.uid].email = email;
+      users[currentUser.uid].company = company;
+      if (newPass && newPass.length >= 6) users[currentUser.uid].pwd = hashPwd(newPass);
+      saveUsers(users);
+    }
+  }
+  if (newPass && newPass.length > 0 && newPass.length < 6) {
+    toast('Password must be at least 6 characters — not changed', 'error');
+  } else if (document.getElementById('set-newpass')) {
+    document.getElementById('set-newpass').value = '';
+  }
+
   if (!currentUser || currentUser.isDemo) {
     toast('Profile saved!');
     return;
@@ -14131,52 +14178,33 @@ async function saveProfile(){
 
   // Sync to server — this is the authoritative account record
   // (CLIENT_MASTER / USER_MASTER), so name/mobile/email/password
-  // changes actually persist across devices, not just this browser.
+  // changes also persist across devices, not just this browser.
   // "company" is sent too in case the backend has (or later adds) a
   // matching column; if it doesn't recognise the field it's simply
-  // ignored server-side, and the name/company still persist locally.
+  // ignored server-side, and the name/company still persist locally
+  // (already updated above, regardless of the server outcome below).
   const payload = { name, mobile, email, company };
   if (newPass && newPass.length >= 6) payload.newPassword = newPass;
-  else if (newPass && newPass.length > 0) {
-    toast('Password must be at least 6 characters — not changed', 'error');
-  }
 
   const res = await _gasUpdateProfile(currentUser.uid, payload);
   let parsed = null;
   try { parsed = res ? JSON.parse(res) : null; } catch(e) {}
 
   if (!parsed) {
-    toast('Profile saved locally — could not reach server, will retry on next sync', 'info');
+    toast('Profile saved on this device — could not confirm with server', 'info');
     return;
   }
   if (parsed.status === 'duplicate_mobile' || parsed.status === 'duplicate_email') {
     const field = parsed.status === 'duplicate_mobile' ? 'mobile number' : 'email';
-    if (msgEl) msgEl.innerHTML = `<span style="color:var(--danger)">⚠️ That ${field} is already used by another account. Name/other changes were NOT saved. Please use a different ${field}.</span>`;
+    if (msgEl) msgEl.innerHTML = `<span style="color:var(--danger)">⚠️ That ${field} is already used by another account on the server. Saved on this device only — please use a different ${field} to sync to the cloud.</span>`;
     toast('That ' + field + ' is already in use by another account', 'error');
     return;
   }
   if (parsed.status === 'ok') {
-    // Keep in-memory session + local user cache consistent with server
-    currentUser.name = name;
-    currentUser.mobile = mobile;
-    currentUser.email = email;
-    currentUser.company = company;
-    document.getElementById('acctHdrName').textContent = name;
-    document.getElementById('acctHdrId').textContent = 'ID: ' + currentUser.userid + ' | ' + mobile;
-    const users = getUsers();
-    if (users[currentUser.uid]) {
-      users[currentUser.uid].name = name;
-      users[currentUser.uid].mobile = mobile;
-      users[currentUser.uid].email = email;
-      users[currentUser.uid].company = company;
-      if (newPass && newPass.length >= 6) users[currentUser.uid].pwd = hashPwd(newPass);
-      saveUsers(users);
-    }
-    if (document.getElementById('set-newpass')) document.getElementById('set-newpass').value = '';
     if (msgEl) msgEl.innerHTML = '<span style="color:var(--emerald)">✅ Profile updated everywhere (this device + your cloud account).</span>';
     toast('Profile saved!');
   } else {
-    toast('Profile saved locally — server said: ' + parsed.status, 'info');
+    toast('Profile saved on this device — server said: ' + parsed.status, 'info');
   }
 }
 
