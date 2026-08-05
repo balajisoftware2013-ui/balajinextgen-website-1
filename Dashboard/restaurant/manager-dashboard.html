@@ -37,6 +37,76 @@ async function erpApi(payload, type='V2_AUTH'){
   }catch(e){console.warn('[ERP API '+type+']',e.message);return{success:false,offline:true};}
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+   OFFLINE-FIRST BILLING QUEUE — auto-inserted, browser-only.
+   Bills save to localStorage instantly and sync in the background
+   every 12s with retry, so a backend/network blip during service
+   never blocks or loses a bill. See BillQueue.saveBillOffline().
+   ═══════════════════════════════════════════════════════════════════ */
+const BillQueue = (() => {
+  const QUEUE_KEY = 'bnx_bill_sync_queue';
+  const FLUSH_INTERVAL_MS = 12000;
+  const MAX_RETRY = 8;
+
+  function getQueue(){ try{ return JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]'); }catch(e){ return []; } }
+  function setQueue(q){ localStorage.setItem(QUEUE_KEY, JSON.stringify(q)); }
+  function genLocalId(){ return 'LOCAL_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8); }
+
+  function ensureBadge(){
+    let badge = document.getElementById('billSyncBadge');
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.id = 'billSyncBadge';
+      badge.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:99999;padding:8px 14px;border-radius:20px;font-size:12px;font-weight:600;color:#fff;background:#f59e0b;box-shadow:0 2px 8px rgba(0,0,0,.25);display:none;';
+      document.body.appendChild(badge);
+    }
+    return badge;
+  }
+
+  function saveBillOffline(billData){
+    const localId = genLocalId();
+    const entry = { localId, billData: Object.assign({}, billData, {localId}), status:'pending', attempts:0, queuedAt:new Date().toISOString() };
+    const q = getQueue(); q.push(entry); setQueue(q);
+    if (typeof printBill === 'function') { try{ printBill(entry.billData); }catch(e){ console.warn('Print failed, bill still queued:', e); } }
+    updateQueueBadge();
+    return { success:true, localId, message:'Saved locally, syncing...' };
+  }
+
+  async function flushQueue(){
+    const q = getQueue();
+    const pending = q.filter(e => e.status==='pending' && e.attempts < MAX_RETRY);
+    if (pending.length === 0) return;
+    for (const entry of pending) {
+      try {
+        entry.attempts++;
+        const res = await erpApi({action:'SAVE_BILL', bill: entry.billData}, 'V2_CORE');
+        if (res && (res.success || res.ok)) { entry.status='synced'; entry.syncedAt=new Date().toISOString(); }
+      } catch(err) { console.warn('Bill sync retry failed for', entry.localId, err); }
+    }
+    const now = Date.now();
+    const cleaned = q.filter(e => e.status!=='synced' || (now - new Date(e.syncedAt).getTime()) < 3600000);
+    setQueue(cleaned);
+    updateQueueBadge();
+  }
+
+  function updateQueueBadge(){
+    const q = getQueue();
+    const pendingCount = q.filter(e => e.status==='pending').length;
+    const badge = ensureBadge();
+    badge.textContent = pendingCount > 0 ? `⏳ ${pendingCount} bill(s) syncing...` : '';
+    badge.style.display = pendingCount > 0 ? 'inline-block' : 'none';
+    const stuck = q.filter(e => e.status==='pending' && e.attempts >= MAX_RETRY);
+    if (stuck.length > 0) console.error(`${stuck.length} bill(s) failed to sync after ${MAX_RETRY} attempts — check backend/network manually.`, stuck);
+  }
+
+  setInterval(flushQueue, FLUSH_INTERVAL_MS);
+  window.addEventListener('online', flushQueue);
+  document.addEventListener('DOMContentLoaded', flushQueue);
+
+  return { saveBillOffline, flushQueue, getQueue, updateQueueBadge };
+})();
+
+
 /* Toast helper (available before DOM) */
 function gasToast(m,t){
   const e=document.getElementById('_gasToast')||document.createElement('div');
@@ -2602,9 +2672,8 @@ async function bmSaveBill(){
     // the payload instead of nested under `bill:` — RPT_recordLiveBill_
     // (44_LivePosBridge.gs) expects payload.bill.billno etc, not
     // payload.billno directly.
-    const res=await erpApi({action:'SAVE_BILL', clientId:d.clientId, bill:d},'V2_CORE');
-    if(res.success){showToast('✅ Bill saved: '+d.billno,'success');}
-    else{showToast('⚠️ Saved locally (offline mode)','warning');}
+    const res = BillQueue.saveBillOffline(d);
+    showToast('✅ Bill saved: '+d.billno+' (syncing…)','success');
   }catch(e){showToast('⚠️ Saved locally','warning');}
 }
 function bmPrintBill(type){
