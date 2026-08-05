@@ -4603,7 +4603,15 @@ console.log('✅ Reports with Date Range Dropdown Loaded');
 // ════════════════════════════════════════
 // FORMATTING HELPERS
 // ════════════════════════════════════════
-function fmt(n){return '₹'+Number(n||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});}
+function fmt(n){
+  n = Number(n||0);
+  // v_decimalfix: only show the .00 paise when the amount actually has a
+  // fractional part — whole-rupee amounts (the vast majority) now print as
+  // ₹8,000 instead of ₹8,000.00, which also shortens the string and helps
+  // with the KPI-card overflow issue on the dashboard.
+  const hasPaise = Math.abs(n - Math.round(n)) >= 0.005;
+  return '₹'+n.toLocaleString('en-IN', hasPaise ? {minimumFractionDigits:2,maximumFractionDigits:2} : {minimumFractionDigits:0,maximumFractionDigits:0});
+}
 
 const DB = {
   profile:{name:'',email:''},
@@ -11821,6 +11829,21 @@ async function shareReportImage(elId, title){
 // clean letterhead, real selectable table text via jsPDF-AutoTable (which
 // automatically starts a new page BEFORE a row would be cut, and repeats
 // the column headers on every page), and a page-number footer.
+// v_pdffix: jsPDF's built-in fonts (helvetica/times/courier) only support
+// the WinAnsi/Latin-1 character set. The ₹ symbol (U+20B9) isn't in that
+// set, so jsPDF silently substituted it with a stray "¹"; emoji (multi-code
+// surrogate pairs like 📊, 💰) aren't in it either, so they came out as
+// garbage byte sequences (e.g. "Ø=ÜÊ"). That's exactly what was showing up
+// in exported/printed reports. _pdfSafe() rewrites text before it's ever
+// handed to jsPDF: ₹ becomes "Rs." (still unambiguous, prints cleanly) and
+// emoji/other unsupported symbols are dropped instead of rendering as junk.
+function _pdfSafe(s){
+  s = (s===null||s===undefined) ? '' : String(s);
+  s = s.replace(/₹/g, 'Rs. ');
+  // Strip emoji & symbol blocks outside the Latin-1 range jsPDF's core fonts support.
+  s = s.replace(/[\u{1F000}-\u{1FFFF}\u{2190}-\u{21FF}\u{2300}-\u{27BF}\u{2B00}-\u{2BFF}\u{2600}-\u{26FF}\uFE0F\u200D]/gu, '');
+  return s.replace(/[ \t]{2,}/g, ' ').trim();
+}
 async function shareReportPDF(elId, title){
   toast('📄 Preparing PDF…','info');
   const el = document.getElementById(elId);
@@ -11830,10 +11853,11 @@ async function shareReportPDF(elId, title){
   const doc = new jsPDF('p','pt','a4');
   if (typeof doc.autoTable !== 'function') { toast('Could not load the PDF table tool — check your internet connection and try again','error'); return; }
 
+  title = _pdfSafe(title);
   const pageW = doc.internal.pageSize.getWidth();
   const pageH = doc.internal.pageSize.getHeight();
   const marginX = 32, bottomMargin = 34;
-  const genLine = (currentUser?currentUser.name+' · ':'') + 'Generated ' + new Date().toLocaleString('en-IN');
+  const genLine = _pdfSafe((currentUser?currentUser.name+' · ':'') + 'Generated ' + new Date().toLocaleString('en-IN'));
 
   // Letterhead — first page only
   doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(150,150,150);
@@ -11851,13 +11875,15 @@ async function shareReportPDF(elId, title){
   function drawCalcRow(label, value, bold){
     ensureSpace(18);
     doc.setFont('helvetica', bold?'bold':'normal'); doc.setFontSize(10.5); doc.setTextColor(30,30,30);
-    doc.text(String(label), marginX, y);
-    if (value) doc.text(String(value), pageW-marginX, y, {align:'right'});
+    label = _pdfSafe(label); value = _pdfSafe(value);
+    doc.text(label, marginX, y);
+    if (value) doc.text(value, pageW-marginX, y, {align:'right'});
     y += bold ? 18 : 16;
   }
   function drawHeading(text){
     ensureSpace(22); y += 6;
     doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(20,20,20);
+    text = _pdfSafe(text);
     doc.text(text, marginX, y); y += 12;
   }
   function drawTable(tableEl){
@@ -11870,8 +11896,9 @@ async function shareReportPDF(elId, title){
       headStyles: { fillColor: [255,122,26], textColor: [255,255,255], fontStyle: 'bold', fontSize: 8.5 },
       alternateRowStyles: { fillColor: [255,247,240] },
       didParseCell: (data)=>{
-        const txt = (data.cell.text||[]).join(' ').trim();
-        if (/^[₹+\-]?[\d,]+(\.\d+)?$/.test(txt)) data.cell.styles.halign = 'right';
+        data.cell.text = (data.cell.text||[]).map(t=>_pdfSafe(t));
+        const txt = data.cell.text.join(' ').trim();
+        if (/^(Rs\.\s*)?[+\-]?[\d,]+(\.\d+)?$/.test(txt)) data.cell.styles.halign = 'right';
       }
     });
     y = doc.lastAutoTable.finalY + 14;
@@ -18674,6 +18701,45 @@ document.addEventListener('click', (e) => {
   const modal = document.getElementById('cashSettingsModal');
   if (modal && e.target === modal) closeCashSettingsModal();
 });
+</script>
+
+<!-- v_kpifit: the .kpi-value CSS relied on text-overflow:ellipsis to hide
+     amounts that were too wide for the card, which is exactly the
+     "amount looks cut off / overlapping the icon" problem on the
+     dashboard — a big ₹ figure (e.g. crores) simply got truncated or ran
+     under the card's icon/edge instead of shrinking to fit. This watches
+     every .kpi-value on the page and, whenever its text changes size,
+     shrinks the font just enough for the full amount to fit inside its
+     card — no more clipped or overlapping numbers, on any screen size. -->
+<script>
+(function(){
+  function fitOne(el){
+    if (!el || !el.isConnected) return;
+    el.style.fontSize = ''; // reset to the CSS default before measuring
+    const min = 10; // never shrink below this so text stays readable
+    let fs = parseFloat(getComputedStyle(el).fontSize);
+    let guard = 0;
+    while (el.scrollWidth > el.clientWidth + 1 && fs > min && guard < 40) {
+      fs -= 1;
+      el.style.fontSize = fs + 'px';
+      guard++;
+    }
+  }
+  function fitAll(){
+    document.querySelectorAll('.kpi-value').forEach(fitOne);
+  }
+  let debounceTimer = null;
+  function scheduleFit(){
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(fitAll, 60);
+  }
+  document.addEventListener('DOMContentLoaded', function(){
+    fitAll();
+    const mo = new MutationObserver(scheduleFit);
+    mo.observe(document.body, { childList:true, subtree:true, characterData:true });
+    window.addEventListener('resize', scheduleFit);
+  });
+})();
 </script>
 
 </body>

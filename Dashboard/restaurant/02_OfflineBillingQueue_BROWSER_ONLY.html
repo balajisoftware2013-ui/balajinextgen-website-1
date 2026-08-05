@@ -1,0 +1,131 @@
+<!-- ═══════════════════════════════════════════════════════════════════
+     OFFLINE-FIRST BILLING QUEUE — BROWSER ONLY
+     Paste this whole <script> block into BOTH:
+       - restaurant-dashboard.html
+       - manager-dashboard.html
+     Paste it near your existing erpApi() definition (both dashboards
+     already have that function — this uses it, doesn't replace it).
+
+     THIS FILE NEVER GOES INTO THE APPS SCRIPT PROJECT.
+     It uses localStorage, setInterval, window, document — none of
+     these exist on Apps Script's servers. That's what broke the
+     project last time. Browser code lives in .html files only.
+     ═══════════════════════════════════════════════════════════════════ -->
+<script>
+const BillQueue = (() => {
+  const QUEUE_KEY = 'bnx_bill_sync_queue';
+  const FLUSH_INTERVAL_MS = 12000;
+  const MAX_RETRY = 8;
+
+  function getQueue() {
+    try {
+      return JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function setQueue(q) {
+    localStorage.setItem(QUEUE_KEY, JSON.stringify(q));
+  }
+
+  function genLocalId() {
+    return 'LOCAL_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  }
+
+  /**
+   * Call this instead of erpApi({action:'SAVE_BILL', ...}) directly.
+   * Returns immediately with a local ID — does NOT wait on network.
+   */
+  function saveBillOffline(billData) {
+    const localId = genLocalId();
+    const entry = {
+      localId,
+      billData: Object.assign({}, billData, { localId }),
+      status: 'pending',
+      attempts: 0,
+      queuedAt: new Date().toISOString()
+    };
+
+    const q = getQueue();
+    q.push(entry);
+    setQueue(q);
+
+    // Print immediately — never wait on sync
+    if (typeof printBill === 'function') {
+      try { printBill(entry.billData); } catch (e) { console.warn('Print failed, bill still queued:', e); }
+    }
+
+    updateQueueBadge();
+    return { success: true, localId, message: 'Saved locally, syncing...' };
+  }
+
+  async function flushQueue() {
+    const q = getQueue();
+    const pending = q.filter(e => e.status === 'pending' && e.attempts < MAX_RETRY);
+    if (pending.length === 0) return;
+
+    for (const entry of pending) {
+      try {
+        entry.attempts++;
+        const res = await erpApi(
+          { action: 'SAVE_BILL', clientId: entry.billData.clientId, bill: entry.billData },
+          'V2_CORE'
+        );
+        if (res && (res.success || res.ok)) {
+          entry.status = 'synced';
+          entry.syncedAt = new Date().toISOString();
+        }
+        // if res indicates failure, leave status='pending' — will retry next flush
+      } catch (err) {
+        // network/backend still down — stays pending, retries next cycle
+        console.warn('Bill sync retry failed for', entry.localId, err);
+      }
+    }
+
+    // Keep synced entries for 1 hour (debug trail), then prune
+    const now = Date.now();
+    const cleaned = q.filter(e => {
+      if (e.status !== 'synced') return true;
+      const age = now - new Date(e.syncedAt).getTime();
+      return age < 60 * 60 * 1000;
+    });
+    setQueue(cleaned);
+    updateQueueBadge();
+  }
+
+  function updateQueueBadge() {
+    const q = getQueue();
+    const pendingCount = q.filter(e => e.status === 'pending').length;
+    const badge = document.getElementById('billSyncBadge');
+    if (badge) {
+      badge.textContent = pendingCount > 0 ? `${pendingCount} syncing...` : '';
+      badge.style.display = pendingCount > 0 ? 'inline-block' : 'none';
+    }
+    const stuck = q.filter(e => e.status === 'pending' && e.attempts >= MAX_RETRY);
+    if (stuck.length > 0) {
+      console.error(`${stuck.length} bill(s) failed to sync after ${MAX_RETRY} attempts — check backend/network manually.`, stuck);
+    }
+  }
+
+  // Start background flush loop — safe here, this IS a browser
+  setInterval(flushQueue, FLUSH_INTERVAL_MS);
+  window.addEventListener('online', flushQueue);
+  document.addEventListener('DOMContentLoaded', flushQueue);
+
+  return { saveBillOffline, flushQueue, getQueue, updateQueueBadge };
+})();
+</script>
+
+<!--
+MIGRATION NOTE FOR YOUR EXISTING CODE:
+
+Find (restaurant-dashboard.html ~line 2605):
+  const res=await erpApi({action:'SAVE_BILL', clientId:d.clientId, bill:d},'V2_CORE');
+
+Replace with:
+  const res = BillQueue.saveBillOffline(d);
+
+Add this near your status bar so cashiers can see sync state:
+  <span id="billSyncBadge" style="display:none;"></span>
+-->
