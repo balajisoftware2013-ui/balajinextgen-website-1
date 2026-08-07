@@ -76,7 +76,13 @@
       const response = await fetch(GAS_CONFIG.url, {
         method: 'POST',
         mode: 'cors',
-        headers: { 'Content-Type': 'application/json' },
+        // FIX: 'application/json' forces a CORS preflight OPTIONS request, which
+        // Apps Script web apps don't answer with Access-Control-Allow-Origin —
+        // so the browser blocks it before doPost ever runs. 'text/plain' is a
+        // CORS "simple" content-type, so no preflight happens. Apps Script's
+        // doPost doesn't care about the declared type; it reads raw postData.contents
+        // either way (already being JSON.parse()'d server-side).
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify({
           action,
           clientId: window.CLIENT_ID || 'unknown',
