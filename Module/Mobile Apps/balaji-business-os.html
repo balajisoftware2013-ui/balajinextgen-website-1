@@ -18368,80 +18368,138 @@ document.addEventListener('keydown', e=>{
   const mo = new MutationObserver(()=>{ clearTimeout(window._a11yT); window._a11yT = setTimeout(run, 300); });
   document.addEventListener('DOMContentLoaded', ()=> mo.observe(document.body, {childList:true, subtree:true}));
 })();
-// ── Date input year fix: cap the year at 4 digits / a sane range ──────────
-// Native <input type="date"> lets people type a year with 5, 6, even more
-// digits (e.g. 202512 or 999999), which silently produces a garbage date.
-// Setting min/max constrains the browser's own picker, and the change/blur
-// check below catches anything that still slips through on manual typing.
-(function fixDateYearInputs(){
+// ── Date input fix v80: proper dd/mm/yyyy masked typing ────────────────────
+// The old native <input type="date"> year box let people get stuck on a
+// half-typed year (e.g. showing "0025" while typing "25"), and the old
+// "help" script only reformatted after 8 raw digits — which native date
+// inputs almost never report via .value while mid-typing, so it rarely
+// even ran. Fix: swap every <input type="date"> for a plain text box that
+// we mask as dd/mm/yyyy ourselves (auto-inserts the "/" as you type, so
+// there's no ambiguous partial-year state). The original <input type="date">
+// element is kept in the DOM (hidden) holding the real ISO value, and stays
+// in sync both ways — so every existing onchange="..."/onkeydown="..." and
+// every `el.value = '...'` elsewhere in the app keeps working unchanged.
+(function fixDateInputs(){
   const MIN_YEAR = 1990, MAX_YEAR = 2099;
-  const currentYear = new Date().getFullYear();
-  
-  function clampYear(el){
-    if(!el.value) return;
-    const y = Number(el.value.slice(0,4));
-    if(el.value.length !== 10 || isNaN(y) || y < MIN_YEAR || y > MAX_YEAR){
-      el.value = '';
-      toast(`⚠️ Year must be 4 digits, between ${MIN_YEAR}–${MAX_YEAR}`);
+
+  function isoToDisp(iso){
+    if(!iso || iso.length !== 10) return '';
+    const [y, m, d] = iso.split('-');
+    return `${d}/${m}/${y}`;
+  }
+
+  function dispToIso(disp){
+    const m = disp.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    if(!m) return '';
+    const [, d, mo, y] = m;
+    const day = +d, mon = +mo, yr = +y;
+    if(mon < 1 || mon > 12) return '';
+    if(yr < MIN_YEAR || yr > MAX_YEAR) return '';
+    const daysInMonth = new Date(yr, mon, 0).getDate();
+    if(day < 1 || day > daysInMonth) return '';
+    return `${y}-${mo}-${d}`;
+  }
+
+  window._dateMaskCommit = window._dateMaskCommit || {};
+
+  function upgrade(el){
+    if(el.dataset.masked) return;
+    el.dataset.masked = '1';
+    if(!el.min) el.min = `${MIN_YEAR}-01-01`;
+    if(!el.max) el.max = `${MAX_YEAR}-12-31`;
+
+    const mask = document.createElement('input');
+    mask.type = 'text';
+    mask.inputMode = 'numeric';
+    mask.autocomplete = 'off';
+    mask.placeholder = 'dd/mm/yyyy';
+    mask.maxLength = 10;
+    mask.className = el.className;
+    mask.style.cssText = el.style.cssText;
+    mask.value = isoToDisp(el.value);
+
+    // Hide the original date input but keep it live in the DOM so all
+    // existing app code that reads/writes/listens on it keeps working.
+    el.style.cssText = 'position:absolute;opacity:0;width:1px;height:1px;pointer-events:none;';
+    el.tabIndex = -1;
+    el.parentNode.insertBefore(mask, el);
+
+    // Keep the mask's display in sync whenever OTHER app code sets
+    // el.value directly (e.g. editSaleDate.value = s.date on open).
+    const baseDesc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+    Object.defineProperty(el, 'value', {
+      configurable: true,
+      get(){ return baseDesc.get.call(this); },
+      set(v){ baseDesc.set.call(this, v); mask.value = isoToDisp(v); }
+    });
+
+    function commit(showToast){
+      if(!mask.value){ el.value = ''; return; }
+      const iso = dispToIso(mask.value);
+      if(!iso){
+        if(showToast) toast('⚠️ Enter a valid date as dd/mm/yyyy');
+        mask.value = isoToDisp(el.value);
+        return;
+      }
+      el.value = iso;
+      el.dispatchEvent(new Event('input', {bubbles:true}));
+      el.dispatchEvent(new Event('change', {bubbles:true}));
     }
-  }
-  
-  // v79-FIX: Help users fill year more easily
-  function improveYearInput(el){
-    // When focused, show current year as helper
-    el.addEventListener('focus', function(){
-      if(!this.value){
-        // Show what current year is in a tooltip
-        const todayStr = new Date().toISOString().split('T')[0];
-        this.placeholder = `E.g. ${todayStr}`;
+
+    // Auto-insert "/" as digits are typed: 07 -> 07/ -> 07/08 -> 07/08/2026
+    mask.addEventListener('input', ()=>{
+      const digits = mask.value.replace(/\D/g, '').slice(0, 8);
+      let out = digits.slice(0, 2);
+      if(digits.length >= 3) out += '/' + digits.slice(2, 4);
+      if(digits.length >= 5) out += '/' + digits.slice(4, 8);
+      mask.value = out;
+      if(digits.length === 8) commit(true);
+    });
+
+    mask.addEventListener('blur', ()=> commit(true));
+
+    mask.addEventListener('keydown', (e)=>{
+      if(e.ctrlKey && e.key === '/'){
+        e.preventDefault();
+        const today = new Date().toISOString().split('T')[0];
+        el.value = today;
+        commit(false);
+        toast('📅 Set to today: ' + isoToDisp(today));
+        return;
+      }
+      if(e.key === 'Enter'){
+        e.preventDefault();
+        commit(true);
+        el.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true, cancelable:true}));
       }
     });
-    
-    // When typing, help auto-fill if only numbers entered
-    el.addEventListener('input', function(){
-      // If typing in format: dd-mm-yyyy (with separators), browser handles it
-      // If typing just numbers: help complete
-      const val = this.value.replace(/-/g, '');
-      if(val.length === 8 && !isNaN(val)){
-        // User typed: ddmmyyyy (8 digits)
-        // Auto-format to: dd-mm-yyyy
-        const formatted = `${val.slice(0,2)}-${val.slice(2,4)}-${val.slice(4,8)}`;
-        this.value = formatted;
-      }
-    });
+
+    // v80-FIX: register this field's commit fn globally so any button
+    // (Go / Save / Check) can force-sync it before reading .value — see
+    // the mousedown/touchstart flush listener below. Fixes "Go" silently
+    // no-oping when tapped right after typing, before blur has landed.
+    window._dateMaskCommit[el.id] = ()=> commit(false);
   }
-  
+
   function run(){
-    document.querySelectorAll('input[type="date"]').forEach(el=>{
-      if(el.dataset.yearFixed) return;
-      el.dataset.yearFixed = '1';
-      
-      // Set reasonable min/max
-      if(!el.min) el.min = `${MIN_YEAR}-01-01`;
-      if(!el.max) el.max = `${MAX_YEAR}-12-31`;
-      
-      // Add validation
-      el.addEventListener('change', ()=> clampYear(el));
-      el.addEventListener('blur', ()=> clampYear(el));
-      
-      // v79-FIX: Improve year input experience
-      improveYearInput(el);
-      
-      // v79-FIX: Add keyboard shortcut - Ctrl+/ for today
-      el.addEventListener('keydown', (e)=>{
-        if(e.ctrlKey && e.key === '/'){
-          e.preventDefault();
-          const today = new Date().toISOString().split('T')[0];
-          el.value = today;
-          el.dispatchEvent(new Event('change'));
-          toast('📅 Set to today: ' + today);
-        }
-      });
-    });
+    document.querySelectorAll('input[type="date"]').forEach(upgrade);
   }
-  
+
+  // v80-FIX: flush ALL masked date fields the instant any button is
+  // pressed — capture phase, before click — so "Go"/"Save"/"Check" buttons
+  // always see the fully-typed date instead of racing the blur/Enter sync.
+  function flushAllDateMasks(){
+    Object.values(window._dateMaskCommit).forEach(fn=>{ try{ fn(); }catch(e){} });
+  }
+  document.addEventListener('mousedown', (e)=>{
+    if(e.target.closest('button, .btn, [onclick]')) flushAllDateMasks();
+  }, true);
+  document.addEventListener('touchstart', (e)=>{
+    if(e.target.closest('button, .btn, [onclick]')) flushAllDateMasks();
+  }, true);
+
   document.addEventListener('DOMContentLoaded', run);
-  const mo = new MutationObserver(()=>{ clearTimeout(window._dateYearT); window._dateYearT = setTimeout(run, 300); });
+  const mo = new MutationObserver(()=>{ clearTimeout(window._dateMaskT); window._dateMaskT = setTimeout(run, 300); });
   document.addEventListener('DOMContentLoaded', ()=> mo.observe(document.body, {childList:true, subtree:true}));
 })();
 
