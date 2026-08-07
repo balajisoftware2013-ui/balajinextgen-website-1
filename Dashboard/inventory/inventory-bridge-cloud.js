@@ -321,6 +321,47 @@
     kickoffCloudInit();
   }
 
+  async function syncSnapshot(snapshotKey, data){
+    const result = await gasCall('SYNC_SNAPSHOT', { snapshotKey, data });
+    return result ? { success:true, ...result } : { success:false, error:'Snapshot sync failed or GAS not configured' };
+  }
+
+  async function pullSnapshot(snapshotKey){
+    const result = await gasCall('PULL_SNAPSHOT', { snapshotKey });
+    // gasCall returns null both on failure AND on {success:true, data:null} (nothing synced yet) —
+    // treat both as "no cloud data available", caller should keep using local storage.
+    return result;
+  }
+
+  async function saveClientFile(fileNameOrFile, opts){
+    opts = opts || {};
+    let fileName, mimeType, base64Data;
+
+    // Accept either a browser File/Blob object, or explicit {fileName, mimeType, base64Data}
+    if(fileNameOrFile instanceof Blob){
+      fileName = opts.fileName || fileNameOrFile.name || 'upload';
+      mimeType = fileNameOrFile.type || 'application/octet-stream';
+      base64Data = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result.split(',')[1]);
+        reader.onerror = reject;
+        reader.readAsDataURL(fileNameOrFile);
+      });
+    } else {
+      fileName = fileNameOrFile;
+      mimeType = opts.mimeType || 'application/octet-stream';
+      base64Data = opts.base64Data;
+    }
+
+    if(!fileName || !base64Data) return { success:false, error:'Missing fileName or file data' };
+
+    const result = await gasCall('SAVE_CLIENT_FILE', {
+      fileName, mimeType, base64Data,
+      docType: opts.docType || 'document'
+    });
+    return result ? { success:true, ...result } : { success:false, error:'Upload failed or GAS not configured' };
+  }
+
   // Expose all functions
   window.InventoryBridge = {
     adjustStock,
@@ -328,6 +369,9 @@
     getStock,
     syncToGas,
     pullFromGas,
+    syncSnapshot,
+    pullSnapshot,
+    saveClientFile,
     initializeFromCloud,
     getLastSync: () => GAS_CONFIG.lastSync,
     getStorageBackend: () => storage.constructor.name
