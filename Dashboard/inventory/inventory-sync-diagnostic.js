@@ -158,7 +158,7 @@
     // 2. Client ID
     console.log('\n%c2. CLIENT CONTEXT', 'background:#1a5f7a;color:#fff;font-weight:bold;padding:5px');
     console.log('Client ID:', window.CLIENT_ID || 'Not set');
-    console.log('GAS URL:', window.GAS_URL ? '✓ Set' : '⚠ Not configured');
+    console.log('GAS URL:', window.GAS_URL ? '✓ Set (but see note in section 4)' : '⚠ Not configured');
 
     // 3. Inventory Data
     console.log('\n%c3. CACHED DATA', 'background:#1a5f7a;color:#fff;font-weight:bold;padding:5px');
@@ -172,12 +172,19 @@
     // 4. InventoryBridge status
     console.log('\n%c4. INVENTORYBRIDGE STATUS', 'background:#1a5f7a;color:#fff;font-weight:bold;padding:5px');
     if (window.InventoryBridge) {
-      console.log('✓ InventoryBridge loaded');
+      console.log('✓ InventoryBridge loaded (local stock bookkeeping only)');
       console.log('Storage Backend:', window.InventoryBridge.getStorageBackend?.());
-      const lastSync = window.InventoryBridge.getLastSync?.();
-      console.log('Last Cloud Sync:', lastSync ? new Date(lastSync).toLocaleString() : 'Never');
+      // NOTE (07-Aug-2026): InventoryBridge's CLOUD sync (syncToGas/pullFromGas)
+      // is intentionally disabled — confirmed its actions (SYNC_INVENTORY_DATA /
+      // PULL_INVENTORY_DATA) were never implemented in the real backend, which
+      // actually uses rbClientSpreadsheetId_() + erpApi()-style granular actions
+      // instead (SAVE_GRN, SAVE_PURCHASE_INVOICE, SYNC_PULL_ALL, etc. — see
+      // dbSyncBadge / liveSyncBadge on this page for the REAL sync status).
+      // "Last Cloud Sync: Never" below is expected and NOT a problem to fix.
+      console.log('Last Cloud Sync: Never (expected — cloud portion disabled by design, see note above)');
+      console.log('→ For real sync status, check the sync badge in the top bar / sidebar, not this tool');
     } else {
-      console.log('✗ InventoryBridge NOT loaded - inventory sync disabled');
+      console.log('✗ InventoryBridge NOT loaded (local stock adjustment tracking unavailable on this page)');
     }
 
     // 5. Data Consistency
@@ -200,9 +207,12 @@
       recs.push('→ Use inventory-bridge-cloud.js instead of inventory-bridge.js');
     }
 
-    if (!window.GAS_URL || window.GAS_URL.includes('YOUR_GAS_ID')) {
-      recs.push('→ Set window.GAS_URL before loading InventoryBridge');
-    }
+    // REMOVED: the old "Set window.GAS_URL before loading InventoryBridge"
+    // recommendation — GAS_URL being set no longer means cloud sync will
+    // work, since InventoryBridge's cloud actions are disabled by design.
+    // Recommending the person "fix" GAS_URL here would send them chasing a
+    // non-problem. Real sync issues now surface via dbSyncBadge/erpApi
+    // failures on-page, not this tool.
 
     if (stats.itemsWithIssues > 0) {
       recs.push('→ Click "Sync" button on Inventory module to resync all modules');
@@ -235,7 +245,8 @@
       environment: {
         storageBackend: getActiveStorage(),
         trackingBlocked: tracking.blocked,
-        gasUrlConfigured: !!window.GAS_URL && !window.GAS_URL.includes('YOUR_GAS_ID')
+        gasUrlConfigured: !!window.GAS_URL && !window.GAS_URL.includes('YOUR_GAS_ID'),
+        inventoryBridgeCloudSync: 'disabled by design — see erpApi/dbSyncBadge for real sync status'
       },
       dataSnapshot: {
         shared: shared ? { itemCount: shared.items?.length } : null,

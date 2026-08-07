@@ -67,6 +67,20 @@
   // ─────────────────────────────────────────────────────────────
 
   async function gasCall(action, payload){
+    // DISABLED (07-Aug-2026): confirmed via the real Code.gs that this project's
+    // backend uses rbClientSpreadsheetId_() (one spreadsheet per client) with
+    // action names like SAVE_GRN / SAVE_PURCHASE_INVOICE / SYNC_PULL_ALL — NOT
+    // the SYNC_INVENTORY_DATA / PULL_INVENTORY_DATA actions this file was
+    // calling. Those were never implemented server-side, so every call here
+    // was failing (CORS-blocked, or "unknown action" once headers were fixed)
+    // on every page load and every stock adjustment — wasted network calls
+    // and console noise, no functionality actually lost by disabling this:
+    // adjustStock()/reverseByRef() below already do the real work locally
+    // regardless of what this returns.
+    return null;
+  }
+
+  async function _gasCall_disabled(action, payload){
     if(!GAS_CONFIG.url || GAS_CONFIG.url.includes('YOUR_GAS_ID')) return null;
     
     try{
@@ -300,7 +314,11 @@
     const isLocalStale = !db.adjustments || db.adjustments.length === 0;
     
     if(isLocalStale){
-      console.log('[InventoryBridge] Local cache empty, pulling from Google Sheets...');
+      // NOTE: cloud pull is disabled (see gasCall above) — pullFromGas always
+      // resolves to null now, so this block never actually does anything.
+      // Kept as a no-op rather than removed so re-enabling cloud sync later
+      // (once the backend has matching handlers) is a one-line change in
+      // gasCall, not a rewrite here.
       const cloudInv = await pullFromGas('adjustments');
       const cloudShared = await pullFromGas('shared');
       
