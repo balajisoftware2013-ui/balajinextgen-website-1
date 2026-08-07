@@ -26,16 +26,6 @@
   const SALES_KEY  = 'BALAJI_SMARTBILL_V2';
   
   // GAS Configuration — update GAS_URL from your deployed project
-  //
-  // ⚠ IMPORTANT: your live Code.gs backend does NOT currently have handlers for
-  // 'SYNC_INVENTORY_DATA' or 'PULL_INVENTORY_DATA' (it only handles saveTable,
-  // LOGOUT, AI_QUERY, syncAll — confirmed from inventory.html/purchase-module.html
-  // themselves). So even with the real URL below, these two calls will safely fail
-  // (gasCall returns null, caught and logged) and NOT actually push/pull from Sheets.
-  // Adjustments still persist correctly via localStorage + refreshCachedCopies() below,
-  // and your existing 'syncAll' call elsewhere already handles real cloud persistence.
-  // To make this bridge's cloud sync real, add SYNC_INVENTORY_DATA / PULL_INVENTORY_DATA
-  // case handlers to Code.gs's doPost() — send me Code.gs and I'll wire it up.
   const GAS_CONFIG = {
     url: window.GAS_URL || 'https://script.google.com/macros/d/YOUR_GAS_ID/usercallable',
     timeout: 5000, // 5 sec max wait
@@ -77,11 +67,8 @@
   // ─────────────────────────────────────────────────────────────
 
   async function gasCall(action, payload){
-    // FIX: placeholder text is 'YOUR_GAS_PROJECT_ID', not 'YOUR_GAS_ID' — the old check
-    // never matched, so every call was firing at an invalid URL and burning the full
-    // timeout on every stock adjustment and every page load.
-    if(!GAS_CONFIG.url || GAS_CONFIG.url.includes('YOUR_GAS_PROJECT_ID') || GAS_CONFIG.url.includes('YOUR_GAS_ID')) return null;
-
+    if(!GAS_CONFIG.url || GAS_CONFIG.url.includes('YOUR_GAS_ID')) return null;
+    
     try{
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), GAS_CONFIG.timeout);
@@ -323,10 +310,8 @@
   }
 
   // Run initialization on page load (after DOM ready).
-  // FIX: fire-and-forget instead of letting an async DOMContentLoaded handler chain
-  // two awaited network calls — since those calls currently always resolve to null
-  // (see note above), this previously just delayed nothing usefully while still
-  // doing pointless network round-trips synchronously inside the load event.
+  // FIX: fire-and-forget instead of chaining two awaited network calls inside
+  // the DOMContentLoaded handler, which pointlessly delayed page readiness.
   function kickoffCloudInit(){
     initializeFromCloud().catch(e => console.warn('[InventoryBridge] init skipped:', e));
   }
