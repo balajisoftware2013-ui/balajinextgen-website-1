@@ -4063,78 +4063,32 @@ window.addEventListener('DOMContentLoaded', async ()=>{
   } catch(e){ console.warn('[LoginRecord]', e); }
 
   // ── Step 2: Connect to Google Sheets automatically ──────
+  // FIX ("fix" — consolidating parallel sync paths): this used to run
+  // its own separate pull via the 'pullAll' action (not wired to any
+  // working backend handler — same "Unknown action" risk as syncData
+  // had) AND blindly overwrite local data, on top of startLiveSync()
+  // below ALSO pulling moments later via the real, working, merge-safe
+  // SYNC_PULL_ALL path. Now this step just calls that same one real
+  // path directly, so there's exactly one pull mechanism, not two.
   const scriptUrl = SCRIPT_URL || localStorage.getItem('BNJERP_script_url');
-  if(scriptUrl) {
+  if(scriptUrl && CID && CID!=='C001') {
     const dot = document.getElementById('syncDot');
     const txt = document.getElementById('syncTxt');
     const badge = document.getElementById('db-count-badge');
 
-    // Show connecting state
     if(dot) dot.style.background = 'var(--orange)';
     if(txt) txt.textContent = '⏳ Connecting to Google Sheets...';
     if(badge){ badge.textContent='☁️ Loading from Google Sheets...'; badge.style.background='var(--ol)'; badge.style.color='var(--orange)'; }
 
     try {
-      // Pull all data from Google Sheets
-      const result = await callAPI('pullAll');
-
-      if(result && result.items && result.items.length > 0) {
-        // ── Save master data from Sheets to localStorage ──
-        if(result.items.length)              DB.save('items',             result.items);
-        if(result.categories?.length)        DB.save('categories',        result.categories);
-        if(result.warehouses?.length)        DB.save('warehouses',        result.warehouses);
-        if(result.vendors?.length)           DB.save('vendors',           result.vendors);
-
-        // ── Combine opening stock + transactions ──────────
-        const openingStock = result.opening_stock || [];
-        const txnLedger    = result.stock_ledger   || [];
-        const fullLedger   = [...openingStock, ...txnLedger];
-        if(fullLedger.length) DB.save('stock_ledger', fullLedger);
-
-        // ── Save transaction data ─────────────────────────
-        if(result.purchase_invoices?.length) DB.save('purchase_invoices', result.purchase_invoices);
-        if(result.issues?.length)            DB.save('issues',            result.issues);
-        if(result.stock_transfers?.length)   DB.save('stock_transfers',   result.stock_transfers);
-        if(result.kitchen_indents?.length)   DB.save('kitchen_indents',   result.kitchen_indents);
-        if(result.bar_orders?.length)        DB.save('bar_orders',        result.bar_orders);
-        if(result.brands?.length)            DB.save('brands',            result.brands);
-        if(result.departments?.length)       DB.save('departments',       result.departments);
-
-        // ── Reload dashboard with real data ───────────────
-        loadDashboard();
-        populateDropdowns();
-        updateDBBadge();
-
-        // ── Update sync indicator ─────────────────────────
-        if(dot) dot.style.background = 'var(--green)';
-        if(txt) txt.textContent = 'Connected · Google Sheets';
-        const t = new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});
-        const syncTimeEl = document.getElementById('syncTime');
-        if(syncTimeEl) syncTimeEl.textContent = t;
-        // Store last sync time
-        localStorage.setItem('BNJERP_last_sync', new Date().toISOString());
-
-        const itemCount    = result.items.length;
-        const vendorCount  = result.vendors?.length || 0;
-        const warehouseCount = result.warehouses?.length || 0;
-        const stockRows    = fullLedger.length;
-
-        toast(`✅ Google Sheets connected — ${itemCount} items · ${vendorCount} vendors · ${stockRows} stock records`, 's');
-        if(badge){ badge.textContent=`☁️ ${itemCount} items · ${stockRows} movements`; badge.style.background='var(--gl)'; badge.style.color='var(--gd)'; }
-
-        // Hide "no data" alert if it was showing
-        const alertEl = document.getElementById('db-status-alert');
-        if(alertEl) alertEl.style.display = 'none';
-
-      } else if(result && result.items && result.items.length === 0) {
-        // Connected but no data in Sheets yet
-        if(dot) dot.style.background = 'var(--orange)';
-        if(txt) txt.textContent = 'Google Sheets empty — using demo data';
-        toast('⚠️ Google Sheets connected but no data. Add items to your DEMO_ITEM_MASTER_DB sheet.', 'w');
-      }
-
+      await pullAllFromBackend(false); // false = re-renders visible panels once done
+      if(dot) dot.style.background = 'var(--green)';
+      if(txt) txt.textContent = 'Connected · Google Sheets';
+      if(badge){ badge.textContent=`☁️ ${DB.count('items')} items · ${DB.count('stock_ledger')} movements`; badge.style.background='var(--gl)'; badge.style.color='var(--gd)'; }
+      toast(`✅ Google Sheets connected — ${DB.count('items')} items · ${DB.count('vendors')} vendors · ${DB.count('stock_ledger')} stock records`, 's');
+      const alertEl = document.getElementById('db-status-alert');
+      if(alertEl) alertEl.style.display = 'none';
     } catch(err) {
-      // Google Sheets unavailable — stay on local data
       console.warn('[Connect] Google Sheets unavailable:', err.message);
       if(dot) dot.style.background = 'var(--muted)';
       if(txt) txt.textContent = 'Local DB · Offline mode';
@@ -5892,63 +5846,32 @@ async function callAPI(action, data = {}) {
 }
 
 // ── SYNC DATA (Topbar Sync button) ─────────────────────────
-// Push localStorage → Google Sheets AND pull back fresh data
+// FIX ("fix" — consolidating 3 parallel sync mechanisms into 1): this
+// used to push via the old 'syncAll' action and pull via 'pullAll'
+// (both different action names than the ones the rest of the app
+// actually has working handlers for — SYNC_PUSH_TABLE/SYNC_PULL_ALL),
+// so this button was liable to the exact same "Unknown action" failure
+// as login_history was. DB.save() already auto-pushes every change the
+// moment it happens (see DB.save above), so there's nothing left to
+// manually push here — this button now just pulls the latest from
+// every other device, using the one sync path that's actually wired
+// up and tested this session.
 async function syncData() {
-  const url = SCRIPT_URL || localStorage.getItem('BNJERP_script_url');
-  if(!url){ toast('Set Apps Script URL in Settings → Apps Script API', 'w'); return; }
-
+  if(!CID || CID==='C001'){ toast('No client session — nothing to sync', 'w'); return; }
   const dot = document.getElementById('syncDot');
   const txt = document.getElementById('syncTxt');
   if(dot) dot.style.background = 'var(--orange)';
   if(txt) txt.textContent = '⏳ Syncing...';
   toast('Syncing with Google Sheets...', '');
-
   try {
-    // ── Push: send local transactions to Google Sheets ──
-    await callAPI('syncAll', {
-      stock_ledger:       DB.all('stock_ledger').filter(l=>l.txn_type!=='opening'),
-      purchase_invoices:  DB.all('purchase_invoices'),
-      issues:             DB.all('issues'),
-      stock_transfers:    DB.all('stock_transfers'),
-      kitchen_indents:    DB.all('kitchen_indents'),
-      bar_orders:         DB.all('bar_orders'),
-    });
-
-    // ── Pull: get fresh data from Google Sheets ─────────
-    const result = await callAPI('pullAll');
-
-    if(result){
-      if(result.items?.length)              DB.save('items',             result.items);
-      if(result.categories?.length)         DB.save('categories',        result.categories);
-      if(result.warehouses?.length)         DB.save('warehouses',        result.warehouses);
-      if(result.vendors?.length)            DB.save('vendors',           result.vendors);
-      const fullLedger = [...(result.opening_stock||[]), ...(result.stock_ledger||[])];
-      if(fullLedger.length)                 DB.save('stock_ledger',      fullLedger);
-      if(result.purchase_invoices?.length)  DB.save('purchase_invoices', result.purchase_invoices);
-      if(result.issues?.length)             DB.save('issues',            result.issues);
-      if(result.stock_transfers?.length)    DB.save('stock_transfers',   result.stock_transfers);
-      if(result.kitchen_indents?.length)    DB.save('kitchen_indents',   result.kitchen_indents);
-      if(result.bar_orders?.length)         DB.save('bar_orders',        result.bar_orders);
-    }
-
-    loadDashboard();
-    populateDropdowns();
-    updateDBBadge();
-
+    await pullAllFromBackend(false); // false = not silent, re-renders visible panels
     if(dot) dot.style.background = 'var(--green)';
     if(txt) txt.textContent = 'Connected · Google Sheets';
-    const t = new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});
-    const stEl = document.getElementById('syncTime'); if(stEl) stEl.textContent = t;
-    localStorage.setItem('BNJERP_last_sync', new Date().toISOString());
-
-    const itemCnt = result?.items?.length || DB.count('items');
-    toast(`✅ Synced — ${itemCnt} items, ${DB.count('stock_ledger')} stock records`, 's');
-
+    toast(`✅ Synced — ${DB.count('items')} items, ${DB.count('stock_ledger')} stock records`, 's');
   } catch(err) {
     if(dot) dot.style.background = 'var(--red)';
-    if(txt) txt.textContent = 'Sync failed — check URL';
-    toast('Sync error: ' + err.message, 'e');
-    console.error('[SYNC]', err);
+    if(txt) txt.textContent = 'Sync error — will retry';
+    toast('❌ Sync failed: '+err.message, 'e');
   }
 }
 
@@ -8315,7 +8238,23 @@ function commitParsedImport(){
 }
 function downloadTemplate(type){const headers={items:'Item Code,Item Name,Category,Brand,HSN,Unit,Purchase Rate,GST%,Min Stock,Max Stock',vendors:'Vendor Name,GSTIN,Phone,Email,Credit Days,Credit Limit,Opening Balance',opening:'Item Code,Item Name,Warehouse,Qty,Rate',purchase:'Invoice No,Date,Supplier,Item,Qty,Rate,GST%'};const csv=headers[type];const blob=new Blob([csv+'\n'],{type:'text/csv'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='template_'+type+'.csv';a.click();toast('Template downloaded ✓','s');}
 // testAPIEndpoint is now the async version above
-function triggerGSheetSync(){const id=document.getElementById('gs-sheet-id')?.value;if(!id){toast('Enter Google Sheet ID','w');return;}const log=document.getElementById('gs-log');if(log){const t=new Date().toLocaleTimeString('en-IN');log.innerHTML+=`<div style="color:var(--green);">[${t}] Sync initiated...</div><div style="color:var(--muted);">[${t}] Items exported: ${DB.all('items').length}</div><div style="color:var(--muted);">[${t}] Stock records: ${DB.all('stock_ledger').length}</div><div style="color:var(--green);">[${t}] Sync complete ✓</div>`;}toast('Google Sheets sync complete ✓','s');}
+// FIX ("fix" — this used to only fake a sync: wrote log lines saying
+// "Sync complete" without ever actually calling the backend. Now
+// calls the one real, working sync path (same as the topbar Sync
+// button and the periodic 20s auto-pull) instead of pretending.
+function triggerGSheetSync(){
+  const log=document.getElementById('gs-log');
+  const t=()=>new Date().toLocaleTimeString('en-IN');
+  if(log)log.innerHTML+=`<div style="color:var(--muted);">[${t()}] Syncing...</div>`;
+  if(!CID||CID==='C001'){ toast('No client session — nothing to sync','w'); if(log)log.innerHTML+=`<div style="color:var(--red);">[${t()}] No client session</div>`; return; }
+  pullAllFromBackend(false).then(()=>{
+    if(log)log.innerHTML+=`<div style="color:var(--green);">[${t()}] Sync complete — ${DB.count('items')} items, ${DB.count('stock_ledger')} stock records ✓</div>`;
+    toast('Google Sheets sync complete ✓','s');
+  }).catch(err=>{
+    if(log)log.innerHTML+=`<div style="color:var(--red);">[${t()}] Sync failed: ${err.message}</div>`;
+    toast('Sync failed: '+err.message,'e');
+  });
+}
 function saveThemeSettings(){toast('Theme settings saved ✓','s');}
 function saveCompanySettings(){const co=document.getElementById('cs-name')?.value;if(co){window.COMPANY=co;const el=document.getElementById('sb-company');if(el)el.textContent=co;}toast('Company settings saved ✓','s');}
 
@@ -9690,168 +9629,7 @@ window._bnERP = {
 };
 </script>
 
-<!-- ════════════════════════════════════════════════════════════
-     BALAJI NEXTGEN ERP — AUTO-SYNC PATCH
-     This patches DB.save so every data change auto-syncs to
-     Google Sheets within 3 seconds (debounced to batch changes).
-════════════════════════════════════════════════════════════ -->
-<script>
-// Auto-sync patch — runs after DOM ready so DB is guaranteed to exist
-document.addEventListener('DOMContentLoaded', function() {
-  if (typeof DB === 'undefined') {
-    console.warn('[AutoSync] DB not available — skipping patch');
-    return;
-  }
-  // ── Tables to auto-sync ──────────────────────────────────────
-  const AUTO_SYNC_TABLES = [
-    'items', 'vendors', 'warehouses', 'stock_ledger',
-    'purchase_invoices', 'stock_transfers', 'divisions',
-    'categories', 'issues', 'login_history'
-  ];
-
-  // ── Debounce timer (batches rapid saves into one API call) ───
-  let _syncTimer = null;
-  let _pendingTables = new Set();
-
-  // ── Patch DB.save to trigger auto-sync ──────────────────────
-  const _origSave = DB.save.bind(DB);
-  DB.save = function(table, value) {
-    // 1. Save to localStorage as normal
-    _origSave(table, value);
-
-    // 2. Queue this table for sync if it's in our list
-    if (AUTO_SYNC_TABLES.includes(table)) {
-      _pendingTables.add(table);
-      scheduleSync();
-    }
-  };
-
-  // ── Also patch DB.insert and DB.update (they call DB.save) ──
-  // Already covered since they call DB.save internally ✓
-
-  // ── Schedule a sync (debounced 3 seconds) ───────────────────
-  function scheduleSync() {
-    if (_syncTimer) clearTimeout(_syncTimer);
-    _syncTimer = setTimeout(flushSync, 3000);
-    updateSyncIndicator('pending');
-  }
-
-  // ── Flush: push all pending tables to Google Sheets ─────────
-  async function flushSync() {
-    const url = window.SCRIPT_URL_LIVE
-             || localStorage.getItem('BNJERP_script_url')
-             || '';
-
-    if (!url) {
-      // No URL configured — silent fail (user hasn't set up yet)
-      updateSyncIndicator('disconnected');
-      return;
-    }
-
-    const tablesToSync = [..._pendingTables];
-    _pendingTables.clear();
-
-    if (tablesToSync.length === 0) return;
-
-    updateSyncIndicator('syncing');
-    addSyncLog('Pushing: ' + tablesToSync.join(', '), 'info');
-
-    try {
-      // Build payload with only changed tables
-      const payload = {};
-      tablesToSync.forEach(t => {
-        payload[t] = DB.all(t);
-      });
-
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain' },
-        body: JSON.stringify({ action: 'syncAll', data: payload })
-      });
-
-      const json = await res.json();
-
-      if (json.success) {
-        const t = new Date().toLocaleTimeString('en-IN', { hour:'2-digit', minute:'2-digit' });
-        updateSyncIndicator('connected', t);
-        addSyncLog('✅ Synced at ' + t + ' — Tables: ' + tablesToSync.join(', '), 'success');
-
-        // Update topbar
-        const syncTime = document.getElementById('syncTime');
-        if (syncTime) syncTime.textContent = t;
-        const syncTxt = document.getElementById('syncTxt');
-        if (syncTxt) syncTxt.textContent = 'Connected · Google Sheets';
-        const syncDot = document.getElementById('syncDot');
-        if (syncDot) syncDot.style.background = 'var(--green)';
-      } else {
-        throw new Error(json.error || 'Sync failed');
-      }
-    } catch (err) {
-      updateSyncIndicator('error');
-      addSyncLog('❌ Sync failed: ' + err.message, 'error');
-
-      // Re-queue failed tables
-      tablesToSync.forEach(t => _pendingTables.add(t));
-
-      // Retry after 30 seconds
-      setTimeout(flushSync, 30000);
-    }
-  }
-
-  // ── Update the sync status dot in topbar ────────────────────
-  function updateSyncIndicator(status, time) {
-    const dot = document.getElementById('syncDot');
-    const txt = document.getElementById('syncTxt');
-    if (!dot || !txt) return;
-
-    const states = {
-      pending:      { color: 'var(--orange)', text: 'Saving to Google Sheets...' },
-      syncing:      { color: 'var(--orange)', text: 'Syncing to Google Sheets...' },
-      connected:    { color: 'var(--green)',  text: 'Connected · Google Sheets' },
-      error:        { color: 'var(--red)',    text: 'Sync error — will retry' },
-      disconnected: { color: 'var(--muted)',  text: 'Local DB — Set up Google Sheets' }
-    };
-    const s = states[status] || states.disconnected;
-    dot.style.background = s.color;
-    txt.textContent = s.text;
-  }
-
-  // ── Add line to the Sync Log panel ──────────────────────────
-  function addSyncLog(msg, type) {
-    const log = document.getElementById('gs-log');
-    if (!log) return;
-    const colors = { success: 'var(--green)', error: 'var(--red)', info: 'var(--sub)' };
-    const time = new Date().toLocaleTimeString('en-IN');
-    const line = document.createElement('div');
-    line.style.cssText = `font-family:'JetBrains Mono',monospace;font-size:11px;color:${colors[type]||colors.info};line-height:1.8;`;
-    line.textContent = '[' + time + '] ' + msg;
-    log.prepend(line);
-    // Keep only last 50 log lines
-    while (log.children.length > 50) log.removeChild(log.lastChild);
-  }
-
-  // ── triggerGSheetSync — already exists in app, enhance it ───
-  window.triggerGSheetSync = async function() {
-    AUTO_SYNC_TABLES.forEach(t => _pendingTables.add(t));
-    if (_syncTimer) clearTimeout(_syncTimer);
-    await flushSync();
-  };
-
-  // ── On page load: check connection status ───────────────────
-  window.addEventListener('DOMContentLoaded', function() {
-    const url = localStorage.getItem('BNJERP_script_url') || '';
-    if (url) {
-      updateSyncIndicator('connected');
-      addSyncLog('Auto-sync active — changes will push to Google Sheets', 'success');
-    } else {
-      updateSyncIndicator('disconnected');
-      addSyncLog('Google Sheets not connected — go to Settings → Apps Script API to set up', 'info');
-    }
-  });
-
-  console.log('[BNJ] Auto-sync patch loaded — DB.save now pushes to Google Sheets');
-}); // end DOMContentLoaded
-</script>
+<!-- FIX ("fix"): removed the redundant AUTO-SYNC PATCH block that duplicated DB.save auto-push using an old, unwired 'syncAll' action — DB.save already pushes via SYNC_PUSH_TABLE/SYNC_PUSH_LOGIN_HISTORY. -->
 
 <!-- dashboard-summary-loader removed — functionality built into this file -->
 <!-- duplicate doLogout() removed here — it was shadowing the proper
