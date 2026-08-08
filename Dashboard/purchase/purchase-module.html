@@ -1413,12 +1413,69 @@ function load(){
         || null;
   };
 
+  // ---- Category inference for auto-created items ----
+  // FIX ("category search otherwise auto create"): ensureInventoryItem()
+  // below used to hardcode every auto-created item to cat:'Uncategorized'
+  // no matter what it was — a whole vendor's worth of vegetables (Onion,
+  // Ginger, Garlic, Chilli, Tomato, Potato...) all landed uncategorized,
+  // every time, forever, since nothing ever went back and fixed them.
+  // Three-tier resolution, cheapest/most-reliable first, all free (no AI
+  // call needed for something this pattern-based):
+  //   1. HSN chapter (first 2 digits) — HSN is a standardized customs
+  //      code, so "0703" is ALWAYS onions/garlic-family regardless of
+  //      vendor or invoice wording.
+  //   2. Keyword match against the item name — covers the common Indian
+  //      grocery/restaurant vocabulary directly.
+  //   3. Reuse the category of an existing item with a very similar name
+  //      already in the Item Master (e.g. a second vendor's "Tomatoes"
+  //      matching an existing "Tomato").
+  // Falls back to 'Uncategorized' only if none of the three find anything
+  // — same as before, but now genuinely a last resort, not the default.
+  const HSN_CATEGORY_MAP={ // HSN chapter prefix -> category
+    '07':'Vegetables','08':'Fruits','09':'Spices','10':'Grains & Cereals',
+    '04':'Dairy','02':'Meat','03':'Seafood','16':'Meat',
+    '22':'Beverages','21':'Condiments','15':'Cooking Oil','17':'Sugar & Sweeteners',
+    '19':'Bakery','11':'Flour & Grains','20':'Processed Foods'
+  };
+  const KEYWORD_CATEGORY_MAP=[ // [category, keyword list] — checked in order, first match wins
+    ['Vegetables',['onion','garlic','ginger','tomato','potato','chilli','chili','capsicum','cabbage','cauliflower','brinjal','carrot','beans','peas','spinach','palak','bhindi','okra','lauki','gourd','pumpkin','cucumber','radish','beetroot','coriander','dhania','pudina','mint','curry leaf','leafy','jhege','saag']],
+    ['Fruits',['banana','apple','mango','orange','grape','papaya','watermelon','pineapple','lemon','lime','pomegranate','guava']],
+    ['Dairy',['milk','paneer','curd','yogurt','ghee','butter','cheese','cream']],
+    ['Meat',['chicken','mutton','beef','pork','egg']],
+    ['Seafood',['fish','prawn','shrimp','crab']],
+    ['Spices',['masala','powder','jeera','cumin','turmeric','haldi','mirchi','elaichi','cardamom','clove','laung','dalchini','cinnamon']],
+    ['Grains & Cereals',['rice','wheat','atta','flour','dal','pulse','besan']],
+    ['Beverages',['tea','coffee','juice','soda','cola','beer','whisky','wine','rum','vodka']],
+    ['Cooking Oil',['oil','ghee']],
+    ['Bakery',['bread','bun','biscuit','cake']]
+  ];
+  window.inferItemCategory=function(name,hsn){
+    const hsnPrefix=(hsn||'').trim().slice(0,2);
+    if(hsnPrefix&&HSN_CATEGORY_MAP[hsnPrefix])return HSN_CATEGORY_MAP[hsnPrefix];
+
+    const n=(name||'').trim().toLowerCase();
+    if(n){
+      for(const [cat,keywords] of KEYWORD_CATEGORY_MAP){
+        if(keywords.some(kw=>n.includes(kw)))return cat;
+      }
+      // Tier 3: reuse an existing item's category if the name is a close
+      // match (handles plural/spelling variants like "Tomatoes" vs "Tomato")
+      const items=InvBridge.all('items').filter(i=>i.cat&&i.cat!=='Uncategorized');
+      const close=items.find(i=>{
+        const existN=(i.name||'').trim().toLowerCase();
+        return existN&&(n.includes(existN)||existN.includes(n));
+      });
+      if(close)return close.cat;
+    }
+    return 'Uncategorized'; // genuine last resort — nothing matched
+  };
+
   // ---- Auto-create an Item Master entry if a purchased line has no match ----
   window.ensureInventoryItem=function(line){
     let item=matchInventoryItem(line.name,line.hsn);
     if(item)return item;
     return InvBridge.insert('items',{
-      _id:invUid('I'),name:line.name,cat:'Uncategorized',hsn:line.hsn||'',
+      _id:invUid('I'),name:line.name,cat:inferItemCategory(line.name,line.hsn),hsn:line.hsn||'',
       gst:line.gst||0,unit:line.unit||'Nos',purchase_price:line.rate||0,
       min_stock:0,max_stock:0
     });
@@ -2474,6 +2531,7 @@ function savePurchase(sendApproval,forceSave){
     grand,
     due:v('p-due'),notes:v('p-notes'),status,approvalLevel:v('p-approval'),
     billFileUrl:pendingBillDriveLink||'', // link to the original scanned bill in Drive, if one was uploaded this session
+    tallyStatus:'PENDING',
     createdAt:new Date().toISOString()
   };
 
@@ -2500,6 +2558,7 @@ function savePurchase(sendApproval,forceSave){
     if(pendingManualBillFile)uploadManualBillAndAttach(doc.id,doc.mode);
     erpApi('UPDATE_PURCHASE_INVOICE', doc).then(r=>{ if(r&&r.success===false) toast('⚠️ '+doc.no+' updated locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️'); });
     if(doc.mode==='inventory'){ try{ pushPurchaseToInventory(doc,vend); }catch(e){ console.warn('Inventory push skipped:',e); } }
+    enqueueTallyVoucher(doc,vend);
     return;
   }
 
@@ -2518,14 +2577,130 @@ function savePurchase(sendApproval,forceSave){
   erpApi('SAVE_PURCHASE_INVOICE', doc).then(r=>{ if(r&&r.success===false) toast('⚠️ '+doc.no+' saved locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️'); });
   // ── PUSH TO INVENTORY: updates Item Master, Purchase Register & Voucher (accounting only — stock moves on GRN acceptance, see pushGRNStockLedger) ──
   if(doc.mode==='inventory'){ try{ pushPurchaseToInventory(doc,vend); }catch(e){ console.warn('Inventory push skipped:',e); } }
+  // ── QUEUE FOR TALLY (posted later, only when this page is open on the PC with Tally — see pollTallyQueue) ──
+  enqueueTallyVoucher(doc,vend);
 }
 
-// ════ RENDER PURCHASE LISTS ════
+// ════ TALLY INTEGRATION ════
+// Architecture note (see chat): the cloud backend cannot reach Tally's
+// HTTP gateway — it only listens on localhost of the PC Tally runs on.
+// So the flow is: save → enqueue to cloud queue (TALLY_ENQUEUE) →
+// THIS PAGE, when open on that PC, polls the queue (pollTallyQueue)
+// and posts directly to localhost:9000.
+//
+// HONEST LIMITATION: Tally's local gateway doesn't send CORS headers,
+// so the browser can't read its response (cross-origin fetch). This
+// means "POSTED" below only confirms the request reached Tally, NOT
+// that Tally accepted it without a validation error (e.g. an unknown
+// ledger or stock item name) — that still needs a glance at Tally's
+// own import log. Ledger/stock item names must match your real Tally
+// company's masters EXACTLY or Tally will reject the voucher; a
+// vendor's first purchase into a category will very likely need that
+// ledger created in Tally once, manually — this can't be avoided from
+// outside Tally.
+const TALLY_GATEWAY_URL='http://localhost:9000';
+let _tallyPollTimer=null;
+
+function xmlEscape(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function tallyDate(d){return String(d||'').replace(/-/g,'');} // YYYY-MM-DD -> YYYYMMDD
+
+// ── Build the Tally voucher XML for one queued item ──
+function buildTallyVoucherXML(item){
+  const d=item.voucherXmlData;
+  if(item.voucherType==='journal'){
+    // Accounting/expense invoice: Dr Expense (+GST), Cr Party
+    const ledgerRows=[
+      `<ALLLEDGERENTRIES.LIST><LEDGERNAME>${xmlEscape(d.expenseLedger)}</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.taxable}</AMOUNT></ALLLEDGERENTRIES.LIST>`
+    ];
+    if(d.cgst>0)ledgerRows.push(`<ALLLEDGERENTRIES.LIST><LEDGERNAME>Input CGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.cgst}</AMOUNT></ALLLEDGERENTRIES.LIST>`);
+    if(d.sgst>0)ledgerRows.push(`<ALLLEDGERENTRIES.LIST><LEDGERNAME>Input SGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.sgst}</AMOUNT></ALLLEDGERENTRIES.LIST>`);
+    if(d.igst>0)ledgerRows.push(`<ALLLEDGERENTRIES.LIST><LEDGERNAME>Input IGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.igst}</AMOUNT></ALLLEDGERENTRIES.LIST>`);
+    ledgerRows.push(`<ALLLEDGERENTRIES.LIST><LEDGERNAME>${xmlEscape(d.vendorName)}</LEDGERNAME><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>${d.grand}</AMOUNT></ALLLEDGERENTRIES.LIST>`);
+    return `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Journal" ACTION="Create"><DATE>${tallyDate(d.date)}</DATE><NARRATION>${xmlEscape(d.narration)}</NARRATION><VOUCHERTYPENAME>Journal</VOUCHERTYPENAME><REFERENCE>${xmlEscape(d.invoiceNo)}</REFERENCE>${ledgerRows.join('')}</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+  }
+
+  // Inventory purchase: stock items in, GST + vendor as ledger entries
+  const invRows=(d.items||[]).map(it=>
+    `<ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>${xmlEscape(it.name)}</STOCKITEMNAME><RATE>${it.rate}/${xmlEscape(it.unit||'Nos')}</RATE><AMOUNT>-${it.amt}</AMOUNT><ACTUALQTY>${it.qty} ${xmlEscape(it.unit||'Nos')}</ACTUALQTY><BILLEDQTY>${it.qty} ${xmlEscape(it.unit||'Nos')}</BILLEDQTY></ALLINVENTORYENTRIES.LIST>`
+  ).join('');
+  const ledgerRows=[`<LEDGERENTRIES.LIST><LEDGERNAME>${xmlEscape(d.purchaseLedger)}</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.taxable}</AMOUNT></LEDGERENTRIES.LIST>`];
+  if(d.cgst>0)ledgerRows.push(`<LEDGERENTRIES.LIST><LEDGERNAME>Input CGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.cgst}</AMOUNT></LEDGERENTRIES.LIST>`);
+  if(d.sgst>0)ledgerRows.push(`<LEDGERENTRIES.LIST><LEDGERNAME>Input SGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.sgst}</AMOUNT></LEDGERENTRIES.LIST>`);
+  if(d.igst>0)ledgerRows.push(`<LEDGERENTRIES.LIST><LEDGERNAME>Input IGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.igst}</AMOUNT></LEDGERENTRIES.LIST>`);
+  ledgerRows.push(`<LEDGERENTRIES.LIST><LEDGERNAME>${xmlEscape(d.vendorName)}</LEDGERNAME><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>${d.grand}</AMOUNT></LEDGERENTRIES.LIST>`);
+
+  return `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME></REQUESTDESC><REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Purchase" ACTION="Create"><DATE>${tallyDate(d.date)}</DATE><PARTYLEDGERNAME>${xmlEscape(d.vendorName)}</PARTYLEDGERNAME><VOUCHERTYPENAME>Purchase</VOUCHERTYPENAME><REFERENCE>${xmlEscape(d.invoiceNo)}</REFERENCE>${invRows}${ledgerRows.join('')}</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+}
+
+// ── Called right after a purchase invoice save — queues it, doesn't post yet ──
+async function enqueueTallyVoucher(doc,vend){
+  if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return;
+  try{
+    const isJournal=doc.mode==='accounting';
+    const voucherXmlData=isJournal?{
+      date:doc.date,invoiceNo:doc.no,vendorName:doc.vendorName,
+      expenseLedger:doc.expCat||'Sundry Expenses',
+      taxable:doc.taxable,cgst:doc.cgst,sgst:doc.sgst,igst:doc.igst,grand:doc.grand,
+      narration:`${doc.expCat||'Expense'} — Inv ${doc.no}`
+    }:{
+      date:doc.date,invoiceNo:doc.no,vendorName:doc.vendorName,
+      purchaseLedger:doc.purchaseAcct||'Purchase - Local',
+      taxable:doc.taxable,cgst:doc.cgst,sgst:doc.sgst,igst:doc.igst,grand:doc.grand,
+      items:(doc.items||[]).map(it=>({name:it.name,rate:it.rate,unit:it.unit,qty:it.qty,amt:it.amt}))
+    };
+    await erpApi('TALLY_ENQUEUE',{invoiceId:doc.id,invoiceNo:doc.no,voucherType:isJournal?'journal':'purchase',voucherXmlData});
+  }catch(e){ console.warn('[Tally] enqueue failed:',e.message); }
+}
+
+// ── Poller: only does anything useful when Tally is actually reachable
+// (i.e. this page is open on the PC Tally runs on) ──
+async function pollTallyQueue(){
+  if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return;
+  try{
+    const r=await erpApi('TALLY_PULL_PENDING',{});
+    if(!r||!r.success||!r.data||!r.data.pending||!r.data.pending.length)return;
+    for(const item of r.data.pending){
+      try{
+        const xml=buildTallyVoucherXML(item);
+        await fetch(TALLY_GATEWAY_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/xml'},body:xml});
+        // no-cors = response is opaque, can't confirm Tally accepted it —
+        // only that the request reached the gateway without a network error.
+        await erpApi('TALLY_MARK_STATUS',{invoiceId:item.invoiceId,status:'POSTED'});
+        _updateLocalTallyStatus(item.invoiceId,'POSTED','');
+      }catch(postErr){
+        // Most likely cause: Tally isn't open/gateway isn't enabled on this PC.
+        await erpApi('TALLY_MARK_STATUS',{invoiceId:item.invoiceId,status:'FAILED',error:postErr.message});
+        _updateLocalTallyStatus(item.invoiceId,'FAILED',postErr.message);
+      }
+    }
+    if(typeof rendPurchaseList==='function')rendPurchaseList();
+  }catch(e){ console.warn('[Tally] poll failed:',e.message); }
+}
+function startTallyPolling(){
+  if(_tallyPollTimer)clearInterval(_tallyPollTimer);
+  pollTallyQueue();
+  _tallyPollTimer=setInterval(pollTallyQueue,30000); // every 30s while this page stays open
+}
+function _updateLocalTallyStatus(invoiceId,status,error){
+  [DB.purchases,DB.acctInvs].forEach(arr=>{
+    const idx=arr.findIndex(x=>x.id===invoiceId);
+    if(idx>=0){arr[idx].tallyStatus=status;arr[idx].tallyError=error||'';}
+  });
+  save();
+}
+
+
+function syncStatusBadge(p){
+  const drive=p.driveSaved?'✓':'…';
+  const tally=p.tallyStatus==='POSTED'?'✓':p.tallyStatus==='FAILED'?'⚠':'…';
+  const tallyTitle=p.tallyStatus==='FAILED'?(p.tallyError||'Tally not reachable — open Tally on this PC'):p.tallyStatus==='POSTED'?'Posted to Tally':'Waiting — needs this page open on the PC with Tally';
+  return `<span style="font-size:10px;white-space:nowrap" title="Database: saved">DB✓</span> <span style="font-size:10px;white-space:nowrap" title="Google Drive">Drive${drive}</span> <span style="font-size:10px;white-space:nowrap" title="${xmlEscape(tallyTitle)}">Tally${tally}</span>`;
+}
 function rendPurchaseList(){
   const lpinv=el('ll-pinv');
   if(!lpinv)return;
   if(!DB.purchases.length){lpinv.innerHTML='<div style="text-align:center;padding:28px;color:var(--text3);font-style:italic">No purchase invoices yet.</div>';return;}
-  lpinv.innerHTML='<div class="tw"><table><thead><tr><th>Invoice No</th><th>Date</th><th>Vendor</th><th>Taxable</th><th>GST</th><th>Total</th><th>Bill</th><th>GRN</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+DB.purchases.map(p=>`<tr><td><b>${p.no}</b></td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td><td class="td-r">${fmt(p.taxable)}</td><td class="td-r">${fmt(p.gstTotal)}</td><td class="td-r"><b>${fmt(p.grand)}</b></td><td>${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View original scanned bill">📎 Bill</a>`:'<span class="badge b-gray" style="font-size:9px">No file</span>'}</td><td>${p.grnStatus==='Completed'?'<span class="badge b-green">✓ '+(p.grnNo||'Done')+'</span>':'<span class="badge b-gray">Pending</span>'}</td><td><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':'b-green'}">${p.status}</span></td><td style="white-space:nowrap"><button class="btn btn-xs" onclick="viewPurchase('${p.id}','inventory')">👁 View</button> <button class="btn btn-xs" onclick="editPurchase('${p.id}','inventory')">✏️ Edit</button> <button class="btn btn-xs btn-red" onclick="deletePurchase('${p.id}','inventory')">🗑️ Delete</button> ${p.status==='Pending Approval'?'<button class="btn btn-xs btn-green" onclick="approveP(\''+p.id+'\')">✅ Approve</button>':''}</td></tr>`).join('')+'</tbody></table></div>';
+  lpinv.innerHTML='<div class="tw"><table><thead><tr><th>Invoice No</th><th>Date</th><th>Vendor</th><th>Taxable</th><th>GST</th><th>Total</th><th>Sync</th><th>Bill</th><th>GRN</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+DB.purchases.map(p=>`<tr><td><b>${p.no}</b></td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td><td class="td-r">${fmt(p.taxable)}</td><td class="td-r">${fmt(p.gstTotal)}</td><td class="td-r"><b>${fmt(p.grand)}</b></td><td>${syncStatusBadge(p)}</td><td>${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View original scanned bill">📎 Bill</a>`:'<span class="badge b-gray" style="font-size:9px">No file</span>'}</td><td>${p.grnStatus==='Completed'?'<span class="badge b-green">✓ '+(p.grnNo||'Done')+'</span>':'<span class="badge b-gray">Pending</span>'}</td><td><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':'b-green'}">${p.status}</span></td><td style="white-space:nowrap"><button class="btn btn-xs" onclick="viewPurchase('${p.id}','inventory')">👁 View</button> <button class="btn btn-xs" onclick="editPurchase('${p.id}','inventory')">✏️ Edit</button> <button class="btn btn-xs btn-red" onclick="deletePurchase('${p.id}','inventory')">🗑️ Delete</button> ${p.status==='Pending Approval'?'<button class="btn btn-xs btn-green" onclick="approveP(\''+p.id+'\')">✅ Approve</button>':''}</td></tr>`).join('')+'</tbody></table></div>';
   const lainv=el('ll-ainv');
   if(!lainv)return;
   if(!DB.acctInvs.length){lainv.innerHTML='<div style="text-align:center;padding:28px;color:var(--text3);font-style:italic">No accounting invoices yet.</div>';return;}
@@ -4376,6 +4551,7 @@ function init(){
   load();tick();setInterval(tick,1000);
   try{ if (typeof pullInventorySyncData === 'function') pullInventorySyncData(); }catch(e){}
   try{ if (typeof startPurchaseLiveSync === 'function') startPurchaseLiveSync(); }catch(e){}
+  try{ if (typeof startTallyPolling === 'function') startTallyPolling(); }catch(e){}
   updateSyncBadge();
   rendDash();rendVendTb();rendAttachments();rendQCR();
   ss('dashDate',new Date().toLocaleDateString('en-IN',{weekday:'long',day:'numeric',month:'long',year:'numeric'}));
