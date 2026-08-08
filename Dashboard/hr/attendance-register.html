@@ -832,6 +832,57 @@ async function erpApi(action, payload){
   return DB.handle(action, payload);
 }
 
+/* ── Backend field mapping (2026-08-08) ──
+   markAttendance/updateAttendance/applyLeave payloads below keep
+   their own short internal field names (emp/date/checkIn/...)
+   everywhere else in this file — only the payload actually SENT to
+   the backend is translated to the real 71_ATTENDANCE_MASTER /
+   73_LEAVE_MASTER columns, which live in the OPS file.
+   ATTENDANCE_ID/LEAVE_ID are new first-column IDs added to those
+   sheets specifically for this — DATE alone isn't a unique row key
+   (every employee shares the same DATE), and EMP_ID alone isn't
+   either (one employee has many leave requests), so a plain
+   "match by first column" upsert would silently collide rows
+   across employees without a real unique key. ATTENDANCE_ID is
+   built deterministically as EMP_ID_DATE so check-in and the
+   later check-out call land on the exact same row without a
+   separate lookup step. lat/lng/selfie/ot/remarks now have real
+   columns (GPS_LAT, GPS_LNG, SELFIE_URL, OT_HOURS, REMARKS) added
+   alongside 71_ATTENDANCE_MASTER's existing ones. days/reason/
+   stage/applied now have DAYS/REASON/STAGE/APPLIED_DATE on
+   73_LEAVE_MASTER for the same reason. */
+function attendanceToBackendRecord(rec){
+  return {
+    id: rec.emp + '_' + rec.date,
+    DATE: rec.date, EMP_ID: rec.emp,
+    IN_TIME: rec.checkIn, OUT_TIME: rec.checkOut,
+    WORKING_HOURS: rec.hours, OT_HOURS: rec.ot,
+    ATTENDANCE_STATUS: rec.status,
+    GPS_LAT: rec.lat, GPS_LNG: rec.lng,
+    SELFIE_URL: rec.selfie, REMARKS: rec.remarks,
+  };
+}
+function leaveToBackendRecord(rec){
+  return {
+    id: rec.id,
+    EMP_ID: rec.emp, LEAVE_TYPE: rec.type,
+    FROM_DATE: rec.from, TO_DATE: rec.to, DAYS: rec.days,
+    REASON: rec.reason, STATUS: rec.status, STAGE: rec.stage,
+    APPLIED_DATE: rec.applied,
+  };
+}
+const ATT_ROUTE = { dbFile:'OPS', sheet:'71_ATTENDANCE_MASTER' };
+const LEAVE_ROUTE = { dbFile:'OPS', sheet:'73_LEAVE_MASTER' };
+function saveAttendanceToBackend(rec){
+  return erpApi('SAVE_MASTER', Object.assign({ category:'attendance', record: JSON.stringify(attendanceToBackendRecord(rec)) }, ATT_ROUTE));
+}
+function saveLeaveToBackend(rec){
+  return erpApi('SAVE_MASTER', Object.assign({ category:'leave', record: JSON.stringify(leaveToBackendRecord(rec)) }, LEAVE_ROUTE));
+}
+function updateLeaveStatusInBackend(id, status, stage){
+  return erpApi('SAVE_MASTER', Object.assign({ category:'leave', record: JSON.stringify({ id, STATUS: status, STAGE: stage }) }, LEAVE_ROUTE));
+}
+
 /* -------------------- INDUSTRY MASTER (single source for the
    registration dropdown — add/remove industries here only) -------------------- */
 const INDUSTRY_MASTER = ["Hospitality","Retail","Trading","Manufacturing","Distribution","Services","Other"];
@@ -2296,7 +2347,7 @@ async function confirmCheckInOut(){
     const rec = {emp:state.user.id, date:todayISO(), status, checkIn:time, checkOut:"", hours:"-", ot:"-",
       lat: state.gps?.lat||null, lng: state.gps?.lng||null, selfie: state.selfieData?"captured":"",
       remarks: note==="unverified" ? (remarks + (remarks?" · ":"") + "⚠️ location not verified").trim() : remarks};
-    await erpApi("markAttendance", rec);
+    await saveAttendanceToBackend(rec);
     pushSharedAttendanceStatus(state.user.id, todayISO(), status, DB.currentClientId);
     toast(note==="wfh" ? `Checked in from home at ${time}` : `Checked in at ${time}${isLate(time)?' (marked Late)':''}`,"success");
   } else {
@@ -2305,7 +2356,7 @@ async function confirmCheckInOut(){
     const totalMin = Math.max(outMin-inMin,0);
     const hrs = Math.floor(totalMin/60), mins = totalMin%60;
     const otMin = Math.max(totalMin-480,0);
-    await erpApi("updateAttendance", {emp:state.user.id, date:todayISO(), checkOut:time,
+    await saveAttendanceToBackend({emp:state.user.id, date:todayISO(), checkOut:time,
       hours:`${hrs}h ${mins}m`, ot: otMin>0?`${Math.floor(otMin/60)}h ${otMin%60}m`:"-", remarks: remarks||mine.remarks});
     toast(`Checked out at ${time} · ${hrs}h ${mins}m worked`,"success");
   }
@@ -2348,7 +2399,7 @@ function submitLeave(){
   if(days<1){ toast("'To' date must be after 'From' date","error"); return; }
   const rec = {id:"LV"+Math.floor(1000+Math.random()*9000), emp:state.user.id, type, from, to, days, reason,
     status:"Pending", stage:"Manager Approval", applied: todayISO()};
-  erpApi("applyLeave", rec);
+  saveLeaveToBackend(rec);
   closeModal("leaveOverlay");
   toast("Leave request submitted for approval","success");
   document.getElementById("lvReason").value="";
@@ -2372,7 +2423,7 @@ function renderApprovals(){
 }
 function decideLeave(id, decision){
   const stageMap = {Approved:"Completed",Rejected:"Completed"};
-  erpApi("updateLeaveStatus",{id, status:decision, stage:stageMap[decision]});
+  updateLeaveStatusInBackend(id, decision, stageMap[decision]);
   toast(`Leave ${decision.toLowerCase()}`, decision==="Approved"?"success":"error");
   renderApprovals(); buildNav();
 }
