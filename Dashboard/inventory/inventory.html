@@ -3777,13 +3777,17 @@ const DB = {
       // FIX: login_history is the shared platform-wide audit log (lives in
       // USER_SECURITY_MASTER_DB, not this client's own spreadsheet) — it
       // must go through the append/update-only action, never the generic
-      // full-overwrite SYNC_PUSH_TABLE, or one client's push would wipe
+      // upsert-merge SYNC_PUSH_TABLE, or one client's push would touch
       // every other client's login history.
       const pushAction = (t === 'login_history') ? 'SYNC_PUSH_LOGIN_HISTORY' : 'SYNC_PUSH_TABLE';
+      // FIX (multi-device safety): mark this table "in flight" so a live
+      // pull that lands mid-push doesn't overwrite the very edit we're
+      // still sending — see pullAllFromBackend's merge below.
+      _pendingPushTables.add(t);
       erpApi(pushAction,{table:t,rows:v}).then(r=>{
         if(r&&r.success===false) console.warn('[LiveSync] push failed for',t,r.message);
         else updateLiveSyncBadge('pushed');
-      }).catch(()=>{});
+      }).catch(()=>{}).finally(()=>{ _pendingPushTables.delete(t); });
     }
   },
   insert: (t, rec) => { const rows=DB.all(t); rows.push({...rec,_id:uid(),_ts:now()}); DB.save(t,rows); return rec; },
@@ -3799,23 +3803,43 @@ const DB = {
     return keys.map(k=>k.replace(DB_PREFIX+CID+'_','') + ': ' + (DB.get(k.replace(DB_PREFIX,''))||[]).length + ' records');
   }
 };
+// Tables currently mid-push to the backend — see DB.save() and
+// pullAllFromBackend() below.
+const _pendingPushTables = new Set();
 
 // ════ LIVE SYNC — periodic real read from the backend ════
 // Polling-based (the realistic option for a plain HTML+Apps Script setup
 // without websockets) — pulls every table from the real backend and
-// overwrites the local copy, so a change made on another device shows up
-// here without needing a manual refresh. Last-write-wins: if two people
-// edit the same record between pulls, whichever save reaches the backend
-// last is what everyone ends up seeing — there's no merge/conflict
-// resolution beyond that, which is an honest limitation of this simple
-// architecture, not a hidden one.
+// MERGES it into the local copy, so a change made on another device
+// shows up here without needing a manual refresh.
+//
+// FIX (multi-device safety): this used to be a blind overwrite
+// (`DB.set(..., rows)`), which had two failure modes with concurrent
+// devices — (1) a pull landing mid-push could stomp the edit this
+// device was still sending, and (2) if this device had a brand-new
+// local row that hadn't reached the backend yet, the next pull would
+// erase it from the browser entirely. Now: rows from the server always
+// win for records both sides have (server is the merged, multi-device
+// truth after the backend's upsert fix), but any local row NOT yet
+// seen on the server is kept rather than dropped, and any table
+// currently mid-push (see _pendingPushTables) is skipped for this
+// cycle entirely — it'll catch up on the next pull once the push lands.
+function _mergePulledTable(table, serverRows){
+  const localRows = DB.all(table);
+  const serverIds = new Set((serverRows||[]).map(r=>r._id).filter(Boolean));
+  const localOnly = localRows.filter(r => r._id && !serverIds.has(r._id));
+  return (serverRows||[]).concat(localOnly);
+}
 let _liveSyncTimer=null, _lastSyncAt=null;
 async function pullAllFromBackend(silent=true){
   if(typeof erpApi!=='function' || !CID || CID==='C001') return;
   try{
     const r=await erpApi('SYNC_PULL_ALL',{});
     if(r&&r.success&&r.tables){
-      Object.entries(r.tables).forEach(([table,rows])=>{ DB.set(CID+'_'+table, rows); });
+      Object.entries(r.tables).forEach(([table,rows])=>{
+        if(_pendingPushTables.has(table)) return; // this device's own push hasn't landed yet — skip this cycle
+        DB.set(CID+'_'+table, _mergePulledTable(table, rows));
+      });
       _lastSyncAt=new Date();
       updateLiveSyncBadge('pulled');
       if(!silent) renderAllVisiblePanels();
