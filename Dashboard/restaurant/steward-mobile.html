@@ -608,10 +608,20 @@ if (window.visualViewport) window.visualViewport.addEventListener('resize', setA
    BACKEND CONNECTOR — same endpoints/keys as restaurant-dashboard.html
    so this app and the POS share one client database
 ══════════════════════════════════════════════════ */
+/* FIX ("save data and accordingly update restaurant dashboard"):
+   V2_FRONTEND pointed at a dead, leftover GAS deployment — confirmed
+   removed entirely from restaurant-dashboard.html itself ("V2_FRONTEND
+   key removed entirely — confirmed unused, was a leftover legacy
+   deployment"). This app was still built around it for BOTH loading
+   the menu and placing orders, so every order placed here looked
+   successful locally but never reached the real backend (KOT_MASTER /
+   ORDER_MASTER) — it silently vanished into an unused deployment.
+   Menu items created in Settings → Menu Creation also never reached
+   this app for the same reason. Removed V2_FRONTEND; everything now
+   goes to V2_CORE, same as restaurant-dashboard.html and kot-management.html. */
 const GAS_APIS_DASH = {
   V2_CORE:     'https://script.google.com/macros/s/' + (localStorage.getItem('bnx_api_core') || 'AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ') + '/exec',
   V2_AUTH:     'https://script.google.com/macros/s/' + (localStorage.getItem('bnx_api_auth') || 'AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx') + '/exec',
-  V2_FRONTEND: 'https://script.google.com/macros/s/' + (localStorage.getItem('bnx_api_front') || 'AKfycbyiaO9zpZAQ1pTlDjz7B2yEUfjv1vrlXTYjTkIY-YwKr6ahOCV6lU_AiB4dpmnBySG1') + '/exec',
 };
 function getClientId(){
   try{ return localStorage.getItem('ERP_CLIENT') || JSON.parse(localStorage.getItem('ERP_USER')||'{}').CLIENT_ID || 'CLI001'; }catch(e){ return 'CLI001'; }
@@ -619,7 +629,7 @@ function getClientId(){
 function getSessionToken(){ return localStorage.getItem('ERP_SESSION')||''; }
 async function gasApi(action,payload,endpoint){
   payload=payload||{};
-  const url=GAS_APIS_DASH[endpoint||'V2_FRONTEND'];
+  const url=GAS_APIS_DASH[endpoint||'V2_CORE'];
   try{
     const r=await fetch(url,{method:'POST',body:JSON.stringify(Object.assign({action:action,clientId:getClientId(),sessionToken:getSessionToken()},payload))});
     return await r.json();
@@ -678,10 +688,14 @@ const MENU_FALLBACK=[
 ];
 let MENU = MENU_FALLBACK.slice();
 
-/* Pulls the SAME menu the POS dashboard uses (getMenuItems action, V2_FRONTEND) —
-   so a category/item created in Settings → Menu Creation shows up here too. */
+/* Pulls the SAME menu the POS dashboard uses (GET_MENU_ITEMS action, V2_CORE —
+   same action restaurant-dashboard.html's cache-warmer calls) so a category/item
+   created in Settings → Menu Creation shows up here too.
+   FIX: was calling a lowercase 'getMenuItems' action against the dead
+   V2_FRONTEND deployment — that action/endpoint pair was never real, so this
+   silently always fell back to the hardcoded MENU_FALLBACK below. */
 async function loadMenuFromServer(){
-  const res = await gasApi('getMenuItems', {}, 'V2_FRONTEND');
+  const res = await gasApi('GET_MENU_ITEMS', {}, 'V2_CORE');
   if(res && res.success && Array.isArray(res.data) && res.data.length){
     MENU = res.data.map(m=>({
       id: m.id || m.ITEM_ID || m.name,
@@ -1168,6 +1182,22 @@ function clearOrder(){order={};renderMenu();}
 const PLACED_ORDERS = {};
 let lastOrderId = null;
 
+/* FIX ("order place and save data and accordingly update restaurant
+   dashboard"): this used to call a single action, 'createOrder', against
+   the dead V2_FRONTEND deployment (see GAS_APIS_DASH comment above). That
+   action never existed on the real backend, so every steward order looked
+   "sent" locally (toast said success) but never reached KOT_MASTER or
+   ORDER_MASTER — it never showed up on the KOT board (kot-management.html)
+   or the Restaurant Dashboard's Order Register / live KPIs, and kitchen
+   staff on the actual KDS never saw it either.
+   Now fires the SAME two calls restaurant-dashboard.html's own
+   sendKOT()/bnxRecordKOT() make for a POS-placed order — SAVE_KOT (kitchen
+   ticket, routes to KOT_MASTER) and SAVE_ORDER (order register) — both to
+   V2_CORE, with matching field names (waiter/covers/remarks/items/orderNo).
+   Also switched to the same offline-first pattern already used for POS
+   KOTs elsewhere in this codebase ("click not work, slow work" fix): show
+   the confirmation immediately, sync to the backend in the background
+   without blocking the tap. */
 async function placeOrder(){
   const tot=Object.values(order).reduce((a,b)=>a+b,0);
   if(!tot){ toast('No items in order','error'); return; }
@@ -1178,15 +1208,14 @@ async function placeOrder(){
   });
   const amount = items.reduce((a,i)=>a+i.price*i.qty,0);
   const stewardName = document.getElementById('prof-name')?.textContent || 'Steward';
-  toast('Sending KOT…','info');
-  const res = await gasApi('createOrder', {
-    table: selTable.id, items, amount, steward: stewardName, source:'STEWARD_APP'
-  }, 'V2_FRONTEND');
-  
-  // Generate order ID for tracking
+  const covers = selTable.covers || 2;
+
+  // Generate order ID for tracking (used as both the local KOT id and the
+  // orderNo/orderId sent to the backend, so this app's KOT list and the
+  // dashboard's Order Register refer to the exact same ticket)
   const orderId = 'ORD_' + Date.now() + '_' + Math.random().toString(36).substr(2,5);
   lastOrderId = orderId;
-  
+
   // Store order for replacement capability
   PLACED_ORDERS[orderId] = {
     id: orderId,
@@ -1198,21 +1227,30 @@ async function placeOrder(){
     timestamp: Date.now(),
     originalItems: JSON.parse(JSON.stringify(items))
   };
-  
-  if(res && res.success===false && !res.offline){
-    toast('⚠️ Server rejected order — saved locally only','error');
-  } else if(res && res.offline){
-    toast('📴 Offline — KOT queued, will sync when online','error');
-  } else {
-    toast('✅ KOT sent to kitchen — visible in POS','success');
-  }
-  // Reflect immediately in this app's own KOT list regardless of network result
+
+  // Reflect immediately in this app's own KOT list — don't wait on network
   KOT.unshift({ id:orderId, table:selTable.id, items: items.map(i=>({name:i.name,qty:i.qty})), status:'PENDING', time:new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}), mins:0 });
   order={};
-  
-  // Show order placed confirmation with replacement option
+  toast('✅ KOT sent to kitchen — visible in POS','success');
   showOrderPlacedModal(orderId);
   setTimeout(() => showScreen('s-home'), 1500);
+
+  // Background sync — fire-and-forget, matches restaurant-dashboard.html's
+  // own KOT flow. If it fails, the order is already recorded locally and
+  // visible in this app; only cross-device/dashboard visibility is affected.
+  const kotItems = items.map(i=>({ name:i.name, qty:i.qty, price:i.price }));
+  gasApi('SAVE_KOT', {
+    table: selTable.id, waiter: stewardName, covers, remarks: '', items: kotItems, orderNo: orderId
+  }, 'V2_CORE').catch(()=>{});
+  gasApi('SAVE_ORDER', {
+    orderId, tableId: selTable.id, orderType: 'DINEIN', waiter: stewardName, covers, items: kotItems
+  }, 'V2_CORE').then(res=>{
+    if(!res || res.success===false){
+      toast('⚠️ Sync to dashboard failed — order saved on this device only','error');
+    }
+  }).catch(()=>{
+    toast('📴 Offline — order queued, will sync when back online','error');
+  });
 }
 
 function showOrderPlacedModal(orderId){
@@ -1371,16 +1409,24 @@ async function sendModifiedOrder(orderId){
   });
   
   toast('Sending modified KOT…','info');
-  const res = await gasApi('updateOrder', {
-    orderId: order.id,
-    table: order.table,
-    items: order.items,
-    changedItems: changedItems,
-    amount: newTotal,
-    steward: order.steward,
-    source: 'STEWARD_APP_REPLACEMENT'
-  }, 'V2_FRONTEND');
-  
+  // FIX: same dead-endpoint/fake-action bug as placeOrder() above — 'updateOrder'
+  // on V2_FRONTEND was never a real backend action. There's no dedicated
+  // "modify items" action proven anywhere else in this codebase, so this
+  // re-sends SAVE_KOT/SAVE_ORDER with the SAME orderId/orderNo as the
+  // original — both actions are keyed by that id everywhere else they're
+  // called from, so the backend can treat this as an update to the same
+  // ticket rather than a brand-new one.
+  const modItems = order.items.map(i=>({ name:i.name, qty:i.qty, price:i.price }));
+  const [kotRes, orderRes] = await Promise.all([
+    gasApi('SAVE_KOT', {
+      table: order.table, waiter: order.steward, covers: 0, remarks: 'Modified order', items: modItems, orderNo: order.id
+    }, 'V2_CORE'),
+    gasApi('SAVE_ORDER', {
+      orderId: order.id, tableId: order.table, orderType: 'DINEIN', waiter: order.steward, covers: 0, items: modItems
+    }, 'V2_CORE')
+  ]);
+  const res = (kotRes && kotRes.success!==false && orderRes && orderRes.success!==false) ? {success:true} : {success:false};
+
   if(res && res.success !== false){
     toast('✅ Modified KOT sent to kitchen','success');
     order.status = 'MODIFIED';
@@ -1399,13 +1445,36 @@ function closeOrderReplacementModal(){
 }
 
 /* Pulls active KOTs from the same backend the POS dashboard writes/reads,
-   so orders placed at the POS terminal also show up here and vice-versa. */
+   so orders placed at the POS terminal also show up here and vice-versa.
+   FIX: was calling a fake 'getKOT' action on the dead V2_FRONTEND
+   deployment — always silently failed, so this app only ever showed
+   KOTs this exact device had placed itself, never POS-placed ones.
+   Now uses the same GET_ACTIVE_ORDERS action (V2_CORE) the Restaurant
+   Dashboard's Order Register uses, and maps that ORDER_MASTER row shape
+   into the {id,table,items,status,time,mins} shape renderKOT() expects. */
+const ORDER_STATUS_TO_KOT_STATUS = {
+  NEW:'PENDING', KOT_PRINTED:'PENDING', PENDING:'PENDING',
+  COOKING:'PREPARING', PREPARING:'PREPARING', IN_PROGRESS:'PREPARING',
+  READY:'READY', SERVED:'READY',
+  DELAYED:'DELAYED'
+};
 async function loadKOTFromServer(){
-  const res = await gasApi('getKOT', {}, 'V2_FRONTEND');
-  if(res && res.success && Array.isArray(res.data) && res.data.length){
+  const res = await gasApi('GET_ACTIVE_ORDERS', {}, 'V2_CORE');
+  const orders = res && res.success && res.data && Array.isArray(res.data.orders) ? res.data.orders : null;
+  if(orders && orders.length){
     KOT.length = 0;
-    res.data.forEach(k=>KOT.push(k));
-  }
+    orders.forEach(o=>{
+      const mins = o.START_TIME ? Math.max(0, Math.round((Date.now()-new Date(o.ORDER_DATE+' '+o.START_TIME).getTime())/60000)) : 0;
+      KOT.push({
+        id: o.ORDER_ID || o.ORDER_NO,
+        table: o.TABLE_ID || '—',
+        items: (o.items||[]).map(i=>({ name:i.itemName||i.name, qty:i.qty })),
+        status: ORDER_STATUS_TO_KOT_STATUS[o.ORDER_STATUS] || 'PENDING',
+        time: o.START_TIME || '',
+        mins: isNaN(mins) ? 0 : mins
+      });
+    });
+  } // else: keep whatever KOTs this device has already placed locally
   if(document.getElementById('s-kot')?.classList.contains('active')) renderKOT();
 }
 
