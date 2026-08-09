@@ -5869,6 +5869,13 @@ document.addEventListener('DOMContentLoaded', () => {
 document.addEventListener('DOMContentLoaded', ()=>{ bnxResolveClientBrand(); });
 document.addEventListener('DOMContentLoaded', ()=>{ if (typeof loadDashboard === 'function') loadDashboard(); });
 document.addEventListener('DOMContentLoaded', ()=>{ if (typeof bnxSyncKotBadge === 'function') bnxSyncKotBadge(); });
+document.addEventListener('DOMContentLoaded', ()=>{
+  // Pull live KOTs/orders once on load, then re-render whichever KOT view is on screen
+  if (typeof bnxSyncLiveKots === 'function') bnxSyncLiveKots().then(()=>{
+    if (typeof buildKOT === 'function') buildKOT();
+    if (typeof buildDashKotList === 'function') buildDashKotList();
+  });
+});
 
 /* ── DEEP LINK: ?page=xxx ──
    FIX: other pages (Cashier Dashboard, Daily Sales Report, Monthly DSR)
@@ -7504,6 +7511,48 @@ function bnxGetKotStore(){
   try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
   return open.length ? open : DEMO_KOT_SAMPLE;
 }
+/* FIX ("save data and accordingly update restaurant dashboard"):
+   bnxGetKotStore() above only ever reads bnx_open_kots — which is only
+   ever written by THIS browser's own sendKOT()/bnxRecordKOT() calls. A
+   KOT saved from steward-mobile.html (or from a POS terminal on another
+   device/browser) reached the backend fine but never appeared here on
+   the Dashboard KOT widget or the KOT page, because nothing here ever
+   pulled from the server — everyone was only ever looking at their own
+   browser's local cache.
+   This pulls the same GET_ACTIVE_ORDERS action the Order Register
+   already uses (the proven-real read endpoint in this codebase) and
+   merges live orders into bnx_open_kots by kotNo/orderNo, so a live
+   order updates/creates its card instead of duplicating on every sync.
+   Locally-recorded KOTs not yet reflected server-side are left alone. */
+async function bnxSyncLiveKots(){
+  if (typeof erpApi !== 'function' || !CLIENT_ID) return;
+  const STATUS_MAP = { NEW:'NEW', KOT_PRINTED:'NEW', PENDING:'NEW',
+    COOKING:'NEW', PREPARING:'NEW', IN_PROGRESS:'NEW',
+    READY:'READY', SERVED:'READY' };
+  let res;
+  try{ res = await erpApi({action:'GET_ACTIVE_ORDERS'}, 'V2_CORE'); }catch(e){ return; }
+  const orders = res && res.success && res.data && Array.isArray(res.data.orders) ? res.data.orders : null;
+  if (!orders || !orders.length) return; // no live data — leave local store as-is
+
+  let open = [];
+  try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
+  orders.forEach(o=>{
+    const kotNo = o.ORDER_NO || o.ORDER_ID;
+    if (!kotNo || o.ORDER_STATUS==='CANCELLED') return;
+    const items = (o.items||[]).map(i=>({ name: i.itemName||i.name||'Item', qty: Number(i.qty||1) }));
+    const rec = {
+      kotNo, table: o.TABLE_ID||'—', type: 'KITCHEN',
+      waiter: o.CREATED_BY||'', covers: o.PAX||'',
+      time: (o.ORDER_DATE && o.START_TIME) ? new Date(o.ORDER_DATE+' '+o.START_TIME).toISOString() : new Date().toISOString(),
+      status: STATUS_MAP[o.ORDER_STATUS] || 'NEW', items
+    };
+    const idx = open.findIndex(k=>k.kotNo===kotNo);
+    if (idx>=0){ open[idx] = { ...open[idx], ...rec, time: open[idx].time }; } // keep original local timestamp if we already had it
+    else { open.unshift(rec); }
+  });
+  if (open.length>100) open = open.slice(0,100);
+  bnxSetOpenKotsRaw(JSON.stringify(open));
+}
 function bnxKotElapsedMin(iso){
   return Math.max(0, Math.round((Date.now() - new Date(iso).getTime())/60000));
 }
@@ -7586,6 +7635,16 @@ function buildKOT(){
    every 12s while this page is the one on screen, so new/aging tickets
    show up and the "Delayed" bucket updates on their own. */
 setInterval(()=>{ if (document.getElementById('page-kot')?.classList.contains('active')) buildKOT(); }, 12000);
+/* Periodically pull live orders (steward app, other terminals) into the
+   local KOT store — see bnxSyncLiveKots() comment above — then refresh
+   whichever KOT view is currently visible. */
+setInterval(()=>{
+  if (typeof bnxSyncLiveKots !== 'function') return;
+  bnxSyncLiveKots().then(()=>{
+    if (document.getElementById('page-kot')?.classList.contains('active') && typeof buildKOT==='function') buildKOT();
+    if (document.getElementById('page-dashboard')?.classList.contains('active') && typeof buildDashKotList==='function') buildDashKotList();
+  });
+}, 20000);
 /* Marks a ticket Ready and persists it — refreshing the page or
    coming back to this tab won't lose the update (previously the
    Ready button only changed its own label in memory and forgot
