@@ -1,27 +1,34 @@
 /* ============================================================
-   BALAJI NEXTGEN ERP — dashboard-summary-loader.js  (FIXED)
+   BALAJI NEXTGEN ERP — dashboard-summary-loader.js  (FIXED v2)
    ------------------------------------------------------------
-   CHANGE FROM OLD VERSION:
-   Old version fetched a hardcoded Google Sheet (which happened to
-   be USER_SECURITY_MASTER_DB — the WRONG sheet for every client)
-   via public CSV export. That sheet never had a DASHBOARD_SUMMARY
-   tab, so every KPI silently stayed at 0.
+   BUG FIXED: this file called window.GAS_URL / window.CLIENT_ID —
+   neither exists on inventory.html or purchase-module.html. The real
+   variables are:
+     inventory.html:        SCRIPT_URL (const), CID (const)
+     purchase-module.html:  PURCHASE_GAS_URL (const), CLIENT_ID (const)
+   Both are top-level `const` in a classic (non-module) <script> tag,
+   so — since this file loads via <script src> AFTER those consts are
+   declared, at the very end of <body> — they're visible here by bare
+   name (same global script scope), just not as window.* properties.
+   This version tries the real names first, with window.GAS_URL/
+   window.CLIENT_ID kept only as a last-resort fallback for any other
+   page that might use those.
 
-   This version instead POSTs to your existing GAS backend
-   (window.GAS_URL) with action: 'GET_DASHBOARD_SUMMARY' and
-   clientId: window.CLIENT_ID. The backend resolves the correct
-   per-client sheet itself (same rbClientSpreadsheetId_() pattern
-   already used by SAVE_PURCHASE_INVOICE etc.), so there's no
-   sheet ID to hardcode or get wrong on the client side.
+   ARCHITECTURE NOTE: on inventory.html specifically, loadDashboard()
+   already computes every visible KPI (kv-val, kv-skus, kv-low, kv-pur,
+   kv-kit, kv-bar, kv-iss, nb-low) itself, from local DB tables kept in
+   sync via SYNC_PULL_ALL/SYNC_PUSH_TABLE (see InventorySyncGeneric.gs).
+   This loader targets a DIFFERENT set of element IDs (kpi-stock-value,
+   kpi-purchase-mtd, etc.) that do not exist in inventory.html at all —
+   so even fully fixed, it currently has nothing to write to on that
+   page. Recommended: remove the <script src="../dashboard-summary-
+   loader.js"> include from inventory.html and purchase-module.html
+   entirely, and only include this file on a page that actually has
+   elements with these exact IDs. Left working correctly below in case
+   there's a page (or a future one) that does.
 
-   REQUIRES: a new backend action GET_DASHBOARD_SUMMARY — see
-   dashboard-summary-backend.gs (companion file). Until that
-   action exists server-side, this will show "Sheet Error" same
-   as before — that's expected, not a new bug.
-
-   Include AFTER erp-config.js on inventory.html / purchase-module.html
-   (erp-config.js must define window.GAS_URL and window.CLIENT_ID
-   before this file loads).
+   REQUIRES backend action GET_DASHBOARD_SUMMARY — see
+   DashboardSummary_Live.gs.
    ============================================================ */
 
 const DashboardLoader = (function () {
@@ -38,6 +45,19 @@ const DashboardLoader = (function () {
     LAST_SYNC    : { id: 'sync-time',        format: 'text'     },
   };
 
+  function resolveGasUrl() {
+    if (typeof SCRIPT_URL !== 'undefined' && SCRIPT_URL) return SCRIPT_URL;
+    if (typeof PURCHASE_GAS_URL !== 'undefined' && PURCHASE_GAS_URL) return PURCHASE_GAS_URL;
+    if (window.GAS_URL) return window.GAS_URL;
+    return null;
+  }
+  function resolveClientId() {
+    if (typeof CID !== 'undefined' && CID && CID !== 'C001') return CID;
+    if (typeof CLIENT_ID !== 'undefined' && CLIENT_ID) return CLIENT_ID;
+    if (window.CLIENT_ID) return window.CLIENT_ID;
+    return null;
+  }
+
   function formatCurrency(val) {
     const n = parseFloat(val) || 0;
     if (n >= 10000000) return '₹' + (n / 10000000).toFixed(2) + ' Cr';
@@ -45,11 +65,9 @@ const DashboardLoader = (function () {
     if (n >= 1000)     return '₹' + (n / 1000).toFixed(1) + 'K';
     return '₹' + n.toLocaleString('en-IN', { minimumFractionDigits: 0 });
   }
-
   function formatNumber(val) {
     return (parseInt(val) || 0).toLocaleString('en-IN');
   }
-
   function setEl(id, text) {
     const el = document.getElementById(id);
     if (!el) return;
@@ -58,14 +76,12 @@ const DashboardLoader = (function () {
     el.style.color = 'var(--green, #059669)';
     setTimeout(() => { el.style.color = ''; }, 1200);
   }
-
   function showLoading() {
     Object.values(KPI_MAP).forEach(cfg => {
       const el = document.getElementById(cfg.id);
       if (el) { el.textContent = '...'; el.style.opacity = '0.5'; }
     });
   }
-
   function hideLoading() {
     Object.values(KPI_MAP).forEach(cfg => {
       const el = document.getElementById(cfg.id);
@@ -74,29 +90,22 @@ const DashboardLoader = (function () {
   }
 
   async function fetchSummaryFromBackend() {
-    if (!window.GAS_URL) {
-      console.warn('[DashboardLoader] window.GAS_URL not set — cannot fetch summary.');
-      return null;
-    }
-    if (!window.CLIENT_ID) {
-      console.warn('[DashboardLoader] window.CLIENT_ID not set — cannot fetch summary.');
-      return null;
-    }
+    const gasUrl = resolveGasUrl();
+    const clientId = resolveClientId();
+    if (!gasUrl) { console.warn('[DashboardLoader] No GAS URL found.'); return null; }
+    if (!clientId) { console.warn('[DashboardLoader] No client ID found.'); return null; }
     try {
-      const res = await fetch(window.GAS_URL, {
+      const res = await fetch(gasUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'text/plain' }, // avoids CORS preflight, matches rest of app
-        body: JSON.stringify({
-          action: 'GET_DASHBOARD_SUMMARY',
-          clientId: window.CLIENT_ID
-        })
+        headers: { 'Content-Type': 'text/plain' },
+        body: JSON.stringify({ action: 'GET_DASHBOARD_SUMMARY', clientId })
       });
       const json = await res.json();
-      if (!json.success) {
+      if (json.success === false) {
         console.warn('[DashboardLoader] Backend returned failure:', json.message);
         return null;
       }
-      return json.data || json.summary || null;
+      return json; // DS_getDashboardSummary_ returns the KPI object directly
     } catch (e) {
       console.error('[DashboardLoader] Fetch failed:', e);
       return null;
@@ -104,17 +113,17 @@ const DashboardLoader = (function () {
   }
 
   async function load() {
-    showLoading();
+    const anyTarget = Object.values(KPI_MAP).some(cfg => document.getElementById(cfg.id));
+    if (!anyTarget) return; // nothing on this page for us to fill — see note above
 
+    showLoading();
     const data = await fetchSummaryFromBackend();
     if (!data) {
       hideLoading();
       const syncEl = document.getElementById('syncTxt');
-      if (syncEl) syncEl.textContent = 'Sheet Error — Check GAS_URL / CLIENT_ID';
+      if (syncEl) syncEl.textContent = 'Sheet Error — Check backend';
       return;
     }
-
-    console.log('[DashboardLoader] Loaded:', data);
 
     Object.entries(KPI_MAP).forEach(([key, cfg]) => {
       const raw = data[key];
@@ -124,29 +133,21 @@ const DashboardLoader = (function () {
       else if (cfg.format === 'number') display = formatNumber(raw);
       setEl(cfg.id, display);
     });
-
     hideLoading();
 
     const syncEl = document.getElementById('syncTxt');
     if (syncEl) syncEl.textContent = 'Connected · Google Sheet';
-
     const dbBadge = document.getElementById('db-count-badge');
     if (dbBadge) dbBadge.textContent = '📊 Live Data';
-
     const lowBadge = document.getElementById('nb-low');
     if (lowBadge && data['LOW_STOCK'] !== undefined) lowBadge.textContent = data['LOW_STOCK'];
-
-    console.log('[DashboardLoader] ✅ Dashboard updated from backend');
   }
 
   function startAutoRefresh(intervalMinutes) {
-    const ms = (intervalMinutes || 5) * 60 * 1000;
-    setInterval(load, ms);
-    console.log(`[DashboardLoader] Auto-refresh every ${intervalMinutes || 5} min`);
+    setInterval(load, (intervalMinutes || 5) * 60 * 1000);
   }
 
   return { load, startAutoRefresh, KPI_MAP };
-
 })();
 
 document.addEventListener('DOMContentLoaded', function () {
