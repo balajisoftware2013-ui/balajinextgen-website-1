@@ -5795,8 +5795,13 @@ async function bnxResolveClientBrand(){
   const known = (typeof DEMO_CLIENT_FALLBACK!=='undefined') ? DEMO_CLIENT_FALLBACK[CLIENT_ID] : null;
   applyBrand(known ? { name: known.name } : {});
 }
-document.addEventListener('DOMContentLoaded', ()=>{ bnxResolveClientBrand(); });
-document.addEventListener('DOMContentLoaded', ()=>{ if (typeof loadDashboard === 'function') loadDashboard(); });
+// FIX ("check full... load to save to all"): bnxResolveClientBrand() and
+// loadDashboard() were each registered as DOMContentLoaded listeners
+// TWICE (here, and again further below alongside the KOT-badge/live-sync
+// listeners) — harmless in that both just re-ran the same idempotent
+// load, but wasteful (every page load fired the dashboard summary fetch
+// twice) and confusing to read as if two different things were happening.
+// Consolidated into the one full listener block below.
 
 /* ══════════════════════════════════════════════════════════════════════════
    REAL DATA LOADING - Fetch actual transaction data from SALES sheet
@@ -6044,56 +6049,101 @@ async function loadDashboard(){
       if(orders!==undefined) document.getElementById('d-ord').textContent=orders;
       if(covers!==undefined) document.getElementById('d-cov').textContent=covers;
       buildActiveOrders(d.activeOrders||[]);
+      // FIX ("dashboard till show wrong data / not live"): read defensively
+      // under a few plausible field names in case the backend's real field
+      // name differs — if GET_DASHBOARD_SUMMARY doesn't return an hourly
+      // breakdown at all, buildHourlyChart shows an honest "not available"
+      // state instead of fabricated numbers (see its own fix note below).
+      buildHourlyChart(d.hourlyChart||d.hourlySales||d.hourlyBreakdown||null);
+      buildDashKotList();
+      buildFloor('dashMap');
+      return; // real data path already handled everything — skip the offline fallback below
     }
   }catch(e){}
+  // FIX — THE MAIN BUG ("dashboard till show wrong data, not live"): this
+  // used to unconditionally call buildActiveOrders([]) here, AFTER the
+  // real/live call above already ran. Since buildActiveOrders() used to
+  // fall back to 5 fabricated sample rows (Ravi/T-04/₹1,254 etc.) whenever
+  // handed an empty array, this line silently overwrote whatever the live
+  // backend just returned — including a genuinely correct "zero active
+  // orders right now" state — with fake-looking data EVERY SINGLE TIME the
+  // dashboard loaded. That's exactly the reported symptom: numbers that
+  // look plausible but never change no matter what's really happening.
+  // Only reached now if the API call itself failed/threw — genuine offline
+  // fallback, not a routine overwrite of real data.
   buildActiveOrders([]);
+  buildHourlyChart(null);
   buildDashKotList();
-  buildHourlyChart();
   buildFloor('dashMap');
 }
-function buildHourlyChart(){
+function buildHourlyChart(realData){
   const g=document.getElementById('hourlyChart'); if(!g) return;
-  const hrs=[{h:'10',v:8},{h:'11',v:18},{h:'12',v:42},{h:'13',v:68},{h:'14',v:55},{h:'15',v:30},{h:'16',v:22},{h:'17',v:38},{h:'18',v:72},{h:'19',v:96},{h:'20',v:88},{h:'21',v:60}];
-  g.innerHTML=hrs.map(x=>`<div class="bc" style="cursor:pointer;" onclick="openHourDetail('${x.h}',${x.v})"><div class="bc-bar" style="background:${x.v>70?'var(--gold)':'rgba(var(--gold-rgb),.38)'};height:${x.v}px;"></div><div class="bc-lbl">${x.h}</div></div>`).join('');
+  // FIX ("dashboard till show wrong data"): this chart used to be 100%
+  // hardcoded fake numbers with NO connection to real sales, shown as if
+  // it were today's actual hourly trend regardless of what really
+  // happened. Now renders real per-hour data if the backend provided it;
+  // otherwise an honest "not available" placeholder — a flat empty state
+  // is more accurate than confident-looking fake data. When the GAS
+  // backend adds a real hourly breakdown to GET_DASHBOARD_SUMMARY, it
+  // flows through automatically via loadDashboard() above.
+  if(!realData || !Array.isArray(realData) || !realData.length){
+    g.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:16px 0;font-size:11px;color:var(--text3)">Hourly breakdown not available yet.</div>';
+    window._hourlyChartData=null;
+    return;
+  }
+  window._hourlyChartData=realData;
+  const maxV=Math.max(...realData.map(x=>+x.v||0),1);
+  g.innerHTML=realData.map((x,idx)=>{
+    const barH=Math.round((+x.v||0)/maxV*96);
+    return `<div class="bc" style="cursor:pointer;" onclick="openHourDetail('${x.h}',${idx})"><div class="bc-bar" style="background:${(x.v||0)>maxV*0.7?'var(--gold)':'rgba(var(--gold-rgb),.38)'};height:${barH}px;"></div><div class="bc-lbl">${x.h}</div></div>`;
+  }).join('');
 }
 
-function openHourDetail(hour, relValue){
-  const sales = relValue * 156;
-  const bills = Math.max(1, Math.round(relValue / 6));
-  const avgBill = Math.round(sales / bills);
+function openHourDetail(hour, idx){
+  // FIX ("dashboard wrong data"): this used to compute Sales/Bills/Tax/
+  // Discount/Payment-split from `relValue * 156` and similar made-up
+  // multipliers — entirely fabricated, regardless of what actually
+  // happened that hour. Now only opens for a real data point
+  // (window._hourlyChartData, set by buildHourlyChart from actual backend
+  // data); if the backend doesn't send a real per-hour breakdown yet, it
+  // says so honestly instead of inventing plausible-looking figures.
+  const point=(window._hourlyChartData||[])[idx];
+  if(!point){
+    document.getElementById('detailModalBody').innerHTML=`<div style="text-align:center;padding:20px;color:var(--text3);font-size:12.5px">Detailed hourly breakdown isn't available from the backend yet.</div>`;
+    document.getElementById('detailModal').style.display='flex';
+    return;
+  }
+  const sales=+point.v||0, bills=+point.bills||0, avgBill=bills?Math.round(sales/bills):0;
+  const rows=[['Bills', bills||'—'],['Average Bill Value', avgBill?('₹'+avgBill.toLocaleString('en-IN')):'—']];
+  if(point.discount!=null)rows.push(['Discount Given','−₹'+(+point.discount).toLocaleString('en-IN')]);
+  if(point.tax!=null)rows.push(['Tax Collected','₹'+(+point.tax).toLocaleString('en-IN')]);
+  if(point.serviceCharge!=null)rows.push(['Service Charge','₹'+(+point.serviceCharge).toLocaleString('en-IN')]);
   document.getElementById('detailModalBody').innerHTML = `
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
       <div><div style="font-weight:800;font-size:16px;">${hour}:00 – ${(parseInt(hour)+1)%24}:00</div><div style="font-size:12px;color:#888;">Hourly Sales Details</div></div>
       <button onclick="closeDetailModal()" style="border:none;background:#f2ede5;width:28px;height:28px;border-radius:8px;font-size:14px;cursor:pointer;">✕</button>
     </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;">
-      <div style="background:#f7f4ef;border-radius:10px;padding:10px;text-align:center;"><div style="font-weight:800;font-size:16px;color:var(--gold)">₹${sales.toLocaleString('en-IN')}</div><div style="font-size:10px;color:#888;">Sales</div></div>
-      <div style="background:#f7f4ef;border-radius:10px;padding:10px;text-align:center;"><div style="font-weight:800;font-size:16px;">${bills}</div><div style="font-size:10px;color:#888;">Bills</div></div>
-    </div>
-    <div style="display:flex;justify-content:space-between;padding:9px 0;border-top:1px solid #eee;font-size:12.5px;"><span>Tables Served</span><span style="font-weight:700;">${Math.max(1,Math.round(bills*0.85))}</span></div>
-    <div style="display:flex;justify-content:space-between;padding:9px 0;border-top:1px solid #eee;font-size:12.5px;"><span>Average Bill Value</span><span style="font-weight:700;">₹${avgBill.toLocaleString('en-IN')}</span></div>
-    <div style="display:flex;justify-content:space-between;padding:9px 0;border-top:1px solid #eee;font-size:12.5px;"><span>Discount Given</span><span style="font-weight:700;color:var(--red);">−₹${Math.round(sales*0.04).toLocaleString('en-IN')}</span></div>
-    <div style="display:flex;justify-content:space-between;padding:9px 0;border-top:1px solid #eee;font-size:12.5px;"><span>Tax Collected</span><span style="font-weight:700;">₹${Math.round(sales*0.05).toLocaleString('en-IN')}</span></div>
-    <div style="display:flex;justify-content:space-between;padding:9px 0;border-top:1px solid #eee;font-size:12.5px;"><span>Service Charge</span><span style="font-weight:700;">₹${Math.round(sales*0.05).toLocaleString('en-IN')}</span></div>
-    <div style="font-weight:700;font-size:11.5px;color:#555;margin:12px 0 6px;">Payment Split</div>
-    <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px;"><span>💵 Cash</span><span style="font-weight:700;">₹${Math.round(sales*0.35).toLocaleString('en-IN')}</span></div>
-    <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px;"><span>📱 UPI</span><span style="font-weight:700;">₹${Math.round(sales*0.45).toLocaleString('en-IN')}</span></div>
-    <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px;"><span>💳 Card</span><span style="font-weight:700;">₹${Math.round(sales*0.20).toLocaleString('en-IN')}</span></div>
+    <div style="background:#f7f4ef;border-radius:10px;padding:10px;text-align:center;margin-bottom:12px;"><div style="font-weight:800;font-size:16px;color:var(--gold)">₹${sales.toLocaleString('en-IN')}</div><div style="font-size:10px;color:#888;">Sales</div></div>
+    ${rows.map(([label,val])=>`<div style="display:flex;justify-content:space-between;padding:9px 0;border-top:1px solid #eee;font-size:12.5px;"><span>${label}</span><span style="font-weight:700;">${val}</span></div>`).join('')}
   `;
   document.getElementById('detailModal').style.display = 'flex';
 }
 function buildActiveOrders(data){
   const t=document.getElementById('activeOrdersTbl'); if(!t) return;
-  const s=[
-    {tbl:'T-04',w:'Ravi',tm:'42m',amt:'₹1,254',st:'<span class="pill p-o">Pending</span>'},
-    {tbl:'T-07',w:'Amit',tm:'8m',amt:'₹580',st:'<span class="pill p-b">Cooking</span>'},
-    {tbl:'T-11',w:'Suresh',tm:'28m',amt:'₹2,680',st:'<span class="pill p-o">Pending</span>'},
-    {tbl:'T-VIP1',w:'Rahul',tm:'55m',amt:'₹18,950',st:'<span class="pill p-p">VIP</span>'},
-    {tbl:'T-15',w:'Ravi',tm:'18m',amt:'₹1,870',st:'<span class="pill p-g">Ready</span>'},
-  ];
-  const rows=data.length?data:s;
-  window._activeOrders = rows;
-  t.innerHTML=rows.map((o,idx)=>`<tr style="cursor:pointer;" onclick="openActiveOrderDetail(${idx})"><td class="mono">${o.tbl}</td><td>${o.w}</td><td class="mono" style="color:var(--text3)">${o.tm}</td><td class="mono" style="color:var(--gold)">${o.amt}</td><td>${o.st}</td></tr>`).join('');
+  // FIX (THE MAIN BUG — "dashboard till show wrong data"): this used to
+  // fall back to 5 completely fabricated orders (T-04/Ravi/₹1,254,
+  // T-VIP1/Rahul/₹18,950, etc.) any time the real `data` array was empty —
+  // which, combined with the stray buildActiveOrders([]) call in
+  // loadDashboard() (also fixed), meant the dashboard showed these fake
+  // orders as if real on almost every load, including the completely
+  // normal case of zero tables occupied right now. An honest empty state
+  // is correct here — 5 fake orders that look real is worse than none.
+  window._activeOrders = data||[];
+  if(!data||!data.length){
+    t.innerHTML='<tr><td colspan="5" style="text-align:center;padding:14px;color:var(--text3);font-size:11.5px">No active orders right now.</td></tr>';
+    return;
+  }
+  t.innerHTML=data.map((o,idx)=>`<tr style="cursor:pointer;" onclick="openActiveOrderDetail(${idx})"><td class="mono">${o.tbl}</td><td>${o.w}</td><td class="mono" style="color:var(--text3)">${o.tm}</td><td class="mono" style="color:var(--gold)">${o.amt}</td><td>${o.st}</td></tr>`).join('');
 }
 function openActiveOrderDetail(idx){
   const o = (window._activeOrders||[])[idx]; if(!o) return;
@@ -7658,6 +7708,20 @@ setInterval(()=>{
     if (document.getElementById('page-dashboard')?.classList.contains('active') && typeof buildDashKotList==='function') buildDashKotList();
   });
 }, 20000);
+/* FIX ("dashboard till show wrong data not live"): the KOT list above
+   already refreshed itself every 20s, but the actual dashboard numbers —
+   Today's Revenue/Orders/Covers, the Active Orders table, the hourly
+   chart — only ever updated on a manual Refresh click or a full page
+   load. A manager sitting on this screen through a busy lunch service
+   would watch stale opening-time figures for hours unless they kept
+   clicking Refresh themselves. Now re-pulls the real dashboard summary
+   every 45s while this page is the one on screen (kept a bit slower than
+   the KOT poll since GET_DASHBOARD_SUMMARY is a heavier call) — the same
+   loadDashboard() used everywhere else, so it goes through the exact same
+   real-data-or-honest-empty-state logic fixed above, never fake numbers. */
+setInterval(()=>{
+  if (document.getElementById('page-dashboard')?.classList.contains('active') && typeof loadDashboard==='function') loadDashboard();
+}, 45000);
 /* Marks a ticket Ready and persists it — refreshing the page or
    coming back to this tab won't lose the update (previously the
    Ready button only changed its own label in memory and forgot
@@ -9022,7 +9086,28 @@ function bnxRecordBill(d){
   }
   return entry;
 }
-function blGetAllBills(){ return bnxGetBillRegister().concat(BL_DATA); }
+// FIX (SEVERE — "check full workable calculation to report... load to save
+// to all"): blGetAllBills() used to PERMANENTLY concatenate all 15
+// fabricated demo bills (₹47,414 worth of fake revenue) onto the real
+// bill register, forever — not just on a fresh empty install like the
+// correctly-built KOT demo fallback elsewhere in this file. Every real
+// client, no matter how much genuine data they had, saw these 15 fake
+// rows mixed permanently into their Bills List, CSV export, and Tally
+// accounting export. Worse: blSettle()/bmSettleAll() below only ever
+// operated on BL_DATA (the fake array) — so clicking "Settle" on a REAL
+// bill silently did nothing while still showing a "settled!" success
+// message, and "Settle All" only ever cleared fake pending bills, never
+// real overdue ones. Fixed throughout: real bills are always the source
+// of truth; BL_DATA is now only shown when the real register is
+// genuinely empty (fresh install, nothing rung up yet), exactly matching
+// the KOT sample's existing correct pattern — and financial operations
+// (Settle, Export, Tally export) now ONLY ever touch real saved bills,
+// never demo ones, so no fictional transaction can be mistaken for real
+// or exported into actual accounting.
+function blGetAllBills(){
+  const real=bnxGetBillRegister();
+  return real.length ? real : BL_DATA;
+}
 function blCancelBill(no){
   const reason = prompt('Reason for cancelling bill '+no+' (required):');
   if (!reason || !reason.trim()) return;
@@ -9231,24 +9316,44 @@ function blReprintBill(no,customer,total){
   w.document.close();setTimeout(function(){w.print();w.close();},600);
 }
 function blSettle(no){
+  // FIX: now finds and saves against the REAL bill register — previously
+  // only ever matched BL_DATA (the fake sample), so settling a real bill
+  // silently changed nothing while still claiming success.
+  const list=bnxGetBillRegister();
+  const b=list.find(x=>x.no===no);
+  if(!b){ alert('This is a read-only demo bill and cannot be settled. Settle works on real saved bills.'); return; }
   if(confirm('Settle bill '+no+'?\nThis will mark it as Paid.')){
-    const b=BL_DATA.find(x=>x.no===no);if(b)b.status='Paid';
+    b.status='Paid';
+    bnxSaveBillRegister(list);
     blRenderTable();
-    alert('Bill '+no+' settled! Powered by Balaji NextGen ERP');
+    if (typeof showNotif==='function') showNotif('✅ Bill '+no+' settled','success'); else alert('Bill '+no+' settled!');
   }
 }
 function bmSettleAll(){
-  const p=BL_DATA.filter(b=>b.status==='Pending');
+  // FIX: now settles REAL pending bills — previously only ever touched
+  // BL_DATA's fake pending rows, so this button did nothing for an
+  // actual restaurant's real overdue payments.
+  const list=bnxGetBillRegister();
+  const p=list.filter(b=>b.status==='Pending');
   if(!p.length){ if (typeof showNotif==='function') showNotif('No pending bills to settle.','error'); else alert('No pending bills!'); return; }
-  const total = p.reduce((a,b)=>a+b.total,0);
+  const total = p.reduce((a,b)=>a+(+b.total||0),0);
   if(confirm('Settle all '+p.length+' pending bills?\nTotal: \u20b9'+total.toLocaleString('en-IN'))){
-    p.forEach(b=>b.status='Paid');blRenderTable();
+    p.forEach(b=>b.status='Paid');
+    bnxSaveBillRegister(list);
+    blRenderTable();
     if (typeof showNotif==='function') showNotif('✅ Settled '+p.length+' bill(s) — ₹'+total.toLocaleString('en-IN'),'success');
     else alert('All pending bills settled!');
   }
 }
 function blExport(){
-  const rows=['Bill No,Date,Time,Table,Customer,Items,Subtotal,GST,Total,Payment,Status,Waiter',...BL_DATA.map(b=>b.no+','+b.dt+','+b.tm+','+b.table+',"'+b.customer+'",'+b.items+','+b.sub+','+b.gst+','+b.total+','+b.pay+','+b.status+','+b.waiter)];
+  // FIX (SEVERE): this CSV export used to export ONLY the 15 fabricated
+  // demo bills — a "download my real sales data" button that produced
+  // entirely fictional numbers regardless of what the restaurant actually
+  // sold. Now exports the REAL bill register; if genuinely empty, says so
+  // instead of silently handing over fake financial data.
+  const real=bnxGetBillRegister();
+  if(!real.length){ alert('No real bills recorded yet — nothing to export.'); return; }
+  const rows=['Bill No,Date,Time,Table,Customer,Items,Subtotal,GST,Total,Payment,Status,Waiter',...real.map(b=>b.no+','+b.dt+','+b.tm+','+b.table+',"'+b.customer+'",'+b.items+','+b.sub+','+b.gst+','+b.total+','+b.pay+','+b.status+','+b.waiter)];
   const a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(rows.join('\n'));a.download='bills-'+new Date().toISOString().slice(0,10)+'.csv';a.click();
 }
 // FIX ("Print All doesn't print anything"): this used to be a bare alert() —
@@ -9289,9 +9394,15 @@ function loadMenuData(){
    Compatible with Tally Prime / ERP 9
 ═══════════════════════════════════════════════════════ */
 function tallyGetExportData(){
+  // FIX (MOST SEVERE — this is a real accounting integration): this used
+  // to export ONLY the 15 fabricated demo bills (₹47,414 of fictional
+  // sales) into the Tally XML/CSV/JSON export — meaning a client could
+  // have literally imported fake transactions into their real company's
+  // books. Now exports only genuinely real, saved bills — never demo data,
+  // under any circumstance, for any accounting/export function.
   const from=document.getElementById('tally-from-dt')?.value;
   const to=document.getElementById('tally-to-dt')?.value;
-  let data=BL_DATA.filter(b=>b.status==='Paid'||b.status==='Pending');
+  let data=bnxGetBillRegister().filter(b=>b.status==='Paid'||b.status==='Pending');
   if(from){ const fd=new Date(from); data=data.filter(b=>{ const p=b.dt.split('-'); return new Date(p[2]+'-'+p[1]+'-'+p[0])>=fd; }); }
   if(to){ const td=new Date(to); data=data.filter(b=>{ const p=b.dt.split('-'); return new Date(p[2]+'-'+p[1]+'-'+p[0])<=td; }); }
   return data;
@@ -9784,7 +9895,17 @@ function receivePayment(name, amount){
   openReceivePaymentModal(name, amount);
 }
 function openReceivePaymentModal(name, amount){
-  const vno = 'RV/2026/0' + (Math.floor(Math.random()*900)+49);
+  // FIX ("check full workable calculation... load to save to all"): this
+  // voucher number was RANDOM (Math.floor(Math.random()*900)+49) — two
+  // different payments received minutes apart could get the exact same
+  // Receipt Voucher number, a real problem for an accounting document
+  // that's supposed to be unique per transaction. Now uses a real
+  // incrementing counter, persisted per-client so it survives reloads and
+  // never repeats or resets.
+  const seqKey='BNX_RV_SEQ_'+(typeof CLIENT_ID!=='undefined'&&CLIENT_ID?CLIENT_ID:'LOCAL');
+  const nextSeq=(parseInt(localStorage.getItem(seqKey)||'48',10)+1);
+  localStorage.setItem(seqKey,String(nextSeq));
+  const vno = 'RV/'+new Date().getFullYear()+'/0'+nextSeq;
   document.getElementById('detailModalBody').innerHTML = `
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
       <div><div style="font-weight:800;font-size:16px;">💰 Receive Payment</div><div style="font-size:12px;color:#888;">Receipt Voucher</div></div>
@@ -13434,12 +13555,22 @@ const ORDER_REG_SCHEMA_DEFAULTS = { ORDER_DATE:'—', INVOICE_NO:'', TEMP_ORDER_
 
 async function loadOrderRegister(){
   document.getElementById('orderRegList').innerHTML = '<div style="text-align:center;padding:30px;color:var(--text3);">Loading…</div>';
+  // FIX (same bug class as the dashboard's Active Orders/Hourly Chart):
+  // this used to treat "API call succeeded but there are genuinely zero
+  // orders right now" the SAME as "the API call failed" — both fell
+  // through to the fake demo rows below. A restaurant with a completely
+  // real, working connection but no orders yet today would still see 3
+  // fabricated orders (Suman/Amit/General Customer) as if they were real.
+  // Now only falls back to demo data when the call itself actually fails
+  // (network/backend error) — a successful call with 0 real orders shows
+  // a true, honest empty list instead.
   try{
     const res = await erpApi({action:'GET_ACTIVE_ORDERS', orderSource: orderRegFilterType||undefined}, 'V2_CORE');
-    if (res && res.success && res.data && res.data.orders && res.data.orders.length){
-      orderRegData = res.data.orders.map(o=>({...ORDER_REG_SCHEMA_DEFAULTS, ...o, ORDER_SOURCE:o.ORDER_SOURCE||o.ORDER_TYPE||'POS', ORDER_TYPE:ORDER_TYPE_LIST.includes(o.ORDER_TYPE)?o.ORDER_TYPE:'DINEIN'}));
+    if (res && res.success){
+      const orders = (res.data && res.data.orders) || [];
+      orderRegData = orders.map(o=>({...ORDER_REG_SCHEMA_DEFAULTS, ...o, ORDER_SOURCE:o.ORDER_SOURCE||o.ORDER_TYPE||'POS', ORDER_TYPE:ORDER_TYPE_LIST.includes(o.ORDER_TYPE)?o.ORDER_TYPE:'DINEIN'}));
     } else {
-      throw new Error('no live data');
+      throw new Error(res&&res.message||'API call failed');
     }
   } catch(e){
     orderRegData = orderRegDemoData();
