@@ -3750,6 +3750,20 @@ function _resolveInventoryClientId(){
     || 'C001';
 }
 let CID = _resolveInventoryClientId(); // FIX v2: reads real ERP_USER session first — see comment above
+// FIX ("data load shown blank but already have data"): CID's own fallback
+// chain can land on 'LOCAL' (window.INV_CLIENT_ID's placeholder default,
+// set at the very top of this file before any login is known) whenever
+// there's no real ERP_USER/ERP_CLIENT session yet — e.g. this page opened
+// directly instead of through the login flow. Every guard below only ever
+// checked for the OTHER placeholder, 'C001', so a CID of 'LOCAL' sailed
+// straight through as if it were a real logged-in client: erpApi() called
+// the live backend with clientId:'LOCAL', which matches no real client,
+// got back nothing, and the dashboard showed "DB: Empty"/"No data found"
+// even though the real client (e.g. CL00010) has hundreds of items sitting
+// untouched on the server. One helper, used everywhere a guard used to
+// hand-roll its own 'C001'-only check, so 'LOCAL' can never slip through
+// again and every no-session guard stays in sync.
+function _hasRealSession(){ return !!CID && CID!=='C001' && CID!=='LOCAL'; }
 // FIX ("mobile: login but no data show"): CID above is a plain const,
 // resolved ONCE when this script first runs. Desktop browsers almost
 // always do a real reload on navigation, so that's fine there. Mobile
@@ -3799,7 +3813,7 @@ const SCRIPT_URL = localStorage.getItem('BNJERP_script_url') || window.BNX_API_U
 // Chef ever seeing it. Backend needs a matching ISSUE_STOCK_TO_DEPT action
 // handler — same transparency as every other erpApi action added in this suite.
 async function erpApi(action, payload){
-  if(!CID || CID==='C001'){
+  if(!_hasRealSession()){
     return { success:false, message:'No real client session — please log in again before saving.' };
   }
   try{
@@ -3837,7 +3851,7 @@ const DB = {
     // backend (fire-and-forget, so the UI never waits on network) — the
     // single choke point every insert/update already goes through, so this
     // covers every table without touching each call site individually.
-    if(typeof erpApi==='function' && CID && CID!=='C001'){
+    if(typeof erpApi==='function' && _hasRealSession()){
       // FIX: login_history is the shared platform-wide audit log (lives in
       // USER_SECURITY_MASTER_DB, not this client's own spreadsheet) — it
       // must go through the append/update-only action, never the generic
@@ -3896,7 +3910,7 @@ function _mergePulledTable(table, serverRows){
 }
 let _liveSyncTimer=null, _lastSyncAt=null;
 async function pullAllFromBackend(silent=true){
-  if(typeof erpApi!=='function' || !CID || CID==='C001') return;
+  if(typeof erpApi!=='function' || !_hasRealSession()) return;
   try{
     const r=await erpApi('SYNC_PULL_ALL',{});
     if(r&&r.success&&r.tables){
@@ -4084,7 +4098,7 @@ window.addEventListener('DOMContentLoaded', async ()=>{
   updateDBBadge();
   // ── Step 2: Start real-time sync — pulls live data from backend,
   // overwriting the local cache once connected; keeps polling every 20s ──
-  if(CID && CID!=='C001'){ startLiveSync(); }
+  if(_hasRealSession()){ startLiveSync(); }
   else{ const b=document.getElementById('liveSyncBadge'); if(b){b.textContent='⚪ No client session — local only';b.style.background='rgba(239,68,68,.12)';} }
   document.getElementById('ph-date').textContent = new Date().toLocaleDateString('en-IN',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
   ['pi-ph-co','pr-ph-co','preg-ph-co','sr-ph-co','lr-ph-co'].forEach(id=>{ const el=document.getElementById(id); if(el) el.textContent=COMPANY; });
@@ -4135,7 +4149,7 @@ window.addEventListener('DOMContentLoaded', async ()=>{
   // SYNC_PULL_ALL path. Now this step just calls that same one real
   // path directly, so there's exactly one pull mechanism, not two.
   const scriptUrl = SCRIPT_URL || localStorage.getItem('BNJERP_script_url');
-  if(scriptUrl && CID && CID!=='C001') {
+  if(scriptUrl && _hasRealSession()) {
     const dot = document.getElementById('syncDot');
     const txt = document.getElementById('syncTxt');
     const badge = document.getElementById('db-count-badge');
@@ -4160,10 +4174,27 @@ window.addEventListener('DOMContentLoaded', async ()=>{
       toast('Working offline — Google Sheets not reachable', '');
     }
 
-  } else {
+  } else if(!scriptUrl){
     // No URL configured — show setup prompt
     const txt = document.getElementById('syncTxt');
     if(txt) txt.textContent = 'Local DB · Set Script URL in Settings';
+  } else {
+    // FIX ("data load shown blank but already have data"): CID is a
+    // placeholder ('C001'/'LOCAL') here, not a real logged-in client —
+    // this branch used to fall through silently to the generic "items<5"
+    // check below, which then showed the same "No data found. This can
+    // happen when opening the file from a new folder location." banner
+    // as a genuinely-empty-but-connected client. That's a different,
+    // misleading message for a different problem: there was no attempt
+    // to reach the real client's data at all, because there's no session
+    // to know WHICH client to ask for. Say that plainly instead, so it's
+    // obvious this needs a real login, not "add some stock".
+    const dot = document.getElementById('syncDot');
+    const txt = document.getElementById('syncTxt');
+    const badge = document.getElementById('db-count-badge');
+    if(dot) dot.style.background = 'var(--red)';
+    if(txt) txt.textContent = 'Not logged in — open via login, not this URL directly';
+    if(badge){ badge.textContent='⚠️ No client session'; badge.style.background='var(--rl)'; badge.style.color='var(--red)'; }
   }
 
   // ── Step 3: Health check ─────────────────────────────────
@@ -4174,8 +4205,14 @@ window.addEventListener('DOMContentLoaded', async ()=>{
   setTimeout(()=>{
     const items = DB.count('items');
     const alertEl = document.getElementById('db-status-alert');
-    if(items < 5){
-      if(alertEl) alertEl.style.display = '';
+    if(!alertEl) return;
+    if(!_hasRealSession()){
+      // Distinct copy from the genuinely-empty-client case below — this
+      // is "not logged in", not "this client has no data yet".
+      alertEl.innerHTML = '⚠️ <strong>Not logged in.</strong> This page has no active client session, so it can\'t tell which client\'s data to load. Log in through the normal login page rather than opening this file/URL directly. <button class="btn" style="margin-left:5px;padding:3px 10px;font-size:11px;" onclick="document.getElementById(\'db-status-alert\').style.display=\'none\'">✕</button>';
+      alertEl.style.display = '';
+    } else if(items < 5){
+      alertEl.style.display = '';
     }
     updateDBBadge();
   }, 600);
@@ -6189,7 +6226,7 @@ async function callAPI(action, data = {}) {
 // every other device, using the one sync path that's actually wired
 // up and tested this session.
 async function syncData() {
-  if(!CID || CID==='C001'){ toast('No client session — nothing to sync', 'w'); return; }
+  if(!_hasRealSession()){ toast('No client session — nothing to sync', 'w'); return; }
   const dot = document.getElementById('syncDot');
   const txt = document.getElementById('syncTxt');
   if(dot) dot.style.background = 'var(--orange)';
@@ -8651,7 +8688,7 @@ function triggerGSheetSync(){
   const log=document.getElementById('gs-log');
   const t=()=>new Date().toLocaleTimeString('en-IN');
   if(log)log.innerHTML+=`<div style="color:var(--muted);">[${t()}] Syncing...</div>`;
-  if(!CID||CID==='C001'){ toast('No client session — nothing to sync','w'); if(log)log.innerHTML+=`<div style="color:var(--red);">[${t()}] No client session</div>`; return; }
+  if(!_hasRealSession()){ toast('No client session — nothing to sync','w'); if(log)log.innerHTML+=`<div style="color:var(--red);">[${t()}] No client session</div>`; return; }
   pullAllFromBackend(false).then(()=>{
     if(log)log.innerHTML+=`<div style="color:var(--green);">[${t()}] Sync complete — ${DB.count('items')} items, ${DB.count('stock_ledger')} stock records ✓</div>`;
     toast('Google Sheets sync complete ✓','s');
