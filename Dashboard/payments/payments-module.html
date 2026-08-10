@@ -1018,19 +1018,51 @@ function rendDash(){
   rendTopVendors();rendTopCusts();rendSideBadges();
 }
 function calcOutstanding(){
-  // Vendor outstanding = purchase invoices - payments made
+  // FIX ("check full workable calculation"): this used to compute "paid"
+  // for EACH invoice as ALL of that vendor's payments matching EITHER
+  // this invoice's invRef OR just the vendor's name — the OR meant a
+  // single payment made against Invoice A got counted as paid AGAIN
+  // against every other invoice from the same vendor (B, C...), since
+  // party-name alone matched all of them. Real example: Vendor has
+  // Invoice A ₹1,000 and Invoice B ₹500 (₹1,500 really owed); one ₹1,000
+  // payment was made against A. Old code: A shows ₹0 owed (correct) AND
+  // B ALSO shows ₹0 owed (wrong — that same ₹1,000 got credited twice),
+  // so real dashboard vendor outstanding read ₹0 when ₹500 was still
+  // genuinely due. Same bug existed symmetrically for customer
+  // receivables. Fixed: payments are matched to their specific invoice
+  // by invRef first; only a payment with NO invRef (a general advance not
+  // tied to any one bill) is pooled and applied ONCE across that vendor's
+  // remaining balance, oldest-appearing-first, never duplicated.
   const pd=getPurchaseData();const pinvs=pd.invoices||pd.pinvs||[];
   let vOut=0;
-  pinvs.forEach(inv=>{
-    const paid=DB.payments.filter(p=>p.invRef===(inv.no||inv.invoiceNo||inv.docNo)||p.party===(inv.supplierName||inv.party||inv.vendorName)).reduce((s,p)=>s+p.amount,0);
-    vOut+=Math.max(0,(inv.grand||inv.grandTotal||inv.total||0)-paid);
+  const vGroups={};
+  pinvs.forEach(inv=>{ const vname=inv.supplierName||inv.party||inv.vendorName||'Unknown'; (vGroups[vname]=vGroups[vname]||[]).push(inv); });
+  Object.entries(vGroups).forEach(([vname,invs])=>{
+    const vPays=DB.payments.filter(p=>p.party===vname);
+    let generalPool=vPays.filter(p=>!p.invRef).reduce((s,p)=>s+p.amount,0);
+    invs.forEach(inv=>{
+      const invNo=inv.no||inv.invoiceNo||inv.docNo;
+      const directPaid=vPays.filter(p=>p.invRef && p.invRef===invNo).reduce((s,p)=>s+p.amount,0);
+      let bal=Math.max(0,(inv.grand||inv.grandTotal||inv.total||0)-directPaid);
+      if(bal>0 && generalPool>0){ const applied=Math.min(bal,generalPool); bal-=applied; generalPool-=applied; }
+      vOut+=bal;
+    });
   });
-  // Customer outstanding = sales invoices - receipts received
+  // Customer outstanding = sales invoices - receipts received (same fix, mirrored)
   const sd=getSalesData();const sinvs=sd.invs||[];
   let cOut=0;
-  sinvs.forEach(inv=>{
-    const received=DB.receipts.filter(r=>r.invRef===inv.docNo||r.party===inv.customer?.name).reduce((s,r)=>s+r.amount,0);
-    cOut+=Math.max(0,(inv.grandTotal||0)-received);
+  const cGroups={};
+  sinvs.forEach(inv=>{ const cname=inv.customer?.name||'Unknown'; (cGroups[cname]=cGroups[cname]||[]).push(inv); });
+  Object.entries(cGroups).forEach(([cname,invs])=>{
+    const cRecs=DB.receipts.filter(r=>r.party===cname);
+    let generalPool=cRecs.filter(r=>!r.invRef).reduce((s,r)=>s+r.amount,0);
+    invs.forEach(inv=>{
+      const invNo=inv.docNo;
+      const directRecv=cRecs.filter(r=>r.invRef && r.invRef===invNo).reduce((s,r)=>s+r.amount,0);
+      let bal=Math.max(0,(inv.grandTotal||0)-directRecv);
+      if(bal>0 && generalPool>0){ const applied=Math.min(bal,generalPool); bal-=applied; generalPool-=applied; }
+      cOut+=bal;
+    });
   });
   return{vOut,cOut};
 }
@@ -1132,30 +1164,46 @@ function rendVendorOut(searchQ){
   const pd=getPurchaseData();const pinvs=pd.invoices||pd.pinvs||[];
   const tb=el('vout-tb');if(!tb)return;
   if(!pinvs.length){tb.innerHTML='<tr class="empty-r"><td colspan="9">No purchase invoices found. Add invoices in Purchase Module first.</td></tr>';ss('vo-total','₹0');ss('vo-count','0');ss('vo-over','0');return;}
+  // FIX (same bug as calcOutstanding above, now fixed in the actual
+  // register you'd use to decide who to pay): "paid" per invoice used to
+  // be ALL of that vendor's payments (by invRef OR just party name), so
+  // one real payment against Invoice A showed as ALSO paid against
+  // Invoice B, C... from the same vendor — understating or hiding real
+  // dues. Payments are now matched to their specific invoice by invRef
+  // first; a payment with no invRef (general advance) is pooled and
+  // applied once per vendor, never duplicated across invoices.
   const q=(searchQ||'').trim().toLowerCase();
   const today=new Date();let total=0,count=0,over=0;
-  const rows=pinvs.map(inv=>{
-    const name=inv.supplierName||inv.party||inv.vendorName||'Unknown';
-    if(q && !name.toLowerCase().includes(q))return null;
-    const invAmt=inv.grand||inv.grandTotal||inv.total||0;
-    const paid=DB.payments.filter(p=>p.invRef===(inv.no||inv.invoiceNo||inv.docNo)||p.party===name).reduce((s,p)=>s+p.amount,0);
-    const bal=Math.max(0,invAmt-paid);
-    if(bal<=0)return null;
-    const invDate=new Date(inv.date||inv.invoiceDate||today);
-    const days=Math.floor((today-invDate)/86400000);
-    total+=bal;count++;if(days>30)over++;
-    return`<tr>
-      <td><b>${name}</b></td>
-      <td style="font-size:10.5px">${inv.no||inv.invoiceNo||inv.docNo||'—'}</td>
-      <td>${fmtD(inv.date||inv.invoiceDate)}</td>
-      <td class="td-r">${fmt(invAmt)}</td>
-      <td class="td-r" style="color:var(--ok)">${fmt(paid)}</td>
-      <td class="td-r" style="font-weight:800;color:var(--er)">${fmt(bal)}</td>
-      <td class="td-c" style="color:${days>30?'var(--er)':'var(--mu)'}"><b>${days}d</b></td>
-      <td><span class="badge ${days>30?'b-red':days>15?'b-amber':'b-green'}">${days>30?'Overdue':days>15?'Due Soon':'Current'}</span></td>
-      <td><button class="btn btn-xs btn-pay" onclick="openPayModalFor('${name}')">💸 Pay</button></td>
-    </tr>`;
-  }).filter(Boolean);
+  const vGroups={};
+  pinvs.forEach(inv=>{ const vname=inv.supplierName||inv.party||inv.vendorName||'Unknown'; (vGroups[vname]=vGroups[vname]||[]).push(inv); });
+  const rows=[];
+  Object.entries(vGroups).forEach(([name,invs])=>{
+    if(q && !name.toLowerCase().includes(q))return;
+    const vPays=DB.payments.filter(p=>p.party===name);
+    let generalPool=vPays.filter(p=>!p.invRef).reduce((s,p)=>s+p.amount,0);
+    invs.forEach(inv=>{
+      const invAmt=inv.grand||inv.grandTotal||inv.total||0;
+      const invNo=inv.no||inv.invoiceNo||inv.docNo;
+      let paid=vPays.filter(p=>p.invRef && p.invRef===invNo).reduce((s,p)=>s+p.amount,0);
+      let bal=Math.max(0,invAmt-paid);
+      if(bal>0 && generalPool>0){ const applied=Math.min(bal,generalPool); bal-=applied; paid+=applied; generalPool-=applied; }
+      if(bal<=0)return;
+      const invDate=new Date(inv.date||inv.invoiceDate||today);
+      const days=Math.floor((today-invDate)/86400000);
+      total+=bal;count++;if(days>30)over++;
+      rows.push(`<tr>
+        <td><b>${name}</b></td>
+        <td style="font-size:10.5px">${invNo||'—'}</td>
+        <td>${fmtD(inv.date||inv.invoiceDate)}</td>
+        <td class="td-r">${fmt(invAmt)}</td>
+        <td class="td-r" style="color:var(--ok)">${fmt(paid)}</td>
+        <td class="td-r" style="font-weight:800;color:var(--er)">${fmt(bal)}</td>
+        <td class="td-c" style="color:${days>30?'var(--er)':'var(--mu)'}"><b>${days}d</b></td>
+        <td><span class="badge ${days>30?'b-red':days>15?'b-amber':'b-green'}">${days>30?'Overdue':days>15?'Due Soon':'Current'}</span></td>
+        <td><button class="btn btn-xs btn-pay" onclick="openPayModalFor('${name}')">💸 Pay</button></td>
+      </tr>`);
+    });
+  });
   tb.innerHTML=rows.length?rows.join(''):'<tr class="empty-r"><td colspan="9">✅ All vendor payments up to date!</td></tr>';
   ss('vo-total',fmt(total));ss('vo-count',count);ss('vo-over',over);
 }
@@ -1163,28 +1211,36 @@ function rendCustOut(){
   const sd=getSalesData();const sinvs=sd.invs||[];
   const tb=el('cout-tb');if(!tb)return;
   if(!sinvs.length){tb.innerHTML='<tr class="empty-r"><td colspan="9">No sales invoices found. Add invoices in Sales Module first.</td></tr>';ss('co-total','₹0');ss('co-count','0');ss('co-over','0');return;}
+  // FIX: same double-counting bug, mirrored for customer receivables.
   const today=new Date();let total=0,count=0,over=0;
-  const rows=sinvs.map(inv=>{
-    const name=inv.customer?.name||'Unknown';
-    const invAmt=inv.grandTotal||0;
-    const recv=DB.receipts.filter(r=>r.invRef===inv.docNo||r.party===name).reduce((s,r)=>s+r.amount,0);
-    const bal=Math.max(0,invAmt-recv);
-    if(bal<=0)return null;
-    const invDate=new Date(inv.date||today);
-    const days=Math.floor((today-invDate)/86400000);
-    total+=bal;count++;if(days>30)over++;
-    return`<tr>
-      <td><b>${name}</b></td>
-      <td style="font-size:10.5px">${inv.docNo||'—'}</td>
-      <td>${fmtD(inv.date)}</td>
-      <td class="td-r">${fmt(invAmt)}</td>
-      <td class="td-r" style="color:var(--ok)">${fmt(recv)}</td>
-      <td class="td-r" style="font-weight:800;color:var(--warn)">${fmt(bal)}</td>
-      <td class="td-c" style="color:${days>30?'var(--er)':'var(--mu)'}"><b>${days}d</b></td>
-      <td><span class="badge ${days>30?'b-red':days>15?'b-amber':'b-green'}">${days>30?'Overdue':days>15?'Due Soon':'Current'}</span></td>
-      <td><button class="btn btn-xs btn-rec" onclick="openRecModalFor('${name}')">💰 Collect</button></td>
-    </tr>`;
-  }).filter(Boolean);
+  const cGroups={};
+  sinvs.forEach(inv=>{ const cname=inv.customer?.name||'Unknown'; (cGroups[cname]=cGroups[cname]||[]).push(inv); });
+  const rows=[];
+  Object.entries(cGroups).forEach(([name,invs])=>{
+    const cRecs=DB.receipts.filter(r=>r.party===name);
+    let generalPool=cRecs.filter(r=>!r.invRef).reduce((s,r)=>s+r.amount,0);
+    invs.forEach(inv=>{
+      const invAmt=inv.grandTotal||0;
+      let recv=cRecs.filter(r=>r.invRef && r.invRef===inv.docNo).reduce((s,r)=>s+r.amount,0);
+      let bal=Math.max(0,invAmt-recv);
+      if(bal>0 && generalPool>0){ const applied=Math.min(bal,generalPool); bal-=applied; recv+=applied; generalPool-=applied; }
+      if(bal<=0)return;
+      const invDate=new Date(inv.date||today);
+      const days=Math.floor((today-invDate)/86400000);
+      total+=bal;count++;if(days>30)over++;
+      rows.push(`<tr>
+        <td><b>${name}</b></td>
+        <td style="font-size:10.5px">${inv.docNo||'—'}</td>
+        <td>${fmtD(inv.date)}</td>
+        <td class="td-r">${fmt(invAmt)}</td>
+        <td class="td-r" style="color:var(--ok)">${fmt(recv)}</td>
+        <td class="td-r" style="font-weight:800;color:var(--warn)">${fmt(bal)}</td>
+        <td class="td-c" style="color:${days>30?'var(--er)':'var(--mu)'}"><b>${days}d</b></td>
+        <td><span class="badge ${days>30?'b-red':days>15?'b-amber':'b-green'}">${days>30?'Overdue':days>15?'Due Soon':'Current'}</span></td>
+        <td><button class="btn btn-xs btn-rec" onclick="openRecModalFor('${name}')">💰 Collect</button></td>
+      </tr>`);
+    });
+  });
   tb.innerHTML=rows.length?rows.join(''):'<tr class="empty-r"><td colspan="9">✅ All customer receipts collected!</td></tr>';
   ss('co-total',fmt(total));ss('co-count',count);ss('co-over',over);
 }
