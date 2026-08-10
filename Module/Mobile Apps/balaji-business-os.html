@@ -3246,6 +3246,18 @@ body.mode-accountant .owner-hint{display:none;}
     </div>
 
     <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border);">
+      <div style="font-size:12px;font-weight:800;color:var(--text);margin-bottom:4px;">🔗 Merge Duplicate Suppliers / Customers</div>
+      <div style="font-size:11px;color:var(--sub);margin-bottom:10px;line-height:1.6;">
+        Fixes the "same party shown twice" problem in Supplier Ledger / Purchase Register (or Customer Ledger /
+        Sales Register): finds supplier or customer records with the exact same name (ignoring case and extra
+        spaces), keeps the oldest one, moves every purchase/sale/payment/note from the duplicate record(s) onto
+        it, and removes the now-empty duplicates. Nothing is deleted — it merges history, it doesn't erase it.
+      </div>
+      <button class="btn btn-outline" id="mergeDupPartiesBtn" style="width:100%;" onclick="runMergeDuplicateParties()">🔗 Scan &amp; Merge Duplicate Parties</button>
+      <div id="mergeDupPartiesResult" style="display:none;margin-top:12px;font-size:12px;background:var(--body-bg);border-radius:10px;padding:10px 12px;line-height:1.8;white-space:pre-wrap;"></div>
+    </div>
+
+    <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border);">
       <div style="font-size:12px;font-weight:800;color:var(--text);margin-bottom:4px;">📦 Recalculate Stock From Vouchers</div>
       <div style="font-size:11px;color:var(--sub);margin-bottom:10px;line-height:1.6;">
         The Import Center deliberately does not change item stock on historical import (to avoid double-counting
@@ -3779,6 +3791,19 @@ function _genId(prefix, list){
   return id;
 }
 function _genItemId(){ return _genId('I', DB.items); }
+// FIX (duplicate suppliers/customers): party-name matching across the app
+// (Import Center, New Supplier/Customer) used raw .toLowerCase() with no
+// whitespace trimming/collapsing. A CSV import or a manual "New Supplier"
+// entry of "M/S Anshu Marine " (trailing space) or "M/S  Anshu Marine"
+// (double space) looked identical on screen but failed the exact-string
+// match against the existing "M/S Anshu Marine" row — so a second supplier
+// record got created with the same visible name, a different ID, and its
+// own separate balance (this is why Supplier Ledger / Purchase Register
+// showed the same party twice with the totals split across both rows).
+// All party-name comparisons now go through this single normalizer.
+function _normName(name){
+  return String(name||'').trim().replace(/\s+/g,' ').toLowerCase();
+}
 /* ── Share-file naming: PartyName-DocNo-Date.pdf (e.g. HashtagRestaurant-INV045-03Jul26.pdf) ── */
 function fileSafeDate(dateStr){
   const d = dateStr ? new Date(dateStr) : new Date();
@@ -4158,6 +4183,107 @@ async function runDataRepair(){
   }finally{
     if(btn){ btn.disabled = false; btn.textContent = '🧹 Scan & Repair Duplicates / Unlinked Parties'; }
   }
+}
+// FIX (duplicate suppliers/customers): merges party records that share the
+// same name (case/whitespace-insensitive via _normName) — the root symptom
+// reported as "Supplier Ledger / Purchase Register shows the same name
+// twice". Keeps the earliest record per name as the survivor, re-points
+// every purchase/sale/payment/note at it, and drops the now-empty
+// duplicate(s). Runs entirely client-side on the in-memory DB, then saves
+// through the normal persistDB() path — same save mechanism every other
+// edit in this app already uses, so it works whether or not a cloud sheet
+// is connected (offline/demo just won't have anything to push).
+function _mergePartyGroup(list, group, refUpdaters){
+  // group: array of party records sharing one normalized name, in list order.
+  const primary = group[0];
+  const dupes = group.slice(1);
+  const dupeIds = dupes.map(d=>d.id);
+  // Re-point every linked record (purchases/sales/payments/notes) from the
+  // duplicate IDs onto the primary's ID.
+  refUpdaters.forEach(updater=>updater(dupeIds, primary.id));
+  // Fill in any blank contact fields on the primary from a duplicate.
+  dupes.forEach(d=>{
+    if(!primary.mobile && d.mobile) primary.mobile = d.mobile;
+    if(!primary.gstin && d.gstin) primary.gstin = d.gstin;
+    if(!primary.address && d.address) primary.address = d.address;
+    if(!primary.state && d.state) primary.state = d.state;
+  });
+  // Opening-balance ("due") handling: once the merged party has ANY real
+  // transaction, getPartyDocBalance() ignores .due entirely (it only reads
+  // the running transaction balance), so summing dues here is safe — it
+  // simply becomes a harmless unused fallback, exactly matching what
+  // happened to each duplicate's own due field before the merge. The only
+  // real risk is a group with NO transactions at all on either record,
+  // where two manually-typed opening balances might represent the SAME
+  // debt entered twice — that case is flagged for manual review instead of
+  // silently added together.
+  const hasAnyTxn = refUpdaters.some(u=>u.hasTxn && u.hasTxn(primary.id, dupeIds));
+  let flagged = null;
+  if(hasAnyTxn){
+    primary.due = (primary.due||0) + dupes.reduce((a,d)=>a+(d.due||0),0);
+  } else {
+    const dueVals = [primary.due||0, ...dupes.map(d=>d.due||0)];
+    const maxDue = Math.max(...dueVals);
+    if(dueVals.some(v=>v!==maxDue)){
+      flagged = {name: primary.name, values: dueVals};
+    }
+    primary.due = maxDue; // best guess; flagged above for the user to confirm
+  }
+  const removeIds = new Set(dupeIds);
+  const idx = list.indexOf(primary);
+  const newList = list.filter(p=>!removeIds.has(p.id));
+  return {newList, flagged};
+}
+function runMergeDuplicateParties(){
+  const btn = document.getElementById('mergeDupPartiesBtn');
+  const resultEl = document.getElementById('mergeDupPartiesResult');
+  const groupByName = (list)=>{
+    const map = {};
+    (list||[]).forEach(p=>{ const k=_normName(p.name); if(!k) return; (map[k]=map[k]||[]).push(p); });
+    return Object.values(map).filter(g=>g.length>1);
+  };
+  const suppGroups = groupByName(DB.suppliers);
+  const custGroups = groupByName(DB.customers);
+  if(!suppGroups.length && !custGroups.length){
+    toast('No duplicate suppliers or customers found ✓');
+    return;
+  }
+  const preview = suppGroups.concat(custGroups).map(g=>`• ${g[0].name} (${g.length} records)`).join('\n');
+  if(!confirm(`Found ${suppGroups.length} duplicate supplier name(s) and ${custGroups.length} duplicate customer name(s):\n\n${preview}\n\nMerge each group into a single record (oldest kept, history moved over)? This cannot be auto-undone.`)) return;
+  if(btn){ btn.disabled = true; btn.textContent = '🔗 Merging…'; }
+  const suppRefUpdaters = [
+    Object.assign((dupeIds, keepId)=>{ (DB.purchases||[]).forEach(p=>{ if(dupeIds.includes(p.supp)) p.supp = keepId; }); }, {hasTxn:(keepId,dupeIds)=> (DB.purchases||[]).some(p=>p.supp===keepId || dupeIds.includes(p.supp))}),
+    (dupeIds, keepId)=>{ (DB.paymentsOut||[]).forEach(pm=>{ if(dupeIds.includes(pm.supp)) pm.supp = keepId; }); },
+    (dupeIds, keepId)=>{ (DB.debitNotes||[]).forEach(dn=>{ if(dupeIds.includes(dn.supp)) dn.supp = keepId; }); },
+  ];
+  const custRefUpdaters = [
+    Object.assign((dupeIds, keepId)=>{ (DB.sales||[]).forEach(s=>{ if(dupeIds.includes(s.cust)) s.cust = keepId; }); }, {hasTxn:(keepId,dupeIds)=> (DB.sales||[]).some(s=>s.cust===keepId || dupeIds.includes(s.cust))}),
+    (dupeIds, keepId)=>{ (DB.paymentsIn||[]).forEach(r=>{ if(dupeIds.includes(r.cust)) r.cust = keepId; }); },
+    (dupeIds, keepId)=>{ (DB.creditNotes||[]).forEach(cn=>{ if(dupeIds.includes(cn.cust)) cn.cust = keepId; }); },
+  ];
+  let suppMerged = 0, custMerged = 0;
+  const flags = [];
+  suppGroups.forEach(g=>{
+    const {newList, flagged} = _mergePartyGroup(DB.suppliers, g, suppRefUpdaters);
+    DB.suppliers = newList; suppMerged += g.length-1;
+    if(flagged) flags.push(flagged);
+  });
+  custGroups.forEach(g=>{
+    const {newList, flagged} = _mergePartyGroup(DB.customers, g, custRefUpdaters);
+    DB.customers = newList; custMerged += g.length-1;
+    if(flagged) flags.push(flagged);
+  });
+  persistDB();
+  renderDashboard(); renderNotifs();
+  if(window._curPage==='money') moneyTab(window._moneyTab||'customers');
+  if(resultEl){
+    resultEl.style.display = 'block';
+    resultEl.innerHTML = `✅ Merged <b>${suppMerged}</b> duplicate supplier record(s) and <b>${custMerged}</b> duplicate customer record(s) into their originals. All linked purchases/sales/payments/notes now point at the kept record.`
+      + (flags.length ? `<br><br>⚠️ These had no linked transactions on either duplicate, so we couldn't confirm the opening balances weren't the same debt entered twice — please double-check:<br>`
+        + flags.map(f=>`• ${f.name}: had ${f.values.map(v=>fmtSmart(v)).join(' and ')} — kept the higher figure`).join('<br>') : '');
+  }
+  if(btn){ btn.disabled = false; btn.textContent = '🔗 Scan & Merge Duplicate Parties'; }
+  toast('Duplicate parties merged ✓');
 }
 // v59: Recalculate Stock From Vouchers — fixes the negative "Opening" figure
 // seen in Inventory → Movement. That figure is computed as
@@ -16986,13 +17112,20 @@ async function confirmTxnImport(){
     if(_txnVoucherExists(isSales, v)){ skippedDupes++; return; }
     let partyId = '';
     let partyObj = null;
+    // FIX: matched on raw .toLowerCase() with no trim/whitespace-collapse —
+    // a stray leading/trailing/double space in the imported party name (very
+    // common from CSV/Excel exports) silently failed to match the existing
+    // party and created a visually-identical duplicate. Now uses _normName()
+    // so "M/S Anshu Marine ", "m/s  anshu marine", etc. all match the same
+    // existing row instead of spawning a second one.
+    const vPartyNorm = v.party ? _normName(v.party) : '';
     if(isSales){
-      let cust = v.party ? DB.customers.find(c=>c.name.toLowerCase()===v.party.toLowerCase()) : null;
-      if(!cust && v.party){ cust = {id:_genId('C', DB.customers), name:v.party, mobile:'', due:0, limit:0, lastDate:''}; DB.customers.push(cust); newParties.push(cust); }
+      let cust = vPartyNorm ? DB.customers.find(c=>_normName(c.name)===vPartyNorm) : null;
+      if(!cust && v.party){ cust = {id:_genId('C', DB.customers), name:v.party.trim().replace(/\s+/g,' '), mobile:'', due:0, limit:0, lastDate:''}; DB.customers.push(cust); newParties.push(cust); }
       partyId = cust ? cust.id : ''; partyObj = cust;
     } else {
-      let supp = v.party ? DB.suppliers.find(s=>s.name.toLowerCase()===v.party.toLowerCase()) : null;
-      if(!supp && v.party){ supp = {id:_genId('S', DB.suppliers), name:v.party, mobile:'', due:0}; DB.suppliers.push(supp); newParties.push(supp); }
+      let supp = vPartyNorm ? DB.suppliers.find(s=>_normName(s.name)===vPartyNorm) : null;
+      if(!supp && v.party){ supp = {id:_genId('S', DB.suppliers), name:v.party.trim().replace(/\s+/g,' '), mobile:'', due:0}; DB.suppliers.push(supp); newParties.push(supp); }
       partyId = supp ? supp.id : ''; partyObj = supp;
     }
     const lineItems = v.items.map(li=>{
@@ -17534,6 +17667,23 @@ function addCustomer(){
     }
     return;
   }
+  // FIX: same duplicate-on-create problem as addSupplier() above, mirrored
+  // here for customers.
+  const dupCust = DB.customers.find(c=>_normName(c.name)===_normName(name));
+  if(dupCust){
+    const useExisting = confirm(`A customer named "${dupCust.name}" already exists (current balance ${fmtSmart(getPartyDocBalance(dupCust,'customers'))}).\n\nPress OK to use the existing customer instead of creating a duplicate.\nPress Cancel to create "${name}" as a separate new record anyway.`);
+    if(useExisting){
+      closeAllSheets();
+      if(window._billingAddReturn==='customer'){
+        window._billingAddReturn = null;
+        billCustomer = dupCust;
+        goBillItems();
+      } else {
+        moneyTab('customers');
+      }
+      return;
+    }
+  }
   const newC = {id:_genId('C', DB.customers), name, mobile, due:openingBal, limit, lastDate:'', gstin, address, state};
   DB.customers.push(newC);
   persistDB(); syncCustomerRow(newC); toast('Customer added'); closeAllSheets();
@@ -17573,6 +17723,28 @@ function addSupplier(){
       moneyTab('suppliers');
     }
     return;
+  }
+  // FIX: creating a "New Supplier" never checked whether that name already
+  // existed, so a re-typed/re-imported name (or the same supplier added
+  // twice by mistake) silently created a second record with its own ID and
+  // its own balance — the exact cause of Supplier Ledger/Purchase Register
+  // showing the same party name twice with the total split across both
+  // rows. Now warns and offers to jump to the existing record instead.
+  const dupSupp = DB.suppliers.find(s=>_normName(s.name)===_normName(name));
+  if(dupSupp){
+    const useExisting = confirm(`A supplier named "${dupSupp.name}" already exists (current balance ${fmtSmart(getPartyDocBalance(dupSupp,'suppliers'))}).\n\nPress OK to use the existing supplier instead of creating a duplicate.\nPress Cancel to create "${name}" as a separate new record anyway.`);
+    if(useExisting){
+      closeAllSheets();
+      if(window._billingAddReturn==='purchSupplier'){
+        window._billingAddReturn = null;
+        window._purchReturning = true;
+        openSheet('purchaseSheet');
+        setTimeout(()=>{ selectPurchSupplier(dupSupp.id); }, 60);
+      } else {
+        moneyTab('suppliers');
+      }
+      return;
+    }
   }
   const newS = {id:_genId('S', DB.suppliers), name, mobile, due:openingBal, gstin, address, state};
   DB.suppliers.push(newS);
