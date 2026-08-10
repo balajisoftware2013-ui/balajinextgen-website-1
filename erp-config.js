@@ -379,6 +379,27 @@ const ERP = {
 };
 
 let _ERP_API_URL = ERP_FALLBACK_API;
+
+/* ── FIX ("data doesn't sync between devices" — inventory.html): every
+   page in this suite (purchase-module.html, bar_module.html, kitchen-
+   indent.html, chef-dashboard.html) already talks to the SAME real Apps
+   Script backend for inventory data sync (SYNC_PULL_ALL/SYNC_PUSH_TABLE/
+   SAVE_*), but each of those files hardcodes the URL locally — only
+   inventory.html was written to read it from a SHARED global instead
+   (window.BNX_API_URL / window.ERP_API_URL / window.INV_GAS_CORE, see
+   inventory.html's SCRIPT_URL line), and NOTHING ever set any of those
+   three globals — not here, not anywhere. So on inventory.html,
+   SCRIPT_URL silently resolved to '' forever, fetch('') hit the current
+   page instead of a real server, JSON parsing failed, and every push/
+   pull was swallowed by erpApi()'s catch block — inventory data has been
+   local-only, per-device, the entire time, even though the sync code
+   itself (DB.save/pullAllFromBackend/live polling) was written correctly.
+   Setting the real shared URL here — the ONE file every page already
+   loads first — makes inventory.html's existing fallback chain resolve
+   it automatically, with no per-page hardcoding needed. Same deployment
+   purchase-module.html already uses successfully (PURCHASE_GAS_URL). */
+window.INV_GAS_CORE = 'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec';
+
 const IS_LOCAL_FILE = (typeof location !== 'undefined' && location.protocol === 'file:');
 if (IS_LOCAL_FILE) { console.log('[ERP] Local file mode - GAS calls disabled'); }
 
