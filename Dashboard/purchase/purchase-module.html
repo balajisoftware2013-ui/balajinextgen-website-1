@@ -1575,26 +1575,69 @@ function load(){
   // not block page load; re-runs syncVendorsFromInventory()/
   // populateItemMasterDL() once real data lands so the screen updates
   // without needing a manual refresh.
+  // FIX (2026-08-11, "vendor search shows nothing" / "purchase saved but
+  // never reads back"): SYNC_PULL_ALL was never actually implemented in
+  // any backend router this project has — every call hit the router's
+  // default "Unknown action" case and failed silently (see 01_Router.gs
+  // v2's comment on this). InvBridge's 'vendors' table was therefore
+  // ALWAYS empty on a fresh session, which is why the vendor dropdown in
+  // the purchase modal never showed anything no matter what you typed.
+  // Replaced with ERP_LOAD_ALL (10_UnifiedDataLayer.gs) — one real call
+  // that reads the CONFIRMED canonical sheets (MASTER_DB.VENDOR_MASTER,
+  // 183 real vendors; MASTER_DB.ITEM_MASTER, 507 real items; PURCHASE_DB.
+  // PURCHASE_INVOICE, etc.) and returns them directly — no localStorage
+  // bridge step needed, so nothing here can silently stay empty.
   window.pullInventorySyncData = async function(){
     try{
       if (typeof erpApi !== 'function' || typeof CLIENT_ID === 'undefined' || !CLIENT_ID) return;
-      const res = await erpApi('SYNC_PULL_ALL', {});
-      if (res && res.success && res.tables){
-        Object.entries(res.tables).forEach(([table, rows]) => { InvBridge.save(table, rows); });
-        try{ syncVendorsFromInventory(); }catch(e){}
+      const res = await erpApi('ERP_LOAD_ALL', {});
+      if (res && res.success && res.data){
+        const d = res.data;
+        // Vendors: straight from MASTER_DB.VENDOR_MASTER, the real
+        // 183-row sheet — replaces syncVendorsFromInventory()'s old
+        // InvBridge-only source entirely.
+        if (Array.isArray(d.vendors) && d.vendors.length){
+          d.vendors.forEach(v=>{
+            const existing = DB.vendors.find(x=>x.id===v.id);
+            if (existing) Object.assign(existing, v);
+            else DB.vendors.push(v);
+          });
+        }
+        // Item master, if this screen uses it (populateItemMasterDL is a
+        // no-op guard if not present on this page).
+        if (Array.isArray(d.items) && typeof window.__lastServerItems === 'undefined') window.__lastServerItems = [];
+        if (Array.isArray(d.items)) window.__lastServerItems = d.items;
         try{ if (typeof populateItemMasterDL === 'function') populateItemMasterDL(); }catch(e){}
         try{ if (typeof populateWarehouseSelect === 'function') populateWarehouseSelect(); }catch(e){}
-        // FIX (mobile: "same client but shows blank/₹0.00" while desktop
-        // shows real data): the block above only ever applied SYNC_PULL_ALL
-        // to InvBridge's tables (vendors/items/warehouses). This module's
-        // OWN records — Purchase Invoices, Accounting Invoices, GRNs,
-        // Returns — live in the separate DB object, and DB only ever loaded
-        // from THIS device's localStorage (see load() above) with no
-        // pull-down step. So a second device/browser (fresh localStorage)
-        // rendered an empty dashboard even though the same client has real
-        // data on the server. Merge those tables into DB the same way,
-        // upserting by id so nothing local-only is lost.
-        try{ mergePurchaseSyncTables(res.tables); }catch(e){ console.warn('[pullInventorySyncData] purchase-table merge failed:', e.message); }
+        // Purchase invoices — real rows from PURCHASE_DB.PURCHASE_INVOICE,
+        // upserted by id so nothing local-only (e.g. not yet synced) gets
+        // wiped by the server copy.
+        if (Array.isArray(d.purchaseInvoices) && d.purchaseInvoices.length){
+          DB.purchases = DB.purchases || [];
+          d.purchaseInvoices.forEach(rec=>{
+            const idx = DB.purchases.findIndex(x=>x.id===rec.id);
+            if (idx>=0){
+              const orig = DB.purchases[idx];
+              const merged = {...orig, ...rec};
+              // Don't let an empty server-side items[] (e.g. this poll
+              // landed between the header save and the item-tab write)
+              // wipe a perfectly good local items array a few seconds
+              // after you saved it.
+              if ((!Array.isArray(rec.items)||!rec.items.length) && Array.isArray(orig.items) && orig.items.length){
+                merged.items = orig.items;
+              }
+              DB.purchases[idx] = merged;
+            } else {
+              DB.purchases.push(rec);
+            }
+          });
+        }
+        save();
+        try{ rendDash(); }catch(e){}
+        try{ rendPurchaseList(); }catch(e){}
+        try{ rendRegs(); }catch(e){}
+        try{ rendVendTb(); }catch(e){}
+        try{ if (typeof rendAnalytics === 'function') rendAnalytics(); }catch(e){}
       }
     }catch(e){ console.warn('[pullInventorySyncData] failed:', e.message); }
   };
@@ -2235,6 +2278,29 @@ function saveVend(){
   if(editId){const i=DB.vendors.findIndex(x=>x.id===editId);if(i>=0)DB.vendors[i]={...DB.vendors[i],...vend};}
   else DB.vendors.push(vend);
   try{ pushVendorToInventory(vend); }catch(e){ console.warn('Inventory vendor push skipped:',e); }
+  // FIX (2026-08-11, "vendor added but not showing" on reload/other
+  // device): saveVend() previously only ever wrote to DB.vendors
+  // (localStorage) and InvBridge (also localStorage) — never to the
+  // actual backend. MASTER_DB.VENDOR_MASTER (the real 183-row sheet
+  // vendor search reads from) never received this vendor at all.
+  // Fire-and-forget like the rest of this file's Drive/backend calls —
+  // doesn't block the UI; on success the server's real VENDOR_ID
+  // replaces our temporary local uid() so future saves update the same
+  // row instead of creating a duplicate.
+  if (typeof erpApi === 'function' && typeof CLIENT_ID !== 'undefined' && CLIENT_ID){
+    erpApi('ERP_SAVE_VENDOR', {
+      id: editId || undefined, name, mobile: vend.mobile, email: vend.email,
+      gstin: vend.gstin, address: vend.addr, city: vend.city, state: vend.state,
+      creditDays: vend.terms, outstanding: vend.outstanding
+    }).then(r=>{
+      if (r && r.success && r.id){
+        const idx = DB.vendors.findIndex(x=>x.id===vend.id);
+        if (idx>=0 && !editId){ DB.vendors[idx].id = r.id; save(); rendVendTb(); }
+      } else if (r && r.success===false){
+        console.warn('[saveVend] server save failed, kept locally only:', r.message);
+      }
+    }).catch(e=>console.warn('[saveVend] server save failed, kept locally only:', e.message));
+  }
   save();closeM('mVend');rendVendTb();rendDash();
   // Reset form
   ['v-name','v-contact','v-mobile','v-email','v-gstin','v-pan','v-addr','v-city','v-edit-id'].forEach(id=>sv(id,''));
