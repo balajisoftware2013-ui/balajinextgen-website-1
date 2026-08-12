@@ -6617,38 +6617,43 @@ document.addEventListener('click',e=>{const p=document.getElementById('notifPane
 // DASHBOARD
 // ════════════════════════════════════════
 // v19: dashboard cash/bank balance helpers (used by renderDashboard + Cash & Bank)
-function _computeCashBalance(){
+// v102 FIX ("Cash Book balance wrong on Today/This Week/Custom"): the cash
+// balance used to be computed by TWO separate, hand-duplicated code paths —
+// this function (used by the Dashboard/Cash & Bank "Cash in Hand" figure)
+// and a second copy inlined inside _stmtCashBook() for the Reports → Cash
+// Book "Opening Balance" (added in v101). Every time one of these got a fix
+// (v89, v94, v101...) the other quietly fell out of sync again, which is
+// exactly why the same "wrong balance" complaint kept coming back — the two
+// screens could legitimately disagree even though each was internally
+// consistent. There is now ONE cash-balance calculation, parameterised by
+// an "as of" cutoff date: _computeCashBalance() asks for the balance as of
+// right now (cutoff=null), _stmtCashBook() asks for the balance as of the
+// start of whichever period is selected (cutoff=range.from). Both also now
+// consistently fold in cash-register closing/reconciliation differences —
+// previously only this function did, so the Cash Book statement silently
+// ignored any counted difference recorded at a register closing.
+function _computeCashBalanceAsOf(cutoff){
   const cs = DB.cashSettings;
-  if (!cs || !cs.set) {
-    // No opening cash set up yet — fall back to a pure net of cash-mode
-    // transactions so the dashboard still shows something meaningful.
-    return DB.transactions.filter(t=>(t.mode||'Cash')==='Cash').reduce((s,t)=>s+(t.type==='income'?1:-1)*(Number(t.amount)||0),0);
-  }
-  // v94 FIX: this used to skip any cash transaction dated before
-  // cs.openingDate ("if (new Date(t.date) < fromDate) return;"). If the
-  // opening date defaults to today while real transaction history goes
-  // back further (very common — the opening-balance step is often set
-  // up after transactions already exist), this silently threw away all
-  // that history and returned a far-too-low balance (often ₹0), while
-  // the detailed Cash Book statement (_stmtDayBook) — which sums ALL
-  // cash transactions plus the opening amount, with no date cutoff —
-  // showed the correct number. That mismatch was the root cause behind
-  // the wrong/negative Opening Balance on the Yearly/Custom Cash Report,
-  // "Monthly shows ₹0", and Cash in Hand disagreeing with the real
-  // ledger. Now matches _stmtDayBook's logic exactly.
-  let bal = Number(cs.openingAmount)||0;
+  const hasOpening = !!(cs && cs.set);
+  // No opening cash set up yet — fall back to a pure net of cash-mode
+  // transactions (as of the cutoff) so every screen still shows something
+  // meaningful, and all screens fall back the same way.
+  let bal = hasOpening ? (Number(cs.openingAmount)||0) : 0;
   DB.transactions.forEach(t=>{
     if ((t.mode||'Cash') !== 'Cash') return;
     if (!t.date) return;
+    if (cutoff && !(new Date(t.date) < cutoff)) return; // only count strictly-before-cutoff entries when a cutoff is given
     bal += (t.type==='income'?1:-1)*(Number(t.amount)||0);
   });
-  // Fold in any past reconciliation differences recorded at closing time
-  // (theft/counting error/etc.) so the running balance stays accurate
-  // going forward without needing a daily "opening" step.
-  Object.values(DB.cashRegister||{}).forEach(reg=>{
-    if (reg.closing && reg.closing.difference) bal += (Number(reg.closing.difference)||0);
+  Object.entries(DB.cashRegister||{}).forEach(([dateKey,reg])=>{
+    if (!(reg && reg.closing && reg.closing.difference)) return;
+    if (cutoff && !(new Date(dateKey) < cutoff)) return;
+    bal += (Number(reg.closing.difference)||0);
   });
   return bal;
+}
+function _computeCashBalance(){
+  return _computeCashBalanceAsOf(null);
 }
 function _computeBankBalance(){
   _ensureBankAccounts();
@@ -10892,7 +10897,6 @@ function _stmtCashBook(range, txns){
   }
   
   const cashTx = txns.filter(t=>(t.mode||'Cash')==='Cash');
-  const cs = DB.cashSettings;
   
   // v101 FIX: opening balance used to be pinned to the 1st of range.from's
   // month no matter what period was selected -- correct for a full-month
@@ -10903,27 +10907,32 @@ function _stmtCashBook(range, txns){
   // the running balance carried forward through 11 Aug). Opening balance
   // is now the running balance as of the actual start of the selected
   // period, matching what "Opening Balance (this period)" means.
-  let opening = 0;
-  if (cs && cs.set) {
-    // Get all cash transactions BEFORE this period
-    const beforeRange = new Date(range.from);
-    const beforeTx = DB.transactions.filter(t=>{
-      const d = new Date(t.date);
-      return (t.mode||'Cash')==='Cash' && d < beforeRange;
-    });
-    
-    // Calculate cumulative balance from opening balance to start of this period
-    let cumulative = cs.openingAmount || 0;
-    beforeTx.forEach(t => {
-      cumulative += (t.type==='income'?1:-1)*(Number(t.amount)||0);
-    });
-    opening = cumulative;
-  } else {
-    // Fallback: use current balance minus period net (old method)
-    const periodNet = cashTx.reduce((s,t)=>s+(t.type==='income'?1:-1)*(Number(t.amount)||0),0);
-    const currentBal = _computeCashBalance();
-    opening = currentBal - periodNet;
-  }
+  // v102 FIX: this used to be a second, hand-copied balance calculation
+  // that could (and did) drift from _computeCashBalance() -- e.g. it never
+  // folded in cash-register reconciliation differences, so the Cash Book's
+  // Opening/Closing Balance could disagree with "Cash in Hand" on the
+  // Dashboard / Cash & Bank page even for the exact same moment in time.
+  // Now calls the same shared helper both screens use, just "as of" the
+  // start of this period instead of "as of now".
+  const opening = _computeCashBalanceAsOf(range.from);
+  
+  // v105 FIX ("Balance goes more negative each row, looks wrong" — turned
+  // out to be the Category/Payment-Mode filter box on the Cash Book): the
+  // Opening/running/Closing Balance figures are only meaningful against
+  // ALL cash transactions. The moment a Category or Payment Mode filter
+  // is applied (e.g. "Employee - Salaries & Wages" only), the table only
+  // shows a slice of the day's activity, but the running Balance column
+  // used to start from the REAL opening cash figure and then add only the
+  // filtered rows — producing a number that looked like a real, ever-more-
+  // negative cash balance but was actually meaningless (a mix of the true
+  // starting cash plus only-this-category spend, ignoring every other
+  // transaction that also happened). That's exactly what made "Balance"
+  // look broken. When a filter is active, the Opening/Closing Balance
+  // cards and the Balance column are hidden entirely rather than show a
+  // number that can't be trusted — Receipt/Payment columns and the Total
+  // Income/Expense/Net Cash Flow summary below (which only ever total the
+  // filtered rows themselves, not a running balance) stay accurate either way.
+  const isFiltered = !!(_stmtFilterCat || _stmtFilterMode);
   
   // v99 FIX: Sort transactions by date BEFORE rendering to ensure all transactions show in order
   // and last transaction is not cut off
@@ -10940,7 +10949,7 @@ function _stmtCashBook(range, txns){
       <td data-label="Category" style="font-size:13px;color:var(--muted);padding:10px">${_catSubLabel(t.cat)||'-'}</td>
       <td data-label="Receipt" style="color:var(--emerald);text-align:right;padding:10px;font-weight:600">${t.type==='income'?fmt(t.amount):'-'}</td>
       <td data-label="Payment" style="color:var(--danger);text-align:right;padding:10px;font-weight:600">${t.type==='expense'?fmt(t.amount):'-'}</td>
-      <td data-label="Balance" style="font-weight:700;text-align:right;padding:10px;background:var(--primary-soft);border-radius:6px">${fmt(running)}</td>
+      ${isFiltered ? '' : `<td data-label="Balance" style="font-weight:700;text-align:right;padding:10px;background:var(--primary-soft);border-radius:6px">${fmt(running)}</td>`}
     </tr>`;
   }).join('');
 
@@ -12325,6 +12334,14 @@ function printElementReport(elId, title, subtitle){
     <style>body{font-family:Arial,sans-serif;padding:24px;color:#1a1a1a}
     table{width:100%;border-collapse:collapse;margin-top:10px}
     td,th{border:1px solid #ccc;padding:6px 8px;font-size:15px;text-align:left}
+    /* v104 FIX ("date not proper show when print"): every statement table
+       (Day Book, Cash Book, Bank Book, Ledger, Payment/Receipt Report) tags
+       its Date cell with data-label="Date". On a narrow print/PDF page a
+       plain <td> is free to line-wrap wherever the browser likes, and a
+       date like "2026-07-08" happens to have a hyphen right at a natural
+       break point, so it was wrapping to "2026-" / "07-08" on two lines.
+       Dates should never wrap — keep them on one line. */
+    td[data-label="Date"]{white-space:nowrap}
     thead{display:table-header-group}
     tfoot{display:table-footer-group}
     /* v99 FIX: without this, a table row could land exactly on a page
@@ -12489,6 +12506,14 @@ async function _reportElementToCanvas(elId, title, subtitle){
   wrapper.appendChild(el.cloneNode(true));
   wrapper.querySelectorAll('table').forEach(t=>{ t.style.width='100%'; t.style.borderCollapse='collapse'; t.style.marginTop='10px'; });
   wrapper.querySelectorAll('td,th').forEach(c=>{ c.style.border='1px solid #ccc'; c.style.padding='6px 8px'; c.style.fontSize='12px'; c.style.textAlign='left'; c.style.color='#1a1a1a'; });
+  // v104 FIX ("date not proper show when send/print"): the wrapper is a
+  // fixed 720px box, and forcing every table to width:100% squeezes a
+  // 6-7 column statement table (Date/Description/Category/.../Balance)
+  // down until the Date column is only ~50-60px wide. A plain <td> wraps
+  // wherever it likes at that width, and "2026-07-08" happens to break
+  // right at the hyphen, exactly like the "2026-" / "07-08" two-line date
+  // seen in exported images. Dates should never wrap onto a second line.
+  wrapper.querySelectorAll('td[data-label="Date"]').forEach(c=>{ c.style.whiteSpace='nowrap'; });
   wrapper.querySelectorAll('.calc-row').forEach(r=>{ r.style.display='flex'; r.style.justifyContent='space-between'; r.style.padding='6px 0'; r.style.borderBottom='1px solid #eee'; r.style.fontSize='12px'; r.style.color='#1a1a1a'; });
   wrapper.querySelectorAll('*').forEach(node=>{ node.style.background='transparent'; });
   wrapper.style.background = '#ffffff';
@@ -12615,12 +12640,26 @@ async function shareReportPDF(elId, title){
     doc.text(text, marginX, y); y += 12;
   }
   function drawTable(tableEl){
+    // v104 FIX ("date not proper show when print/send"): only the Date
+    // column needs a guaranteed minimum width to avoid wrapping — forcing
+    // that same fixed width onto column 0 of every table would wrongly
+    // squeeze the Category × Month matrix table (whose first column is a
+    // long category name, not a date). Detect a real Date column by its
+    // data-label rather than assuming "column 0" everywhere.
+    const hasDateCol = !!tableEl.querySelector('td[data-label="Date"]');
     doc.autoTable({
       html: tableEl.id ? ('#'+tableEl.id) : tableEl,
       startY: y,
       margin: { left: marginX, right: marginX, top: 36, bottom: bottomMargin },
       theme: 'grid',
       styles: { fontSize: 8.5, cellPadding: 5, textColor: [30,30,30], lineColor: [225,225,225], lineWidth: 0.5, overflow: 'linebreak' },
+      // Every statement table (Day Book, Cash Book, Bank Book, Ledger,
+      // Payment/Receipt Report) puts Date in the first column. autoTable's
+      // automatic column-width algorithm could still squeeze that column
+      // narrower than a date needs on a crowded table (7 columns on a
+      // portrait A4 page), wrapping "2026-07-08" onto two lines. Reserve
+      // enough fixed width for a full date so it always stays on one line.
+      columnStyles: hasDateCol ? { 0: { cellWidth: 60 } } : {},
       headStyles: { fillColor: [255,122,26], textColor: [255,255,255], fontStyle: 'bold', fontSize: 8.5 },
       alternateRowStyles: { fillColor: [255,247,240] },
       didParseCell: (data)=>{
@@ -16311,6 +16350,40 @@ document.addEventListener('keydown', function(e) {
 // Only active once logged in, and never hijacks typing inside a text
 // field/textarea/select (except Esc, which always closes an open modal).
 // ════════════════════════════════════════
+// v103 FIX ("filling a date opens Search Everything"): the v41 fix below
+// switched from e.target to document.activeElement to detect "person is
+// typing in a field", on the theory that activeElement always reflects the
+// real focused control even while a native <input type="date">'s calendar
+// popup is open. In practice it doesn't — clicking a day in the popup, or
+// the up/down spinner arrows on a date/number field, can move
+// document.activeElement to document.body for a single tick even though
+// the person is still actively using that field, exactly like the
+// e.target mismatch v41 was trying to fix. A digit typed at that exact
+// tick still got hijacked into the global "type anywhere to search"
+// shortcut and popped the Search Everything modal instead of reaching the
+// date field.
+// Fix: track the most-recently-focused form field ourselves via
+// focusin/focusout, and keep treating it as "still typing there" for a
+// short grace window after a focusout — long enough to cover the popup's
+// momentary focus flicker, short enough that genuinely tabbing/clicking
+// away still lets the search shortcut work normally afterwards.
+let _lastFocusedFormEl = null;
+let _formFocusLostTimer = null;
+function _isFormFieldEl(el){
+  if (!el) return false;
+  const t = el.tagName;
+  return t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT' || !!el.isContentEditable;
+}
+document.addEventListener('focusin', function(e){
+  if (!_isFormFieldEl(e.target)) return;
+  _lastFocusedFormEl = e.target;
+  if (_formFocusLostTimer) { clearTimeout(_formFocusLostTimer); _formFocusLostTimer = null; }
+}, true);
+document.addEventListener('focusout', function(e){
+  if (!_isFormFieldEl(e.target) || e.target !== _lastFocusedFormEl) return;
+  if (_formFocusLostTimer) clearTimeout(_formFocusLostTimer);
+  _formFocusLostTimer = setTimeout(()=>{ _lastFocusedFormEl = null; _formFocusLostTimer = null; }, 350);
+}, true);
 document.addEventListener('keydown', function(e){
   if (!currentUser) return; // only inside the app, not on the auth screen
   // v41: use document.activeElement rather than e.target to decide whether
@@ -16322,9 +16395,11 @@ document.addEventListener('keydown', function(e){
   // global Search Everything modal instead of reaching the date field.
   // activeElement always reflects the real focused control, so it isn't
   // fooled by that popup-related target mismatch.
+  // v103: also honour the recently-focused-field grace window above, for
+  // the cases activeElement itself gets fooled too (see comment above).
   const active = document.activeElement;
   const tag = (active && active.tagName) || '';
-  const isTyping = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (active && active.isContentEditable);
+  const isTyping = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (active && active.isContentEditable) || !!_lastFocusedFormEl;
 
   if (e.key === 'Escape') {
     const openModalEl = document.querySelector('.modal-backdrop.open');
