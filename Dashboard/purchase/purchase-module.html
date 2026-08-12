@@ -1653,10 +1653,25 @@ function load(){
               if ((!Array.isArray(rec.items)||!rec.items.length) && Array.isArray(orig.items) && orig.items.length){
                 merged.items = orig.items;
               }
+              // CONFIRMED by server — this id genuinely exists in
+              // PURCHASE_DB.PURCHASE_INVOICE right now. Clears any stale
+              // "not synced" state from before.
+              merged.synced = true;
               DB.purchases[idx] = merged;
             } else {
+              rec.synced = true; // came straight from the server, so by definition confirmed
               DB.purchases.push(rec);
             }
+          });
+          // FIX ("data can save anywhere and be accessible anywhere" — the
+          // ₹888.99 Sarda Enterprise record showing on the dashboard with
+          // an empty PURCHASE_INVOICE sheet): any LOCAL record whose id is
+          // NOT in this full server list, and which was never confirmed
+          // synced, genuinely never reached the server — mark it instead
+          // of letting it silently look identical to a real save forever.
+          const serverIds = new Set(d.purchaseInvoices.map(r=>r.id));
+          DB.purchases.forEach(p=>{
+            if (p.synced!==true && !serverIds.has(p.id)) p.syncUnconfirmed=true;
           });
         }
         save();
@@ -2952,7 +2967,18 @@ function savePurchase(sendApproval,forceSave){
     due:v('p-due'),notes:v('p-notes'),status,approvalLevel:v('p-approval'),
     billFileUrl:pendingBillDriveLink||'', // link to the original scanned bill in Drive, if one was uploaded this session
     tallyStatus:'PENDING',
-    createdAt:new Date().toISOString()
+    createdAt:new Date().toISOString(),
+    // FIX ("data can save anywhere and be accessible anywhere" / dashboard
+    // showed an invoice the actual Google Sheet never received): this app
+    // is local-first — the record above renders on screen the instant you
+    // click Save, BEFORE the server call below even starts. If that server
+    // call fails (or was never reachable), there was previously NOTHING
+    // distinguishing that failed save from a real one — same row, same
+    // "Approved"/"Draft" badge, forever. synced starts false and only
+    // flips true once erpApi() genuinely confirms success (see below and
+    // in rendDash/rendRegs where synced===false now shows a visible badge
+    // instead of silently looking identical to a confirmed save).
+    synced:false
   };
 
   if(editingPurchaseId){
@@ -2976,7 +3002,15 @@ function savePurchase(sendApproval,forceSave){
     toast(`${doc.no} updated successfully.`,'ok','✏️');
     savePurchaseToDrive(doc,vend);
     if(pendingManualBillFile)uploadManualBillAndAttach(doc.id,doc.mode);
-    erpApi('UPDATE_PURCHASE_INVOICE', doc).then(r=>{ if(r&&r.success===false) toast('⚠️ '+doc.no+' updated locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️'); });
+    erpApi('UPDATE_PURCHASE_INVOICE', doc).then(r=>{
+      if(r&&r.success===false){
+        toast('⚠️ '+doc.no+' updated locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️');
+      }else if(r&&r.success){
+        const arr3=doc.mode==='accounting'?DB.acctInvs:DB.purchases;
+        const idx3=arr3.findIndex(x=>x.id===doc.id);
+        if(idx3>=0){arr3[idx3].synced=true;save();rendDash();rendRegs();}
+      }
+    });
     if(doc.mode==='inventory'){ try{ pushPurchaseToInventory(doc,vend); }catch(e){ console.warn('Inventory push skipped:',e); } }
     enqueueTallyVoucher(doc,vend);
     return;
@@ -2994,7 +3028,17 @@ function savePurchase(sendApproval,forceSave){
   savePurchaseToDrive(doc, vend);
   if(pendingManualBillFile)uploadManualBillAndAttach(doc.id,doc.mode);
   // ── PUSH TO REAL BACKEND (client-wise database — see CLIENT_ID/erpApi note at top of file) ──
-  erpApi('SAVE_PURCHASE_INVOICE', doc).then(r=>{ if(r&&r.success===false) toast('⚠️ '+doc.no+' saved locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️'); });
+  erpApi('SAVE_PURCHASE_INVOICE', doc).then(r=>{
+    if(r&&r.success===false){
+      toast('⚠️ '+doc.no+' saved locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️');
+    }else if(r&&r.success){
+      const arr2=doc.mode==='accounting'?DB.acctInvs:DB.purchases;
+      const idx2=arr2.findIndex(x=>x.id===doc.id);
+      if(idx2>=0){arr2[idx2].synced=true;save();rendDash();rendRegs();}
+    }else{
+      toast('⚠️ '+doc.no+' saved locally, but got no confirmation from server — check connection','warn','☁️');
+    }
+  });
   // ── PUSH TO INVENTORY: updates Item Master, Purchase Register & Voucher (accounting only — stock moves on GRN acceptance, see pushGRNStockLedger) ──
   if(doc.mode==='inventory'){ try{ pushPurchaseToInventory(doc,vend); }catch(e){ console.warn('Inventory push skipped:',e); } }
   // ── QUEUE FOR TALLY (posted later, only when this page is open on the PC with Tally — see pollTallyQueue) ──
@@ -4773,7 +4817,7 @@ function rendDash(){
     const recent=[...DB.purchases.map(p=>({...p,_mode:'inventory'})),...DB.acctInvs.map(p=>({...p,_mode:'accounting'}))]
       .sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).slice(0,6);
     if(!recent.length){recEl.innerHTML='<div style="text-align:center;padding:24px;color:var(--text3);font-style:italic">No purchases yet.</div>';}
-    else recEl.innerHTML='<div class="tw"><table><thead><tr><th>Invoice</th><th>Date</th><th>Vendor</th><th>Amount</th><th>Bill</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+recent.map(p=>`<tr><td><b>${p.no}</b></td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td><td class="td-r"><b>${fmt(p.grand)}</b></td><td>${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View enclosed bill">📎</a>`:'<span class="badge b-gray" style="font-size:9px">—</span>'}</td><td><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':p.status==='Approved'?'b-green':'b-red'}">${p.status}</span></td><td style="white-space:nowrap"><button class="btn btn-xs" onclick="viewPurchase('${p.id}','${p._mode}')">👁</button> <button class="btn btn-xs" onclick="editPurchase('${p.id}','${p._mode}')">✏️</button> <button class="btn btn-xs btn-red" onclick="deletePurchase('${p.id}','${p._mode}')">🗑️</button></td></tr>`).join('')+'</tbody></table></div>';
+    else recEl.innerHTML='<div class="tw"><table><thead><tr><th>Invoice</th><th>Date</th><th>Vendor</th><th>Amount</th><th>Bill</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+recent.map(p=>`<tr><td><b>${p.no}</b>${p.syncUnconfirmed?` <span class="badge b-red" style="font-size:8px" title="This id was not found on the server — save may have failed">⚠ NOT SYNCED</span>`:(p.synced!==true?` <span class="badge b-amber" style="font-size:8px" title="Saved locally, waiting for server confirmation">⏳ syncing…</span>`:'')}</td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td><td class="td-r"><b>${fmt(p.grand)}</b></td><td>${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View enclosed bill">📎</a>`:'<span class="badge b-gray" style="font-size:9px">—</span>'}</td><td><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':p.status==='Approved'?'b-green':'b-red'}">${p.status}</span></td><td style="white-space:nowrap"><button class="btn btn-xs" onclick="viewPurchase('${p.id}','${p._mode}')">👁</button> <button class="btn btn-xs" onclick="editPurchase('${p.id}','${p._mode}')">✏️</button> <button class="btn btn-xs btn-red" onclick="deletePurchase('${p.id}','${p._mode}')">🗑️</button></td></tr>`).join('')+'</tbody></table></div>';
   }
   updateApprCount();
 }
@@ -5255,7 +5299,7 @@ function rendRegs(){
       const tallyBadge=p.tallyStatus==='POSTED'?'<span class="badge b-green" style="font-size:9px">✓ Posted</span>':p.tallyStatus==='FAILED'?'<span class="badge b-red" style="font-size:9px" title="'+xmlEscape(p.tallyError||'')+'">⚠ Failed</span>':'<span class="badge b-gray" style="font-size:9px">Pending</span>';
       const mainRow=`<tr>
         <td>${itemCount?`<button class="btn btn-xs" onclick="toggleRegItems('${p.id}')" id="reg-items-btn-${p.id}" title="Show ${itemCount} item(s)">▸</button>`:''}</td>
-        <td><b>${p.no}</b></td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td>
+        <td><b>${p.no}</b>${p.syncUnconfirmed?` <span class="badge b-red" style="font-size:8px" title="This id was not found on the server — save may have failed">⚠ NOT SYNCED</span>`:(p.synced!==true?` <span class="badge b-amber" style="font-size:8px" title="Saved locally, waiting for server confirmation">⏳ syncing…</span>`:'')}</td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td>
         <td><span class="badge b-teal">${p.mode||'inventory'}</span></td>
         <td><span class="badge b-purple" style="font-size:10px;white-space:nowrap">${_ln}</span></td>
         <td class="td-r">${fmt(p.taxable)}</td><td class="td-r">${fmt(p.gstTotal)}</td><td class="td-r"><b>${fmt(p.grand)}</b></td>
