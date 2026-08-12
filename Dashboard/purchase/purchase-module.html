@@ -2404,46 +2404,26 @@ function delVend(id){
 
 // ════ SAVE VENDOR TO GOOGLE DRIVE ════
 async function saveVendorToDrive(vend,isEdit){
-  if(!gDriveReady||!gAccessToken){
-    // Silent — don't bother user if Drive not connected
-    return;
+  if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID){
+    return; // silent — don't bother user if no client session, matches original behaviour
   }
   try{
-    // Build a human-readable JSON file for the vendor
     const vendorRecord={
       ...vend,
       exportedAt:new Date().toISOString(),
       appName:'Balaji NextGen Smart Procurement'
     };
-    const jsonStr=JSON.stringify(vendorRecord,null,2);
-    const blob=new Blob([jsonStr],{type:'application/json'});
-
-    // FIX ("clients folder also manual changes... items save to vendor
-    // save"): this used to save straight into the shared GLOBAL Drive
-    // root's "Vendors" folder — every client's vendors mixed together in
-    // one place, un-scoped to any client. Now goes through
-    // getClientRootFolder() like every other save in this file, so each
-    // client's vendor files land inside THEIR OWN existing folder in
-    // CLIENT_DATABASES, under a VENDORS subfolder.
-    const clientRootId=await getClientRootFolder();
-    const vendorsFolderId=await getOrCreateFolder('VENDORS',clientRootId);
     const safeVendName=(vend.name||'Unknown').replace(/[<>:"/\\|?*]/g,'_');
-    const vendFolderId=await getOrCreateFolder(safeVendName,vendorsFolderId);
-
-    // File name: vendor_GSTIN_timestamp.json or vendor_name_timestamp.json
     const gstinPart=vend.gstin?vend.gstin:'NOGSTIN';
     const datePart=new Date().toISOString().split('T')[0];
     const fileName=`vendor_${gstinPart}_${datePart}.json`;
+    const jsonB64=btoa(unescape(encodeURIComponent(JSON.stringify(vendorRecord,null,2))));
 
-    const metadata={name:fileName,parents:[vendFolderId]};
-    const form=new FormData();
-    form.append('metadata',new Blob([JSON.stringify(metadata)],{type:'application/json'}));
-    form.append('file',blob);
-    const res=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',{
-      method:'POST',headers:{Authorization:'Bearer '+gAccessToken},body:form
+    const res=await erpApi('UPLOAD_TO_CLIENT_DRIVE',{
+      clientId:CLIENT_ID, fileName, mimeType:'application/json', base64Data:jsonB64,
+      subPath:['VENDORS',safeVendName]
     });
-    const j=await res.json();
-    if(j.id){
+    if(res&&res.success){
       toast(`📁 Vendor saved to Drive: ${safeVendName}`,'ok','✅');
     }
   }catch(e){
@@ -2453,79 +2433,62 @@ async function saveVendorToDrive(vend,isEdit){
 }
 
 // ════ SAVE PURCHASE INVOICE TO GOOGLE DRIVE (Client-wise) ════
+// FIX ("professional default google drive auto save" — extending the same
+// fix already applied to manual bill attach / Open Client Drive Folder):
+// this used to require gDriveReady/gAccessToken OAuth. Now builds the same
+// 2 files (JSON summary + CSV) client-side (cheap, no network/auth needed
+// for that part) and uploads both through the server (DriveUpload_Direct.
+// gs's UPLOAD_TO_CLIENT_DRIVE), which uses Apps Script's own Drive access.
+// Same folder structure as before: [Client] → Purchase Invoice →
+// [VendorName] → [YYYY-MM].
 async function savePurchaseToDrive(doc, vend){
-  // FIX ("Drive save invoices"): this used to return here completely
-  // silently whenever Drive wasn't connected — the in-app invoice save
-  // (savePurchase() above) always succeeds and toasts "saved" regardless,
-  // so there was no visible sign the Drive copy never happened. Combined
-  // with gDriveReady never being restored at boot (see init()) and the
-  // implicit-flow token expiring after ~1hr with no auto-refresh, invoices
-  // could go quietly un-synced to Drive for an entire session. Now this
-  // says so, once per invoice, so it's obvious to reconnect instead of
-  // discovering it later from an empty Drive folder.
-  if(!gDriveReady||!gAccessToken){
-    toast(`⚠️ ${doc.no} saved in-app, but NOT synced to Drive — click "⚠️ Drive: Not connected" (top bar) to reconnect`,'warn','☁️');
+  if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID){
+    toast(`⚠️ ${doc.no} saved in-app, but NOT synced to Drive — no client session`,'warn','☁️');
     return;
   }
   try{
-    // Build folder path: [Client] → Purchase Invoice → [VendorName] → [YYYY-MM] → invoice files
-    const clientRootId = await getClientRootFolder();
-    const purchaseRootId = await getOrCreateFolder('Purchase Invoice', clientRootId);
     const safeVendName = (vend?.name||doc.vendorName||'Unknown_Vendor').replace(/[<>:"/\\|?*]/g,'_');
-    const vendFolderId = await getOrCreateFolder(safeVendName, purchaseRootId);
     const monthStr = (doc.date||new Date().toISOString().split('T')[0]).slice(0,7); // YYYY-MM
-    const monthFolderId = await getOrCreateFolder(monthStr, vendFolderId);
+    const subPath = ['Purchase Invoice', safeVendName, monthStr];
 
-    // Note: the original scanned bill file is uploaded once, at scan-time
-    // (see uploadToDrive() in processInvoiceScan), and its link is carried
-    // through onto doc.billFileUrl by savePurchase() — not re-uploaded here,
-    // to avoid saving a duplicate copy of the same file on every edit/re-save.
+    // Note: the original scanned bill file is uploaded once, at scan-time,
+    // and its link is carried through onto doc.billFileUrl by savePurchase()
+    // — not re-uploaded here, to avoid saving a duplicate copy on every edit.
 
-    // 1. Save invoice JSON summary
+    // 1. Invoice JSON summary
     const invoiceSummary = {
-      MODULE: 'PURCHASE',
-      INVOICE_NO: doc.no,
-      INVOICE_DATE: doc.date,
-      VENDOR_NAME: doc.vendorName,
-      VENDOR_GSTIN: vend?.gstin||'',
-      MODE: doc.mode,
-      ITEMS: doc.items,
-      SUBTOTAL: doc.subtotal,
-      TAXABLE: doc.taxable,
-      GST_TOTAL: doc.gstTotal,
-      TCS: doc.tcs||0,
-      GRAND_TOTAL: doc.grand,
-      STATUS: doc.status,
-      PO_REF: doc.poRef||'',
-      GRN_REF: doc.grnRef||'',
-      NOTES: doc.notes||'',
-      SAVED_AT: new Date().toISOString(),
-      APP: 'Balaji NextGen ERP'
+      MODULE: 'PURCHASE', INVOICE_NO: doc.no, INVOICE_DATE: doc.date,
+      VENDOR_NAME: doc.vendorName, VENDOR_GSTIN: vend?.gstin||'', MODE: doc.mode,
+      ITEMS: doc.items, SUBTOTAL: doc.subtotal, TAXABLE: doc.taxable,
+      GST_TOTAL: doc.gstTotal, TCS: doc.tcs||0, GRAND_TOTAL: doc.grand,
+      STATUS: doc.status, PO_REF: doc.poRef||'', GRN_REF: doc.grnRef||'',
+      NOTES: doc.notes||'', SAVED_AT: new Date().toISOString(), APP: 'Balaji NextGen ERP'
     };
-    const jsonBlob = new Blob([JSON.stringify(invoiceSummary, null, 2)], {type:'application/json'});
     const jsonName = `${doc.no}_${safeVendName}_${doc.date}.json`;
-    await uploadFileToDrive(jsonName, jsonBlob, monthFolderId);
+    const jsonB64 = btoa(unescape(encodeURIComponent(JSON.stringify(invoiceSummary,null,2))));
+    const r1 = await erpApi('UPLOAD_TO_CLIENT_DRIVE',{clientId:CLIENT_ID,fileName:jsonName,mimeType:'application/json',base64Data:jsonB64,subPath});
 
-    // 2. Also save a CSV line-items file
+    // 2. CSV line-items file
     const csvHeader = 'Invoice No,Date,Vendor,Item,HSN,Qty,Unit,Rate,Disc%,GST%,Tax Amt,Amount\n';
     const csvRows = (doc.items||[]).map(it =>
       `"${doc.no}","${doc.date}","${doc.vendorName}","${it.name||''}","${it.hsn||''}",${it.qty||0},"${it.unit||''}",${it.rate||0},${it.disc||0},${it.gst||0},${it.taxAmt||0},${it.amt||0}`
     ).join('\n');
-    const csvBlob = new Blob([csvHeader+csvRows], {type:'text/csv'});
     const csvName = `${doc.no}_items_${doc.date}.csv`;
-    await uploadFileToDrive(csvName, csvBlob, monthFolderId);
+    const csvB64 = btoa(unescape(encodeURIComponent(csvHeader+csvRows)));
+    const r2 = await erpApi('UPLOAD_TO_CLIENT_DRIVE',{clientId:CLIENT_ID,fileName:csvName,mimeType:'text/csv',base64Data:csvB64,subPath});
+
+    if(!r1||!r1.success||!r2||!r2.success){
+      toast(`⚠️ ${doc.no} saved in-app, but Drive sync failed: `+((r1&&r1.message)||(r2&&r2.message)||'unknown error'),'warn','☁️');
+      return;
+    }
 
     toast(`📁 Invoice ${doc.no} saved to Drive → ${CLIENT_ID||DB.co?.name||'Client'}/Purchase Invoice/${safeVendName}/${monthStr}`,'ok','✅');
-    // Store the drive folder link — direct link to the real month folder
-    // this file just landed in (previously a generic Drive *search* URL,
-    // which worked but took an extra click/search instead of opening
-    // straight to the right place).
     const idx = doc.mode==='accounting'
       ? DB.acctInvs.findIndex(x=>x.id===doc.id)
       : DB.purchases.findIndex(x=>x.id===doc.id);
     if(idx>=0){
       const arr = doc.mode==='accounting' ? DB.acctInvs : DB.purchases;
-      arr[idx].driveFolder = `https://drive.google.com/drive/folders/${monthFolderId}`;
+      arr[idx].driveFolder = r1.folderUrl;
       arr[idx].driveSaved = true;
       save();
     }
@@ -2537,17 +2500,17 @@ async function savePurchaseToDrive(doc, vend){
 
 // ════ SAVE ATTACHMENT FILE TO GOOGLE DRIVE ════
 async function saveAttachmentFileToDrive(file, purchaseNo, vendorName){
-  if(!gDriveReady||!gAccessToken) return null;
+  if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID) return null;
   try{
-    const clientRootId = await getClientRootFolder();
-    const purchaseRootId = await getOrCreateFolder('Purchase Invoice', clientRootId);
     const safeVendName = (vendorName||'Unknown_Vendor').replace(/[<>:"/\\|?*]/g,'_');
-    const vendFolderId = await getOrCreateFolder(safeVendName, purchaseRootId);
-    const attFolderId = await getOrCreateFolder('Attachments', vendFolderId);
     const ext = file.name.split('.').pop()||'bin';
     const fname = `${purchaseNo}_attachment_${Date.now()}.${ext}`;
-    const fileId = await uploadFileToDrive(fname, file, attFolderId);
-    return fileId ? `https://drive.google.com/file/d/${fileId}/view` : null;
+    const base64Data = await fileToBase64_(file);
+    const res = await erpApi('UPLOAD_TO_CLIENT_DRIVE',{
+      clientId:CLIENT_ID, fileName:fname, mimeType:file.type||'application/octet-stream', base64Data,
+      subPath:['Purchase Invoice',safeVendName,'Attachments']
+    });
+    return (res&&res.success&&res.url) ? res.url : null;
   }catch(e){
     console.warn('Attachment Drive save failed:',e);
     return null;
@@ -5183,7 +5146,7 @@ function renderPaymentAdvice(){
 // that same month later.
 let _pendingLedgerCtx=null;
 function triggerLedgerUpload(vendorName,month){
-  if(!gDriveReady||!gAccessToken){toast('Connect Google Drive in Settings first to upload ledgers','warn','⚠️');return;}
+  if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID){toast('No client session — log in through the site first','warn','⚠️');return;}
   _pendingLedgerCtx={vendorName,month};
   let inp=el('_ledgerUploadInp');
   if(!inp){
@@ -5201,19 +5164,19 @@ async function handleLedgerFileChosen(e){
   const {vendorName,month}=_pendingLedgerCtx;_pendingLedgerCtx=null;
   toast('📁 Uploading ledger for '+vendorName+' ('+month+')...','','📤');
   try{
-    // FIX ("Ledger folder under client folder" — as its own top-level
-    // folder, a SIBLING of Purchase Invoice, not buried inside it):
-    // CLIENT_DATABASES / [Client] / Ledger / [Vendor] / [Month] / file
-    const clientRootId=await getClientRootFolder();
-    const ledgerRootId=await getOrCreateFolder('Ledger',clientRootId);
+    // FIX ("professional default google drive auto save"): moved to the
+    // same server-side upload as the rest of this file — no OAuth. Same
+    // folder structure: CLIENT_DATABASES / [Client] / Ledger / [Vendor] / [Month]
     const safeVendName=(vendorName||'Unknown_Vendor').replace(/[<>:"/\\|?*]/g,'_');
-    const vendFolderId=await getOrCreateFolder(safeVendName,ledgerRootId);
-    const monthFolderId=await getOrCreateFolder(month,vendFolderId);
     const ext=file.name.split('.').pop()||'pdf';
     const fname=`Ledger_${safeVendName}_${month}.${ext}`;
-    const fileId=await uploadFileToDrive(fname,file,monthFolderId);
-    if(!fileId){toast('⚠️ Ledger upload failed — check Drive connection','err','⚠️');return;}
-    const link=`https://drive.google.com/file/d/${fileId}/view`;
+    const base64Data=await fileToBase64_(file);
+    const res=await erpApi('UPLOAD_TO_CLIENT_DRIVE',{
+      clientId:CLIENT_ID, fileName:fname, mimeType:file.type||'application/octet-stream', base64Data,
+      subPath:['Ledger',safeVendName,month]
+    });
+    if(!res||!res.success||!res.url){toast('⚠️ Ledger upload failed — check connection','err','⚠️');return;}
+    const link=res.url;
     const idx=DB.vendorLedgers.findIndex(l=>l.vendorName===vendorName&&l.month===month);
     const rec={id:idx>=0?DB.vendorLedgers[idx].id:uid(),vendorName,month,fileName:file.name,driveLink:link,uploadedAt:new Date().toISOString()};
     if(idx>=0)DB.vendorLedgers[idx]=rec;else DB.vendorLedgers.push(rec);
