@@ -1735,6 +1735,84 @@ function filterEmps(){renderEmpTable(document.getElementById('empSearch').value)
 // ═══════════════════════════════════════════════════════════════════
 //  IMPORT EMPLOYEES (from salary Excel)
 // ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+//  ROBUST SALARY/ATTENDANCE SHEET PARSER
+//  Real-world sheets (like the one used here) often only fill the
+//  leading "SL" serial-number column on the first row or two, leaving
+//  it blank on every row after that. The old parser used that SL
+//  column to decide which rows were data rows, so it silently dropped
+//  every row after the first — that's why only one (sometimes two)
+//  employees ever showed up after an upload. This parser instead
+//  finds the real header row, maps each column by its header text
+//  (so it also survives extra/blank/reordered columns), and treats
+//  any row with a Name or EMP ID as a data row — never relying on SL.
+// ═══════════════════════════════════════════════════════════════════
+const SHEET_COL_ALIASES={
+  empid:['emp id','empid','employee id','id'],
+  name:['name','employee name'],
+  paydays:['pay days','paydays'],
+  presentdays:['present days','presentdays','present'],
+  basic:['basic'],
+  hra:['hra'],
+  conv:['conv','conveyance'],
+  other:['other allow','other allowance','other','others'],
+  totalearn:['total earning','total earn','gross'],
+  pf:['pf'],
+  esi:['esi'],
+  pt:['pt'],
+  advance:['advance'],
+  totaldedn:['total dedn','total deduction'],
+  netamount:['net amount','net pay','netpay']
+};
+function normHdr(s){return String(s||'').toLowerCase().replace(/[^a-z0-9 ]/g,' ').replace(/\s+/g,' ').trim();}
+function findSheetHeaderRow(rows){
+  for(let i=0;i<rows.length;i++){
+    const norm=(rows[i]||[]).map(normHdr);
+    const hasName=norm.some(c=>c==='name'||c==='employee name');
+    const hasEmpId=norm.some(c=>c.includes('emp')&&c.includes('id'));
+    if(hasName&&hasEmpId) return i;
+  }
+  return -1;
+}
+function mapSheetColumns(headerRow){
+  const map={};
+  (headerRow||[]).forEach((cell,idx)=>{
+    const norm=normHdr(cell);
+    if(!norm) return;
+    for(const key in SHEET_COL_ALIASES){
+      if(map[key]!==undefined) continue; // first (left-most) match wins
+      if(SHEET_COL_ALIASES[key].includes(norm)){ map[key]=idx; break; }
+    }
+  });
+  return map;
+}
+// Fallback indices match this app's own template layout (18 cols):
+// 0=outer SL,1=blank,2=inner SL,3=EMP ID,4=Name,5=Pay Days,6=Present Days,
+// 7=Basic,8=HRA,9=Conv.,10=Other Allow,11=Total Earning,12=PF,13=ESI,
+// 14=PT,15=Advance,16=Total Dedn,17=Net Amount
+const SHEET_COL_FALLBACK={empid:3,name:4,paydays:5,presentdays:6,basic:7,hra:8,conv:9,other:10,totalearn:11,pf:12,esi:13,pt:14,advance:15,totaldedn:16,netamount:17};
+function extractSheetDataRows(rows){
+  const hdrIdx=findSheetHeaderRow(rows);
+  const colMap=hdrIdx>=0?mapSheetColumns(rows[hdrIdx]):{};
+  const nameIdx=colMap.name!==undefined?colMap.name:SHEET_COL_FALLBACK.name;
+  const empIdIdx=colMap.empid!==undefined?colMap.empid:SHEET_COL_FALLBACK.empid;
+  const start=hdrIdx>=0?hdrIdx+1:0;
+  const dataRows=[];
+  for(let i=start;i<rows.length;i++){
+    const r=rows[i]||[];
+    const name=String(r[nameIdx]||'').trim();
+    const empId=String(r[empIdIdx]||'').trim();
+    if(!name&&!empId) continue; // skip blank/spacer rows — never rely on the SL column
+    dataRows.push(r);
+  }
+  return{dataRows,colMap};
+}
+function sheetVal(r,colMap,key){
+  const i=colMap[key]!==undefined?colMap[key]:SHEET_COL_FALLBACK[key];
+  return i!==undefined?r[i]:'';
+}
+function sheetNum(r,colMap,key){return parseFloat(sheetVal(r,colMap,key))||0;}
+
 function importEmployees(input){
   const file=(input.files||[])[0]; if(!file) return;
   const reader=new FileReader();
@@ -1743,23 +1821,27 @@ function importEmployees(input){
       const wb=XLSX.read(e.target.result,{type:'binary'});
       const ws=wb.Sheets[wb.SheetNames[0]];
       const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:''});
-      // Find data rows (look for numbered rows)
-      const data=rows.filter(r=>r[0]&&!isNaN(r[0])&&r[0]>0);
-      if(!data.length){toast('Could not find employee rows in Excel','err');return;}
-      pendingImport=data.map(r=>({
-        name:String(r[4]||r[2]||'').trim(),
-        id:String(r[3]||r[1]||'').trim(),
-        basic:parseFloat(r[8])||0, hra:parseFloat(r[9])||0, other:parseFloat(r[10])||0,
-        pf:parseFloat(r[12])||0, esi:parseFloat(r[13])||0, pt:parseFloat(r[14])||0,
-        advance:(r[15]!==undefined&&r[15]!==''&&r[15]!==null)?parseFloat(r[15])||0:0,
-        net:parseFloat(r[17])||0
-      })).filter(e=>e.name&&e.basic);
+      const{dataRows,colMap}=extractSheetDataRows(rows);
+      if(!dataRows.length){toast('Could not find employee rows in Excel','err');return;}
+      pendingImport=dataRows.map(r=>{
+        const advRaw=sheetVal(r,colMap,'advance');
+        return{
+          name:String(sheetVal(r,colMap,'name')||'').trim(),
+          id:String(sheetVal(r,colMap,'empid')||'').trim(),
+          basic:sheetNum(r,colMap,'basic'), hra:sheetNum(r,colMap,'hra'),
+          conv:sheetNum(r,colMap,'conv'), other:sheetNum(r,colMap,'other'),
+          pf:sheetNum(r,colMap,'pf'), esi:sheetNum(r,colMap,'esi'), pt:sheetNum(r,colMap,'pt'),
+          advance:(advRaw!==undefined&&advRaw!==''&&advRaw!==null)?parseFloat(advRaw)||0:0,
+          net:sheetNum(r,colMap,'netamount')
+        };
+      }).filter(e=>e.name);
       document.getElementById('importMsg').textContent=`Found ${pendingImport.length} employees ready to import.`;
       const tb=document.getElementById('importTbody');
       tb.innerHTML=pendingImport.map(e=>`<tr>
         <td>${e.name}</td><td style="font-family:var(--mono);font-size:10px;">${e.id}</td>
         <td class="num">₹${fmt(e.basic)}</td><td class="num">₹${fmt(e.hra)}</td>
-        <td class="num">₹${fmt(e.other)}</td><td class="num">₹${fmt(e.pf)}</td>
+        <td class="num">₹${fmt(e.conv)}</td><td class="num">₹${fmt(e.other)}</td>
+        <td class="num">₹${fmt(e.pf)}</td>
         <td class="num">₹${fmt(e.esi)}</td><td class="num">₹${fmt(e.pt)}</td>
         <td class="num">₹${fmt(e.net)}</td>
       </tr>`).join('');
@@ -1775,7 +1857,7 @@ function confirmImport(){
     const emp={
       name:p.name,id:p.id,dept:'',desig:'',mobile:'',gender:'Male',doj:'',
       pan:'',uan:'',esino:'',bank:'',ifsc:'',
-      basic:p.basic,hra:p.hra,other:p.other,pf:p.pf,esi:p.esi,pt:p.pt,active:true
+      basic:p.basic,hra:p.hra,conv:p.conv,other:p.other,pf:p.pf,esi:p.esi,pt:p.pt,active:true
     };
     if(existing.has(p.id)){
       const idx=employees.findIndex(e=>e.id===p.id);
