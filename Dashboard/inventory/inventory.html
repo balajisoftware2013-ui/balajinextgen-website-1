@@ -655,10 +655,10 @@ window.INV_REPORT_DB = localStorage.getItem('bnx_report_db_id') || '';
     <div class="sb-group" id="grp-issue">
       <div class="sb-grp-hdr" onclick="sbToggle('grp-issue')">
         <span>📤 Issue &amp; Indent</span>
-        <span class="sb-arrow sb-has-badge">▾ <span class="nb danger" id="nb-issue-hdr" style="font-size:9px;padding:1px 5px;border-radius:10px;background:var(--red);color:#fff;margin-left:3px;">3</span></span>
+        <span class="sb-arrow sb-has-badge">▾ <span class="nb danger" id="nb-issue-hdr" style="font-size:9px;padding:1px 5px;border-radius:10px;background:var(--red);color:#fff;margin-left:3px;">0</span></span>
       </div>
       <div class="sb-grp-body" id="grp-issue-body">
-        <a class="nav-item" id="nv-issue" onclick="showP('issue',this)"><span class="ni">📤</span> Dept Issue / Indent <span class="nb danger" id="nb-issue">3</span></a>
+        <a class="nav-item" id="nv-issue" onclick="showP('issue',this)"><span class="ni">📤</span> Dept Issue / Indent <span class="nb danger" id="nb-issue">0</span></a>
         <a class="nav-item ns-restaurant-only" id="nv-kitchen-ind" onclick="showP('kitchen-ind',this)"><span class="ni">🍳</span> Kitchen Consumption</a>
         <a class="nav-item ns-restaurant-only" id="nv-bar-ord" onclick="showP('bar-ord',this)"><span class="ni">🍺</span> Bar Consumption</a>
       </div>
@@ -1599,7 +1599,7 @@ window.INV_REPORT_DB = localStorage.getItem('bnx_report_db_id') || '';
       </div>
       <div class="card">
         <div class="card-h"><h3>📋 Indent History</h3></div>
-        <div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Indent No</th><th>Kitchen</th><th>Items</th><th>Status</th><th>Actions</th></tr></thead><tbody id="ki-history-body"></tbody></table></div>
+        <div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Item</th><th>Qty Required</th><th>Qty Issued</th><th>Status</th><th>Actions</th></tr></thead><tbody id="ki-history-body"></tbody></table></div>
       </div>
     </div>
 
@@ -5339,23 +5339,76 @@ function saveKitchenIndent(){
   loadKitchenHistory();
   loadDashboard();
 }
-function loadKitchenHistory(){
-  const kis=DB.all('kitchen_indents').sort((a,b)=>b._ts>a._ts?1:-1);
-  const statusColors={pending:'o',approved:'a',issued:'g',rejected:'r'};
-  document.getElementById('ki-history-body').innerHTML=kis.length?kis.map(ki=>`<tr><td style="font-family:'JetBrains Mono',monospace;font-size:11px;">${ki.date}</td><td style="font-weight:700;">${ki.indent_no}</td><td>${ki.kitchen}</td><td class="r">${(ki.items||[]).length}</td><td><span class="badge ${statusColors[ki.status]||'gr'}">${ki.status}</span></td><td><button class="btn" style="padding:2px 7px;font-size:11px;" onclick="approveKI('${ki._id}')">Approve</button> <button class="btn s" style="padding:2px 7px;font-size:11px;" onclick="issueKI('${ki._id}')">Issue</button></td></tr>`).join(''):'<tr><td colspan="6" class="tbl-empty">No indents found</td></tr>';
+// FIX ("inventory dashboard also show indent request"): this previously
+// read/wrote a local-only DB.all('kitchen_indents') that had no
+// connection to real kitchen-submitted indents at all — kitchen-indent.
+// html's Kitchen Indent History and this page's Kitchen Indent History
+// were two entirely separate, disconnected datasets. Now both call the
+// same real backend (GET_PENDING_INDENTS / APPROVE_ISSUE_INDENT, already
+// live in KitchenIndent_Direct.gs) so an indent raised in the kitchen
+// actually shows up here for Store to act on.
+//
+// NOTE: the real backend has no "indent number" grouping several items
+// under one ID — KitchenIndent_Direct.gs writes ONE ROW PER ITEM, each
+// with its own IND_ID (see KI_saveKitchenIndent_). So this table is now
+// one row per requested item, not one row per multi-item "indent" — the
+// old Indent No/Kitchen/Items-count columns don't have real backend
+// equivalents and were replaced with Item/Qty Required/Qty Issued
+// (matches the table header already updated above).
+//
+// Also: the real backend has no separate "approve" step — a single
+// APPROVE_ISSUE_INDENT call sets both ISSUED_QTY and STATUS=ISSUED at
+// once. The old two-button Approve/Issue flow was purely local-DB
+// fiction; only one "Issue" action exists for real, so that's all
+// that's offered here now.
+async function loadKitchenHistory(){
+  const body = document.getElementById('ki-history-body');
+  if (!body) return;
+  body.innerHTML = '<tr><td colspan="6" class="tbl-empty">Loading…</td></tr>';
+  const res = await erpApi('GET_PENDING_INDENTS', {});
+  if (!res || !res.success) {
+    body.innerHTML = '<tr><td colspan="6" class="tbl-empty">Could not reach server — check connection</td></tr>';
+    return;
+  }
+  const indents = (res.data && res.data.indents) || res.indents || [];
+  // Newest first — real DATE values come back as ISO timestamps or
+  // dd-MM-yyyy strings depending on how Sheets stored the cell (see the
+  // same issue already fixed in kitchen-indent.html's parseIndentDate);
+  // sorting by the raw IND_ID insertion order (array order from the
+  // sheet) is used instead of trying to parse/compare dates here, since
+  // the backend already returns rows in sheet order (oldest first) —
+  // reversing that gives newest-first without needing date parsing.
+  const ordered = indents.slice().reverse();
+  const statusColors = { PENDING:'o', ISSUED:'g' };
+  body.innerHTML = ordered.length ? ordered.map(ind => {
+    const dateStr = String(ind.DATE || '').slice(0, 10); // ISO "yyyy-MM-dd..." prefix or plain dd-MM-yyyy either way shows something readable
+    const status = ind.STATUS || 'PENDING';
+    return `<tr>
+      <td style="font-family:'JetBrains Mono',monospace;font-size:11px;">${dateStr}</td>
+      <td style="font-weight:700;">${ind.ITEM_NAME || ind.ITEM_ID || '—'}</td>
+      <td class="r">${ind.REQUIRED_QTY ?? 0} ${ind.UNIT || ''}</td>
+      <td class="r">${ind.ISSUED_QTY ?? 0} ${ind.UNIT || ''}</td>
+      <td><span class="badge ${statusColors[status] || 'gr'}">${status}</span></td>
+      <td>${status === 'PENDING'
+        ? `<button class="btn s" style="padding:2px 7px;font-size:11px;" onclick="issueKI('${ind.IND_ID}',${JSON.stringify(String(ind.REQUIRED_QTY ?? 0))})">Issue</button>`
+        : '—'}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="6" class="tbl-empty">No indents found</td></tr>';
 }
-function approveKI(id){DB.update('kitchen_indents',id,{status:'approved'});loadKitchenHistory();toast('Indent approved ✓','s');}
-function issueKI(id){
-  const ki=DB.findOne('kitchen_indents',{_id:id});
-  if(!ki)return;
-  (ki.items||[]).forEach(it=>{
-    const prev=getStockBalance(it.item_id,'WH002');
-    const issQty=it.qty;
-    DB.insert('stock_ledger',{_id:uid('SL'),item_id:it.item_id,wh_id:'WH002',date:today(),txn_type:'kitchen_issue',ref_id:id,ref_type:'kitchen_indent',qty_in:0,qty_out:issQty,balance:Math.max(0,prev-issQty),rate:DB.findOne('items',{_id:it.item_id})?.purchase_price||0,value:issQty*(DB.findOne('items',{_id:it.item_id})?.purchase_price||0)});
-    it.issued=issQty;
+async function issueKI(indId, requiredQty){
+  const res = await erpApi('APPROVE_ISSUE_INDENT', {
+    indentType: 'KITCHEN',
+    indId: indId,
+    issuedQty: requiredQty,
+    issuedBy: (window.SESSION && SESSION.name) || 'Store Manager'
   });
-  DB.update('kitchen_indents',id,{status:'issued',items:ki.items});
-  loadKitchenHistory();loadDashboard();toast('Items issued to kitchen ✓','s');
+  if (res && res.success) {
+    toast('Items issued to kitchen ✓','s');
+    loadKitchenHistory();
+    if (typeof loadDashboard === 'function') loadDashboard();
+  } else {
+    toast('⚠ Could not issue — ' + ((res && res.message) || 'server error'), 'e');
+  }
 }
 
 // ── Bar Orders ──────────────────────────────────
@@ -7191,12 +7244,32 @@ async function loadIssueRegister() {
   `).join(''):'<tr><td colspan="11" class="tbl-empty">No issue records found</td></tr>';
 }
 
+// FIX ("badge shows 3 but no issue records"): nb-issue/nb-issue-hdr were
+// hardcoded to "3" directly in the HTML and no function anywhere ever
+// changed them — the MutationObserver above only ever mirrors nb-issue
+// INTO nb-issue-hdr, it never sets nb-issue's real value in the first
+// place. This does that, using the same fetchDeptIssues(true) call
+// loadPendingACK() already uses for the real pending-acknowledgement
+// count, and runs once at startup so the badge is correct before the
+// user ever opens the Dept Issue page.
+function refreshIssueBadge(count){
+  const el = document.getElementById('nb-issue');
+  if (el) el.textContent = String(count);
+}
+document.addEventListener('DOMContentLoaded', async () => {
+  try {
+    const issues = await fetchDeptIssues(true);
+    refreshIssueBadge(issues.length);
+  } catch (e) { /* best-effort — badge just stays at 0 if this fails */ }
+});
+
 async function loadPendingACK() {
   const body = document.getElementById('iss-ack-body');
   body.innerHTML = '<tr><td colspan="8" class="tbl-empty">Loading…</td></tr>';
   const issues = await fetchDeptIssues(true);
   const cnt=issues.length;
   const el=document.getElementById('nb-ack');if(el)el.textContent=cnt;
+  refreshIssueBadge(cnt); // FIX: nb-issue/nb-issue-hdr were hardcoded "3" in the HTML and nothing ever updated them — see refreshIssueBadge() below.
   body.innerHTML=issues.length?issues.map(iss=>{
     const daysPending=Math.floor((new Date()-new Date(iss.date))/86400000);
     return`<tr>
