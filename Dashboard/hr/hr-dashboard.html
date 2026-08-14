@@ -3807,11 +3807,38 @@ function downloadTallyRelayScript(){
 // ── New-employee → Tally sync tracking ──────────────────────────────
 // Every employee added via the Employees page starts with tallySynced=false.
 // Posting the Employee Master to Tally (and getting a genuine Created/Altered
-// back — not a silent 0/0) marks every employee currently sent as synced, so
-// the badge below tells you at a glance whether Tally is missing anyone
-// before you try posting a Payroll Voucher (which will fail on any employee
-// Tally doesn't know about, exactly like the "Cost Centre does not exist"
-// error).
+// back — not a silent 0/0) marks employees as synced ONLY if Tally's counts
+// actually cover everyone we sent — not just "the post as a whole didn't
+// error". The badge below tells you at a glance whether Tally is missing
+// anyone before you try posting a Payroll Voucher (which will fail on any
+// employee Tally doesn't know about, exactly like the "Cost Centre does not
+// exist" error).
+//
+// FIX (2026-08): Tally's response only ever gives aggregate Created/Altered
+// counts for the whole batch — it does NOT say which named records those
+// counts belong to. The old code treated any non-error response as "every
+// employee currently in the app is now synced", via
+// `employees.forEach(e=>e.tallySynced=true)`. That's wrong whenever Tally
+// silently skips ONE object out of a batch without raising it as a
+// top-level Error/Exception/LineError (e.g. a name collision, an invalid
+// character, a duplicate near-match) — the aggregate count comes back lower
+// than expected, `result.ok` is still true, and the old code marked that
+// skipped employee as synced anyway. That falsely-synced employee then has
+// no Cost Centre in Tally, and the NEXT Payroll Voucher post fails with
+// "Cost Centre '<name>' does not exist!" — while the dashboard confidently
+// (and wrongly) says "✓ All N employees are synced to Tally", with no way
+// to re-trigger a fix short of clearing sync state by hand. This is exactly
+// what happened with ABHIJIT JANA.
+//
+// The fix: only ever mark synced the employees we actually included in
+// THIS post (not the whole `employees` array), and only do that when the
+// counts Tally reported are enough to cover the whole batch we sent. Each
+// employee sent produces 2 objects (EMPLOYEE + matching COSTCENTRE), so a
+// fully-successful batch of N employees should report Created+Altered >= 2*N.
+// If it reports less, we can't tell which specific employee(s) were
+// skipped — so nothing in that batch is marked synced, and the log says so
+// explicitly, so the mismatch can be investigated in Tally before retrying
+// (rather than silently resurfacing as a Cost Centre error later).
 function empHaveNew(){
   const fullList=employees.length?employees:
     (currentExportData?.entries||[]).map(e=>({name:e.name,tallySynced:false}));
@@ -3823,30 +3850,61 @@ async function postEmployeeMaster(){
     refreshTallySyncBadge();
     return {ok:true, created:0, altered:0, skipped:true};
   }
+  // Snapshot exactly which employees this post will attempt to send —
+  // BEFORE calling buildEmpMasterXML() — so we know precisely who to (or
+  // not to) mark synced once Tally's response comes back. buildEmpMasterXML
+  // filters on the same !tallySynced condition, so this matches its XML 1:1.
+  const fullList=employees.length?employees:
+    (currentExportData?.entries||[]).map(e=>({name:e.name,tallySynced:false}));
+  const toSend = fullList.filter(e=>!e.tallySynced);
   const r = await postToTally(buildEmpMasterXML(), 'Employee Master', true);
   if(r.ok){
-    employees.forEach(e=>e.tallySynced=true);
-    save();
+    const expectedObjects = toSend.length*2; // EMPLOYEE + COSTCENTRE per person
+    const actualObjects = (r.created||0)+(r.altered||0);
+    if(actualObjects >= expectedObjects){
+      toSend.forEach(e=>e.tallySynced=true);
+      save();
+    } else {
+      const names = toSend.map(e=>esc(e.name)).join(', ');
+      tallyLog(`⚠ Employee Master: sent ${toSend.length} employee(s) (expected ${expectedObjects} objects created/altered — Employee + Cost Centre each) but Tally only reported ${actualObjects}. At least one employee's Cost Centre likely was NOT created, even though Tally didn't flag it as an error.`,'err');
+      tallyLog(`   None of this batch has been marked as synced, so it will be resent next time: ${names}.`,'err');
+      tallyLog(`   Check Tally (Accounting Masters → Cost Centres) for which of these names is missing or mismatched, fix it there, then post Employee Master again.`,'err');
+      toast(`Employee Master: Tally accepted fewer objects than expected — see log`,'err');
+      r.ok = false;
+      r.error = 'partial-batch';
+    }
   }
   refreshTallySyncBadge();
   return r;
 }
 // ── New pay-head/ledger → Tally sync tracking ───────────────────────
-// Same idea as postEmployeeMaster: once a pay head (or the party ledger)
-// is confirmed in Tally it's marked synced and never sent again, so a
-// re-post only creates whatever is genuinely new — nothing existing gets
-// silently Altered.
+// Same idea as postEmployeeMaster, and the same fix applies: only mark the
+// pay heads/ledger actually sent in THIS post as synced, and only when
+// Tally's Created+Altered count covers everything we sent — not the whole
+// `payHeads` array on any non-error response.
 async function postPayHeadsMaster(){
   if(!payHeadsHaveNew()){
     tallyLog(`✔ Pay Heads: already synced — nothing new to send, ignored.`,'ok');
     return {ok:true, created:0, altered:0, skipped:true};
   }
+  const party=cv('t-party');
+  const sendingLedger = party && !syncedLedgers[party];
+  const toSend = payHeads.filter(p=>!p.tallySynced);
   const r = await postToTally(buildPayHeadXML(), 'Pay Heads');
   if(r.ok){
-    const party=cv('t-party');
-    if(party) syncedLedgers[party]=true;
-    payHeads.forEach(p=>p.tallySynced=true);
-    save();
+    const expectedObjects = toSend.length + (sendingLedger?1:0);
+    const actualObjects = (r.created||0)+(r.altered||0);
+    if(actualObjects >= expectedObjects){
+      if(sendingLedger) syncedLedgers[party]=true;
+      toSend.forEach(p=>p.tallySynced=true);
+      save();
+    } else {
+      const names = toSend.map(p=>esc(p.name)).join(', ');
+      tallyLog(`⚠ Pay Heads: expected ${expectedObjects} object(s) created/altered but Tally only reported ${actualObjects}. Nothing in this batch has been marked synced, so it will be resent next time: ${names}${sendingLedger?` (plus ledger "${esc(party)}")`:''}.`,'err');
+      toast(`Pay Heads: Tally accepted fewer objects than expected — see log`,'err');
+      r.ok = false;
+      r.error = 'partial-batch';
+    }
   }
   return r;
 }
