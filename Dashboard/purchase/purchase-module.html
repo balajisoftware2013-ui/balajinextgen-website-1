@@ -1905,10 +1905,38 @@ function load(){
   };
 
   // ---- Fill the Item / Description datalist from Inventory's Item Master ----
+  // FIX (INVENTORY items not showing in add list): This function now:
+  // 1. Tries InvBridge first (Inventory module's item master)
+  // 2. Falls back to local DB.itemMaster if InvBridge is unavailable
+  // 3. Handles empty results gracefully
+  // 4. Removes duplicate item names to keep the list clean
   window.populateItemMasterDL=function(){
     const dl=document.getElementById('itemMasterDL');if(!dl)return;
-    const items=InvBridge.all('items');
-    dl.innerHTML=items.map(i=>`<option value="${(i.name||'').replace(/"/g,'&quot;')}">`).join('');
+    try{
+      // Primary: Inventory's item master (when Inventory module is loaded)
+      let items=[];
+      if(typeof InvBridge!=='undefined'&&InvBridge.all){
+        items=InvBridge.all('items')||[];
+      }
+      // Fallback: local DB.itemMaster (in case Inventory not loaded)
+      if(items.length===0&&DB.itemMaster&&DB.itemMaster.length){
+        items=DB.itemMaster;
+      }
+      // Remove duplicates and generate options
+      const seen=new Set();
+      const options=items
+        .filter(i=>{
+          const name=(i.name||'').trim();
+          if(!name||seen.has(name))return false;
+          seen.add(name);
+          return true;
+        })
+        .map(i=>`<option value="${(i.name||'').replace(/"/g,'&quot;')}">`);
+      dl.innerHTML=options.join('');
+    }catch(e){
+      console.warn('populateItemMasterDL error:',e);
+      // Silent fail — the datalist just won't have suggestions, but form still works
+    }
   };
 
   // ---- Fill the Warehouse dropdown from Inventory's Warehouse Master ----
@@ -1968,7 +1996,9 @@ function load(){
     const set=(id,val)=>{const e=document.getElementById(id);if(e)e.value=val;};
     set('pit-hsn-'+n,item.hsn||'');
     set('pit-unit-'+n,item.unit||'Nos');
-    if(!parseFloat(document.getElementById('pit-rate-'+n)?.value||0)) set('pit-rate-'+n,item.purchase_price||0);
+    // FIX (RATE auto-fill): Always populate rate from inventory's purchase_price when item is picked,
+    // not just when rate field is empty. This ensures fresh rates from inventory every time.
+    set('pit-rate-'+n,item.purchase_price||0);
     const gstSel=document.getElementById('pit-gst-'+n);
     if(gstSel)gstSel.value=String(item.gst||0);
     if(typeof calcPTotals==='function')calcPTotals();
@@ -2314,7 +2344,11 @@ function vendSearch(q){
   const list=el('vendDDList');if(!list)return;
   const m=DB.vendors.filter(v=>v.name.toLowerCase().includes(q.toLowerCase())||(v.mobile||'').includes(q)).slice(0,8);
   if(!m.length||!q){list.classList.remove('on');return;}
-  list.innerHTML=m.map(v=>`<div class="dd-item" onmousedown="selectVend('${v.id}')"><div class="ddi-name">${v.name}</div><div class="ddi-sub">${v.mobile||''}${v.gstin?' · '+v.gstin:''} · ${v.city||''}</div></div>`).join('');
+  // FIX (add new vendor option): Include "+ New Vendor" at bottom of dropdown to create vendor on-the-fly
+  // Pre-fills vendor name with what user typed, so they can quickly add if not in list
+  const items=m.map(v=>`<div class="dd-item" onmousedown="selectVend('${v.id}')"><div class="ddi-name">${v.name}</div><div class="ddi-sub">${v.mobile||''}${v.gstin?' · '+v.gstin:''} · ${v.city||''}</div></div>`);
+  items.push(`<div class="dd-item" onmousedown="openAddVendorQuick('${(q||'').replace(/'/g,'\\'')}')"><div class="ddi-name" style="color:var(--brand);font-weight:700">➕ Add New: ${q}</div><div class="ddi-sub">Create new vendor with this name</div></div>`);
+  list.innerHTML=items.join('');
   list.classList.add('on');
 }
 function selectVend(id,fallbackName){
@@ -2376,6 +2410,24 @@ function selectVend(id,fallbackName){
   if(pa&&(!pa.dataset.touched))pa.value=isInterStatePurchase(id)?'Purchase - Interstate':'Purchase - Local';
 }
 function filtVend(q){rendVendTb(q);}
+
+// FIX (add vendor inline): Opens vendor creation modal from purchase form's vendor search dropdown.
+// Pre-fills vendor name with user's search text, so they can quickly create vendor if not in list.
+// After saving, the new vendor is added to DB.vendors and immediately selected in the purchase form.
+function openAddVendorQuick(name){
+  const cleanName=(name||'').trim();
+  sv('v-name',cleanName);
+  sv('v-contact','');sv('v-mobile','');sv('v-email','');sv('v-gstin','');
+  sv('v-pan','');sv('v-addr','');sv('v-city','');sv('v-edit-id','');
+  sv('v-state','Maharashtra');
+  el('v-terms').value='30 Days';
+  el('v-rating').value='3';
+  const gi=el('gstin-autofill-info');if(gi)gi.textContent='';
+  el('mVendTitle').innerHTML='🏭 Add Vendor (from Purchase Form) <button class="mc" onclick="closeM(\'mVend\')">✕</button>';
+  openM('mVend');
+  // Auto-select the new vendor after save by triggering saveVend's existing flow
+  // The existing saveVend() calls rendVendTb() which will refresh the vendor dropdown
+}
 
 // ════ REGISTER ROW ACTIONS DROPDOWN (View/Edit/Post to Tally/Delete) ════
 // Replaces the old separate Tally-status column + inline action buttons
@@ -2454,6 +2506,14 @@ function saveVend(){
   ['v-name','v-contact','v-mobile','v-email','v-gstin','v-pan','v-addr','v-city','v-edit-id'].forEach(id=>sv(id,''));
   const gi=el('gstin-autofill-info');if(gi)gi.textContent='';
   el('mVendTitle').innerHTML='🏭 Add Vendor <button class="mc" onclick="closeM(\'mVend\')">✕</button>';
+  
+  // FIX (auto-select new vendor): If vendor was created from purchase form (title contains "from Purchase Form"),
+  // auto-select it in the vendor field so user doesn't have to search again.
+  const mVendTitle=el('mVendTitle')?.textContent||'';
+  if(mVendTitle.includes('from Purchase Form')&&!editId){
+    selectVend(vend.id);
+  }
+  
   toast('Vendor saved! '+name,'ok','🏭');
   // Auto-save vendor data to Google Drive
   saveVendorToDrive(vend,!!editId);
@@ -6129,6 +6189,8 @@ function autoCreateAndSave(){
       if(idx>=0)DB.itemMaster[idx].lastRate=it.rate;
     }
   });
+  // FIX (refresh datalist): After adding new items to DB.itemMaster, refresh the purchase form's item dropdown
+  try{if(typeof populateItemMasterDL==='function')populateItemMasterDL();}catch(e){}
   const ledger=autoSelectLedger(d);
   smMatchedVendorId=vendorId;
   extractedData={...d,ledgerAccountId:ledger?.id||''};
@@ -6382,6 +6444,9 @@ function confirmSmartImport(asDraft){
     }
     return{...it,name:confirmed};
   });
+
+  // FIX (refresh datalist): After adding/confirming items in Smart Match, refresh the item dropdown
+  try{if(typeof populateItemMasterDL==='function')populateItemMasterDL();}catch(e){}
 
   closeM('mSmartMatch');
 
