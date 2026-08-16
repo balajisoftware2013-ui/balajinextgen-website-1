@@ -3569,7 +3569,7 @@ function _saveGRNInternal(){
     if(!p){toast('Selected purchase invoice not found','err','⚠️');return;}
     if(!p.items||!p.items.length){toast('This purchase invoice has no items','err','⚠️');return;}
     const vend=DB.vendors.find(v=>v.id===p.vendorId);
-    let anyAccepted=false,anyUnsynced=false;
+    let anyAccepted=false;
     p.items.forEach((it,i)=>{
       const received=+v('gi-recv-'+i)||0,accepted=+v('gi-acc-'+i)||0,rejected=+v('gi-rej-'+i)||0;
       const rec={id:uid(),no:gno,date,poRef:poRef||p.poRef,vendorId:p.vendorId,vendorName:vend?.name||p.vendorName,item:it.name,rate:+it.rate||0,gst:+it.gst||0,received,accepted,rejected,vehicle,driver,godown:godownName,godownId,remarks,status:'Received',purchaseId:p.id,purchaseNo:p.no,createdAt:new Date().toISOString()};
@@ -3578,16 +3578,16 @@ function _saveGRNInternal(){
       if(accepted>0){
         anyAccepted=true;
         const costRate=getItcAdjustedRate(it.rate,it.gst);
-        if(typeof InventoryBridge!=='undefined'){
-          // refId links this exact movement back to the GRN line (so Edit/Delete can
-          // reverse it precisely) and rate carries the real purchase cost through to
-          // Stock Ledger/Stock Value, which previously always showed ₹0.00. Rate here
-          // is ITC-adjusted per the GST Treatment set in Settings — see getItcAdjustedRate().
-          const result=InventoryBridge.adjustStock(it.name,accepted,'GRN '+gno+' from '+rec.vendorName,{refId:rec.id,rate:costRate,ref:gno,party:rec.vendorName});
-          if(result===false){rec.stockSynced=false;anyUnsynced=true;}
-        }
-        // Same accepted qty, same GRN, into the Warehouse Ledger this file's
-        // BNJERP inventory.html reads — kept in lockstep with InventoryBridge above.
+        // FIX (Phase 2 — single stock engine): InventoryBridge.adjustStock()
+        // removed from here. It was a SEPARATE, local-storage-only stock
+        // tracker that never synced to the cloud — calling it alongside
+        // pushGRNStockLedger() (which writes the real, cloud-synced
+        // stock_ledger inventory.html actually reads) meant two numbers
+        // that could silently drift apart across devices. stock_ledger is
+        // now the one source of truth. pushGRNStockLedger()'s own
+        // ensureInventoryItem() auto-creates a missing Item Master entry
+        // rather than failing, so — unlike before — this can no longer
+        // "silently skip" an item; it always posts.
         if(typeof pushGRNStockLedger==='function')pushGRNStockLedger({...it,rate:costRate},accepted,godownId,rec.id,date,rec.vendorName);
         // Liquor items also flow straight into Bar's own ml-based stock (see pushBottleToBarStore above)
         pushBottleToBarStore(it.name,accepted,it.rate,gno,rec.vendorName,date);
@@ -3596,8 +3596,7 @@ function _saveGRNInternal(){
     // Mark the source Purchase Invoice as GRN-complete and link it back
     p.grnStatus='Completed';p.grnNo=gno;p.grnRef=gno;
     DB.seq.g++;save();el('fa-grn').innerHTML='';rendGRN();rendDash();rendPurchaseList();rendRegs();
-    if(anyUnsynced)toast('⚠️ GRN '+gno+' saved, but one or more items aren\'t in your item master — stock not updated for those. Add them in Inventory first.','warn','⚠️');
-    else toast('GRN '+gno+' completed for '+p.no+(anyAccepted?' — stock updated':''),'ok','🚛');
+    toast('GRN '+gno+' completed for '+p.no+(anyAccepted?' — stock updated':''),'ok','🚛');
     return;
   }
 
@@ -3614,26 +3613,13 @@ function _saveGRNInternal(){
   DB.grns.push(rec);DB.seq.g++;save();el('fa-grn').innerHTML='';rendGRN();rendDash();
   erpApi('SAVE_GRN', rec).then(r=>{ if(r&&r.success===false) toast('⚠️ GRN '+rec.no+' saved locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️'); });
 
-  // BUG FIX: this used to only save the GRN paperwork — it never
-  // actually increased stock, so receiving real goods never showed up
-  // as available inventory anywhere until someone manually adjusted it
-  // later. The bridge already had an onGRNSaved() hook for exactly this,
-  // but this page never loaded the bridge script and the hook expected
-  // a grn.items[] array while this form only ever produces one item
-  // per GRN — so even wiring it up naively would have silently done
-  // nothing. Calling adjustStock() directly instead, with the ACCEPTED
-  // quantity (not received) — rejected goods shouldn't count as usable
-  // stock even though they were physically delivered.
-  if (rec.accepted > 0 && typeof InventoryBridge !== 'undefined'){
-    const costRate=getItcAdjustedRate(knownRate,knownGst);
-    const result = InventoryBridge.adjustStock(item, rec.accepted, 'GRN '+rec.no+' from '+rec.vendorName,{refId:rec.id,rate:costRate,ref:rec.no,party:rec.vendorName});
-    if (result === false){
-      toast('⚠️ GRN saved, but "'+item+'" isn\'t in your item master yet — stock NOT updated. Add it in Inventory first, then re-adjust manually.','warn','⚠️');
-      DB.grns[DB.grns.length-1].stockSynced = false;
-      save();
-      return;
-    }
-  }
+  // FIX (Phase 2 — single stock engine): InventoryBridge.adjustStock()
+  // removed — see the linked-invoice branch above for why. This also
+  // fixes a real bug that was hiding here: the old code returned early
+  // when InventoryBridge failed, which meant pushGRNStockLedger() below
+  // (the actually-synced write) never even ran — the GRN would show
+  // "stock NOT updated" even though the real engine might have handled
+  // it fine. Now pushGRNStockLedger always runs when accepted > 0.
   if (rec.accepted > 0 && typeof pushGRNStockLedger==='function'){
     pushGRNStockLedger({name:item,rate:getItcAdjustedRate(knownRate,knownGst),unit:'Nos',gst:knownGst},rec.accepted,godownId,rec.id,date,rec.vendorName);
   }
