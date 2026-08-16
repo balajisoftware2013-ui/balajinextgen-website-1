@@ -481,6 +481,22 @@ const TEMPLATES = {
       ['National Distributors','19LMNOP4321K1Z9','PB-5542','03/04/2026','Cooking Oil 15L','1512','10','2000','0','20000.00','0','0','1000.00','21000.00']
     ]
   },
+  purchase_ledger: {
+    label: 'Purchase (Simple Ledger)',
+    headers: ['MONTH','Purchase Date','Suppliers Name','Bill No','Bill Amount','Items Head','Paid','Dues','Bill Status','Entry Status'],
+    rows: [
+      ['Apr','06/04/2026','Bagrodia Supermarkets Private Limited','CN2627/00239','3950','Grocery Items','0','3950','Bank','Pending'],
+      ['Apr','07/04/2026','Vasudeva Travels','DS00000048','24204','Travelling Expenses','24204','0','Bank','Done']
+    ]
+  },
+  sales_ledger: {
+    label: 'Sales (Simple Ledger)',
+    headers: ['MONTH','Sale Date','Customer Name','Bill No','Bill Amount','Items Head','Received','Dues','Bill Status','Entry Status'],
+    rows: [
+      ['May','12/05/2026','ABC Retail Traders','INV/26-27/00101','18500','Grocery Items','10000','8500','Bank','Done'],
+      ['May','15/05/2026','Hashtag Restaurant','INV/26-27/00102','9600','Food and Beverage Items','9600','0','Bank','Done']
+    ]
+  },
   payroll: {
     label: 'Payroll',
     headers: ['Employee','Employee ID','Basic Salary','HRA','Allowances','Gross Salary','PF','ESI','PT','TDS','Advance','Loan','Other Deductions','Net Salary'],
@@ -792,7 +808,7 @@ async function parsePdf(file){
 // ==========================================================================
 const DOC_SIGNATURES = {
   bank_statement: ['withdrawal','deposit','balance','value date','chq','utr','narration'],
-  sales:          ['invoice no','invoice date','customer','taxable value','hsn','cgst','sgst','igst','gstin'],
+  sales:          ['invoice no','invoice date','customer','taxable value','hsn','cgst','sgst','igst','gstin','bill no','received'],
   purchase:       ['supplier','vendor','purchase','gstin','grn'],
   payroll:        ['employee','basic','hra','gross salary','net salary','pf','esi',' pt ','tds'],
   expense:        ['expense','category','vendor','office expense'],
@@ -900,6 +916,13 @@ function detectColumnRoles(){
   r.debitLedger = findHeader(['debit ledger']);
   r.creditLedger= findHeader(['credit ledger']);
   r.category    = findHeader(['category','expense head']);
+  // Simple ledger-style Purchase/Sales sheets (Month, Bill No, Bill Amount, Paid,
+  // Dues, Bill Status...) don't carry GST-invoice columns — these fields let
+  // buildRecords() handle that format directly instead of forcing a GST split.
+  r.paidAmt     = findHeader(['paid','received amount','received']);
+  r.duesAmt     = findHeader(['dues','due amount','balance due']);
+  r.billStatus  = findHeader(['bill status']);
+  r.entryStatus = findHeader(['entry status']);
   STATE.colRoles = r;
 }
 function detectDateFormat(){
@@ -916,8 +939,13 @@ function detectDateFormat(){
 }
 function parseAmt(v){
   if (v===undefined||v===null||v==='') return 0;
-  const n = parseFloat(String(v).replace(/[,₹\s]/g,'').replace(/(cr|dr)$/i,''));
-  return isNaN(n) ? 0 : n;
+  const s = String(v).trim();
+  // Accounting notation: amounts wrapped in parentheses, e.g. "(3,950)", mean negative
+  // (credit notes / purchase returns) — common in ledger-style Excel/Sheets exports.
+  const isParenNeg = /^\(.*\)$/.test(s);
+  const n = parseFloat(s.replace(/[,₹()\s]/g,'').replace(/(cr|dr)$/i,''));
+  if (isNaN(n)) return 0;
+  return isParenNeg ? -Math.abs(n) : n;
 }
 // Handles combined "Amount" + "Dr/Cr" column formats some banks/PDF exports use,
 // and single-amount cells like "5,000.00 Cr" or "-5,000.00".
@@ -1263,18 +1291,35 @@ function buildRecords(){
       if (cls.confidence < 0.7) { rec.status = 'needs_review'; rec.errors.push(`Low-confidence classification (${Math.round(cls.confidence*100)}%) — suggested: ${cls.suggestedLedger}`); }
       rec.otherLedger = cls.suggestedLedger;
     } else if (STATE.docType === 'sales' || STATE.docType === 'purchase'){
-      rec.taxable = parseAmt(row[r.taxable]);
-      rec.cgst = parseAmt(row[r.cgst]);
-      rec.sgst = parseAmt(row[r.sgst]);
-      rec.igst = parseAmt(row[r.igst]);
-      rec.roundoff = parseAmt(row[r.roundoff]);
+      rec.hasGstCols = !!(r.taxable || r.cgst || r.sgst || r.igst);
       rec.total = parseAmt(row[r.total]);
       rec.hsn = r.hsn ? row[r.hsn] : '';
       rec.gstin = r.gstin ? row[r.gstin] : '';
-      const calcTotal = rec.taxable + rec.cgst + rec.sgst + rec.igst + rec.roundoff;
-      if (Math.abs(calcTotal - rec.total) > 1) rec.errors.push(`GST mismatch: taxable+GST=₹${calcTotal.toFixed(2)} vs total ₹${rec.total.toFixed(2)}`);
-      rec.amount = rec.total;
       rec.voucherType = STATE.docType === 'sales' ? 'Sales' : 'Purchase';
+      if (rec.hasGstCols) {
+        // Full GST-invoice format: Taxable Value + CGST/SGST/IGST columns present.
+        rec.taxable = parseAmt(row[r.taxable]);
+        rec.cgst = parseAmt(row[r.cgst]);
+        rec.sgst = parseAmt(row[r.sgst]);
+        rec.igst = parseAmt(row[r.igst]);
+        rec.roundoff = parseAmt(row[r.roundoff]);
+        const calcTotal = rec.taxable + rec.cgst + rec.sgst + rec.igst + rec.roundoff;
+        if (Math.abs(calcTotal - rec.total) > 1) rec.errors.push(`GST mismatch: taxable+GST=₹${calcTotal.toFixed(2)} vs total ₹${rec.total.toFixed(2)}`);
+      } else {
+        // Simple ledger-style bill: MONTH / Bill No / Bill Amount / Paid / Dues / Items Head —
+        // no GST breakdown to reconcile. Post the full bill amount against an expense/income
+        // ledger (from "Items Head", e.g. "Grocery Items", "Travelling Expenses"), and if the
+        // sheet shows an amount already Paid, generate a matching Payment/Receipt voucher so
+        // the remaining Dues stay open on the party's ledger — same logic as the sheet's own
+        // Paid/Dues columns.
+        rec.itemsHead = r.item ? String(row[r.item]||'').trim() : '';
+        rec.paidAmt = r.paidAmt ? parseAmt(row[r.paidAmt]) : 0;
+        rec.duesAmt = r.duesAmt ? parseAmt(row[r.duesAmt]) : (rec.total - rec.paidAmt);
+        rec.billStatus = r.billStatus ? String(row[r.billStatus]||'').trim() : '';
+        rec.entryStatus = r.entryStatus ? String(row[r.entryStatus]||'').trim() : '';
+        rec.ledgerHead = rec.itemsHead || (STATE.docType==='sales' ? 'Sales' : 'Purchase');
+      }
+      rec.amount = rec.total;
       if (!rec.party) rec.errors.push('Missing customer/supplier name');
       if (!rec.invoiceNo) rec.errors.push('Missing invoice number');
     } else if (STATE.docType === 'payroll'){
@@ -1455,20 +1500,37 @@ function buildRecordXml(r){
   }
   if (r.voucherType === 'Sales'){
     const lines = [xmlLedgerEntry(r.party, r.total, false)];
-    lines.push(xmlLedgerEntry('Sales', r.taxable, true));
-    if (r.cgst) lines.push(xmlLedgerEntry('Output CGST', r.cgst, true));
-    if (r.sgst) lines.push(xmlLedgerEntry('Output SGST', r.sgst, true));
-    if (r.igst) lines.push(xmlLedgerEntry('Output IGST', r.igst, true));
-    if (r.roundoff) lines.push(xmlLedgerEntry('Round Off', r.roundoff, true));
-    return voucherXml('Sales', d, r.narration||('Sales Invoice '+r.invoiceNo), lines, `<REFERENCE>${xesc(r.invoiceNo)}</REFERENCE>`);
+    if (r.hasGstCols) {
+      lines.push(xmlLedgerEntry('Sales', r.taxable, true));
+      if (r.cgst) lines.push(xmlLedgerEntry('Output CGST', r.cgst, true));
+      if (r.sgst) lines.push(xmlLedgerEntry('Output SGST', r.sgst, true));
+      if (r.igst) lines.push(xmlLedgerEntry('Output IGST', r.igst, true));
+      if (r.roundoff) lines.push(xmlLedgerEntry('Round Off', r.roundoff, true));
+    } else {
+      lines.push(xmlLedgerEntry(r.ledgerHead || 'Sales', r.total, true));
+    }
+    let out = voucherXml('Sales', d, r.narration||('Sales Invoice '+r.invoiceNo), lines, `<REFERENCE>${xesc(r.invoiceNo)}</REFERENCE>`);
+    if (r.paidAmt) out += voucherXml('Receipt', d, `Received against bill ${r.invoiceNo}`, [
+      xmlLedgerEntry('HDFC Bank', r.paidAmt, false), xmlLedgerEntry(r.party, r.paidAmt, true)
+    ]);
+    return out;
   }
   if (r.voucherType === 'Purchase'){
-    const lines = [xmlLedgerEntry('Purchase', r.taxable, false)];
-    if (r.cgst) lines.push(xmlLedgerEntry('Input CGST', r.cgst, false));
-    if (r.sgst) lines.push(xmlLedgerEntry('Input SGST', r.sgst, false));
-    if (r.igst) lines.push(xmlLedgerEntry('Input IGST', r.igst, false));
+    const lines = [];
+    if (r.hasGstCols) {
+      lines.push(xmlLedgerEntry('Purchase', r.taxable, false));
+      if (r.cgst) lines.push(xmlLedgerEntry('Input CGST', r.cgst, false));
+      if (r.sgst) lines.push(xmlLedgerEntry('Input SGST', r.sgst, false));
+      if (r.igst) lines.push(xmlLedgerEntry('Input IGST', r.igst, false));
+    } else {
+      lines.push(xmlLedgerEntry(r.ledgerHead || 'Purchase', r.total, false));
+    }
     lines.push(xmlLedgerEntry(r.party, r.total, true));
-    return voucherXml('Purchase', d, r.narration||('Purchase Bill '+r.invoiceNo), lines, `<REFERENCE>${xesc(r.invoiceNo)}</REFERENCE>`);
+    let out = voucherXml('Purchase', d, r.narration||('Purchase Bill '+r.invoiceNo), lines, `<REFERENCE>${xesc(r.invoiceNo)}</REFERENCE>`);
+    if (r.paidAmt) out += voucherXml('Payment', d, `Paid against bill ${r.invoiceNo}`, [
+      xmlLedgerEntry(r.party, r.paidAmt, false), xmlLedgerEntry('HDFC Bank', r.paidAmt, true)
+    ]);
+    return out;
   }
   if (r.voucherType === 'Payroll Journal'){
     const lines = [xmlLedgerEntry('Salary Expense', r.gross, false)];
