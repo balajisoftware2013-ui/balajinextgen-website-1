@@ -223,6 +223,7 @@ select,input[type=text],input[type=number],input[type=date],input[type=url]{padd
   <div class="card step-panel hidden" data-step="log">
     <h2>7 · Import Center & Posting Log</h2>
     <div class="desc">Full history of every import, with per-file stats and an immutable posting log.</div>
+    <div id="logFailBanner"></div>
     <div class="tblwrap"><table id="historyTable"></table></div>
     <h2 style="margin-top:22px;">Posting Log (this import)</h2>
     <div class="row" style="margin-bottom:10px;">
@@ -271,7 +272,11 @@ select,input[type=text],input[type=number],input[type=date],input[type=url]{padd
     <div class="field">
       <label>Tally HTTP/XML Gateway URL</label>
       <input type="url" id="cfgTallyUrl" value="http://localhost:9000">
-      <div class="tinytxt" style="margin-top:5px;">In Tally: Gateway of Tally → F11 (Features) → Enable ODBC/XML Server (port 9000). This page must be able to reach that address — see note below.</div>
+      <div class="tinytxt" style="margin-top:5px;">In Tally: Gateway of Tally → F11 (Features) → Enable ODBC/XML Server → Yes (default port 9000). Tally must be open, on this port, with the company above loaded, whenever you post.</div>
+    </div>
+    <div class="row" style="margin:6px 0 12px;">
+      <button class="btn sm secondary" onclick="testTallyConnBtn()">🔌 Test Connection</button>
+      <span class="small" id="testConnResult"></span>
     </div>
     <div class="field">
       <label>Role</label>
@@ -282,7 +287,7 @@ select,input[type=text],input[type=number],input[type=date],input[type=url]{padd
       </select>
     </div>
     <div class="errline" style="background:var(--amber-soft);color:var(--amber);">
-      Browsers block plain-HTTP requests from an HTTPS page to localhost in most setups (mixed-content / CORS). If live posting fails, the engine automatically falls back to a downloadable Tally XML file you import via Tally → Import Data.
+      Browsers can block a page from calling localhost directly (CORS / Private Network Access), even with Tally open and correctly configured. If Test Connection keeps failing after following the steps above, use "Download Tally XML Bundle" from the Import Log screen and import it via Tally → Gateway of Tally → Import Data instead — that path always works.
     </div>
     <div class="row" style="margin-top:14px;">
       <button class="btn" onclick="saveSettings()">Save</button>
@@ -505,18 +510,49 @@ function saveSettings(){
   toast('Settings saved');
   checkGasBackend(); checkTallyConn(); loadLedgerMaster();
 }
+async function testTallyConnBtn(){
+  CFG.TALLY_URL = document.getElementById('cfgTallyUrl').value.trim() || 'http://localhost:9000';
+  const el = document.getElementById('testConnResult');
+  el.textContent = 'Testing…'; el.style.color = 'var(--sub)';
+  const ok = await checkTallyConn();
+  el.textContent = ok ? '✓ Reachable — Tally responded' : '✗ Not reachable — see steps above, or use the XML export fallback';
+  el.style.color = ok ? 'var(--green)' : 'var(--red)';
+}
 async function checkGasBackend(){
   const dot = document.getElementById('gasDot'), stat = document.getElementById('gasStatus');
-  if (!CFG.GAS_URL){ dot.className='dot'; stat.textContent='Not configured'; return; }
-  try { await erpApi('ping', {}); dot.className='dot ok'; stat.textContent='Connected'; }
-  catch(e){ dot.className='dot bad'; stat.textContent='Unreachable'; }
+  if (!CFG.GAS_URL){
+    dot.className='dot'; stat.textContent='Not configured';
+    stat.title = 'Open Settings and paste your GAS Web App URL (ends in /exec).';
+    return;
+  }
+  try {
+    await erpApi('ping', {});
+    dot.className='dot ok'; stat.textContent='Connected'; stat.title='';
+  } catch(e){
+    dot.className='dot bad';
+    // Surface *why* it failed instead of a bare "Unreachable" — a TypeError from
+    // fetch usually means CORS/network/wrong URL; an Error with a status means
+    // the Apps Script deployment responded but rejected the call.
+    const reason = /Failed to fetch|NetworkError|TypeError/i.test(e.message)
+      ? 'Unreachable — check URL, deployment access, or CORS'
+      : e.message || 'Unreachable';
+    stat.textContent = 'Unreachable';
+    stat.title = reason;
+  }
 }
 async function checkTallyConn(){
   const dot = document.getElementById('tallyDot'), stat = document.getElementById('tallyStatus');
+  dot.className='dot'; stat.textContent='Checking…';
   try {
-    const res = await fetch(CFG.TALLY_URL, {method:'POST', body:'<ENVELOPE><HEADER><TALLYREQUEST>Export</TALLYREQUEST></HEADER><BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>List of Companies</REPORTNAME></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>'});
-    if (res) { dot.className='dot ok'; stat.textContent='Reachable'; }
-  } catch(e){ dot.className='dot bad'; stat.textContent='Not reachable (XML export fallback active)'; }
+    // Content-Type text/plain keeps this a CORS "simple request" — text/xml forces a
+    // preflight OPTIONS call that Tally's built-in HTTP server does not answer, which
+    // made every connection attempt fail even when Tally was open and reachable.
+    const res = await fetch(CFG.TALLY_URL, {method:'POST', headers:{'Content-Type':'text/plain'}, body:'<ENVELOPE><HEADER><TALLYREQUEST>Export</TALLYREQUEST></HEADER><BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>List of Companies</REPORTNAME></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>'});
+    if (res) { dot.className='dot ok'; stat.textContent='Reachable'; return true; }
+  } catch(e){
+    dot.className='dot bad'; stat.textContent='Not reachable — see Settings';
+  }
+  return false;
 }
 
 // ---------- LEDGER MASTER ----------
@@ -1005,11 +1041,63 @@ const BANK_RULES = [
   {re:/(chq|cheque)/i, side:'either', label:'Cheque Transaction', conf:0.5},
   {re:/gst|tax/i, side:'debit', label:'Tax Payment', conf:0.6}
 ];
+// Common Indian bank narration formats carry the counterparty name inline, e.g.:
+//   "UPI/CR/123456789012/JOHN DOE/HDFC0001234/UPI"
+//   "NEFT-N123456789-JOHN DOE ENTERPRISES-HDFC BANK-..."
+//   "IMPS/P2A/123456789012/JOHNDOE/..."
+// Pulling that name out lets us (a) show something useful instead of "—" and
+// (b) match it against the ledger master to auto-resolve confidence instead
+// of dumping every digital-transfer line into "needs review".
+const NARRATION_PARTY_PATTERNS = [
+  /^(?:UPI)[\/\-](?:CR|DR)?[\/\-]?\d{6,}[\/\-]([A-Za-z][A-Za-z .&'\-]{2,40}?)[\/\-]/i,
+  /^(?:NEFT|RTGS)[\/\-][A-Z0-9]{6,}[\/\-]([A-Za-z][A-Za-z .&'\-]{2,40}?)[\/\-]/i,
+  /^IMPS[\/\-][A-Z0-9]{2,6}[\/\-]\d{6,}[\/\-]([A-Za-z][A-Za-z .&'\-]{2,40}?)(?:[\/\-]|$)/i,
+  /(?:^|\/)(?:TO|FROM|BY)[\s:]+([A-Za-z][A-Za-z .&'\-]{2,40}?)(?:\s*\/|\s*$)/i
+];
+function extractPartyFromNarration(narration){
+  if (!narration) return '';
+  const n = String(narration).trim();
+  for (const re of NARRATION_PARTY_PATTERNS){
+    const m = n.match(re);
+    if (m && m[1]){
+      const name = m[1].trim().replace(/\s{2,}/g,' ');
+      // Reject junk matches (pure numbers, single letters, generic bank words)
+      if (name.length >= 3 && !/^\d+$/.test(name) && !/^(BANK|LTD|LIMITED|IFSC|A\/C)$/i.test(name)) return name;
+    }
+  }
+  return '';
+}
 function classifyBankNarration(narration, isCredit){
   const rule = BANK_RULES.find(r => r.re.test(narration));
-  if (!rule) return {label:'Unclassified', confidence:0.2, suggestedLedger: isCredit ? 'Suspense' : 'Suspense'};
-  const suggestedLedger = isCredit ? (rule.ledgerCredit || 'Sundry Debtors') : (rule.ledgerDebit || 'Sundry Creditors');
-  return {label: rule.label, confidence: rule.conf, suggestedLedger};
+  const extractedParty = extractPartyFromNarration(narration);
+
+  if (!rule) {
+    if (extractedParty) return {label:'Unclassified', confidence:0.35, suggestedLedger: extractedParty, extractedParty};
+    return {label:'Unclassified', confidence:0.2, suggestedLedger: isCredit ? 'Suspense' : 'Suspense'};
+  }
+
+  let suggestedLedger = isCredit ? (rule.ledgerCredit || 'Sundry Debtors') : (rule.ledgerDebit || 'Sundry Creditors');
+  let confidence = rule.conf;
+  let label = rule.label;
+
+  // Generic catch-alls (Digital Transfer / Cheque) benefit most from a
+  // resolved counterparty name — try to match it against the ledger master.
+  if (extractedParty && (rule.label === 'Digital Transfer' || rule.label === 'Cheque Transaction')) {
+    const match = matchLedger(extractedParty);
+    label = `${rule.label} — ${extractedParty}`;
+    if (match.status === 'matched') {
+      suggestedLedger = match.tallyName;
+      confidence = 0.9; // known ledger, safe to auto-post
+    } else if (match.status === 'suggested') {
+      suggestedLedger = match.tallyName;
+      confidence = 0.75; // fuzzy ledger match, still above review threshold
+    } else {
+      suggestedLedger = extractedParty;
+      confidence = 0.6; // new counterparty — still needs a quick look, but no longer opaque
+    }
+  }
+
+  return {label, confidence, suggestedLedger, extractedParty};
 }
 function simpleHash(str){
   let h = 0; for (let i=0;i<str.length;i++){ h = (h*31 + str.charCodeAt(i)) | 0; }
@@ -1040,6 +1128,10 @@ function buildRecords(){
       rec.amount = isCredit ? rec.credit : rec.debit;
       rec.side = isCredit ? 'credit' : 'debit';
       rec.voucherType = isCredit ? 'Receipt' : 'Payment';
+      // Bank statements rarely have a dedicated "party" column — fall back to
+      // the counterparty name parsed out of the narration so the Party/Ledger
+      // column isn't just a blank dash for every row.
+      if (!rec.party && cls.extractedParty) rec.party = cls.extractedParty;
       if (cls.confidence < 0.7) { rec.status = 'needs_review'; rec.errors.push(`Low-confidence classification (${Math.round(cls.confidence*100)}%) — suggested: ${cls.suggestedLedger}`); }
       rec.otherLedger = cls.suggestedLedger;
     } else if (STATE.docType === 'sales' || STATE.docType === 'purchase'){
@@ -1155,7 +1247,7 @@ function renderPreview(){
         <td class="checkboxcell"><input type="checkbox" ${r.selected?'checked':''} onchange="r_select('${r.id}',this.checked)"></td>
         <td>${r.rowNum}</td>
         <td>${r.date||'—'}</td>
-        <td>${escapeHtml(r.party||r.debitLedger||'—')}</td>
+        <td>${escapeHtml(r.party||r.debitLedger||r.otherLedger||(r.narration?r.narration.slice(0,30):'')||'—')}</td>
         <td>${r.voucherType}</td>
         <td>₹${(r.amount||0).toLocaleString('en-IN',{maximumFractionDigits:2})}</td>
         <td><span class="badge ${badge(r.status)}">${r.status.replace('_',' ')}</span></td>
@@ -1272,6 +1364,12 @@ async function postRecords(mode){
   const toPost = STATE.records.filter(r => mode==='valid' ? r.status==='ready' : r.selected && r.status!=='duplicate');
   if (toPost.length===0){ toast('Nothing to post in this selection', 'err'); return; }
   if (CFG.ROLE.startsWith('Importer')) { toast('Your role does not have posting permission', 'err'); return; }
+  if (!CFG.TALLY_COMPANY) { toast('Set your Tally Company Name in Settings first', 'err'); openSettings(); return; }
+  const tallyUp = await checkTallyConn();
+  if (!tallyUp){
+    const proceed = confirm('Tally is not reachable right now (not open, XML server off, or a browser/CORS block). Posting will fail for every record until it is.\n\nOpen Settings for the fix steps? Click Cancel to still generate the Tally XML file for manual import instead.');
+    if (proceed) { openSettings(); return; }
+  }
   goStep('post');
   STATE.currentImportId = 'IMP' + Date.now();
   STATE.xmlBundle = [];
@@ -1286,11 +1384,11 @@ async function postRecords(mode){
     STATE.xmlBundle.push(envelope(xmlMsgs));
     let batchOk = false, errMsg = '';
     try {
-      const res = await fetch(CFG.TALLY_URL, {method:'POST', headers:{'Content-Type':'text/xml'}, body: envelope(xmlMsgs)});
+      const res = await fetch(CFG.TALLY_URL, {method:'POST', headers:{'Content-Type':'text/plain'}, body: envelope(xmlMsgs)});
       const text = await res.text();
       batchOk = !/LINEERROR|<STATUS>0<\/STATUS>|Could not/i.test(text) ;
       if (!batchOk) errMsg = (text.match(/<LINEERROR>(.*?)<\/LINEERROR>/)||[,'Rejected by Tally'])[1];
-    } catch(e){ batchOk = false; errMsg = 'Tally unreachable — check Settings / mixed-content / CORS'; }
+    } catch(e){ batchOk = false; errMsg = 'Tally not reachable — open Tally with the ODBC/XML Server enabled (see Settings for steps), then use Retry Failed. Or download the XML Bundle below and import it manually.'; }
 
     batch.forEach(r => {
       const status = batchOk ? 'POSTED' : 'FAILED';
@@ -1343,6 +1441,15 @@ function downloadXmlBundle(){
 // ==========================================================================
 function renderLogTable(){
   const rows = STATE.postingLog.filter(l => l.importId===STATE.currentImportId).slice(0,1000);
+  const failedCount = rows.filter(l=>l.status==='FAILED').length;
+  document.getElementById('logFailBanner').innerHTML = failedCount ? `
+    <div class="errline" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+      <span>${failedCount} record(s) failed to reach Tally directly — this is normal until Tally is open with its ODBC/XML Server enabled on this machine.</span>
+      <span class="row">
+        <button class="btn sm secondary" onclick="openSettings()">Fix Connection</button>
+        <button class="btn sm ghost" onclick="downloadXmlBundle()">Download XML Bundle (always works)</button>
+      </span>
+    </div>` : '';
   document.getElementById('logTable').innerHTML = `
     <tr><th>Row</th><th>Voucher Type</th><th>Ledger</th><th>Amount</th><th>Status</th><th>Error</th><th>Posted At</th></tr>
     ${rows.map(l=>`<tr><td>${l.sourceRow}</td><td>${l.voucherType}</td><td>${escapeHtml(l.ledger)}</td><td>₹${(l.amount||0).toLocaleString('en-IN')}</td><td><span class="badge ${l.status==='POSTED'?'b-posted':'b-failed'}">${l.status}</span></td><td class="tinytxt">${escapeHtml(l.error||'')}</td><td class="tinytxt">${new Date(l.postedAt).toLocaleString('en-IN')}</td></tr>`).join('') || '<tr><td colspan=7 class="small">No postings yet for this import</td></tr>'}
