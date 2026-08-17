@@ -112,6 +112,10 @@ select,input[type=text],input[type=number],input[type=date],input[type=url]{padd
 </head>
 <body>
 
+<div id="fileProtocolWarning" class="hidden" style="background:#b91c1c;color:#fff;padding:10px 18px;font-size:13px;font-weight:600;text-align:center;">
+  ⚠️ You're opening this file directly (file://) — Tally posting will NEVER connect this way, even with the proxy running. Serve it over http:// instead: open a terminal in this folder and run <code style="background:rgba(255,255,255,.2);padding:1px 5px;border-radius:4px;">python -m http.server 8080</code>, then browse to <code style="background:rgba(255,255,255,.2);padding:1px 5px;border-radius:4px;">http://localhost:8080/tally-posting-engine.html</code>.
+</div>
+
 <div class="topbar">
   <div class="brand"><img src="assets/logos/logo.png" alt="Balaji NextGen ERP" class="brand-logo" onerror="this.style.display='none';this.nextElementSibling.style.display='inline';"><span class="brand-fallback" style="display:none;">🧾</span> Tally Direct Posting Engine
     <small>Balaji NextGen ERP — Universal Excel / PDF / Bank Statement → Tally</small>
@@ -367,7 +371,18 @@ select,input[type=text],input[type=number],input[type=date],input[type=url]{padd
 const CFG = {
   CLIENT_ID: localStorage.getItem('CLIENT_ID') || 'CL00011',
   GAS_URL: localStorage.getItem('TDPE_GAS_URL') || '',
-  TALLY_URL: localStorage.getItem('TDPE_TALLY_URL') || 'http://localhost:9001', // 9001 = local CORS proxy (tally-proxy.js), which forwards to Tally on 9000
+  // Self-healing: a direct :9000 URL never works from a browser (Tally sends no
+  // CORS headers), so if an old/typed-in setting points straight at Tally,
+  // silently upgrade it to the local CORS proxy (tally-proxy.js) on :9001.
+  TALLY_URL: (() => {
+    const saved = localStorage.getItem('TDPE_TALLY_URL');
+    if (!saved) return 'http://localhost:9001';
+    if (/^https?:\/\/localhost:9000\/?$/i.test(saved.trim())) {
+      localStorage.setItem('TDPE_TALLY_URL', 'http://localhost:9001');
+      return 'http://localhost:9001';
+    }
+    return saved;
+  })(),
   TALLY_COMPANY: localStorage.getItem('TDPE_TALLY_COMPANY') || '',
   ROLE: localStorage.getItem('TDPE_ROLE') || 'Admin (all permissions)',
   BANK_LEDGER: localStorage.getItem('TDPE_BANK_LEDGER') || 'Cash',
@@ -473,6 +488,9 @@ let currentStep = 'import';
 
 // ---------- UI BOOT ----------
 document.addEventListener('DOMContentLoaded', () => {
+  if (location.protocol === 'file:') {
+    document.getElementById('fileProtocolWarning').classList.remove('hidden');
+  }
   document.getElementById('clientBadge').textContent = CFG.CLIENT_ID;
   buildStepper();
   checkGasBackend();
@@ -522,11 +540,20 @@ async function autopilotTick(){
   if (!CFG.AUTOPILOT_ON) return;
   if (CFG.ROLE.startsWith('Importer') || CFG.ROLE.startsWith('Approver')){ return; } // no posting permission, skip silently
   const readyCount = STATE.records.filter(r=>r.status==='ready').length;
-  if (!readyCount) return;
+  const failedCount = STATE.postingLog.filter(l => l.importId===STATE.currentImportId && l.status==='FAILED').length;
+  if (!readyCount && !failedCount) return;
   const tallyUp = await checkTallyConn();
   if (!tallyUp) { toast('Auto-Pilot: Tally not reachable, will retry next cycle', 'err'); return; }
-  toast(`Auto-Pilot: posting ${readyCount} ready record(s)…`, 'ok');
-  await postRecords('valid');
+  if (readyCount) {
+    toast(`Auto-Pilot: posting ${readyCount} ready record(s)…`, 'ok');
+    await postRecords('valid');
+  }
+  // Advanced auto: Tally just came back online, so also auto-retry anything
+  // that failed earlier in this import instead of waiting for a manual click.
+  if (failedCount) {
+    toast(`Auto-Pilot: Tally is back — auto-retrying ${failedCount} failed record(s)…`, 'ok');
+    await retryFailed();
+  }
 }
 function toggleAutopilotQuick(){
   CFG.AUTOPILOT_ON = !CFG.AUTOPILOT_ON;
@@ -733,13 +760,33 @@ async function checkGasBackend(){
 async function checkTallyConn(){
   const dot = document.getElementById('tallyDot'), stat = document.getElementById('tallyStatus');
   dot.className='dot'; stat.textContent='Checking…';
-  try {
+  const tryUrl = async (url) => {
     // Content-Type text/plain keeps this a CORS "simple request" — text/xml forces a
     // preflight OPTIONS call that Tally's built-in HTTP server does not answer, which
     // made every connection attempt fail even when Tally was open and reachable.
-    const res = await fetch(CFG.TALLY_URL, {method:'POST', headers:{'Content-Type':'text/plain'}, body:'<ENVELOPE><HEADER><TALLYREQUEST>Export</TALLYREQUEST></HEADER><BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>List of Companies</REPORTNAME></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>'});
+    return fetch(url, {method:'POST', headers:{'Content-Type':'text/plain'}, body:'<ENVELOPE><HEADER><TALLYREQUEST>Export</TALLYREQUEST></HEADER><BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>List of Companies</REPORTNAME></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>'});
+  };
+  try {
+    const res = await tryUrl(CFG.TALLY_URL);
     if (res) { dot.className='dot ok'; stat.textContent='Reachable'; return true; }
   } catch(e){
+    // Self-healing fallback: if we weren't already trying the proxy on :9001,
+    // try it automatically before giving up — this recovers from a stale
+    // Settings value (e.g. someone pasted :9000 back in) without user action.
+    if (!/:9001\/?$/.test(CFG.TALLY_URL)) {
+      try {
+        const res2 = await tryUrl('http://localhost:9001');
+        if (res2) {
+          CFG.TALLY_URL = 'http://localhost:9001';
+          localStorage.setItem('TDPE_TALLY_URL', CFG.TALLY_URL);
+          const field = document.getElementById('cfgTallyUrl');
+          if (field) field.value = CFG.TALLY_URL;
+          dot.className='dot ok'; stat.textContent='Reachable';
+          toast('Auto-fixed: switched Tally URL to the working proxy (localhost:9001)', 'ok');
+          return true;
+        }
+      } catch(e2) { /* fall through to failure state below */ }
+    }
     dot.className='dot bad'; stat.textContent='Not reachable — see Settings';
   }
   return false;
