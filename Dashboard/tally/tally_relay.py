@@ -55,6 +55,14 @@ def parse_tally_response(xml_text):
 
     ok = errors_n == 0 and exceptions_n == 0 and not line_errors
 
+    if not ok and not line_errors:
+        # Tally reported a failure (ERRORS/EXCEPTIONS > 0) but didn't include a
+        # <LINEERROR> tag — surface a (now much less truncated) excerpt of
+        # Tally's actual raw reply so the real cause is visible instead of
+        # just "Rejected by Tally".
+        excerpt = re.sub(r"\s+", " ", xml_text).strip()[:4000]
+        line_errors = [f"(no <LINEERROR> tag in reply) Raw Tally reply: {excerpt}"]
+
     return {
         "ok": ok,
         "created": created_n,

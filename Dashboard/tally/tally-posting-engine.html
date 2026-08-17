@@ -1658,6 +1658,24 @@ function xesc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g
 function xmlLedgerEntry(name, amount, isDeemedPositive){
   return `<LEDGERENTRIES.LIST><LEDGERNAME>${xesc(name)}</LEDGERNAME><ISDEEMEDPOSITIVE>${isDeemedPositive?'Yes':'No'}</ISDEEMEDPOSITIVE><AMOUNT>${isDeemedPositive?'-':''}${Math.abs(amount).toFixed(2)}</AMOUNT></LEDGERENTRIES.LIST>`;
 }
+// Best-effort fix for "EXCEPTIONS with no LINEERROR" on Payment/Receipt vouchers:
+// many Tally companies have "bank allocation" details turned on for real bank
+// ledgers (as opposed to a plain Cash ledger). When that's on, the HTTP/XML
+// gateway silently exceptions any voucher missing a <BANKALLOCATIONS.LIST>
+// block instead of returning an explanatory error. We add it only for the
+// bank-side leg, and only when a real bank ledger is configured (not the
+// 'Cash' fallback), using TRANSACTIONTYPE "Transfer" as the safest generic
+// value (covers NEFT/RTGS/IMPS/UPI wage payouts). If your company's bank
+// allocation actually needs a different TRANSACTIONTYPE (e.g. "Cheque"),
+// tell me and I'll adjust this.
+function xmlBankLedgerEntry(name, amount, isDeemedPositive, date, partyName){
+  const base = `<LEDGERNAME>${xesc(name)}</LEDGERNAME><ISDEEMEDPOSITIVE>${isDeemedPositive?'Yes':'No'}</ISDEEMEDPOSITIVE><AMOUNT>${isDeemedPositive?'-':''}${Math.abs(amount).toFixed(2)}</AMOUNT>`;
+  const isRealBank = name && name.trim().toLowerCase() !== 'cash';
+  const bankBlock = isRealBank
+    ? `<BANKALLOCATIONS.LIST><DATE>${date}</DATE><TRANSACTIONTYPE>Transfer</TRANSACTIONTYPE><BANKPARTYNAME>${xesc(partyName||name)}</BANKPARTYNAME><AMOUNT>${isDeemedPositive?'-':''}${Math.abs(amount).toFixed(2)}</AMOUNT></BANKALLOCATIONS.LIST>`
+    : '';
+  return `<LEDGERENTRIES.LIST>${base}${bankBlock}</LEDGERENTRIES.LIST>`;
+}
 function envelope(bodyXml){
   return `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>${xesc(CFG.TALLY_COMPANY)}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA>${bodyXml}</REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
 }
@@ -1675,14 +1693,14 @@ function buildRecordXml(r){
   const d = tallyDateFmt(r.date);
   if (r.voucherType === 'Receipt'){
     return voucherXml('Receipt', d, r.narration||('Receipt from '+r.party), [
-      xmlLedgerEntry(activeBankLedger(), r.amount, false),
+      xmlBankLedgerEntry(activeBankLedger(), r.amount, false, d, r.otherLedger||r.party),
       xmlLedgerEntry(r.otherLedger||r.party||'Suspense Account', r.amount, true)
     ]);
   }
   if (r.voucherType === 'Payment'){
     return voucherXml('Payment', d, r.narration||('Payment to '+r.party), [
       xmlLedgerEntry(r.otherLedger||r.party||'Suspense Account', r.amount, false),
-      xmlLedgerEntry(activeBankLedger(), r.amount, true)
+      xmlBankLedgerEntry(activeBankLedger(), r.amount, true, d, r.otherLedger||r.party)
     ]);
   }
   if (r.voucherType === 'Sales'){
@@ -1940,7 +1958,12 @@ async function postRecords(mode){
     } catch(e){ /* non-blocking — posting still proceeds, individual vouchers will show the real Tally error if a ledger is genuinely missing */ }
   }
   document.getElementById('postSummaryLine').textContent = `Posting ${toPost.length.toLocaleString('en-IN')} of ${STATE.records.length.toLocaleString('en-IN')} records to "${CFG.TALLY_COMPANY||'(company not set)'}"…`;
-  const BATCH = 25;
+  // Posting one voucher per request (not a batch of 25) so a failure is
+  // attributed to the exact record that caused it, and so a single bad
+  // voucher can't drag 24 good ones down as FAILED. Slower, but accurate —
+  // important while diagnosing the current EXCEPTIONS issue. Bump this back
+  // up once postings are reliably succeeding.
+  const BATCH = 1;
   let posted=0, failed=0, consecutiveConnFailures=0, stoppedEarly=false;
   for (let i=0; i<toPost.length; i+=BATCH){
     const batch = toPost.slice(i, i+BATCH);

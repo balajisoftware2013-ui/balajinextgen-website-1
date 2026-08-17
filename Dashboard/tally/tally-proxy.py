@@ -61,7 +61,7 @@ def parse_tally_response(xml_text):
         # company/voucher-type mismatches. Don't hide it behind a generic
         # message: surface a trimmed excerpt of Tally's actual raw reply so
         # the real cause is visible instead of just "Rejected by Tally".
-        excerpt = re.sub(r"\s+", " ", xml_text).strip()[:400]
+        excerpt = re.sub(r"\s+", " ", xml_text).strip()[:4000]
         line_errors = [f"(no <LINEERROR> tag in reply) Raw Tally reply: {excerpt}"]
 
     return {
