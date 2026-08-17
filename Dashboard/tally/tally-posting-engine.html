@@ -409,7 +409,8 @@ const STATE = {
   keywordRules: [],       // [{id, keywords:['chrgs','charges'], ledger:'Bank Charges', group:'Indirect Expenses'}]
   bankLedgerMap: lsGet(LS.bankLedgerMap(), {}),   // detected bank code -> Tally ledger name chosen for it, remembered per Client ID
   selectedBankLedger: '',  // active "Bank Select" for the current import — used in every voucher XML instead of a hardcoded name
-  createdLedgersThisSession: new Set()  // names already auto-created in Tally this session, so we don't re-send Create XML for them
+  createdLedgersThisSession: new Set(), // names already auto-created in Tally this session, so we don't re-send Create XML for them
+  createdGroupsThisSession: new Set()   // group/header names already auto-created in Tally this session
 };
 
 // Default narration→ledger keyword rules. These run BEFORE the generic
@@ -1154,18 +1155,21 @@ function similarity(a,b){
 }
 function inferGroup(name, docType){
   const n = name.toLowerCase();
+  // NOTE: these must be the ledger's actual Tally PARENT GROUP name (a real
+  // group that either already exists as a Tally reserved group, or that we
+  // auto-create as a header — see ensureGroupsExist()). Previously this
+  // appended free-text like "(Output CGST)" which is not a real Tally group,
+  // so any ledger created under it would fail with "Group does not exist";
+  // that detail now lives only in the ledger name itself, not the group.
   if (/(bank|hdfc|icici|sbi|axis|kotak|current a\/c|savings|yes bank|pnb|idfc|bob\b)/.test(n)) return 'Bank Accounts';
   if (/^cash$/.test(n)) return 'Cash-in-Hand';
-  if (/cgst/.test(n)) return docType==='sales'?'Duties & Taxes (Output CGST)':'Duties & Taxes (Input CGST)';
-  if (/sgst/.test(n)) return docType==='sales'?'Duties & Taxes (Output SGST)':'Duties & Taxes (Input SGST)';
-  if (/igst/.test(n)) return docType==='sales'?'Duties & Taxes (Output IGST)':'Duties & Taxes (Input IGST)';
+  if (/cgst|sgst|igst|tds/.test(n)) return 'Duties & Taxes';
   if (/salary/.test(n)) return 'Indirect Expenses';
   if (/(pf|provident)/.test(n)) return 'Current Liabilities';
   if (/esi/.test(n)) return 'Current Liabilities';
-  if (/tds/.test(n)) return 'Duties & Taxes';
   if (docType==='sales') return 'Sundry Debtors';
   if (docType==='purchase' || docType==='expense') return 'Sundry Creditors';
-  return 'Suspense';
+  return 'Suspense A/c';
 }
 function buildPartyList(){
   const r = STATE.colRoles;
@@ -1586,6 +1590,9 @@ function voucherXml(vchType, date, narration, ledgerLines, extra){
 function ledgerCreateXml(name, group, gstin, state){
   return `<TALLYMESSAGE xmlns:UDF="TallyUDF"><LEDGER NAME="${xesc(name)}" ACTION="Create"><NAME>${xesc(name)}</NAME><PARENT>${xesc(group)}</PARENT>${gstin?`<PARTYGSTIN>${xesc(gstin)}</PARTYGSTIN>`:''}${state?`<LEDSTATENAME>${xesc(state)}</LEDSTATENAME>`:''}</LEDGER></TALLYMESSAGE>`;
 }
+function groupCreateXml(name, parent){
+  return `<TALLYMESSAGE xmlns:UDF="TallyUDF"><GROUP NAME="${xesc(name)}" ACTION="Create"><NAME>${xesc(name)}</NAME><PARENT>${xesc(parent)}</PARENT></GROUP></TALLYMESSAGE>`;
+}
 function activeBankLedger(){ return STATE.selectedBankLedger || CFG.BANK_LEDGER || 'Cash'; }
 function buildRecordXml(r){
   const d = tallyDateFmt(r.date);
@@ -1658,8 +1665,66 @@ function buildRecordXml(r){
 // used for Pay Heads/Employee Master in the HR dashboard's Tally posting).
 // Runs right before a batch is posted so no voucher ever fails with
 // "ledger does not exist" — every ledger it references gets created under
-// the right group first.
+// the right group first, AND the group ("header") itself is auto-created
+// first if it doesn't already exist in Tally (see ensureGroupsExist below).
+// Without this, creating a ledger under a non-standard/custom group that
+// isn't in the company yet fails with "Group does not exist".
 // ==========================================================================
+// Tally's built-in reserved groups (present in every company by default) —
+// never need creating, only ledgers we invent (e.g. custom expense heads)
+// might sit under a group that isn't one of these and isn't in Tally yet.
+const STANDARD_TALLY_GROUPS = new Set([
+  'primary','capital account','loans (liability)','current liabilities','fixed assets',
+  'investments','current assets','branch / divisions','misc. expenses (asset)','suspense a/c',
+  'sundry debtors','sundry creditors','sales accounts','purchase accounts','direct incomes',
+  'indirect incomes','direct expenses','indirect expenses','bank accounts','bank oc a/c',
+  'bank od a/c','cash-in-hand','deposits (asset)','loans & advances (asset)','stock-in-hand',
+  'duties & taxes','provisions','reserves & surplus','secured loans','unsecured loans'
+].map(s=>s.toLowerCase()));
+function groupExistsInTally(name){
+  if (!name) return true;
+  const n = String(name).trim().toLowerCase();
+  return STANDARD_TALLY_GROUPS.has(n) || STATE.createdGroupsThisSession.has(n);
+}
+// A sane default PARENT for any custom group we have to invent on the fly,
+// so it lands under a sensible top-level classification instead of erroring.
+function defaultParentForGroup(name){
+  const n = String(name).toLowerCase();
+  if (/expense/.test(n)) return 'Indirect Expenses';
+  if (/income/.test(n)) return 'Indirect Incomes';
+  if (/tax|duties/.test(n)) return 'Duties & Taxes';
+  if (/liabilit|payable/.test(n)) return 'Current Liabilities';
+  if (/asset|receivable/.test(n)) return 'Current Assets';
+  return 'Primary';
+}
+// Posts a GROUP Create XML for every distinct group referenced by `refs` that
+// isn't a standard Tally group and isn't already created this session/known
+// in the ledger master's group list. Same Create→Alter fallback pattern as
+// ledgers, so a stale group cache never blocks posting.
+async function ensureGroupsExist(refs){
+  const seen = {}; const toCreate = [];
+  refs.forEach(ref => {
+    const gname = ref.group; if (!gname) return;
+    const key = String(gname).trim().toLowerCase();
+    if (seen[key]) return; seen[key] = true;
+    if (!groupExistsInTally(gname)) toCreate.push(gname);
+  });
+  if (!toCreate.length) return {created:[], failed:[]};
+  const createXml = toCreate.map(g => groupCreateXml(g, defaultParentForGroup(g))).join('');
+  let created = [], failed = [];
+  try {
+    const res = await fetch(CFG.TALLY_URL, {method:'POST', headers:{'Content-Type':'text/plain'}, body: envelope(createXml)});
+    const text = await res.text();
+    const dup = toCreate.filter(g => new RegExp(g.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '[\\s\\S]{0,120}(already exist|Duplicate)', 'i').test(text));
+    if (dup.length){
+      const alterXml = dup.map(g => `<TALLYMESSAGE xmlns:UDF="TallyUDF"><GROUP NAME="${xesc(g)}" ACTION="Alter"><NAME>${xesc(g)}</NAME><PARENT>${xesc(defaultParentForGroup(g))}</PARENT></GROUP></TALLYMESSAGE>`).join('');
+      try { await fetch(CFG.TALLY_URL, {method:'POST', headers:{'Content-Type':'text/plain'}, body: envelope(alterXml)}); } catch(e){ /* best-effort fallback */ }
+    }
+    created = toCreate;
+  } catch(e) { failed = toCreate; }
+  created.forEach(g => STATE.createdGroupsThisSession.add(String(g).trim().toLowerCase()));
+  return {created, failed};
+}
 function getLedgerGroup(name, hint){
   if (!name) return 'Suspense Account';
   if (hint) return hint;
@@ -1730,7 +1795,11 @@ async function autoCreateMissingLedgers(batch){
       if (!ledgerExistsInMaster(ref.name)) toCreate.push(ref);
     });
   });
-  if (!toCreate.length) return {created:[], failed:[]};
+  if (!toCreate.length) return {created:[], failed:[], groupsCreated:[]};
+  // Auto-create any missing header/group FIRST — creating a ledger under a
+  // group that doesn't exist yet in Tally fails, so the header must exist
+  // before we send the ledger Create XML below.
+  const {created: groupsCreated} = await ensureGroupsExist(toCreate);
   const createXml = toCreate.map(l => ledgerCreateXml(l.name, l.group, l.gstin, l.state)).join('');
   let created = [], failed = [];
   try {
@@ -1750,7 +1819,7 @@ async function autoCreateMissingLedgers(batch){
   });
   lsSet(LS.ledgers(), STATE.ledgerMaster);
   if (CFG.GAS_URL && created.length) { try { await erpApi('saveLedgerMaster', {ledgers: created}); } catch(e){ /* GAS may not support this action yet — non-blocking */ } }
-  return {created, failed};
+  return {created, failed, groupsCreated};
 }
 
 async function autoPostAll(){
@@ -1773,9 +1842,21 @@ async function postRecords(mode){
   goStep('post');
   if (mode !== 'retry') STATE.currentImportId = 'IMP' + Date.now();
   STATE.xmlBundle = [];
-  document.getElementById('postSummaryLine').textContent = `Posting ${toPost.length.toLocaleString('en-IN')} of ${STATE.records.length.toLocaleString('en-IN')} records to "${CFG.TALLY_COMPANY||'(company not set)'}"…`;
+  document.getElementById('postSummaryLine').textContent = `Checking ledgers/groups in Tally for ${toPost.length.toLocaleString('en-IN')} record(s)…`;
   document.getElementById('postLiveTable').innerHTML = `<tr><th>Row</th><th>Party</th><th>Amount</th><th>Status</th><th>Detail</th></tr>`;
   const liveBody = document.getElementById('postLiveTable');
+  // Auto-create any ledgers this batch needs (and, first, any group/header
+  // those ledgers sit under) so vouchers don't fail with "ledger/group does
+  // not exist". Runs once per batch, before any voucher XML is sent.
+  if (tallyUp){
+    try {
+      const {created, groupsCreated, failed: failedCreate} = await autoCreateMissingLedgers(toPost);
+      if (groupsCreated.length) toast(`Auto-created ${groupsCreated.length} group(s) in Tally: ${groupsCreated.join(', ')}`, 'ok');
+      if (created.length) toast(`Auto-created ${created.length} ledger(s) in Tally`, 'ok');
+      if (failedCreate.length) toast(`Could not auto-create ${failedCreate.length} ledger(s) — Tally unreachable during setup step`, 'err');
+    } catch(e){ /* non-blocking — posting still proceeds, individual vouchers will show the real Tally error if a ledger is genuinely missing */ }
+  }
+  document.getElementById('postSummaryLine').textContent = `Posting ${toPost.length.toLocaleString('en-IN')} of ${STATE.records.length.toLocaleString('en-IN')} records to "${CFG.TALLY_COMPANY||'(company not set)'}"…`;
   const BATCH = 25;
   let posted=0, failed=0;
   for (let i=0; i<toPost.length; i+=BATCH){
