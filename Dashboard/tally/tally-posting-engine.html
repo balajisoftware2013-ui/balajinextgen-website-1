@@ -287,7 +287,7 @@ select,input[type=text],input[type=number],input[type=date],input[type=url]{padd
       <label>Tally HTTP/XML Gateway URL</label>
       <input type="url" id="cfgTallyUrl" value="http://localhost:9001">
       <div class="tinytxt" style="margin-top:5px;">In Tally: Gateway of Tally → F11 (Features) → Enable ODBC/XML Server → Yes (default port 9000). Tally must be open, on this port, with the company above loaded, whenever you post.</div>
-      <div class="tinytxt" style="margin-top:5px;color:var(--orange2);font-weight:600;">⚠️ Browsers block direct calls to Tally's port 9000 (no CORS support). This app is set to talk to the included <code>tally-proxy.js</code> on port 9001 instead — run <code>node tally-proxy.js</code> before testing/posting, and open this page via http://localhost (not by double-clicking the file). See TALLY-SETUP.md.</div>
+      <div class="tinytxt" style="margin-top:5px;color:var(--orange2);font-weight:600;">⚠️ Browsers block direct calls to Tally's port 9000 (no CORS support, and no way to read the reply). Run a small local bridge on port 9001 instead — either <code>node tally-proxy.js</code> or <code>python tally_relay.py</code> (both included with this app; the Python one also gives cleaner per-line error messages). Leave it running, and open this page via http://localhost (not by double-clicking the file). See TALLY-SETUP.md.</div>
     </div>
     <div class="row" style="margin:6px 0 12px;">
       <button class="btn sm secondary" onclick="testTallyConnBtn()">🔌 Test Connection</button>
@@ -757,6 +757,25 @@ async function checkGasBackend(){
     stat.title = reason;
   }
 }
+// ---------- TALLY REPLY PARSING (supports both bridge types) ----------
+// tally-proxy.js (Node) forwards Tally's raw XML reply as-is.
+// tally_relay.py (Python) parses that XML server-side and replies with clean
+// JSON: {ok, created, altered, errors, exceptions, lineErrors:[...]}. Detect
+// which one we're talking to from the Content-Type header and normalize both
+// into the same {ok, errMsg, searchText} shape everywhere we read a reply.
+function interpretTallyReply(text, contentType){
+  if (contentType && contentType.toLowerCase().includes('json')) {
+    try {
+      const j = JSON.parse(text);
+      const ok = j.ok !== false;
+      const errMsg = (j.lineErrors && j.lineErrors[0]) || (ok ? '' : 'Rejected by Tally');
+      return { ok, errMsg, searchText: JSON.stringify(j) };
+    } catch(e) { /* header said json but body wasn't — fall through to XML parsing */ }
+  }
+  const ok = !/LINEERROR|<STATUS>0<\/STATUS>|Could not/i.test(text);
+  const errMsg = ok ? '' : (text.match(/<LINEERROR>(.*?)<\/LINEERROR>/)||[,'Rejected by Tally'])[1];
+  return { ok, errMsg, searchText: text };
+}
 async function checkTallyConn(){
   const dot = document.getElementById('tallyDot'), stat = document.getElementById('tallyStatus');
   dot.className='dot'; stat.textContent='Checking…';
@@ -768,7 +787,8 @@ async function checkTallyConn(){
   };
   try {
     const res = await tryUrl(CFG.TALLY_URL);
-    if (res) { dot.className='dot ok'; stat.textContent='Reachable'; return true; }
+    if (res && res.ok) { dot.className='dot ok'; stat.textContent='Reachable'; return true; }
+    throw new Error('bridge responded but reported an error (status ' + (res && res.status) + ')');
   } catch(e){
     // Self-healing fallback: if we weren't already trying the proxy on :9001,
     // try it automatically before giving up — this recovers from a stale
@@ -776,7 +796,7 @@ async function checkTallyConn(){
     if (!/:9001\/?$/.test(CFG.TALLY_URL)) {
       try {
         const res2 = await tryUrl('http://localhost:9001');
-        if (res2) {
+        if (res2 && res2.ok) {
           CFG.TALLY_URL = 'http://localhost:9001';
           localStorage.setItem('TDPE_TALLY_URL', CFG.TALLY_URL);
           const field = document.getElementById('cfgTallyUrl');
@@ -1772,7 +1792,8 @@ async function ensureGroupsExist(refs){
   try {
     const res = await fetch(CFG.TALLY_URL, {method:'POST', headers:{'Content-Type':'text/plain'}, body: envelope(createXml)});
     const text = await res.text();
-    const dup = toCreate.filter(g => new RegExp(g.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '[\\s\\S]{0,120}(already exist|Duplicate)', 'i').test(text));
+    const reply = interpretTallyReply(text, res.headers.get('content-type')||'');
+    const dup = toCreate.filter(g => new RegExp(g.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '[\\s\\S]{0,120}(already exist|Duplicate)', 'i').test(reply.searchText));
     if (dup.length){
       const alterXml = dup.map(g => `<TALLYMESSAGE xmlns:UDF="TallyUDF"><GROUP NAME="${xesc(g)}" ACTION="Alter"><NAME>${xesc(g)}</NAME><PARENT>${xesc(defaultParentForGroup(g))}</PARENT></GROUP></TALLYMESSAGE>`).join('');
       try { await fetch(CFG.TALLY_URL, {method:'POST', headers:{'Content-Type':'text/plain'}, body: envelope(alterXml)}); } catch(e){ /* best-effort fallback */ }
@@ -1862,7 +1883,8 @@ async function autoCreateMissingLedgers(batch){
   try {
     const res = await fetch(CFG.TALLY_URL, {method:'POST', headers:{'Content-Type':'text/plain'}, body: envelope(createXml)});
     const text = await res.text();
-    const dup = toCreate.filter(l => new RegExp(l.name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '[\\s\\S]{0,120}(already exist|Duplicate)', 'i').test(text));
+    const reply = interpretTallyReply(text, res.headers.get('content-type')||'');
+    const dup = toCreate.filter(l => new RegExp(l.name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '[\\s\\S]{0,120}(already exist|Duplicate)', 'i').test(reply.searchText));
     if (dup.length){
       const alterXml = dup.map(l => `<TALLYMESSAGE xmlns:UDF="TallyUDF"><LEDGER NAME="${xesc(l.name)}" ACTION="Alter"><NAME>${xesc(l.name)}</NAME><PARENT>${xesc(l.group)}</PARENT>${l.gstin?`<PARTYGSTIN>${xesc(l.gstin)}</PARTYGSTIN>`:''}</LEDGER></TALLYMESSAGE>`).join('');
       try { await fetch(CFG.TALLY_URL, {method:'POST', headers:{'Content-Type':'text/plain'}, body: envelope(alterXml)}); } catch(e){ /* best-effort fallback */ }
@@ -1928,8 +1950,9 @@ async function postRecords(mode){
     try {
       const res = await fetch(CFG.TALLY_URL, {method:'POST', headers:{'Content-Type':'text/plain'}, body: envelope(xmlMsgs)});
       const text = await res.text();
-      batchOk = !/LINEERROR|<STATUS>0<\/STATUS>|Could not/i.test(text) ;
-      if (!batchOk) errMsg = (text.match(/<LINEERROR>(.*?)<\/LINEERROR>/)||[,'Rejected by Tally'])[1];
+      const reply = interpretTallyReply(text, res.headers.get('content-type')||'');
+      batchOk = res.ok && reply.ok;
+      if (!batchOk) errMsg = reply.errMsg;
     } catch(e){ batchOk = false; errMsg = 'Tally not reachable — open Tally with the ODBC/XML Server enabled (see Settings for steps), then use Retry Failed. Or download the XML Bundle below and import it manually.'; }
 
     batch.forEach(r => {

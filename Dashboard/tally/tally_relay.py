@@ -42,10 +42,10 @@ TALLY_PORT = 9000
 
 def parse_tally_response(xml_text):
     """Turn Tally's raw XML reply into a simple ok/created/errors summary."""
-    created = re.search(r"<CREATED>(\\d+)</CREATED>", xml_text)
-    altered = re.search(r"<ALTERED>(\\d+)</ALTERED>", xml_text)
-    errors = re.search(r"<ERRORS>(\\d+)</ERRORS>", xml_text)
-    exceptions = re.search(r"<EXCEPTIONS>(\\d+)</EXCEPTIONS>", xml_text)
+    created = re.search(r"<CREATED>(\d+)</CREATED>", xml_text)
+    altered = re.search(r"<ALTERED>(\d+)</ALTERED>", xml_text)
+    errors = re.search(r"<ERRORS>(\d+)</ERRORS>", xml_text)
+    exceptions = re.search(r"<EXCEPTIONS>(\d+)</EXCEPTIONS>", xml_text)
     line_errors = re.findall(r"<LINEERROR>(.*?)</LINEERROR>", xml_text, re.S)
 
     created_n = int(created.group(1)) if created else 0
@@ -119,7 +119,7 @@ def main():
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
-            print("\\nStopped.")
+            print("\nStopped.")
             sys.exit(0)
 
 
