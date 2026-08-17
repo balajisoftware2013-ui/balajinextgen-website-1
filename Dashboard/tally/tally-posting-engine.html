@@ -121,6 +121,7 @@ select,input[type=text],input[type=number],input[type=date],input[type=url]{padd
     <div class="pill"><span class="dot" id="tallyDot"></span> Tally: <span id="tallyStatus">Not connected</span></div>
     <div class="pill">🏢 <span id="clientBadge">CL00011</span></div>
     <div class="pill">🏦 <span id="bankLedgerBadge">—</span></div>
+    <div class="pill" id="autopilotPill" style="cursor:pointer;" onclick="toggleAutopilotQuick()"><span class="dot" id="autopilotDot"></span> Auto-Pilot: <span id="autopilotStatus">Off</span></div>
     <button class="iconbtn" style="background:rgba(255,255,255,.32);" onclick="autoPostAll()">⚡ Auto Post Everything</button>
     <button class="iconbtn" onclick="openSettings()">⚙ Settings</button>
   </div>
@@ -295,6 +296,21 @@ select,input[type=text],input[type=number],input[type=date],input[type=url]{padd
         <option>Importer (import & map only)</option>
       </select>
     </div>
+    <div class="field" style="background:#fbfbfd;border:1px solid var(--line);border-radius:10px;padding:12px 14px;">
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;">
+        <input type="checkbox" id="cfgAutopilotOn" style="width:auto;"> ⚡ Auto-Pilot — automatically post "ready" records on a schedule
+      </label>
+      <div class="row" style="gap:8px;">
+        <span class="small" style="min-width:auto;">Check every</span>
+        <select id="cfgAutopilotInterval" style="width:auto;">
+          <option value="5">5 minutes</option>
+          <option value="15">15 minutes</option>
+          <option value="30">30 minutes</option>
+          <option value="60">60 minutes</option>
+        </select>
+      </div>
+      <div class="tinytxt" style="margin-top:6px;">While enabled and this tab stays open, any record that reaches "ready" status is posted to Tally automatically — no need to click Post. Turns off if you close the tab; re-open and it resumes per this setting.</div>
+    </div>
     <div class="errline" style="background:var(--amber-soft);color:var(--amber);">
       Browsers can block a page from calling localhost directly (CORS / Private Network Access), even with Tally open and correctly configured. If Test Connection keeps failing after following the steps above, use "Download Tally XML Bundle" from the Import Log screen and import it via Tally → Gateway of Tally → Import Data instead — that path always works.
     </div>
@@ -347,7 +363,9 @@ const CFG = {
   TALLY_URL: localStorage.getItem('TDPE_TALLY_URL') || 'http://localhost:9000',
   TALLY_COMPANY: localStorage.getItem('TDPE_TALLY_COMPANY') || '',
   ROLE: localStorage.getItem('TDPE_ROLE') || 'Admin (all permissions)',
-  BANK_LEDGER: localStorage.getItem('TDPE_BANK_LEDGER') || 'Cash'
+  BANK_LEDGER: localStorage.getItem('TDPE_BANK_LEDGER') || 'Cash',
+  AUTOPILOT_ON: localStorage.getItem('TDPE_AUTOPILOT_ON') === '1',
+  AUTOPILOT_MIN: parseInt(localStorage.getItem('TDPE_AUTOPILOT_MIN')) || 15
 };
 async function erpApi(action, payload) {
   if (!CFG.GAS_URL) throw new Error('GAS backend URL not configured');
@@ -464,7 +482,49 @@ document.addEventListener('DOMContentLoaded', () => {
   renderTemplateButtons();
   STATE.selectedBankLedger = CFG.BANK_LEDGER;
   updateBankLedgerBadge();
+  document.getElementById('cfgAutopilotOn').checked = CFG.AUTOPILOT_ON;
+  document.getElementById('cfgAutopilotInterval').value = String(CFG.AUTOPILOT_MIN);
+  renderAutopilotPill();
+  if (CFG.AUTOPILOT_ON) startAutopilot();
 });
+
+// ==========================================================================
+// AUTO-PILOT — scheduled future auto-posting of "ready" records
+// ==========================================================================
+let autopilotTimer = null;
+function renderAutopilotPill(){
+  const dot = document.getElementById('autopilotDot');
+  const status = document.getElementById('autopilotStatus');
+  if (!dot || !status) return;
+  dot.className = 'dot' + (CFG.AUTOPILOT_ON ? ' ok' : '');
+  status.textContent = CFG.AUTOPILOT_ON ? `On (every ${CFG.AUTOPILOT_MIN}m)` : 'Off';
+}
+function startAutopilot(){
+  stopAutopilot();
+  autopilotTimer = setInterval(autopilotTick, CFG.AUTOPILOT_MIN * 60 * 1000);
+  renderAutopilotPill();
+}
+function stopAutopilot(){
+  if (autopilotTimer){ clearInterval(autopilotTimer); autopilotTimer = null; }
+  renderAutopilotPill();
+}
+async function autopilotTick(){
+  if (!CFG.AUTOPILOT_ON) return;
+  if (CFG.ROLE.startsWith('Importer') || CFG.ROLE.startsWith('Approver')){ return; } // no posting permission, skip silently
+  const readyCount = STATE.records.filter(r=>r.status==='ready').length;
+  if (!readyCount) return;
+  const tallyUp = await checkTallyConn();
+  if (!tallyUp) { toast('Auto-Pilot: Tally not reachable, will retry next cycle', 'err'); return; }
+  toast(`Auto-Pilot: posting ${readyCount} ready record(s)…`, 'ok');
+  await postRecords('valid');
+}
+function toggleAutopilotQuick(){
+  CFG.AUTOPILOT_ON = !CFG.AUTOPILOT_ON;
+  localStorage.setItem('TDPE_AUTOPILOT_ON', CFG.AUTOPILOT_ON ? '1' : '0');
+  document.getElementById('cfgAutopilotOn').checked = CFG.AUTOPILOT_ON;
+  if (CFG.AUTOPILOT_ON) { startAutopilot(); toast(`Auto-Pilot turned on — checking every ${CFG.AUTOPILOT_MIN} minutes`, 'ok'); }
+  else { stopAutopilot(); toast('Auto-Pilot turned off', 'ok'); }
+}
 function updateBankLedgerBadge(){
   const el = document.getElementById('bankLedgerBadge');
   if (el) el.textContent = STATE.selectedBankLedger || CFG.BANK_LEDGER || 'not set';
@@ -609,16 +669,21 @@ function saveSettings(){
   CFG.TALLY_COMPANY = document.getElementById('cfgTallyCompany').value.trim();
   CFG.ROLE = document.getElementById('cfgRole').value;
   CFG.BANK_LEDGER = document.getElementById('cfgBankLedger').value.trim() || CFG.BANK_LEDGER;
+  CFG.AUTOPILOT_ON = document.getElementById('cfgAutopilotOn').checked;
+  CFG.AUTOPILOT_MIN = parseInt(document.getElementById('cfgAutopilotInterval').value) || 15;
   localStorage.setItem('CLIENT_ID', CFG.CLIENT_ID);
   localStorage.setItem('TDPE_GAS_URL', CFG.GAS_URL);
   localStorage.setItem('TDPE_TALLY_URL', CFG.TALLY_URL);
   localStorage.setItem('TDPE_TALLY_COMPANY', CFG.TALLY_COMPANY);
   localStorage.setItem('TDPE_ROLE', CFG.ROLE);
   localStorage.setItem('TDPE_BANK_LEDGER', CFG.BANK_LEDGER);
+  localStorage.setItem('TDPE_AUTOPILOT_ON', CFG.AUTOPILOT_ON ? '1' : '0');
+  localStorage.setItem('TDPE_AUTOPILOT_MIN', String(CFG.AUTOPILOT_MIN));
   STATE.bankLedgerMap = lsGet(LS.bankLedgerMap(), {});
   if (!STATE.selectedBankLedger) STATE.selectedBankLedger = CFG.BANK_LEDGER;
   document.getElementById('clientBadge').textContent = CFG.CLIENT_ID;
   updateBankLedgerBadge();
+  if (CFG.AUTOPILOT_ON) startAutopilot(); else stopAutopilot();
   closeSettings();
   toast('Settings saved');
   checkGasBackend(); checkTallyConn(); loadLedgerMaster();
@@ -1687,6 +1752,13 @@ async function autoCreateMissingLedgers(batch){
   return {created, failed};
 }
 
+async function autoPostAll(){
+  if (!STATE.records || !STATE.records.length){ toast('Import a file first — nothing staged to post', 'err'); return; }
+  const readyCount = STATE.records.filter(r=>r.status==='ready').length;
+  if (!readyCount){ toast('No records are in "ready" status yet — review the staged records first', 'err'); return; }
+  if (!confirm(`Auto Post Everything will post all ${readyCount} ready record(s) straight to Tally now. Continue?`)) return;
+  await postRecords('valid');
+}
 async function postRecords(mode){
   const toPost = STATE.records.filter(r => mode==='valid' ? r.status==='ready' : r.selected && r.status!=='duplicate');
   if (toPost.length===0){ toast('Nothing to post in this selection', 'err'); return; }
@@ -1698,7 +1770,7 @@ async function postRecords(mode){
     if (proceed) { openSettings(); return; }
   }
   goStep('post');
-  STATE.currentImportId = 'IMP' + Date.now();
+  if (mode !== 'retry') STATE.currentImportId = 'IMP' + Date.now();
   STATE.xmlBundle = [];
   document.getElementById('postSummaryLine').textContent = `Posting ${toPost.length.toLocaleString('en-IN')} of ${STATE.records.length.toLocaleString('en-IN')} records to "${CFG.TALLY_COMPANY||'(company not set)'}"…`;
   document.getElementById('postLiveTable').innerHTML = `<tr><th>Row</th><th>Party</th><th>Amount</th><th>Status</th><th>Detail</th></tr>`;
@@ -1754,7 +1826,7 @@ async function retryFailed(){
   const toRetry = STATE.records.filter(r => failedRows.includes(r.rowNum));
   toRetry.forEach(r => r.selected = true);
   STATE.postingLog = STATE.postingLog.filter(l => !(l.importId===STATE.currentImportId && l.status==='FAILED'));
-  await postRecords('selected_retry_placeholder'); // reuse selected path
+  await postRecords('retry'); // reuse selected path, keep same importId so log/history stay unified
 }
 
 function downloadXmlBundle(){
