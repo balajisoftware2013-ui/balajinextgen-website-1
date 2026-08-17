@@ -3507,6 +3507,32 @@ function deletePurchase(id,mode){
   // Roll back the vendor's outstanding balance that this invoice added
   const vi=DB.vendors.findIndex(v=>v.id===p.vendorId);
   if(vi>=0)DB.vendors[vi].outstanding=Math.max(0,(DB.vendors[vi].outstanding||0)-(p.grand||0));
+  // FIX ("purchase invoice deleted but inventory still shows the stock"):
+  // deletePurchase() only ever removed the invoice row itself. If goods had
+  // already been received against this invoice (saveGRN() sets
+  // grnStatus='Completed' and creates a GRN row with purchaseId=p.id, which
+  // is what actually pushed stock into inventory via InventoryBridge), that
+  // GRN — and the stock it added — was never touched here. So deleting the
+  // invoice made it vanish from the Purchase module while the goods it
+  // brought in kept sitting in Inventory forever, exactly like deleting a
+  // GRN directly (deleteGRN() below) already correctly reverses. Fix:
+  // mirror deleteGRN()'s reversal for every GRN linked to this invoice
+  // before removing the invoice itself.
+  const linkedGRNs=DB.grns.filter(g=>g.purchaseId===p.id);
+  linkedGRNs.forEach(g=>{
+    if(typeof InventoryBridge!=='undefined'){
+      const reversed=InventoryBridge.reverseByRef(g.id);
+      if(!reversed&&g.accepted>0)InventoryBridge.adjustStock(g.item,-g.accepted,'Invoice '+p.no+' deleted (GRN '+g.no+' reversed)',{refId:g.id,rate:getItcAdjustedRate(g.rate,g.gst),ref:g.no,party:g.vendorName});
+    }
+    if(typeof reverseGRNStockLedger==='function'){
+      const reversed=reverseGRNStockLedger(g.id);
+      if(!reversed&&g.accepted>0&&typeof pushGRNStockLedger==='function')pushGRNStockLedger({name:g.item,rate:getItcAdjustedRate(g.rate,g.gst),unit:'Nos',gst:g.gst||0},-g.accepted,g.godownId,g.id,g.date,g.vendorName);
+    }
+    const gi=DB.grns.findIndex(x=>x.id===g.id);
+    if(gi>=0)DB.grns.splice(gi,1);
+    erpApi('DELETE_GRN',{id:g.id,no:g.no}).then(r=>{ if(r&&r.success===false) toast('⚠️ Linked GRN '+g.no+' deleted locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️'); });
+  });
+  if(linkedGRNs.length){rendGRN();toast(`Reversed ${linkedGRNs.length} linked GRN(s) and their stock.`,'ok','📦');}
   arr.splice(idx,1);
   if(editingPurchaseId===id){editingPurchaseId=null;editingPurchaseMode=null;}
   save();rendDash();rendRegs();rendPurchaseList();updateApprCount();
