@@ -1658,22 +1658,25 @@ function xesc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g
 function xmlLedgerEntry(name, amount, isDeemedPositive){
   return `<LEDGERENTRIES.LIST><LEDGERNAME>${xesc(name)}</LEDGERNAME><ISDEEMEDPOSITIVE>${isDeemedPositive?'Yes':'No'}</ISDEEMEDPOSITIVE><AMOUNT>${isDeemedPositive?'-':''}${Math.abs(amount).toFixed(2)}</AMOUNT></LEDGERENTRIES.LIST>`;
 }
-// Best-effort fix for "EXCEPTIONS with no LINEERROR" on Payment/Receipt vouchers:
-// many Tally companies have "bank allocation" details turned on for real bank
-// ledgers (as opposed to a plain Cash ledger). When that's on, the HTTP/XML
-// gateway silently exceptions any voucher missing a <BANKALLOCATIONS.LIST>
-// block instead of returning an explanatory error. We add it only for the
-// bank-side leg, and only when a real bank ledger is configured (not the
-// 'Cash' fallback), using TRANSACTIONTYPE "Transfer" as the safest generic
-// value (covers NEFT/RTGS/IMPS/UPI wage payouts). If your company's bank
-// allocation actually needs a different TRANSACTIONTYPE (e.g. "Cheque"),
-// tell me and I'll adjust this.
-function xmlBankLedgerEntry(name, amount, isDeemedPositive, date, partyName){
+// Auto-detect fix for "EXCEPTIONS with no LINEERROR" on Payment/Receipt vouchers:
+// we don't actually know which XML shape your Tally company needs, so instead
+// of guessing once, we try a short list of shapes per voucher and keep
+// whichever one Tally accepts. Once one works, we lock it in and use it
+// directly for the rest of the batch (see postRecords), only falling back to
+// re-trying the list if that stops working for a particular record.
+const BANK_VARIANTS = [
+  { id: 'bank-transfer', label: 'Bank allocation (Transfer)' },
+  { id: 'no-bank-alloc', label: 'No bank allocation (plain ledger line)' },
+  { id: 'bank-cheque',   label: 'Bank allocation (Cheque)' },
+  { id: 'bank-others',   label: 'Bank allocation (Others)' },
+];
+function xmlBankLedgerEntry(name, amount, isDeemedPositive, date, partyName, variant){
   const base = `<LEDGERNAME>${xesc(name)}</LEDGERNAME><ISDEEMEDPOSITIVE>${isDeemedPositive?'Yes':'No'}</ISDEEMEDPOSITIVE><AMOUNT>${isDeemedPositive?'-':''}${Math.abs(amount).toFixed(2)}</AMOUNT>`;
   const isRealBank = name && name.trim().toLowerCase() !== 'cash';
-  const bankBlock = isRealBank
-    ? `<BANKALLOCATIONS.LIST><DATE>${date}</DATE><TRANSACTIONTYPE>Transfer</TRANSACTIONTYPE><BANKPARTYNAME>${xesc(partyName||name)}</BANKPARTYNAME><AMOUNT>${isDeemedPositive?'-':''}${Math.abs(amount).toFixed(2)}</AMOUNT></BANKALLOCATIONS.LIST>`
-    : '';
+  variant = variant || 'bank-transfer';
+  if (!isRealBank || variant === 'no-bank-alloc') return `<LEDGERENTRIES.LIST>${base}</LEDGERENTRIES.LIST>`;
+  const txnType = variant === 'bank-cheque' ? 'Cheque' : variant === 'bank-others' ? 'Others' : 'Transfer';
+  const bankBlock = `<BANKALLOCATIONS.LIST><DATE>${date}</DATE><TRANSACTIONTYPE>${txnType}</TRANSACTIONTYPE><BANKPARTYNAME>${xesc(partyName||name)}</BANKPARTYNAME><AMOUNT>${isDeemedPositive?'-':''}${Math.abs(amount).toFixed(2)}</AMOUNT></BANKALLOCATIONS.LIST>`;
   return `<LEDGERENTRIES.LIST>${base}${bankBlock}</LEDGERENTRIES.LIST>`;
 }
 function envelope(bodyXml){
@@ -1689,18 +1692,18 @@ function groupCreateXml(name, parent){
   return `<TALLYMESSAGE xmlns:UDF="TallyUDF"><GROUP NAME="${xesc(name)}" ACTION="Create"><NAME>${xesc(name)}</NAME><PARENT>${xesc(parent)}</PARENT></GROUP></TALLYMESSAGE>`;
 }
 function activeBankLedger(){ return STATE.selectedBankLedger || CFG.BANK_LEDGER || 'Cash'; }
-function buildRecordXml(r){
+function buildRecordXml(r, variant){
   const d = tallyDateFmt(r.date);
   if (r.voucherType === 'Receipt'){
     return voucherXml('Receipt', d, r.narration||('Receipt from '+r.party), [
-      xmlBankLedgerEntry(activeBankLedger(), r.amount, false, d, r.otherLedger||r.party),
+      xmlBankLedgerEntry(activeBankLedger(), r.amount, false, d, r.otherLedger||r.party, variant),
       xmlLedgerEntry(r.otherLedger||r.party||'Suspense Account', r.amount, true)
     ]);
   }
   if (r.voucherType === 'Payment'){
     return voucherXml('Payment', d, r.narration||('Payment to '+r.party), [
       xmlLedgerEntry(r.otherLedger||r.party||'Suspense Account', r.amount, false),
-      xmlBankLedgerEntry(activeBankLedger(), r.amount, true, d, r.otherLedger||r.party)
+      xmlBankLedgerEntry(activeBankLedger(), r.amount, true, d, r.otherLedger||r.party, variant)
     ]);
   }
   if (r.voucherType === 'Sales'){
@@ -1716,7 +1719,7 @@ function buildRecordXml(r){
     }
     let out = voucherXml('Sales', d, r.narration||('Sales Invoice '+r.invoiceNo), lines, `<REFERENCE>${xesc(r.invoiceNo)}</REFERENCE>`);
     if (r.paidAmt) out += voucherXml('Receipt', d, `Received against bill ${r.invoiceNo}`, [
-      xmlLedgerEntry(activeBankLedger(), r.paidAmt, false), xmlLedgerEntry(r.party, r.paidAmt, true)
+      xmlBankLedgerEntry(activeBankLedger(), r.paidAmt, false, d, r.party, variant), xmlLedgerEntry(r.party, r.paidAmt, true)
     ]);
     return out;
   }
@@ -1733,7 +1736,7 @@ function buildRecordXml(r){
     lines.push(xmlLedgerEntry(r.party, r.total, true));
     let out = voucherXml('Purchase', d, r.narration||('Purchase Bill '+r.invoiceNo), lines, `<REFERENCE>${xesc(r.invoiceNo)}</REFERENCE>`);
     if (r.paidAmt) out += voucherXml('Payment', d, `Paid against bill ${r.invoiceNo}`, [
-      xmlLedgerEntry(r.party, r.paidAmt, false), xmlLedgerEntry(activeBankLedger(), r.paidAmt, true)
+      xmlLedgerEntry(r.party, r.paidAmt, false), xmlBankLedgerEntry(activeBankLedger(), r.paidAmt, true, d, r.party, variant)
     ]);
     return out;
   }
@@ -1964,21 +1967,45 @@ async function postRecords(mode){
   // important while diagnosing the current EXCEPTIONS issue. Bump this back
   // up once postings are reliably succeeding.
   const BATCH = 1;
+  // Only Payment/Receipt (and Sales/Purchase with a paidAmt) touch the bank
+  // ledger, so only those benefit from trying multiple XML shapes below.
+  function usesBankLedger(r){
+    return r.voucherType==='Payment' || r.voucherType==='Receipt' ||
+      ((r.voucherType==='Sales'||r.voucherType==='Purchase') && r.paidAmt);
+  }
   let posted=0, failed=0, consecutiveConnFailures=0, stoppedEarly=false;
   for (let i=0; i<toPost.length; i+=BATCH){
-    const batch = toPost.slice(i, i+BATCH);
-    const xmlMsgs = batch.map(buildRecordXml).join('');
-    STATE.xmlBundle.push(envelope(xmlMsgs));
-    let batchOk = false, errMsg = '', connFailure = false;
-    try {
-      const res = await fetch(CFG.TALLY_URL, {method:'POST', headers:{'Content-Type':'text/plain'}, body: envelope(xmlMsgs)});
-      const text = await res.text();
-      const reply = interpretTallyReply(text, res.headers.get('content-type')||'');
-      batchOk = res.ok && reply.ok;
-      if (!batchOk) errMsg = reply.errMsg;
-    } catch(e){
-      batchOk = false; connFailure = true;
-      errMsg = 'Tally not reachable — open Tally with the ODBC/XML Server enabled (see Settings for steps), then use Retry Failed. Or download the XML Bundle below and import it manually.';
+    const batch = toPost.slice(i, i+BATCH); // BATCH=1, so this is always a single record
+    const r = batch[0];
+    const needsVariants = usesBankLedger(r);
+    // Try the previously-locked-in working variant first (fast path); only
+    // fall back to trying the rest of the list if that one stops working.
+    const tryOrder = needsVariants
+      ? (STATE.workingBankVariant ? [STATE.workingBankVariant, ...BANK_VARIANTS.map(v=>v.id).filter(id=>id!==STATE.workingBankVariant)] : BANK_VARIANTS.map(v=>v.id))
+      : [null];
+    let batchOk = false, errMsg = '', connFailure = false, usedVariant = null, lastXml = '';
+    for (const variant of tryOrder){
+      const xmlMsgs = buildRecordXml(r, variant);
+      lastXml = envelope(xmlMsgs);
+      try {
+        const res = await fetch(CFG.TALLY_URL, {method:'POST', headers:{'Content-Type':'text/plain'}, body: lastXml});
+        const text = await res.text();
+        const reply = interpretTallyReply(text, res.headers.get('content-type')||'');
+        batchOk = res.ok && reply.ok;
+        if (!batchOk) { errMsg = reply.errMsg; continue; }
+        usedVariant = variant;
+        break;
+      } catch(e){
+        batchOk = false; connFailure = true;
+        errMsg = 'Tally not reachable — open Tally with the ODBC/XML Server enabled (see Settings for steps), then use Retry Failed. Or download the XML Bundle below and import it manually.';
+        break; // no point trying other variants if Tally itself is unreachable
+      }
+    }
+    STATE.xmlBundle.push(lastXml);
+    if (batchOk && needsVariants && usedVariant !== STATE.workingBankVariant){
+      STATE.workingBankVariant = usedVariant;
+      const label = (BANK_VARIANTS.find(v=>v.id===usedVariant)||{}).label || usedVariant;
+      toast(`Auto-detected working Tally format: ${label} — using it for the rest of this batch`, 'ok');
     }
     consecutiveConnFailures = connFailure ? consecutiveConnFailures + 1 : 0;
 
