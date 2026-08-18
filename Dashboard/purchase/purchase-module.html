@@ -1807,6 +1807,42 @@ function load(){
           DB.purchases.forEach(p=>{
             if (p.synced!==true && !serverIds.has(p.id)) p.syncUnconfirmed=true;
           });
+          // FIX ("one time click then show delete but again show, 2nd
+          // time delete click then final deleted" — Aug 2026): this
+          // merge only ever ADDED/UPDATED records from the server list —
+          // nothing here ever removed a local record that the server no
+          // longer has. So a genuinely-deleted invoice, once already
+          // confirmed synced=true from an earlier pull, sat in
+          // DB.purchases forever until deletePurchase() was run against
+          // it a second time. Combined with the 20-second poll interval
+          // this file already runs pullInventorySyncData() on, a delete
+          // click that happened to land in the small window before the
+          // server had actually processed the deletion would get its
+          // optimistic local removal undone by the very next poll
+          // (server still had it → poll adds it right back) — exactly
+          // "shows deleted, then reappears". Now: any local record that
+          // (a) was previously confirmed synced=true (so it genuinely
+          // existed on the server before) AND (b) isn't in the server's
+          // current list AND (c) isn't a delete this tab has in flight
+          // right now (see window._pendingDeletes in deletePurchase())
+          // is removed locally too — a real server-side deletion now
+          // actually sticks on the very next poll, not just eventually.
+          const pendingDel = window._pendingDeletes || new Set();
+          DB.purchases = DB.purchases.filter(p =>
+            pendingDel.has(p.id) || p.synced!==true || serverIds.has(p.id)
+          );
+        }
+        // Same deletion reconciliation for Accounting invoices — same
+        // field-name caveat as the confirmed purchaseInvoices above
+        // applies here too (d.acctInvoices isn't independently verified
+        // against this response shape); guarded so it safely no-ops if
+        // the field isn't actually present rather than assuming.
+        if (Array.isArray(d.acctInvoices) && Array.isArray(DB.acctInvs)) {
+          const acctServerIds = new Set(d.acctInvoices.map(r=>r.id));
+          const pendingDel = window._pendingDeletes || new Set();
+          DB.acctInvs = DB.acctInvs.filter(p =>
+            pendingDel.has(p.id) || p.synced!==true || acctServerIds.has(p.id)
+          );
         }
         save();
         try{ rendDash(); }catch(e){}
@@ -2704,64 +2740,37 @@ async function saveVendorToDrive(vend,isEdit){
 // gs's UPLOAD_TO_CLIENT_DRIVE), which uses Apps Script's own Drive access.
 // Same folder structure as before: [Client] → Purchase Invoice →
 // [VendorName] → [YYYY-MM].
-async function savePurchaseToDrive(doc, vend){
-  if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID){
-    toast(`⚠️ ${doc.no} saved in-app, but NOT synced to Drive — no client session`,'warn','☁️');
+// FIX ("upload and json files and .csv file show in google drive which is
+// no need only need invoice copy" — Aug 2026): this used to ALSO generate
+// and upload a JSON summary + a CSV line-items file to Drive on every
+// single save AND every edit — visible in the screenshot as duplicate
+// SE/2194/2026-27_items_....csv / ..._Sarda Enterprise_....json pairs,
+// since the filename has no time component, so re-saving the same
+// invoice on the same day just created a second file with the identical
+// name instead of overwriting anything. None of that data needs to live
+// in Drive at all — it's already the real invoice record in this app's
+// own database (PURCHASE_INVOICE sheet), and the actual scanned bill
+// copy is uploaded once, separately, at scan-time (see the comment
+// below). This function now only confirms that original bill copy
+// exists — it doesn't create or upload anything new.
+function savePurchaseToDrive(doc, vend){
+  // The original scanned bill file is uploaded once, at scan-time, and
+  // its link is carried through onto doc.billFileUrl by savePurchase()
+  // — that's the one and only file this invoice needs in Drive.
+  if(!doc.billFileUrl){
+    toast(`${doc.no} saved — no scanned bill attached, so nothing to keep in Drive for this one`,'','📁');
     return;
   }
-  try{
-    const safeVendName = (vend?.name||doc.vendorName||'Unknown_Vendor').replace(/[<>:"/\\|?*]/g,'_');
-    const monthStr = (doc.date||new Date().toISOString().split('T')[0]).slice(0,7); // YYYY-MM
-    const subPath = ['Purchase Invoice', safeVendName, monthStr];
-
-    // Note: the original scanned bill file is uploaded once, at scan-time,
-    // and its link is carried through onto doc.billFileUrl by savePurchase()
-    // — not re-uploaded here, to avoid saving a duplicate copy on every edit.
-
-    // 1. Invoice JSON summary
-    const invoiceSummary = {
-      MODULE: 'PURCHASE', INVOICE_NO: doc.no, INVOICE_DATE: doc.date,
-      VENDOR_NAME: doc.vendorName, VENDOR_GSTIN: vend?.gstin||'', MODE: doc.mode,
-      ITEMS: doc.items, SUBTOTAL: doc.subtotal, TAXABLE: doc.taxable,
-      GST_TOTAL: doc.gstTotal, TCS: doc.tcs||0, GRAND_TOTAL: doc.grand,
-      STATUS: doc.status, PO_REF: doc.poRef||'', GRN_REF: doc.grnRef||'',
-      NOTES: doc.notes||'', SAVED_AT: new Date().toISOString(), APP: 'Balaji NextGen ERP'
-    };
-    const jsonName = `${doc.no}_${safeVendName}_${doc.date}.json`;
-    const jsonB64 = btoa(unescape(encodeURIComponent(JSON.stringify(invoiceSummary,null,2))));
-    const r1 = await erpApi('UPLOAD_TO_CLIENT_DRIVE',{clientId:CLIENT_ID,fileName:jsonName,mimeType:'application/json',base64Data:jsonB64,subPath});
-
-    // 2. CSV line-items file
-    const csvHeader = 'Invoice No,Date,Vendor,Item,HSN,Qty,Unit,Rate,Disc%,GST%,Tax Amt,Amount\n';
-    const csvRows = (doc.items||[]).map(it =>
-      `"${doc.no}","${doc.date}","${doc.vendorName}","${it.name||''}","${it.hsn||''}",${it.qty||0},"${it.unit||''}",${it.rate||0},${it.disc||0},${it.gst||0},${it.taxAmt||0},${it.amt||0}`
-    ).join('\n');
-    const csvName = `${doc.no}_items_${doc.date}.csv`;
-    const csvB64 = btoa(unescape(encodeURIComponent(csvHeader+csvRows)));
-    const r2 = await erpApi('UPLOAD_TO_CLIENT_DRIVE',{clientId:CLIENT_ID,fileName:csvName,mimeType:'text/csv',base64Data:csvB64,subPath});
-
-    if(!r1||!r1.success||!r2||!r2.success){
-      toast(`⚠️ ${doc.no} saved in-app, but Drive sync failed: `+((r1&&r1.message)||(r2&&r2.message)||'unknown error'),'warn','☁️');
-      return;
-    }
-
-    toast((r1.usedSharedAccount?`📁 ${doc.no} saved — shareable link ready`:`📁 Invoice ${doc.no} saved to your Drive → Purchase Invoice/${safeVendName}/${monthStr}`),'ok','✅');
-    const idx = doc.mode==='accounting'
-      ? DB.acctInvs.findIndex(x=>x.id===doc.id)
-      : DB.purchases.findIndex(x=>x.id===doc.id);
-    if(idx>=0){
-      const arr = doc.mode==='accounting' ? DB.acctInvs : DB.purchases;
-      arr[idx].driveFolder = r1.folderUrl;
-      arr[idx].driveSaved = true;
-      save();
-    }
-  }catch(e){
-    console.warn('Drive purchase save failed:',e);
-    toast('Drive save failed — check connection','warn','⚠️');
+  const idx = doc.mode==='accounting'
+    ? DB.acctInvs.findIndex(x=>x.id===doc.id)
+    : DB.purchases.findIndex(x=>x.id===doc.id);
+  if(idx>=0){
+    const arr = doc.mode==='accounting' ? DB.acctInvs : DB.purchases;
+    arr[idx].driveSaved = true;
+    save();
   }
 }
 
-// ════ SAVE ATTACHMENT FILE TO GOOGLE DRIVE ════
 async function saveAttachmentFileToDrive(file, purchaseNo, vendorName){
   if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID) return null;
   try{
@@ -3476,7 +3485,17 @@ function buildTallyStockItemXML(it){
 function buildTallyAutoMastersXML(item){
   const d=item.voucherXmlData;
   const blocks=[];
+  // Vendor ledger — always created for reference/GST-party purposes,
+  // even when payment wasn't actually on credit (see below).
   blocks.push(buildTallyLedgerXML(d.vendorName,'Sundry Creditors'));
+  // FIX ("mode of purchase invoice mode entry need in tally"): the ledger
+  // this voucher actually credits depends on Payment Mode — Cash/Bank
+  // Transfer/UPI/Cheque settle immediately, so create THAT ledger too
+  // when it's not just the vendor's own Sundry Creditors account (which
+  // is already created above).
+  if(d.creditLedgerName && d.creditLedgerName!==d.vendorName){
+    blocks.push(buildTallyLedgerXML(d.creditLedgerName,d.creditLedgerParent||'Cash-in-Hand'));
+  }
   if(item.voucherType==='journal'){
     blocks.push(buildTallyLedgerXML(d.expenseLedger,'Indirect Expenses'));
   }else{
@@ -3494,26 +3513,39 @@ function buildTallyVoucherXML(item){
   const d=item.voucherXmlData;
   const mastersXml=buildTallyAutoMastersXML(item);
   if(item.voucherType==='journal'){
-    // Accounting/expense invoice: Dr Expense (+GST), Cr Party
+    // Accounting/expense invoice: Dr Expense (+GST unless ITC Reverse — see
+    // _buildTallyVoucherXmlData comment), Cr Party
     const ledgerRows=[
       `<ALLLEDGERENTRIES.LIST><LEDGERNAME>${xmlEscape(d.expenseLedger)}</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.taxable}</AMOUNT></ALLLEDGERENTRIES.LIST>`
     ];
     if(d.cgst>0)ledgerRows.push(`<ALLLEDGERENTRIES.LIST><LEDGERNAME>Input CGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.cgst}</AMOUNT></ALLLEDGERENTRIES.LIST>`);
     if(d.sgst>0)ledgerRows.push(`<ALLLEDGERENTRIES.LIST><LEDGERNAME>Input SGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.sgst}</AMOUNT></ALLLEDGERENTRIES.LIST>`);
     if(d.igst>0)ledgerRows.push(`<ALLLEDGERENTRIES.LIST><LEDGERNAME>Input IGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.igst}</AMOUNT></ALLLEDGERENTRIES.LIST>`);
-    ledgerRows.push(`<ALLLEDGERENTRIES.LIST><LEDGERNAME>${xmlEscape(d.vendorName)}</LEDGERNAME><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>${d.grand}</AMOUNT></ALLLEDGERENTRIES.LIST>`);
+    // FIX ("mode of purchase invoice mode entry need in tally"): credits
+    // whichever ledger the Payment Mode actually implies (Cash/Bank
+    // Account for immediate payment, vendor's own Sundry Creditors only
+    // when genuinely "Credit") — see _buildTallyVoucherXmlData comment.
+    ledgerRows.push(`<ALLLEDGERENTRIES.LIST><LEDGERNAME>${xmlEscape(d.creditLedgerName||d.vendorName)}</LEDGERNAME><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>${d.grand}</AMOUNT></ALLLEDGERENTRIES.LIST>`);
     return `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME></REQUESTDESC><REQUESTDATA>${mastersXml}<TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Journal" ACTION="Create"><DATE>${tallyDate(d.date)}</DATE><NARRATION>${xmlEscape(d.narration)}</NARRATION><VOUCHERTYPENAME>Journal</VOUCHERTYPENAME><REFERENCE>${xmlEscape(d.invoiceNo)}</REFERENCE>${ledgerRows.join('')}</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
   }
 
-  // Inventory purchase: stock items in, GST + vendor as ledger entries
+  // FIX ("import exception... mismatch" — Aug 2026): see the big comment
+  // in _buildTallyVoucherXmlData() for the full story. Each item's AMOUNT
+  // is now d.itcReverse-aware pcTaxable (the ONE place GST for that item
+  // lives when reversed) — no more redundant Purchase Ledger line
+  // duplicating the same taxable value the items already carry, and GST
+  // ledger lines only appear at all when NOT itcReverse (otherwise that
+  // GST is already inside each item's own AMOUNT above).
   const invRows=(d.items||[]).map(it=>
-    `<ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>${xmlEscape(it.name)}</STOCKITEMNAME><RATE>${it.rate}/${xmlEscape(it.unit||'Nos')}</RATE><AMOUNT>-${it.amt}</AMOUNT><ACTUALQTY>${it.qty} ${xmlEscape(it.unit||'Nos')}</ACTUALQTY><BILLEDQTY>${it.qty} ${xmlEscape(it.unit||'Nos')}</BILLEDQTY></ALLINVENTORYENTRIES.LIST>`
+    `<ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>${xmlEscape(it.name)}</STOCKITEMNAME><RATE>${it.rate}/${xmlEscape(it.unit||'Nos')}</RATE><AMOUNT>-${it.pcTaxable}</AMOUNT><ACTUALQTY>${it.qty} ${xmlEscape(it.unit||'Nos')}</ACTUALQTY><BILLEDQTY>${it.qty} ${xmlEscape(it.unit||'Nos')}</BILLEDQTY></ALLINVENTORYENTRIES.LIST>`
   ).join('');
-  const ledgerRows=[`<LEDGERENTRIES.LIST><LEDGERNAME>${xmlEscape(d.purchaseLedger)}</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.taxable}</AMOUNT></LEDGERENTRIES.LIST>`];
+  const ledgerRows=[];
   if(d.cgst>0)ledgerRows.push(`<LEDGERENTRIES.LIST><LEDGERNAME>Input CGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.cgst}</AMOUNT></LEDGERENTRIES.LIST>`);
   if(d.sgst>0)ledgerRows.push(`<LEDGERENTRIES.LIST><LEDGERNAME>Input SGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.sgst}</AMOUNT></LEDGERENTRIES.LIST>`);
   if(d.igst>0)ledgerRows.push(`<LEDGERENTRIES.LIST><LEDGERNAME>Input IGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.igst}</AMOUNT></LEDGERENTRIES.LIST>`);
-  ledgerRows.push(`<LEDGERENTRIES.LIST><LEDGERNAME>${xmlEscape(d.vendorName)}</LEDGERNAME><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>${d.grand}</AMOUNT></LEDGERENTRIES.LIST>`);
+  // FIX ("mode of purchase invoice mode entry need in tally"): same
+  // payment-mode-aware credit ledger as the Journal path above.
+  ledgerRows.push(`<LEDGERENTRIES.LIST><LEDGERNAME>${xmlEscape(d.creditLedgerName||d.vendorName)}</LEDGERNAME><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>${d.grand}</AMOUNT></LEDGERENTRIES.LIST>`);
 
   return `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME></REQUESTDESC><REQUESTDATA>${mastersXml}<TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Purchase" ACTION="Create"><DATE>${tallyDate(d.date)}</DATE><PARTYLEDGERNAME>${xmlEscape(d.vendorName)}</PARTYLEDGERNAME><VOUCHERTYPENAME>Purchase</VOUCHERTYPENAME><REFERENCE>${xmlEscape(d.invoiceNo)}</REFERENCE>${invRows}${ledgerRows.join('')}</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
 }
@@ -3538,16 +3570,67 @@ function _buildTallyVoucherXmlData(doc){
   // "Rent", or whatever the user actually chose.
   const _led=(DB.ledgerAccounts||[]).find(l=>l.id===doc.ledgerAccountId);
   const resolvedLedgerName=_led?_led.name:(isJournal?(doc.expCat||'Sundry Expenses'):(doc.purchaseAcct||'Purchase - Local'));
+  // FIX ("import exception... mismatch in total amount between credit and
+  // debit" — Aug 2026): this voucher used to debit BOTH the full item-wise
+  // ALLINVENTORYENTRIES value AND a redundant ledger-level Purchase Ledger
+  // entry for the same taxable amount, plus separately debiting Input
+  // CGST/SGST/IGST that were ALSO already baked into each item's own
+  // AMOUNT — three overlapping representations of the same money, none
+  // reconciled against each other, which is exactly why Tally's own
+  // import exception screen flagged a debit/credit mismatch. Also never
+  // consulted ITC Reverse at all, unlike the InvBridge voucher a few
+  // hundred lines up which already gets this right.
+  //
+  // Rebuilt so there's exactly ONE representation of the money:
+  //  - ITC Reverse: each item's Tally AMOUNT = pcTaxable (GST already
+  //    folded in) — no separate GST ledger lines, no redundant Purchase
+  //    Ledger line. Items alone carry the full value, balancing exactly
+  //    against the vendor credit.
+  //  - ITC Claim: each item's AMOUNT = pcTaxable too, but pcTaxable is
+  //    GST-EXCLUSIVE in this mode (see calcPTotals()/savePurchase()) —
+  //    plus separate Input CGST/SGST/IGST lines for the recoverable
+  //    portion. Still exactly one representation of the GST, not two.
+  const itcReverse=(DB.settings?.itcMode||'reverse')==='reverse';
+  // FIX ("mode of purchase invoice mode entry need in tally" — Aug 2026):
+  // the "Payment Mode" field on the invoice form (Credit/Cash/UPI/Bank
+  // Transfer/Cheque) was captured and saved on doc.paymentMode but never
+  // reached the Tally voucher at all — every purchase posted as if it
+  // were on credit, crediting the vendor's Sundry Creditors ledger,
+  // even when it was actually paid immediately in cash or by bank/UPI.
+  // That's wrong accounting: a cash purchase should credit Cash, not
+  // create a payable that was never actually owed. Only "Credit" (on
+  // account, genuinely payable later) should credit the vendor ledger —
+  // everything else credits the ledger that actually moved.
+  const paymentMode=doc.paymentMode||'Credit';
+  const creditLedgerName = paymentMode==='Credit' ? doc.vendorName
+    : paymentMode==='Cash' ? 'Cash'
+    : 'Bank Account'; // UPI / Bank Transfer / Cheque all settle through the bank
+  const creditLedgerParent = paymentMode==='Credit' ? 'Sundry Creditors'
+    : paymentMode==='Cash' ? 'Cash-in-Hand'
+    : 'Bank Accounts';
   const voucherXmlData=isJournal?{
     date:doc.date,invoiceNo:doc.no,vendorName:doc.vendorName,
     expenseLedger:resolvedLedgerName,
-    taxable:doc.taxable,cgst:doc.cgst,sgst:doc.sgst,igst:doc.igst,grand:doc.grand,
-    narration:`${resolvedLedgerName} — Inv ${doc.no}`
+    itcReverse,paymentMode,creditLedgerName,creditLedgerParent,
+    taxable:doc.productCodeTaxable, // GST-inclusive when itcReverse, exclusive otherwise
+    cgst:itcReverse?0:doc.cgst,sgst:itcReverse?0:doc.sgst,igst:itcReverse?0:doc.igst,
+    grand:doc.grand,
+    narration:`${resolvedLedgerName} — Inv ${doc.no} | ${paymentMode}${itcReverse?' | ITC Reverse — GST in cost':''}`
   }:{
     date:doc.date,invoiceNo:doc.no,vendorName:doc.vendorName,
     purchaseLedger:resolvedLedgerName,
-    taxable:doc.taxable,cgst:doc.cgst,sgst:doc.sgst,igst:doc.igst,grand:doc.grand,
-    items:(doc.items||[]).map(it=>({name:it.name,rate:it.rate,unit:it.unit,qty:it.qty,amt:it.amt}))
+    itcReverse,paymentMode,creditLedgerName,creditLedgerParent,
+    taxable:doc.productCodeTaxable,
+    cgst:itcReverse?0:doc.cgst,sgst:itcReverse?0:doc.sgst,igst:itcReverse?0:doc.igst,
+    grand:doc.grand,
+    // pcTaxable is each item's own share of productCodeTaxable — the ONE
+    // value that represents that item's Tally AMOUNT now. Falls back to
+    // computing it if an older saved record predates pcTaxable being
+    // stored on line items.
+    items:(doc.items||[]).map(it=>({
+      name:it.name,rate:it.rate,unit:it.unit,qty:it.qty,
+      pcTaxable: it.pcTaxable!=null ? it.pcTaxable : (it.lineNet!=null ? it.lineNet+(itcReverse?(it.taxAmt||0):0) : it.amt)
+    }))
   };
   return {isJournal,voucherXmlData};
 }
@@ -3738,6 +3821,18 @@ function deletePurchase(id,mode){
   if(vi>=0)DB.vendors[vi].outstanding=Math.max(0,(DB.vendors[vi].outstanding||0)-(p.grand||0));
   arr.splice(idx,1);
   if(editingPurchaseId===id){editingPurchaseId=null;editingPurchaseMode=null;}
+  // FIX ("one time click then show delete but again show, 2nd time
+  // delete click then final deleted" — Aug 2026): this file polls
+  // pullInventorySyncData() every 20 seconds. If that poll happened to
+  // land in the small window between this optimistic local removal and
+  // the DELETE_PURCHASE_INVOICE call below actually finishing server-
+  // side, the poll would still see this invoice on the server and add
+  // it straight back — looking exactly like "delete didn't work".
+  // window._pendingDeletes marks this id as "a delete is in flight for
+  // this one" so pullInventorySyncData()'s merge skips re-adding it no
+  // matter how many polls land before the server confirms.
+  window._pendingDeletes = window._pendingDeletes || new Set();
+  window._pendingDeletes.add(id);
   save();rendDash();rendRegs();rendPurchaseList();updateApprCount();
   toast(`${p.no} deleted locally. Syncing with server...`,'ok','🗑️');
   // FIX ("delete bills but wrong shown in some places / not match"): this
@@ -3748,12 +3843,22 @@ function deletePurchase(id,mode){
   // NEW: Enhanced delete with inventory rollback + Drive cleanup
   erpApi('DELETE_PURCHASE_INVOICE', {id:p.id, no:p.no, mode, billFileUrl:p.billFileUrl}).then(r=>{
     if(r&&r.success===false){
-      toast('⚠️ '+p.no+' deleted locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️');
+      // FIX (same pass): a failed server delete used to just show a
+      // warning and leave the row gone from the screen forever — local
+      // and server would disagree permanently (row still exists on the
+      // server, but nowhere in the UI) until the person reloaded and got
+      // confused about where it went. Put it back, honestly, instead.
+      window._pendingDeletes.delete(id);
+      const restoreArr = mode==='accounting'?DB.acctInvs:DB.purchases;
+      if(!restoreArr.find(x=>x.id===p.id)){ restoreArr.push(p); save(); rendDash();rendRegs();rendPurchaseList(); }
+      toast('⚠️ '+p.no+' could NOT be deleted on the server — restored: '+(r.message||'unknown error'),'err','⚠️');
     }else if(r&&r.success){
+      window._pendingDeletes.delete(id);
       toast(`${p.no} fully deleted. Inventory rolled back.`,'ok','✅');
       broadcastInventoryChange('PURCHASE_DELETED', {no:p.no, id:p.id});
     }
   }).catch(e=>{
+    window._pendingDeletes.delete(id);
     toast('⚠️ Sync error: '+e.message,'err','⚠️');
   });
 }
@@ -3769,13 +3874,25 @@ function setupInventorySyncListener(){
         const msg=event.data;
         if(!msg||!msg.action)return;
         console.log('Inventory sync message received:', msg.action);
+        // FIX ("one time click then show delete but again show" — Aug
+        // 2026, part 2): both branches here called loadFromCloud() — a
+        // function that has never existed anywhere in this file. Every
+        // cross-tab broadcast this listener received threw a
+        // ReferenceError and silently died right here, meaning the
+        // rendDash()/rendRegs()/rendPurchaseList()/toast() calls below
+        // it never ran either — another tab's delete (or create/update)
+        // never refreshed THIS tab's screen at all until something else
+        // happened to trigger a redraw. The real pull function is
+        // pullInventorySyncData() (defined above, already used by the
+        // 20-second poll and on initial load) — that's what this should
+        // have been calling all along.
         if(msg.action==='PURCHASE_CREATED' || msg.action==='PURCHASE_UPDATED'){
-          loadFromCloud();
+          try{ pullInventorySyncData(); }catch(e){ console.warn('pullInventorySyncData failed:',e); }
           rendDash();
           rendPurchaseList();
           toast('Inventory updated from another device','info','☁️');
         }else if(msg.action==='PURCHASE_DELETED'){
-          loadFromCloud();
+          try{ pullInventorySyncData(); }catch(e){ console.warn('pullInventorySyncData failed:',e); }
           rendDash();
           rendRegs();
           rendPurchaseList();
