@@ -78,6 +78,13 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        # Private Network Access (PNA): Chrome/Edge require this extra header
+        # on the preflight before they'll let an HTTPS page (e.g. an ERP
+        # dashboard served from a public domain) call into a private/
+        # localhost address like this relay. Without it, the browser blocks
+        # the request itself and "Test Connection" always reports "Not
+        # reachable" — even with Tally and this relay both running fine.
+        self.send_header("Access-Control-Allow-Private-Network", "true")
 
     def do_OPTIONS(self):
         self.send_response(204)
