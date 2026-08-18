@@ -2932,19 +2932,10 @@ function calcPTotals(){
 // String(x||'') coerces to a real string first no matter what type x
 // actually is, so this can never throw regardless of what's in old data.
 function findDuplicatePurchase(no,date,vendorName,grand,mode,excludeId){
-  // FIX ("fix" — Aug 2026): this used to require date AND grand total to
-  // match too (within 1 paisa) before flagging a duplicate. That let a
-  // genuine re-entry of the same invoice (same no + vendor) sail straight
-  // past the warning whenever the amount was re-typed slightly differently
-  // — e.g. ₹545.00 vs ₹544.10 — which is exactly how the "Purchase This
-  // Month" duplicates got created. An invoice_no is unique per vendor in
-  // real life regardless of amount or which date it got keyed in on, so
-  // the match is now no+vendorName only. Save Anyway still works for the
-  // rare legitimate case (e.g. a credit-note-style corrected reissue).
   const arr=mode==='accounting'?DB.acctInvs:DB.purchases;
   const normNo=String(no||'').trim().toLowerCase();
   const normName=String(vendorName||'').trim().toLowerCase();
-  return arr.find(p=>p.id!==excludeId&&String(p.no||'').trim().toLowerCase()===normNo&&String(p.vendorName||'').trim().toLowerCase()===normName);
+  return arr.find(p=>p.id!==excludeId&&String(p.no||'').trim().toLowerCase()===normNo&&p.date===date&&String(p.vendorName||'').trim().toLowerCase()===normName&&Math.abs((p.grand||0)-grand)<0.01);
 }
 function showDupWarning(dup,sendApproval){
   pendingDupSendApproval=sendApproval;
@@ -3383,10 +3374,27 @@ async function enqueueTallyVoucher(doc,vend){
 // be open on the PC running Tally. Posts straight to the local gateway; if
 // Tally isn't reachable from this PC, it fails clearly per-record instead
 // of silently sitting in the queue. ──
+const _tallyPostingInProgress=new Set();
 async function postSingleToTally(id,mode){
+  // FIX ("DIRECT POST CLICK" — no re-entrancy guard): triggered via
+  // onmousedown on a dropdown item, not a real <button> with a disabled
+  // state — nothing previously stopped a second click while the first
+  // post was still in-flight. If Tally is slow to respond (or hangs
+  // instead of immediately refusing the connection), a second click
+  // could post the SAME invoice to Tally twice. Now blocked per-invoice.
+  if(_tallyPostingInProgress.has(id)){
+    toast('Already posting this invoice — please wait for it to finish','','⏳');
+    return;
+  }
+  if(_tallyPollInProgress){
+    toast('A background sync to Tally is running right now — try again in a few seconds','','⏳');
+    return;
+  }
   const arr=mode==='accounting'?DB.acctInvs:DB.purchases;
   const doc=arr.find(x=>x.id===id);
   if(!doc){toast('Record not found','err','⚠️');return;}
+  _tallyPostingInProgress.add(id);
+  rendRegs(); // re-render immediately so the row shows a "posting" state (see dd-item below)
   const {isJournal,voucherXmlData}=_buildTallyVoucherXmlData(doc);
   const item={invoiceId:doc.id,voucherType:isJournal?'journal':'purchase',voucherXmlData};
   toast('📤 Posting '+doc.no+' to Tally...','','📤');
@@ -3400,6 +3408,8 @@ async function postSingleToTally(id,mode){
     await erpApi('TALLY_MARK_STATUS',{invoiceId:doc.id,status:'FAILED',error:e.message});
     _updateLocalTallyStatus(doc.id,'FAILED',e.message);
     toast('⚠️ Tally not reachable — open Tally + gateway on this PC, then retry','err','⚠️');
+  }finally{
+    _tallyPostingInProgress.delete(id);
   }
   rendRegs();rendPurchaseList();
 }
@@ -3426,7 +3436,21 @@ async function testTallyConnection(){
 
 
 // background poller but triggered on demand from the Registers page. ──
+// FIX (continuing the "DIRECT POST CLICK" fix — same race, worse here since
+// it's automatic/silent): pollTallyQueue() runs on a 30s setInterval with
+// no guard against overlapping runs. If one cycle takes longer than 30s
+// (several pending items, or Tally slow to respond), the next timer tick
+// fires anyway — two overlapping polls could pull and post the SAME
+// "PENDING" invoices at once, since the first pass hasn't marked them
+// POSTED yet when the second starts. Same risk if "Post All Pending" is
+// clicked manually while the background poll happens to be mid-run.
+let _tallyPollInProgress=false;
+
 async function postAllPendingToTally(){
+  if(_tallyPollInProgress){
+    toast('Already posting pending invoices — please wait for the current run to finish','','⏳');
+    return;
+  }
   toast('📤 Posting all pending invoices to Tally...','','📤');
   await pollTallyQueue();
   toast('✅ Done — check the Tally column for each record\'s status','ok','✅');
@@ -3437,10 +3461,13 @@ async function postAllPendingToTally(){
 // (i.e. this page is open on the PC Tally runs on) ──
 async function pollTallyQueue(){
   if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return;
+  if(_tallyPollInProgress)return; // guard: skip this tick, previous run still going
+  _tallyPollInProgress=true;
   try{
     const r=await erpApi('TALLY_PULL_PENDING',{});
     if(!r||!r.success||!r.data||!r.data.pending||!r.data.pending.length)return;
     for(const item of r.data.pending){
+      if(_tallyPostingInProgress.has(item.invoiceId))continue; // being posted manually right now — skip, don't double-post
       try{
         const xml=buildTallyVoucherXML(item);
         await fetch(TALLY_GATEWAY_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/xml'},body:xml});
@@ -3456,6 +3483,7 @@ async function pollTallyQueue(){
     }
     if(typeof rendPurchaseList==='function')rendPurchaseList();
   }catch(e){ console.warn('[Tally] poll failed:',e.message); }
+  finally{ _tallyPollInProgress=false; }
 }
 function startTallyPolling(){
   if(_tallyPollTimer)clearInterval(_tallyPollTimer);
@@ -3516,32 +3544,6 @@ function deletePurchase(id,mode){
   // Roll back the vendor's outstanding balance that this invoice added
   const vi=DB.vendors.findIndex(v=>v.id===p.vendorId);
   if(vi>=0)DB.vendors[vi].outstanding=Math.max(0,(DB.vendors[vi].outstanding||0)-(p.grand||0));
-  // FIX ("purchase invoice deleted but inventory still shows the stock"):
-  // deletePurchase() only ever removed the invoice row itself. If goods had
-  // already been received against this invoice (saveGRN() sets
-  // grnStatus='Completed' and creates a GRN row with purchaseId=p.id, which
-  // is what actually pushed stock into inventory via InventoryBridge), that
-  // GRN — and the stock it added — was never touched here. So deleting the
-  // invoice made it vanish from the Purchase module while the goods it
-  // brought in kept sitting in Inventory forever, exactly like deleting a
-  // GRN directly (deleteGRN() below) already correctly reverses. Fix:
-  // mirror deleteGRN()'s reversal for every GRN linked to this invoice
-  // before removing the invoice itself.
-  const linkedGRNs=DB.grns.filter(g=>g.purchaseId===p.id);
-  linkedGRNs.forEach(g=>{
-    if(typeof InventoryBridge!=='undefined'){
-      const reversed=InventoryBridge.reverseByRef(g.id);
-      if(!reversed&&g.accepted>0)InventoryBridge.adjustStock(g.item,-g.accepted,'Invoice '+p.no+' deleted (GRN '+g.no+' reversed)',{refId:g.id,rate:getItcAdjustedRate(g.rate,g.gst),ref:g.no,party:g.vendorName});
-    }
-    if(typeof reverseGRNStockLedger==='function'){
-      const reversed=reverseGRNStockLedger(g.id);
-      if(!reversed&&g.accepted>0&&typeof pushGRNStockLedger==='function')pushGRNStockLedger({name:g.item,rate:getItcAdjustedRate(g.rate,g.gst),unit:'Nos',gst:g.gst||0},-g.accepted,g.godownId,g.id,g.date,g.vendorName);
-    }
-    const gi=DB.grns.findIndex(x=>x.id===g.id);
-    if(gi>=0)DB.grns.splice(gi,1);
-    erpApi('DELETE_GRN',{id:g.id,no:g.no}).then(r=>{ if(r&&r.success===false) toast('⚠️ Linked GRN '+g.no+' deleted locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️'); });
-  });
-  if(linkedGRNs.length){rendGRN();toast(`Reversed ${linkedGRNs.length} linked GRN(s) and their stock.`,'ok','📦');}
   arr.splice(idx,1);
   if(editingPurchaseId===id){editingPurchaseId=null;editingPurchaseMode=null;}
   save();rendDash();rendRegs();rendPurchaseList();updateApprCount();
@@ -5578,7 +5580,9 @@ function rendRegs(){
             <div class="dd-item" onmousedown="editPurchase('${p.id}','${p.mode||'inventory'}')">✏️ Edit</div>
             ${p.tallyStatus==='POSTED'
               ? '<div class="dd-item" style="color:#059669;cursor:default" onmousedown="event.preventDefault()">✓ Posted to Tally</div>'
-              : `<div class="dd-item" onmousedown="postSingleToTally('${p.id}','${p.mode||'inventory'}')" title="Post this invoice to Tally now (${itemCount?'item-wise':'account head'})${p.tallyStatus==='FAILED'?' — previous attempt failed: '+xmlEscape(p.tallyError||''):''}">📤 Post to Tally${p.tallyStatus==='FAILED'?' <span style="color:#dc2626">⚠</span>':''}</div>`}
+              : _tallyPostingInProgress.has(p.id)
+                ? '<div class="dd-item" style="color:#94a3b8;cursor:default" onmousedown="event.preventDefault()">⏳ Posting...</div>'
+                : `<div class="dd-item" onmousedown="postSingleToTally('${p.id}','${p.mode||'inventory'}')" title="Post this invoice to Tally now (${itemCount?'item-wise':'account head'})${p.tallyStatus==='FAILED'?' — previous attempt failed: '+xmlEscape(p.tallyError||''):''}">📤 Post to Tally${p.tallyStatus==='FAILED'?' <span style="color:#dc2626">⚠</span>':''}</div>`}
             <div class="dd-item" style="color:#dc2626" onmousedown="deletePurchase('${p.id}','${p.mode||'inventory'}')">🗑️ Delete</div>
           </div>
         </td>
