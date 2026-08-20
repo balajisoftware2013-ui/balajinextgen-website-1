@@ -1719,16 +1719,108 @@ function isInterStatePurchase(vendorId){
   return vendCode!==coCode;
 }
 
+// FIX ("every users same client same data show ... other place can same
+// data work and save and load all" — Aug 2026): inspecting CL00010's real
+// exported spreadsheet confirmed PURCHASE_INVOICE (the sheet
+// SAVE_PURCHASE_INVOICE/UPDATE_PURCHASE_INVOICE write to) has ZERO real
+// rows — every purchase entered in THIS app has been landing only in this
+// browser's localStorage, invisible to inventory.html and everything that
+// depends on it (Stock Value, Out of Stock, the stock_ledger bridge,
+// anyone on a different device or browser). inventory.html's own Purchase
+// Entry feature writes into SYNC_purchase_invoices (a real, working,
+// already-populated table) via the same generic SYNC_PUSH_TABLE mechanism
+// every other synced table in this whole codebase uses. This maps this
+// app's internal doc shape into that exact same record shape (confirmed
+// field-by-field against real rows already sitting in SYNC_purchase_invoices)
+// and pushes through the same mechanism, so both apps genuinely read/write
+// ONE shared purchase-invoice store instead of two disconnected ones.
+// Reverse of _mapDocToSyncPurchaseRecord below — converts a shared
+// SYNC_purchase_invoices record (confirmed real field shape, read
+// directly from CL00010's actual data) back into this app's internal
+// doc shape. mode is always 'inventory' since the shared table has no
+// concept of this app's accounting/expense-only invoices — those stay
+// local-only to this app for now (DB.acctInvs isn't part of this
+// shared-sync pass).
+function _mapSyncRecordToDoc(rec){
+  const taxable=+rec.taxable||0, cgst=+rec.cgst||0, sgst=+rec.sgst||0, igst=+rec.igst||0;
+  const items=(rec.items||[]).map(it=>({
+    name: it.item_name||'', hsn: it.hsn||'', qty: +it.qty||0, unit: it.unit||'Nos',
+    rate: +it.rate||0, disc: 0, gst: +it.gst_rate||0,
+    taxAmt: 0, lineNet: +it.amount||0, extraShare: 0, pcTaxable: +it.amount||0, amt: +it.amount||0
+  }));
+  return {
+    id: rec._id,
+    no: rec.inv_no||'',
+    date: rec.inv_date||'',
+    vendorId: rec.party_id||'',
+    vendorName: rec.party_name||'',
+    poRef: '', grnRef: '', mode: 'inventory',
+    whId: rec.wh_id||'', paymentMode: 'Credit',
+    items,
+    subtotal: taxable, discount: 0, taxable,
+    gstTotal: cgst+sgst+igst, cgst, sgst, igst,
+    grand: +rec.total||0,
+    due: rec.due_date||'', notes: '', status: 'Approved',
+    billFileUrl: '', tallyStatus: 'PENDING',
+    createdAt: rec._ts||new Date().toISOString()
+  };
+}
+function _mapDocToSyncPurchaseRecord(doc){
+  const vend=DB.vendors.find(v=>v.id===doc.vendorId);
+  const otherCharges=(+doc.freight||0)+(+doc.loadingUnloading||0)+(+doc.specialPurposeFee||0)+(+doc.roundOffGovt||0)+(+doc.otherCharges||0);
+  return {
+    _id: doc.id,
+    inv_no: doc.no||'',
+    party_id: doc.vendorId||'',
+    party_name: doc.vendorName||(vend&&vend.name)||'',
+    inv_date: doc.date||'',
+    due_date: doc.due||'',
+    wh_id: doc.whId||'',
+    taxable: +doc.taxable||0,
+    cgst: +doc.cgst||0, sgst: +doc.sgst||0, igst: +doc.igst||0,
+    other_charges: otherCharges,
+    total: +doc.grand||0,
+    status: 'unpaid', // this app tracks payment separately via DB.payments/vendor.outstanding, not a per-invoice flag — 'unpaid' matches inventory.html's own default until a dedicated payment-status field exists here
+    items: (doc.items||[]).map(it=>({
+      item_id: it.itemId||('I'+uid()),
+      item_name: it.name||'',
+      hsn: it.hsn||'',
+      qty: +it.qty||0,
+      rate: +it.rate||0,
+      gst_rate: +it.gst||0,
+      cgst: 0, sgst: 0,
+      amount: +it.amt||0
+    })),
+    _ts: doc.createdAt||new Date().toISOString(),
+    _synced: true
+  };
+}
+let _pushingPurchaseSyncTable=false;
+async function pushPurchaseInvoicesToSyncTable(){
+  if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return;
+  if(_pushingPurchaseSyncTable)return; // a push is already in flight — the next save()'s data will be included in THAT push once it lands, no need to queue a second one
+  _pushingPurchaseSyncTable=true;
+  try{
+    const rows=(DB.purchases||[]).map(_mapDocToSyncPurchaseRecord);
+    const r=await erpApi('SYNC_PUSH_TABLE',{table:'purchase_invoices',rows});
+    if(r&&r.success===false)console.warn('[Shared Sync] push failed for purchase_invoices:',r.message);
+  }catch(e){
+    console.warn('[Shared Sync] push failed:',e.message);
+  }finally{
+    _pushingPurchaseSyncTable=false;
+  }
+}
 function save(){
   try{localStorage.setItem('BALAJI_PROCUREMENT',JSON.stringify(DB))}catch(e){}
   // NOTE: previously also called InventoryBridge.syncSnapshot('procurement', DB)
   // here — that was part of an abandoned design (Drive-folder-based backend,
   // confirmed incompatible with this project's real rbClientSpreadsheetId_
-  // architecture) and had become a silent no-op. Removed. Real cross-device
-  // sync for Purchase already happens per-record via erpApi (SAVE_GRN,
-  // SAVE_PURCHASE_INVOICE, UPDATE_PURCHASE_INVOICE, DELETE_PURCHASE_INVOICE —
-  // see those call sites elsewhere in this file); payments-module.html reads
-  // this data directly via SYNC_PULL_ALL, no snapshot step needed.
+  // architecture) and had become a silent no-op. Removed.
+  // Real cross-device sync for Purchase Invoices now ALSO goes through the
+  // shared SYNC_purchase_invoices table (see pushPurchaseInvoicesToSyncTable
+  // above) — fire-and-forget, so the UI never waits on network, same
+  // pattern inventory.html's own DB.save() already uses for every table.
+  pushPurchaseInvoicesToSyncTable();
 }
 function load(){
   try{
@@ -1949,6 +2041,56 @@ function load(){
             pendingDel.has(p.id) || p.synced!==true || serverIds.has(p.id)
           );
         }
+        // FIX ("every users same client same data show ... other place
+        // can same data work and save and load all" — Aug 2026): the
+        // d.purchaseInvoices merge just above reads from ERP_LOAD_ALL,
+        // which was confirmed (by directly inspecting CL00010's real
+        // spreadsheet) to read the PURCHASE_INVOICE sheet — which has
+        // ZERO real rows. That block has therefore always been a no-op
+        // in practice (Array.isArray(...).length is always 0), which is
+        // why nothing entered elsewhere (e.g. inventory.html's own
+        // Purchase Entry) ever showed up here. Left in place rather than
+        // removed (harmless, and other fields in ERP_LOAD_ALL's response
+        // may still be used elsewhere in this file) — this block below
+        // is the actual working pull, from the same SYNC_purchase_invoices
+        // table save() now also pushes to (see pushPurchaseInvoicesToSyncTable
+        // above), using the exact reverse of _mapDocToSyncPurchaseRecord's
+        // field mapping. Same merge-safety pattern as the block above:
+        // respects in-flight local pushes/deletes, doesn't let an
+        // empty/partial incoming items[] wipe a good local one.
+        try{
+          const syncRes = await erpApi('SYNC_PULL_ALL', {});
+          const incoming = syncRes && syncRes.success && syncRes.tables && syncRes.tables.purchase_invoices;
+          if (Array.isArray(incoming) && incoming.length){
+            const pendingDel2 = window._pendingDeletes || new Set();
+            const pendingPush = window._pushingPurchaseSyncTable;
+            if (!pendingPush){ // a push is currently in flight — skip this pull cycle so it can't stomp on data still being sent
+              const incomingIds = new Set(incoming.map(r=>r._id));
+              incoming.forEach(rec=>{
+                if (pendingDel2.has(rec._id)) return; // delete in flight on this tab — don't resurrect
+                const mapped = _mapSyncRecordToDoc(rec);
+                const idx = DB.purchases.findIndex(x=>x.id===rec._id);
+                if (idx>=0){
+                  const orig = DB.purchases[idx];
+                  const merged = {...orig, ...mapped};
+                  if ((!Array.isArray(mapped.items)||!mapped.items.length) && Array.isArray(orig.items) && orig.items.length){
+                    merged.items = orig.items;
+                  }
+                  merged.synced = true;
+                  DB.purchases[idx] = merged;
+                } else {
+                  mapped.synced = true;
+                  DB.purchases.push(mapped);
+                }
+              });
+              // Same "genuinely deleted upstream" reconciliation as the
+              // block above, scoped to this shared table's own id set.
+              DB.purchases = DB.purchases.filter(p =>
+                pendingDel2.has(p.id) || p.synced!==true || incomingIds.has(p.id)
+              );
+            }
+          }
+        }catch(e){ console.warn('[Shared Sync] pull failed:', e.message); }
         // Same deletion reconciliation for Accounting invoices — same
         // field-name caveat as the confirmed purchaseInvoices above
         // applies here too (d.acctInvoices isn't independently verified
