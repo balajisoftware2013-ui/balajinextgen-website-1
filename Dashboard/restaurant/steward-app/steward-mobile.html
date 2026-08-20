@@ -1179,12 +1179,29 @@ async function placeOrder(){
   const amount = items.reduce((a,i)=>a+i.price*i.qty,0);
   const stewardName = document.getElementById('prof-name')?.textContent || 'Steward';
   toast('Sending KOT…','info');
+  // FIX ("can't update order" — Aug 2026): this call never sent a
+  // client-generated id, and — this was the actual bug — nothing below
+  // ever READ BACK whatever real order/KOT id the server assigned on
+  // success. Every later "Modify Order" call (sendModifiedOrder) sends
+  // whatever id is stored in PLACED_ORDERS[...].id back to the server's
+  // updateOrder action to find and change that same record — so if that
+  // id is one the server has never seen, the update is structurally
+  // guaranteed to fail no matter what, independent of whether the
+  // V2_FRONTEND backend itself works correctly. Fixed below: use the
+  // server's real id when the create call succeeds, and only fall back
+  // to a local placeholder id for the genuinely-offline case (where
+  // there's no server id to have yet).
   const res = await gasApi('createOrder', {
     table: selTable.id, items, amount, steward: stewardName, source:'STEWARD_APP'
   }, 'V2_FRONTEND');
   
-  // Generate order ID for tracking
-  const orderId = 'ORD_' + Date.now() + '_' + Math.random().toString(36).substr(2,5);
+  // Prefer the server's real id (read defensively under a few plausible
+  // field names, same pattern already used elsewhere in this codebase
+  // for backend responses whose exact field name isn't guaranteed) —
+  // only generate a local placeholder id if the server didn't return
+  // one (offline, or the backend doesn't send an id back yet).
+  const serverOrderId = res && (res.orderId || res.id || res.kotId || (res.data && (res.data.orderId || res.data.id)));
+  const orderId = serverOrderId || ('LOCAL_ORD_' + Date.now() + '_' + Math.random().toString(36).substr(2,5));
   lastOrderId = orderId;
   
   // Store order for replacement capability
@@ -1196,7 +1213,12 @@ async function placeOrder(){
     steward: stewardName,
     status: 'PLACED',
     timestamp: Date.now(),
-    originalItems: JSON.parse(JSON.stringify(items))
+    originalItems: JSON.parse(JSON.stringify(items)),
+    // FIX (same pass): lets sendModifiedOrder() tell the person honestly
+    // when a "Modify Order" attempt can't possibly reach the server —
+    // this order was never confirmed, so there's no real order for the
+    // backend to find and update.
+    hasServerId: !!serverOrderId
   };
   
   if(res && res.success===false && !res.offline){
@@ -1363,6 +1385,16 @@ function calculateOrderTotal(orderId){
 async function sendModifiedOrder(orderId){
   const order = PLACED_ORDERS[orderId];
   if(!order || order.items.length === 0) return;
+  // FIX ("can't update order" — Aug 2026): if the original order was
+  // never actually confirmed by the server (offline at the time, or the
+  // server rejected it), there is no real order on the backend for this
+  // update to find — sending it anyway would just fail silently-ish
+  // with a generic error. Telling the person the real reason up front
+  // instead of letting them retry a doomed request.
+  if(!order.hasServerId){
+    toast('⚠️ This order was never confirmed by the server — resend it as a new KOT instead of modifying it','error');
+    return;
+  }
   
   const newTotal = calculateOrderTotal(orderId);
   const changedItems = order.items.filter(item => {
