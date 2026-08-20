@@ -4395,8 +4395,20 @@ async function pullAllFromBackend(silent=true){
 function renderAllVisiblePanels(){
   // Re-render whatever's currently on screen so a live pull shows up
   // immediately instead of only on next navigation.
-  try{ loadDashboard&&loadDashboard(); }catch(e){}
-  try{ const active=document.querySelector('.panel.active'); if(active) showP(active.id.replace('p-',''),null); }catch(e){}
+  // FIX ("inventory first workable need but slow works" — Aug 2026):
+  // loadDashboard() used to run HERE unconditionally, every single
+  // poll (every 8s, since the poll interval was shortened for the
+  // "delay show" fix) — a full stock_ledger sort + KPI/category/
+  // warehouse rebuild ran in the background even while you were on
+  // Purchase Entry, Reports, or any other page with the Dashboard not
+  // even visible. Now only pays that cost when the Dashboard is
+  // genuinely the panel on screen.
+  try{
+    const active=document.querySelector('.panel.active');
+    const activeId=active?active.id.replace('p-',''):null;
+    if(activeId==='dashboard') loadDashboard();
+    if(activeId) showP(activeId,null);
+  }catch(e){}
 }
 function updateLiveSyncBadge(kind){
   const b=document.getElementById('liveSyncBadge');if(!b)return;
@@ -5370,10 +5382,28 @@ function loadDashboard() {
   // Stock per item (latest balance)
   const itemStock = {};
   stock.forEach(s=>{ if(!itemStock[s.item_id]) itemStock[s.item_id]={}; if(!itemStock[s.item_id][s.wh_id]) itemStock[s.item_id][s.wh_id]=0; });
+  // FIX ("inventory first workable need but slow works" — Aug 2026):
+  // this used to stock.sort(...) — a full O(n log n) sort of the ENTIRE
+  // stock_ledger array just to find, per item+warehouse, the single
+  // row with the latest _ts. stock_ledger is append-only and only
+  // grows (every purchase/issue/adjustment adds rows, nothing is ever
+  // removed) — sorting the whole thing on every dashboard load gets
+  // slower forever. A single O(n) pass that just keeps whichever row
+  // has the higher _ts per key produces the exact same result without
+  // ever sorting anything.
   const latestByItem = {};
-  stock.sort((a,b)=>a._ts>b._ts?1:-1).forEach(s=>{ if(!latestByItem[s.item_id+s.wh_id]||s._ts>latestByItem[s.item_id+s.wh_id]._ts) latestByItem[s.item_id+s.wh_id]=s; });
+  stock.forEach(s=>{
+    const key=s.item_id+s.wh_id;
+    if(!latestByItem[key]||s._ts>latestByItem[key]._ts) latestByItem[key]=s;
+  });
   const totalStock = {};
   Object.values(latestByItem).forEach(s=>{ totalStock[s.item_id]=(totalStock[s.item_id]||0)+s.balance; });
+  // FIX (same pass): items.find(x=>x._id===...) was called inside
+  // several loops below (kitchen/bar issued value, warehouse value) —
+  // an O(n) scan of the full item list on EVERY iteration of an outer
+  // loop, i.e. O(items × movements) total. One Map built once here
+  // turns every one of those into an O(1) lookup instead.
+  const itemById=new Map(items.map(i=>[i._id,i]));
 
   // Point-in-time KPIs — NOT period-filtered (Stock Value/SKUs/Low/Out are
   // "right now" snapshots, same convention balaji-business-os.html uses:
@@ -5384,8 +5414,8 @@ function loadDashboard() {
   // Flow KPIs — DO respect the period filter now (was hardcoded to
   // month-to-date / today-only regardless of what the person wanted to see).
   const purFlow = pis.filter(p=>inRange(p.inv_date)).reduce((s,p)=>s+(p.total||0),0);
-  const kiIssued = DB.all('kitchen_indents').filter(k=>inRange(k.date)).reduce((s,k)=>s+(k.items||[]).reduce((a,it)=>a+(it.issued||0)*(items.find(x=>x._id===it.item_id)?.purchase_price||0),0),0);
-  const barIssued = DB.all('bar_indents').filter(b=>inRange(b.date)).reduce((s,b)=>s+(b.items||[]).reduce((a,it)=>a+(it.issued||0)*(items.find(x=>x._id===it.item_id)?.purchase_price||0),0),0);
+  const kiIssued = DB.all('kitchen_indents').filter(k=>inRange(k.date)).reduce((s,k)=>s+(k.items||[]).reduce((a,it)=>a+(it.issued||0)*(itemById.get(it.item_id)?.purchase_price||0),0),0);
+  const barIssued = DB.all('bar_indents').filter(b=>inRange(b.date)).reduce((s,b)=>s+(b.items||[]).reduce((a,it)=>a+(it.issued||0)*(itemById.get(it.item_id)?.purchase_price||0),0),0);
 
   setKpiValue('kv-val', fmt(totalVal));
   setKpiValue('kv-skus', items.length);
@@ -5417,7 +5447,7 @@ function loadDashboard() {
   // Change 2: Warehouse table with Division column
   const warehouses = DB.all('warehouses');
   const whVal = {};
-  Object.values(latestByItem).forEach(s=>{ whVal[s.wh_id]=(whVal[s.wh_id]||{val:0,items:new Set()}); whVal[s.wh_id].val+=(s.balance||0)*((items.find(x=>x._id===s.item_id)||{}).purchase_price||0); whVal[s.wh_id].items.add(s.item_id); });
+  Object.values(latestByItem).forEach(s=>{ whVal[s.wh_id]=(whVal[s.wh_id]||{val:0,items:new Set()}); whVal[s.wh_id].val+=(s.balance||0)*(itemById.get(s.item_id)?.purchase_price||0); whVal[s.wh_id].items.add(s.item_id); });
   const whDivMap = {'WH001':'F&B','WH002':'Cold Chain','WH003':'Bar','WH004':'Operations'};
   document.getElementById('wh-dash-body').innerHTML = warehouses.map(w=>{ const wd=whVal[w._id]||{val:0,items:new Set()}; const pct=Math.round(wd.val/Math.max(1,totalVal)*100); const div=whDivMap[w._id]||w.type||'—'; return `<tr onclick="showP('warehouse',document.getElementById('nv-warehouse'))" style="cursor:pointer;"><td><strong>${w.name}</strong></td><td><span class="badge a" style="font-size:9px;">${div}</span></td><td class="r">${fmt(wd.val)}</td><td class="r">${wd.items.size}</td><td><span class="badge ${pct>80?'r':pct>50?'o':'g'}">${pct>80?'Monitor':pct>20?'Healthy':'Low'}</span></td></tr>`; }).join('');
 
@@ -5933,40 +5963,68 @@ async function loadKitchenHistory(){
     const status = ind.STATUS || 'PENDING';
     return `<tr>
       <td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${dateStr}</td>
-      <td style="font-weight:700;">${ind.ITEM_NAME || ind.ITEM_ID || '—'}</td>
+      <td style="font-weight:700;">${toProperCase(ind.ITEM_NAME) || ind.ITEM_ID || '—'}</td>
       <td class="r">${ind.REQUIRED_QTY ?? 0} ${ind.UNIT || ''}</td>
       <td class="r">${ind.ISSUED_QTY ?? 0} ${ind.UNIT || ''}</td>
       <td><span class="badge ${statusColors[status] || 'gr'}">${status}</span></td>
       <td>${status === 'PENDING'
-        ? `<button class="btn s" style="padding:2px 7px;font-size:11px;" onclick="issueKI('${ind.IND_ID}',${JSON.stringify(String(ind.REQUIRED_QTY ?? 0))})">Issue</button>`
+        ? `<button class="btn s" id="ki-issue-btn-${ind.IND_ID}" style="padding:2px 7px;font-size:11px;" onclick="issueKI('${ind.IND_ID}',${JSON.stringify(String(ind.REQUIRED_QTY ?? 0))})">Issue</button>`
         : '—'}</td>
     </tr>`;
   }).join('') : '<tr><td colspan="6" class="tbl-empty">No indents found</td></tr>';
 }
+// FIX ("delay and replay problem" — Aug 2026): issueKI() had no
+// protection against being called twice for the same indent. If the
+// server took a moment to respond (any real network delay — the exact
+// "delay" being reported), the Issue button stayed fully clickable the
+// whole time with no visual feedback, so a person seeing nothing
+// happen would naturally click it again — firing a SECOND
+// APPROVE_ISSUE_INDENT request for the same indent before the first
+// had finished, deducting stock twice for one real issue ("replay").
+// Same re-entrancy-guard pattern already used for Post to Tally
+// (_tallyPostingInProgress in purchase-module.html) — track in-flight
+// indent ids, disable + relabel the button immediately on click, and
+// refuse a second call for the same id while one is still running.
+const _kiIssuingInProgress = new Set();
 async function issueKI(indId, requiredQty){
-  const res = await erpApi('APPROVE_ISSUE_INDENT', {
-    indentType: 'KITCHEN',
-    indId: indId,
-    issuedQty: requiredQty,
-    issuedBy: (window.SESSION && SESSION.name) || 'Store Manager'
-  });
-  if (res && res.success) {
-    toast('Items issued to kitchen ✓','s');
-    loadKitchenHistory();
-    if (typeof loadDashboard === 'function') loadDashboard();
-    // FIX ("if issue according show department dashboard" — Aug 2026):
-    // the backend already logs every Kitchen/Bar issue into the Dept
-    // Issue Register automatically (see the KitchenIndent_Direct.gs /
-    // BarIndent_Direct.gs comment this file already carries), but
-    // nothing on this side ever refreshed after a NEW issue — the
-    // "Dept Issue / Indent" badge and, if that page happened to be
-    // open, its list only ever picked up an issue on the next full
-    // page reload. Refreshes both immediately now, same as every other
-    // "just changed something, update what's showing it" pattern
-    // already used elsewhere in this file.
-    refreshDeptIssueViewsAfterIssue();
-  } else {
-    toast('⚠ Could not issue — ' + ((res && res.message) || 'server error'), 'e');
+  if(_kiIssuingInProgress.has(indId)){
+    toast('Already issuing this indent — please wait','w');
+    return;
+  }
+  _kiIssuingInProgress.add(indId);
+  const btn=document.getElementById('ki-issue-btn-'+indId);
+  if(btn){ btn.disabled=true; btn.textContent='Issuing…'; }
+  try{
+    const res = await erpApi('APPROVE_ISSUE_INDENT', {
+      indentType: 'KITCHEN',
+      indId: indId,
+      issuedQty: requiredQty,
+      issuedBy: (window.SESSION && SESSION.name) || 'Store Manager'
+    });
+    if (res && res.success) {
+      toast('Items issued to kitchen ✓','s');
+      loadKitchenHistory();
+      if (typeof loadDashboard === 'function') loadDashboard();
+      // FIX ("if issue according show department dashboard" — Aug 2026):
+      // the backend already logs every Kitchen/Bar issue into the Dept
+      // Issue Register automatically (see the KitchenIndent_Direct.gs /
+      // BarIndent_Direct.gs comment this file already carries), but
+      // nothing on this side ever refreshed after a NEW issue — the
+      // "Dept Issue / Indent" badge and, if that page happened to be
+      // open, its list only ever picked up an issue on the next full
+      // page reload. Refreshes both immediately now, same as every other
+      // "just changed something, update what's showing it" pattern
+      // already used elsewhere in this file.
+      refreshDeptIssueViewsAfterIssue();
+    } else {
+      toast('⚠ Could not issue — ' + ((res && res.message) || 'server error'), 'e');
+      if(btn){ btn.disabled=false; btn.textContent='Issue'; }
+    }
+  }catch(e){
+    toast('⚠ Sync error: '+e.message,'e');
+    if(btn){ btn.disabled=false; btn.textContent='Issue'; }
+  }finally{
+    _kiIssuingInProgress.delete(indId);
   }
 }
 
@@ -5992,33 +6050,51 @@ async function loadBarIndentHistory(){
     const status = ind.STATUS || 'PENDING';
     return `<tr>
       <td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${dateStr}</td>
-      <td style="font-weight:700;">${ind.ITEM_NAME || ind.ITEM_ID || '—'}</td>
+      <td style="font-weight:700;">${toProperCase(ind.ITEM_NAME) || ind.ITEM_ID || '—'}</td>
       <td>${ind.CATEGORY || '—'}</td>
       <td class="r">${ind.REQUIRED_QTY ?? 0} ${ind.UNIT || ''}</td>
       <td class="r">${ind.ISSUED_QTY ?? 0} ${ind.UNIT || ''}</td>
       <td><span class="badge ${statusColors[status] || 'gr'}">${status}</span></td>
       <td>${status === 'PENDING'
-        ? `<button class="btn s" style="padding:2px 7px;font-size:11px;" onclick="issueBI('${ind.IND_ID}',${JSON.stringify(String(ind.REQUIRED_QTY ?? 0))})">Issue</button>`
+        ? `<button class="btn s" id="bi-issue-btn-${ind.IND_ID}" style="padding:2px 7px;font-size:11px;" onclick="issueBI('${ind.IND_ID}',${JSON.stringify(String(ind.REQUIRED_QTY ?? 0))})">Issue</button>`
         : '—'}</td>
     </tr>`;
   }).join('') : '<tr><td colspan="7" class="tbl-empty">No bar indents found</td></tr>';
 }
+// FIX ("delay and replay problem" — Aug 2026): same double-issue guard
+// as issueKI() above — see that function's comment for the full story.
+const _biIssuingInProgress = new Set();
 async function issueBI(indId, requiredQty){
-  const res = await erpApi('APPROVE_ISSUE_BAR_INDENT', {
-    indId: indId,
-    issuedQty: requiredQty,
-    issuedBy: (window.SESSION && SESSION.name) || 'Store Manager'
-  });
-  if (res && res.success) {
-    toast('Items issued to bar ✓','s');
-    loadBarIndentHistory();
-    if (typeof loadDashboard === 'function') loadDashboard();
-    // FIX ("if issue according show department dashboard" — Aug 2026):
-    // same refresh as issueKI() above — a Bar issue is just as real a
-    // Dept Issue Register entry as a Kitchen one.
-    refreshDeptIssueViewsAfterIssue();
-  } else {
-    toast('⚠ Could not issue — ' + ((res && res.message) || 'server error'), 'e');
+  if(_biIssuingInProgress.has(indId)){
+    toast('Already issuing this indent — please wait','w');
+    return;
+  }
+  _biIssuingInProgress.add(indId);
+  const btn=document.getElementById('bi-issue-btn-'+indId);
+  if(btn){ btn.disabled=true; btn.textContent='Issuing…'; }
+  try{
+    const res = await erpApi('APPROVE_ISSUE_BAR_INDENT', {
+      indId: indId,
+      issuedQty: requiredQty,
+      issuedBy: (window.SESSION && SESSION.name) || 'Store Manager'
+    });
+    if (res && res.success) {
+      toast('Items issued to bar ✓','s');
+      loadBarIndentHistory();
+      if (typeof loadDashboard === 'function') loadDashboard();
+      // FIX ("if issue according show department dashboard" — Aug 2026):
+      // same refresh as issueKI() above — a Bar issue is just as real a
+      // Dept Issue Register entry as a Kitchen one.
+      refreshDeptIssueViewsAfterIssue();
+    } else {
+      toast('⚠ Could not issue — ' + ((res && res.message) || 'server error'), 'e');
+      if(btn){ btn.disabled=false; btn.textContent='Issue'; }
+    }
+  }catch(e){
+    toast('⚠ Sync error: '+e.message,'e');
+    if(btn){ btn.disabled=false; btn.textContent='Issue'; }
+  }finally{
+    _biIssuingInProgress.delete(indId);
   }
 }
 // Shared by issueKI()/issueBI() — re-pulls the real Dept Issue count
