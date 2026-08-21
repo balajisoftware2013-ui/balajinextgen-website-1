@@ -2220,12 +2220,28 @@ function load(){
       returns:'purchase_returns'
     };
     let changed=false;
+    // FIX ("deleted entries come back" — Aug 2026, root-cause pass #3):
+    // this function is exposed on window so it can be called from OUTSIDE
+    // this file (e.g. the dashboard shell that hosts this module). Every
+    // previous "delete comes back" fix patched pullInventorySyncData()'s
+    // two merge loops only — this third merge path never got the same
+    // treatment. It (a) never checked window._pendingDeletes, so an
+    // external caller landing mid-delete could resurrect the row this tab
+    // just removed, and (b) only ever ADDED/UPDATED records — it never
+    // dropped a local row the server no longer has, so a genuinely
+    // server-deleted invoice (deleted from another device) sat in
+    // DB.purchases/DB.acctInvs forever once pulled in through this path.
+    // Now matches the exact same guard + stale-removal logic already
+    // proven in pullInventorySyncData() above.
+    const pendingDel=window._pendingDeletes||new Set();
     Object.entries(map).forEach(([dbKey,tableName])=>{
       const incoming=tables[tableName];
-      if(!Array.isArray(incoming)||!incoming.length)return;
+      if(!Array.isArray(incoming))return;
       DB[dbKey]=DB[dbKey]||[];
+      const incomingIds=new Set(incoming.filter(r=>r&&r.id).map(r=>r.id));
       incoming.forEach(rec=>{
         if(!rec||!rec.id)return;
+        if(pendingDel.has(rec.id))return; // delete in flight on this tab — don't resurrect it
         const idx=DB[dbKey].findIndex(x=>x.id===rec.id);
         if(idx>=0){
           const orig=DB[dbKey][idx];
@@ -2247,11 +2263,19 @@ function load(){
           if((dbKey==='purchases'||dbKey==='acctInvs') && (!Array.isArray(rec.items)||!rec.items.length) && Array.isArray(orig.items) && orig.items.length){
             mergedRec.items=orig.items;
           }
+          mergedRec.synced=true; // confirmed present on the server right now
           DB[dbKey][idx]=mergedRec;
         } else {
+          rec.synced=true; // came straight from the server, so by definition confirmed
           DB[dbKey].push(rec);
         }
       });
+      // A record that (a) was previously confirmed synced=true (so it
+      // genuinely existed on the server before), (b) isn't in this
+      // incoming list, and (c) isn't a delete this tab has in flight
+      // right now — is gone server-side and should stop showing here too,
+      // instead of surviving forever because this path only ever added.
+      DB[dbKey]=DB[dbKey].filter(p=>pendingDel.has(p.id)||p.synced!==true||incomingIds.has(p.id));
       changed=true;
     });
     if(!changed)return;
@@ -3596,6 +3620,14 @@ function findDuplicatePurchase(no,date,vendorName,grand,mode,excludeId){
   const arr=mode==='accounting'?DB.acctInvs:DB.purchases;
   const normNo=String(no||'').trim().toLowerCase();
   const normName=String(vendorName||'').trim().toLowerCase();
+  // FIX ("duplicate entries not allow entry time" — Aug 2026): requiring the
+  // Amount to match within ₹0.01 let a real duplicate straight through
+  // whenever the second entry had a typo'd or corrected amount (e.g.
+  // SE/2194/2026-27, same vendor, same date, entered once at ₹976.88 and
+  // again at ₹888.99 — same bill, mis-keyed total, both saved with zero
+  // warning). Invoice No + Vendor + Date (±1 day) is already a very strong
+  // "same physical bill" signal on its own — amount is now only used to
+  // decide HOW loud the warning is, never to skip it.
   // FIX ("fix duplicate issues" — Aug 2026, AI Invoice Scan): this used to
   // require p.date===date EXACTLY. That's fine for manual entry, but when
   // the same physical bill gets AI-scanned twice (e.g. the person wasn't
@@ -3615,11 +3647,15 @@ function findDuplicatePurchase(no,date,vendorName,grand,mode,excludeId){
     if(isNaN(da)||isNaN(db))return false;
     return Math.abs(da-db)<=86400000; // within 1 day
   };
-  return arr.find(p=>p.id!==excludeId&&String(p.no||'').trim().toLowerCase()===normNo&&dateClose(p.date,date)&&String(p.vendorName||'').trim().toLowerCase()===normName&&Math.abs((p.grand||0)-grand)<0.01);
+  return arr.find(p=>p.id!==excludeId&&String(p.no||'').trim().toLowerCase()===normNo&&dateClose(p.date,date)&&String(p.vendorName||'').trim().toLowerCase()===normName);
 }
-function showDupWarning(dup,sendApproval){
+function showDupWarning(dup,sendApproval,newGrand){
   pendingDupSendApproval=sendApproval;
-  el('dupWarnBody').innerHTML=`<div><b>Invoice No:</b> ${dup.no}</div><div><b>Date:</b> ${fmtD(dup.date)}</div><div><b>Party / Vendor:</b> ${dup.vendorName}</div><div><b>Amount:</b> ${fmt(dup.grand)}</div><div><b>Status:</b> <span class="badge b-blue">${dup.status}</span></div>`;
+  // FIX: flag it clearly when the amount doesn't match too — that's the
+  // "same invoice no/vendor/date but different total" case that used to
+  // sail straight through as if it wasn't a duplicate at all.
+  const amtDiffers = newGrand!=null && Math.abs((dup.grand||0)-newGrand)>=0.01;
+  el('dupWarnBody').innerHTML=`${amtDiffers?`<div style="margin-bottom:8px;padding:8px;border-radius:6px;background:rgba(220,38,38,0.08);color:#dc2626;font-weight:700">⚠️ Same Invoice No, Vendor &amp; Date already exists — but the amount is different (existing: ${fmt(dup.grand)}, this entry: ${fmt(newGrand)}). Check it isn't a mis-keyed duplicate of the same bill before saving.</div>`:''}<div><b>Invoice No:</b> ${dup.no}</div><div><b>Date:</b> ${fmtD(dup.date)}</div><div><b>Party / Vendor:</b> ${dup.vendorName}</div><div><b>Amount:</b> ${fmt(dup.grand)}</div><div><b>Status:</b> <span class="badge b-blue">${dup.status}</span></div>`;
   el('dupViewBtn').onclick=()=>{closeM('mDupWarn');viewPurchase(dup.id,dup.mode||curMode);};
   el('dupEditBtn').onclick=()=>{closeM('mDupWarn');closeM('mPurch');editPurchase(dup.id,dup.mode||curMode);};
   el('dupSaveAnywayBtn').onclick=()=>{closeM('mDupWarn');savePurchase(pendingDupSendApproval,true);};
@@ -3801,7 +3837,7 @@ function savePurchase(sendApproval,forceSave){
     const dup=findDuplicatePurchase(invNo,invDate,vend.name,grand,curMode,editingPurchaseId);
     if(dup){
       dup.mode=curMode;
-      showDupWarning(dup,sendApproval);
+      showDupWarning(dup,sendApproval,grand);
       return;
     }
   }
@@ -4281,10 +4317,24 @@ function _updateLocalTallyStatus(invoiceId,status,error){
 
 
 function syncStatusBadge(p){
-  const drive=p.driveSaved?'✓':'…';
-  const tally=p.tallyStatus==='POSTED'?'✓':p.tallyStatus==='FAILED'?'⚠':'…';
+  // FIX ("remove drive sync, all live" — Aug 2026): the "Drive…" badge
+  // showed "…" (pending) forever for every manually-entered invoice —
+  // most invoices have no scanned bill attached at all, so there was
+  // never a Drive upload to confirm in the first place. It read exactly
+  // like a stuck/broken sync on invoices that were actually saved fine,
+  // which is what made this column look untrustworthy. Drive status now
+  // only shows when this record actually HAS an attached bill file (the
+  // existing "Bill" column already links to it); otherwise this column
+  // is just live DB + Tally status, which are the two things that apply
+  // to every record.
+  let dbCls,dbLabel;
+  if(p.syncUnconfirmed){dbCls='b-red';dbLabel='⚠ Not Synced';}
+  else if(p.synced===false){dbCls='b-amber';dbLabel='⏳ Syncing…';}
+  else {dbCls='b-green';dbLabel='✓ Live';}
+  const tally=p.tallyStatus==='POSTED'?'✓ Posted':p.tallyStatus==='FAILED'?'⚠ Failed':'… Pending';
+  const tallyCls=p.tallyStatus==='POSTED'?'b-green':p.tallyStatus==='FAILED'?'b-red':'b-gray';
   const tallyTitle=p.tallyStatus==='FAILED'?(p.tallyError||'Tally not reachable — open Tally on this PC'):p.tallyStatus==='POSTED'?'Posted to Tally':'Waiting — needs this page open on the PC with Tally';
-  return `<span style="font-size:10px;white-space:nowrap" title="Database: saved">DB✓</span> <span style="font-size:10px;white-space:nowrap" title="Google Drive">Drive${drive}</span> <span style="font-size:10px;white-space:nowrap" title="${xmlEscape(tallyTitle)}">Tally${tally}</span>`;
+  return `<span class="badge ${dbCls}" style="font-size:9px" title="Database sync status">${dbLabel}</span> <span class="badge ${tallyCls}" style="font-size:9px" title="${xmlEscape(tallyTitle)}">Tally: ${tally}</span>${p.billFileUrl?` <span class="badge b-teal" style="font-size:9px" title="Bill file attached in Drive">📎 Drive✓</span>`:''}`;
 }
 function rendPurchaseList(){
   const lpinv=el('ll-pinv');
@@ -4434,7 +4484,7 @@ function togglePinvSelectAll(cb){
 }
 function selectDuplicatePurchases(){
   const dupIds=window._pinvDuplicateIds||new Set();
-  if(!dupIds.size){ toast('No duplicate invoices detected (matching invoice no, vendor, date & total).','ok','✅'); return; }
+  if(!dupIds.size){ toast('No duplicate invoices detected (matching invoice no, vendor &amp; date).','ok','✅'); return; }
   let onThisPage=0, offPage=0;
   document.querySelectorAll('.pinv-row-chk').forEach(c=>{
     if(dupIds.has(c.dataset.id)){ c.checked=true; onThisPage++; }
@@ -6781,9 +6831,15 @@ function rendRegs(){
   // badge, and let "🔁 Select Duplicates" below pre-check every copy
   // except the earliest (by createdAt) in each group for review + bulk
   // delete.
+  // FIX ("duplicate entries not allow entry time"): grouping used to also
+  // require the Amount to match, so two entries of the same bill with a
+  // mis-keyed total (see findDuplicatePurchase() above) never got flagged
+  // here either. Now groups on Invoice No + Vendor + Date only — the
+  // amount is shown in the badge tooltip instead, so a same-bill/
+  // different-amount pair still gets caught for review.
   const _dupGroups={};
   (DB.purchases||[]).forEach(p=>{
-    const key=`${p.no}||${p.vendorName}||${p.date}||${(+p.grand||0).toFixed(2)}`;
+    const key=`${p.no}||${p.vendorName}||${p.date}`;
     (_dupGroups[key]=_dupGroups[key]||[]).push(p);
   });
   const pinvDupGroupSize={}; // id -> size of its duplicate group (1 = unique)
@@ -6815,7 +6871,7 @@ function rendRegs(){
       const mainRow=`<tr${pinvDupGroupSize[p.id]?' class="row-pinv-dup" style="background:rgba(220,38,38,0.06)"':''}>
         <td><input type="checkbox" class="pinv-row-chk" data-id="${p.id}" onchange="updatePinvSelectionUI()"></td>
         <td>${itemCount?`<button class="btn btn-xs" onclick="toggleRegItems('${p.id}')" id="reg-items-btn-${p.id}" title="Show ${itemCount} item(s)">▸</button>`:''}</td>
-        <td><b>${p.no}</b>${p.syncUnconfirmed?` <span class="badge b-red" style="font-size:8px" title="This id was not found on the server — save may have failed">⚠ NOT SYNCED</span>`:(p.synced!==true?` <span class="badge b-amber" style="font-size:8px" title="Saved locally, waiting for server confirmation">⏳ syncing…</span>`:'')}${pinvDupGroupSize[p.id]?` <span class="badge b-red" style="font-size:8px" title="${pinvDupGroupSize[p.id]} invoices share this exact invoice no, vendor, date &amp; total — review before deleting">⚠ Duplicate ×${pinvDupGroupSize[p.id]}</span>`:''}</td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td>
+        <td><b>${p.no}</b>${p.syncUnconfirmed?` <span class="badge b-red" style="font-size:8px" title="This id was not found on the server — save may have failed">⚠ NOT SYNCED</span>`:(p.synced!==true?` <span class="badge b-amber" style="font-size:8px" title="Saved locally, waiting for server confirmation">⏳ syncing…</span>`:'')}${pinvDupGroupSize[p.id]?` <span class="badge b-red" style="font-size:8px" title="${pinvDupGroupSize[p.id]} invoices share this exact invoice no, vendor &amp; date — review before deleting (amounts may differ, e.g. a mis-keyed re-entry)">⚠ Duplicate ×${pinvDupGroupSize[p.id]}</span>`:''}</td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td>
         <td><span class="badge b-teal">${p.mode||'inventory'}</span></td>
         <td><span class="badge b-purple" style="font-size:10px;white-space:nowrap">${_ln}</span></td>
         <td class="td-r">${fmt(p.taxable)}</td><td class="td-r">${fmt(p.gstTotal)}</td><td class="td-r"><b>${fmt(p.grand)}</b></td>
