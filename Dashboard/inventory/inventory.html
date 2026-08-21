@@ -3649,7 +3649,7 @@ window.INV_REPORT_DB = localStorage.getItem('bnx_report_db_id') || '';
           <div class="card-b">
             <div class="fg" style="margin-bottom:10px;"><label>Google Sheet ID</label><input id="gs-sheet-id" placeholder="Paste your Sheet ID here..." style="border:1px solid var(--border);border-radius:var(--rs);padding:8px;background:var(--bg);width:100%;"></div>
             <div class="fg" style="margin-bottom:10px;"><label>Sync Mode</label><select id="gs-mode" style="border:1px solid var(--border);border-radius:var(--rs);padding:8px;background:var(--bg);width:100%;"><option>Read & Write (Bidirectional)</option><option>Read Only (Sheet → ERP)</option><option>Write Only (ERP → Sheet)</option></select></div>
-            <div class="cfg-row"><div><div class="cfg-lbl">Auto Sync</div><div class="cfg-sub">Sync every 30 minutes</div></div><div class="toggle on" data-setting="set-auto-sync" role="button" tabindex="0" aria-pressed="true" onclick="toggleSetting(this);"></div></div>
+            <div class="cfg-row"><div><div class="cfg-lbl">Auto Sync</div><div class="cfg-sub">Instant between tabs on this device; every 4s across other devices — turn off to refresh only with 🔄</div></div><div class="toggle on" data-setting="set-auto-sync" role="button" tabindex="0" aria-pressed="true" onclick="toggleSetting(this);"></div></div>
             <div class="cfg-row"><div><div class="cfg-lbl">Stock Changes</div><div class="cfg-sub">Push stock updates in real time</div></div><div class="toggle on" data-setting="set-stock-changes" role="button" tabindex="0" aria-pressed="true" onclick="toggleSetting(this);"></div></div>
             <button class="btn p" style="width:100%;justify-content:center;margin-top:10px;" onclick="triggerGSheetSync()">🔄 Test & Sync</button>
           </div>
@@ -4259,7 +4259,7 @@ const DB = {
       _pendingPushTables.add(t);
       erpApi(pushAction,{table:t,rows:v}).then(r=>{
         if(r&&r.success===false) console.warn('[LiveSync] push failed for',t,r.message);
-        else updateLiveSyncBadge('pushed');
+        else { updateLiveSyncBadge('pushed'); try{ broadcastTableChanged(t); }catch(e){} }
       }).catch(()=>{}).finally(()=>{ _pendingPushTables.delete(t); });
     }
   },
@@ -4438,6 +4438,11 @@ function updateLiveSyncBadge(kind){
   b.textContent = short ? '🟢 Live' : (kind==='pulled'?'🟢 Live · synced ':'🟢 Live · saved ')+t;
   b.title='Last '+kind+' at '+t;
 }
+function stopLiveSync(){
+  if(_liveSyncTimer){clearInterval(_liveSyncTimer);_liveSyncTimer=null;}
+  const b=document.getElementById('liveSyncBadge');
+  if(b){b.textContent='⏸ Auto Sync off';b.title='Auto Sync is turned off in Settings — use 🔄 to refresh manually';}
+}
 function startLiveSync(){
   if(_liveSyncTimer)clearInterval(_liveSyncTimer);
   pullAllFromBackend(false); // initial pull refreshes the dashboard - nothing to lose on page load
@@ -4447,22 +4452,52 @@ function startLiveSync(){
   // was purely this poll interval. A change made directly in the Sheet,
   // or saved from another device, could sit unseen here for up to a
   // full 20s even if you were staring at the screen. Two changes:
-  //  1. Shorter interval (8s instead of 20s) — less time to wait either way.
-  //  2. Pull immediately the moment this tab regains focus — the exact
+  //  1. Shorter interval (4s instead of 8s) — less time to wait for a
+  //     CROSS-DEVICE change (a different phone/PC) to show up here.
+  //  2. Same-device tabs no longer wait on this timer at all — see the
+  //     BroadcastChannel instant-sync block below, which pulls the
+  //     moment another tab on this browser saves anything.
+  //  3. Pull immediately the moment this tab regains focus — the exact
   //     moment someone switches back after editing the Sheet (or lets
   //     another device save) is when they're most likely to look, so
   //     that's when it should refresh, not on some arbitrary timer tick.
-  _liveSyncTimer=setInterval(()=>pullAllFromBackend(true), 8000); // ongoing pulls stay silent - never interrupt an in-progress form
+  _liveSyncTimer=setInterval(()=>pullAllFromBackend(true), 4000); // ongoing pulls stay silent - never interrupt an in-progress form
+}
+// ════ INSTANT SYNC — BroadcastChannel for same-device tabs ════
+// FIX ("instant real time need" — Aug 2026): the 8s poll (below) is the
+// realistic ceiling for CROSS-DEVICE updates on a plain GAS backend with
+// no websockets — but for two tabs/windows open on the SAME device/
+// browser (e.g. Dashboard in one tab, Purchase Entry in another, or
+// steward-mobile + restaurant-dashboard side by side), there's no need
+// to wait for a poll tick at all: the save already happened in this
+// browser. BroadcastChannel delivers that instantly, in milliseconds,
+// with zero network round-trip.
+let _bnxLiveChannel=null;
+try{
+  if(typeof window.BroadcastChannel!=='undefined'){
+    _bnxLiveChannel=new BroadcastChannel('bnx_inventory_live_'+CID);
+    _bnxLiveChannel.onmessage=(e)=>{
+      const msg=e.data;
+      if(!msg||!msg.table)return;
+      // Another tab on this same device/browser just saved `msg.table` —
+      // pull it immediately instead of waiting for this tab's own timer.
+      try{ pullAllFromBackend(true); }catch(err){}
+    };
+  }
+}catch(e){ console.warn('[LiveSync] BroadcastChannel unavailable:', e.message); }
+function broadcastTableChanged(table){
+  if(!_bnxLiveChannel)return;
+  try{ _bnxLiveChannel.postMessage({table, ts:Date.now()}); }catch(e){}
 }
 let _lastFocusPullAt=0;
 document.addEventListener('visibilitychange',()=>{
   if(document.visibilityState!=='visible')return;
-  if(Date.now()-_lastFocusPullAt<3000)return; // just pulled — avoid a redundant back-to-back call
+  if(Date.now()-_lastFocusPullAt<1500)return; // just pulled — avoid a redundant back-to-back call
   _lastFocusPullAt=Date.now();
   try{ pullAllFromBackend(true); }catch(e){}
 });
 window.addEventListener('focus',()=>{
-  if(Date.now()-_lastFocusPullAt<3000)return;
+  if(Date.now()-_lastFocusPullAt<1500)return;
   _lastFocusPullAt=Date.now();
   try{ pullAllFromBackend(true); }catch(e){}
 });
@@ -4733,8 +4768,15 @@ window.addEventListener('DOMContentLoaded', async ()=>{
   restoreCompanySettingsFields();
   tryAutoLoadCompanyFromClientMaster();
   // ── Step 2: Start real-time sync — pulls live data from backend,
-  // overwriting the local cache once connected; keeps polling every 20s ──
-  if(_hasRealSession()){ startLiveSync(); }
+  // overwriting the local cache once connected; keeps polling every 8s ──
+  // FIX ("fix inventory auto update"): respect the "Auto Sync" toggle
+  // (Settings) at startup too, not just when clicked — default true (the
+  // toggle's own default markup is "on") so nothing changes for anyone
+  // who's never touched this setting.
+  if(_hasRealSession()){
+    if(getSetting('set-auto-sync', true)) startLiveSync();
+    else { pullAllFromBackend(false); stopLiveSync(); } // one-time pull on load, then stay paused as requested
+  }
   else{ const b=document.getElementById('liveSyncBadge'); if(b){b.textContent='⚪ No client session — local only';b.style.background='rgba(239,68,68,.12)';} }
   document.getElementById('ph-date').textContent = new Date().toLocaleDateString('en-IN',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
   ['pi-ph-co','pr-ph-co','preg-ph-co','sr-ph-co','lr-ph-co'].forEach(id=>{ const el=document.getElementById(id); if(el) el.textContent=COMPANY; });
@@ -10148,11 +10190,24 @@ function setSetting(key, value){
 }
 // Bound to every [data-setting] toggle's onclick. Toggles the visual
 // state AND persists it in one call — no per-toggle wiring needed.
+// FIX ("fix inventory auto update" — Aug 2026): the "Auto Sync" toggle in
+// Settings looked and behaved like a real switch (saved its on/off state
+// fine via setSetting above) but nothing ever READ that saved value —
+// startLiveSync() always ran its 8-second pull loop unconditionally,
+// regardless of what this toggle said. Turning "Auto Sync" off did
+// nothing at all; the label ("Sync every 30 minutes") didn't even match
+// the real 8s interval either. Now toggling it actually starts/stops the
+// live pull loop, and the label below is corrected to say what really
+// happens.
 function toggleSetting(el){
   el.classList.toggle('on');
   const on = el.classList.contains('on');
   el.setAttribute('aria-pressed', on ? 'true' : 'false');
   setSetting(el.dataset.setting, on);
+  if(el.dataset.setting==='set-auto-sync'){
+    if(on){ startLiveSync(); toast('Auto Sync turned on — instant on this device, every 4s across others','s'); }
+    else { stopLiveSync(); toast('Auto Sync turned off — use 🔄 to refresh manually','w'); }
+  }
 }
 // Called on load (after the client session/DB is ready) and again after
 // every backend pull, so a setting changed on another device is picked
@@ -10164,6 +10219,12 @@ function applyStoredSettings(){
     el.classList.toggle('on', !!val);
     el.setAttribute('aria-pressed', val ? 'true' : 'false');
   });
+  // FIX ("fix inventory auto update"): if another device turned Auto Sync
+  // on/off, THIS device's live pull loop should actually match — not just
+  // the toggle's visual state above.
+  const autoSyncOn = getSetting('set-auto-sync', true);
+  if(autoSyncOn && !_liveSyncTimer) startLiveSync();
+  else if(!autoSyncOn && _liveSyncTimer) stopLiveSync();
   // Tally Export "what to include" checkboxes (te-purchase/te-sales/
   // te-items/te-ledgers/te-journals) — same persistence, exportTally()
   // now actually reads these instead of ignoring them (see below).
