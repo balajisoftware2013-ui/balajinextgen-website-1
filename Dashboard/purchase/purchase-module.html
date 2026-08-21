@@ -1772,7 +1772,21 @@ function _mapSyncRecordToDoc(rec){
     subtotal: taxable, discount: 0, taxable,
     gstTotal: cgst+sgst+igst, cgst, sgst, igst,
     grand: +rec.total||0,
-    due: rec.due_date||'', notes: '', status: 'Approved',
+    due: rec.due_date||'', notes: '',
+    // FIX ("every purpose approval must" — Aug 2026): this used to
+    // hardcode every record pulled from the shared sync table as
+    // status:'Approved', no matter how it actually got there — so an
+    // invoice entered directly in inventory.html (or any other source
+    // writing to this shared table) landed here already "Approved",
+    // completely bypassing this app's own Approve step. That's the
+    // likely reason the Dashboard/Registers showed literally every
+    // invoice as already Approved. approval_status is a new field (see
+    // _mapDocToSyncPurchaseRecord below) that round-trips this app's
+    // real Draft/Pending Approval/Approved status through the shared
+    // table; anything pulled in without one (older rows, or rows from a
+    // source that's never set it) now defaults to 'Pending Approval' —
+    // it still has to be Approved here, never silently skips that step.
+    status: rec.approval_status||'Pending Approval',
     billFileUrl: '', tallyStatus: 'PENDING',
     createdAt: rec._ts||new Date().toISOString()
   };
@@ -1793,6 +1807,7 @@ function _mapDocToSyncPurchaseRecord(doc){
     other_charges: otherCharges,
     total: +doc.grand||0,
     status: 'unpaid', // this app tracks payment separately via DB.payments/vendor.outstanding, not a per-invoice flag — 'unpaid' matches inventory.html's own default until a dedicated payment-status field exists here
+    approval_status: doc.status||'Pending Approval', // this app's real Draft/Pending Approval/Approved/Rejected/On Hold state — see _mapSyncRecordToDoc's use of this above; keeps the approval workflow intact across the shared table instead of everything silently arriving pre-"Approved"
     items: (doc.items||[]).map(it=>({
       item_id: it.itemId||('I'+uid()),
       item_name: it.name||'',
@@ -4913,6 +4928,36 @@ async function saveAttachment(){
       rec.driveLink = driveLink;
       rec.driveSaved = true;
       toast(`📁 Attachment uploaded to Drive → ${vendorName}/Attachments`,'ok','✅');
+      // FIX ("bill attachment not save" — Aug 2026): this used to stop
+      // here. rec.driveLink only ever lived on the local-only
+      // DB.attachments array (never pushed to any server table — see
+      // save(), which only syncs DB.purchases), and was NEVER copied
+      // onto the actual invoice's own billFileUrl field. So from the
+      // invoice's point of view — its own "Bill" column on the
+      // Dashboard, Registers, and this Attachments list itself — the
+      // upload always looked like it silently failed, and on any other
+      // device/browser (or after a cache clear) the attachment record
+      // vanished entirely since it was never persisted server-side.
+      // Now: patch billFileUrl straight onto the matching purchase or
+      // accounting invoice (matched the same way linkedPurch was found
+      // just above), push that single field change to the server via
+      // UPDATE_PURCHASE_INVOICE (same call savePurchase()/the AI Scan
+      // path already use for this), and re-render every list that shows
+      // a Bill column so it shows immediately — no reload/poll needed.
+      if(linkedPurch){
+        linkedPurch.billFileUrl=driveLink;
+        save();
+        try{ rendPurchaseList(); }catch(e){}
+        try{ rendRegs(); }catch(e){}
+        try{ rendDash(); }catch(e){}
+        if(typeof erpApi==='function'){
+          erpApi('UPDATE_PURCHASE_INVOICE', linkedPurch).then(r=>{
+            if(r&&r.success===false)toast('⚠️ Bill linked locally to '+linkedPurch.no+', but server sync failed: '+(r.message||'unknown error'),'warn','☁️');
+          });
+        }
+      }else{
+        toast('⚠️ No invoice found matching "'+pno+'" — attachment saved, but not linked to a Bill column. Check the Invoice No matches exactly.','warn','⚠️');
+      }
     }
   }
   pendingAttFile=null;
@@ -5858,8 +5903,9 @@ function showExtracted(){
   el('extractedArea').style.display='block';
   const itemsHtml=extractedData.items&&extractedData.items.length
     ?`<div style="margin-top:12px;grid-column:1/-1"><div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.4px;margin-bottom:6px">📦 ${extractedData.items.length} Items Extracted</div>
+      <div style="font-size:10px;color:var(--text3);margin:-2px 0 5px">✏️ Qty, Rate &amp; Amount are editable below — fix any AI misreads before saving.</div>
       <div class="tw"><table><thead><tr><th>#</th><th>Item</th><th>Qty</th><th>Unit</th><th>Rate</th><th>GST%</th><th>Amount</th></tr></thead><tbody>
-      ${extractedData.items.map((it,i)=>`<tr><td style="color:var(--text3)">${i+1}</td><td><b>${it.name}</b>${it.hsn?`<br><span style="font-size:10px;color:var(--text3)">HSN:${it.hsn}</span>`:''}</td><td class="td-c">${it.qty}</td><td class="td-c">${it.unit||'—'}</td><td class="td-r">₹${(+it.rate||0).toFixed(2)}</td><td class="td-c">${it.gst||0}%</td><td class="td-r"><b>₹${(+it.amt||0).toFixed(2)}</b></td></tr>`).join('')}
+      ${extractedData.items.map((it,i)=>`<tr><td style="color:var(--text3)">${i+1}</td><td><b>${it.name}</b>${it.hsn?`<br><span style="font-size:10px;color:var(--text3)">HSN:${it.hsn}</span>`:''}</td><td class="td-c"><input type="number" step="0.01" min="0" value="${it.qty}" style="width:55px;text-align:center;padding:3px 4px" onchange="exItemFieldChanged(${i},'qty',this.value)"></td><td class="td-c">${it.unit||'—'}</td><td class="td-r"><input type="number" step="0.01" min="0" value="${(+it.rate||0).toFixed(2)}" style="width:80px;text-align:right;padding:3px 4px" onchange="exItemFieldChanged(${i},'rate',this.value)"></td><td class="td-c">${it.gst||0}%</td><td class="td-r"><input type="number" step="0.01" value="${(+it.amt||0).toFixed(2)}" style="width:85px;text-align:right;padding:3px 4px;font-weight:700" onchange="exItemFieldChanged(${i},'amt',this.value)" title="Auto-recalculated from Qty × Rate — edit directly to override"></td></tr>`).join('')}
       </tbody></table></div></div>`:'';
   el('exGrid').innerHTML=`
     <div class="ex-item"><label>Vendor Name</label><div class="val" style="font-weight:800;color:var(--brand)">${extractedData.vendorName}</div></div>
@@ -5893,6 +5939,33 @@ function showExtracted(){
       🤖 <b>AI:</b> ${extractedData.mode==='accounting'?'💼 Accounting/Expense':'📦 Inventory/Stock'} · <b>${extractedData.items?.length||0} items</b> · Confidence: <b>${extractedData.confidence}%</b>
     </div>`;
   renderAutoMatchPreview(rt);
+}
+// FIX ("Quantity rate and amount edit option need" — Aug 2026, AI Invoice
+// Scan): the extracted-items preview in showExtracted() used to render Qty/
+// Rate/Amount as plain text — no way to correct an OCR misread (e.g. "8"
+// read as "3") before saving, short of importing anyway and fixing it in
+// the full item table afterward. Inputs now call this on change (blur/
+// enter, not every keystroke, so typing doesn't fight a live re-render):
+// edits write straight onto extractedData.items[i] (the same object
+// importExtracted() deep-copies from when Save is clicked, so corrections
+// carry through), Amount auto-recalculates as Qty×Rate when either changes
+// (matching the same override pattern the manual entry form's item table
+// already uses), or can be typed directly to override that when the
+// invoice's printed amount doesn't cleanly equal qty*rate (e.g. embedded
+// rebates — see the pcTaxable/ITC-reverse notes elsewhere in this file).
+// showExtracted() is called again after each edit so the Taxable/GST/Grand
+// Total figures and the taxable-mismatch warning banner stay in sync with
+// whatever was just corrected.
+function exItemFieldChanged(i,field,value){
+  if(!extractedData||!Array.isArray(extractedData.items)||!extractedData.items[i])return;
+  const it=extractedData.items[i];
+  const num=value===''?0:+value;
+  if(isNaN(num))return;
+  it[field]=num;
+  if(field==='qty'||field==='rate'){
+    it.amt=+(((+it.qty||0)*(+it.rate||0)).toFixed(2));
+  }
+  showExtracted();
 }
 function importExtracted(){
   if(!extractedData){toast('No data to import','err','⚠️');return;}
