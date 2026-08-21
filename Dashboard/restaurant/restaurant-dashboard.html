@@ -210,9 +210,19 @@ async function gasApi(action, payload, endpoint) {
             // saveDBWithRetry() in balaji-business-os.html — just missing
             // here, in the one function nearly everything on this page
             // actually calls.
+            // FIX — CRITICAL: this body never included sessionToken at
+            // all. The confirmed backend (20_POSBillingHandlers.gs)
+            // requires sessionToken on every call via
+            // bnxRequireSession_() and returns "Invalid or expired
+            // session" if it's missing — every gasApi() call from this
+            // dashboard (SAVE_ORDER, SAVE_KOT, SAVE_BILL,
+            // SAVE_TABLE_STATUS, menu/order reads, everything) would
+            // have failed the instant that backend went live. Mirrors
+            // steward-mobile.html's getSessionToken(), which already
+            // does this correctly.
             const r = await fetch(url, {
               method: 'POST',
-              body: JSON.stringify(Object.assign({ action: action, clientId: CLIENT_ID }, payload)),
+              body: JSON.stringify(Object.assign({ action: action, clientId: CLIENT_ID, sessionToken: (localStorage.getItem('ERP_SESSION')||'') }, payload)),
               signal: ctrl.signal,
               headers: { 'Content-Type': 'text/plain;charset=utf-8' }
             });
@@ -6702,15 +6712,29 @@ async function bnxSaveTableStatus(tableNo, patch){
     localStorage.setItem(bnxTableMasterKey(), JSON.stringify(extra));
   }catch(e){}
   if (typeof gasApi !== 'function') return { success:false, error:'gasApi unavailable' };
-  // FIX (table status was NOT actually retried — it claimed "will
-  // retry on next Sync DB" but never queued anything, so a failed
-  // save was silently dropped the moment this function returned. Now
-  // uses the SAME requestId + bnxQueuePending outbox that SAVE_BILL/
-  // SAVE_KOT/SAVE_ORDER already use elsewhere in this file, so a
-  // failed table-status write actually retries with backoff via
-  // flushOutbox() instead of just showing a one-time warning.
+  // FIX — CRITICAL (found by cross-checking the confirmed 20_POSBillingHandlers.gs
+  // backend contract): this file's `patch` objects use tableData's own
+  // internal shorthand keys (s/c/t/pax — 'available','occupied' etc,
+  // lowercase), but bnxSaveTableStatus on the SERVER reads
+  // req.status/req.covers/req.bill and only writes a column if that
+  // exact key is present. Every dashboard-originated table-status save
+  // was sending {s,c,t,...} — none of which match — so the server
+  // found the row, wrote NOTHING to STATUS/GUESTS/BILL_AMOUNT, and
+  // still returned success:true. The dashboard has been silently NOT
+  // syncing table status to Google Sheets this whole time, while every
+  // "✅ saved to 04_TABLE_MASTER" notification lied. steward-mobile.html
+  // was never affected — it already sends {status,covers,bill} (see
+  // bnxUpdateTableOverlay). Server also expects uppercase status
+  // strings (AVAILABLE/OCCUPIED/RESERVED/CLEANING/RUNNING/BILLED, per
+  // spec and steward's own calls) — dashboard's local model is
+  // lowercase, so that's translated here too, only for what's sent
+  // over the wire; the local model/cache below is untouched.
   const requestId = (typeof bnxUuid==='function') ? bnxUuid() : String(Date.now());
-  const payload = Object.assign({ requestId, tableNo }, patch);
+  const serverPatch = {};
+  if (patch.s !== undefined) serverPatch.status = String(patch.s).toUpperCase();
+  if (patch.pax !== undefined) serverPatch.covers = patch.pax;
+  if (patch.bill !== undefined) serverPatch.bill = patch.bill; // dashboard's simple tableData model doesn't track this yet — passthrough for any future caller that does
+  const payload = Object.assign({ requestId, tableNo }, serverPatch);
   try{
     const r = await gasApi('SAVE_TABLE_STATUS', payload);
     if (!r || !r.success){
