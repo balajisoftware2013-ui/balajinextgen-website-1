@@ -811,7 +811,8 @@ async function loadMenuFromServer(){
     if(Array.isArray(saved) && saved.length){
       MENU = saved.map(m=>({
         id: m.code || m.id || m.n, name: m.n || m.name, cat: m.c || m.cat || 'Other',
-        price: Number(m.p ?? m.price) || 0, icon: m.e || m.icon || bnxDefaultIcon(m.c||m.cat), avail: m.avail!==false
+        price: Number(m.p ?? m.price) || 0, icon: m.e || m.icon || bnxDefaultIcon(m.c||m.cat), avail: m.avail!==false,
+        gst: Number(m.gst)||0
       }));
     }
   }catch(e){}
@@ -823,7 +824,8 @@ async function loadMenuFromServer(){
       cat: m.category || m.CATEGORY || m.c || 'Other',
       price: parseFloat(m.price || m.PRICE || m.p) || 0,
       icon: m.icon || m.e || bnxDefaultIcon(m.category||m.CATEGORY||m.c),
-      avail: m.avail !== false
+      avail: m.avail !== false,
+      gst: Number(m.gst || m.GST)||0
     }));
   } // else: keep whatever was loaded above (shared local menu, or MENU_FALLBACK if none exists yet)
   if(document.getElementById('s-new-order')?.classList.contains('active')) renderMenu();
@@ -1332,11 +1334,21 @@ function openBillModal(){
   if(!tableKots.length){ toast('No active KOT for this table to bill','error'); return; }
   const items = [];
   tableKots.forEach(k=>(k.items||[]).forEach(i=>{
+    const menuItem = MENU.find(m=>m.name===i.name);
+    const gstPct = i.gst!==undefined ? Number(i.gst)||0 : (menuItem?.gst||0);
     const ex = items.find(x=>x.name===i.name);
-    if(ex) ex.qty += i.qty; else items.push({name:i.name, qty:i.qty, price:i.price||0});
+    if(ex) ex.qty += i.qty; else items.push({name:i.name, qty:i.qty, price:i.price||0, gst:gstPct});
   }));
   const sub = items.reduce((a,i)=>a+i.price*i.qty,0);
-  const gst = Math.round(sub*0.05); // 2.5% CGST + 2.5% SGST, matches dashboard's default GST split
+  // FIX ("all calculation parts also check fix"): this used to charge a
+  // flat guessed 5% on every bill regardless of what each item is
+  // actually configured for. Menu items carry a real per-item GST%
+  // (set in Menu Manager, same 'gst' field the dashboard's
+  // saveNewMenuItem()/Excel import use) — each line is now taxed at
+  // ITS OWN rate and summed, falling back to a 5% default only for
+  // items with no GST% configured at all (so a bill is never silently
+  // charged ₹0 tax just because an item's rate wasn't set).
+  const gst = Math.round(items.reduce((a,i)=>a + i.price*i.qty*((i.gst||5)/100), 0));
   const total = sub+gst;
   closeModal();
   const modal = document.getElementById('bill-modal');
@@ -1350,7 +1362,7 @@ function openBillModal(){
       </div>
       <div style="border-top:1px dashed var(--border2);padding-top:8px;font-size:12px;">
         <div style="display:flex;justify-content:space-between;"><span>Subtotal</span><span>₹${sub.toLocaleString()}</span></div>
-        <div style="display:flex;justify-content:space-between;"><span>GST (5%)</span><span>₹${gst.toLocaleString()}</span></div>
+        <div style="display:flex;justify-content:space-between;"><span>GST</span><span>₹${gst.toLocaleString()}</span></div>
         <div style="display:flex;justify-content:space-between;font-weight:800;font-size:16px;margin-top:4px;"><span>Total</span><span>₹${total.toLocaleString()}</span></div>
       </div>
       <div class="sec-title">Payment Mode</div>
@@ -1615,7 +1627,7 @@ async function placeOrder(){
   if(!selTable){ toast('No table selected','error'); return; }
   const items = Object.entries(order).map(([id,qty])=>{
     const m = MENU.find(x=>x.id===id);
-    return { id, name:m?m.name:id, qty, price:m?m.price:0, cat:m?m.cat:'' };
+    return { id, name:m?m.name:id, qty, price:m?m.price:0, cat:m?m.cat:'', gst:m?(m.gst||0):0 };
   });
   const amount = items.reduce((a,i)=>a+i.price*i.qty,0);
   const stewardName = document.getElementById('prof-name')?.textContent || 'Steward';
@@ -1879,20 +1891,39 @@ function closeOrderReplacementModal(){
    never return anything, so it silently did nothing every 20s. It now
    re-reads the shared local store first (instant — this is what makes
    orders placed on the dashboard show up here, same device) and merges
-   in GET_ACTIVE_ORDERS from the backend for orders placed on OTHER
-   devices/terminals, when that action exists server-side. */
+   in GET_ACTIVE_ORDERS from the backend for orders on OTHER devices.
+   AUDIT FIX: the merge below now mirrors the dashboard's OWN
+   bnxSyncLiveKots() parser exactly (same nested res.data.orders shape,
+   same ORDER_NO/TABLE_ID/CREATED_BY/PAX field names, same status
+   ranking so a pull can never downgrade a ticket already marked
+   Ready/Served locally) — this app was previously guessing at a flat
+   res.data array with different field names, which would have silently
+   matched nothing even if the backend responded correctly. */
 async function loadKOTFromServer(){
   bnxLoadOpenKots();
   const res = await gasApi('GET_ACTIVE_ORDERS', {}, 'V2_CORE');
-  if(res && res.success && Array.isArray(res.data) && res.data.length){
-    const known = new Set(KOT.map(k=>k.kotNo));
-    res.data.forEach(o=>{
-      const kotNo = o.ORDER_ID || o.orderId || o.kotNo;
-      if(kotNo && !known.has(kotNo)){
-        KOT.push({ kotNo, table:o.TABLE_ID||o.table, type:o.orderType||'KITCHEN', time:o.CREATED_AT||new Date().toISOString(),
-          waiter:o.CREATED_BY||o.waiter||'', covers:o.covers||'', items:o.items||[], status:o.ORDER_STATUS||o.status||'NEW' });
+  const orders = res && res.success && res.data && Array.isArray(res.data.orders) ? res.data.orders : null;
+  if(orders && orders.length){
+    const STATUS_MAP = { NEW:'NEW', KOT_PRINTED:'NEW', PENDING:'NEW', COOKING:'NEW', PREPARING:'NEW', IN_PROGRESS:'NEW', READY:'READY', SERVED:'SERVED', BILLED:'BILLED', CANCELLED:'CANCELLED' };
+    const STATUS_RANK = { NEW:0, READY:1, SERVED:2, BILLED:3, CANCELLED:3 };
+    orders.forEach(o=>{
+      const kotNo = o.ORDER_NO || o.ORDER_ID;
+      if(!kotNo || o.ORDER_STATUS==='CANCELLED') return;
+      const items = (o.items||[]).map(i=>({ name:i.itemName||i.name||'Item', qty:Number(i.qty||1), price:Number(i.price||i.rate||0) }));
+      const pulledStatus = STATUS_MAP[o.ORDER_STATUS] || 'NEW';
+      const rec = { kotNo, table:o.TABLE_ID||'—', type:'KITCHEN', waiter:o.CREATED_BY||'', covers:o.PAX||'',
+        time: (o.ORDER_DATE && o.START_TIME) ? new Date(o.ORDER_DATE+' '+o.START_TIME).toISOString() : new Date().toISOString(), items };
+      const idx = KOT.findIndex(k=>k.kotNo===kotNo);
+      if(idx>=0){
+        const localRank = STATUS_RANK[KOT[idx].status] ?? 0;
+        const pulledRank = STATUS_RANK[pulledStatus] ?? 0;
+        const status = pulledRank>localRank ? pulledStatus : KOT[idx].status;
+        KOT[idx] = Object.assign({}, KOT[idx], rec, { time:KOT[idx].time, status });
+      } else {
+        KOT.unshift(Object.assign({}, rec, { status:pulledStatus }));
       }
     });
+    if(KOT.length>100) KOT.length=100;
     bnxSetOpenKotsRaw(JSON.stringify(KOT));
   }
   if(document.getElementById('s-kot')?.classList.contains('active')) renderKOT();
