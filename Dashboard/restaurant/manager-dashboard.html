@@ -24,6 +24,46 @@ if(typeof ERP==='undefined') var ERP = {
   logout(r='../login.html'){if(confirm('Logout from Balaji NextGen ERP?\n\nPowered by Balaji NextGen Solutions')){this.clear();window.location.href=r;}}
 };
 
+/* ══════════════════════════════════════════════════
+   SHARED DATA STORE — same keys as restaurant-dashboard.html and
+   steward-mobile.html (bnxTableMasterKey, bnxBillRegKey, etc). This
+   dashboard previously had NO CLIENT_ID and NO connection to any of
+   the shared bnx_* storage the other two apps read/write — Tables,
+   Reports, Purchase and Inventory here were each their own isolated,
+   in-memory-only demo dataset (reset on every page refresh, never
+   shared with anything). Wiring this in lets Tables and Reports below
+   show the SAME real floor status and SAME real bills the other two
+   apps show, on the same device. ══════════════════════════════════════════════════ */
+function getClientId(){
+  try{
+    var u=JSON.parse(sessionStorage.getItem('ERP_USER')||localStorage.getItem('ERP_USER')||'{}');
+    var fromSession = u.CLIENT_ID||u.clientId||u.client_id||'';
+    var fromFlatKey = localStorage.getItem('ERP_CLIENT')||'';
+    var fromUrl = new URLSearchParams(window.location.search).get('client')||'';
+    var id = fromSession || fromFlatKey || fromUrl || localStorage.getItem('bnx_client_id') || '';
+    if(id) localStorage.setItem('bnx_client_id', id);
+    return id;
+  }catch(e){ return localStorage.getItem('bnx_client_id')||''; }
+}
+const CLIENT_ID = getClientId();
+async function gasApi(action,payload,endpoint){
+  payload=payload||{};
+  const url=GAS_APIS[endpoint||'V2_CORE'];
+  try{
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body:JSON.stringify(Object.assign({action:action,clientId:CLIENT_ID},payload))});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return await r.json();
+  }catch(e){ return {success:false,offline:true,error:e.message}; }
+}
+function bnxTableMasterKey(){ return 'bnx_table_master_extra_' + (CLIENT_ID || 'default'); }
+function bnxBillRegKey(){ return 'bnx_bill_register_' + (CLIENT_ID || 'default'); }
+function bnxGetBillRegister(){ try{ return JSON.parse(localStorage.getItem(bnxBillRegKey())||'[]'); }catch(e){ return []; } }
+
+const BM_LOCAL_STORE_PREFIX = 'bnx_mgr_local_'; // this app's own isolated widgets (Purchase/Inventory) — see notes below
+function bmLocalGet(key, fallback){ try{ const v=JSON.parse(localStorage.getItem(BM_LOCAL_STORE_PREFIX+key+'_'+(CLIENT_ID||'default'))); return v===null?fallback:v; }catch(e){ return fallback; } }
+function bmLocalSet(key, val){ try{ localStorage.setItem(BM_LOCAL_STORE_PREFIX+key+'_'+(CLIENT_ID||'default'), JSON.stringify(val)); }catch(e){} }
+
 /* Unified API call */
 async function erpApi(payload, type='V2_AUTH'){
   try{
@@ -2904,7 +2944,68 @@ const REP_TYPE_DATA = {
     { ref:'SWIGGY', name:'Swiggy orders', amt:18400 }, { ref:'EASYDINER', name:'EasyDiner reservations', amt:6800 },
     { ref:'CL0002', name:'CL0002 — Corporate account', amt:3000 } ] },
 };
+function repDateInRange(ddmmyyyy, range){
+  if(!ddmmyyyy) return false;
+  const [dd,mm,yyyy] = ddmmyyyy.split('-').map(Number);
+  if(!dd||!mm||!yyyy) return false;
+  const d = new Date(yyyy, mm-1, dd);
+  const now = new Date(); now.setHours(0,0,0,0);
+  if(range==='today') return d.getTime()===now.getTime();
+  if(range==='yesterday'){ const y=new Date(now); y.setDate(y.getDate()-1); return d.getTime()===y.getTime(); }
+  if(range==='week'){ const w=new Date(now); w.setDate(w.getDate()-7); return d>=w && d<=now; }
+  if(range==='month') return d.getMonth()===now.getMonth() && d.getFullYear()===now.getFullYear();
+  if(range==='lastmonth'){ const lm=new Date(now.getFullYear(), now.getMonth()-1, 1); return d.getMonth()===lm.getMonth() && d.getFullYear()===lm.getFullYear(); }
+  if(range==='fy'){ const fyStart = now.getMonth()>=3 ? new Date(now.getFullYear(),3,1) : new Date(now.getFullYear()-1,3,1); return d>=fyStart && d<=now; }
+  if(range==='custom'){
+    const from=document.getElementById('repFrom')?.value, to=document.getElementById('repTo')?.value;
+    if(!from && !to) return true;
+    if(from && d<new Date(from)) return false;
+    if(to && d>new Date(to)) return false;
+    return true;
+  }
+  return true;
+}
+/* FIX ("bill and master fix... reports... according dashboard also
+   update"): Sales/Item-wise/Party-wise below now compute from the SAME
+   real shared bill register restaurant-dashboard.html and
+   steward-mobile.html write into — a bill settled on either app shows
+   up in these reports for real, filtered by the actual range picked.
+   Falls back to the demo baseline ONLY when the real register is
+   genuinely empty (fresh install), same convention used everywhere
+   else in this ecosystem. The other 8 report types (Balance Sheet,
+   P&L, Cash Flow, Purchase, Stock, Stock Ledger, GST, Profit) need
+   real accounting/purchase/inventory data that has no shared source
+   anywhere in this app ecosystem yet — computing believable-looking
+   numbers for those from nothing would be worse than an honest demo
+   label, so they're intentionally left as-is, not silently upgraded.*/
+function repRealData(type, range){
+  const bills = bnxGetBillRegister().filter(b=>b.status!=='Cancelled' && repDateInRange(b.dt, range));
+  if(!bills.length) return null;
+  if(type==='sales'){
+    return {
+      total: bills.reduce((s,b)=>s+(b.total||0),0),
+      transactions: bills.length,
+      bars: [62,78,55,88,71,95].map(v=>Math.round(v*(bills.length/6)*100)/100), // placeholder shape only — no hour-by-hour breakdown stored on a bill
+      rows: bills.slice(0,10).map(b=>({ ref:b.no, name:b.customer||'General Customer', amt:b.total||0 }))
+    };
+  }
+  if(type==='partywise'){
+    const byParty = {};
+    bills.forEach(b=>{ const n=b.customer||'General Customer'; byParty[n]=(byParty[n]||0)+(b.total||0); });
+    const rows = Object.entries(byParty).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([name,amt])=>({ref:'—',name,amt}));
+    return { total: bills.reduce((s,b)=>s+(b.total||0),0), transactions: Object.keys(byParty).length, bars:[1,1,1,1,1,1], rows };
+  }
+  if(type==='itemwise'){
+    const byItem = {};
+    bills.forEach(b=>(b.itemsDetail||[]).forEach(i=>{ byItem[i.name]=(byItem[i.name]||0)+((i.price||0)*(i.qty||1)); }));
+    const rows = Object.entries(byItem).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([name,amt])=>({ref:'—',name,amt}));
+    return { total: bills.reduce((s,b)=>s+(b.total||0),0), transactions: bills.length, bars:[1,1,1,1,1,1], rows };
+  }
+  return null;
+}
 function repDemoData(type, range){
+  const real = repRealData(type, range);
+  if(real) return real;
   const mult = { today:1, yesterday:0.85, week:6.2, month:24, lastmonth:22, fy:260, custom:1 }[range] || 1;
   const d = REP_TYPE_DATA[type] || REP_TYPE_DATA.sales;
   const bars = [62,78,55,88,71,95].map(v=>Math.round(v*mult*100)/100);
@@ -3062,24 +3163,58 @@ const TBL_STATUS_COLORS = { empty:'var(--green)', occupied:'var(--red)', reserve
 const TBL_STATUS_CYCLE = ['empty','occupied','reserved','cleaning'];
 let TBL_DATA = null;
 
+/* FIX ("if table also according load in system"): TBL_DATA was
+   generated fresh from a hardcoded status pattern every time this ran
+   and lived only in a plain JS variable — refreshing the page wiped
+   it, and it had zero connection to the REAL floor status the
+   restaurant dashboard and Steward Mobile show (04_TABLE_MASTER +
+   the shared bnx_table_master_extra overlay). A table shown OCCUPIED
+   here could be genuinely AVAILABLE everywhere else. This now loads
+   the same live sheet those two apps read, with the in-memory pattern
+   kept ONLY as the offline fallback shown before the first real sync
+   completes. */
+function bnxTblMapStatus(status){
+  const s=String(status||'').trim().toUpperCase();
+  if(s==='OCCUPIED'||s==='RUNNING') return 'occupied';
+  if(s==='RESERVED') return 'reserved';
+  if(s==='CLEANING') return 'cleaning';
+  return 'empty';
+}
+function tblSeedFallback(){
+  TBL_DATA = [];
+  const sections = [
+    { name:'Ground Floor', count:8, startNo:1 },
+    { name:'Terrace', count:4, startNo:9 },
+    { name:'AC Family Room', count:3, startNo:13 },
+  ];
+  let statuses = ['occupied','empty','empty','reserved','occupied','empty','cleaning','empty','occupied','empty','reserved','empty','empty','occupied','empty'];
+  let idx = 0;
+  sections.forEach(sec=>{
+    for (let i=0;i<sec.count;i++){
+      TBL_DATA.push({ no: sec.startNo+i, id:'T'+String(sec.startNo+i).padStart(2,'0'), section: sec.name, status: statuses[idx % statuses.length], pax: 4 + (i%2)*2 });
+      idx++;
+    }
+  });
+}
+async function tblSyncLive(){
+  const res = await gasApi('fetchSheet', { tab: '04_TABLE_MASTER' });
+  if(!res || !res.success || !Array.isArray(res.data) || !res.data.length) return false;
+  const rows = res.data.filter(r=>r && r[0]);
+  const fromSheet = rows.map((r,idx)=>({
+    no: idx+1, id: String(r[0]).trim(), section: r[1]||'Main Hall',
+    status: bnxTblMapStatus(r[3]), pax: Number(r[6])||Number(r[4])||4
+  }));
+  let extra=[]; try{ extra=JSON.parse(localStorage.getItem(bnxTableMasterKey())||'[]'); }catch(e){}
+  const known=new Set(fromSheet.map(t=>t.id));
+  extra = extra.filter(t=>(t.id||t.n) && !known.has(t.id||t.n)).map((t,i)=>({ no:fromSheet.length+i+1, id:t.id||t.n, section:t.zone||'Main Hall', status:bnxTblMapStatus(t.s), pax:t.pax||4 }));
+  TBL_DATA = fromSheet.concat(extra);
+  if(document.getElementById('page-tables')?.classList.contains('active')) tblRender();
+  return true;
+}
 function tblInit(){
-  if (!TBL_DATA){
-    TBL_DATA = [];
-    const sections = [
-      { name:'Ground Floor', count:8, startNo:1 },
-      { name:'Terrace', count:4, startNo:9 },
-      { name:'AC Family Room', count:3, startNo:13 },
-    ];
-    let statuses = ['occupied','empty','empty','reserved','occupied','empty','cleaning','empty','occupied','empty','reserved','empty','empty','occupied','empty'];
-    let idx = 0;
-    sections.forEach(sec=>{
-      for (let i=0;i<sec.count;i++){
-        TBL_DATA.push({ no: sec.startNo+i, section: sec.name, status: statuses[idx % statuses.length], pax: 4 + (i%2)*2 });
-        idx++;
-      }
-    });
-  }
+  if (!TBL_DATA) tblSeedFallback(); // shown instantly while the real sync below completes
   tblRender();
+  tblSyncLive();
 }
 function tblRender(){
   const bySection = {};
@@ -3105,19 +3240,44 @@ function tblCycle(no){
   t.status = TBL_STATUS_CYCLE[(idx+1) % TBL_STATUS_CYCLE.length];
   tblRender();
   showToast(`Table ${no} → ${t.status}`, 'success');
+  // Same shared overlay restaurant-dashboard.html/steward-mobile.html
+  // write to, plus the same best-effort backend sync — a status change
+  // made here is now visible to those apps too (same device), and
+  // attempts to reach the real sheet the same honest way they do.
+  if(t.id){
+    let extra=[]; try{ extra=JSON.parse(localStorage.getItem(bnxTableMasterKey())||'[]'); }catch(e){}
+    const rec = { id:t.id, n:t.id, s:t.status, pax:t.pax, zone:t.section };
+    const eidx = extra.findIndex(x=>(x.id||x.n)===t.id);
+    if(eidx>-1) Object.assign(extra[eidx], rec); else extra.push(rec);
+    localStorage.setItem(bnxTableMasterKey(), JSON.stringify(extra));
+    gasApi('SAVE_TABLE_STATUS', { tableNo:t.id, status:t.status.toUpperCase() }, 'V2_CORE').catch(()=>{});
+  }
 }
 
 /* ═══════════════════════════════════════════════════════
-   PURCHASE + INVENTORY — linked demo dataset. Saving a
-   Purchase pushes stock straight into Inventory, same as
-   it would via a real backend SAVE_PURCHASE action that
-   also updates STOCK_LEDGER.
-═══════════════════════════════════════════════════════ */
+   PURCHASE + INVENTORY — IMPORTANT HONEST NOTE: this is this
+   dashboard's own small self-contained widget, NOT the real
+   production Purchase/GRN/Inventory system (inventory.html,
+   purchase-module.html, GRN_Direct.gs, InventorySync_Direct.gs) —
+   that system has 851 real raw materials, multi-warehouse, GST
+   purchase register, and its own weighted-average costing engine,
+   none of which is reachable from here. Wiring this widget straight
+   into that system would risk writing malformed rows into a live
+   client's real stock ledger, so it deliberately has NOT been done.
+   What WAS fixed: this used to be a plain JS variable that reset to
+   the same 3 fake purchases and 8 fake stock rows on every single
+   page refresh. It now persists locally (survives refresh, scoped
+   per CLIENT_ID) so at least what a manager enters here sticks
+   around — but it remains this dashboard's own local widget until a
+   deliberate decision is made to point it at the real system. */
 let INV_STOCK = null; // { itemName: { qty, unit, reorderLevel } }
 let PUR_HISTORY = null;
 
 function purInvSeed(){
   if (INV_STOCK) return;
+  INV_STOCK = bmLocalGet('inv_stock', null);
+  PUR_HISTORY = bmLocalGet('pur_history', null);
+  if (INV_STOCK && PUR_HISTORY) return; // real saved data already exists locally
   INV_STOCK = {
     'Basmati Rice': { qty: 42, unit:'kg', reorder:15 },
     'Chicken': { qty: 8, unit:'kg', reorder:10 },
@@ -3133,6 +3293,8 @@ function purInvSeed(){
     { id:'PO-1040', supplier:'Krishna Dairy', item:'Milk', qty:15, unit:'ltr', amount:825, date:'Yesterday' },
     { id:'PO-1039', supplier:'Metro Wholesale', item:'Basmati Rice', qty:30, unit:'kg', amount:2700, date:'2 days ago' },
   ];
+  bmLocalSet('inv_stock', INV_STOCK);
+  bmLocalSet('pur_history', PUR_HISTORY);
 }
 
 function purInit(){ purInvSeed(); purOpenNew(); purRenderList(); }
@@ -3261,6 +3423,8 @@ function purSave(){
   });
 
   showToast(`Purchase saved — ${validLines.length} item(s) updated in Inventory`, 'success');
+  bmLocalSet('inv_stock', INV_STOCK);
+  bmLocalSet('pur_history', PUR_HISTORY);
   purOpenNew();
   purRenderList();
 }
