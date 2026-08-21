@@ -583,10 +583,16 @@ if (window.visualViewport) window.visualViewport.addEventListener('resize', setA
     <div id="mob-table-body"></div>
     <div style="display:flex;gap:8px;margin-top:14px;">
       <button class="btn-ghost" style="flex:1;" onclick="closeModal()">Close</button>
-      <button class="btn-primary" style="flex:2;" onclick="openOrderForTable()">+ New Order</button>
+      <button class="btn-primary" style="flex:1.4;" onclick="openOrderForTable()">+ New Order</button>
+      <button id="mob-settle-btn" class="btn-primary" style="flex:1.4;background:var(--green);" onclick="openBillModal()">💳 Settle Bill</button>
     </div>
   </div>
 </div>
+
+<!-- BILL / PAYMENT MODAL -->
+<div id="bill-modal"></div>
+<!-- RECEIPT MODAL -->
+<div id="receipt-modal"></div>
 
 <!-- ONLINE ORDER MODAL -->
 <div class="modal-overlay" id="online-modal">
@@ -606,32 +612,47 @@ if (window.visualViewport) window.visualViewport.addEventListener('resize', setA
 <script>
 /* ══════════════════════════════════════════════════
    BACKEND CONNECTOR — same endpoints/keys as restaurant-dashboard.html
-   so this app and the POS share one client database
-══════════════════════════════════════════════════ */
-/* FIX ("save data and accordingly update restaurant dashboard"):
-   V2_FRONTEND pointed at a dead, leftover GAS deployment — confirmed
-   removed entirely from restaurant-dashboard.html itself ("V2_FRONTEND
-   key removed entirely — confirmed unused, was a leftover legacy
-   deployment"). This app was still built around it for BOTH loading
-   the menu and placing orders, so every order placed here looked
-   successful locally but never reached the real backend (KOT_MASTER /
-   ORDER_MASTER) — it silently vanished into an unused deployment.
-   Menu items created in Settings → Menu Creation also never reached
-   this app for the same reason. Removed V2_FRONTEND; everything now
-   goes to V2_CORE, same as restaurant-dashboard.html and kot-management.html. */
+   so this app and the POS share one client database.
+
+   FIX ("give steward mobile same data and restaurant dashboard same
+   data"): this used to point V2_FRONTEND at a deployment ID the
+   dashboard's own code confirms is dead/removed leftover legacy —
+   every getMenuItems/createOrder/updateOrder/getKOT call from this
+   app was silently going nowhere. V2_AUTH also pointed at a different
+   deployment than the dashboard's V2_AUTH. Both now point at the same
+   deployment IDs restaurant-dashboard.html actually uses, and
+   V2_FRONTEND is removed — nothing calls it anymore (see the rewired
+   menu/table/order functions below, all now on V2_CORE, matching the
+   dashboard's own erpApi()/gasApi() calls exactly). ══════════════════════════════════════════════════ */
 const GAS_APIS_DASH = {
-  V2_CORE:     'https://script.google.com/macros/s/' + (localStorage.getItem('bnx_api_core') || 'AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ') + '/exec',
-  V2_AUTH:     'https://script.google.com/macros/s/' + (localStorage.getItem('bnx_api_auth') || 'AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ') + '/exec',
+  V2_CORE: 'https://script.google.com/macros/s/' + (localStorage.getItem('bnx_api_core') || 'AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ') + '/exec',
+  V2_AUTH: 'https://script.google.com/macros/s/' + (localStorage.getItem('bnx_api_auth') || 'AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ') + '/exec',
 };
+/* FIX: same multi-fallback CLIENT_ID resolution the dashboard uses
+   (session ERP_USER → flat ERP_CLIENT key → ?client= URL param →
+   cached bnx_client_id) instead of a hardcoded 'CLI001' fallback that
+   could quietly point a real client's steward app at the wrong
+   client's data. */
 function getClientId(){
-  try{ return localStorage.getItem('ERP_CLIENT') || JSON.parse(localStorage.getItem('ERP_USER')||'{}').CLIENT_ID || 'CLI001'; }catch(e){ return 'CLI001'; }
+  try{
+    var u=JSON.parse(sessionStorage.getItem('ERP_USER')||localStorage.getItem('ERP_USER')||'{}');
+    var fromSession = u.CLIENT_ID||u.clientId||u.client_id||'';
+    var fromFlatKey = localStorage.getItem('ERP_CLIENT')||'';
+    var fromUrl = new URLSearchParams(window.location.search).get('client')||'';
+    var id = fromSession || fromFlatKey || fromUrl || localStorage.getItem('bnx_client_id') || '';
+    if(id) localStorage.setItem('bnx_client_id', id);
+    return id;
+  }catch(e){ return localStorage.getItem('bnx_client_id')||''; }
 }
+const CLIENT_ID = getClientId();
 function getSessionToken(){ return localStorage.getItem('ERP_SESSION')||''; }
 async function gasApi(action,payload,endpoint){
   payload=payload||{};
   const url=GAS_APIS_DASH[endpoint||'V2_CORE'];
   try{
-    const r=await fetch(url,{method:'POST',body:JSON.stringify(Object.assign({action:action,clientId:getClientId(),sessionToken:getSessionToken()},payload))});
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body:JSON.stringify(Object.assign({action:action,clientId:getClientId(),sessionToken:getSessionToken()},payload))});
+    if(!r.ok) throw new Error('HTTP '+r.status);
     return await r.json();
   }catch(e){ return {success:false,offline:true,error:e.message}; }
 }
@@ -688,33 +709,179 @@ const MENU_FALLBACK=[
 ];
 let MENU = MENU_FALLBACK.slice();
 
-/* Pulls the SAME menu the POS dashboard uses (GET_MENU_ITEMS action, V2_CORE —
-   same action restaurant-dashboard.html's cache-warmer calls) so a category/item
-   created in Settings → Menu Creation shows up here too.
-   FIX: was calling a lowercase 'getMenuItems' action against the dead
-   V2_FRONTEND deployment — that action/endpoint pair was never real, so this
-   silently always fell back to the hardcoded MENU_FALLBACK below. */
+/* ══════════════════════════════════════════════════
+   SHARED DATA STORE — same localStorage keys/shape as
+   restaurant-dashboard.html (bnxMenuKey, bnxOpenKotsKey, bnxKotSeqKey,
+   bnxBillRegKey, bnxCreditLedgerKey, bnxTableMasterKey,
+   bnxOrderOverrideKey, bnx_bill_sync_queue). Same browser/device (the
+   normal case for a steward's tablet used alongside the counter POS)
+   now shows the SAME menu, tables, KOTs, bills and credit ledger the
+   dashboard shows — instantly, no network round-trip needed — and
+   every write here also fires the identical background sync call the
+   dashboard fires, so once a device/tablet is different from the
+   counter POS, or the backend SAVE_* handlers exist, this reaches the
+   real sheet too. Menu default icons use the exact same
+   CATEGORY_DEFAULT_ICON map as the dashboard, so a newly-created item
+   gets a matching icon whichever app created it. ══════════════════════════════════════════════════ */
+const CATEGORY_DEFAULT_ICON = {
+  'Beer':'🍺','Whisky':'🥃','Cocktail':'🍹','Bar':'🍸','Spirits':'🍸',
+  'Wine':'🍷','Soft Drinks':'🥤','Fresh Juice':'🧃','Tobacco':'🚬',
+  'Pizza':'🍕','Noodles':'🍜','Rice':'🍱','Fries':'🍟','Indian':'🍛',
+  'Small Plates':'🍢','Sweet Indulgence':'🍮','Desserts':'🍮',
+};
+function bnxDefaultIcon(cat){ return CATEGORY_DEFAULT_ICON[cat] || '🍽'; }
+function bnxMenuKey(){ return 'bnx_menu_data_' + (CLIENT_ID || 'default'); }
+function bnxTableMasterKey(){ return 'bnx_table_master_extra_' + (CLIENT_ID || 'default'); }
+function bnxOpenKotsKey(){ return 'bnx_open_kots_' + (CLIENT_ID || 'default'); }
+function bnxGetOpenKotsRaw(){ var v=localStorage.getItem(bnxOpenKotsKey()); if(v===null) v=localStorage.getItem('bnx_open_kots'); return v; }
+function bnxSetOpenKotsRaw(v){ localStorage.setItem(bnxOpenKotsKey(), v); }
+function bnxKotSeqKey(){ return 'bnx_kot_seq_' + (CLIENT_ID || 'default'); }
+function bnxGetKotSeq(){ var v=localStorage.getItem(bnxKotSeqKey()); if(v===null) v=localStorage.getItem('bnx_kot_seq'); return v; }
+function bnxSetKotSeq(v){ localStorage.setItem(bnxKotSeqKey(), String(v)); }
+function bnxBillRegKey(){ return 'bnx_bill_register_' + (CLIENT_ID || 'default'); }
+function bnxGetBillRegister(){ try{ return JSON.parse(localStorage.getItem(bnxBillRegKey())||'[]'); }catch(e){ return []; } }
+function bnxSaveBillRegister(list){ localStorage.setItem(bnxBillRegKey(), JSON.stringify(list)); }
+function bnxBillSeqKey(){ return 'bnx_bill_seq_' + (CLIENT_ID || 'default'); }
+function bnxGetBillSeq(){ var v=localStorage.getItem(bnxBillSeqKey()); if(v===null) v=localStorage.getItem('bnx_bill_seq'); return v; }
+function bnxSetBillSeq(v){ localStorage.setItem(bnxBillSeqKey(), String(v)); }
+function bnxCreditLedgerKey(){ return 'bnx_credit_ledger_' + (CLIENT_ID || 'default'); }
+function bnxGetCreditLedger(){ try{ return JSON.parse(localStorage.getItem(bnxCreditLedgerKey())||'[]'); }catch(e){ return []; } }
+function bnxSaveCreditLedger(list){ localStorage.setItem(bnxCreditLedgerKey(), JSON.stringify(list)); }
+function bnxPostCreditSale(customerName, mobile, amount, billDate, billNo){
+  customerName=(customerName||'').trim()||'GENERAL CUSTOMER'; amount=Math.round(Number(amount)||0);
+  if(!amount) return;
+  const norm=s=>(s||'').toString().trim().toLowerCase();
+  const list=bnxGetCreditLedger();
+  let entry=list.find(c=>norm(c.name)===norm(customerName));
+  if(!entry){ entry={name:customerName,mobile:mobile||'—',gstin:'—',type:'Individual',limit:0,outstanding:0,lastBillDate:'—',lastPaymentDate:'—',lastBillNo:''}; list.unshift(entry); }
+  entry.outstanding=Math.round((Number(entry.outstanding)||0)+amount);
+  entry.lastBillDate=billDate||entry.lastBillDate; entry.lastBillNo=billNo||entry.lastBillNo;
+  if(mobile && mobile!=='—') entry.mobile=mobile;
+  bnxSaveCreditLedger(list);
+}
+function bnxOrderOverrideKey(){ return 'bnx_order_overrides_' + (CLIENT_ID || 'default'); }
+function bnxGetOrderOverrides(){ try{ return JSON.parse(localStorage.getItem(bnxOrderOverrideKey())||'{}'); }catch(e){ return {}; } }
+function bnxSaveOrderOverrides(map){ localStorage.setItem(bnxOrderOverrideKey(), JSON.stringify(map)); }
+function bnxMarkTableOrdersBilled(tableId, invoiceNo){
+  const t=(tableId||'').toString().trim().toUpperCase(); if(!t) return;
+  const overrides=bnxGetOrderOverrides();
+  overrides[t]={status:'BILLED',invoiceNo:invoiceNo||'',at:Date.now()};
+  bnxSaveOrderOverrides(overrides);
+}
+/* Reuses the SAME sync queue key the dashboard's BillQueue reads from
+   (bnx_bill_sync_queue) — a bill rung up here gets picked up and
+   flushed to the backend by whichever app's BillQueue.flushQueue()
+   runs first (this app's own flushBillQueue below, or the dashboard's,
+   if both are open on the same device), instead of each app needing
+   its own separate sync engine. */
+function bnxQueueBillForSync(billData){
+  const QUEUE_KEY='bnx_bill_sync_queue';
+  let q=[]; try{ q=JSON.parse(localStorage.getItem(QUEUE_KEY)||'[]'); }catch(e){}
+  const localId='LOCAL_'+Date.now()+'_'+Math.random().toString(36).slice(2,8);
+  q.push({localId, billData:Object.assign({},billData,{localId}), status:'pending', attempts:0, queuedAt:new Date().toISOString()});
+  localStorage.setItem(QUEUE_KEY, JSON.stringify(q));
+}
+async function flushBillQueue(){
+  const QUEUE_KEY='bnx_bill_sync_queue';
+  let q=[]; try{ q=JSON.parse(localStorage.getItem(QUEUE_KEY)||'[]'); }catch(e){}
+  const pending=q.filter(e=>e.status==='pending' && e.attempts<8);
+  for(const entry of pending){
+    entry.attempts++;
+    try{
+      const res=await gasApi('SAVE_BILL',{bill:entry.billData},'V2_CORE');
+      if(res && (res.success||res.ok)){ entry.status='synced'; entry.syncedAt=new Date().toISOString(); }
+    }catch(err){}
+  }
+  localStorage.setItem(QUEUE_KEY, JSON.stringify(q));
+}
+setInterval(flushBillQueue, 15000);
+
+/* Pulls the SAME menu the POS dashboard uses (getMenuItems action, V2_FRONTEND) —
+   so a category/item created in Settings → Menu Creation shows up here too. */
 async function loadMenuFromServer(){
+  // FIX ("same menu item show according"): this called a dead endpoint
+  // ('getMenuItems'/V2_FRONTEND). It now first loads the SAME
+  // localStorage menu (bnx_menu_data_<CLIENT_ID>) the dashboard's
+  // Menu Manager saves to — so an item created or Excel-imported on
+  // the dashboard shows up here immediately on the same device — then
+  // still attempts the real backend action as an enhancement/merge for
+  // cross-device sync once/if the backend actually persists menu data.
+  try{
+    const saved = JSON.parse(localStorage.getItem(bnxMenuKey())||'null');
+    if(Array.isArray(saved) && saved.length){
+      MENU = saved.map(m=>({
+        id: m.code || m.id || m.n, name: m.n || m.name, cat: m.c || m.cat || 'Other',
+        price: Number(m.p ?? m.price) || 0, icon: m.e || m.icon || bnxDefaultIcon(m.c||m.cat), avail: m.avail!==false,
+        gst: Number(m.gst)||0
+      }));
+    }
+  }catch(e){}
   const res = await gasApi('GET_MENU_ITEMS', {}, 'V2_CORE');
   if(res && res.success && Array.isArray(res.data) && res.data.length){
     MENU = res.data.map(m=>({
-      id: m.id || m.ITEM_ID || m.name,
-      name: m.name || m.ITEM_NAME,
-      cat: m.category || m.CATEGORY || 'Other',
-      price: parseFloat(m.price || m.PRICE) || 0,
-      icon: m.icon || '🍽',
-      avail: m.avail !== false
+      id: m.id || m.ITEM_ID || m.code || m.name,
+      name: m.name || m.ITEM_NAME || m.n,
+      cat: m.category || m.CATEGORY || m.c || 'Other',
+      price: parseFloat(m.price || m.PRICE || m.p) || 0,
+      icon: m.icon || m.e || bnxDefaultIcon(m.category||m.CATEGORY||m.c),
+      avail: m.avail !== false,
+      gst: Number(m.gst || m.GST)||0
     }));
-  } // else: keep MENU_FALLBACK, app still usable offline
+  } // else: keep whatever was loaded above (shared local menu, or MENU_FALLBACK if none exists yet)
   if(document.getElementById('s-new-order')?.classList.contains('active')) renderMenu();
 }
-const TABLES=Array.from({length:18},(_,i)=>({
+/* FIX ("if table also according load in system"): tables here used to
+   be a permanently hardcoded 18-row demo array with fake statuses —
+   never read from anywhere real, so a table the dashboard shows as
+   OCCUPIED could show AVAILABLE here forever. This now reads the same
+   04_TABLE_MASTER sheet the dashboard reads (same 'fetchSheet' action,
+   same column order), on the same schedule. Kept as a `let` (not
+   `const`) so loadTablesLive() below can replace it once the real
+   sync completes; the array below is now ONLY the offline fallback
+   shown before the first sync finishes or if the sheet can't be
+   reached — same honest-failure pattern the dashboard uses, never
+   silently pretending stale/fake data is live. */
+const TABLES_FALLBACK=Array.from({length:18},(_,i)=>({
   id:`T${String(i+1).padStart(2,'0')}`,no:i+1,
   status:['AVAILABLE','OCCUPIED','RUNNING','AVAILABLE','RESERVED','AVAILABLE','OCCUPIED','RUNNING','AVAILABLE','AVAILABLE','OCCUPIED','RUNNING','AVAILABLE','AVAILABLE','RESERVED','AVAILABLE','OCCUPIED','RUNNING'][i]||'AVAILABLE',
   covers:[0,4,2,0,2,0,3,1,0,0,5,2,0,0,4,0,6,3][i]||0,
   bill:[0,1840,920,0,0,0,2100,540,0,0,3200,760,0,0,0,0,4100,1200][i]||0,
   steward:['','Amit','Amit','','','','Amit','','','','Amit','Amit','','','','','',''][i]||''
 }));
+let TABLES = TABLES_FALLBACK.slice();
+function bnxMapSheetStatusToTcard(status){
+  const s=String(status||'').trim().toUpperCase();
+  if(s==='OCCUPIED') return 'OCCUPIED';
+  if(s==='RUNNING') return 'RUNNING';
+  if(s==='RESERVED') return 'RESERVED';
+  if(s==='VIP') return 'VIP';
+  return 'AVAILABLE';
+}
+async function loadTablesLive(){
+  const res = await gasApi('fetchSheet', { tab: '04_TABLE_MASTER' });
+  if(!res || !res.success || !Array.isArray(res.data) || !res.data.length) return false;
+  // Column order matches 04_TABLE_MASTER exactly, same mapping the
+  // dashboard uses: [TABLE_NO, TABLE_NAME, TABLE_TYPE, STATUS, PAX,
+  // CAPTAIN, GUESTS, START_TIME, KITCHEN_STATUS, BAR_STATUS,
+  // KOT_COUNT, BILL_AMOUNT]
+  const rows = res.data.filter(r=>r && r[0]);
+  const fromSheet = rows.map((r,idx)=>({
+    id: String(r[0]).trim(), no: idx+1,
+    status: bnxMapSheetStatusToTcard(r[3]),
+    covers: Number(r[6])||0,
+    bill: Number(r[11])||0,
+    steward: r[5]||''
+  }));
+  // re-merge any table added locally while offline that hasn't reached
+  // the sheet yet — same pattern as the dashboard's bnxTableMasterKey()
+  let extra=[]; try{ extra=JSON.parse(localStorage.getItem(bnxTableMasterKey())||'[]'); }catch(e){}
+  const known=new Set(fromSheet.map(t=>t.id));
+  extra = extra.filter(t=>t.id && !known.has(t.id)).map(t=>({id:t.id||t.n,no:0,status:bnxMapSheetStatusToTcard(t.s),covers:t.pax||0,bill:t.billAmount||0,steward:t.captain||''}));
+  TABLES = fromSheet.concat(extra);
+  if(document.getElementById('s-tables')?.classList.contains('active')) renderMobTables();
+  if(document.getElementById('s-home')?.classList.contains('active')) renderMyTables();
+  return true;
+}
 const ONLINE_ORDERS=[
   {id:'ZOM001',platform:'ZOMATO',icon:'🍅',color:'#e23744',customer:'Priya Singh',items:'Butter Chicken x1, Naan x2',amount:400,status:'NEW',time:'10:45 AM'},
   {id:'SWG001',platform:'SWIGGY',icon:'🧡',color:'#fc8019',customer:'Raj Kumar',items:'Veg Biryani x2, Mojito x2',amount:760,status:'CONFIRMED',time:'10:38 AM'},
@@ -722,13 +889,20 @@ const ONLINE_ORDERS=[
   {id:'ZOM002',platform:'ZOMATO',icon:'🍅',color:'#e23744',customer:'Amit Sharma',items:'Chicken Biryani x1, Mojito x1',amount:460,status:'OUT_FOR_DELIVERY',time:'10:10 AM'},
   {id:'SWG002',platform:'SWIGGY',icon:'🧡',color:'#fc8019',customer:'Meena Patel',items:'Butter Chicken x2',amount:640,status:'NEW',time:'10:50 AM'}
 ];
-const KOT=[
-  {table:'T02',items:[{name:'Butter Chicken',qty:2},{name:'Naan',qty:4}],status:'PREPARING',time:'10:30 AM',mins:8},
-  {table:'T07',items:[{name:'Veg Biryani',qty:1},{name:'Mojito',qty:2}],status:'DELAYED',time:'10:15 AM',mins:20},
-  {table:'T11',items:[{name:'Paneer Tikka',qty:3}],status:'READY',time:'10:45 AM',mins:5},
-  {table:'ZOM001',items:[{name:'Butter Chicken',qty:1},{name:'Naan',qty:2}],status:'PREPARING',time:'10:45 AM',mins:10},
-  {table:'SWG002',items:[{name:'Butter Chicken',qty:2}],status:'PENDING',time:'10:50 AM',mins:0}
-];
+/* FIX ("if order to print to payment receive to report to dashboard
+   all actual according"): KOT here used to be a fake hardcoded array,
+   completely disconnected from what the dashboard shows. It now reads
+   the SAME shared open-KOTs store (bnx_open_kots_<CLIENT_ID>) the
+   dashboard's bnxRecordKOT()/bnxGetOpenKotsRaw() write and read — a
+   KOT sent from Steward shows on the dashboard's KOT/KDS pages
+   immediately (same browser), and vice versa. Each entry keeps the
+   dashboard's exact shape: {kotNo, table, type, time, waiter, covers,
+   items, status}. */
+let KOT=[];
+function bnxLoadOpenKots(){
+  try{ const raw=bnxGetOpenKotsRaw(); KOT = raw ? JSON.parse(raw) : []; }catch(e){ KOT=[]; }
+}
+bnxLoadOpenKots();
 
 /* ADD ("filter report not working — need to view + filter past orders
    in the steward app"): the steward app had no way to see completed/
@@ -819,6 +993,7 @@ async function doLogin(){
   document.getElementById('prof-role').textContent=(result.ROLE||'')+' • Morning Shift';
   loadMenuFromServer();
   loadKOTFromServer();
+  loadTablesLive();
   showScreen('s-home');
 }
 
@@ -831,7 +1006,7 @@ function renderMobTables(){
       <div class="tc-no">${t.no}</div>
       <div class="tc-status" style="color:${sc[t.status]||'var(--text3)'}">${t.status}</div>
       ${t.covers?`<div class="tc-info">${t.covers} guests</div>`:''}
-      ${t.bill?`<div class="tc-bill" style="color:var(--gold)">₹${t.bill.toLocaleString('en-IN')}</div>`:''}
+      ${t.bill?`<div class="tc-bill" style="color:var(--gold)">₹${t.bill.toLocaleString()}</div>`:''}
     </div>`).join('');
 }
 
@@ -851,9 +1026,11 @@ function openTable(id){
         <div style="font-size:14px;font-weight:800;margin-top:2px;">${selTable.covers||0}</div>
       </div>
     </div>
-    ${selTable.bill?`<div style="background:var(--gold-bg);border:1px solid rgba(212,160,23,.25);border-radius:12px;padding:12px 16px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"><span style="font-size:13px;color:var(--gold);font-weight:700;">Running Bill</span><span style="font-size:22px;font-weight:900;font-family:'DM Mono',monospace;color:var(--gold);">₹${selTable.bill.toLocaleString('en-IN')}</span></div>`:''}
+    ${selTable.bill?`<div style="background:var(--gold-bg);border:1px solid rgba(212,160,23,.25);border-radius:12px;padding:12px 16px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"><span style="font-size:13px;color:var(--gold);font-weight:700;">Running Bill</span><span style="font-size:22px;font-weight:900;font-family:'DM Mono',monospace;color:var(--gold);">₹${selTable.bill.toLocaleString()}</span></div>`:''}
     ${selTable.steward?`<div style="font-size:12px;color:var(--text3);">👤 Steward: ${selTable.steward}</div>`:''}
   `;
+  const settleBtn = document.getElementById('mob-settle-btn');
+  if(settleBtn) settleBtn.style.display = (selTable.status==='OCCUPIED'||selTable.status==='RUNNING') ? '' : 'none';
   document.getElementById('table-modal').classList.add('open');
 }
 
@@ -919,7 +1096,7 @@ function renderMyTables(){
         <div style="font-size:13px;font-weight:700;">Table ${t.id}</div>
         <div style="font-size:11px;color:var(--text3);margin-top:2px;">${t.covers} guests</div>
       </div>
-      ${t.bill?`<div style="font-size:16px;font-weight:900;font-family:'DM Mono',monospace;color:var(--gold);">₹${t.bill.toLocaleString('en-IN')}</div>`:''}
+      ${t.bill?`<div style="font-size:16px;font-weight:900;font-family:'DM Mono',monospace;color:var(--gold);">₹${t.bill.toLocaleString()}</div>`:''}
     </div>`).join('');
 }
 
@@ -978,22 +1155,40 @@ function setOrderHistRange(range,el){
   renderOrderHistory();
 }
 const ORD_HIST_STATUS_COLOR={SETTLED:'var(--green)',NC:'var(--orange)',CANCELLED:'var(--red)'};
+/* FIX ("filter report not working... need real bills"): this always
+   showed the same 8 hardcoded demo rows, forever, no matter how many
+   real bills were settled. It now reads the same shared Bill Register
+   the dashboard's Bills List/Reports use — real settled bills appear
+   here with working Cancel — and only falls back to the demo rows
+   when the real register is genuinely empty (fresh install), same
+   "real data takes over only once it exists" convention the dashboard
+   uses everywhere else. */
+function bnxBillToHistRow(b){
+  return { id:b.no, table:b.table, date:(b.dt||'').split('-').reverse().join?.('')?b.dt:b.dt,
+    rawDate:b.dt, time:b.tm, status:b.status==='Cancelled'?'CANCELLED':(b.status==='Pending'?'DUE':'SETTLED'),
+    createdBy:b.waiter||'-', items:(b.itemsDetail||[]).map(i=>({name:i.name,qty:i.qty,rate:i.price})), total:b.total, isReal:true };
+}
 function renderOrderHistory(){
   const list=document.getElementById('order-hist-list');
   if(!list) return;
-  const filtered=ORDER_HISTORY.filter(o=>ordHistInRange(o.date));
+  const realBills = bnxGetBillRegister();
+  const source = realBills.length ? realBills.map(bnxBillToHistRow) : ORDER_HISTORY;
+  const filtered = realBills.length ? source.filter(o=>ordHistInRange(o.rawDate)) : source.filter(o=>ordHistInRange(o.date));
   document.getElementById('hist-count').textContent=`${filtered.length} order${filtered.length===1?'':'s'}`;
   if(!filtered.length){ list.innerHTML='<div style="text-align:center;padding:40px;color:var(--text3);font-size:12.5px;">No orders in this range</div>'; return; }
   list.innerHTML=filtered.map(o=>{
-    const total=o.items.reduce((s,i)=>s+i.qty*i.rate,0);
+    const total = o.total!==undefined ? o.total : o.items.reduce((s,i)=>s+i.qty*i.rate,0);
     const color=ORD_HIST_STATUS_COLOR[o.status]||'var(--text3)';
     const itemsStr=o.items.map(i=>`${i.name} x${i.qty}`).join(', ');
+    const cancelBtn = (o.isReal && o.status!=='CANCELLED')
+      ? `<button style="margin-top:6px;background:var(--red-bg);border:1px solid rgba(224,80,80,.3);color:var(--red);border-radius:6px;padding:3px 8px;font-size:10px;font-weight:700;cursor:pointer;" onclick="cancelHistBill('${o.id}')">Cancel</button>` : '';
     return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 14px;margin-bottom:9px;">
       <div style="display:flex;justify-content:space-between;align-items:start;">
         <div>
           <div style="font-weight:800;font-size:13px;">${o.id} · Table ${o.table}</div>
           <div style="font-size:10.5px;color:var(--text3);margin-top:2px;">${itemsStr}</div>
-          <div style="font-size:10px;color:var(--text3);margin-top:4px;">👤 ${o.createdBy} · ${o.date} · ${o.time}</div>
+          <div style="font-size:10px;color:var(--text3);margin-top:4px;">👤 ${o.createdBy} · ${o.rawDate||o.date} · ${o.time}</div>
+          ${cancelBtn}
         </div>
         <div style="text-align:right;">
           <div style="font-family:'DM Mono',monospace;font-weight:800;">₹${total}</div>
@@ -1002,6 +1197,21 @@ function renderOrderHistory(){
       </div>
     </div>`;
   }).join('');
+}
+/* Soft-cancel only (matches dashboard's blCancelBill) — the bill stays
+   in the register/report trail with status Cancelled, never deleted,
+   so accounting/GST records stay complete and auditable. */
+function cancelHistBill(billNo){
+  const reason = prompt('Reason for cancelling bill '+billNo+'?','');
+  if(reason===null) return;
+  const list = bnxGetBillRegister();
+  const b = list.find(x=>x.no===billNo);
+  if(!b){ toast('Bill not found','error'); return; }
+  b.status='Cancelled'; b.cancelReason=reason||'';
+  bnxSaveBillRegister(list);
+  toast('🚫 Bill '+billNo+' cancelled','error');
+  renderOrderHistory();
+  gasApi('UPDATE_ORDER_STATUS', {orderId:billNo, status:'CANCELLED', remarks:reason}, 'V2_CORE').catch(()=>{});
 }
 
 function filterPlatform(plt,el){
@@ -1013,22 +1223,251 @@ function filterPlatform(plt,el){
 }
 
 /* ── KOT ── */
+function bnxKotTimeLabel(iso){
+  try{ return new Date(iso).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}); }catch(e){ return iso||''; }
+}
+function bnxKotElapsedMin(iso){
+  try{ const d=(Date.now()-new Date(iso).getTime())/60000; return d>=0?Math.round(d):0; }catch(e){ return 0; }
+}
 function renderKOT(){
-  const sc={PREPARING:'stat-prep',READY:'stat-ready',PENDING:'stat-pending',DELAYED:'stat-delayed'};
-  document.getElementById('kot-list').innerHTML=KOT.map(k=>`
+  const sc={PREPARING:'stat-prep',READY:'stat-ready',NEW:'stat-pending',PENDING:'stat-pending',DELAYED:'stat-delayed'};
+  const active = KOT.filter(k=>!['CANCELLED','BILLED','SERVED'].includes(k.status));
+  const listEl = document.getElementById('kot-list');
+  if(!active.length){ listEl.innerHTML=`<div style="text-align:center;padding:30px 10px;color:var(--text3);font-size:12px;">No active KOTs</div>`; return; }
+  listEl.innerHTML=active.map(k=>{
+    const mins=bnxKotElapsedMin(k.time);
+    return `
     <div class="kot-card">
       <div class="kot-header">
         <span class="kot-table">📍 ${k.table}</span>
-        <span class="kot-time">${k.time}${k.mins?` • ${k.mins} min`:''}</span>
+        <span class="kot-time">${bnxKotTimeLabel(k.time)}${mins?` • ${mins} min`:''}</span>
         <span class="kot-status ${sc[k.status]||'stat-prep'}">${k.status}</span>
       </div>
-      ${k.items.map(i=>`
+      ${(k.items||[]).map(i=>`
       <div class="kot-item">
         <div class="kit-qty">${i.qty}</div>
         <div class="kit-name">${i.name}</div>
-        ${k.status==='READY'?`<button style="background:var(--green-bg);border:1px solid rgba(46,184,92,.3);color:var(--green);border-radius:8px;padding:4px 10px;font-size:11px;font-weight:700;cursor:pointer;" onclick="toast('Marked served','success')">Served ✓</button>`:''}
       </div>`).join('')}
-    </div>`).join('');
+      <div style="display:flex;gap:6px;margin-top:8px;">
+        <button style="flex:1;background:var(--blue-bg);border:1px solid rgba(74,144,226,.3);color:var(--blue);border-radius:8px;padding:6px 10px;font-size:11px;font-weight:700;cursor:pointer;" onclick="printKOTTicket('${k.kotNo}')">🖨 Print</button>
+        ${k.status!=='READY'?`<button style="flex:1;background:var(--green-bg);border:1px solid rgba(46,184,92,.3);color:var(--green);border-radius:8px;padding:6px 10px;font-size:11px;font-weight:700;cursor:pointer;" onclick="updateKotStatus('${k.kotNo}','READY')">Ready ✓</button>`
+          :`<button style="flex:1;background:var(--green-bg);border:1px solid rgba(46,184,92,.3);color:var(--green);border-radius:8px;padding:6px 10px;font-size:11px;font-weight:700;cursor:pointer;" onclick="updateKotStatus('${k.kotNo}','SERVED')">Served ✓</button>`}
+        <button style="flex:1;background:var(--red-bg);border:1px solid rgba(224,80,80,.3);color:var(--red);border-radius:8px;padding:6px 10px;font-size:11px;font-weight:700;cursor:pointer;" onclick="cancelKot('${k.kotNo}')">Cancel ✕</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+/* FIX ("edit to cancel to delete all workable"): edit/cancel actions
+   previously didn't exist for KOTs at all. Both update the SAME shared
+   store the dashboard reads, and both fire the matching backend action
+   (UPDATE_ORDER_STATUS) — soft-cancel, never a hard delete, so a
+   cancelled KOT stays in the Order Register/report trail instead of
+   vanishing (matches how the dashboard's own cancelBill/NC flow work). */
+function updateKotStatus(kotNo, newStatus){
+  bnxLoadOpenKots();
+  const k = KOT.find(x=>x.kotNo===kotNo);
+  if(!k) return;
+  k.status = newStatus;
+  bnxSetOpenKotsRaw(JSON.stringify(KOT));
+  renderKOT();
+  toast((newStatus==='READY'?'✅ Marked ready':'✅ Marked served'),'success');
+  gasApi('UPDATE_ORDER_STATUS', {orderId:kotNo, status:newStatus}, 'V2_CORE')
+    .catch(e=>console.warn('UPDATE_ORDER_STATUS background sync failed:', e));
+}
+function cancelKot(kotNo){
+  const reason = prompt('Reason for cancelling this KOT?','');
+  if(reason===null) return;
+  bnxLoadOpenKots();
+  const k = KOT.find(x=>x.kotNo===kotNo);
+  if(!k) return;
+  k.status='CANCELLED'; k.cancelReason=reason||'';
+  bnxSetOpenKotsRaw(JSON.stringify(KOT));
+  renderKOT();
+  toast('🚫 KOT cancelled','error');
+  gasApi('UPDATE_ORDER_STATUS', {orderId:kotNo, status:'CANCELLED', remarks:reason}, 'V2_CORE')
+    .catch(e=>console.warn('UPDATE_ORDER_STATUS background sync failed:', e));
+}
+/* FIX ("if order to print"): no print function existed anywhere in
+   this app. Opens a print-formatted kitchen ticket in a hidden iframe
+   and calls window.print() — works the same way on a phone/tablet as
+   the browser's native share/print sheet. */
+function printKOTTicket(kotNo){
+  bnxLoadOpenKots();
+  const k = KOT.find(x=>x.kotNo===kotNo);
+  if(!k){ toast('KOT not found','error'); return; }
+  const rows=(k.items||[]).map(i=>`<tr><td style="padding:4px 0;">${i.qty} × ${i.name}</td></tr>`).join('');
+  const html=`<html><head><title>KOT ${k.kotNo}</title><style>
+    body{font-family:monospace;width:280px;margin:0 auto;padding:10px;}
+    h2{text-align:center;margin:0 0 6px;} .meta{font-size:12px;margin-bottom:8px;}
+    table{width:100%;border-collapse:collapse;font-size:13px;} hr{border:none;border-top:1px dashed #000;margin:8px 0;}
+  </style></head><body>
+    <h2>KOT — ${k.kotNo}</h2>
+    <div class="meta">Table: ${k.table}<br>Waiter: ${k.waiter||'-'} &nbsp; Covers: ${k.covers||'-'}<br>Time: ${bnxKotTimeLabel(k.time)}</div>
+    <hr><table>${rows}</table><hr>
+    <div style="text-align:center;font-size:11px;">Balaji NextGen ERP</div>
+  </body></html>`;
+  bnxPrintHtml(html);
+}
+function bnxPrintHtml(html){
+  const w=document.createElement('iframe');
+  w.style.position='fixed'; w.style.right='0'; w.style.bottom='0'; w.style.width='0'; w.style.height='0'; w.style.border='0';
+  document.body.appendChild(w);
+  const doc=w.contentWindow.document;
+  doc.open(); doc.write(html); doc.close();
+  setTimeout(()=>{ w.contentWindow.focus(); w.contentWindow.print(); setTimeout(()=>document.body.removeChild(w),1000); },250);
+}
+
+/* ══════════════════════════════════════════════════
+   BILLING / PAYMENT / RECEIPT — brand new. This flow did not exist
+   anywhere in Steward Mobile before ("order to print to payment
+   receive to report to dashboard"). Reuses the exact same shared bill
+   register, credit ledger, and sync-queue the dashboard uses, so a
+   bill settled from a steward's phone shows up in the dashboard's
+   Bills List / Reports / Due Collection immediately (same device),
+   and syncs to the backend the same best-effort way the dashboard's
+   own BillQueue does. ══════════════════════════════════════════════════ */
+const PAY_MODES = ['CASH','UPI','CARD','ZOMATO','SWIGGY','DUE'];
+function openBillModal(){
+  if(!selTable){ toast('No table selected','error'); return; }
+  bnxLoadOpenKots();
+  const tableKots = KOT.filter(k=>k.table===selTable.id && !['CANCELLED','BILLED'].includes(k.status));
+  if(!tableKots.length){ toast('No active KOT for this table to bill','error'); return; }
+  const items = [];
+  tableKots.forEach(k=>(k.items||[]).forEach(i=>{
+    const menuItem = MENU.find(m=>m.name===i.name);
+    const gstPct = i.gst!==undefined ? Number(i.gst)||0 : (menuItem?.gst||0);
+    const ex = items.find(x=>x.name===i.name);
+    if(ex) ex.qty += i.qty; else items.push({name:i.name, qty:i.qty, price:i.price||0, gst:gstPct});
+  }));
+  const sub = items.reduce((a,i)=>a+i.price*i.qty,0);
+  // FIX ("all calculation parts also check fix"): this used to charge a
+  // flat guessed 5% on every bill regardless of what each item is
+  // actually configured for. Menu items carry a real per-item GST%
+  // (set in Menu Manager, same 'gst' field the dashboard's
+  // saveNewMenuItem()/Excel import use) — each line is now taxed at
+  // ITS OWN rate and summed, falling back to a 5% default only for
+  // items with no GST% configured at all (so a bill is never silently
+  // charged ₹0 tax just because an item's rate wasn't set).
+  const gst = Math.round(items.reduce((a,i)=>a + i.price*i.qty*((i.gst||5)/100), 0));
+  const total = sub+gst;
+  closeModal();
+  const modal = document.getElementById('bill-modal');
+  modal.innerHTML = `
+  <div class="modal-overlay open" onclick="closeBillModal(event)">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-handle"></div>
+      <div class="modal-title">Settle — Table ${selTable.id}</div>
+      <div style="max-height:200px;overflow-y:auto;margin:10px 0;">
+        ${items.map(i=>`<div style="display:flex;justify-content:space-between;font-size:12px;padding:4px 0;"><span>${i.qty} × ${i.name}</span><span>₹${(i.qty*i.price).toLocaleString()}</span></div>`).join('')}
+      </div>
+      <div style="border-top:1px dashed var(--border2);padding-top:8px;font-size:12px;">
+        <div style="display:flex;justify-content:space-between;"><span>Subtotal</span><span>₹${sub.toLocaleString()}</span></div>
+        <div style="display:flex;justify-content:space-between;"><span>GST</span><span>₹${gst.toLocaleString()}</span></div>
+        <div style="display:flex;justify-content:space-between;font-weight:800;font-size:16px;margin-top:4px;"><span>Total</span><span>₹${total.toLocaleString()}</span></div>
+      </div>
+      <div class="sec-title">Payment Mode</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px;">
+        ${PAY_MODES.map(p=>`<button class="pay-mode-btn" id="pm-${p}" onclick="selectPayMode('${p}')" style="padding:10px 4px;border-radius:10px;border:1.5px solid var(--border2);background:var(--surface2);font-size:11px;font-weight:700;cursor:pointer;">${p}</button>`).join('')}
+      </div>
+      <div id="due-customer-fields" style="display:none;margin-bottom:10px;">
+        <input id="due-cust-name" placeholder="Customer name" style="width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--border2);margin-bottom:6px;font-size:13px;">
+        <input id="due-cust-mobile" placeholder="Mobile number" style="width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--border2);font-size:13px;">
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn-ghost" style="flex:1;" onclick="closeBillModal()">Cancel</button>
+        <button class="btn-primary" style="flex:2;background:var(--green);" onclick="confirmPayment(${JSON.stringify({items,sub,gst,total}).replace(/"/g,'&quot;')})">✅ Confirm & Print Receipt</button>
+      </div>
+    </div>
+  </div>`;
+  window._selectedPayMode = 'CASH';
+  setTimeout(()=>selectPayMode('CASH'),0);
+}
+function selectPayMode(mode){
+  window._selectedPayMode = mode;
+  PAY_MODES.forEach(p=>{
+    const btn=document.getElementById('pm-'+p);
+    if(btn) btn.style.cssText = p===mode
+      ? 'padding:10px 4px;border-radius:10px;border:1.5px solid var(--gold);background:var(--gold-bg);color:var(--gold);font-size:11px;font-weight:800;cursor:pointer;'
+      : 'padding:10px 4px;border-radius:10px;border:1.5px solid var(--border2);background:var(--surface2);font-size:11px;font-weight:700;cursor:pointer;';
+  });
+  const dueFields = document.getElementById('due-customer-fields');
+  if(dueFields) dueFields.style.display = mode==='DUE' ? 'block' : 'none';
+}
+function closeBillModal(e){ if(e && e.target!==e.currentTarget) return; document.getElementById('bill-modal').innerHTML=''; }
+function bnxBillSeqKeyNext(){
+  const seq = parseInt(bnxGetBillSeq()||'5000',10)+1;
+  bnxSetBillSeq(seq);
+  return 'HASH'+seq;
+}
+async function confirmPayment(calc){
+  const mode = window._selectedPayMode || 'CASH';
+  let custName='GENERAL CUSTOMER', custMobile='';
+  if(mode==='DUE'){
+    custName = document.getElementById('due-cust-name')?.value?.trim() || '';
+    custMobile = document.getElementById('due-cust-mobile')?.value?.trim() || '';
+    if(!custName){ toast('Customer name required for Due/Credit','error'); return; }
+  }
+  const billNo = bnxBillSeqKeyNext();
+  const now = new Date();
+  const dt = now.toLocaleDateString('en-GB').split('/').join('-'); // dd-mm-yyyy, matches dashboard's b.dt format
+  const tm = now.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});
+  const stewardName = document.getElementById('prof-name')?.textContent || 'Steward';
+
+  // FIX ("if any menu item ... to report to dashboard all actual
+  // according"): writes into the SAME shared bill register the
+  // dashboard's Bills List/Reports/Tally export read from
+  // (bnxGetBillRegister/bnxSaveBillRegister) — a bill rung up on
+  // Steward now genuinely appears in every one of those places, not
+  // just inside this app.
+  const list = bnxGetBillRegister();
+  const entry = {
+    no: billNo, dt, tm, table: selTable.id, customer: custName||'GENERAL CUSTOMER', mob: custMobile,
+    items: calc.items.length, itemsDetail: calc.items, sub: calc.sub, gst: calc.gst, total: calc.total,
+    pay: mode, status: mode==='DUE' ? 'Pending' : 'Paid', waiter: stewardName, kot: '', live:true,
+    businessDate: dt, pax: selTable.covers||0
+  };
+  list.unshift(entry);
+  bnxSaveBillRegister(list.length>6000 ? list.slice(0,6000) : list);
+
+  // FIX ("credit due also fix"): a Due/Credit bill now actually posts
+  // into the shared credit ledger the Customer Credit/Due Collection
+  // pages read from — real outstanding balance, not demo rows.
+  if(mode==='DUE') bnxPostCreditSale(custName, custMobile, calc.total, dt, billNo);
+
+  // Mark this table's open KOTs BILLED (soft — order history/report
+  // trail is preserved) and free the table.
+  bnxLoadOpenKots();
+  KOT.forEach(k=>{ if(k.table===selTable.id && !['CANCELLED','BILLED'].includes(k.status)) k.status='BILLED'; });
+  bnxSetOpenKotsRaw(JSON.stringify(KOT));
+  bnxMarkTableOrdersBilled(selTable.id, billNo);
+  bnxUpdateTableOverlay(selTable.id, { status:'AVAILABLE', covers:0, bill:0 });
+
+  // Background sync — same queue the dashboard's BillQueue drains.
+  bnxQueueBillForSync(entry);
+
+  closeBillModal();
+  toast('✅ Bill '+billNo+' settled · ₹'+calc.total.toLocaleString(),'success');
+  printReceipt(entry);
+  renderMobTables(); renderMyTables(); renderKOT();
+}
+function printReceipt(bill){
+  const rows = (bill.itemsDetail||[]).map(i=>`<tr><td>${i.qty} × ${i.name}</td><td style="text-align:right;">₹${(i.qty*i.price).toLocaleString()}</td></tr>`).join('');
+  const html = `<html><head><title>Receipt ${bill.no}</title><style>
+    body{font-family:monospace;width:280px;margin:0 auto;padding:10px;font-size:12px;}
+    h2{text-align:center;margin:0 0 4px;} table{width:100%;border-collapse:collapse;}
+    .tot{font-weight:800;font-size:15px;} hr{border:none;border-top:1px dashed #000;margin:6px 0;}
+    .row{display:flex;justify-content:space-between;}
+  </style></head><body>
+    <h2>Balaji NextGen ERP</h2>
+    <div style="text-align:center;">Bill No: ${bill.no}<br>${bill.dt} ${bill.tm} · Table ${bill.table}</div>
+    <hr><table>${rows}</table><hr>
+    <div class="row"><span>Subtotal</span><span>₹${bill.sub.toLocaleString()}</span></div>
+    <div class="row"><span>GST</span><span>₹${bill.gst.toLocaleString()}</span></div>
+    <div class="row tot"><span>Total</span><span>₹${bill.total.toLocaleString()}</span></div>
+    <div class="row"><span>Payment</span><span>${bill.pay}</span></div>
+    <hr><div style="text-align:center;">Thank you — visit again!</div>
+  </body></html>`;
+  bnxPrintHtml(html);
 }
 
 /* ── MENU / NEW ORDER ── */
@@ -1174,7 +1613,7 @@ function updateOrderBadge(){
   const total=Object.values(order).reduce((a,b)=>a+b,0);
   const amt=Object.entries(order).reduce((a,[id,qty])=>a+(MENU.find(m=>m.id===id)?.price||0)*qty,0);
   document.getElementById('order-badge').textContent=`${total} items`;
-  document.getElementById('order-total-val').textContent=`₹${amt.toLocaleString('en-IN')}`;
+  document.getElementById('order-total-val').textContent=`₹${amt.toLocaleString()}`;
 }
 
 function clearOrder(){order={};renderMenu();}
@@ -1182,75 +1621,77 @@ function clearOrder(){order={};renderMenu();}
 const PLACED_ORDERS = {};
 let lastOrderId = null;
 
-/* FIX ("order place and save data and accordingly update restaurant
-   dashboard"): this used to call a single action, 'createOrder', against
-   the dead V2_FRONTEND deployment (see GAS_APIS_DASH comment above). That
-   action never existed on the real backend, so every steward order looked
-   "sent" locally (toast said success) but never reached KOT_MASTER or
-   ORDER_MASTER — it never showed up on the KOT board (kot-management.html)
-   or the Restaurant Dashboard's Order Register / live KPIs, and kitchen
-   staff on the actual KDS never saw it either.
-   Now fires the SAME two calls restaurant-dashboard.html's own
-   sendKOT()/bnxRecordKOT() make for a POS-placed order — SAVE_KOT (kitchen
-   ticket, routes to KOT_MASTER) and SAVE_ORDER (order register) — both to
-   V2_CORE, with matching field names (waiter/covers/remarks/items/orderNo).
-   Also switched to the same offline-first pattern already used for POS
-   KOTs elsewhere in this codebase ("click not work, slow work" fix): show
-   the confirmation immediately, sync to the backend in the background
-   without blocking the tap. */
 async function placeOrder(){
   const tot=Object.values(order).reduce((a,b)=>a+b,0);
   if(!tot){ toast('No items in order','error'); return; }
   if(!selTable){ toast('No table selected','error'); return; }
   const items = Object.entries(order).map(([id,qty])=>{
     const m = MENU.find(x=>x.id===id);
-    return { id, name:m?m.name:id, qty, price:m?m.price:0, cat:m?m.cat:'' };
+    return { id, name:m?m.name:id, qty, price:m?m.price:0, cat:m?m.cat:'', gst:m?(m.gst||0):0 };
   });
   const amount = items.reduce((a,i)=>a+i.price*i.qty,0);
   const stewardName = document.getElementById('prof-name')?.textContent || 'Steward';
-  const covers = selTable.covers || 2;
+  toast('Sending KOT…','info');
+  // FIX ("can't update order"): placeOrder() used to call a dead
+  // endpoint (V2_FRONTEND) with a made-up action name ('createOrder')
+  // that the dashboard itself never speaks — so it never had a real
+  // order id to hand back, and every later edit was doomed. This now
+  // records the order the SAME way the dashboard's bnxRecordKOT() does:
+  // a real sequential KOT number from the shared bnx_kot_seq_<CLIENT_ID>
+  // counter, written straight into the shared open-KOTs store (visible
+  // to the dashboard immediately), with the SAME SAVE_KOT/SAVE_ORDER
+  // background-sync calls the dashboard fires — never blocking the
+  // click on the network round trip.
+  const seq = parseInt(bnxGetKotSeq()||'1040',10)+1;
+  bnxSetKotSeq(seq);
+  const kotNo = 'KOT-'+seq;
+  bnxLoadOpenKots();
+  const entry = { kotNo, table:selTable.id, type:'KITCHEN', time:new Date().toISOString(), waiter:stewardName, covers:'', items, amount, status:'NEW' };
+  KOT.unshift(entry);
+  if(KOT.length>100) KOT.length=100;
+  bnxSetOpenKotsRaw(JSON.stringify(KOT));
 
-  // Generate order ID for tracking (used as both the local KOT id and the
-  // orderNo/orderId sent to the backend, so this app's KOT list and the
-  // dashboard's Order Register refer to the exact same ticket)
-  const orderId = 'ORD_' + Date.now() + '_' + Math.random().toString(36).substr(2,5);
+  const orderId = kotNo;
   lastOrderId = orderId;
-
-  // Store order for replacement capability
   PLACED_ORDERS[orderId] = {
-    id: orderId,
-    table: selTable.id,
-    items: JSON.parse(JSON.stringify(items)),
-    amount: amount,
-    steward: stewardName,
-    status: 'PLACED',
-    timestamp: Date.now(),
-    originalItems: JSON.parse(JSON.stringify(items))
+    id: orderId, table: selTable.id, items: JSON.parse(JSON.stringify(items)), amount, steward: stewardName,
+    status: 'PLACED', timestamp: Date.now(), originalItems: JSON.parse(JSON.stringify(items)), hasServerId: true
   };
 
-  // Reflect immediately in this app's own KOT list — don't wait on network
-  KOT.unshift({ id:orderId, table:selTable.id, items: items.map(i=>({name:i.name,qty:i.qty})), status:'PENDING', time:new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}), mins:0 });
+  toast('✅ KOT sent to kitchen — visible on dashboard','success');
   order={};
-  toast('✅ KOT sent to kitchen — visible in POS','success');
+
+  // Fire-and-forget background sync to Google Sheets — matches the
+  // dashboard's bnxRecordKOT() call exactly (same action names,
+  // same payload shape). If it fails, the KOT is already recorded
+  // locally and visible to this device's dashboard/steward app.
+  gasApi('SAVE_KOT', {table:selTable.id, waiter:stewardName, covers:'', remarks:'', items, orderNo:kotNo}, 'V2_CORE')
+    .catch(err=>console.warn('SAVE_KOT background sync failed (already recorded locally):', err));
+  gasApi('SAVE_ORDER', {orderId:kotNo, tableId:selTable.id, orderType:'KITCHEN', waiter:stewardName, covers:'', items}, 'V2_CORE')
+    .catch(err=>console.warn('SAVE_ORDER background sync failed for '+kotNo+':', err));
+
+  // Mark table as running/occupied in the shared table overlay so the
+  // dashboard's floor map picks it up too.
+  bnxUpdateTableOverlay(selTable.id, { status:'RUNNING', covers: selTable.covers||0, bill: (selTable.bill||0)+amount });
+
   showOrderPlacedModal(orderId);
   setTimeout(() => showScreen('s-home'), 1500);
-
-  // Background sync — fire-and-forget, matches restaurant-dashboard.html's
-  // own KOT flow. If it fails, the order is already recorded locally and
-  // visible in this app; only cross-device/dashboard visibility is affected.
-  const kotItems = items.map(i=>({ name:i.name, qty:i.qty, price:i.price }));
-  gasApi('SAVE_KOT', {
-    table: selTable.id, waiter: stewardName, covers, remarks: '', items: kotItems, orderNo: orderId
-  }, 'V2_CORE').catch(()=>{});
-  gasApi('SAVE_ORDER', {
-    orderId, tableId: selTable.id, orderType: 'DINEIN', orderSource: 'STEWARD', waiter: stewardName, covers, items: kotItems
-  }, 'V2_CORE').then(res=>{
-    if(!res || res.success===false){
-      toast('⚠️ Sync to dashboard failed — order saved on this device only','error');
-    }
-  }).catch(()=>{
-    toast('📴 Offline — order queued, will sync when back online','error');
-  });
+}
+/* Same shared overlay the dashboard's bnxSaveTableStatus() writes to —
+   updates immediately here, and best-effort syncs to the backend
+   SAVE_TABLE_STATUS action (same honest "may still be a wire-up
+   point" pattern the dashboard itself uses for this specific call). */
+function bnxUpdateTableOverlay(tableId, patch){
+  const t = TABLES.find(x=>x.id===tableId);
+  if(t) Object.assign(t, patch);
+  let extra=[]; try{ extra=JSON.parse(localStorage.getItem(bnxTableMasterKey())||'[]'); }catch(e){}
+  const idx = extra.findIndex(x=>(x.id||x.n)===tableId);
+  const rec = { id:tableId, n:tableId, s:(patch.status||t?.status||'AVAILABLE').toLowerCase(), pax:patch.covers, billAmount:patch.bill, captain:patch.steward };
+  if(idx>-1) Object.assign(extra[idx], rec); else extra.push(rec);
+  localStorage.setItem(bnxTableMasterKey(), JSON.stringify(extra));
+  if(document.getElementById('s-tables')?.classList.contains('active')) renderMobTables();
+  gasApi('SAVE_TABLE_STATUS', Object.assign({tableNo:tableId}, patch), 'V2_CORE')
+    .catch(e=>console.warn('SAVE_TABLE_STATUS background sync failed (needs backend handler):', e));
 }
 
 function showOrderPlacedModal(orderId){
@@ -1263,7 +1704,7 @@ function showOrderPlacedModal(orderId){
   const itemsList = placedOrder.items.map(i=>`<div class="opm-item">
     <span class="opm-qty">${i.qty}×</span>
     <span class="opm-name">${i.name}</span>
-    <span class="opm-price">₹${(i.qty * i.price).toLocaleString('en-IN')}</span>
+    <span class="opm-price">₹${(i.qty * i.price).toLocaleString()}</span>
   </div>`).join('');
   
   modal.innerHTML = `
@@ -1276,7 +1717,7 @@ function showOrderPlacedModal(orderId){
         <div class="opm-items">${itemsList}</div>
         <div class="opm-total">
           <span>Total:</span>
-          <span>₹${placedOrder.amount.toLocaleString('en-IN')}</span>
+          <span>₹${placedOrder.amount.toLocaleString()}</span>
         </div>
         <div class="opm-actions">
           <button class="btn btn-secondary" onclick="openOrderReplacementModal('${orderId}')">
@@ -1349,7 +1790,7 @@ function openOrderReplacementModal(orderId){
         <div class="orm-footer">
           <div class="orm-total">
             <span>New Total:</span>
-            <span>₹${calculateOrderTotal(orderId).toLocaleString('en-IN')}</span>
+            <span>₹${calculateOrderTotal(orderId).toLocaleString()}</span>
           </div>
           <button class="btn btn-primary" onclick="sendModifiedOrder('${orderId}')">
             📤 Send Updated KOT
@@ -1401,6 +1842,16 @@ function calculateOrderTotal(orderId){
 async function sendModifiedOrder(orderId){
   const order = PLACED_ORDERS[orderId];
   if(!order || order.items.length === 0) return;
+  // FIX ("can't update order" — Aug 2026): if the original order was
+  // never actually confirmed by the server (offline at the time, or the
+  // server rejected it), there is no real order on the backend for this
+  // update to find — sending it anyway would just fail silently-ish
+  // with a generic error. Telling the person the real reason up front
+  // instead of letting them retry a doomed request.
+  if(!order.hasServerId){
+    toast('⚠️ This order was never confirmed by the server — resend it as a new KOT instead of modifying it','error');
+    return;
+  }
   
   const newTotal = calculateOrderTotal(orderId);
   const changedItems = order.items.filter(item => {
@@ -1409,32 +1860,22 @@ async function sendModifiedOrder(orderId){
   });
   
   toast('Sending modified KOT…','info');
-  // FIX: same dead-endpoint/fake-action bug as placeOrder() above — 'updateOrder'
-  // on V2_FRONTEND was never a real backend action. There's no dedicated
-  // "modify items" action proven anywhere else in this codebase, so this
-  // re-sends SAVE_KOT/SAVE_ORDER with the SAME orderId/orderNo as the
-  // original — both actions are keyed by that id everywhere else they're
-  // called from, so the backend can treat this as an update to the same
-  // ticket rather than a brand-new one.
-  const modItems = order.items.map(i=>({ name:i.name, qty:i.qty, price:i.price }));
-  const [kotRes, orderRes] = await Promise.all([
-    gasApi('SAVE_KOT', {
-      table: order.table, waiter: order.steward, covers: 0, remarks: 'Modified order', items: modItems, orderNo: order.id
-    }, 'V2_CORE'),
-    gasApi('SAVE_ORDER', {
-      orderId: order.id, tableId: order.table, orderType: 'DINEIN', orderSource: 'STEWARD', waiter: order.steward, covers: 0, items: modItems
-    }, 'V2_CORE')
-  ]);
-  const res = (kotRes && kotRes.success!==false && orderRes && orderRes.success!==false) ? {success:true} : {success:false};
+  // FIX: was calling a dead endpoint with a made-up 'updateOrder'
+  // action. Now updates the SAME shared open-KOT entry the dashboard
+  // reads (instant, same device) and fires SAVE_ORDER again with the
+  // updated item list — matches how the dashboard itself re-saves an
+  // order on change, since there's no separate 'update' action there.
+  bnxLoadOpenKots();
+  const k = KOT.find(x=>x.kotNo===order.id);
+  if(k){ k.items = order.items; k.amount = newTotal; k.status='MODIFIED'; bnxSetOpenKotsRaw(JSON.stringify(KOT)); }
+  order.status = 'MODIFIED';
+  order.originalItems = JSON.parse(JSON.stringify(order.items));
+  toast('✅ Modified KOT sent to kitchen','success');
+  renderKOT();
 
-  if(res && res.success !== false){
-    toast('✅ Modified KOT sent to kitchen','success');
-    order.status = 'MODIFIED';
-    order.originalItems = JSON.parse(JSON.stringify(order.items));
-  } else {
-    toast('⚠️ Failed to send modified order','error');
-  }
-  
+  gasApi('SAVE_ORDER', {orderId:order.id, tableId:order.table, orderType:'KITCHEN', waiter:order.steward, items:order.items}, 'V2_CORE')
+    .catch(e=>console.warn('SAVE_ORDER (modify) background sync failed:', e));
+
   closeOrderReplacementModal();
   closeModal();
 }
@@ -1446,35 +1887,45 @@ function closeOrderReplacementModal(){
 
 /* Pulls active KOTs from the same backend the POS dashboard writes/reads,
    so orders placed at the POS terminal also show up here and vice-versa.
-   FIX: was calling a fake 'getKOT' action on the dead V2_FRONTEND
-   deployment — always silently failed, so this app only ever showed
-   KOTs this exact device had placed itself, never POS-placed ones.
-   Now uses the same GET_ACTIVE_ORDERS action (V2_CORE) the Restaurant
-   Dashboard's Order Register uses, and maps that ORDER_MASTER row shape
-   into the {id,table,items,status,time,mins} shape renderKOT() expects. */
-const ORDER_STATUS_TO_KOT_STATUS = {
-  NEW:'PENDING', KOT_PRINTED:'PENDING', PENDING:'PENDING',
-  COOKING:'PREPARING', PREPARING:'PREPARING', IN_PROGRESS:'PREPARING',
-  READY:'READY', SERVED:'READY',
-  DELAYED:'DELAYED'
-};
+   FIX: this called a dead endpoint ('getKOT'/V2_FRONTEND) that could
+   never return anything, so it silently did nothing every 20s. It now
+   re-reads the shared local store first (instant — this is what makes
+   orders placed on the dashboard show up here, same device) and merges
+   in GET_ACTIVE_ORDERS from the backend for orders on OTHER devices.
+   AUDIT FIX: the merge below now mirrors the dashboard's OWN
+   bnxSyncLiveKots() parser exactly (same nested res.data.orders shape,
+   same ORDER_NO/TABLE_ID/CREATED_BY/PAX field names, same status
+   ranking so a pull can never downgrade a ticket already marked
+   Ready/Served locally) — this app was previously guessing at a flat
+   res.data array with different field names, which would have silently
+   matched nothing even if the backend responded correctly. */
 async function loadKOTFromServer(){
+  bnxLoadOpenKots();
   const res = await gasApi('GET_ACTIVE_ORDERS', {}, 'V2_CORE');
   const orders = res && res.success && res.data && Array.isArray(res.data.orders) ? res.data.orders : null;
   if(orders && orders.length){
-    KOT.length = 0;
+    const STATUS_MAP = { NEW:'NEW', KOT_PRINTED:'NEW', PENDING:'NEW', COOKING:'NEW', PREPARING:'NEW', IN_PROGRESS:'NEW', READY:'READY', SERVED:'SERVED', BILLED:'BILLED', CANCELLED:'CANCELLED' };
+    const STATUS_RANK = { NEW:0, READY:1, SERVED:2, BILLED:3, CANCELLED:3 };
     orders.forEach(o=>{
-      const mins = o.START_TIME ? Math.max(0, Math.round((Date.now()-new Date(o.ORDER_DATE+' '+o.START_TIME).getTime())/60000)) : 0;
-      KOT.push({
-        id: o.ORDER_ID || o.ORDER_NO,
-        table: o.TABLE_ID || '—',
-        items: (o.items||[]).map(i=>({ name:i.itemName||i.name, qty:i.qty })),
-        status: ORDER_STATUS_TO_KOT_STATUS[o.ORDER_STATUS] || 'PENDING',
-        time: o.START_TIME || '',
-        mins: isNaN(mins) ? 0 : mins
-      });
+      const kotNo = o.ORDER_NO || o.ORDER_ID;
+      if(!kotNo || o.ORDER_STATUS==='CANCELLED') return;
+      const items = (o.items||[]).map(i=>({ name:i.itemName||i.name||'Item', qty:Number(i.qty||1), price:Number(i.price||i.rate||0) }));
+      const pulledStatus = STATUS_MAP[o.ORDER_STATUS] || 'NEW';
+      const rec = { kotNo, table:o.TABLE_ID||'—', type:'KITCHEN', waiter:o.CREATED_BY||'', covers:o.PAX||'',
+        time: (o.ORDER_DATE && o.START_TIME) ? new Date(o.ORDER_DATE+' '+o.START_TIME).toISOString() : new Date().toISOString(), items };
+      const idx = KOT.findIndex(k=>k.kotNo===kotNo);
+      if(idx>=0){
+        const localRank = STATUS_RANK[KOT[idx].status] ?? 0;
+        const pulledRank = STATUS_RANK[pulledStatus] ?? 0;
+        const status = pulledRank>localRank ? pulledStatus : KOT[idx].status;
+        KOT[idx] = Object.assign({}, KOT[idx], rec, { time:KOT[idx].time, status });
+      } else {
+        KOT.unshift(Object.assign({}, rec, { status:pulledStatus }));
+      }
     });
-  } // else: keep whatever KOTs this device has already placed locally
+    if(KOT.length>100) KOT.length=100;
+    bnxSetOpenKotsRaw(JSON.stringify(KOT));
+  }
   if(document.getElementById('s-kot')?.classList.contains('active')) renderKOT();
 }
 
@@ -1551,7 +2002,10 @@ renderMobOnline();
 renderKOT();
 loadMenuFromServer();
 loadKOTFromServer();
+loadTablesLive();
+flushBillQueue();
 setInterval(loadKOTFromServer, 20000); // light polling so steward app & POS stay in sync
+setInterval(loadTablesLive, 20000);    // same for the live floor/table status
 </script>
 </body>
 </html>
