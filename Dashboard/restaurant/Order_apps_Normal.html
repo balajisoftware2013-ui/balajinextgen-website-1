@@ -347,6 +347,29 @@ html,body{height:100%;background:var(--bg);font-family:'DM Sans',sans-serif;colo
 ══════════════════════════════════════════════ */
 
 const GAS_URL = 'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec';
+// FIX — CRITICAL: this file had NO client-identity concept at all —
+// every SAVE_KOT it sends omits clientId entirely, so the backend
+// can't attribute the order to any client (and would reject it, or
+// worse, misattribute it, depending on the handler). Added the same
+// session-based resolution used throughout the rest of this suite —
+// no URL param, no hardcoded real-client fallback.
+const ORD_CLIENT_ID = (function(){
+  try{
+    var u=JSON.parse(sessionStorage.getItem('ERP_USER')||localStorage.getItem('ERP_USER')||'{}');
+    var fromSession = u.CLIENT_ID||u.clientId||u.client_id||'';
+    var fromFlatKey = localStorage.getItem('ERP_CLIENT')||'';
+    var id = fromSession || fromFlatKey || localStorage.getItem('bnx_client_id') || '';
+    if(id) localStorage.setItem('bnx_client_id', id);
+    return id;
+  }catch(e){ return ''; }
+})();
+function ordUuid(){
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c){
+    var r = Math.random()*16|0, v = c==='x' ? r : (r&0x3|0x8);
+    return v.toString(16);
+  });
+}
+function ordOutboxKey(){ return 'bnx_outbox_' + (ORD_CLIENT_ID || 'default'); } // same key convention as restaurant-dashboard.html/steward-mobile.html
 
 /* ── STATE ── */
 let state = {
@@ -559,6 +582,10 @@ function buildCartView() {
 async function submitOrder() {
   const keys = Object.keys(state.cart);
   if(!keys.length){ showToast('⚠️ Cart is empty'); return; }
+  // FIX: refuse to submit with no client resolved rather than
+  // silently sending a clientId-less request the backend can't
+  // attribute to anyone.
+  if(!ORD_CLIENT_ID){ showToast('⚠️ No client session found — please log in again'); return; }
   const btn = document.getElementById('submitBtn');
   btn.textContent = '⏳ Sending to Kitchen…'; btn.classList.add('disabled'); btn.onclick=null;
   const items = keys.map(n=>({name:n, qty:state.cart[n].qty, price:state.cart[n].price}));
@@ -566,8 +593,25 @@ async function submitOrder() {
   const tax = Math.round(sub*.05);
   const total = sub + tax*2;
   state.kotNo = 'KOT-' + Date.now().toString().slice(-4);
+  // FIX: requestId added for idempotency (matches the rest of the
+  // suite) — without it, a retry of this exact request (including the
+  // manual outbox retry added below) could create a duplicate KOT
+  // server-side once the backend's idempotency check covers this
+  // action. NOTE (flagging, not silently fixing): state.kotNo above
+  // is still generated from the last 4 digits of a millisecond
+  // timestamp — that space cycles every 10 seconds, so two orders
+  // from ANY device within the same 10-second window can collide.
+  // This is a real duplicate-KOT-number risk; the proper fix is
+  // server-side sequence generation (the confirmed backend already
+  // does this via bnxNextSequence_ for SAVE_KOT/SAVE_ORDER) — this
+  // client-generated number should be treated as a display-only
+  // placeholder, not trusted as final, once that's wired in.
+  const requestId = ordUuid();
   const orderPayload = {
     action: 'SAVE_KOT',
+    requestId,
+    clientId: ORD_CLIENT_ID,
+    sessionToken: (localStorage.getItem('ERP_SESSION')||''),
     orderNo: state.orderNo,
     kotNo: state.kotNo,
     table: state.table,
@@ -587,7 +631,23 @@ async function submitOrder() {
     const d = await r.json();
     synced = d && d.success;
   } catch(e) { synced = false; }
-  // Show success either way (offline mode graceful)
+  // FIX: on failure this used to just show a softer-worded success
+  // screen ("Will sync when online") with NO actual queuing anywhere
+  // — the order was gone the moment the tab closed or refreshed.
+  // Now it's persisted into the same bnx_outbox_<CLIENT_ID> key the
+  // rest of the suite uses, so it's at least recoverable/visible
+  // instead of silently lost. This file doesn't have its own retry
+  // loop (flagging, not building one here) — a proper fix is either
+  // adding flushOutbox() here too, or pointing this app at the
+  // already-fixed steward-mobile.html instead of maintaining two
+  // parallel order-taking apps.
+  if (!synced){
+    try{
+      const list = JSON.parse(localStorage.getItem(ordOutboxKey())||'[]');
+      list.push({ requestId, action:'SAVE_KOT', payload: orderPayload, attempts:0, queuedAt:new Date().toISOString() });
+      localStorage.setItem(ordOutboxKey(), JSON.stringify(list));
+    }catch(e){}
+  }
   showSuccessScreen(items, sub, tax*2, total, synced);
 }
 
