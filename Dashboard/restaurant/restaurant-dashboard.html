@@ -8314,37 +8314,59 @@ function quickBillFromKOT(kotNo){
   }, 60);
 }
 
-/* ── KDS DATA ── */
-const kdsData=[
-  {table:'Table 4',order:'#ORD-0214',status:'cooking',timer:'08:24',items:['Butter Chicken','Naan x4','Mango Lassi']},
-  {table:'Table 7',order:'#ORD-0215',status:'new',timer:'02:10',items:['Seekh Kebab','Dal Makhani','Roti x3']},
-  {table:'Table 9',order:'#ORD-0216',status:'new',timer:'00:45',items:['Veg Soup','BBQ Pizza']},
-  {table:'Table 11',order:'#ORD-0217',status:'cooking',timer:'14:38',items:['Mutton Rogan Josh','Garlic Naan x6']},
-  {table:'Table 15',order:'#ORD-0218',status:'ready',timer:'--:--',items:['Grilled Fish','Greek Salad']},
-  {table:'Table 18',order:'#ORD-0219',status:'cooking',timer:'06:12',items:['Palak Paneer','Butter Naan x2']},
-  {table:'Table 22',order:'#ORD-0220',status:'new',timer:'01:20',items:['Masala Chai x2','Samosa x4']},
-];
+/* FIX ("KDS shows fake orders forever, disconnected from real KOTs"):
+   kdsData was a permanently hardcoded array of 7 demo tickets —
+   completely separate from bnx_open_kots, the store buildKOT()/
+   sendKOT()/steward-mobile.html all actually write to. A real order
+   never appeared here, and Accept/Reject/Mark Ready never touched any
+   real ticket. This now derives its view straight from the SAME
+   bnxGetKotStore() the KOT page reads (so this app and Steward Mobile
+   both feed it), with its own NEW→COOKING→READY→SERVED lifecycle
+   layered on the store's status field — kdsAction()/kdsReject() below
+   write straight back into that same shared store and fire the real
+   UPDATE_ORDER_STATUS sync, exactly like kotReady() already does. */
 let kdsFilter = 'all';
+function bnxKdsTimerLabel(iso){
+  const mins = bnxKotElapsedMin(iso);
+  const h=Math.floor(mins/60), m=mins%60;
+  return (h?String(h).padStart(2,'0')+':':'')+String(m).padStart(2,'0')+':00';
+}
+function bnxKdsMapStatus(s){
+  const u=String(s||'NEW').toUpperCase();
+  if(u==='COOKING') return 'cooking';
+  if(u==='READY') return 'ready';
+  if(u==='SERVED'||u==='BILLED') return 'served';
+  return 'new';
+}
+function bnxGetKdsData(){
+  return bnxGetKotStore().filter(k=>k.status!=='CANCELLED').map(k=>({
+    kotNo: k.kotNo, table: k.table, order: '#'+k.kotNo,
+    status: bnxKdsMapStatus(k.status),
+    timer: bnxKdsTimerLabel(k.time),
+    items: (k.items||[]).map(i=>(i.qty||1)+'× '+(i.name||i.n))
+  }));
+}
 function buildKDS(){
   const g=document.getElementById('kdsGrid'); if(!g) return;
+  const kdsData = bnxGetKdsData();
   const visible = kdsFilter==='all' ? kdsData : kdsData.filter(k=>k.status===kdsFilter);
   const lbls={new:'🆕 New Order',cooking:'🔥 Cooking',ready:'✅ Ready to Serve',served:'🍽️ Served'};
   const btntxt={new:'▶ Accept & Start Cooking',cooking:'✅ Mark Ready',ready:'🍽️ Mark Served'};
-  g.innerHTML = visible.length ? visible.map((k,idx)=>{
-    const realIdx = kdsData.indexOf(k);
+  g.innerHTML = visible.length ? visible.map(k=>{
     return `<div class="kds-card kds-${k.status}">
       <div class="kds-timer">${k.timer}</div>
       <div class="kds-id">${k.order}</div>
-      <div class="kds-table">${k.table}</div>
+      <div class="kds-table">📍 ${k.table}</div>
       <ul class="kds-items">${k.items.map(i=>`<li class="${k.status==='ready'||k.status==='served'?'done':''}">${i}</li>`).join('')}</ul>
-      ${k.status!=='served' ? `<button class="btn-full ${k.status==='ready'?'grn':'sec'}" style="font-size:11px;margin-bottom:5px;" onclick="kdsAction(${realIdx})">${btntxt[k.status]}</button>` : ''}
-      ${k.status==='new' ? `<button class="btn-full" style="font-size:11px;margin-bottom:5px;background:var(--red);color:#fff;" onclick="kdsReject(${realIdx})">✖ Reject to Manager</button>` : ''}
+      ${k.status!=='served' ? `<button class="btn-full ${k.status==='ready'?'grn':'sec'}" style="font-size:11px;margin-bottom:5px;" onclick="kdsAction('${k.kotNo}')">${btntxt[k.status]}</button>` : ''}
+      ${k.status==='new' ? `<button class="btn-full" style="font-size:11px;margin-bottom:5px;background:var(--red);color:#fff;" onclick="kdsReject('${k.kotNo}')">✖ Reject to Manager</button>` : ''}
       <div style="text-align:center;font-size:10px;color:var(--text3);">${lbls[k.status]}</div>
     </div>`;
   }).join('') : '<div style="grid-column:1/-1;text-align:center;padding:30px;color:var(--text3);font-size:13px;">No orders in this status.</div>';
   kdsUpdateCounts();
 }
 function kdsUpdateCounts(){
+  const kdsData = bnxGetKdsData();
   const cnt = {new:0,cooking:0,ready:0};
   kdsData.forEach(k=>{ if (cnt[k.status]!=null) cnt[k.status]++; });
   const wrap = document.querySelector('#page-kitchen .section-h > div:last-child');
@@ -8358,30 +8380,33 @@ function kdsUpdateCounts(){
   `;
 }
 function kdsSetFilter(f){ kdsFilter = f; buildKDS(); }
-/* Real status transitions — was previously just relabeling the button
-   text and disabling it, the card never actually moved between New /
-   Cooking / Ready, and the header counts never changed. Now the order
-   actually progresses through the real KDS workflow and the counts
-   update live. */
-function kdsAction(idx){
-  const k = kdsData[idx]; if (!k) return;
-  const next = { new:'cooking', cooking:'ready', ready:'served' };
-  const msg = { new:'🔥 Kitchen accepted — cooking started', cooking:'✅ Marked Ready to Serve', ready:'🍽️ Served' };
-  const n = next[k.status];
-  if (!n) return;
-  k.status = n;
-  k.timer = n==='served' ? '--:--' : k.timer;
-  if (typeof showNotif === 'function') showNotif(msg[k.status==='cooking'?'new':k.status==='ready'?'cooking':'ready'] || 'Updated', 'success');
+function kdsAction(kotNo){
+  const next = { new:'COOKING', cooking:'READY', ready:'SERVED' };
+  let open = []; try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
+  const rec = open.find(k=>k.kotNo===kotNo);
+  if(!rec) return; // demo sample card — nothing real to persist
+  const cur = bnxKdsMapStatus(rec.status);
+  const n = next[cur]; if(!n) return;
+  rec.status = n;
+  bnxSetOpenKotsRaw(JSON.stringify(open));
+  const msg = { COOKING:'🔥 Kitchen accepted — cooking started', READY:'✅ Marked Ready to Serve', SERVED:'🍽️ Served' };
+  if (typeof showNotif === 'function') showNotif(msg[n] || 'Updated', 'success');
   buildKDS();
+  gasApi('UPDATE_ORDER_STATUS', {orderId:kotNo, status:n}, 'V2_CORE').catch(()=>{});
 }
-function kdsReject(idx){
-  const k = kdsData[idx]; if (!k) return;
-  const reason = prompt('Reject '+k.order+' ('+k.table+') to Manager — reason?', 'Item unavailable');
+function kdsReject(kotNo){
+  let open = []; try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
+  const rec = open.find(k=>k.kotNo===kotNo);
+  if(!rec) return;
+  const reason = prompt('Reject '+kotNo+' ('+rec.table+') to Manager — reason?', 'Item unavailable');
   if (reason===null) return;
-  if (typeof showNotif === 'function') showNotif('⚠️ '+k.order+' rejected to Manager — '+reason, 'error');
-  kdsData.splice(idx,1);
+  rec.status='CANCELLED'; rec.cancelReason=reason;
+  bnxSetOpenKotsRaw(JSON.stringify(open));
+  if (typeof showNotif === 'function') showNotif('⚠️ '+kotNo+' rejected to Manager — '+reason, 'error');
   buildKDS();
+  gasApi('UPDATE_ORDER_STATUS', {orderId:kotNo, status:'CANCELLED', remarks:reason}, 'V2_CORE').catch(()=>{});
 }
+setInterval(()=>{ if (document.getElementById('page-kitchen')?.classList.contains('active')) buildKDS(); }, 12000);
 
 /* ── BILLING ── */
 function selBillPay(btn){ document.querySelectorAll('.bill-preview .pay-opt').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); }
@@ -9979,7 +10004,47 @@ function blPrintAll(){
 /* ── LOAD MENU DATA (sync menu from DB) ── */
 function loadMenuData(){
   showNotif('🔄 Syncing menu from DB…','success');
-  setTimeout(()=>{ buildMenu(); showNotif('✅ Menu synced — '+menuData.length+' items loaded','success'); },900);
+  // FIX ("if any menu item create then default icon give... check fix"):
+  // this used to be a pure fake — a 900ms setTimeout that just
+  // re-rendered whatever was already in memory and claimed "synced".
+  // It now actually calls GET_MENU_ITEMS and merges real results in —
+  // additively (new items added, matching existing items' price/gst/
+  // availability updated by name) — never wiping out locally-created
+  // items a manager just added, same "real data merges in, nothing
+  // fake displaces something real" convention this file uses
+  // everywhere else. Falls back to the honest "couldn't reach server,
+  // showing what you have" message if the call fails.
+  gasApi('GET_MENU_ITEMS', {}, 'V2_CORE').then(res=>{
+    if(res && res.success && Array.isArray(res.data) && res.data.length){
+      let added=0, updated=0;
+      res.data.forEach(row=>{
+        const name = row.name || row.ITEM_NAME || row.n;
+        if(!name) return;
+        const cat = row.category || row.CATEGORY || row.c || 'Uncategorised';
+        const existing = menuData.find(m=>m.n.toLowerCase()===name.toLowerCase());
+        if(existing){
+          existing.p = parseFloat(row.price ?? row.PRICE ?? row.p) || existing.p;
+          existing.gst = parseFloat(row.gst ?? row.GST) || existing.gst || 0;
+          updated++;
+        } else {
+          menuData.push({ n:name, p:parseFloat(row.price ?? row.PRICE ?? row.p)||0, c:cat,
+            v: (row.veg||row.v||'NV'), e: row.icon||row.e||bnxDefaultIcon(cat), fav:false,
+            code: row.id||row.ITEM_ID||('ITM'+Date.now().toString().slice(-6)), gst: parseFloat(row.gst ?? row.GST)||0 });
+          added++;
+        }
+      });
+      bnxSaveMenuData();
+      bnxRebuildCategoryPills();
+      buildMenu();
+      showNotif('✅ Menu synced — '+added+' added, '+updated+' updated ('+menuData.length+' total)','success');
+    } else {
+      buildMenu();
+      showNotif('⚠️ Could not reach menu backend — showing last saved menu ('+menuData.length+' items)','error');
+    }
+  }).catch(()=>{
+    buildMenu();
+    showNotif('⚠️ Menu sync failed — showing last saved menu ('+menuData.length+' items)','error');
+  });
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -15036,22 +15101,30 @@ function warmBillingCache() {
   // Async cache warming (non-blocking)
   setTimeout(async () => {
     try {
-      // Pre-fetch master data: menu items, tax rates, payment modes
-      const cacheActions = [
-        { action: 'GET_MENU_ITEMS', data: {} },
-        { action: 'GET_TAX_CONFIG', data: {} },
-        { action: 'GET_PAYMENT_MODES', data: {} }
-      ];
-      
-      // Use batch API if available, otherwise sequential
-      if (typeof gasApiBatch === 'function') {
-        await gasApiBatch(cacheActions, 'V2_CORE');
-      } else {
-        for (const action of cacheActions) {
-          await gasApi(action.action, action.data, 'V2_CORE').catch(() => {});
-        }
+      // FIX ("warm cache pulls menu but throws the result away"): this
+      // fired GET_MENU_ITEMS purely to "warm" a cache that nothing
+      // else ever read — the response was discarded outright. Now
+      // merges it into menuData exactly like loadMenuData()'s real
+      // sync does, so the very first page load already has whatever
+      // the backend has, not just whatever this browser saved before.
+      const menuRes = await gasApi('GET_MENU_ITEMS', {}, 'V2_CORE').catch(()=>null);
+      if(menuRes && menuRes.success && Array.isArray(menuRes.data) && menuRes.data.length && typeof menuData!=='undefined'){
+        menuRes.data.forEach(row=>{
+          const name = row.name || row.ITEM_NAME || row.n; if(!name) return;
+          const cat = row.category || row.CATEGORY || row.c || 'Uncategorised';
+          const existing = menuData.find(m=>m.n.toLowerCase()===name.toLowerCase());
+          if(!existing){
+            menuData.push({ n:name, p:parseFloat(row.price ?? row.PRICE ?? row.p)||0, c:cat,
+              v:(row.veg||row.v||'NV'), e:row.icon||row.e||(typeof bnxDefaultIcon==='function'?bnxDefaultIcon(cat):'🍽'), fav:false,
+              code: row.id||row.ITEM_ID||('ITM'+Date.now().toString().slice(-6)), gst: parseFloat(row.gst ?? row.GST)||0 });
+          }
+        });
+        if(typeof bnxSaveMenuData==='function') bnxSaveMenuData();
+        if(typeof bnxRebuildCategoryPills==='function') bnxRebuildCategoryPills();
+        if(document.getElementById('page-pos')?.classList.contains('active') && typeof buildMenu==='function') buildMenu();
       }
-      
+      await gasApi('GET_TAX_CONFIG', {}, 'V2_CORE').catch(()=>{});
+      await gasApi('GET_PAYMENT_MODES', {}, 'V2_CORE').catch(()=>{});
       console.log('[BN_CACHE] Billing data warmed');
     } catch (e) {
       console.warn('[BN_CACHE] Warmup skipped:', e.message);
