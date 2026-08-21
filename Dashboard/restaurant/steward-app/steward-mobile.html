@@ -58,7 +58,15 @@ html,body{height:100%;width:100%;background:var(--bg);font-family:'DM Sans',sans
 .tb-title{font-size:16px;font-weight:800;color:#fff;flex:1;}
 .tb-sub{font-size:10px;color:rgba(255,255,255,.7);}
 .tb-badge{background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.3);color:#fff;font-size:11px;font-weight:800;padding:3px 10px;border-radius:12px;}
-.scroll{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:14px;padding-bottom:calc(80px + var(--safe-bot));}
+/* FIX: the fixed-position LIVE/pending-sync/failed-sync badge stack
+   (bnxEnsureStatusBadges) sits at bottom:calc(72px + safe-bot) and can
+   now be up to 3 rows tall — the old 80px bottom padding here only
+   cleared the bottom-nav bar, not the badge stack above it, so the
+   last card(s) in any scroll list could end up scrolling underneath
+   the badges (e.g. "Table T07" getting covered by "SYNCING / 5
+   pending sync"). 170px clears bottom-nav + a full 3-badge stack with
+   margin to spare. */
+.scroll{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:14px;padding-bottom:calc(170px + var(--safe-bot));}
 .scroll::-webkit-scrollbar{width:2px;}.scroll::-webkit-scrollbar-thumb{background:var(--surface3);}
 
 /* ── BOTTOM NAV ── */
@@ -651,28 +659,39 @@ const GAS_APIS_DASH = {
    config tab doesn't exist yet or the call fails — never blocks
    startup on this. */
 async function bnxRefreshConfig(){
+  // FIX (audit #6, P1 — "bnxRefreshConfig fails silently"): same fix
+  // as restaurant-dashboard.html — still falls back to the hardcoded
+  // bootstrap IDs either way (never blocks startup), but now every
+  // outcome is logged instead of vanishing with zero trace.
   try{
     const r = await fetch(GAS_APIS_DASH.V2_CORE, {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({action:'GET_CONFIG'})});
     const res = await r.json();
     if(res && res.success && res.data){
       if(res.data.v2CoreId) localStorage.setItem('bnx_api_core', res.data.v2CoreId);
       if(res.data.v2AuthId) localStorage.setItem('bnx_api_auth', res.data.v2AuthId);
+      console.log('[CONFIG] GET_CONFIG loaded OK — using', res.data.v2CoreId ? 'server-supplied' : 'hardcoded fallback', 'deployment IDs');
+    } else {
+      console.error('[CONFIG] GET_CONFIG returned no usable data — still on hardcoded fallback deployment IDs. Response:', res);
     }
-  }catch(e){ /* silent — hardcoded fallback above still works */ }
+  }catch(e){ console.error('[CONFIG] GET_CONFIG request failed — still on hardcoded fallback deployment IDs:', e.message); }
 }
 bnxRefreshConfig();
-/* FIX: same multi-fallback CLIENT_ID resolution the dashboard uses
-   (session ERP_USER → flat ERP_CLIENT key → ?client= URL param →
-   cached bnx_client_id) instead of a hardcoded 'CLI001' fallback that
-   could quietly point a real client's steward app at the wrong
-   client's data. */
+/* FIX (audit #1, P0 — "CLIENT_ID can still be changed from URL"):
+   ?client= removed as a source entirely. Someone opening
+   steward-mobile.html?client=OTHER_CLIENT can no longer make that
+   param feed CLIENT_ID at all — only the authenticated session
+   (ERP_USER, set at login from the server's LOGIN response) or this
+   device's own previously-cached bnx_client_id can. Real, full
+   closure of this still requires the SERVER to derive/verify
+   CLIENT_ID from sessionToken on every request rather than trusting
+   whatever clientId the client sends (see gasApi below) — that part
+   needs a backend change this pass can't make. */
 function getClientId(){
   try{
     var u=JSON.parse(sessionStorage.getItem('ERP_USER')||localStorage.getItem('ERP_USER')||'{}');
     var fromSession = u.CLIENT_ID||u.clientId||u.client_id||'';
     var fromFlatKey = localStorage.getItem('ERP_CLIENT')||'';
-    var fromUrl = new URLSearchParams(window.location.search).get('client')||'';
-    var id = fromSession || fromFlatKey || fromUrl || localStorage.getItem('bnx_client_id') || '';
+    var id = fromSession || fromFlatKey || localStorage.getItem('bnx_client_id') || '';
     if(id) localStorage.setItem('bnx_client_id', id);
     return id;
   }catch(e){ return localStorage.getItem('bnx_client_id')||''; }
@@ -2099,10 +2118,16 @@ async function sendModifiedOrder(orderId){
   order.originalItems = JSON.parse(JSON.stringify(order.items));
   renderKOT();
 
+  // FIX (audit #5): requestId was generated but never put INSIDE the
+  // payload sent to SAVE_ORDER, so idempotency protection did nothing
+  // for a modified KOT — a network retry of this exact call could
+  // create a duplicate server-side update. Now included in the
+  // payload for both the live call and the queued retry payload.
   const requestId = bnxUuid();
-  const res = await gasApi('SAVE_ORDER', {orderId:order.id, tableId:order.table, orderType:'KITCHEN', waiter:order.steward, items:order.items}, 'V2_CORE');
+  const editPayload = {requestId, orderId:order.id, tableId:order.table, orderType:'KITCHEN', waiter:order.steward, items:order.items};
+  const res = await gasApi('SAVE_ORDER', editPayload, 'V2_CORE');
   if(!res || !res.success){
-    bnxQueuePending('SAVE_ORDER', {orderId:order.id, tableId:order.table, orderType:'KITCHEN', waiter:order.steward, items:order.items}, requestId, 'kot-edit:'+order.id);
+    bnxQueuePending('SAVE_ORDER', editPayload, requestId, 'kot-edit:'+order.id);
     toast('📴 Could not confirm the change with the server — queued, will retry automatically. Kitchen still sees the update on this device.','error');
     bnxSetLiveStatus('offline');
   } else {
@@ -2209,7 +2234,30 @@ function toast(msg,type='info'){
   el.style.background=type==='success'?'#16a34a':type==='error'?'#dc2626':'#1a1816';
   clearTimeout(el._t);el._t=setTimeout(()=>{el.style.display='none';},2500);
 }
-function doLogout(){if(confirm('Logout?')){showScreen('s-login');}}
+function doLogout(){
+  if(!confirm('Logout?')) return;
+  // FIX (audit P2 — "On logout: destroy session, clear user session,
+  // prevent previous client's data appearing after next login"): this
+  // used to only switch screens — ERP_USER/ERP_SESSION/ERP_ROLE/
+  // ERP_CLIENT/bnx_client_id all stayed in localStorage forever, so a
+  // page refresh (or a different steward picking up the same shared
+  // tablet) silently stayed authenticated as whoever logged in last.
+  // Clears session/identity only — deliberately does NOT touch
+  // bnx_outbox_<CLIENT_ID> or any other CLIENT_ID-scoped operational
+  // cache (menu/tables/open KOTs), per spec: "Do NOT delete unsynced
+  // transactions." Those stay associated with the correct client and
+  // resync normally on next login.
+  try{
+    localStorage.removeItem('ERP_USER');
+    localStorage.removeItem('ERP_SESSION');
+    localStorage.removeItem('ERP_ROLE');
+    localStorage.removeItem('ERP_CLIENT');
+    localStorage.removeItem('ERP_EXPIRY');
+    localStorage.removeItem('bnx_client_id');
+    sessionStorage.removeItem('ERP_USER');
+  }catch(e){}
+  showScreen('s-login');
+}
 
 /* ── PWA: register service worker + install button (Android + iPhone) ──
    Android/Chrome fire 'beforeinstallprompt' and support a native install dialog.

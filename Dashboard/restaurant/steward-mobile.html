@@ -14,6 +14,7 @@
 <link rel="icon" type="image/png" sizes="512x512" href="icons/icon-512.png">
 
 <!-- iOS / Safari home-screen support -->
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Steward">
@@ -57,7 +58,15 @@ html,body{height:100%;width:100%;background:var(--bg);font-family:'DM Sans',sans
 .tb-title{font-size:16px;font-weight:800;color:#fff;flex:1;}
 .tb-sub{font-size:10px;color:rgba(255,255,255,.7);}
 .tb-badge{background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.3);color:#fff;font-size:11px;font-weight:800;padding:3px 10px;border-radius:12px;}
-.scroll{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:14px;padding-bottom:calc(80px + var(--safe-bot));}
+/* FIX: the fixed-position LIVE/pending-sync/failed-sync badge stack
+   (bnxEnsureStatusBadges) sits at bottom:calc(72px + safe-bot) and can
+   now be up to 3 rows tall — the old 80px bottom padding here only
+   cleared the bottom-nav bar, not the badge stack above it, so the
+   last card(s) in any scroll list could end up scrolling underneath
+   the badges (e.g. "Table T07" getting covered by "SYNCING / 5
+   pending sync"). 170px clears bottom-nav + a full 3-badge stack with
+   margin to spare. */
+.scroll{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:14px;padding-bottom:calc(170px + var(--safe-bot));}
 .scroll::-webkit-scrollbar{width:2px;}.scroll::-webkit-scrollbar-thumb{background:var(--surface3);}
 
 /* ── BOTTOM NAV ── */
@@ -650,28 +659,39 @@ const GAS_APIS_DASH = {
    config tab doesn't exist yet or the call fails — never blocks
    startup on this. */
 async function bnxRefreshConfig(){
+  // FIX (audit #6, P1 — "bnxRefreshConfig fails silently"): same fix
+  // as restaurant-dashboard.html — still falls back to the hardcoded
+  // bootstrap IDs either way (never blocks startup), but now every
+  // outcome is logged instead of vanishing with zero trace.
   try{
     const r = await fetch(GAS_APIS_DASH.V2_CORE, {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({action:'GET_CONFIG'})});
     const res = await r.json();
     if(res && res.success && res.data){
       if(res.data.v2CoreId) localStorage.setItem('bnx_api_core', res.data.v2CoreId);
       if(res.data.v2AuthId) localStorage.setItem('bnx_api_auth', res.data.v2AuthId);
+      console.log('[CONFIG] GET_CONFIG loaded OK — using', res.data.v2CoreId ? 'server-supplied' : 'hardcoded fallback', 'deployment IDs');
+    } else {
+      console.error('[CONFIG] GET_CONFIG returned no usable data — still on hardcoded fallback deployment IDs. Response:', res);
     }
-  }catch(e){ /* silent — hardcoded fallback above still works */ }
+  }catch(e){ console.error('[CONFIG] GET_CONFIG request failed — still on hardcoded fallback deployment IDs:', e.message); }
 }
 bnxRefreshConfig();
-/* FIX: same multi-fallback CLIENT_ID resolution the dashboard uses
-   (session ERP_USER → flat ERP_CLIENT key → ?client= URL param →
-   cached bnx_client_id) instead of a hardcoded 'CLI001' fallback that
-   could quietly point a real client's steward app at the wrong
-   client's data. */
+/* FIX (audit #1, P0 — "CLIENT_ID can still be changed from URL"):
+   ?client= removed as a source entirely. Someone opening
+   steward-mobile.html?client=OTHER_CLIENT can no longer make that
+   param feed CLIENT_ID at all — only the authenticated session
+   (ERP_USER, set at login from the server's LOGIN response) or this
+   device's own previously-cached bnx_client_id can. Real, full
+   closure of this still requires the SERVER to derive/verify
+   CLIENT_ID from sessionToken on every request rather than trusting
+   whatever clientId the client sends (see gasApi below) — that part
+   needs a backend change this pass can't make. */
 function getClientId(){
   try{
     var u=JSON.parse(sessionStorage.getItem('ERP_USER')||localStorage.getItem('ERP_USER')||'{}');
     var fromSession = u.CLIENT_ID||u.clientId||u.client_id||'';
     var fromFlatKey = localStorage.getItem('ERP_CLIENT')||'';
-    var fromUrl = new URLSearchParams(window.location.search).get('client')||'';
-    var id = fromSession || fromFlatKey || fromUrl || localStorage.getItem('bnx_client_id') || '';
+    var id = fromSession || fromFlatKey || localStorage.getItem('bnx_client_id') || '';
     if(id) localStorage.setItem('bnx_client_id', id);
     return id;
   }catch(e){ return localStorage.getItem('bnx_client_id')||''; }
@@ -831,6 +851,7 @@ function bnxEnsureStatusBadges(){
   wrap.innerHTML = `
     <div id="bnx-live-badge" style="background:rgba(0,0,0,.55);color:#fff;font-size:10px;font-weight:800;padding:3px 9px;border-radius:20px;backdrop-filter:blur(4px);"></div>
     <div id="bnx-pending-badge" style="display:none;background:var(--gold);color:#fff;font-size:9.5px;font-weight:700;padding:3px 9px;border-radius:20px;"></div>
+    <div id="bnx-failed-badge" style="display:none;background:var(--red,#c0392b);color:#fff;font-size:9.5px;font-weight:700;padding:3px 9px;border-radius:20px;pointer-events:auto;cursor:pointer;"></div>
   `;
   document.body.appendChild(wrap);
 }
@@ -842,6 +863,28 @@ function bnxQueuePending(action, payload, requestId, onSuccess){
   const list = bnxGetOutbox();
   list.push({ requestId, action, payload, attempts:0, queuedAt:new Date().toISOString(), onSuccessTag: onSuccess||null });
   bnxSetOutbox(list);
+}
+/* FIX ("problem error ... gave up after 10 attempts", Aug 2026): an
+   entry that failed 10x used to just be console.error'd and dropped
+   from the outbox — the underlying order/bill/table-status write was
+   gone with NO trace in the UI. A steward had no way to know a KOT or
+   a bill never actually reached the kitchen/server. Failed entries
+   now move into a separate, visible "failed" store instead of being
+   discarded, with a badge + a manual "Retry now" so a real failure
+   (backend down for a long stretch, bad deployment ID, etc.) surfaces
+   to the person who can actually act on it, rather than vanishing. */
+function bnxOutboxFailedKey(){ return 'bnx_outbox_failed_' + (CLIENT_ID || 'default'); }
+function bnxGetFailedOutbox(){ try{ return JSON.parse(localStorage.getItem(bnxOutboxFailedKey())||'[]'); }catch(e){ return []; } }
+function bnxSetFailedOutbox(list){ localStorage.setItem(bnxOutboxFailedKey(), JSON.stringify(list)); bnxUpdateSyncBadge(); }
+function bnxRetryFailedOutbox(){
+  const failed = bnxGetFailedOutbox();
+  if(!failed.length) return;
+  const live = bnxGetOutbox();
+  failed.forEach(e=>{ e.attempts=0; e.lastAttemptAt=0; live.push(e); });
+  bnxSetFailedOutbox([]);
+  bnxSetOutbox(live);
+  toast('Retrying '+failed.length+' failed sync item(s)…','info');
+  flushOutbox();
 }
 let bnxLiveStatus = 'checking'; // 'live' | 'syncing' | 'offline'
 function bnxSetLiveStatus(s){
@@ -856,10 +899,18 @@ function bnxSetLiveStatus(s){
 function bnxUpdateSyncBadge(){
   const n = bnxGetOutbox().length;
   const el = document.getElementById('bnx-pending-badge');
-  if(!el) return;
-  el.textContent = n ? n+' pending sync' : '';
-  el.style.display = n ? '' : 'none';
-  if(n) bnxSetLiveStatus('syncing');
+  if(el){
+    el.textContent = n ? n+' pending sync' : '';
+    el.style.display = n ? '' : 'none';
+    if(n) bnxSetLiveStatus('syncing');
+  }
+  const nf = bnxGetFailedOutbox().length;
+  const fel = document.getElementById('bnx-failed-badge');
+  if(fel){
+    fel.textContent = nf ? '⚠️ '+nf+' sync issue'+(nf>1?'s':'')+' — tap to retry' : '';
+    fel.style.display = nf ? '' : 'none';
+    fel.onclick = bnxRetryFailedOutbox;
+  }
 }
 async function flushOutbox(){
   const list = bnxGetOutbox();
@@ -882,21 +933,32 @@ async function flushOutbox(){
     if(res && res.success){
       // Successfully synced late — apply any follow-up UI update tagged on this entry
       if(entry.onSuccessTag==='kot') bnxLoadOpenKots();
+      if(typeof entry.onSuccessTag==='string' && entry.onSuccessTag.startsWith('kot-edit:')){
+        const kotNo = entry.onSuccessTag.slice('kot-edit:'.length);
+        bnxLoadOpenKots();
+        const k = KOT.find(x=>x.kotNo===kotNo);
+        if(k){ k.pendingLocalEdit = false; bnxSetOpenKotsRaw(JSON.stringify(KOT)); }
+      }
     } else if(entry.attempts < 10){
       remaining.push(entry);
       anyFailed = true;
     } else {
-      console.error('[OUTBOX] gave up after 10 attempts:', entry);
+      console.error('[OUTBOX] gave up after 10 attempts, moved to failed store:', entry);
+      const failed = bnxGetFailedOutbox();
+      failed.push(entry);
+      bnxSetFailedOutbox(failed);
+      toast('⚠️ A '+(entry.action==='SAVE_BILL'?'bill':entry.action==='SAVE_ORDER'?'order':'update')+' failed to sync after many tries — see "Sync issues" below','error');
     }
   }
   bnxSetOutbox(remaining);
-  if(!remaining.length) bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
+  if(!remaining.length && !bnxGetFailedOutbox().length) bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
   else if(anyFailed) bnxSetLiveStatus('syncing');
 }
 setInterval(flushOutbox, 15000);
 window.addEventListener('online', ()=>{ bnxSetLiveStatus('live'); flushOutbox(); });
 window.addEventListener('offline', ()=> bnxSetLiveStatus('offline'));
 bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
+bnxUpdateSyncBadge(); // reflect any items already stuck in "failed" from a previous session
 
 /* Pulls the SAME menu the POS dashboard uses (getMenuItems action, V2_FRONTEND) —
    so a category/item created in Settings → Menu Creation shows up here too. */
@@ -1380,6 +1442,7 @@ function renderKOT(){
       </div>`).join('')}
       <div style="display:flex;gap:6px;margin-top:8px;">
         <button style="flex:1;background:var(--blue-bg);border:1px solid rgba(74,144,226,.3);color:var(--blue);border-radius:8px;padding:6px 10px;font-size:11px;font-weight:700;cursor:pointer;" onclick="printKOTTicket('${k.kotNo}')">🖨 Print</button>
+        <button style="flex:1;background:var(--gold-bg);border:1px solid rgba(212,160,23,.3);color:var(--gold);border-radius:8px;padding:6px 10px;font-size:11px;font-weight:700;cursor:pointer;" onclick="editKotOrder('${k.kotNo}')">✏️ Edit</button>
         ${k.status!=='READY'?`<button style="flex:1;background:var(--green-bg);border:1px solid rgba(46,184,92,.3);color:var(--green);border-radius:8px;padding:6px 10px;font-size:11px;font-weight:700;cursor:pointer;" onclick="updateKotStatus('${k.kotNo}','READY')">Ready ✓</button>`
           :`<button style="flex:1;background:var(--green-bg);border:1px solid rgba(46,184,92,.3);color:var(--green);border-radius:8px;padding:6px 10px;font-size:11px;font-weight:700;cursor:pointer;" onclick="updateKotStatus('${k.kotNo}','SERVED')">Served ✓</button>`}
         <button style="flex:1;background:var(--red-bg);border:1px solid rgba(224,80,80,.3);color:var(--red);border-radius:8px;padding:6px 10px;font-size:11px;font-weight:700;cursor:pointer;" onclick="cancelKot('${k.kotNo}')">Cancel ✕</button>
@@ -2032,30 +2095,80 @@ async function sendModifiedOrder(orderId){
   }
   
   const newTotal = calculateOrderTotal(orderId);
-  const changedItems = order.items.filter(item => {
-    const orig = order.originalItems.find(i => i.id === item.id);
-    return !orig || orig.qty !== item.qty;
-  });
   
   toast('Sending modified KOT…','info');
-  // FIX: was calling a dead endpoint with a made-up 'updateOrder'
-  // action. Now updates the SAME shared open-KOT entry the dashboard
-  // reads (instant, same device) and fires SAVE_ORDER again with the
-  // updated item list — matches how the dashboard itself re-saves an
-  // order on change, since there's no separate 'update' action there.
+  // Updates the SAME shared open-KOT entry the dashboard reads (instant,
+  // same device/tab) and fires SAVE_ORDER again with the updated item
+  // list — matches how the dashboard itself re-saves an order on change,
+  // since there's no separate 'update' action there.
   bnxLoadOpenKots();
   const k = KOT.find(x=>x.kotNo===order.id);
-  if(k){ k.items = order.items; k.amount = newTotal; k.status='MODIFIED'; bnxSetOpenKotsRaw(JSON.stringify(KOT)); }
+  // FIX ("changing quantity in one app doesn't update the other" — Aug
+  // 2026): this local edit used to be overwritten a few seconds later by
+  // the next loadKOTFromServer() poll, because the SAVE_ORDER re-save
+  // below was pure fire-and-forget (no retry, no outbox) — if that
+  // single background call failed for any reason, the server's item
+  // list stayed the OLD, unmodified one, and the next 20s poll's merge
+  // pulled that stale list back over the local edit, silently reverting
+  // the steward's change with zero indication anything went wrong.
+  // pendingLocalEdit tells loadKOTFromServer's merge to keep this
+  // ticket's local items until the sync is actually confirmed.
+  if(k){ k.items = order.items; k.amount = newTotal; k.status='MODIFIED'; k.pendingLocalEdit = true; bnxSetOpenKotsRaw(JSON.stringify(KOT)); }
   order.status = 'MODIFIED';
   order.originalItems = JSON.parse(JSON.stringify(order.items));
-  toast('✅ Modified KOT sent to kitchen','success');
   renderKOT();
 
-  gasApi('SAVE_ORDER', {orderId:order.id, tableId:order.table, orderType:'KITCHEN', waiter:order.steward, items:order.items}, 'V2_CORE')
-    .catch(e=>console.warn('SAVE_ORDER (modify) background sync failed:', e));
+  // FIX (audit #5): requestId was generated but never put INSIDE the
+  // payload sent to SAVE_ORDER, so idempotency protection did nothing
+  // for a modified KOT — a network retry of this exact call could
+  // create a duplicate server-side update. Now included in the
+  // payload for both the live call and the queued retry payload.
+  const requestId = bnxUuid();
+  const editPayload = {requestId, orderId:order.id, tableId:order.table, orderType:'KITCHEN', waiter:order.steward, items:order.items};
+  const res = await gasApi('SAVE_ORDER', editPayload, 'V2_CORE');
+  if(!res || !res.success){
+    bnxQueuePending('SAVE_ORDER', editPayload, requestId, 'kot-edit:'+order.id);
+    toast('📴 Could not confirm the change with the server — queued, will retry automatically. Kitchen still sees the update on this device.','error');
+    bnxSetLiveStatus('offline');
+  } else {
+    bnxLoadOpenKots();
+    const k2 = KOT.find(x=>x.kotNo===order.id);
+    if(k2){ k2.pendingLocalEdit = false; bnxSetOpenKotsRaw(JSON.stringify(KOT)); }
+    toast('✅ Modified KOT sent to kitchen — confirmed on server','success');
+  }
 
   closeOrderReplacementModal();
   closeModal();
+}
+
+/* FIX ("editing an order after it's sent to kitchen doesn't work" — Aug
+   2026): the ONLY way to reach the modify/replace-items screen used to
+   be the "Modify / Replace Items" button on the one-time "Order Placed"
+   confirmation popup, which is backed purely by the in-memory
+   PLACED_ORDERS object and auto-dismisses/gets navigated away from
+   1.5s after placing. Once a steward left that screen — or reloaded,
+   or came back to KOT later, which is the normal workflow — there was
+   no edit entry point anywhere for a ticket that's already in the
+   kitchen queue, and PLACED_ORDERS[orderId] was empty so the modal
+   silently did nothing. This rehydrates a PLACED_ORDERS record straight
+   from the persisted KOT store (same one both apps share) so "Edit" on
+   any active KOT card works regardless of when/where it was placed. */
+function editKotOrder(kotNo){
+  bnxLoadOpenKots();
+  const k = KOT.find(x=>x.kotNo===kotNo);
+  if(!k){ toast('Order not found','error'); return; }
+  if(!PLACED_ORDERS[kotNo]){
+    PLACED_ORDERS[kotNo] = {
+      id: kotNo, table: k.table,
+      items: JSON.parse(JSON.stringify(k.items||[])),
+      amount: (k.items||[]).reduce((a,i)=>a+(i.qty||0)*(i.price||0),0),
+      steward: k.waiter || (document.getElementById('prof-name')?.textContent || 'Steward'),
+      status: k.status, timestamp: Date.now(),
+      originalItems: JSON.parse(JSON.stringify(k.items||[])),
+      hasServerId: !String(kotNo).startsWith('PENDING-')
+    };
+  }
+  openOrderReplacementModal(kotNo);
 }
 
 function closeOrderReplacementModal(){
@@ -2093,6 +2206,10 @@ async function loadKOTFromServer(){
         time: (o.ORDER_DATE && o.START_TIME) ? new Date(o.ORDER_DATE+' '+o.START_TIME).toISOString() : new Date().toISOString(), items };
       const idx = KOT.findIndex(k=>k.kotNo===kotNo);
       if(idx>=0){
+        // Never let a poll pull the server's (possibly stale, not-yet-
+        // confirmed) item list back over a local edit that hasn't been
+        // confirmed synced yet — see sendModifiedOrder's pendingLocalEdit.
+        if(KOT[idx].pendingLocalEdit) return;
         const localRank = STATUS_RANK[KOT[idx].status] ?? 0;
         const pulledRank = STATUS_RANK[pulledStatus] ?? 0;
         const status = pulledRank>localRank ? pulledStatus : KOT[idx].status;
@@ -2117,7 +2234,30 @@ function toast(msg,type='info'){
   el.style.background=type==='success'?'#16a34a':type==='error'?'#dc2626':'#1a1816';
   clearTimeout(el._t);el._t=setTimeout(()=>{el.style.display='none';},2500);
 }
-function doLogout(){if(confirm('Logout?')){showScreen('s-login');}}
+function doLogout(){
+  if(!confirm('Logout?')) return;
+  // FIX (audit P2 — "On logout: destroy session, clear user session,
+  // prevent previous client's data appearing after next login"): this
+  // used to only switch screens — ERP_USER/ERP_SESSION/ERP_ROLE/
+  // ERP_CLIENT/bnx_client_id all stayed in localStorage forever, so a
+  // page refresh (or a different steward picking up the same shared
+  // tablet) silently stayed authenticated as whoever logged in last.
+  // Clears session/identity only — deliberately does NOT touch
+  // bnx_outbox_<CLIENT_ID> or any other CLIENT_ID-scoped operational
+  // cache (menu/tables/open KOTs), per spec: "Do NOT delete unsynced
+  // transactions." Those stay associated with the correct client and
+  // resync normally on next login.
+  try{
+    localStorage.removeItem('ERP_USER');
+    localStorage.removeItem('ERP_SESSION');
+    localStorage.removeItem('ERP_ROLE');
+    localStorage.removeItem('ERP_CLIENT');
+    localStorage.removeItem('ERP_EXPIRY');
+    localStorage.removeItem('bnx_client_id');
+    sessionStorage.removeItem('ERP_USER');
+  }catch(e){}
+  showScreen('s-login');
+}
 
 /* ── PWA: register service worker + install button (Android + iPhone) ──
    Android/Chrome fire 'beforeinstallprompt' and support a native install dialog.
