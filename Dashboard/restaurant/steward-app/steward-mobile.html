@@ -776,33 +776,88 @@ function bnxMarkTableOrdersBilled(tableId, invoiceNo){
   overrides[t]={status:'BILLED',invoiceNo:invoiceNo||'',at:Date.now()};
   bnxSaveOrderOverrides(overrides);
 }
-/* Reuses the SAME sync queue key the dashboard's BillQueue reads from
-   (bnx_bill_sync_queue) — a bill rung up here gets picked up and
-   flushed to the backend by whichever app's BillQueue.flushQueue()
-   runs first (this app's own flushBillQueue below, or the dashboard's,
-   if both are open on the same device), instead of each app needing
-   its own separate sync engine. */
-function bnxQueueBillForSync(billData){
-  const QUEUE_KEY='bnx_bill_sync_queue';
-  let q=[]; try{ q=JSON.parse(localStorage.getItem(QUEUE_KEY)||'[]'); }catch(e){}
-  const localId='LOCAL_'+Date.now()+'_'+Math.random().toString(36).slice(2,8);
-  q.push({localId, billData:Object.assign({},billData,{localId}), status:'pending', attempts:0, queuedAt:new Date().toISOString()});
-  localStorage.setItem(QUEUE_KEY, JSON.stringify(q));
+/* ══════════════════════════════════════════════════
+   P0 PRODUCTION PASS — matches 20_POSBillingHandlers_v2.gs backend.
+
+   requestId: generated once per transaction ATTEMPT and reused
+   across retries of that same attempt, so a network retry can never
+   create a duplicate order/KOT/bill server-side (the backend checks
+   this against its idempotency cache).
+
+   LIVE STATUS: 🟢 LIVE / 🟡 SYNCING / 🔴 OFFLINE, shown in the top
+   bar — never claim "saved" when only localStorage has saved it.
+   PENDING SYNC OUTBOX: any write that fails goes here (not silently
+   lost, not silently pretended successful) and retries automatically.
+══════════════════════════════════════════════════ */
+function bnxUuid(){
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c){
+    var r = Math.random()*16|0, v = c==='x' ? r : (r&0x3|0x8);
+    return v.toString(16);
+  });
 }
-async function flushBillQueue(){
-  const QUEUE_KEY='bnx_bill_sync_queue';
-  let q=[]; try{ q=JSON.parse(localStorage.getItem(QUEUE_KEY)||'[]'); }catch(e){}
-  const pending=q.filter(e=>e.status==='pending' && e.attempts<8);
-  for(const entry of pending){
+function bnxEnsureStatusBadges(){
+  if(document.getElementById('bnx-live-badge')) return;
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'position:fixed;top:calc(env(safe-area-inset-top,0px) + 6px);right:8px;z-index:9999;display:flex;flex-direction:column;align-items:flex-end;gap:4px;pointer-events:none;';
+  wrap.innerHTML = `
+    <div id="bnx-live-badge" style="background:rgba(0,0,0,.55);color:#fff;font-size:10px;font-weight:800;padding:3px 9px;border-radius:20px;backdrop-filter:blur(4px);"></div>
+    <div id="bnx-pending-badge" style="display:none;background:var(--gold);color:#fff;font-size:9.5px;font-weight:700;padding:3px 9px;border-radius:20px;"></div>
+  `;
+  document.body.appendChild(wrap);
+}
+bnxEnsureStatusBadges();
+function bnxOutboxKey(){ return 'bnx_outbox_' + (CLIENT_ID || 'default'); }
+function bnxGetOutbox(){ try{ return JSON.parse(localStorage.getItem(bnxOutboxKey())||'[]'); }catch(e){ return []; } }
+function bnxSetOutbox(list){ localStorage.setItem(bnxOutboxKey(), JSON.stringify(list)); bnxUpdateSyncBadge(); }
+function bnxQueuePending(action, payload, requestId, onSuccess){
+  const list = bnxGetOutbox();
+  list.push({ requestId, action, payload, attempts:0, queuedAt:new Date().toISOString(), onSuccessTag: onSuccess||null });
+  bnxSetOutbox(list);
+}
+let bnxLiveStatus = 'checking'; // 'live' | 'syncing' | 'offline'
+function bnxSetLiveStatus(s){
+  bnxLiveStatus = s;
+  const el = document.getElementById('bnx-live-badge');
+  if(!el) return;
+  const map = { live:['🟢','LIVE','var(--green)'], syncing:['🟡','SYNCING','var(--gold)'], offline:['🔴','OFFLINE','var(--red)'], checking:['⚪','…','var(--text3)'] };
+  const [dot,label,color] = map[s]||map.checking;
+  el.innerHTML = dot+' '+label;
+  el.style.color = color;
+}
+function bnxUpdateSyncBadge(){
+  const n = bnxGetOutbox().length;
+  const el = document.getElementById('bnx-pending-badge');
+  if(!el) return;
+  el.textContent = n ? n+' pending sync' : '';
+  el.style.display = n ? '' : 'none';
+  if(n) bnxSetLiveStatus('syncing');
+}
+async function flushOutbox(){
+  const list = bnxGetOutbox();
+  if(!list.length) return;
+  let anyFailed = false;
+  const remaining = [];
+  for(const entry of list){
     entry.attempts++;
-    try{
-      const res=await gasApi('SAVE_BILL',{bill:entry.billData},'V2_CORE');
-      if(res && (res.success||res.ok)){ entry.status='synced'; entry.syncedAt=new Date().toISOString(); }
-    }catch(err){}
+    const res = await gasApi(entry.action, entry.payload, 'V2_CORE');
+    if(res && res.success){
+      // Successfully synced late — apply any follow-up UI update tagged on this entry
+      if(entry.onSuccessTag==='kot') bnxLoadOpenKots();
+    } else if(entry.attempts < 10){
+      remaining.push(entry);
+      anyFailed = true;
+    } else {
+      console.error('[OUTBOX] gave up after 10 attempts:', entry);
+    }
   }
-  localStorage.setItem(QUEUE_KEY, JSON.stringify(q));
+  bnxSetOutbox(remaining);
+  if(!remaining.length) bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
+  else if(anyFailed) bnxSetLiveStatus('syncing');
 }
-setInterval(flushBillQueue, 15000);
+setInterval(flushOutbox, 15000);
+window.addEventListener('online', ()=>{ bnxSetLiveStatus('live'); flushOutbox(); });
+window.addEventListener('offline', ()=> bnxSetLiveStatus('offline'));
+bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
 
 /* Pulls the SAME menu the POS dashboard uses (getMenuItems action, V2_FRONTEND) —
    so a category/item created in Settings → Menu Creation shows up here too. */
@@ -1402,11 +1457,10 @@ function selectPayMode(mode){
   if(dueFields) dueFields.style.display = mode==='DUE' ? 'block' : 'none';
 }
 function closeBillModal(e){ if(e && e.target!==e.currentTarget) return; document.getElementById('bill-modal').innerHTML=''; }
-function bnxBillSeqKeyNext(){
-  const seq = parseInt(bnxGetBillSeq()||'5000',10)+1;
-  bnxSetBillSeq(seq);
-  return 'HASH'+seq;
-}
+// NOTE: bnxBillSeqKeyNext() (client-side sequential bill numbering)
+// removed per the P0 fix — bill numbers are now generated
+// server-side (LockService-protected) in confirmPayment() below, so
+// two devices settling at the same instant can never collide.
 async function confirmPayment(calc){
   const mode = window._selectedPayMode || 'CASH';
   let custName='GENERAL CUSTOMER', custMobile='';
@@ -1415,46 +1469,70 @@ async function confirmPayment(calc){
     custMobile = document.getElementById('due-cust-mobile')?.value?.trim() || '';
     if(!custName){ toast('Customer name required for Due/Credit','error'); return; }
   }
-  const billNo = bnxBillSeqKeyNext();
   const now = new Date();
   const dt = now.toLocaleDateString('en-GB').split('/').join('-'); // dd-mm-yyyy, matches dashboard's b.dt format
   const tm = now.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});
   const stewardName = document.getElementById('prof-name')?.textContent || 'Steward';
 
-  // FIX ("if any menu item ... to report to dashboard all actual
-  // according"): writes into the SAME shared bill register the
-  // dashboard's Bills List/Reports/Tally export read from
-  // (bnxGetBillRegister/bnxSaveBillRegister) — a bill rung up on
-  // Steward now genuinely appears in every one of those places, not
-  // just inside this app.
-  const list = bnxGetBillRegister();
-  const entry = {
-    no: billNo, dt, tm, table: selTable.id, customer: custName||'GENERAL CUSTOMER', mob: custMobile,
-    items: calc.items.length, itemsDetail: calc.items, sub: calc.sub, gst: calc.gst, total: calc.total,
-    pay: mode, status: mode==='DUE' ? 'Pending' : 'Paid', waiter: stewardName, kot: '', live:true,
-    businessDate: dt, pax: selTable.covers||0
+  // P0 REWRITE ("Never tell the user 'Saved' when only localStorage
+  // has saved it" — the audit specifically called this out as the
+  // MOST important place to fix, since this is real money): this
+  // used to generate a bill number CLIENT-SIDE (bnxBillSeqKeyNext(),
+  // sequential per-device — two devices settling at the same instant
+  // could generate the same number), write it to the local register,
+  // print the receipt, and show "✅ Bill settled" — all BEFORE
+  // SAVE_BILL was even attempted, which only ran afterward via a
+  // fire-and-forget queue. Now: send first, let the SERVER generate
+  // the authoritative bill number (LockService-protected — cannot
+  // collide across devices), and only settle/print once confirmed.
+  const requestId = bnxUuid();
+  const confirmBtn = document.querySelector('#bill-modal .btn-primary');
+  if(confirmBtn){ confirmBtn.disabled = true; confirmBtn.textContent = 'Confirming…'; }
+
+  const draftBill = {
+    dt, tm, table: selTable.id, customer: custName||'GENERAL CUSTOMER', mob: custMobile,
+    sub: calc.sub, gst: calc.gst, total: calc.total, pay: mode,
+    status: mode==='DUE' ? 'Pending' : 'Paid', waiter: stewardName, itemsDetail: calc.items
   };
+
+  const res = await gasApi('SAVE_BILL', { requestId, bill: draftBill }, 'V2_CORE');
+
+  if(!res || !res.success){
+    // Genuine failure — queue it and tell the truth. The table is
+    // NOT freed and NO receipt is printed yet, because the bill isn't
+    // real yet — printing a receipt for an unconfirmed bill is
+    // exactly the "tell the user saved when it wasn't" bug we're
+    // fixing here, not something to keep doing for bills specifically.
+    bnxQueuePending('SAVE_BILL', { requestId, bill: draftBill }, requestId, 'bill');
+    if(confirmBtn){ confirmBtn.disabled = false; confirmBtn.textContent = '✅ Confirm & Print Receipt'; }
+    bnxSetLiveStatus('offline');
+    toast('📴 Could not reach server — bill queued as Pending Sync, will retry automatically. Table kept open.','error');
+    return;
+  }
+
+  bnxSetLiveStatus('live');
+  const billNo = res.serverId || res.billNo;
+  const entry = Object.assign({ no: billNo, items: calc.items.length, live:true, businessDate: dt, pax: selTable.covers||0, kot:'' }, draftBill);
+
+  // FIX ("if any menu item ... to report to dashboard all actual
+  // according"): still mirrored into the shared local bill register
+  // so Bills List/Reports/Tally export on this device show it
+  // instantly — but only AFTER the server confirmed it, as a cache
+  // of a real transaction, not as the transaction's source of truth.
+  const list = bnxGetBillRegister();
   list.unshift(entry);
   bnxSaveBillRegister(list.length>6000 ? list.slice(0,6000) : list);
 
-  // FIX ("credit due also fix"): a Due/Credit bill now actually posts
-  // into the shared credit ledger the Customer Credit/Due Collection
-  // pages read from — real outstanding balance, not demo rows.
   if(mode==='DUE') bnxPostCreditSale(custName, custMobile, calc.total, dt, billNo);
 
-  // Mark this table's open KOTs BILLED (soft — order history/report
-  // trail is preserved) and free the table.
   bnxLoadOpenKots();
   KOT.forEach(k=>{ if(k.table===selTable.id && !['CANCELLED','BILLED'].includes(k.status)) k.status='BILLED'; });
   bnxSetOpenKotsRaw(JSON.stringify(KOT));
   bnxMarkTableOrdersBilled(selTable.id, billNo);
   bnxUpdateTableOverlay(selTable.id, { status:'AVAILABLE', covers:0, bill:0 });
 
-  // Background sync — same queue the dashboard's BillQueue drains.
-  bnxQueueBillForSync(entry);
-
   closeBillModal();
-  toast('✅ Bill '+billNo+' settled · ₹'+calc.total.toLocaleString(),'success');
+  toast('✅ Bill '+billNo+' settled — confirmed on server · ₹'+calc.total.toLocaleString(),'success');
   printReceipt(entry);
   renderMobTables(); renderMyTables(); renderKOT();
 }
@@ -1639,47 +1717,61 @@ async function placeOrder(){
   });
   const amount = items.reduce((a,i)=>a+i.price*i.qty,0);
   const stewardName = document.getElementById('prof-name')?.textContent || 'Steward';
+
+  // P0 REWRITE ("Never tell the user 'Saved' when only localStorage
+  // has saved it"): this used to generate a local KOT number, write
+  // it into the shared store, and show "✅ KOT sent to kitchen"
+  // BEFORE ever contacting the server — SAVE_KOT/SAVE_ORDER only
+  // fired afterward, fire-and-forget, and a failure was silently
+  // swallowed (just a console.warn). Now: send first, wait for the
+  // server's real order ID, and only show success once the server
+  // has actually confirmed it — matching the backend's v2 handler,
+  // which generates the authoritative ID itself and ignores anything
+  // the client sends as an orderId for a new order.
+  const requestId = bnxUuid();
+  const btn = document.querySelector('#s-new-order .btn-primary[onclick="placeOrder()"]');
+  if(btn){ btn.disabled = true; btn.textContent = 'Sending…'; }
   toast('Sending KOT…','info');
-  // FIX ("can't update order"): placeOrder() used to call a dead
-  // endpoint (V2_FRONTEND) with a made-up action name ('createOrder')
-  // that the dashboard itself never speaks — so it never had a real
-  // order id to hand back, and every later edit was doomed. This now
-  // records the order the SAME way the dashboard's bnxRecordKOT() does:
-  // a real sequential KOT number from the shared bnx_kot_seq_<CLIENT_ID>
-  // counter, written straight into the shared open-KOTs store (visible
-  // to the dashboard immediately), with the SAME SAVE_KOT/SAVE_ORDER
-  // background-sync calls the dashboard fires — never blocking the
-  // click on the network round trip.
-  const seq = parseInt(bnxGetKotSeq()||'1040',10)+1;
-  bnxSetKotSeq(seq);
-  const kotNo = 'KOT-'+seq;
+
+  const res = await gasApi('SAVE_ORDER', {
+    requestId, tableId:selTable.id, orderType:'KITCHEN', waiter:stewardName, covers:'', items
+  }, 'V2_CORE');
+
+  if(btn){ btn.disabled = false; btn.textContent = '📤 Send KOT'; }
+
+  if(!res || !res.success){
+    // Genuine failure or offline — queue it, tell the truth about the
+    // state ("Pending Sync"), never pretend it's on the dashboard yet.
+    bnxQueuePending('SAVE_ORDER', { requestId, tableId:selTable.id, orderType:'KITCHEN', waiter:stewardName, covers:'', items }, requestId, 'kot');
+    toast('📴 Could not reach server — order queued, will send when back online','error');
+    bnxSetLiveStatus('offline');
+    // Still reflected locally so THIS device's own screens are usable
+    // offline, but tagged pending — never shown as a confirmed KOT.
+    const localTag = { kotNo:'PENDING-'+requestId.slice(0,8), table:selTable.id, type:'KITCHEN', time:new Date().toISOString(),
+      waiter:stewardName, covers:'', items, amount, status:'PENDING_SYNC' };
+    bnxLoadOpenKots(); KOT.unshift(localTag); bnxSetOpenKotsRaw(JSON.stringify(KOT));
+    order={};
+    setTimeout(() => showScreen('s-home'), 1200);
+    return;
+  }
+
+  bnxSetLiveStatus('live');
+  const orderId = res.serverId || res.orderId;
+  lastOrderId = orderId;
   bnxLoadOpenKots();
-  const entry = { kotNo, table:selTable.id, type:'KITCHEN', time:new Date().toISOString(), waiter:stewardName, covers:'', items, amount, status:'NEW' };
+  const entry = { kotNo:orderId, table:selTable.id, type:'KITCHEN', time:res.serverTimestamp||new Date().toISOString(), waiter:stewardName, covers:'', items, amount, status:'NEW' };
   KOT.unshift(entry);
   if(KOT.length>100) KOT.length=100;
   bnxSetOpenKotsRaw(JSON.stringify(KOT));
 
-  const orderId = kotNo;
-  lastOrderId = orderId;
   PLACED_ORDERS[orderId] = {
     id: orderId, table: selTable.id, items: JSON.parse(JSON.stringify(items)), amount, steward: stewardName,
     status: 'PLACED', timestamp: Date.now(), originalItems: JSON.parse(JSON.stringify(items)), hasServerId: true
   };
 
-  toast('✅ KOT sent to kitchen — visible on dashboard','success');
+  toast('✅ KOT sent to kitchen — confirmed on server','success');
   order={};
 
-  // Fire-and-forget background sync to Google Sheets — matches the
-  // dashboard's bnxRecordKOT() call exactly (same action names,
-  // same payload shape). If it fails, the KOT is already recorded
-  // locally and visible to this device's dashboard/steward app.
-  gasApi('SAVE_KOT', {table:selTable.id, waiter:stewardName, covers:'', remarks:'', items, orderNo:kotNo}, 'V2_CORE')
-    .catch(err=>console.warn('SAVE_KOT background sync failed (already recorded locally):', err));
-  gasApi('SAVE_ORDER', {orderId:kotNo, tableId:selTable.id, orderType:'KITCHEN', waiter:stewardName, covers:'', items}, 'V2_CORE')
-    .catch(err=>console.warn('SAVE_ORDER background sync failed for '+kotNo+':', err));
-
-  // Mark table as running/occupied in the shared table overlay so the
-  // dashboard's floor map picks it up too.
   bnxUpdateTableOverlay(selTable.id, { status:'RUNNING', covers: selTable.covers||0, bill: (selTable.bill||0)+amount });
 
   showOrderPlacedModal(orderId);
@@ -2011,7 +2103,7 @@ renderKOT();
 loadMenuFromServer();
 loadKOTFromServer();
 loadTablesLive();
-flushBillQueue();
+flushOutbox();
 setInterval(loadKOTFromServer, 20000); // light polling so steward app & POS stay in sync
 setInterval(loadTablesLive, 20000);    // same for the live floor/table status
 </script>

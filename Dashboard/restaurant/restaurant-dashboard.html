@@ -7545,22 +7545,25 @@ async function sendKOT(){
   const covers=document.getElementById('coversInput')?.value||'2';
   const remarks=document.getElementById('remarksInput')?.value||'';
   const items=Object.entries(cart).map(([n,v])=>({name:n,qty:v.qty,price:v.price}));
-  // FIX ("click not work, slow work"): this used to `await erpApi(...)`
-  // before showing ANY feedback — the button felt frozen for however
-  // long the network round-trip took. Same offline-first fix as
-  // billing: give instant feedback and print immediately, sync to
-  // the backend in the background without blocking the click at all.
+  // DELIBERATELY KEPT INSTANT (not awaited) — unlike billing, this file's
+  // own history shows this was already made instant once before after
+  // kitchen staff complained the click froze waiting on network ("click
+  // not work, slow work"). A KOT ticket is not money; the kitchen needs
+  // the paper NOW. What's fixed instead: the background sync below is
+  // now idempotent (requestId) and, on failure, goes into the SAME
+  // visible Pending Sync outbox billing uses — retried automatically —
+  // instead of a bare console.warn that silently gave up.
   alert('✅ KOT Sent to Kitchen!\n\nTable: '+tbl+'\nWaiter: '+waiter+'\nItems: '+items.length+' items\n\nPowered by Balaji NextGen ERP');
   printKOTSplit(tbl, waiter, covers, items);
   cart={}; renderCart();
   document.getElementById('kotBadge').textContent=String((parseInt(document.getElementById('kotBadge').textContent)||0)+1);
   if (typeof buildKOT === 'function') buildKOT();
   if (typeof buildDashKotList === 'function') buildDashKotList();
-  // Fire-and-forget sync — no await, no blocking. If it fails, the
-  // KOT ticket is already printed and recorded locally; this only
-  // affects whether the kitchen also sees it on the digital KDS.
-  erpApi({action:'SAVE_KOT',table:tbl,waiter,covers,remarks,items,orderNo:posOrderNo},'V2_CORE')
-    .catch(err => console.warn('SAVE_KOT background sync failed (KOT already printed/recorded locally):', err));
+  const kotRequestId = bnxUuid();
+  const kotReq = {requestId:kotRequestId, table:tbl,waiter,covers,remarks,items,orderNo:posOrderNo};
+  gasApi('SAVE_KOT', kotReq, 'V2_CORE').then(res=>{
+    if(!res || !res.success) bnxQueuePending('SAVE_KOT', kotReq, kotRequestId);
+  }).catch(()=>bnxQueuePending('SAVE_KOT', kotReq, kotRequestId));
 }
 
 /* KOT numbers were never stored anywhere after printing — New Bill's
@@ -7574,6 +7577,13 @@ async function sendKOT(){
    that's what lets the KOT page and dashboard render the REAL ticket
    instead of a hardcoded demo list. */
 function bnxRecordKOT(table, type, waiter, covers, items){
+  // Local number generation kept here deliberately (see sendKOT note
+  // above — printing can't wait on a network round trip). This IS a
+  // real gap vs. the audit's "server-side numbering" requirement for
+  // this specific number — genuinely closing it requires either
+  // pre-fetching a small batch of server-issued numbers ahead of time,
+  // or accepting the print-delay tradeoff for KOT specifically. Flagging
+  // honestly rather than claiming this is fully server-authoritative.
   const seq = parseInt(bnxGetKotSeq()||'1040',10) + 1;
   bnxSetKotSeq(seq);
   const kotNo = (type==='BAR' ? 'BAR-' : 'KOT-') + seq;
@@ -7583,18 +7593,11 @@ function bnxRecordKOT(table, type, waiter, covers, items){
   open.unshift(entry);
   if (open.length>100) open = open.slice(0,100);
   bnxSetOpenKotsRaw(JSON.stringify(open));
-  // FIX ("load google sheet all order save and show if steward order
-  // given and all update"): this recorded every new KOT/order to
-  // localStorage only — it never reached the Google Sheets backend at
-  // all, unlike bills (which sync via BillQueue). An order placed here
-  // stayed invisible to every other device/staff member until someone
-  // opened THIS exact browser. Now fires the same kind of background
-  // sync bill-saving already uses elsewhere in this file, so the order
-  // (including which steward took it) actually reaches the sheet.
-  if (typeof erpApi === 'function') {
-    erpApi({action:'SAVE_ORDER', orderId:kotNo, tableId:table, orderType:type, waiter:waiter||'', covers:covers||'', items:items||[]}, 'V2_CORE')
-      .catch(e=>console.warn('SAVE_ORDER background sync failed for', kotNo, e));
-  }
+  const orderRequestId = bnxUuid();
+  const orderReq = {requestId:orderRequestId, orderId:kotNo, tableId:table, orderType:type, waiter:waiter||'', covers:covers||'', items:items||[]};
+  gasApi('SAVE_ORDER', orderReq, 'V2_CORE').then(res=>{
+    if(!res || !res.success) bnxQueuePending('SAVE_ORDER', orderReq, orderRequestId);
+  }).catch(()=>bnxQueuePending('SAVE_ORDER', orderReq, orderRequestId));
   return kotNo;
 }
 /* Splits the order into a Bar ticket and a Kitchen ticket by
@@ -7927,7 +7930,7 @@ function printThermalReceipt(d){
   w.document.close();
   setTimeout(()=>{ w.print(); }, 500);
 }
-function settleOrder(){
+async function settleOrder(){
   if (!Object.keys(cart).length){ alert('⚠️ Cart is empty! Add items before settling.'); return; }
   if (typeof isDayOpen === 'function' && !isDayOpen()){
     if (typeof showNotif === 'function') showNotif('🔒 Start the business day first (top-right Day badge) before settling orders.', 'error');
@@ -7936,13 +7939,10 @@ function settleOrder(){
   }
   const tbl = document.getElementById('posTable')?.textContent || 'T-07';
   if (!confirm('Settle order for '+tbl+'?\nPayment: '+payMethod)) return;
-  // Was a fake stub before — cleared the cart and showed a success alert
-  // without saving or printing anything. Now it actually prints the real
-  // receipt (same shared format as POS Print Bill / New Bill) AND records
-  // it into the real Bill Register — FIX: settling from the POS screen
-  // used to leave zero trace in Bills List / DSR / reports, since only
-  // the New Bill (bmSaveBill) path ever called bnxRecordBill(). Every
-  // table order settled here now shows up in Bills List immediately.
+  // P0 REWRITE — second local-first billing path found (New Bill form
+  // vs POS Settle button were independently making the same mistake):
+  // server-first now, server generates the real bill number, print
+  // only happens after confirmation.
   const items = Object.entries(cart).map(([n,v])=>({ name:n, qty:v.qty, rate:v.price, amt:v.price*v.qty }));
   const sub = items.reduce((a,i)=>a+i.amt,0);
   const gstTxt = (document.getElementById('cTax')?.textContent||'₹0').replace(/[^\d.]/g,'');
@@ -7951,19 +7951,36 @@ function settleOrder(){
   const totalTxt = (document.getElementById('cTotal')?.textContent||'₹0').replace(/[^\d.]/g,'');
   const total = parseFloat(totalTxt) || sub;
   const now = new Date();
-  const billNo = (typeof bmNextBillNo==='function') ? bmNextBillNo() : ('BN/'+Date.now());
+
+  const requestId = bnxUuid();
+  const draftBill = {
+    dt: now.toLocaleDateString('en-GB'), tm: now.toLocaleTimeString('en-IN',{hour12:true,hour:'2-digit',minute:'2-digit'}),
+    table: tbl, customer: (document.getElementById('custNameInput')?.value || 'GENERAL CUSTOMER'),
+    mob: document.getElementById('custMobileInput')?.value || '', itemsDetail: items, sub, gst, total,
+    pay: payMethod, waiter: document.getElementById('waiterSel')?.value || '',
+    status: /^(DUE|CREDIT)$/i.test(payMethod||'') ? 'Pending' : 'Paid'
+  };
+
+  const res = await gasApi('SAVE_BILL', { requestId, bill: draftBill }, 'V2_CORE');
+  if (!res || !res.success){
+    bnxQueuePending('SAVE_BILL', { requestId, bill: draftBill }, requestId);
+    bnxSetLiveStatus('offline');
+    if (typeof showNotif === 'function') showNotif('📴 Could not reach server — order queued as Pending Sync. Not printed or recorded yet.', 'error');
+    else alert('⚠️ Could not reach the server. Queued and will save automatically — NOT recorded yet, nothing printed.');
+    return;
+  }
+  bnxSetLiveStatus('live');
+  const billNo = res.serverId || res.billNo;
+
   printBill();
   if (typeof bnxRecordBill === 'function'){
-    bnxRecordBill({
-      no: billNo, dt: now.toLocaleDateString('en-GB'), tm: now.toLocaleTimeString('en-IN',{hour12:true,hour:'2-digit',minute:'2-digit'}),
-      table: tbl, customer: (document.getElementById('custNameInput')?.value || 'GENERAL CUSTOMER'),
-      mob: document.getElementById('custMobileInput')?.value || '', items, sub,
-      gst, total, pay: payMethod, waiter: document.getElementById('waiterSel')?.value || ''
-    });
+    bnxRecordBill(Object.assign({ no: billNo, items }, draftBill));
   }
-  if (typeof BillQueue !== 'undefined') BillQueue.saveBillOffline({no:billNo, table:tbl, items, sub, total});
+  if (/^(DUE|CREDIT)$/i.test(payMethod||'') && typeof bnxPostCreditSale === 'function'){
+    bnxPostCreditSale(draftBill.customer, draftBill.mob, total, draftBill.dt, billNo);
+  }
   cart={}; renderCart();
-  if (typeof showNotif === 'function') showNotif('✅ Order Settled — '+tbl+' · Bill '+billNo+' saved to Bill Register', 'success');
+  if (typeof showNotif === 'function') showNotif('✅ Order Settled — '+tbl+' · Bill '+billNo+' confirmed on server', 'success');
   showPage('billing',document.querySelector('[onclick*="billing"]'));
 }
 
@@ -8299,14 +8316,14 @@ function quickBillFromKOT(kotNo){
   const k = bnxGetKotStore().find(x=>x.kotNo===kotNo);
   if (!k){ alert('KOT not found.'); return; }
   showPage('billing', document.querySelector('[onclick*="billing"]'));
-  setTimeout(()=>{
+  setTimeout(async ()=>{
     const tEl=document.getElementById('bm-bf-table'); if(tEl) tEl.value=k.table||'';
     const cEl=document.getElementById('bm-bf-cname'); if(cEl) cEl.value='GENERAL CUSTOMER';
     const kEl=document.getElementById('bm-bf-kot'); if(kEl) kEl.value=k.kotNo;
     document.getElementById('bmItemRows').innerHTML='';
     (k.items||[]).forEach(it=>bmAddItemRow(it.name||it.n, it.qty||1, it.rate||it.price||0));
     if (typeof bmRecalc==='function') bmRecalc();
-    const saved = typeof bmSaveBill==='function' ? bmSaveBill(true) : null;
+    const saved = typeof bmSaveBill==='function' ? await bmSaveBill(true) : null;
     if (saved){
       if (typeof showNotif==='function') showNotif('✅ Bill '+saved.billno+' saved from '+k.kotNo+' — opening print preview', 'success');
       bmOpenPrintModal('thermal');
@@ -9074,15 +9091,15 @@ function bmSwitchPrint(format,btn){
   document.getElementById('bm-modal-thermal').style.display=format==='thermal'?'block':'none';
   document.getElementById('bm-modal-a4').style.display=format==='a4'?'block':'none';
 }
-function bmDoPrint(){
+async function bmDoPrint(){
   // FIX ("print happens but record never shows up later"): bmSaveBill()
-  // can legitimately refuse to save (e.g. business day not opened yet)
-  // and returns null in that case — but this function used to ignore
-  // that return value and print anyway, so the bill would come out of
-  // the printer with NOTHING recorded in Bill Register / Bills List /
-  // the backend sheet. Now printing is aborted (same message bmSaveBill
-  // already shows) whenever the save didn't actually go through.
-  const saved = bmSaveBill(true);
+  // can legitimately refuse to save (e.g. business day not opened yet,
+  // or the server couldn't be reached — now queued as Pending Sync
+  // instead) and returns null in that case — printing is aborted
+  // whenever the save didn't actually go through, same as before, now
+  // awaiting the real server confirmation instead of a synchronous
+  // local-only save.
+  const saved = await bmSaveBill(true);
   if (!saved) return;
   const isA4=document.getElementById('bm-modal-a4').style.display!=='none';
   const content=isA4?document.getElementById('bmModalA4').outerHTML:document.getElementById('bmModalThermal').outerHTML;
@@ -9135,7 +9152,7 @@ function bmDoKOTPrint(){
   w.document.close();setTimeout(()=>{w.print();w.close();},600);
 }
 
-function bmSaveBill(reprintAfter){
+async function bmSaveBill(reprintAfter){
   if (typeof isDayOpen === 'function' && !isDayOpen()){
     if (typeof showNotif === 'function') showNotif('🔒 Start the business day first (top-right Day badge) before billing.', 'error');
     else alert('Business day is not open yet. Tap the Day Closed badge at the top to start the day before billing.');
@@ -9144,41 +9161,60 @@ function bmSaveBill(reprintAfter){
   }
   const d=bmGetBillData();
   d.businessDate = typeof getBusinessDate === 'function' ? getBusinessDate() : null;
-  // Editing an existing bill (blEditBill loaded it) keeps its own bill no;
-  // a fresh bill gets the next sequential number.
+  const now = new Date();
+  d.date = d.date || now.toLocaleDateString('en-GB');
+  d.time = d.time || now.toLocaleTimeString('en-IN',{hour12:true,hour:'2-digit',minute:'2-digit'});
+
+  // P0 REWRITE (per the production audit — "this is the MOST
+  // important place to fix, real money"): bmSaveBill() used to
+  // generate the bill number CLIENT-SIDE (bmNextBillNo(), sequential
+  // per-browser — two terminals settling at the same instant could
+  // generate the same number), record it into the local Bill
+  // Register, and show "✅ Bill Saved!" — ALL before SAVE_BILL was
+  // even attempted, which only ran afterward via BillQueue,
+  // fire-and-forget. Now: send first, let the server generate the
+  // authoritative bill number (LockService-protected — cannot
+  // collide across terminals/devices), and only record/show success
+  // once confirmed. Editing an already-saved bill keeps sending its
+  // real existing bill number (server treats it as an update lookup,
+  // not a new-number request).
   const isEditingExisting = bnxGetBillRegister().some(b=>b.no===d.billno);
-  const finalBillNo = isEditingExisting ? d.billno : bmNextBillNo();
+  const requestId = bnxUuid();
+  const draftBill = {
+    no: isEditingExisting ? d.billno : undefined, dt: d.date, tm: d.time,
+    table: d.table, customer: d.cname, mob: d.cmob, itemsDetail: d.items,
+    sub: d.sub, gst: d.tax, total: d.total, pay: d.paymode, waiter: d.waiter,
+    status: /^(DUE|CREDIT)$/i.test(d.paymode||'') ? 'Pending' : 'Paid'
+  };
+
+  const res = await gasApi('SAVE_BILL', { requestId, bill: draftBill }, 'V2_CORE');
+
+  if (!res || !res.success){
+    bnxQueuePending('SAVE_BILL', { requestId, bill: draftBill }, requestId);
+    bnxSetLiveStatus('offline');
+    if (typeof showNotif==='function') showNotif('📴 Could not reach server — bill queued as Pending Sync, will retry automatically. Nothing recorded yet.', 'error');
+    else alert('⚠️ Could not reach the server. This bill has been queued and will save automatically once connection is back — it is NOT recorded yet.');
+    return null;
+  }
+  bnxSetLiveStatus('live');
+
+  const finalBillNo = res.serverId || res.billNo || d.billno;
   const billNoEl = document.getElementById('bm-bf-billno'); if (billNoEl) billNoEl.value = finalBillNo;
   d.billno = finalBillNo;
-  // FIX ("auto save bill header and bill items, bill register reprint/edit/cancel"):
-  // this now actually writes the bill header + items into the Bill Register
-  // (bnxRecordBill) instead of just showing an alert — it's what makes it
-  // show up in Bills List with working Reprint/Edit/Cancel afterwards.
-  const now = new Date();
+
+  // Mirrors into the local Bill Register AFTER server confirmation —
+  // a fast local cache of a real transaction, not the transaction's
+  // source of truth.
   bnxRecordBill({
-    no: d.billno, dt: d.date || now.toLocaleDateString('en-GB'), tm: d.time || now.toLocaleTimeString('en-IN',{hour12:true,hour:'2-digit',minute:'2-digit'}),
+    no: d.billno, dt: d.date, tm: d.time,
     table: d.table, customer: d.cname, mob: d.cmob, items: d.items, sub: d.sub, gst: d.tax, total: d.total,
     pay: d.paymode, waiter: d.waiter, kot: d.kot, businessDate: d.businessDate, pax: d.pax
   });
-  // FIX ("bill register record and receive and credit ledger also update"):
-  // saving a bill used to end at the Bill Register — a Due/Credit sale
-  // never appeared anywhere a manager actually collects money (Customer
-  // Credit Ledger, Accounts Receivable / Due Collection). Now every
-  // Due/Credit bill posts straight into that customer's outstanding
-  // balance the moment it's saved, same as a real accounting system.
   if (/^(DUE|CREDIT)$/i.test(d.paymode||'')) {
-    if (typeof bnxPostCreditSale === 'function') bnxPostCreditSale(d.cname, d.cmob, d.total, d.date || now.toLocaleDateString('en-GB'), d.billno);
+    if (typeof bnxPostCreditSale === 'function') bnxPostCreditSale(d.cname, d.cmob, d.total, d.date, d.billno);
   }
-  // FIX ("update order register ... according pic data"): the Order
-  // Register kept showing a table as NEW/KOT_PRINTED/READY forever after
-  // it had actually been billed, because nothing here ever told it the
-  // order was done. Every order still open for this table is now flipped
-  // to BILLED with the real invoice number the instant the bill saves —
-  // whether the order came from POS, the Steward app, or a direct walk-in
-  // bill with no prior KOT at all.
   if (typeof bnxMarkTableOrdersBilled === 'function') bnxMarkTableOrdersBilled(d.table, d.billno);
-  if (typeof BillQueue !== 'undefined') BillQueue.saveBillOffline(d);
-  if (!reprintAfter) alert('✅ Bill Saved!\n\nBill No: '+d.billno+'\nTotal: ₹'+Number(d.total).toLocaleString('en-IN')+'\nBusiness Date: '+d.businessDate+'\n\nSaved to Bill Register · will sync to DB via V2_CORE API.\nPowered by Balaji NextGen ERP');
+  if (!reprintAfter) alert('✅ Bill Saved!\n\nBill No: '+d.billno+'\nTotal: ₹'+Number(d.total).toLocaleString('en-IN')+'\nBusiness Date: '+d.businessDate+'\n\nConfirmed on server — synced to Google Sheets.\nPowered by Balaji NextGen ERP');
   return d;
 }
 
@@ -9532,6 +9568,79 @@ function bnxSetOpenKotsRaw(v){ localStorage.setItem(bnxOpenKotsKey(), v); }
 
 function bnxRestaurantInfoKey(){ return 'bnx_restaurant_info_' + (CLIENT_ID || 'default'); }
 function bnxUserModeKey(){ return 'bnx_user_mode_' + (CLIENT_ID || 'default'); }
+
+/* ══════════════════════════════════════════════════
+   P0 PRODUCTION PASS — matches 20_POSBillingHandlers_v2.gs backend
+   and steward-mobile.html's matching pass. requestId makes writes
+   idempotent (a network retry can't create a duplicate bill/order
+   server-side); failures go to a visible Pending Sync outbox instead
+   of being silently swallowed or shown as fake success.
+══════════════════════════════════════════════════ */
+function bnxUuid(){
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c){
+    var r = Math.random()*16|0, v = c==='x' ? r : (r&0x3|0x8);
+    return v.toString(16);
+  });
+}
+function bnxOutboxKey(){ return 'bnx_outbox_' + (CLIENT_ID || 'default'); }
+function bnxGetOutbox(){ try{ return JSON.parse(localStorage.getItem(bnxOutboxKey())||'[]'); }catch(e){ return []; } }
+function bnxSetOutbox(list){ localStorage.setItem(bnxOutboxKey(), JSON.stringify(list)); bnxUpdateSyncBadge(); }
+function bnxQueuePending(action, payload, requestId){
+  const list = bnxGetOutbox();
+  list.push({ requestId, action, payload, attempts:0, queuedAt:new Date().toISOString() });
+  bnxSetOutbox(list);
+}
+let bnxLiveStatus = 'checking';
+function bnxSetLiveStatus(s){
+  bnxLiveStatus = s;
+  const el = document.getElementById('bnx-live-badge');
+  if(!el) return;
+  const map = { live:['🟢','LIVE','var(--green)'], syncing:['🟡','SYNCING','var(--gold)'], offline:['🔴','OFFLINE','var(--red)'], checking:['⚪','…','var(--text3)'] };
+  const [dot,label,color] = map[s]||map.checking;
+  el.innerHTML = dot+' '+label;
+  el.style.color = color;
+}
+function bnxUpdateSyncBadge(){
+  const n = bnxGetOutbox().length;
+  const el = document.getElementById('bnx-pending-badge');
+  if(!el) return;
+  el.textContent = n ? n+' pending sync' : '';
+  el.style.display = n ? '' : 'none';
+  if(n) bnxSetLiveStatus('syncing');
+}
+async function flushOutbox(){
+  const list = bnxGetOutbox();
+  if(!list.length) return;
+  const remaining = [];
+  for(const entry of list){
+    entry.attempts++;
+    const res = await gasApi(entry.action, entry.payload, 'V2_CORE');
+    if(!(res && res.success)){
+      if(entry.attempts < 10) remaining.push(entry);
+      else console.error('[OUTBOX] gave up after 10 attempts:', entry);
+    }
+  }
+  bnxSetOutbox(remaining);
+  if(!remaining.length) bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
+}
+setInterval(flushOutbox, 15000);
+window.addEventListener('online', ()=>{ bnxSetLiveStatus('live'); flushOutbox(); });
+window.addEventListener('offline', ()=> bnxSetLiveStatus('offline'));
+function bnxEnsureStatusBadges(){
+  if(document.getElementById('bnx-live-badge')) return;
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'position:fixed;top:10px;right:12px;z-index:99998;display:flex;flex-direction:column;align-items:flex-end;gap:4px;pointer-events:none;';
+  wrap.innerHTML = `
+    <div id="bnx-live-badge" style="background:rgba(0,0,0,.6);color:#fff;font-size:10.5px;font-weight:800;padding:4px 11px;border-radius:20px;backdrop-filter:blur(4px);"></div>
+    <div id="bnx-pending-badge" style="display:none;background:var(--gold);color:#fff;font-size:10px;font-weight:700;padding:3px 10px;border-radius:20px;"></div>
+  `;
+  document.body.appendChild(wrap);
+}
+document.addEventListener('DOMContentLoaded', function(){
+  bnxEnsureStatusBadges();
+  bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
+  flushOutbox();
+});
 function bnxRecordBill(d){
   const list = bnxGetBillRegister();
   const existingIdx = list.findIndex(b=>b.no===d.no);
