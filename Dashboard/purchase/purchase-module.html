@@ -230,11 +230,24 @@ table{width:100%;border-collapse:collapse}
    match it — still the full orange brand-light fill + solid orange
    border, visible on every expanded item breakdown (e.g. the Purchase
    Register's inline item table). Now genuinely neutral. */
-thead th{background:var(--bg2,#f8fafc);color:var(--text2);padding:8px 10px;font-size:9.5px;text-transform:uppercase;letter-spacing:.5px;white-space:nowrap;font-weight:700;border-bottom:1.5px solid var(--border2,#e2e8f0)}
-tbody td{padding:7px 10px;border-bottom:1px solid var(--border);font-size:12.5px;color:var(--text);vertical-align:middle}
+thead th{background:var(--bg2,#f8fafc);color:var(--text2);padding:11px 12px;font-size:9.5px;text-transform:uppercase;letter-spacing:.5px;white-space:nowrap;font-weight:700;border-bottom:1.5px solid var(--border2,#e2e8f0)}
+/* FIX ("heavy felling / rows badges buttons crammed together" — Aug 2026):
+   register tables (Purchase Invoice Register etc.) packed a lot into a
+   small area — 7px vertical cell padding, badges and action buttons
+   butted right up against each other with only a single literal space
+   character between them in the template strings. Nothing here changed
+   what's shown, only how much room it's given: more vertical padding per
+   row, looser line-height so a 3-line wrapped vendor name doesn't feel
+   squeezed, and real spacing between adjacent badges/buttons inside a
+   cell (::tw scope, so this doesn't touch the top toolbar's own buttons,
+   which already have their own explicit gap). */
+tbody td{padding:11px 12px;border-bottom:1px solid var(--border);font-size:12.5px;color:var(--text);vertical-align:middle;line-height:1.55}
 tbody tr:last-child td{border-bottom:none}
 tbody tr:hover td{background:var(--brand-bg)}
 tbody tr:nth-child(even) td{background:var(--brand-light)}
+.tw .badge{margin:2px 3px 2px 0}
+.tw .btn-xs{margin:2px 2px}
+.tw td .badge:last-child,.tw td .btn-xs:last-child{margin-right:0}
 .td-r{text-align:right}.td-c{text-align:center}
 /* FIX ("fix total views not looks" — Register totals row numbers running
    together with no visual separation): tfoot cells inherited the same
@@ -1823,9 +1836,32 @@ function _mapDocToSyncPurchaseRecord(doc){
   };
 }
 let _pushingPurchaseSyncTable=false;
+let _purchaseSyncPushQueued=false;
 async function pushPurchaseInvoicesToSyncTable(){
   if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return;
-  if(_pushingPurchaseSyncTable)return; // a push is already in flight — the next save()'s data will be included in THAT push once it lands, no need to queue a second one
+  // FIX ("delete blank but after a sec same data reflect — not deleted" —
+  // Aug 2026, root-cause pass): every earlier fix for this recurring bug
+  // patched the PULL side (the _pendingDeletes guard in
+  // pullInventorySyncData's merge, above) — none of them touched THIS gap,
+  // which is the actual cause. This used to just `return` here and drop
+  // the call entirely whenever another push happened to already be in
+  // flight, on the assumption that "the next save()'s data will be
+  // included in THAT push once it lands" — false whenever nothing else
+  // triggers a further save() afterward. deletePurchase() splices the row
+  // out and calls save() → pushPurchaseInvoicesToSyncTable(); if THAT call
+  // landed while an earlier, unrelated push was still in flight, it got
+  // silently swallowed here — DB.purchases lost the row locally, but the
+  // shared SYNC_purchase_invoices table on the server (what this file's
+  // own SYNC_PULL_ALL poll AND inventory.html both read) never did. The
+  // very next poll (up to 20s later) then pulled the "deleted" invoice
+  // straight back in — reproducing on the FIRST delete click, no race
+  // with a second click needed, which is exactly what made this survive
+  // every previous _pendingDeletes-based fix. Now: instead of dropping the
+  // call, queue exactly one guaranteed follow-up push, sent the moment the
+  // in-flight one finishes, carrying whatever DB.purchases looks like at
+  // that moment — so a deletion (or any other change) can never be lost
+  // to this race, no matter how many pushes land back-to-back.
+  if(_pushingPurchaseSyncTable){ _purchaseSyncPushQueued=true; return; }
   _pushingPurchaseSyncTable=true;
   try{
     const rows=(DB.purchases||[]).map(_mapDocToSyncPurchaseRecord);
@@ -1835,6 +1871,10 @@ async function pushPurchaseInvoicesToSyncTable(){
     console.warn('[Shared Sync] push failed:',e.message);
   }finally{
     _pushingPurchaseSyncTable=false;
+    if(_purchaseSyncPushQueued){
+      _purchaseSyncPushQueued=false;
+      pushPurchaseInvoicesToSyncTable(); // send the up-to-date state now, rather than lose it
+    }
   }
 }
 function save(){
@@ -4249,7 +4289,7 @@ function approveP(id){
   }
 }
 // ════ DELETE PURCHASE / ACCOUNTING INVOICE ════
-function deletePurchase(id,mode){
+async function deletePurchase(id,mode){
   const arr=mode==='accounting'?DB.acctInvs:DB.purchases;
   const idx=arr.findIndex(x=>x.id===id);
   if(idx<0){toast('Record not found','err','⚠️');return;}
@@ -4274,6 +4314,23 @@ function deletePurchase(id,mode){
   window._pendingDeletes.add(id);
   save();rendDash();rendRegs();rendPurchaseList();updateApprCount();
   toast(`${p.no} deleted locally. Syncing with server...`,'ok','🗑️');
+  // FIX ("purchase delete and blank but after sec same data reflect —
+  // not deleted" — Aug 2026, root-cause pass): save() above kicks off
+  // pushPurchaseInvoicesToSyncTable() fire-and-forget, but this function
+  // used to return immediately without ever confirming that push actually
+  // reached the shared SYNC_purchase_invoices table — the ONE table this
+  // file's own SYNC_PULL_ALL poll (and inventory.html) actually reads.
+  // The separate DELETE_PURCHASE_INVOICE call below targets a different,
+  // largely-unused backend table (see the note at the top of this file on
+  // PURCHASE_DB.PURCHASE_INVOICE having zero real rows) — it was never
+  // what actually removed this invoice from the table that matters, so
+  // _pendingDeletes was only ever guarding against ITS race, not the real
+  // one. Now: explicitly wait for a confirmed, guaranteed push (the
+  // queued-retry fix in pushPurchaseInvoicesToSyncTable() above ensures
+  // this can't be silently dropped even if another push was already in
+  // flight) before moving on — closing the actual window a poll could
+  // land in and resurrect the row.
+  await pushPurchaseInvoicesToSyncTable();
   // FIX ("delete bills but wrong shown in some places / not match"): this
   // used to only remove the record locally — deleteGRN() right below already
   // calls the backend on delete, this never did, so a "deleted" invoice
@@ -4378,6 +4435,12 @@ async function bulkDeleteSelectedPurchases(){
   if(typeof editingPurchaseId!=='undefined' && ids.includes(editingPurchaseId)){editingPurchaseId=null;editingPurchaseMode=null;}
   save();rendDash();rendRegs();rendPurchaseList();updateApprCount();
   toast(`${removed.length} invoice(s) deleted locally. Syncing with server...`,'ok','🗑️');
+  // FIX (same root cause as deletePurchase() above — "purchase delete and
+  // blank but after sec same data reflect"): wait for a confirmed,
+  // guaranteed push to the shared SYNC_purchase_invoices table before
+  // proceeding, so a poll landing right after a bulk delete can't
+  // resurrect any of the just-removed rows.
+  await pushPurchaseInvoicesToSyncTable();
   // Same server-delete + honest-failure-restore pattern as the single-row
   // deletePurchase() above, run in parallel across every selected id.
   const results=await Promise.allSettled(removed.map(p=>
