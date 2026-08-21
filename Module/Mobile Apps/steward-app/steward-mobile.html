@@ -636,6 +636,30 @@ const GAS_APIS_DASH = {
   V2_CORE: 'https://script.google.com/macros/s/' + (localStorage.getItem('bnx_api_core') || 'AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ') + '/exec',
   V2_AUTH: 'https://script.google.com/macros/s/' + (localStorage.getItem('bnx_api_auth') || 'AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx') + '/exec',
 };
+/* CENTRALIZED CONFIG (production audit #16/#3 — "hardcoded deployment
+   IDs must go"): the two hardcoded IDs above remain ONLY as the
+   bootstrap fallback needed to make this very first call — this
+   fetches the real, current IDs from GET_CONFIG (one source of
+   truth, shared with restaurant-dashboard.html) and caches them into
+   the SAME localStorage keys GAS_APIS_DASH already reads as an
+   override, on every load. A future deployment ID rotation is one
+   cell edit in your DEPLOYMENT_CONFIG tab, not a redeploy of 3 HTML
+   files — this is exactly the gap that caused the earlier login
+   regression (V2_AUTH silently overwritten by a copy/paste from
+   another file). Fails silently to the hardcoded fallback if the
+   config tab doesn't exist yet or the call fails — never blocks
+   startup on this. */
+async function bnxRefreshConfig(){
+  try{
+    const r = await fetch(GAS_APIS_DASH.V2_CORE, {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({action:'GET_CONFIG'})});
+    const res = await r.json();
+    if(res && res.success && res.data){
+      if(res.data.v2CoreId) localStorage.setItem('bnx_api_core', res.data.v2CoreId);
+      if(res.data.v2AuthId) localStorage.setItem('bnx_api_auth', res.data.v2AuthId);
+    }
+  }catch(e){ /* silent — hardcoded fallback above still works */ }
+}
+bnxRefreshConfig();
 /* FIX: same multi-fallback CLIENT_ID resolution the dashboard uses
    (session ERP_USER → flat ERP_CLIENT key → ?client= URL param →
    cached bnx_client_id) instead of a hardcoded 'CLI001' fallback that
@@ -842,8 +866,18 @@ async function flushOutbox(){
   if(!list.length) return;
   let anyFailed = false;
   const remaining = [];
+  const now = Date.now();
   for(const entry of list){
+    // EXPONENTIAL BACKOFF (production audit #13 — "retry with
+    // exponential backoff, no duplicate network calls"): flat 15s
+    // retries hammer an already-failing backend at the same rate as a
+    // healthy one. Delay grows 15s→30s→60s...capped at 5min, so a
+    // backend that's down for a while gets progressively less traffic
+    // instead of a constant drumbeat of doomed requests.
+    const dueAt = (entry.lastAttemptAt||0) + Math.min(15000 * Math.pow(2, entry.attempts), 300000);
+    if(now < dueAt){ remaining.push(entry); continue; }
     entry.attempts++;
+    entry.lastAttemptAt = now;
     const res = await gasApi(entry.action, entry.payload, 'V2_CORE');
     if(res && res.success){
       // Successfully synced late — apply any follow-up UI update tagged on this entry
@@ -1059,10 +1093,38 @@ async function doLogin(){
   document.getElementById('prof-name').textContent=name;
   document.getElementById('prof-avatar').textContent=name[0];
   document.getElementById('prof-role').textContent=(result.ROLE||'')+' • Morning Shift';
-  loadMenuFromServer();
+  loadBootstrapOrFallback();
   loadKOTFromServer();
-  loadTablesLive();
   showScreen('s-home');
+}
+/* Production audit #4/#13 — "one bootstrap request instead of 6-15
+   API calls": tries GET_BOOTSTRAP first (menu+tables in one round
+   trip); if it's not available yet server-side or fails, falls back
+   to the two separate calls this app already had, so nothing breaks
+   for a backend that hasn't added the bootstrap handler yet. */
+async function loadBootstrapOrFallback(){
+  const res = await gasApi('GET_BOOTSTRAP', {}, 'V2_CORE');
+  if(res && res.success && res.data){
+    if(Array.isArray(res.data.menu) && res.data.menu.length){
+      MENU = res.data.menu.map(m=>({
+        id: m.id, name: m.name, cat: m.category||'Other', price: Number(m.price)||0,
+        icon: m.icon || bnxDefaultIcon(m.category), avail: m.avail!==false, gst: Number(m.gst)||0
+      }));
+      if(document.getElementById('s-new-order')?.classList.contains('active')) renderMenu();
+    }
+    if(Array.isArray(res.data.tables) && res.data.tables.length){
+      // Same row shape loadTablesLive() already parses from fetchSheet — reuse it directly.
+      TABLES = res.data.tables.filter(r=>r&&r[0]).map((r,idx)=>({
+        id:String(r[0]).trim(), no:idx+1, status:bnxMapSheetStatusToTcard(r[3]),
+        covers:Number(r[6])||0, bill:Number(r[11])||0, steward:r[5]||''
+      }));
+      if(document.getElementById('s-tables')?.classList.contains('active')) renderMobTables();
+    }
+    return;
+  }
+  // Bootstrap not available/failed — original individual calls
+  loadMenuFromServer();
+  loadTablesLive();
 }
 
 /* ── TABLES ── */

@@ -102,9 +102,32 @@ const GAS_APIS_DASH = {
   // broke when this was pointed at V2_CORE. V2_CORE stays consolidated —
   // only that part of the earlier change is reverted. V2_FRONTEND key
   // removed entirely — confirmed unused, was a leftover legacy deployment.
+  //
+  // ⚠️ UNVERIFIED: this fallback ID is IDENTICAL to V2_CORE's — the
+  // exact same pattern that broke steward-mobile.html's login (that
+  // app's real working V2_AUTH was a DIFFERENT id,
+  // AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx).
+  // Left untouched here to avoid a second guessed regression — but
+  // worth testing whether dashboard login has actually been verified
+  // working, or whether this has the same latent bug, just unnoticed.
   V2_CORE:     'https://script.google.com/macros/s/' + (function(){try{return localStorage.getItem('bnx_api_core');}catch(e){}}()||'AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ') + '/exec',
   V2_AUTH:     'https://script.google.com/macros/s/' + (function(){try{return localStorage.getItem('bnx_api_auth');}catch(e){}}()||'AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ') + '/exec',
 };
+/* CENTRALIZED CONFIG — same mechanism as steward-mobile.html, see its
+   comment for the full explanation. Once DEPLOYMENT_CONFIG exists in
+   your security DB, both apps' V2_CORE/V2_AUTH stay in sync from one
+   place instead of each carrying an independent, driftable copy. */
+async function bnxRefreshConfig(){
+  try{
+    const r = await fetch(GAS_APIS_DASH.V2_CORE, {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({action:'GET_CONFIG'})});
+    const res = await r.json();
+    if(res && res.success && res.data){
+      if(res.data.v2CoreId) localStorage.setItem('bnx_api_core', res.data.v2CoreId);
+      if(res.data.v2AuthId) localStorage.setItem('bnx_api_auth', res.data.v2AuthId);
+    }
+  }catch(e){ /* silent — hardcoded fallback above still works */ }
+}
+bnxRefreshConfig();
 const GAS_URL = GAS_APIS_DASH.V2_CORE;
 const CLIENT_ID=(function(){
   try{
@@ -9673,8 +9696,12 @@ async function flushOutbox(){
   const list = bnxGetOutbox();
   if(!list.length) return;
   const remaining = [];
+  const now = Date.now();
   for(const entry of list){
+    const dueAt = (entry.lastAttemptAt||0) + Math.min(15000 * Math.pow(2, entry.attempts), 300000);
+    if(now < dueAt){ remaining.push(entry); continue; }
     entry.attempts++;
+    entry.lastAttemptAt = now;
     const res = await gasApi(entry.action, entry.payload, 'V2_CORE');
     if(!(res && res.success)){
       if(entry.attempts < 10) remaining.push(entry);
@@ -15281,6 +15308,28 @@ function warmBillingCache() {
   // Async cache warming (non-blocking)
   setTimeout(async () => {
     try {
+      // Production audit #4/#13 — try GET_BOOTSTRAP first (one round
+      // trip for menu+tables instead of several separate calls);
+      // falls through to the original individual calls unchanged if
+      // it's not available server-side yet.
+      const bootRes = await gasApi('GET_BOOTSTRAP', {}, 'V2_CORE').catch(()=>null);
+      if(bootRes && bootRes.success && bootRes.data){
+        if(Array.isArray(bootRes.data.menu) && bootRes.data.menu.length && typeof menuData!=='undefined'){
+          bootRes.data.menu.forEach(row=>{
+            const existing = menuData.find(m=>m.n.toLowerCase()===String(row.name||'').toLowerCase());
+            if(!existing && row.name){
+              menuData.push({ n:row.name, p:Number(row.price)||0, c:row.category||'Uncategorised',
+                v:'NV', e:row.icon||(typeof bnxDefaultIcon==='function'?bnxDefaultIcon(row.category):'🍽'), fav:false,
+                code: row.id||('ITM'+Date.now().toString().slice(-6)), gst: Number(row.gst)||0 });
+            }
+          });
+          if(typeof bnxSaveMenuData==='function') bnxSaveMenuData();
+          if(typeof bnxRebuildCategoryPills==='function') bnxRebuildCategoryPills();
+          if(document.getElementById('page-pos')?.classList.contains('active') && typeof buildMenu==='function') buildMenu();
+        }
+        console.log('[BN_CACHE] Billing data warmed via GET_BOOTSTRAP');
+        return;
+      }
       // FIX ("warm cache pulls menu but throws the result away"): this
       // fired GET_MENU_ITEMS purely to "warm" a cache that nothing
       // else ever read — the response was discarded outright. Now
