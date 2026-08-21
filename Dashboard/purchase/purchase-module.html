@@ -1777,7 +1777,7 @@ function _mapSyncRecordToDoc(rec){
   return {
     id: rec._id,
     no: rec.inv_no||'',
-    date: rec.inv_date||'',
+    date: normalizeDateStr(rec.inv_date)||rec.inv_date||'',
     vendorId: rec.party_id||'',
     vendorName: rec.party_name||'',
     poRef: '', grnRef: '', mode: 'inventory',
@@ -1838,6 +1838,7 @@ function _mapDocToSyncPurchaseRecord(doc){
 }
 let _pushingPurchaseSyncTable=false;
 let _purchaseSyncPushQueued=false;
+let _purchaseSyncPushWaiters=[]; // resolvers for callers awaiting the NEXT push to actually land
 async function pushPurchaseInvoicesToSyncTable(){
   if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return;
   // FIX ("delete blank but after a sec same data reflect — not deleted" —
@@ -1862,7 +1863,27 @@ async function pushPurchaseInvoicesToSyncTable(){
   // in-flight one finishes, carrying whatever DB.purchases looks like at
   // that moment — so a deletion (or any other change) can never be lost
   // to this race, no matter how many pushes land back-to-back.
-  if(_pushingPurchaseSyncTable){ _purchaseSyncPushQueued=true; return; }
+  // FIX (Aug 2026, "delete problem check — still not solved"): the fix
+  // above only ever guaranteed a follow-up push would eventually be SENT —
+  // it never made deletePurchase()'s `await pushPurchaseInvoicesToSyncTable()`
+  // actually wait for it. When a push was already in flight, this just set
+  // the queue flag and hit `return` — an async function's bare `return`
+  // resolves its promise immediately with undefined. So the "explicitly
+  // wait for a confirmed, guaranteed push before moving on" comment in
+  // deletePurchase() was never true in exactly the case it existed to
+  // cover: the delete's own push landing while an unrelated push (e.g. an
+  // edit's save(), or the 20s poll's own SYNC_PUSH_TABLE) was still in
+  // flight. deletePurchase() carried on immediately, and the still-queued
+  // push (carrying the actual row removal) could still lose the race
+  // against the next SYNC_PULL_ALL poll, which then pulled the "deleted"
+  // row straight back onto the Dashboard/Registers. Now: a call that
+  // arrives while a push is in flight returns a promise that only
+  // resolves once the queued follow-up push it triggered has genuinely
+  // completed, so `await` really does wait.
+  if(_pushingPurchaseSyncTable){
+    _purchaseSyncPushQueued=true;
+    return new Promise(resolve=>{ _purchaseSyncPushWaiters.push(resolve); });
+  }
   _pushingPurchaseSyncTable=true;
   try{
     const rows=(DB.purchases||[]).map(_mapDocToSyncPurchaseRecord);
@@ -1874,8 +1895,10 @@ async function pushPurchaseInvoicesToSyncTable(){
     _pushingPurchaseSyncTable=false;
     if(_purchaseSyncPushQueued){
       _purchaseSyncPushQueued=false;
-      pushPurchaseInvoicesToSyncTable(); // send the up-to-date state now, rather than lose it
+      await pushPurchaseInvoicesToSyncTable(); // send the up-to-date state now, rather than lose it — and actually wait for it
     }
+    const waiters=_purchaseSyncPushWaiters;_purchaseSyncPushWaiters=[];
+    waiters.forEach(res=>res());
   }
 }
 function save(){
@@ -2582,7 +2605,31 @@ function load(){
   };
 })();
 function fmt(n){return'₹'+(+n||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}
-function fmtD(d){return d?new Date(d).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}):'—'}
+// FIX ("not proper view date" — Aug 2026): dates reach this file from
+// several sources that don't all reliably give ISO yyyy-mm-dd — the AI
+// invoice scanner is prompted for YYYY-MM-DD but scanned Indian bills
+// print DD/MM/YYYY, DD-MM-YYYY, or "21 Jul 2026", and the vision model
+// sometimes echoes the printed format back verbatim instead of
+// converting it. A raw non-ISO string set into a native
+// <input type="date"> is silently rejected (field just shows empty), and
+// fed straight to `new Date(...)` here it either prints "Invalid Date"
+// or — worse — silently swaps day/month (e.g. "03/04/2026" read as 4 Mar
+// instead of 3 Apr). This converts the common shapes to real yyyy-mm-dd.
+function normalizeDateStr(d){
+  if(!d)return '';
+  d=String(d).trim();
+  if(/^\d{4}-\d{2}-\d{2}$/.test(d))return d; // already ISO
+  const m=d.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/); // DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
+  if(m){
+    let dd=+m[1],mm=+m[2];
+    if(mm>12&&dd<=12){[dd,mm]=[mm,dd];} // first part >12 must be the day, whichever slot it printed in
+    if(mm>=1&&mm<=12&&dd>=1&&dd<=31)return `${m[3]}-${String(mm).padStart(2,'0')}-${String(dd).padStart(2,'0')}`;
+    return '';
+  }
+  const parsed=new Date(d); // e.g. "21 Jul 2026"
+  return isNaN(parsed.getTime())?'':parsed.toISOString().split('T')[0];
+}
+function fmtD(d){const n=normalizeDateStr(d);return n?new Date(n+'T00:00:00').toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}):'—'}
 function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2)}
 // FIX ("all text same style auto capital or proper fix if items or
 // vendor master all" — Aug 2026): same normalizer added to
@@ -5832,7 +5879,7 @@ async function processInvoiceScan(file){
       pan:data.vendorPan||'',
       mobile:data.vendorMobile||'',
       invoiceNo:data.invoiceNo||('VI-'+Date.now()),
-      invoiceDate:data.invoiceDate||new Date().toISOString().split('T')[0],
+      invoiceDate:normalizeDateStr(data.invoiceDate)||new Date().toISOString().split('T')[0],
       billTo:data.billTo||'',
       items:normalizedItems,
       subtotal:data.subtotal||0,
