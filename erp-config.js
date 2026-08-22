@@ -416,20 +416,41 @@ function erpLoadRegistry(cb){
      a flat object with uppercase keys regardless of GS version
 ─────────────────────────────────────────────────────────────── */
 
-/* ── DEMO MODE: works without GAS URL ── */
+/* ── DEMO MODE: works without GAS URL ──
+   SECURITY FIX: these credentials (including two SUPER_ADMIN logins, one of
+   them a real-looking phone number) were reachable on the LIVE hosted app,
+   not just local testing — this file loads on every page, and anyone with
+   devtools open could call _erpDemoLogin('admin','admin') and hand
+   themselves a real SUPER_ADMIN session client-side, no server round-trip.
+   Since session resolution elsewhere in this suite falls back to a
+   ?client=<id> URL parameter when the session itself doesn't carry one (and
+   this demo payload never sets CLIENT_ID), that's a path toward accessing
+   ANY client's data, not just a sandboxed demo — exactly what client
+   isolation (spec §3) exists to prevent. The stated purpose — letting the
+   app run without a configured GAS URL — is only real when there's also no
+   real backend and no real client data at stake, i.e. local file:// testing.
+   Once hosted with INV_GAS_CORE pointing at a real deployment (as it always
+   does now, see above), this must never be reachable. Restricted below. */
 const _DEMO_USERS = [
   {id:'admin',    pw:'admin',    ROLE:'SUPER_ADMIN',FULL_NAME:'Super Admin',  BRANCH:'Main Branch', CLIENT:'Balaji NextGen'},
   {id:'manager',  pw:'manager',  ROLE:'MANAGER',    FULL_NAME:'Manager',      BRANCH:'Main Branch', CLIENT:'Balaji NextGen'},
   {id:'cashier',  pw:'cashier',  ROLE:'CASHIER',    FULL_NAME:'Cashier',      BRANCH:'Counter 1',   CLIENT:'Balaji NextGen'},
   {id:'chef',     pw:'chef',     ROLE:'CHEF',       FULL_NAME:'Chef',         BRANCH:'Kitchen',     CLIENT:'Balaji NextGen'},
   {id:'waiter',   pw:'waiter',   ROLE:'WAITER',     FULL_NAME:'Waiter',       BRANCH:'Floor 1',     CLIENT:'Balaji NextGen'},
-  {id:'owner',    pw:'owner',    ROLE:'OWNER',      FULL_NAME:'Owner',        BRANCH:'HQ',          CLIENT:'Balaji NextGen'},
+  {id:'owner',    pw:'owner',   ROLE:'OWNER',      FULL_NAME:'Owner',        BRANCH:'HQ',          CLIENT:'Balaji NextGen'},
   {id:'developer',pw:'dev123',   ROLE:'DEVELOPER',  FULL_NAME:'Developer',    BRANCH:'Tech',        CLIENT:'Balaji NextGen'},
   {id:'9832014403',pw:'1234',   ROLE:'SUPER_ADMIN', FULL_NAME:'Balaji Admin', BRANCH:'HQ',          CLIENT:'Balaji NextGen'},
   {id:'admin@demo.com',pw:'demo123',ROLE:'SUPER_ADMIN',FULL_NAME:'Demo Admin',BRANCH:'Main',        CLIENT:'Balaji NextGen'},
 ];
 
 function _erpDemoLogin(loginId, password) {
+  // FIX: hard-block demo credentials outside local file:// testing — see
+  // the block comment above. This is the actual enforcement point; the
+  // credential list itself is left in place only so file:// testing keeps
+  // working without a live backend.
+  if (!IS_LOCAL_FILE) {
+    return { status:'error', message:'Demo login is disabled on this deployment. Please sign in with a real account.' };
+  }
   const id  = (loginId  || '').toLowerCase().trim();
   const pwd = (password || '').trim();
   for (const u of _DEMO_USERS) {
