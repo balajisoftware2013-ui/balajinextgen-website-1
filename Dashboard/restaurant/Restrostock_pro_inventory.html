@@ -706,6 +706,21 @@ const PURCHASE_MODULE_URL = '../purchase/purchase-module.html';
 // ── Client ID resolution — same priority order/keys as inventory.html
 // and purchase-module.html, so a session started in either place is
 // recognised here too without a separate login. ──
+// P0 FIX — CRITICAL (same URL-trust bug already found and fixed across
+// every other file in this suite, but a more severe version of it):
+// this used to read ?client= directly from the URL and — worse than
+// every other instance of this bug — WROTE it into the shared
+// 'bnx_client_id' localStorage cache. That cache is read by
+// window.INV_CLIENT_ID above and by every other module on this device
+// that trusts 'bnx_client_id' as a legitimately-resolved value (not a
+// raw, unverified URL param). Opening this page once with
+// ?client=SOMEONE_ELSES_CODE didn't just affect this page's own
+// session — it permanently poisoned the client ID every other page
+// opened afterward on the same browser would silently pick up,
+// including real financial writes from modules that never went near
+// the URL themselves. Removed entirely; only an authenticated session
+// (ERP_USER) or a value already cached by a real login can resolve
+// CID now, matching the fix already applied everywhere else.
 function _resolveKitchenClientId(){
   try{
     const raw = localStorage.getItem('ERP_USER') || sessionStorage.getItem('ERP_USER')
@@ -715,10 +730,6 @@ function _resolveKitchenClientId(){
       const cid = u.CLIENT_ID || u.clientId || u.client_id;
       if (cid) return cid;
     }
-  }catch(e){}
-  try{
-    const fromUrl = new URLSearchParams(location.search).get('client');
-    if (fromUrl){ localStorage.setItem('bnx_client_id', fromUrl); return fromUrl; }
   }catch(e){}
   return localStorage.getItem('ERP_CLIENT')
     || window.INV_CLIENT_ID
@@ -739,10 +750,20 @@ async function erpApi(action, payload){
   if(!_hasRealSession()){
     return { success:false, message:'No real client session — please log in again before saving.' };
   }
+  // P0 FIX: sessionToken was never sent — the confirmed backend
+  // requires it on every call via bnxRequireSession_() and rejects
+  // anything without it, same fix already applied across every other
+  // file in this suite.
+  const sessionToken = (function(){
+    try{
+      const u = JSON.parse(localStorage.getItem('ERP_USER')||sessionStorage.getItem('ERP_USER')||'{}');
+      return u.sessionToken || u.SESSION_TOKEN || u.token || localStorage.getItem('ERP_SESSION') || '';
+    }catch(e){ return localStorage.getItem('ERP_SESSION') || ''; }
+  })();
   try{
     const r = await fetch(KITCHEN_SCRIPT_URL, {
       method:'POST',
-      body: JSON.stringify(Object.assign({ action, clientId:CID }, payload))
+      body: JSON.stringify(Object.assign({ action, clientId:CID, sessionToken }, payload))
     });
     return await r.json();
   }catch(e){
@@ -1065,7 +1086,7 @@ function renderIng(list){
     const sl=p.stock===0?'Out of Stock':p.stock<=p.minQty?'Low Stock':'In Stock';
     const now=new Date();const expDays=p.expiry?Math.ceil((new Date(p.expiry)-now)/864e5):999;
     const expBadge=expDays<=3?'br':expDays<=7?'by':'bg';
-    return `<tr><td><code>${p.code}</code></td><td><strong>${p.name}</strong> ${p._liveSync?'<span class="badge bg" style="font-size:9px" title="Live — synced from real Store stock">🔗 Live</span>':'<span class="badge by" style="font-size:9px" title="No matching item in the shared Store item master yet — this number is local only, not synced">Local only</span>'}<div class="txs tmut">${p.supplier||''}</div></td><td><span class="badge bb">${p.category}</span></td><td><div class="pw"><span style="font-weight:700;min-width:28px">${p.stock}</span><div class="pb"><div class="pf" style="width:${pct}%;background:${sc}"></div></div></div></td><td>${p.minQty}</td><td>${p.unit}</td><td>₹${p.cost}</td><td>₹${fmt(val)}</td><td><span class="badge bgr">${p.storage}</span></td><td>${p.expiry?`<span class="badge ${expBadge}">${expDays}d</span>`:'—'}</td><td><span class="badge ${sb}">${sl}</span></td><td><div class="flex gap6"><button class="btn bo xs" onclick="editIng('${p._id}')">✏</button><button class="btn bd xs" onclick="delIng('${p._id}')">🗑</button></div></td></tr>`;
+    return `<tr><td><code>${p.code}</code></td><td><strong>${p.name}</strong> ${p._liveSync?'<span class="badge bg" style="font-size:9px" title="Live — synced from real Store stock">🔗 Live</span>':'<span class="badge by" style="font-size:9px" title="No matching item in the shared Store item master yet — this number is local only, not synced">Local only</span>'}<div class="txs tmut">${p.supplier||''}</div></td><td><span class="badge bb">${p.category}</span></td><td><div class="pw"><span style="font-weight:700;min-width:28px">${p.stock}</span><div class="pb"><div class="pf" style="width:${pct}%;background:${sc}"></div></div></div></td><td>${p.minQty}</td><td>${p.unit}</td><td>₹${fmt(p.cost)}</td><td>₹${fmt(val)}</td><td><span class="badge bgr">${p.storage}</span></td><td>${p.expiry?`<span class="badge ${expBadge}">${expDays}d</span>`:'—'}</td><td><span class="badge ${sb}">${sl}</span></td><td><div class="flex gap6"><button class="btn bo xs" onclick="editIng('${p._id}')">✏</button><button class="btn bd xs" onclick="delIng('${p._id}')">🗑</button></div></td></tr>`;
   }).join('')||`<tr><td colspan="12" class="nodata">No ingredients found</td></tr>`;
 }
 // FIX ("edit → cancel → add new silently overwrites the edited
@@ -1191,14 +1212,14 @@ function renderRecipes(){
     return `<div class="recipe-card"><h4>${r.name} <span class="badge ${catBadge}" style="font-size:11px">${r.category}</span></h4>
       <p class="tsm tmut" style="margin-bottom:12px">${r.desc}</p>
       <div class="flex gap10" style="margin-bottom:10px;flex-wrap:wrap">
-        <div><div class="txs tmut">Selling Price</div><div style="font-size:16px;font-weight:800">₹${r.price}</div></div>
+        <div><div class="txs tmut">Selling Price</div><div style="font-size:16px;font-weight:800">₹${fmt(r.price)}</div></div>
         <div><div class="txs tmut">Food Cost %</div><div style="font-size:16px;font-weight:800;color:${costColor}">${r.costPct}%</div></div>
         <div><div class="txs tmut">Food Cost ₹</div><div style="font-size:16px;font-weight:800">₹${(r.price*r.costPct/100).toFixed(0)}</div></div>
         <div><div class="txs tmut">Gross Profit</div><div style="font-size:16px;font-weight:800;color:#10B981">₹${(r.price*(1-r.costPct/100)).toFixed(0)}</div></div>
       </div>
       <div class="txs tmut" style="margin-bottom:5px">Key Ingredients: ${r.ingredients.join(' · ')}</div>
       <div class="waste-bar"><div class="waste-fill" style="width:${r.costPct}%"></div></div>
-      <div class="txs tmut">Food cost: ${r.costPct}% of ₹${r.price}</div>
+      <div class="txs tmut">Food cost: ${r.costPct}% of ₹${fmt(r.price)}</div>
     </div>`;
   }).join('')||`<div class="al ali">No recipes yet. Add your first menu item.</div>`;
 }
@@ -1279,7 +1300,7 @@ function renderCost(){
     <div class="kpi" style="--kc:#10B981"><div class="ktop"><div class="klbl">Below Target</div></div><div class="kval">${db.recipes.filter(r=>r.costPct<=target).length}</div></div>
   </div>
   <div class="tc"><div class="ch" style="padding:13px 16px"><span class="ct">💰 Food Cost by Dish</span></div><div class="tw"><table><thead><tr><th>Dish</th><th>Category</th><th>Sell Price ₹</th><th>Food Cost ₹</th><th>Food Cost %</th><th>Gross Profit ₹</th><th>Status</th></tr></thead><tbody>
-  ${sorted.map(r=>{const fc=+(r.price*r.costPct/100).toFixed(0);const gp=r.price-fc;const good=r.costPct<=target;return `<tr><td><strong>${r.name}</strong></td><td><span class="badge bb">${r.category}</span></td><td>₹${r.price}</td><td>₹${fc}</td><td style="color:${r.costPct>35?'#EF4444':r.costPct>30?'#F59E0B':'#10B981'};font-weight:700">${r.costPct}%</td><td style="color:#10B981;font-weight:700">₹${gp}</td><td><span class="badge ${good?'bg':'br'}">${good?'✓ OK':'↑ High'}</span></td></tr>`;}).join('')}
+  ${sorted.map(r=>{const fc=+(r.price*r.costPct/100).toFixed(0);const gp=r.price-fc;const good=r.costPct<=target;return `<tr><td><strong>${r.name}</strong></td><td><span class="badge bb">${r.category}</span></td><td>₹${fmt(r.price)}</td><td>₹${fmt(fc)}</td><td style="color:${r.costPct>35?'#EF4444':r.costPct>30?'#F59E0B':'#10B981'};font-weight:700">${r.costPct}%</td><td style="color:#10B981;font-weight:700">₹${fmt(gp)}</td><td><span class="badge ${good?'bg':'br'}">${good?'✓ OK':'↑ High'}</span></td></tr>`;}).join('')}
   </tbody></table></div></div>`;
 }
 
@@ -1538,9 +1559,9 @@ function genRptBody(type){
   const range=typeof bnxGetRange==='function'?bnxGetRange('rpt'):null;
   if(type==='stock-summary'){
     const tv=db.ingredients.reduce((s,i)=>s+i.stock*i.cost,0);
-    body.innerHTML=`<div class="tw"><table id="rpt-table"><thead><tr><th>Code</th><th>Ingredient</th><th>Category</th><th>Stock</th><th>Unit</th><th>Cost ₹/Unit</th><th>Value ₹</th><th>Storage</th><th>Status</th></tr></thead><tbody>${db.ingredients.map(i=>`<tr><td><code>${i.code}</code></td><td>${i.name}</td><td>${i.category}</td><td>${i.stock}</td><td>${i.unit}</td><td>₹${i.cost}</td><td>₹${fmt(i.stock*i.cost)}</td><td>${i.storage}</td><td><span class="badge ${i.stock<=i.minQty?'by':'bg'}">${i.stock<=i.minQty?'Low':'OK'}</span></td></tr>`).join('')}<tr style="font-weight:800;background:var(--sf3)"><td colspan="6">TOTAL VALUE</td><td>₹${fmt(tv)}</td><td colspan="2"></td></tr></tbody></table></div>`;
+    body.innerHTML=`<div class="tw"><table id="rpt-table"><thead><tr><th>Code</th><th>Ingredient</th><th>Category</th><th>Stock</th><th>Unit</th><th>Cost ₹/Unit</th><th>Value ₹</th><th>Storage</th><th>Status</th></tr></thead><tbody>${db.ingredients.map(i=>`<tr><td><code>${i.code}</code></td><td>${i.name}</td><td>${i.category}</td><td>${i.stock}</td><td>${i.unit}</td><td>₹${fmt(i.cost)}</td><td>₹${fmt(i.stock*i.cost)}</td><td>${i.storage}</td><td><span class="badge ${i.stock<=i.minQty?'by':'bg'}">${i.stock<=i.minQty?'Low':'OK'}</span></td></tr>`).join('')}<tr style="font-weight:800;background:var(--sf3)"><td colspan="6">TOTAL VALUE</td><td>₹${fmt(tv)}</td><td colspan="2"></td></tr></tbody></table></div>`;
   } else if(type==='recipe-cost'){
-    body.innerHTML=`<div class="tw"><table id="rpt-table"><thead><tr><th>Dish</th><th>Category</th><th>Sell ₹</th><th>Food Cost ₹</th><th>Food Cost %</th><th>Gross Profit ₹</th></tr></thead><tbody>${db.recipes.map(r=>{const fc=+(r.price*r.costPct/100).toFixed(0);return `<tr><td><strong>${r.name}</strong></td><td>${r.category}</td><td>₹${r.price}</td><td>₹${fc}</td><td style="color:${r.costPct>30?'#EF4444':'#10B981'};font-weight:700">${r.costPct}%</td><td style="color:#10B981;font-weight:700">₹${r.price-fc}</td></tr>`;}).join('')}</tbody></table></div>`;
+    body.innerHTML=`<div class="tw"><table id="rpt-table"><thead><tr><th>Dish</th><th>Category</th><th>Sell ₹</th><th>Food Cost ₹</th><th>Food Cost %</th><th>Gross Profit ₹</th></tr></thead><tbody>${db.recipes.map(r=>{const fc=+(r.price*r.costPct/100).toFixed(0);return `<tr><td><strong>${r.name}</strong></td><td>${r.category}</td><td>₹${fmt(r.price)}</td><td>₹${fmt(fc)}</td><td style="color:${r.costPct>30?'#EF4444':'#10B981'};font-weight:700">${r.costPct}%</td><td style="color:#10B981;font-weight:700">₹${fmt(r.price-fc)}</td></tr>`;}).join('')}</tbody></table></div>`;
   } else if(type==='waste-report'){
     const log=typeof bnxInRange==='function'?db.wasteLog.filter(w=>bnxInRange(w.date,range)):db.wasteLog;
     const tw=log.reduce((s,w)=>s+w.cost,0);
@@ -1610,8 +1631,8 @@ function localAI(q){
   if(l.includes('low stock')||l.includes('order')||l.includes('reorder'))return low.length?`⚠️ ${low.length} ingredients need ordering:\n${low.map(i=>`• ${i.name}: ${i.stock}/${i.minQty} ${i.unit} (supplier: ${i.supplier})`).join('\n')}`:'✅ All ingredients adequately stocked!';
   if(l.includes('expir'))return exp3.length?`⏰ Expiring in 3 days:\n${exp3.map(i=>`• ${i.name}: ${i.stock} ${i.unit} (${i.expiry})`).join('\n')}\nUse FIFO, run specials, or discard safely.`:'✅ No items expiring in 3 days!';
   if(l.includes('summar')||l.includes('overview'))return `📊 Kitchen Summary:\n• Ingredients: ${db.ingredients.length}\n• Stock value: ₹${fmt(tv)}\n• Low stock: ${low.length}\n• Recipes: ${db.recipes.length}\n• Avg food cost: ${db.recipes.length?(db.recipes.reduce((s,r)=>s+r.costPct,0)/db.recipes.length).toFixed(1):0}%`;
-  if(l.includes('can make')||l.includes('available'))return `Available dishes based on stock:\n${db.recipes.filter(r=>r.costPct<=35).map(r=>`✅ ${r.name} (₹${r.price})`).join('\n')}`;
-  if(l.includes('food cost')||l.includes('cost'))return `Food cost breakdown:\n${db.recipes.sort((a,b)=>b.costPct-a.costPct).slice(0,5).map(r=>`• ${r.name}: ${r.costPct}% (₹${r.price})`).join('\n')}\nTarget: ${db.settings.foodCostTarget||28}%`;
+  if(l.includes('can make')||l.includes('available'))return `Available dishes based on stock:\n${db.recipes.filter(r=>r.costPct<=35).map(r=>`✅ ${r.name} (₹${fmt(r.price)})`).join('\n')}`;
+  if(l.includes('food cost')||l.includes('cost'))return `Food cost breakdown:\n${db.recipes.sort((a,b)=>b.costPct-a.costPct).slice(0,5).map(r=>`• ${r.name}: ${r.costPct}% (₹${fmt(r.price)})`).join('\n')}\nTarget: ${db.settings.foodCostTarget||28}%`;
   if(l.includes('waste'))return `Waste this week: ${db.wasteLog.slice(0,7).reduce((s,w)=>s+w.qty,0).toFixed(1)} kg costing ₹${fmt(db.wasteLog.slice(0,7).reduce((s,w)=>s+w.cost,0).toFixed(0))}. Top reason: ${db.wasteLog[0]?.reason||'—'}`;
   if(l.includes('purchase')||l.includes('plan'))return `Suggested purchase for low-stock:\n${low.map(i=>`• ${i.name}: Order ${i.minQty*2} ${i.unit} from ${i.supplier} (~₹${fmt((i.minQty*2*i.cost).toFixed(0))})`).join('\n')||'All adequately stocked!'}`;
   return `I can help with: stock analysis, expiry alerts, food cost review, waste tracking, recipe costing, purchase planning, and more. Ask anything! 👨‍🍳`;
