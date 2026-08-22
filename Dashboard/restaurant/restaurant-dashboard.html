@@ -430,9 +430,20 @@ setInterval(() => {
       if(!u){ window.location.assign('../../login.html'); return; }
       const r=(u.ROLE||u.role||'').toUpperCase();
       const allowed=['SUPER_ADMIN','DEVELOPER','ADMIN','OWNER','MANAGER','CASHIER','WAITER','STEWARD','CAPTAIN','CHEF','KITCHEN','BAR','STAFF','MD','CEO'];
+      // P0 FIX (external audit #18 — "Authentication fallback is still
+      // too permissive"): this used to be `else { showPage(); }` — ANY
+      // session with an unrecognized/blank ROLE still got the full
+      // restaurant dashboard rendered. A valid session is not the same
+      // as an authorized role; showing the page here means "no valid
+      // role for this module" silently becomes "full access anyway".
+      // Backend permission checks (audit #19) remain the real
+      // authority for every sensitive action regardless of this gate —
+      // this only stops an unrecognized role from ever seeing the UI
+      // at all. Failing session/role checks now route to login with a
+      // reason flag instead of rendering the dashboard.
       if(allowed.includes(r)){ showPage(); }
-      else { showPage(); } /* show anyway for restaurant */
-    }catch(e){ showPage(); }
+      else { window.location.assign('../../login.html?denied=1'); }
+    }catch(e){ showPage(); } /* JS error reading session ≠ an authz decision — fail open here only to avoid bricking the app on an unrelated bug; the role check above is the actual gate */
   }
   // v28 FIX: "works on first login, POS/dashboard looks dead on the
   // 2nd click" — this check used to fire as soon as `ERP` merely
@@ -6207,10 +6218,17 @@ window.addEventListener('pageshow', function(ev){
 
 
 /* ── LOGOUT ── */
-function doLogout(){
-  // Clear this user's entry from the shared active-session registry
-  // (see login.html) so a later login for the same ID doesn't get an
-  // incorrect "already active" conflict prompt.
+// P0 FIX (external audit #4 — "Logout should be transaction-aware"):
+// doLogout() used to go straight to bnxClearAllLocalAppData() with no
+// check at all. Two separate problems, both fixed here:
+//   1. bnxClearAllLocalAppData() is now outbox-safe on its own (see
+//      its definition above) — a logout can no longer delete unsynced
+//      transactions even in the worst case.
+//   2. But silently proceeding past pending transactions is still bad
+//      UX/ops — the audit's ideal flow is: 0 pending → logout;
+//      pending exists → offer Sync Now / Logout Anyway / Cancel. That
+//      flow is implemented below instead of a blind logout.
+function bnxDoLogoutNow_(){
   try{
     var u = (typeof ERP!=='undefined' && ERP.getUser) ? ERP.getUser() : null;
     var loginId = u && (u.LOGIN_ID||u.loginId||u.EMAIL||u.MOBILE);
@@ -6227,14 +6245,29 @@ function doLogout(){
   // PREVIOUS client had configured (including business-critical, non
   // CLIENT_ID-namespaced settings like GST config and invoice number
   // prefix — see bnxClearAllLocalAppData's comment). Every logout now
-  // wipes this device's local app cache, same purge the manual "Reset
-  // All Data" button runs, so the next login starts clean and pulls
-  // fresh data for whichever client signs in.
+  // wipes this device's local app cache (pending transactions
+  // excepted — see bnxClearAllLocalAppData), so the next login starts
+  // clean and pulls fresh data for whichever client signs in.
   try{ if(typeof bnxClearAllLocalAppData==='function') bnxClearAllLocalAppData(); }catch(e){}
   try{
     if(typeof ERP!=='undefined'&&ERP.logout){ ERP.logout('../../login.html'); }
     else{ window.location.href='../../login.html'; }
   }catch(e){ window.location.href='../login.html'; }
+}
+async function doLogout(){
+  const pending = (typeof bnxGetOutbox === 'function') ? bnxGetOutbox().length : 0;
+  if (pending === 0){ bnxDoLogoutNow_(); return; }
+  const wantSync = confirm('⚠️ '+pending+' transaction'+(pending>1?'s':'')+' pending sync to the server.\n\nOK = try syncing now, then check again\nCancel = choose to log out anyway or stay logged in');
+  if (wantSync){
+    if (typeof flushOutbox === 'function') await flushOutbox();
+    const stillPending = (typeof bnxGetOutbox === 'function') ? bnxGetOutbox().length : 0;
+    if (stillPending === 0){ bnxDoLogoutNow_(); return; }
+    const logoutAnyway = confirm('⚠️ Still '+stillPending+' transaction'+(stillPending>1?'s':'')+' unsynced (server/network may be unreachable).\n\nThese are protected and will NOT be deleted, and will keep retrying automatically once the app is reopened online.\n\nOK = Logout anyway\nCancel = stay logged in');
+    if (logoutAnyway) bnxDoLogoutNow_();
+    return;
+  }
+  const logoutAnyway = confirm('Log out with '+pending+' transaction'+(pending>1?'s':'')+' still unsynced?\n\nThey are protected and will NOT be deleted, and will resume syncing automatically the next time this app is opened online.\n\nOK = Logout anyway\nCancel = stay logged in');
+  if (logoutAnyway) bnxDoLogoutNow_();
 }
 
 /* v29 FIX: "dashboard access/open not solved — maybe session timeout".
@@ -8581,7 +8614,7 @@ function kdsAction(kotNo){
   const msg = { COOKING:'🔥 Kitchen accepted — cooking started', READY:'✅ Marked Ready to Serve', SERVED:'🍽️ Served' };
   if (typeof showNotif === 'function') showNotif(msg[n] || 'Updated', 'success');
   buildKDS();
-  gasApi('UPDATE_ORDER_STATUS', {orderId:kotNo, status:n}, 'V2_CORE').catch(()=>{});
+  bnxGuaranteedSync('UPDATE_ORDER_STATUS', {orderId:kotNo, status:n});
 }
 function kdsReject(kotNo){
   let open = []; try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
@@ -8593,7 +8626,7 @@ function kdsReject(kotNo){
   bnxSetOpenKotsRaw(JSON.stringify(open));
   if (typeof showNotif === 'function') showNotif('⚠️ '+kotNo+' rejected to Manager — '+reason, 'error');
   buildKDS();
-  gasApi('UPDATE_ORDER_STATUS', {orderId:kotNo, status:'CANCELLED', remarks:reason}, 'V2_CORE').catch(()=>{});
+  bnxGuaranteedSync('UPDATE_ORDER_STATUS', {orderId:kotNo, status:'CANCELLED', remarks:reason});
 }
 setInterval(()=>{ if (document.getElementById('page-kitchen')?.classList.contains('active')) buildKDS(); }, 12000);
 
@@ -9811,6 +9844,36 @@ function bnxUuid(){
     return v.toString(16);
   });
 }
+/* P0 FIX (external audit #5 — "KOT status updates need the same
+   guaranteed outbox treatment everywhere"): gasApi()/erpApi() never
+   actually reject on failure — both internally catch every error and
+   resolve/return {success:false, ...} instead (see their definitions
+   above). That means every existing `gasApi(...).catch(()=>{})` and
+   `erpApi(...).catch(e=>console.warn(...))` call site in this file
+   was 100% dead code — the .catch() handler could never fire, and a
+   failed status update just silently vanished with no retry and no
+   visible sign anything was wrong. kdsAction/kdsReject/cancelOrderReg/
+   proceedToBill/confirmNC/saveOrderRegEdit all had this bug. This
+   helper is the real fix: it AWAITS the call, checks r.success itself
+   (not exceptions), and queues to the same outbox SAVE_TABLE_STATUS
+   already uses on any failure — network error or a clean
+   {success:false} response, both are now caught and retried. */
+async function bnxGuaranteedSync(action, payload, useErpApi){
+  const requestId = (typeof bnxUuid==='function') ? bnxUuid() : String(Date.now());
+  const withId = Object.assign({ requestId }, payload);
+  try{
+    const r = useErpApi
+      ? await erpApi(Object.assign({ action: action }, withId), 'V2_CORE')
+      : await gasApi(action, withId, 'V2_CORE');
+    if (!r || !r.success){
+      if (typeof bnxQueuePending === 'function') bnxQueuePending(action, withId, requestId);
+    }
+    return r;
+  }catch(e){
+    if (typeof bnxQueuePending === 'function') bnxQueuePending(action, withId, requestId);
+    return { success:false, error: e.message };
+  }
+}
 function bnxOutboxKey(){ return 'bnx_outbox_' + (CLIENT_ID || 'default'); }
 function bnxGetOutbox(){ try{ return JSON.parse(localStorage.getItem(bnxOutboxKey())||'[]'); }catch(e){ return []; } }
 function bnxSetOutbox(list){ localStorage.setItem(bnxOutboxKey(), JSON.stringify(list)); bnxUpdateSyncBadge(); }
@@ -9818,6 +9881,30 @@ function bnxQueuePending(action, payload, requestId){
   const list = bnxGetOutbox();
   list.push({ requestId, action, payload, attempts:0, queuedAt:new Date().toISOString() });
   bnxSetOutbox(list);
+}
+/* P0 FIX (external audit #23 — "Never display Success when the
+   backend failed" / status must show LIVE, SYNCING, OFFLINE, PENDING
+   SYNC, and FAILED): a queued entry that failed 10 retries used to
+   just get console.error'd and silently dropped from the outbox —
+   the underlying KOT/order/bill/table-status write was gone with NO
+   trace anywhere in the UI, and the badge would happily go back to
+   🟢 LIVE as if everything had synced. steward-mobile.html already
+   had this fixed with a separate visible "failed" store + retry
+   badge; this file didn't. Ported the same pattern here so both
+   apps behave identically, per audit #6 ("do not duplicate/diverge
+   transaction engines between the two files"). */
+function bnxOutboxFailedKey(){ return 'bnx_outbox_failed_' + (CLIENT_ID || 'default'); }
+function bnxGetFailedOutbox(){ try{ return JSON.parse(localStorage.getItem(bnxOutboxFailedKey())||'[]'); }catch(e){ return []; } }
+function bnxSetFailedOutbox(list){ localStorage.setItem(bnxOutboxFailedKey(), JSON.stringify(list)); bnxUpdateSyncBadge(); }
+function bnxRetryFailedOutbox(){
+  const failed = bnxGetFailedOutbox();
+  if(!failed.length) return;
+  const live = bnxGetOutbox();
+  failed.forEach(e=>{ e.attempts=0; e.lastAttemptAt=0; live.push(e); });
+  bnxSetFailedOutbox([]);
+  bnxSetOutbox(live);
+  if (typeof showNotif === 'function') showNotif('Retrying '+failed.length+' failed sync item(s)…', 'info');
+  flushOutbox();
 }
 let bnxLiveStatus = 'checking';
 function bnxSetLiveStatus(s){
@@ -9832,14 +9919,24 @@ function bnxSetLiveStatus(s){
 function bnxUpdateSyncBadge(){
   const n = bnxGetOutbox().length;
   const el = document.getElementById('bnx-pending-badge');
-  if(!el) return;
-  el.textContent = n ? n+' pending sync' : '';
-  el.style.display = n ? '' : 'none';
-  if(n) bnxSetLiveStatus('syncing');
+  if(el){
+    el.textContent = n ? n+' pending sync' : '';
+    el.style.display = n ? '' : 'none';
+    if(n) bnxSetLiveStatus('syncing');
+  }
+  const nf = bnxGetFailedOutbox().length;
+  const fel = document.getElementById('bnx-failed-badge');
+  if(fel){
+    fel.textContent = nf ? '⚠️ '+nf+' sync issue'+(nf>1?'s':'')+' — tap to retry' : '';
+    fel.style.display = nf ? '' : 'none';
+    fel.style.pointerEvents = nf ? 'auto' : 'none';
+    fel.onclick = bnxRetryFailedOutbox;
+  }
 }
 async function flushOutbox(){
   const list = bnxGetOutbox();
   if(!list.length) return;
+  let anyFailed = false;
   const remaining = [];
   const now = Date.now();
   for(const entry of list){
@@ -9848,13 +9945,22 @@ async function flushOutbox(){
     entry.attempts++;
     entry.lastAttemptAt = now;
     const res = await gasApi(entry.action, entry.payload, 'V2_CORE');
-    if(!(res && res.success)){
-      if(entry.attempts < 10) remaining.push(entry);
-      else console.error('[OUTBOX] gave up after 10 attempts:', entry);
+    if(res && res.success){
+      // synced — nothing further to do, entry is simply dropped from the outbox
+    } else if(entry.attempts < 10){
+      remaining.push(entry);
+      anyFailed = true;
+    } else {
+      console.error('[OUTBOX] gave up after 10 attempts, moved to failed store:', entry);
+      const failed = bnxGetFailedOutbox();
+      failed.push(entry);
+      bnxSetFailedOutbox(failed);
+      if (typeof showNotif === 'function') showNotif('⚠️ A '+(entry.action==='SAVE_BILL'?'bill':entry.action==='SAVE_ORDER'?'order':entry.action==='SAVE_KOT'?'KOT':'update')+' failed to sync after many tries — see the sync-issues badge','error');
     }
   }
   bnxSetOutbox(remaining);
-  if(!remaining.length) bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
+  if(!remaining.length && !bnxGetFailedOutbox().length) bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
+  else if(anyFailed) bnxSetLiveStatus('syncing');
 }
 setInterval(flushOutbox, 15000);
 window.addEventListener('online', ()=>{ bnxSetLiveStatus('live'); flushOutbox(); });
@@ -9887,12 +9993,14 @@ function bnxEnsureStatusBadges(){
   wrap.innerHTML = `
     <div id="bnx-live-badge" style="background:rgba(0,0,0,.6);color:#fff;font-size:10.5px;font-weight:800;padding:4px 11px;border-radius:20px;backdrop-filter:blur(4px);"></div>
     <div id="bnx-pending-badge" style="display:none;background:var(--gold);color:#fff;font-size:10px;font-weight:700;padding:3px 10px;border-radius:20px;"></div>
+    <div id="bnx-failed-badge" style="display:none;background:var(--red,#c0392b);color:#fff;font-size:10px;font-weight:700;padding:3px 10px;border-radius:20px;cursor:pointer;"></div>
   `;
   document.body.appendChild(wrap);
 }
 document.addEventListener('DOMContentLoaded', function(){
   bnxEnsureStatusBadges();
   bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
+  bnxUpdateSyncBadge(); // reflect any items already stuck in "failed" from a previous session
   flushOutbox();
 });
 function bnxRecordBill(d){
@@ -14849,10 +14957,30 @@ function saveBarManualEntry(){
 // there — logging out to let someone else in is exactly when this
 // should happen silently), while the manual button below still exists
 // for clearing a single device without logging out.
+// P0 FIX (external audit #3 — "Reset system needs another safety
+// layer" / "NEVER clear unsynced transactions"): this used to wipe
+// EVERY key starting with bnx_, which silently includes
+// bnx_outbox_<CLIENT_ID> — the pending-sync outbox that
+// SAVE_KOT/SAVE_ORDER/SAVE_BILL/SAVE_TABLE_STATUS queue to when a
+// write fails. A steward's not-yet-synced bill or table-status
+// change would be permanently deleted by this function with no
+// warning — real transaction data loss, not just a stale cache
+// clear. doLogout() also calls this on EVERY logout (see below),
+// which made the risk far worse than the manual Reset button alone:
+// any steward simply logging out with the network down could lose
+// their own unsynced work. BNX_PROTECTED_KEY_PREFIXES below are
+// never touched by this function, no matter which caller invokes it.
+function bnxProtectedKeyPrefixes_(){
+  return ['bnx_outbox_', 'bnx_outbox_failed_'];
+}
+function bnxIsProtectedKey_(k){
+  return bnxProtectedKeyPrefixes_().some(p => k.startsWith(p));
+}
 function bnxClearAllLocalAppData(){
   const keysToRemove = [];
   for (let i=0;i<localStorage.length;i++){
     const k = localStorage.key(i);
+    if (!k || bnxIsProtectedKey_(k)) continue;
     // FIX ("reset but not remove dashboard clean"): these 3 exact keys
     // don't match any of the 4 prefixes below, so they silently survived
     // every previous "Reset All Data" run:
@@ -14861,26 +14989,41 @@ function bnxClearAllLocalAppData(){
     //     size setting was the visible leftover after a "clean" reset.
     //   - _lastArchive and _bnHealthMetrics are internal keys with no
     //     shared prefix at all.
-    if (k && (k === 'bnxPosPrintSize' || k === '_lastArchive' || k === '_bnHealthMetrics')) {
+    if (k === 'bnxPosPrintSize' || k === '_lastArchive' || k === '_bnHealthMetrics') {
       keysToRemove.push(k);
       continue;
     }
-    if (k && (k.startsWith('bnx_') || k.startsWith('bnErp') ||
-        k.startsWith('erp_restaurant_brand_') || k.startsWith('erp_petty_accounts_master_'))) {
+    if (k.startsWith('bnx_') || k.startsWith('bnErp') ||
+        k.startsWith('erp_restaurant_brand_') || k.startsWith('erp_petty_accounts_master_')) {
       keysToRemove.push(k);
     }
   }
   keysToRemove.forEach(k=>localStorage.removeItem(k));
   return keysToRemove.length;
 }
+// P0 FIX (external audit #3 — "Factory Reset is blocked... Sync them
+// first, unless the user explicitly exports/reconciles them"): this
+// now checks the real outbox before allowing a reset. A steward/
+// manager can still force it through, but only after an explicit,
+// separate confirmation that names the risk — no more accidental
+// one-prompt data loss.
 function resetAllLocalData(){
-  const typed = prompt('☢️ RESET ALL DATA — this clears EVERYTHING stored on this device for this app: bill-number sequence, Day Open/Close status, open KOTs, held bills, the local Bill Register, menu items added locally, theme/display preferences, paper size, POS mode, staff/table overrides, and every other local setting.\n\nThis cannot be undone on this device. It still does NOT touch your Google Sheets database.\n\nType RESET EVERYTHING (in capitals) to confirm:');
+  const pending = (typeof bnxGetOutbox === 'function') ? bnxGetOutbox().length : 0;
+  if (pending > 0){
+    const forceReset = confirm('⚠️ '+pending+' PENDING TRANSACTION'+(pending>1?'S':'')+' — not yet synced to the server.\n\nReset All Data will NOT delete these (they are protected), but you should sync them first so this device and the server agree.\n\nPress OK to try syncing now, or Cancel to stop and check the Pending Sync badge yourself.');
+    if (forceReset){
+      if (typeof flushOutbox === 'function') flushOutbox();
+      if (typeof showNotif === 'function') showNotif('Attempting sync — check the pending-sync badge, then run Reset All Data again once it reaches 0.', 'info');
+    }
+    return;
+  }
+  const typed = prompt('☢️ RESET ALL DATA — this clears EVERYTHING stored on this device for this app: bill-number sequence, Day Open/Close status, open KOTs, held bills, the local Bill Register, menu items added locally, theme/display preferences, paper size, POS mode, staff/table overrides, and every other local setting.\n\nThis cannot be undone on this device. It still does NOT touch your Google Sheets database. Unsynced pending transactions (if any) are protected and never deleted by this action.\n\nType RESET EVERYTHING (in capitals) to confirm:');
   if (typed !== 'RESET EVERYTHING'){
     if (typed !== null && typeof showNotif === 'function') showNotif('Reset cancelled — you must type RESET EVERYTHING exactly to confirm.', 'error');
     return;
   }
   const n = bnxClearAllLocalAppData();
-  if (typeof showNotif === 'function') showNotif('☢️ Reset All Data complete ('+n+' items cleared). Reloading…', 'success');
+  if (typeof showNotif === 'function') showNotif('☢️ Reset All Data complete ('+n+' items cleared, pending transactions preserved). Reloading…', 'success');
   setTimeout(()=>location.reload(), 1200);
 }
 
@@ -15016,8 +15159,20 @@ async function loadOrderRegister(){
       throw new Error(res&&res.message||'API call failed');
     }
   } catch(e){
-    orderRegData = orderRegDemoData();
+    // P0 FIX (external audit #2 — "Remove/replace hardcoded demo
+    // transaction data" / "no hardcoded customer/order/bill figures in
+    // LIVE mode"): the fallback itself is reasonable (better than a
+    // blank error screen when the backend is briefly unreachable), but
+    // it used to render silently — nothing distinguished "3 real
+    // orders" from "3 fake orders because the API call failed". A
+    // manager glancing at this screen during an outage could easily
+    // read Suman/Amit/General Customer as real covers. Now flagged
+    // both in the data (isDemo:true, checked by renderOrderRegList
+    // below) and with a visible warning notification every time it
+    // fires.
+    orderRegData = orderRegDemoData().map(o=>Object.assign({isDemo:true}, o));
     if (orderRegFilterType) orderRegData = orderRegData.filter(o=>o.ORDER_SOURCE===orderRegFilterType);
+    if (typeof showNotif === 'function') showNotif('⚠️ Server unreachable — showing DEMO order data, not real orders', 'error');
   }
   // FIX ("update order regiter... kot update"): whatever just came back
   // (live API or demo fallback) reflects the backend/sample state at
@@ -15164,12 +15319,20 @@ function ordRegDateInRange(dt){
 function renderOrderRegList(){
   const el = document.getElementById('orderRegList');
   const filtered = orderRegData.filter(o=>ordRegDateInRange(o.ORDER_DATE));
-  if (!filtered.length){ el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text3);">No orders in this range</div>'; return; }
-  if (orderRegViewMode === 'excel'){ el.innerHTML = renderOrderRegExcelTable(filtered); return; }
-  if (orderRegViewMode !== 'table'){ el.innerHTML = filtered.map(orderRegCardHtml).join(''); return; }
+  // P0 FIX (audit #2): unmissable banner whenever ANY row currently on
+  // screen is demo fallback data (isDemo:true, set only in
+  // loadOrderRegister's catch block above) — not just a one-time
+  // toast that scrolls away, but pinned above the list for as long as
+  // the demo data is showing.
+  const demoBanner = filtered.some(o=>o.isDemo)
+    ? '<div style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;border-radius:8px;padding:8px 12px;margin-bottom:10px;font-size:12px;font-weight:700;text-align:center;">⚠️ DEMO DATA — server unreachable, these are NOT real orders</div>'
+    : '';
+  if (!filtered.length){ el.innerHTML = demoBanner + '<div style="text-align:center;padding:40px;color:var(--text3);">No orders in this range</div>'; return; }
+  if (orderRegViewMode === 'excel'){ el.innerHTML = demoBanner + renderOrderRegExcelTable(filtered); return; }
+  if (orderRegViewMode !== 'table'){ el.innerHTML = demoBanner + filtered.map(orderRegCardHtml).join(''); return; }
   const byTable = {};
   filtered.forEach(o=>{ (byTable[o.TABLE_ID]=byTable[o.TABLE_ID]||[]).push(o); });
-  el.innerHTML = Object.keys(byTable).sort().map(tid=>{
+  el.innerHTML = demoBanner + Object.keys(byTable).sort().map(tid=>{
     const orders = byTable[tid];
     const tableTotal = orders.reduce((s,o)=>s+(o.items||[]).reduce((a,i)=>a+Number(i.amount||i.qty*i.rate||0),0),0);
     return `<div>
@@ -15260,7 +15423,7 @@ async function saveOrderRegEdit(orderId){
   renderOrderRegList();
   closeOrderRegModal();
   if (typeof showNotif==='function') showNotif('✅ Order '+o.ORDER_NO+' updated','success'); else alert('Order updated.');
-  erpApi({action:'SAVE_ORDER', orderId, tableId:o.TABLE_ID, items:o.items}, 'V2_CORE').catch(e=>console.warn('SAVE_ORDER background sync failed:', e));
+  bnxGuaranteedSync('SAVE_ORDER', {orderId, tableId:o.TABLE_ID, items:o.items}, true);
 }
 async function cancelOrderReg(orderId){
   const o = orderRegData.find(x=>x.ORDER_ID===orderId); if (!o) return;
@@ -15270,7 +15433,7 @@ async function cancelOrderReg(orderId){
   closeOrderRegModal();
   renderOrderRegList();
   if (typeof showNotif==='function') showNotif('✖ Order '+o.ORDER_NO+' cancelled','error'); else alert('Order cancelled.');
-  erpApi({action:'UPDATE_ORDER_STATUS', orderId, status:'CANCELLED', remarks:reason}, 'V2_CORE').catch(e=>console.warn('UPDATE_ORDER_STATUS background sync failed:', e));
+  bnxGuaranteedSync('UPDATE_ORDER_STATUS', {orderId, status:'CANCELLED', remarks:reason}, true);
 }
 
 /* FIX ("process to generate bill and bill show window, according new bill
@@ -15286,7 +15449,7 @@ async function cancelOrderReg(orderId){
 function proceedToBill(orderId){
   const o = orderRegData.find(x=>x.ORDER_ID===orderId);
   closeOrderRegModal();
-  erpApi({action:'UPDATE_ORDER_STATUS', orderId, status:'CONFIRMED'}, 'V2_CORE').catch(()=>{});
+  bnxGuaranteedSync('UPDATE_ORDER_STATUS', {orderId, status:'CONFIRMED'}, true);
   showPage('billing', document.querySelector('[onclick*="billing"]'));
   
   if (o){
@@ -15342,7 +15505,7 @@ async function confirmNC(){
   const remarks = document.getElementById('ncRemarks').value.trim();
   if (!remarks){ alert('Please enter a reason — required for NC approval.'); return; }
   closeNCModal();
-  erpApi({action:'UPDATE_ORDER_STATUS', orderId:ncTargetOrderId, status:'NC', remarks}, 'V2_CORE').catch(e=>console.warn('NC status background sync failed:', e));
+  bnxGuaranteedSync('UPDATE_ORDER_STATUS', {orderId:ncTargetOrderId, status:'NC', remarks}, true);
   loadOrderRegister();
   alert('🚫 Order marked NC — sent for manager approval.\nReason: '+remarks);
 }
