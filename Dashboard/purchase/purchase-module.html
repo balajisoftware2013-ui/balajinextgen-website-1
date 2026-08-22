@@ -1934,6 +1934,44 @@ function load(){
     const d=localStorage.getItem('BALAJI_PROCUREMENT');
     if(d){const p=JSON.parse(d);DB={...DB,...p};DB.seq=DB.seq||{p:1,a:1,g:1,q:1,r:1,att:1};DB.settings=DB.settings||{itcIndustry:'restaurant',itcMode:'reverse'};DB.payments=DB.payments||[];DB.vendorLedgers=DB.vendorLedgers||[];}
   }catch(e){}
+  // FIX ("cant delete, deleted then 20 sec again come" — Aug 2026,
+  // one-time cleanup): before mergeSharedInventoryPurchases() started
+  // deduping by content (invoice no + vendor + date + amount), a merged
+  // 'INV-' row could get "baked" into this permanent BALAJI_PROCUREMENT
+  // store the moment any save() ran while it happened to be in memory —
+  // creating a genuine, permanent second copy of the same invoice that
+  // the new dedup logic can't retroactively clean up (it only stops
+  // NEW duplicates, not ones already saved). Squash any such duplicates
+  // here, once, keeping the earliest copy of each and persisting the
+  // cleaned list — so an already-duplicated invoice only has to be
+  // deleted once, not twice.
+  try{
+    if(Array.isArray(DB.purchases)&&DB.purchases.length){
+      const seen=new Map(); // contentKey -> kept record
+      const deduped=[];
+      let removedCount=0;
+      DB.purchases.forEach(p=>{
+        const key=`${p.no}||${p.vendorName}||${p.date}||${(parseFloat(p.grand)||0).toFixed(2)}`;
+        const prior=seen.get(key);
+        if(!prior){ seen.set(key,p); deduped.push(p); return; }
+        // Prefer keeping the one with a real server-confirmed id / synced
+        // record over a merged 'INV-' placeholder, when there's a choice.
+        const priorIsNative = !prior._fromInventoryModule;
+        const thisIsNative = !p._fromInventoryModule;
+        if(!priorIsNative && thisIsNative){
+          const idx=deduped.indexOf(prior);
+          if(idx>=0)deduped[idx]=p;
+          seen.set(key,p);
+        }
+        removedCount++;
+      });
+      if(removedCount){
+        DB.purchases=deduped;
+        console.log('[Purchase Register] Removed '+removedCount+' duplicate invoice row(s) that had been saved twice under different ids.');
+        try{ localStorage.setItem('BALAJI_PROCUREMENT',JSON.stringify(DB)); }catch(e){}
+      }
+    }
+  }catch(e){ console.warn('[Purchase Register] one-time duplicate cleanup failed:',e); }
   // Runs AFTER the merge above so a real, explicitly-saved company
   // GSTIN (see saveCompanyProfile()) always wins over whatever stale
   // 'co' value might be sitting in the older generic BALAJI_PROCUREMENT
@@ -2001,11 +2039,27 @@ function load(){
       DB.purchases = DB.purchases||[];
       const existingIds = new Set(DB.purchases.map(p=>p.id));
       const hiddenIds = (typeof getHiddenInvPurchaseIds==='function') ? getHiddenInvPurchaseIds() : new Set();
+      // FIX ("cant delete, deleted then 20 sec again come" — Aug 2026):
+      // if the SAME invoice already exists as an ordinary DB.purchases
+      // record (e.g. it also reached the server and came back through
+      // pullInventorySyncData's own ERP_LOAD_ALL poll, which runs every
+      // 8s), this merge used to add it a SECOND time under its own
+      // 'INV-' id anyway — two rows for one real invoice. Deleting
+      // either twin looked like "it comes back", because the OTHER twin
+      // — untouched by that delete — was still there and simply got
+      // re-rendered on the next poll. Skip merging in a record that's
+      // already represented by invoice no + vendor + date + amount,
+      // so there's only ever one row per real invoice to delete.
+      const contentKey=p=>`${p.no}||${p.vendorName}||${p.date}||${(parseFloat(p.grand)||0).toFixed(2)}`;
+      const existingContentKeys = new Set(DB.purchases.map(contentKey));
       invPis.forEach(rec=>{
         const rawId = rec._id||rec.id;
         if(hiddenIds.has(rawId)) return; // explicitly deleted from the Purchase Register — never resurrect
         const mappedId = 'INV-'+rawId;
         if(existingIds.has(mappedId)) return; // already merged on a previous pass
+        const recKey=`${rec.inv_no||rec._id}||${rec.party_name||'Unknown Vendor'}||${rec.inv_date}||${(parseFloat(rec.total)||0).toFixed(2)}`;
+        if(existingContentKeys.has(recKey)) return; // same invoice already present under a different (native) id
+        existingContentKeys.add(recKey);
         const cgst=parseFloat(rec.cgst)||0, sgst=parseFloat(rec.sgst)||0, igst=parseFloat(rec.igst)||0;
         DB.purchases.push({
           id: mappedId,
