@@ -2000,8 +2000,11 @@ function load(){
       if(!invPis.length) return;
       DB.purchases = DB.purchases||[];
       const existingIds = new Set(DB.purchases.map(p=>p.id));
+      const hiddenIds = (typeof getHiddenInvPurchaseIds==='function') ? getHiddenInvPurchaseIds() : new Set();
       invPis.forEach(rec=>{
-        const mappedId = 'INV-'+(rec._id||rec.id);
+        const rawId = rec._id||rec.id;
+        if(hiddenIds.has(rawId)) return; // explicitly deleted from the Purchase Register — never resurrect
+        const mappedId = 'INV-'+rawId;
         if(existingIds.has(mappedId)) return; // already merged on a previous pass
         const cgst=parseFloat(rec.cgst)||0, sgst=parseFloat(rec.sgst)||0, igst=parseFloat(rec.igst)||0;
         DB.purchases.push({
@@ -2020,12 +2023,61 @@ function load(){
           billFileUrl: (rec.bill_attachments&&rec.bill_attachments[0]&&rec.bill_attachments[0].data)||'',
           grnRef: '',
           synced: true,
+          createdAt: rec._ts || rec.inv_date || invNow(),
           _fromInventoryModule: true // marks read-only-ish origin — edit/delete here won't touch the inventory.html record
         });
       });
     }catch(e){ console.warn('[Purchase Register] mergeSharedInventoryPurchases failed:',e); }
   }
   window.mergeSharedInventoryPurchases = mergeSharedInventoryPurchases;
+
+  // ════ FIX ("delete but not delete proper" — Aug 2026) ════
+  // deletePurchase() below only ever spliced the row out of DB.purchases —
+  // for a normal invoice that's enough (nothing else re-adds it). But for
+  // a row that came from mergeSharedInventoryPurchases() above, the real
+  // record STILL sits in the shared InvBridge purchase_invoices store, and
+  // rendRegs() calls mergeSharedInventoryPurchases() on every render — so
+  // the very next render saw the id missing from DB.purchases and merged
+  // it straight back in. Looked exactly like "delete does nothing."
+  // Fix: actually remove the record from its real source (the shared
+  // store), and roll back the stock it posted by replaying that item's
+  // stock ledger without this purchase's rows — same rollback promise the
+  // delete confirmation dialog already makes for ordinary invoices.
+  const HIDDEN_KEY='BALAJI_HIDDEN_INV_PURCHASE_IDS';
+  function getHiddenInvPurchaseIds(){ try{ return new Set(JSON.parse(localStorage.getItem(HIDDEN_KEY)||'[]')); }catch{ return new Set(); } }
+  function addHiddenInvPurchaseId(rawId){ try{ const s=getHiddenInvPurchaseIds(); s.add(rawId); localStorage.setItem(HIDDEN_KEY, JSON.stringify([...s])); }catch(e){} }
+  window.deleteSharedInventoryPurchase = function(rawId){
+    try{
+      // 1) Remove the invoice itself from the shared store (also updates
+      //    inventory.html's own Dashboard "Purchase" KPI, since it reads
+      //    the exact same store).
+      const pis = InvBridge.get('purchase_invoices')||[];
+      const filtered = pis.filter(r=>(r._id||r.id)!==rawId);
+      if(filtered.length!==pis.length) InvBridge.save('purchase_invoices', filtered);
+      // 2) Roll back stock: remove this purchase's own stock_ledger rows,
+      //    then replay each affected item+warehouse's remaining rows in
+      //    time order to recompute a correct running balance — a plain
+      //    splice would leave every later row's stored balance too high.
+      const sl = InvBridge.get('stock_ledger')||[];
+      const ownRows = sl.filter(s=>s.ref_id===rawId && s.ref_type==='purchase_invoice');
+      if(ownRows.length){
+        const affectedKeys=new Set(ownRows.map(s=>s.item_id+'||'+s.wh_id));
+        let remaining = sl.filter(s=>!(s.ref_id===rawId && s.ref_type==='purchase_invoice'));
+        affectedKeys.forEach(key=>{
+          const [item_id,wh_id]=key.split('||');
+          const rows=remaining.filter(s=>s.item_id===item_id&&s.wh_id===wh_id).sort((a,b)=>String(a._ts||'').localeCompare(String(b._ts||'')));
+          let bal=0;
+          rows.forEach(r=>{ bal += (r.qty_in||0)-(r.qty_out||0); r.balance=bal; });
+        });
+        InvBridge.save('stock_ledger', remaining);
+      }
+      // 3) Belt-and-suspenders: remember this id was explicitly deleted so
+      //    it can never be merged back in, even across a page reload or a
+      //    stray write from another open tab.
+      addHiddenInvPurchaseId(rawId);
+    }catch(e){ console.warn('[Purchase Register] deleteSharedInventoryPurchase failed:',e); }
+  };
+  window.getHiddenInvPurchaseIds = getHiddenInvPurchaseIds;
 
   // FIX ("inventory and purchase module give data connection"):
   // this module previously only ever read from InvBridge's local
@@ -4442,6 +4494,21 @@ async function deletePurchase(id,mode){
   if(vi>=0)DB.vendors[vi].outstanding=Math.max(0,(DB.vendors[vi].outstanding||0)-(p.grand||0));
   arr.splice(idx,1);
   if(editingPurchaseId===id){editingPurchaseId=null;editingPurchaseMode=null;}
+  // FIX ("delete but not delete proper"): rows tagged _fromInventoryModule
+  // were merged in live from the shared Inventory store every render — the
+  // splice above only ever removed them from THIS screen's in-memory copy,
+  // so the very next rendRegs() call pulled the still-untouched original
+  // straight back in. These never had a real row in this file's own
+  // PURCHASE_DB.PURCHASE_INVOICE sheet to begin with, so the normal
+  // erpApi('DELETE_PURCHASE_INVOICE',...) call below is a guaranteed no-op
+  // for them. Delete at the real source instead and stop here.
+  if(p._fromInventoryModule && typeof deleteSharedInventoryPurchase==='function'){
+    const rawId = String(id).replace(/^INV-/,'');
+    deleteSharedInventoryPurchase(rawId);
+    save();rendDash();rendRegs();rendPurchaseList();updateApprCount();
+    toast(`${p.no} deleted and stock rolled back.`,'ok','✅');
+    return;
+  }
   // FIX ("one time click then show delete but again show, 2nd time
   // delete click then final deleted" — Aug 2026): this file polls
   // pullInventorySyncData() every 20 seconds. If that poll happened to
@@ -4573,25 +4640,39 @@ async function bulkDeleteSelectedPurchases(){
   if(!confirm(`Delete ${recs.length} selected invoice(s), totaling ${fmt(totalAmt)}?\n\n${preview}\n\nThis will:\n• Remove from all reports\n• Roll back inventory\n• Delete Drive files\n\nThis cannot be undone.`))return;
   window._pendingDeletes = window._pendingDeletes || new Set();
   const removed=[];
+  // FIX ("delete but not delete proper"): same fix as the single-row
+  // deletePurchase() above, applied to bulk delete — rows merged in live
+  // from the shared Inventory store (_fromInventoryModule) get deleted at
+  // their real source right here, not just spliced from this screen's
+  // in-memory copy, or the next render pulls them straight back in.
+  const invSourced=[];
   recs.forEach(p=>{
     const idx=DB.purchases.findIndex(x=>x.id===p.id);
     if(idx<0)return;
     const vi=DB.vendors.findIndex(v=>v.id===p.vendorId);
     if(vi>=0)DB.vendors[vi].outstanding=Math.max(0,(DB.vendors[vi].outstanding||0)-(p.grand||0));
     DB.purchases.splice(idx,1);
-    window._pendingDeletes.add(p.id);
+    if(p._fromInventoryModule && typeof deleteSharedInventoryPurchase==='function'){
+      deleteSharedInventoryPurchase(String(p.id).replace(/^INV-/,''));
+      invSourced.push(p);
+    }else{
+      window._pendingDeletes.add(p.id);
+    }
     removed.push(p);
   });
   if(!removed.length)return;
   if(typeof editingPurchaseId!=='undefined' && ids.includes(editingPurchaseId)){editingPurchaseId=null;editingPurchaseMode=null;}
   save();rendDash();rendRegs();rendPurchaseList();updateApprCount();
   toast(`${removed.length} invoice(s) deleted locally. Syncing with server...`,'ok','🗑️');
+  // Inventory-sourced rows are already fully deleted at their real source
+  // (no server sync table involved) — skip them in every step below.
+  const removedServerSide = removed.filter(p=>!invSourced.includes(p));
   // FIX (same root cause as deletePurchase() above — "purchase delete and
   // blank but after sec same data reflect"): wait for a confirmed,
   // guaranteed push to the shared SYNC_purchase_invoices table before
   // proceeding, so a poll landing right after a bulk delete can't
   // resurrect any of the just-removed rows.
-  await pushPurchaseInvoicesToSyncTable();
+  if(removedServerSide.length) await pushPurchaseInvoicesToSyncTable();
   // FIX ("deleted invoices keep coming back" — Aug 2026, root-cause pass):
   // same root cause as the single-row deletePurchase() above. The
   // pushPurchaseInvoicesToSyncTable() call just above (now awaited) is
@@ -4605,14 +4686,15 @@ async function bulkDeleteSelectedPurchases(){
   // already genuinely succeeded (this is why bulk-deleted invoices kept
   // reappearing). Now only used for its side effects (inventory rollback
   // bookkeeping, Drive file cleanup); its failure is reported as a
-  // non-restoring warning, never as a reason to bring rows back.
-  const results=await Promise.allSettled(removed.map(p=>
+  // non-restoring warning, never as a reason to bring rows back. Skips
+  // invoices already fully handled via deleteSharedInventoryPurchase().
+  const results=await Promise.allSettled(removedServerSide.map(p=>
     erpApi('DELETE_PURCHASE_INVOICE',{id:p.id, no:p.no, mode:p.mode||'inventory', billFileUrl:p.billFileUrl})
   ));
   let sideEffectFailed=0, warned=0;
   const failReasons=new Set();
   results.forEach((res,i)=>{
-    const p=removed[i];
+    const p=removedServerSide[i];
     window._pendingDeletes.delete(p.id);
     const r = res.status==='fulfilled' ? res.value : {success:false, message:(res.reason&&res.reason.message)||'network error'};
     if(r&&r.success===false){
@@ -6403,10 +6485,26 @@ function rendDash(){
   ss('d-grns',DB.grns.length);ss('d-rets',DB.returns.length);ss('d-vends',DB.vendors.length);
   const recEl=el('d-recent');
   if(recEl){
+    // FIX ("fix proper... first date" — Aug 2026): this used to sort by
+    // createdAt (when the row was entered into the system), not by the
+    // invoice's own date — so a 2021-dated invoice entered today could
+    // outrank a 2026-dated one right above/below it, looking completely
+    // out of order ("6803, 05 Aug 2021" sitting between two Aug 2026
+    // rows). "Recent Purchases" should mean recent by invoice date.
+    // Falls back to createdAt only when a row has no usable date (e.g. a
+    // very old record saved before dates were required) so it doesn't
+    // just vanish to the bottom under an Invalid Date.
+    const sortKey=p=>{ const d=new Date(p.date); return isNaN(d)?new Date(p.createdAt||0):d; };
     const recent=[...DB.purchases.map(p=>({...p,_mode:'inventory'})),...DB.acctInvs.map(p=>({...p,_mode:'accounting'}))]
-      .sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).slice(0,6);
+      .sort((a,b)=>sortKey(b)-sortKey(a)).slice(0,6);
     if(!recent.length){recEl.innerHTML='<div style="text-align:center;padding:24px;color:var(--text3);font-style:italic">No purchases yet.</div>';}
-    else recEl.innerHTML='<div class="tw"><table><thead><tr><th>Invoice</th><th>Date</th><th>Vendor</th><th>Amount</th><th>Bill</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+recent.map(p=>`<tr><td><b>${p.no}</b>${p.syncUnconfirmed?` <span class="badge b-red" style="font-size:8px" title="This id was not found on the server — save may have failed">⚠ NOT SYNCED</span>`:(p.synced!==true?` <span class="badge b-amber" style="font-size:8px" title="Saved locally, waiting for server confirmation">⏳ syncing…</span>`:'')}</td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td><td class="td-r"><b>${fmt(p.grand)}</b></td><td>${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View enclosed bill">📎</a>`:'<span class="badge b-gray" style="font-size:9px">—</span>'}</td><td><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':p.status==='Approved'?'b-green':'b-red'}">${p.status}</span></td><td style="white-space:nowrap"><button class="btn btn-xs" onclick="viewPurchase('${p.id}','${p._mode}')">👁</button> <button class="btn btn-xs" onclick="editPurchase('${p.id}','${p._mode}')">✏️</button> <button class="btn btn-xs btn-red" onclick="deletePurchase('${p.id}','${p._mode}')">🗑️</button></td></tr>`).join('')+'</tbody></table></div>';
+    // FIX ("action click then option view edit and delete"): three bare
+    // icon buttons crammed into this narrow dashboard card wrapped/
+    // overflowed awkwardly and were inconsistent with the Register page
+    // right next door, which already uses a single ⋮ menu. Reuse that
+    // exact same dropdown (toggleRowActions/dd-list) here for a
+    // consistent, working click-to-see-options pattern in both places.
+    else recEl.innerHTML='<div class="tw"><table><thead><tr><th>Invoice</th><th>Date</th><th>Vendor</th><th>Amount</th><th>Bill</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+recent.map(p=>`<tr><td><b>${p.no}</b>${p.syncUnconfirmed?` <span class="badge b-red" style="font-size:8px" title="This id was not found on the server — save may have failed">⚠ NOT SYNCED</span>`:(p.synced!==true?` <span class="badge b-amber" style="font-size:8px" title="Saved locally, waiting for server confirmation">⏳ syncing…</span>`:'')}</td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td><td class="td-r"><b>${fmt(p.grand)}</b></td><td>${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View enclosed bill">📎</a>`:'<span class="badge b-gray" style="font-size:9px">—</span>'}</td><td><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':p.status==='Approved'?'b-green':'b-red'}">${p.status}</span></td><td class="dd-wrap" style="position:relative"><button class="btn btn-xs" onclick="event.stopPropagation();toggleRowActions('dash-${p.id}',this)" title="Actions">⋮</button><div class="dd-list" id="row-actions-dash-${p.id}" style="min-width:150px;left:auto;right:0"><div class="dd-item" onmousedown="viewPurchase('${p.id}','${p._mode}')">👁 View</div><div class="dd-item" onmousedown="editPurchase('${p.id}','${p._mode}')">✏️ Edit</div><div class="dd-item" style="color:#dc2626" onmousedown="deletePurchase('${p.id}','${p._mode}')">🗑️ Delete</div></div></td></tr>`).join('')+'</tbody></table></div>';
   }
   updateApprCount();
 }
