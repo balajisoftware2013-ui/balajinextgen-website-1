@@ -149,7 +149,15 @@ async function bnxRefreshConfig(){
       if(res.data.v2AuthId) GAS_APIS_DASH.V2_AUTH = 'https://script.google.com/macros/s/' + res.data.v2AuthId + '/exec';
       console.log('[CONFIG] GET_CONFIG loaded OK — using', res.data.v2CoreId ? 'server-supplied' : 'hardcoded fallback', 'deployment IDs');
     } else {
-      console.error('[CONFIG] GET_CONFIG returned no usable data — still on hardcoded fallback deployment IDs. Response:', res);
+      // FIX: was logging the raw response object collapsed as
+      // "▶ Object" — in production devtools no one expands that, so
+      // the actual reason ("Unknown action" from an unwired router
+      // case vs a real backend error vs a malformed shape) was
+      // invisible. Print the fields that matter directly.
+      console.error('[CONFIG] GET_CONFIG returned no usable data — still on hardcoded fallback deployment IDs.',
+        'success=' + (res && res.success), 'error=' + (res && res.error), 'hasData=' + !!(res && res.data),
+        '(if success is undefined and error is undefined, the backend most likely never hit bnxGetConfig() at all —',
+        'check that case \'GET_CONFIG\': return bnxGetConfig(req); is actually wired into your live doPost() router)');
     }
   }catch(e){ console.error('[CONFIG] GET_CONFIG request failed — still on hardcoded fallback deployment IDs:', e.message); }
 }
@@ -213,9 +221,19 @@ const CLIENT_INDUSTRY=(function(){
 const REQUEST_QUEUE = { pending: [], active: 0, maxConcurrent: 5 };
 const API_RETRY_CONFIG = { maxAttempts: 3, baseDelay: 300, maxDelay: 5000 };
 
+let _bnxWarnedNoSession = false;
 async function gasApi(action, payload, endpoint) {
   payload = payload || {};
   const url = GAS_APIS_DASH[endpoint || 'V2_CORE'];
+  // FIX: every write handler in 20_POSBillingHandlers.gs rejects with
+  // "Invalid or expired session" the instant sessionToken is missing
+  // or stale — but that only ever showed up buried in an aggregate
+  // [BN_HEALTH] failures:N count, with nothing pointing at the cause.
+  // Flag it loudly, once per page load, the first time it's true.
+  if (!_bnxWarnedNoSession && action !== 'GET_CONFIG' && !(localStorage.getItem('ERP_SESSION')||'')) {
+    _bnxWarnedNoSession = true;
+    console.error('[AUTH] No ERP_SESSION token in localStorage — every session-gated API call (SAVE_KOT/SAVE_ORDER/SAVE_BILL/SAVE_TABLE_STATUS/etc.) will fail with "Invalid or expired session" until the user logs in again.');
+  }
   
   return new Promise((resolve) => {
     const task = async () => {
@@ -10137,12 +10155,17 @@ function bnxUpdateSyncBadge(){
     el.style.display = n ? '' : 'none';
     if(n) bnxSetLiveStatus('syncing');
   }
-  const nf = bnxGetFailedOutbox().length;
+  const failedList = bnxGetFailedOutbox();
+  const nf = failedList.length;
   const fel = document.getElementById('bnx-failed-badge');
   if(fel){
     fel.textContent = nf ? '⚠️ '+nf+' sync issue'+(nf>1?'s':'')+' — tap to retry' : '';
     fel.style.display = nf ? '' : 'none';
     fel.style.pointerEvents = nf ? 'auto' : 'none';
+    // FIX: tooltip now shows the actual reason(s) the writes are stuck
+    // (e.g. "Invalid or expired session"), not just a count, so staff/
+    // support don't need devtools open to see what's wrong.
+    fel.title = nf ? Array.from(new Set(failedList.map(e=>e.lastError||'Unknown error'))).join('; ') : '';
     fel.onclick = bnxRetryFailedOutbox;
   }
 }
@@ -10160,15 +10183,23 @@ async function flushOutbox(){
     const res = await gasApi(entry.action, entry.payload, 'V2_CORE');
     if(res && res.success){
       // synced — nothing further to do, entry is simply dropped from the outbox
-    } else if(entry.attempts < 10){
-      remaining.push(entry);
-      anyFailed = true;
     } else {
-      console.error('[OUTBOX] gave up after 10 attempts, moved to failed store:', entry);
-      const failed = bnxGetFailedOutbox();
-      failed.push(entry);
-      bnxSetFailedOutbox(failed);
-      if (typeof showNotif === 'function') showNotif('⚠️ A '+(entry.action==='SAVE_BILL'?'bill':entry.action==='SAVE_ORDER'?'order':entry.action==='SAVE_KOT'?'KOT':'update')+' failed to sync after many tries — see the sync-issues badge','error');
+      // FIX: entries were retried/failed with zero record of WHY —
+      // console.error dumped the entry (action/payload) but never the
+      // server's actual error message, so 10 attempts could pass with
+      // no way to tell a session/auth failure apart from a scope
+      // violation or a missing tab. Stash it on the entry every attempt.
+      entry.lastError = (res && res.error) || (res && res.errorCode) || 'No response from server';
+      if(entry.attempts < 10){
+        remaining.push(entry);
+        anyFailed = true;
+      } else {
+        console.error('[OUTBOX] gave up after 10 attempts, moved to failed store. Reason:', entry.lastError, entry);
+        const failed = bnxGetFailedOutbox();
+        failed.push(entry);
+        bnxSetFailedOutbox(failed);
+        if (typeof showNotif === 'function') showNotif('⚠️ A '+(entry.action==='SAVE_BILL'?'bill':entry.action==='SAVE_ORDER'?'order':entry.action==='SAVE_KOT'?'KOT':'update')+' failed to sync after many tries ('+entry.lastError+') — see the sync-issues badge','error');
+      }
     }
   }
   bnxSetOutbox(remaining);
