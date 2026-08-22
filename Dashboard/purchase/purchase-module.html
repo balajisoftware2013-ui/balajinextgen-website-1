@@ -1862,6 +1862,43 @@ function _mapDocToSyncPurchaseRecord(doc){
 let _pushingPurchaseSyncTable=false;
 let _purchaseSyncPushQueued=false;
 let _purchaseSyncPushWaiters=[]; // resolvers for callers awaiting the NEXT push to actually land
+// FIX ("backend copies from business os files" — Aug 2026): ported
+// Business OS's per-row sync pattern (syncItemRow/syncCustomerRow in
+// balaji-business-os.html — one record per call, not the whole table)
+// as the authoritative path for creating/editing/deleting a single
+// purchase invoice. pushPurchaseInvoicesToSyncTable() below (the
+// existing full-array push) is left in place and still runs via save()
+// for every OTHER mutation to DB.purchases this file makes (attachments,
+// Drive links, approval status, etc.) — safety net for paths not yet
+// migrated. But for the two flows this whole session's bugs actually
+// came from — saving an invoice, and deleting one — these two functions
+// are now the real source of truth: each one reads the server's CURRENT
+// state and writes back just the one row that changed, so a stale local
+// snapshot in this or any other tab can never resurrect a row someone
+// else already deleted.
+async function syncPurchaseInvoiceRowToServer(doc){
+  if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return {success:false,message:'no session'};
+  try{
+    const row=_mapDocToSyncPurchaseRecord(doc);
+    const r=await erpApi('SYNC_PURCHASE_INVOICE_ROW',{row});
+    if(r&&r.success===false)console.warn('[Row Sync] SYNC_PURCHASE_INVOICE_ROW failed for',doc.id,':',r.message);
+    return r;
+  }catch(e){
+    console.warn('[Row Sync] SYNC_PURCHASE_INVOICE_ROW error:',e.message);
+    return {success:false,message:e.message};
+  }
+}
+async function deletePurchaseInvoiceRowFromServer(id){
+  if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return {success:false,message:'no session'};
+  try{
+    const r=await erpApi('DELETE_PURCHASE_INVOICE_ROW',{id});
+    if(r&&r.success===false)console.warn('[Row Sync] DELETE_PURCHASE_INVOICE_ROW failed for',id,':',r.message);
+    return r;
+  }catch(e){
+    console.warn('[Row Sync] DELETE_PURCHASE_INVOICE_ROW error:',e.message);
+    return {success:false,message:e.message};
+  }
+}
 async function pushPurchaseInvoicesToSyncTable(){
   if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return;
   // FIX ("delete blank but after a sec same data reflect — not deleted" —
@@ -4020,6 +4057,14 @@ function savePurchase(sendApproval,forceSave){
     editingPurchaseId=null;editingPurchaseMode=null;pendingBillDriveLink=null;
     save();closeM('mPurch');rendDash();rendRegs();rendPurchaseList();updateApprCount();
     toast(`${doc.no} updated successfully.`,'ok','✏️');
+    // FIX ("backend copies from business os files" — Aug 2026): this is
+    // now the AUTHORITATIVE sync for this edit — see
+    // syncPurchaseInvoiceRowToServer()'s header comment above. save()'s
+    // full-array push (triggered just above) still runs too as a
+    // safety net, but this row-level call is what actually guarantees
+    // this specific edit reaches the server correctly even if this
+    // tab's full local array happened to be stale in some other way.
+    if(doc.mode==='inventory')syncPurchaseInvoiceRowToServer(doc);
     savePurchaseToDrive(doc,vend);
     if(pendingManualBillFile)uploadManualBillAndAttach(doc.id,doc.mode);
     erpApi('UPDATE_PURCHASE_INVOICE', doc).then(r=>{
@@ -4056,6 +4101,12 @@ function savePurchase(sendApproval,forceSave){
   if(vi>=0)DB.vendors[vi].outstanding=(DB.vendors[vi].outstanding||0)+grand;
   save();updateApprCount();
   toast(sendApproval?`${doc.no} sent for approval!`:`${doc.no} saved as draft.`,'ok','📦');
+  // FIX ("backend copies from business os files" — Aug 2026): same
+  // authoritative row-level sync as the edit path above — see
+  // syncPurchaseInvoiceRowToServer()'s header comment for why this
+  // closes the resurrection-bug class that the full-array push alone
+  // couldn't.
+  if(doc.mode==='inventory')syncPurchaseInvoiceRowToServer(doc);
   // ── AUTO SAVE PURCHASE INVOICE TO GOOGLE DRIVE (client-wise) ──
   savePurchaseToDrive(doc, vend);
   if(pendingManualBillFile)uploadManualBillAndAttach(doc.id,doc.mode);
@@ -4461,17 +4512,54 @@ function rendPurchaseList(){
   const lpinv=el('ll-pinv');
   if(!lpinv)return;
   if(!DB.purchases.length){lpinv.innerHTML='<div style="text-align:center;padding:28px;color:var(--text3);font-style:italic">No purchase invoices yet.</div>';return;}
-  lpinv.innerHTML='<div class="tw"><table><thead><tr><th>Invoice No</th><th>Date</th><th>Vendor</th><th>Taxable</th><th>GST</th><th>Total</th><th>Sync</th><th>Bill</th><th>GRN</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+DB.purchases.map(p=>{const dOk=/^\d{4}-\d{2}-\d{2}$/.test(String(p.date||''));const dCell=dOk?fmtD(p.date):`<span class="badge b-red" title="Missing/invalid invoice date — fix before posting to Tally" style="cursor:pointer" onclick="editPurchase('${p.id}','inventory')">⚠️ No Date</span>`;return `<tr><td><b>${p.no}</b></td><td>${dCell}</td><td>${p.vendorName}</td><td class="td-r">${fmt(p.taxable)}</td><td class="td-r">${fmt(p.gstTotal)}</td><td class="td-r"><b>${fmt(p.grand)}</b></td><td>${syncStatusBadge(p)}</td><td>${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View original scanned bill">📎 Bill</a>`:'<span class="badge b-gray" style="font-size:9px">No file</span>'}</td><td>${p.grnStatus==='Completed'?'<span class="badge b-green">✓ '+(p.grnNo||'Done')+'</span>':'<span class="badge b-gray">Pending</span>'}</td><td><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':'b-green'}">${p.status}</span></td><td style="white-space:nowrap"><button class="btn btn-xs" onclick="viewPurchase('${p.id}','inventory')">👁 View</button> <button class="btn btn-xs" onclick="editPurchase('${p.id}','inventory')">✏️ Edit</button> <button class="btn btn-xs btn-red" onclick="deletePurchase('${p.id}','inventory')">🗑️ Delete</button> ${p.status==='Pending Approval'?'<button class="btn btn-xs btn-green" onclick="approveP(\''+p.id+'\')">✅ Approve</button>':''}</td></tr>`;}).join('')+'</tbody></table></div>';
+  // FIX ("table action click then three action show so remove from
+  // tables" / "Sync remove" — Aug 2026): this table used to have a
+  // dedicated "Sync" column (two stacked badges — DB status + Tally
+  // status, cramped into one narrow cell) plus 3-4 separate inline
+  // buttons (View/Edit/Delete/Approve) per row, both contributing to
+  // the misaligned, cluttered look in the screenshot. rendRegs()
+  // already solved exactly this with a single ⋮ dropdown (toggleRowActions/
+  // .dd-wrap/.dd-list — viewport-clamped, scroll-safe, already proven
+  // there) — ported the same pattern here instead of reinventing one.
+  // Sync/Tally status moves into the dropdown as a non-clickable info
+  // line rather than disappearing entirely — still one click away, just
+  // not fighting for space as its own column.
+  lpinv.innerHTML='<div class="tw"><table><thead><tr><th>Invoice No</th><th>Date</th><th>Vendor</th><th>Taxable</th><th>GST</th><th>Total</th><th>Bill</th><th>GRN</th><th>Status</th><th></th></tr></thead><tbody>'+DB.purchases.map(p=>{const dOk=/^\d{4}-\d{2}-\d{2}$/.test(String(p.date||''));const dCell=dOk?fmtD(p.date):`<span class="badge b-red" title="Missing/invalid invoice date — fix before posting to Tally" style="cursor:pointer" onclick="editPurchase('${p.id}','inventory')">⚠️ No Date</span>`;
+    let dbCls,dbLabel;
+    if(p.syncUnconfirmed){dbCls='#dc2626';dbLabel='⚠ Not Synced';}
+    else if(p.synced===false){dbCls='#d97706';dbLabel='⏳ Syncing…';}
+    else {dbCls='#059669';dbLabel='✓ Live';}
+    const tally=p.tallyStatus==='POSTED'?'✓ Posted':p.tallyStatus==='FAILED'?'⚠ Failed':'… Pending';
+    const tallyCls=p.tallyStatus==='POSTED'?'#059669':p.tallyStatus==='FAILED'?'#dc2626':'#94a3b8';
+    return `<tr><td><b>${p.no}</b></td><td>${dCell}</td><td>${p.vendorName}</td><td class="td-r">${fmt(p.taxable)}</td><td class="td-r">${fmt(p.gstTotal)}</td><td class="td-r"><b>${fmt(p.grand)}</b></td><td>${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View original scanned bill">📎 Bill</a>`:'<span class="badge b-gray" style="font-size:9px">No file</span>'}</td><td>${p.grnStatus==='Completed'?'<span class="badge b-green">✓ '+(p.grnNo||'Done')+'</span>':'<span class="badge b-gray">Pending</span>'}</td><td><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':'b-green'}">${p.status}</span></td><td class="dd-wrap" style="position:relative">
+      <button class="btn btn-xs" onclick="event.stopPropagation();toggleRowActions('list-${p.id}',this)" title="Actions">⋮</button>
+      <div class="dd-list" id="row-actions-list-${p.id}" style="min-width:180px;left:auto;right:0">
+        <div class="dd-item" style="color:${dbCls};cursor:default" onmousedown="event.preventDefault()">${dbLabel}</div>
+        <div class="dd-item" style="color:${tallyCls};cursor:default" onmousedown="event.preventDefault()">Tally: ${tally}</div>
+        <div class="dd-item" onmousedown="viewPurchase('${p.id}','inventory')">👁 View</div>
+        <div class="dd-item" onmousedown="editPurchase('${p.id}','inventory')">✏️ Edit</div>
+        ${p.status==='Pending Approval'?`<div class="dd-item" style="color:#059669" onmousedown="approveP('${p.id}')">✅ Approve</div>`:''}
+        <div class="dd-item" style="color:#dc2626" onmousedown="deletePurchase('${p.id}','inventory')">🗑️ Delete</div>
+      </div>
+    </td></tr>`;}).join('')+'</tbody></table></div>';
   const lainv=el('ll-ainv');
   if(!lainv)return;
   if(!DB.acctInvs.length){lainv.innerHTML='<div style="text-align:center;padding:28px;color:var(--text3);font-style:italic">No accounting invoices yet.</div>';return;}
-  lainv.innerHTML='<div class="tw"><table><thead><tr><th>Invoice No</th><th>Date</th><th>Party</th><th>Expense Head</th><th>Department</th><th>Total</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+DB.acctInvs.map(p=>{
-    let actionBtn='';
-    if(p.status==='Pending Approval')actionBtn=`<button class="btn btn-xs btn-green" onclick="approveA('${p.id}')">✅ Approve</button>`;
-    else if(p.status==='Approved')actionBtn=`<button class="btn btn-xs btn-blue" onclick="ackA('${p.id}')">📋 Acknowledge</button>`;
-    else if(p.status==='Acknowledged')actionBtn=`<button class="btn btn-xs btn-primary" onclick="completeA('${p.id}')">🏁 Complete</button>`;
+  lainv.innerHTML='<div class="tw"><table><thead><tr><th>Invoice No</th><th>Date</th><th>Party</th><th>Expense Head</th><th>Department</th><th>Total</th><th>Status</th><th></th></tr></thead><tbody>'+DB.acctInvs.map(p=>{
+    let stageItem='';
+    if(p.status==='Pending Approval')stageItem=`<div class="dd-item" style="color:#059669" onmousedown="approveA('${p.id}')">✅ Approve</div>`;
+    else if(p.status==='Approved')stageItem=`<div class="dd-item" style="color:#2563eb" onmousedown="ackA('${p.id}')">📋 Acknowledge</div>`;
+    else if(p.status==='Acknowledged')stageItem=`<div class="dd-item" onmousedown="completeA('${p.id}')">🏁 Complete</div>`;
     const statusCls=p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':p.status==='Approved'?'b-blue':p.status==='Acknowledged'?'b-purple':'b-green';
-    return `<tr><td><b>${p.no}</b></td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td><td><span class="badge b-blue">${p.expCat||'—'}</span></td><td>${p.department||'—'}</td><td class="td-r"><b>${fmt(p.grand)}</b></td><td><span class="badge ${statusCls}">${p.status}</span></td><td style="white-space:nowrap"><button class="btn btn-xs" onclick="viewPurchase('${p.id}','accounting')">👁 View</button> <button class="btn btn-xs" onclick="editPurchase('${p.id}','accounting')">✏️ Edit</button> <button class="btn btn-xs btn-red" onclick="deletePurchase('${p.id}','accounting')">🗑️ Delete</button> ${actionBtn}</td></tr>`;
+    return `<tr><td><b>${p.no}</b></td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td><td><span class="badge b-blue">${p.expCat||'—'}</span></td><td>${p.department||'—'}</td><td class="td-r"><b>${fmt(p.grand)}</b></td><td><span class="badge ${statusCls}">${p.status}</span></td><td class="dd-wrap" style="position:relative">
+      <button class="btn btn-xs" onclick="event.stopPropagation();toggleRowActions('a-${p.id}',this)" title="Actions">⋮</button>
+      <div class="dd-list" id="row-actions-a-${p.id}" style="min-width:170px;left:auto;right:0">
+        <div class="dd-item" onmousedown="viewPurchase('${p.id}','accounting')">👁 View</div>
+        <div class="dd-item" onmousedown="editPurchase('${p.id}','accounting')">✏️ Edit</div>
+        ${stageItem}
+        <div class="dd-item" style="color:#dc2626" onmousedown="deletePurchase('${p.id}','accounting')">🗑️ Delete</div>
+      </div>
+    </td></tr>`;
   }).join('')+'</tbody></table></div>';
 }
 function approveP(id){
@@ -4512,22 +4600,27 @@ async function deletePurchase(id,mode){
   window._pendingDeletes.add(id);
   save();rendDash();rendRegs();rendPurchaseList();updateApprCount();
   toast(`${p.no} deleted locally. Syncing with server...`,'ok','🗑️');
+  // FIX ("backend copies from business os files" — Aug 2026, replaces
+  // the "root-cause pass" fix below): pushPurchaseInvoicesToSyncTable()
+  // pushed this tab's ENTIRE local array as an upsert, relying on
+  // window._pendingDeletes (a per-tab in-memory Set) to tell the
+  // backend which ids to actually remove. That's exactly what let
+  // deletions get undone by ANY other tab/session pushing its own
+  // stale full snapshot afterward — the actual bug behind every
+  // "duplicate invoice reappears" incident this session. deletePurchase
+  // InvoiceRowFromServer() is a single-row, server-side-locked delete
+  // (see its header comment) — it reads the CURRENT server state and
+  // removes just this one id, so no other tab's stale snapshot can
+  // resurrect it afterward, regardless of what that tab still has
+  // cached locally.
+  await deletePurchaseInvoiceRowFromServer(id);
   // FIX ("purchase delete and blank but after sec same data reflect —
   // not deleted" — Aug 2026, root-cause pass): save() above kicks off
-  // pushPurchaseInvoicesToSyncTable() fire-and-forget, but this function
-  // used to return immediately without ever confirming that push actually
-  // reached the shared SYNC_purchase_invoices table — the ONE table this
-  // file's own SYNC_PULL_ALL poll (and inventory.html) actually reads.
-  // The separate DELETE_PURCHASE_INVOICE call below targets a different,
-  // largely-unused backend table (see the note at the top of this file on
-  // PURCHASE_DB.PURCHASE_INVOICE having zero real rows) — it was never
-  // what actually removed this invoice from the table that matters, so
-  // _pendingDeletes was only ever guarding against ITS race, not the real
-  // one. Now: explicitly wait for a confirmed, guaranteed push (the
-  // queued-retry fix in pushPurchaseInvoicesToSyncTable() above ensures
-  // this can't be silently dropped even if another push was already in
-  // flight) before moving on — closing the actual window a poll could
-  // land in and resurrect the row.
+  // pushPurchaseInvoicesToSyncTable() fire-and-forget too, as the
+  // existing safety net for every other mutation path — awaiting it
+  // here as well costs one more round trip but guarantees this
+  // specific deletion's local removal is reflected in that push too,
+  // rather than racing it.
   await pushPurchaseInvoicesToSyncTable();
   // FIX ("delete bills but wrong shown in some places / not match"): this
   // used to only remove the record locally — deleteGRN() right below already
@@ -4642,11 +4735,20 @@ async function bulkDeleteSelectedPurchases(){
   if(typeof editingPurchaseId!=='undefined' && ids.includes(editingPurchaseId)){editingPurchaseId=null;editingPurchaseMode=null;}
   save();rendDash();rendRegs();rendPurchaseList();updateApprCount();
   toast(`${removed.length} invoice(s) deleted locally. Syncing with server...`,'ok','🗑️');
+  // FIX ("backend copies from business os files" — Aug 2026, replaces
+  // the "root-cause pass" fix below): same reasoning as deletePurchase()
+  // above — window._pendingDeletes only protects against THIS tab's own
+  // next poll; it does nothing about any OTHER tab/session pushing its
+  // stale full snapshot afterward, which is what actually resurrected
+  // bulk-deleted duplicates. deletePurchaseInvoiceRowFromServer() is a
+  // single-row, server-side-locked delete — fired for every removed row
+  // in parallel, each one reading the CURRENT server state at the
+  // moment it runs rather than trusting any tab's local memory.
+  await Promise.allSettled(removed.map(p=>deletePurchaseInvoiceRowFromServer(p.id)));
   // FIX (same root cause as deletePurchase() above — "purchase delete and
-  // blank but after sec same data reflect"): wait for a confirmed,
-  // guaranteed push to the shared SYNC_purchase_invoices table before
-  // proceeding, so a poll landing right after a bulk delete can't
-  // resurrect any of the just-removed rows.
+  // blank but after sec same data reflect"): still also await the
+  // full-array push as the existing safety net for every other mutation
+  // path this tab makes.
   await pushPurchaseInvoicesToSyncTable();
   // FIX ("deleted invoices keep coming back" — Aug 2026, root-cause pass):
   // same root cause as the single-row deletePurchase() above. The
@@ -6479,7 +6581,44 @@ function rendDash(){
     const recent=[...DB.purchases.map(p=>({...p,_mode:'inventory'})),...DB.acctInvs.map(p=>({...p,_mode:'accounting'}))]
       .sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).slice(0,6);
     if(!recent.length){recEl.innerHTML='<div style="text-align:center;padding:24px;color:var(--text3);font-style:italic">No purchases yet.</div>';}
-    else recEl.innerHTML='<div class="tw"><table><thead><tr><th>Invoice</th><th>Date</th><th>Vendor</th><th>Amount</th><th>Bill</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+recent.map(p=>`<tr${dashDupGroupSize[p.id]?' style="background:rgba(220,38,38,0.06)"':''}><td><b>${p.no}</b>${p.syncUnconfirmed?` <span class="badge b-red" style="font-size:8px" title="This id was not found on the server — save may have failed">⚠ NOT SYNCED</span>`:(p.synced!==true?` <span class="badge b-amber" style="font-size:8px" title="Saved locally, waiting for server confirmation">⏳ syncing…</span>`:'')}${dashDupGroupSize[p.id]?` <span class="badge b-red" style="font-size:8px" title="${dashDupGroupSize[p.id]} invoices share this exact invoice no, vendor &amp; date — review in Purchase Invoice Register before deleting">⚠ Duplicate ×${dashDupGroupSize[p.id]}</span>`:''}</td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td><td class="td-r"><b>${fmt(p.grand)}</b></td><td>${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View enclosed bill">📎</a>`:'<span class="badge b-gray" style="font-size:9px">—</span>'}</td><td><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':p.status==='Approved'?'b-green':'b-red'}">${p.status}</span></td><td style="white-space:nowrap"><button class="btn btn-xs" onclick="viewPurchase('${p.id}','${p._mode}')">👁</button> <button class="btn btn-xs" onclick="editPurchase('${p.id}','${p._mode}')">✏️</button> <button class="btn btn-xs btn-red" onclick="deletePurchase('${p.id}','${p._mode}')">🗑️</button></td></tr>`).join('')+'</tbody></table></div>';
+    // FIX ("recent purchase table alienment fix" / "all formatting
+    // problem" — Aug 2026): the NOT SYNCED/syncing/Duplicate badges used
+    // to sit inline right after the invoice number as plain text — on a
+    // narrow column that wrapped mid-badge, pushing some rows taller
+    // than others and breaking the table's vertical rhythm (visible in
+    // the screenshot: a badge's own tooltip text bleeding into the row
+    // below it). Wrapped the invoice no + badges in a flex column so
+    // badges stack cleanly underneath instead of wrapping unpredictably,
+    // and vertical-align:top on every cell so a taller badge-stack row
+    // no longer misaligns the Date/Vendor/Amount text next to it (they
+    // were vertical-align:middle by default, so a 2-line invoice cell
+    // shifted its neighbors down to the row's vertical center). Also
+    // swapped the 3 separate View/Edit/Delete buttons for the same ⋮
+    // dropdown used everywhere else in this file, for one consistent
+    // pattern across Dashboard/Purchase Invoices/Register.
+    else recEl.innerHTML='<div class="tw"><table><thead><tr><th>Invoice</th><th>Date</th><th>Vendor</th><th>Amount</th><th>Bill</th><th>Status</th><th></th></tr></thead><tbody>'+recent.map(p=>{
+      const badges=[
+        p.syncUnconfirmed?`<span class="badge b-red" style="font-size:8px" title="This id was not found on the server — save may have failed">⚠ NOT SYNCED</span>`
+          :(p.synced!==true?`<span class="badge b-amber" style="font-size:8px" title="Saved locally, waiting for server confirmation">⏳ syncing…</span>`:''),
+        dashDupGroupSize[p.id]?`<span class="badge b-red" style="font-size:8px" title="${dashDupGroupSize[p.id]} invoices share this exact invoice no, vendor &amp; date — review in Purchase Invoice Register before deleting">⚠ Duplicate ×${dashDupGroupSize[p.id]}</span>`:''
+      ].filter(Boolean).join(' ');
+      return `<tr${dashDupGroupSize[p.id]?' style="background:rgba(220,38,38,0.06)"':''}>
+        <td style="vertical-align:top"><div style="display:flex;flex-direction:column;gap:2px;align-items:flex-start"><b>${p.no}</b>${badges?`<div style="display:flex;flex-wrap:wrap;gap:3px">${badges}</div>`:''}</div></td>
+        <td style="vertical-align:top;white-space:nowrap">${fmtD(p.date)}</td>
+        <td style="vertical-align:top">${p.vendorName}</td>
+        <td class="td-r" style="vertical-align:top;white-space:nowrap"><b>${fmt(p.grand)}</b></td>
+        <td style="vertical-align:top">${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View enclosed bill">📎</a>`:'<span class="badge b-gray" style="font-size:9px">—</span>'}</td>
+        <td style="vertical-align:top"><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':p.status==='Approved'?'b-green':'b-red'}">${p.status}</span></td>
+        <td class="dd-wrap" style="position:relative;vertical-align:top">
+          <button class="btn btn-xs" onclick="event.stopPropagation();toggleRowActions('dash-${p.id}',this)" title="Actions">⋮</button>
+          <div class="dd-list" id="row-actions-dash-${p.id}" style="min-width:150px;left:auto;right:0">
+            <div class="dd-item" onmousedown="viewPurchase('${p.id}','${p._mode}')">👁 View</div>
+            <div class="dd-item" onmousedown="editPurchase('${p.id}','${p._mode}')">✏️ Edit</div>
+            <div class="dd-item" style="color:#dc2626" onmousedown="deletePurchase('${p.id}','${p._mode}')">🗑️ Delete</div>
+          </div>
+        </td>
+      </tr>`;
+    }).join('')+'</tbody></table></div>';
   }
   updateApprCount();
 }
@@ -7021,16 +7160,16 @@ function rendRegs(){
       // Delete. Failed-post state is still visible via the ⚠ marker on
       // the "Post to Tally" menu item itself (title carries the error).
       const mainRow=`<tr${pinvDupGroupSize[p.id]?' class="row-pinv-dup" style="background:rgba(220,38,38,0.06)"':''}>
-        <td><input type="checkbox" class="pinv-row-chk" data-id="${p.id}" onchange="updatePinvSelectionUI()"></td>
-        <td>${itemCount?`<button class="btn btn-xs" onclick="toggleRegItems('${p.id}')" id="reg-items-btn-${p.id}" title="Show ${itemCount} item(s)">▸</button>`:''}</td>
-        <td><b>${p.no}</b>${p.syncUnconfirmed?` <span class="badge b-red" style="font-size:8px" title="This id was not found on the server — save may have failed">⚠ NOT SYNCED</span>`:(p.synced!==true?` <span class="badge b-amber" style="font-size:8px" title="Saved locally, waiting for server confirmation">⏳ syncing…</span>`:'')}${pinvDupGroupSize[p.id]?` <span class="badge b-red" style="font-size:8px" title="${pinvDupGroupSize[p.id]} invoices share this exact invoice no, vendor &amp; date — review before deleting (amounts may differ, e.g. a mis-keyed re-entry)">⚠ Duplicate ×${pinvDupGroupSize[p.id]}</span>`:''}</td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td>
-        <td><span class="badge b-teal">${p.mode||'inventory'}</span></td>
-        <td><span class="badge b-purple" style="font-size:10px;white-space:nowrap">${_ln}</span></td>
-        <td class="td-r">${fmt(p.taxable)}</td><td class="td-r">${fmt(p.gstTotal)}</td><td class="td-r"><b>${fmt(p.grand)}</b></td>
-        <td>${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View enclosed/attached copy of the bill">📎 View</a>`:'<span class="badge b-gray" style="font-size:9px">No file</span>'}</td>
-        <td>${p.grnRef?'<span class="badge b-teal">'+p.grnRef+'</span>':'—'}</td>
-        <td><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':p.status==='Approved'?'b-green':'b-red'}">${p.status}</span></td>
-        <td class="dd-wrap" style="position:relative">
+        <td style="vertical-align:top"><input type="checkbox" class="pinv-row-chk" data-id="${p.id}" onchange="updatePinvSelectionUI()"></td>
+        <td style="vertical-align:top">${itemCount?`<button class="btn btn-xs" onclick="toggleRegItems('${p.id}')" id="reg-items-btn-${p.id}" title="Show ${itemCount} item(s)">▸</button>`:''}</td>
+        <td style="vertical-align:top"><div style="display:flex;flex-direction:column;gap:2px;align-items:flex-start"><b>${p.no}</b>${(p.syncUnconfirmed||p.synced!==true||pinvDupGroupSize[p.id])?`<div style="display:flex;flex-wrap:wrap;gap:3px">${p.syncUnconfirmed?`<span class="badge b-red" style="font-size:8px" title="This id was not found on the server — save may have failed">⚠ NOT SYNCED</span>`:(p.synced!==true?`<span class="badge b-amber" style="font-size:8px" title="Saved locally, waiting for server confirmation">⏳ syncing…</span>`:'')}${pinvDupGroupSize[p.id]?`<span class="badge b-red" style="font-size:8px" title="${pinvDupGroupSize[p.id]} invoices share this exact invoice no, vendor &amp; date — review before deleting (amounts may differ, e.g. a mis-keyed re-entry)">⚠ Duplicate ×${pinvDupGroupSize[p.id]}</span>`:''}</div>`:''}</div></td><td style="vertical-align:top;white-space:nowrap">${fmtD(p.date)}</td><td style="vertical-align:top">${p.vendorName}</td>
+        <td style="vertical-align:top"><span class="badge b-teal">${p.mode||'inventory'}</span></td>
+        <td style="vertical-align:top"><span class="badge b-purple" style="font-size:10px;white-space:nowrap">${_ln}</span></td>
+        <td class="td-r" style="vertical-align:top">${fmt(p.taxable)}</td><td class="td-r" style="vertical-align:top">${fmt(p.gstTotal)}</td><td class="td-r" style="vertical-align:top"><b>${fmt(p.grand)}</b></td>
+        <td style="vertical-align:top">${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View enclosed/attached copy of the bill">📎 View</a>`:'<span class="badge b-gray" style="font-size:9px">No file</span>'}</td>
+        <td style="vertical-align:top">${p.grnRef?'<span class="badge b-teal">'+p.grnRef+'</span>':'—'}</td>
+        <td style="vertical-align:top"><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':p.status==='Approved'?'b-green':'b-red'}">${p.status}</span></td>
+        <td class="dd-wrap" style="position:relative;vertical-align:top">
           <button class="btn btn-xs" onclick="event.stopPropagation();toggleRowActions('${p.id}',this)" title="Actions">⋮</button>
           <div class="dd-list" id="row-actions-${p.id}" style="min-width:170px;left:auto;right:0">
             <div class="dd-item" onmousedown="viewPurchase('${p.id}','${p.mode||'inventory'}')">👁 View</div>
