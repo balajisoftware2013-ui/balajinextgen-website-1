@@ -1105,6 +1105,55 @@ function removeFromCart(idx) {
   renderCart();
 }
 
+// P0 FIX: this board's SAVE_KOT write had none of the protections the
+// rest of the suite already has — no client-scoped outbox on failure
+// (a failed save just showed a toast and vanished, same "console-only
+// failure" bug already fixed elsewhere), no requestId (a retry could
+// duplicate the KOT), and let the CLIENT generate/send its own
+// sequence number (orderNo) — the confirmed backend trusts a client-
+// supplied orderNo when present ("already printed on paper before
+// this call"), so two kot-management.html devices generating KOT-004
+// at the same moment could genuinely collide, bypassing the backend's
+// own LockService-guarded sequence that every OTHER KOT-creating
+// screen in this suite already relies on for exactly this reason.
+// Fixed: no orderNo sent (server always generates it), requestId
+// added, and failures now go to a real client-scoped outbox instead
+// of a fire-and-forget toast.
+function kmOutboxKey(){ return 'bnx_km_outbox_' + (KM_CLIENT_ID || 'default'); }
+function kmGetOutbox(){ try{ return JSON.parse(localStorage.getItem(kmOutboxKey())||'[]'); }catch(e){ return []; } }
+function kmSetOutbox(list){ localStorage.setItem(kmOutboxKey(), JSON.stringify(list)); kmUpdateOutboxBadge(); }
+function kmQueuePending(action, payload, requestId){
+  const list = kmGetOutbox();
+  list.push({ requestId, action, payload, attempts:0, queuedAt:new Date().toISOString() });
+  kmSetOutbox(list);
+}
+function kmUpdateOutboxBadge(){
+  const n = kmGetOutbox().length;
+  let badge = document.getElementById('kmOutboxBadge');
+  if(!badge){
+    badge = document.createElement('div');
+    badge.id = 'kmOutboxBadge';
+    badge.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:99999;padding:8px 14px;border-radius:20px;font-size:12px;font-weight:700;color:#fff;background:var(--red,#c0392b);box-shadow:0 2px 8px rgba(0,0,0,.25);display:none;cursor:pointer;';
+    badge.onclick = kmFlushOutbox;
+    document.body.appendChild(badge);
+  }
+  badge.textContent = n ? `⚠️ ${n} KOT(s) not synced — tap to retry` : '';
+  badge.style.display = n ? 'inline-block' : 'none';
+}
+async function kmFlushOutbox(){
+  const list = kmGetOutbox();
+  if(!list.length) return;
+  const remaining = [];
+  for (const entry of list){
+    const res = await kmApi(entry.action, entry.payload);
+    if(!res || !res.success) remaining.push(entry);
+  }
+  kmSetOutbox(remaining);
+}
+setInterval(kmFlushOutbox, 15000);
+window.addEventListener('online', kmFlushOutbox);
+document.addEventListener('DOMContentLoaded', kmUpdateOutboxBadge);
+
 function saveKOT() {
   const table  = document.getElementById('kot-table')?.value;
   const waiter = document.getElementById('kot-waiter')?.value;
@@ -1113,8 +1162,17 @@ function saveKOT() {
   const notes  = document.getElementById('kot-notes')?.value || '';
   if(!table) { toast('Select a table first!', 'error'); return; }
   if(!activeCart.length) { toast('Add at least one item!', 'error'); return; }
+  // P0 FIX ("no dummy data if login" — same principle as
+  // customer-order.html/steward-mobile.html): refuse to send a KOT
+  // built against the hardcoded fallback menu to the real kitchen —
+  // those item names/prices don't correspond to anything the client
+  // actually sells or the backend actually has priced.
+  if (usingFallbackMenu){
+    toast('⚠️ Real menu not loaded yet — cannot send this KOT to the kitchen. Wait for the menu to sync or refresh.', 'error');
+    return;
+  }
   const kots = dbGet();
-  const kotNo = 'KOT-' + String(kots.length + 1).padStart(3,'0');
+  const kotNo = 'KOT-' + String(kots.length + 1).padStart(3,'0'); // LOCAL display number only — see note below
   const zone = TABLES.find(t=>t.n===table)?.zone || 'Main Hall';
   const newKOT = {
     id: uid(), no: kotNo, table, waiter, covers: parseInt(covers),
@@ -1132,12 +1190,26 @@ function saveKOT() {
   // FIX: now actually posts to the backend (SAVE_KOT, matching the
   // same 45_LiveKotBridge.gs KOT_MASTER used everywhere else), not
   // just this browser's local IndexedDB/localStorage copy.
-  kmApi('SAVE_KOT', {
+  // P0 FIX: orderNo intentionally NOT sent — the confirmed backend
+  // trusts a client-supplied orderNo as an already-printed ticket
+  // number; sending our own locally-generated kotNo here would let
+  // two devices collide on the same number. The server-generated
+  // serverId becomes the real, authoritative KOT number; kotNo above
+  // remains only this device's local/offline display label.
+  const kmRequestId = (typeof bnxUuid==='function') ? bnxUuid() : ('km-'+Date.now()+'-'+Math.random().toString(36).slice(2,8));
+  const kmPayload = {
     table: table, waiter: waiter, covers: parseInt(covers), remarks: notes,
     items: newKOT.items.map(i => ({ name: i.n, qty: i.q, price: i.p })),
-    orderNo: kotNo,
-  }).then(res => {
-    if(!res || !res.success){ toast('⚠ Saved locally — kitchen server sync failed, will need retry', 'warn'); }
+    requestId: kmRequestId,
+  };
+  kmApi('SAVE_KOT', kmPayload).then(res => {
+    if(!res || !res.success){
+      kmQueuePending('SAVE_KOT', kmPayload, kmRequestId);
+      toast('⚠ Saved locally — kitchen server sync failed, queued for retry', 'warn');
+    }
+  }).catch(()=>{
+    kmQueuePending('SAVE_KOT', kmPayload, kmRequestId);
+    toast('⚠ Saved locally — kitchen server sync failed, queued for retry', 'warn');
   });
 }
 

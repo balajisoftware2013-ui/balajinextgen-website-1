@@ -284,6 +284,37 @@
       performValidation();
     }
 
+    // P0 FIX (onboarding-engine spec, #17 — "IMPORT_BATCH_ID... If the
+    // same file is uploaded again: Detect it. Do not duplicate data."):
+    // this tool did bulk real-money writes (IMPORT_BATCH — the exact
+    // historical-sales-import path) with no batch ID, no duplicate-file
+    // detection, and no confirmation step at all — re-uploading the
+    // same file by accident (easy to do mid-shift, or after a page
+    // refresh losing scroll position) would silently double every row.
+    // Lightweight client-side signature: filename + sheet + row count +
+    // first 3 rows' content. Not cryptographically strong, but real
+    // duplicate-file accidents (same file, same button, twice) always
+    // match on this; a genuinely different file essentially never will.
+    // Client-scoped so Client A's import history can never appear to
+    // Client B on a shared device.
+    function bnxImportHistoryKey(){ return 'bnx_import_history_' + (CLIENT_ID || 'default'); }
+    function bnxGetImportHistory(){ try{ return JSON.parse(localStorage.getItem(bnxImportHistoryKey())||'[]'); }catch(e){ return []; } }
+    function bnxSaveImportHistory(list){ try{ localStorage.setItem(bnxImportHistoryKey(), JSON.stringify(list.slice(-50))); }catch(e){} }
+    function bnxFileSignature(){
+      const sampleRows = (sheetData.rows||[]).slice(0,3).map(r=>r.join('|')).join('||');
+      const raw = (fileData.filename||'') + '::' + (selectedSheet||'') + '::' + (sheetData.rows||[]).length + '::' + sampleRows;
+      let hash = 0;
+      for (let i=0;i<raw.length;i++){ hash = ((hash<<5)-hash+raw.charCodeAt(i))|0; }
+      return 'SIG-' + Math.abs(hash).toString(36);
+    }
+    function bnxGenBatchId(){
+      const d = new Date();
+      const ymd = d.getFullYear()+String(d.getMonth()+1).padStart(2,'0')+String(d.getDate()).padStart(2,'0');
+      return 'IMP-'+ymd+'-'+Math.random().toString(36).slice(2,8).toUpperCase();
+    }
+
+    let currentBatchId = null;
+
     function performValidation() {
       if (!sheetData) {
         showMessage('validateMessage', '❌ No data selected', 'error');
@@ -310,12 +341,70 @@
     }
 
     function proceedToImport() {
+      // P0 FIX: duplicate-file detection — warn (not block outright;
+      // a legitimate re-import of a corrected file is a real use case)
+      // before starting a second real bulk write against a file
+      // signature already imported successfully for this client.
+      const sig = bnxFileSignature();
+      const history = bnxGetImportHistory();
+      const priorMatch = history.find(h => h.signature === sig && h.status === 'completed');
+      if (priorMatch){
+        const proceedAnyway = confirm('⚠️ This file was already imported on ' + priorMatch.completedAt + ' (Batch ' + priorMatch.batchId + ', ' + priorMatch.successCount + ' rows).\n\nImporting it again will likely create duplicate records — only continue if you specifically intend to re-import.\n\nOK = Import anyway\nCancel = Stop');
+        if (!proceedAnyway) return;
+      }
+      // P0 FIX: explicit confirmation before a real bulk financial
+      // write — this tool had none at all (doc principle #14: "Never
+      // silently modify client data... show IMPORT SUMMARY... Are you
+      // sure?").
+      const rows = sheetData.rows.length;
+      const chunks = Math.ceil(rows / CHUNK_SIZE);
+      const goAhead = confirm('Import ' + rows + ' row(s) from "' + (fileData.filename||'') + '" → ' + selectedSheet + '\n\nThis will write real data to the ' + selectedSheet + ' sheet in ' + chunks + ' batch(es). This cannot be automatically undone from this screen.\n\nOK = Start Import\nCancel = Go back');
+      if (!goAhead) return;
+
+      currentBatchId = bnxGenBatchId();
       updateSteps(3, 4);
       document.getElementById('validateSection').style.display = 'none';
       document.getElementById('importSection').style.display = 'block';
       document.getElementById('importProgress').style.display = 'block';
       
       batchImport();
+    }
+
+    async function batchImportChunkWithRetry(rows, batchNum, totalBatches, maxAttempts){
+      let lastError = null;
+      for (let attempt=1; attempt<=maxAttempts; attempt++){
+        try {
+          const res = await fetch(GAS_CONFIG.GAS_URL, {
+            method: 'POST',
+            body: JSON.stringify({
+              action: 'IMPORT_BATCH',
+              clientId: CLIENT_ID,
+              sessionToken: (localStorage.getItem('ERP_SESSION')||''),
+              sheet: selectedSheet,
+              rows: JSON.stringify(rows),
+              batchNum: batchNum,
+              totalBatches: totalBatches,
+              // P0 FIX: batchId + attempt-stable per-chunk requestId,
+              // so a retried chunk (network blip, not a data change)
+              // can be recognized and deduplicated server-side instead
+              // of appended a second time — same idempotency principle
+              // as every other write engine in this suite.
+              batchId: currentBatchId,
+              requestId: currentBatchId + '-' + batchNum
+            })
+          });
+          const data = await res.json();
+          if (data.success) return { ok:true, data };
+          lastError = data.message || 'Server rejected this batch';
+          // A rejection (bad data, validation failure) won't fix
+          // itself on retry — only retry on network/transport failure.
+          return { ok:false, error: lastError };
+        } catch(err) {
+          lastError = err.message;
+          if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 1000 * attempt));
+        }
+      }
+      return { ok:false, error: lastError };
     }
 
     async function batchImport() {
@@ -336,6 +425,7 @@
       
       let successCount = 0;
       let failCount = 0;
+      const failedBatches = [];
       
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
@@ -354,42 +444,52 @@
           return obj;
         });
         
-        try {
-          const res = await fetch(GAS_CONFIG.GAS_URL, {
-            method: 'POST',
-            body: JSON.stringify({
-              action: 'IMPORT_BATCH',
-              clientId: CLIENT_ID,
-              sessionToken: (localStorage.getItem('ERP_SESSION')||''),
-              sheet: selectedSheet,
-              rows: JSON.stringify(rows),
-              batchNum: i + 1,
-              totalBatches: chunks.length
-            })
-          });
-          
-          const data = await res.json();
-          if (data.success) {
-            successCount += chunk.length;
-          } else {
-            failCount += chunk.length;
-            console.error(`Batch ${i + 1} failed:`, data.message);
-          }
-        } catch(err) {
+        // P0 FIX: was a single attempt, no retry — a plain network
+        // blip mid-shift permanently failed that chunk with zero
+        // recovery. Now retries transport failures up to 3 times with
+        // backoff before counting the chunk as failed; a real server-
+        // side rejection (bad data) still fails immediately since
+        // retrying it changes nothing.
+        const result = await batchImportChunkWithRetry(rows, i + 1, chunks.length, 3);
+        if (result.ok) {
+          successCount += chunk.length;
+        } else {
           failCount += chunk.length;
-          console.error(`Batch ${i + 1} error:`, err);
+          failedBatches.push({ batchNum: i+1, error: result.error });
+          console.error(`Batch ${i + 1} failed:`, result.error);
         }
         
         await new Promise(r => setTimeout(r, 500)); // Rate limit
       }
       
-      completeImport(successCount, failCount);
+      // P0 FIX: record this run in the client-scoped import history —
+      // powers the duplicate-file warning in proceedToImport() above,
+      // and gives at least a minimal audit trail (batch ID, file,
+      // rows, timestamp, status) where none existed before.
+      const history = bnxGetImportHistory();
+      history.push({
+        batchId: currentBatchId,
+        signature: bnxFileSignature(),
+        filename: fileData.filename || '',
+        sheet: selectedSheet,
+        totalRows: totalRows,
+        successCount: successCount,
+        failCount: failCount,
+        status: failCount === 0 ? 'completed' : (successCount === 0 ? 'failed' : 'partial'),
+        completedAt: new Date().toLocaleString('en-IN')
+      });
+      bnxSaveImportHistory(history);
+      
+      completeImport(successCount, failCount, failedBatches);
     }
 
-    function completeImport(successCount, failCount) {
+    function completeImport(successCount, failCount, failedBatches) {
+      const failedNote = (failedBatches && failedBatches.length)
+        ? `<br><span style="color:var(--red,#c0392b);">⚠️ Batch(es) ${failedBatches.map(b=>b.batchNum).join(', ')} failed after retries — those rows were NOT imported. Re-run this file to retry just those rows, or check the server logs.</span>`
+        : '';
       const html = `<div class="status-box success">
-        <strong>✅ Import Complete!</strong><br>
-        Imported: ${successCount} rows | Failed: ${failCount}
+        <strong>✅ Import Complete!</strong> (Batch ${currentBatchId})<br>
+        Imported: ${successCount} rows | Failed: ${failCount}${failedNote}
       </div>`;
       
       document.getElementById('validateResult').innerHTML = html;

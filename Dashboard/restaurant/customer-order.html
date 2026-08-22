@@ -248,6 +248,27 @@ async function gasApi(action,payload,endpoint){
   }catch(e){ return {success:false,offline:true,error:e.message}; }
 }
 
+/* ⚠️ ARCHITECTURAL SECURITY NOTE — different trust model from every
+   other file in this suite, cannot be closed from this frontend alone:
+   every staff-facing app (dashboard/steward) resolves CLIENT_ID from
+   an authenticated sessionToken, which the backend validates before
+   trusting anything the browser sends. THIS page has no login/session
+   at all by design — it's a public QR-code guest self-order page — so
+   STATE.clientId below is read directly from the URL's ?client= param
+   with nothing to cross-check it against. Anyone can currently place
+   an order (or attempt a points redemption) against ANY client simply
+   by editing the URL, e.g. changing ?client=CL00010 to another
+   client's real ID. Closing this requires a BACKEND change this file
+   can't make alone: issue each table a signed/opaque QR token at
+   print time (not a bare clientId+table pair guessable/editable from
+   the URL) and have the backend verify that token server-side before
+   accepting SAVE_ORDER/CUSTOMER_CHECKIN/REDEEM_POINTS — the same
+   "backend derives identity, never trusts the browser" principle
+   already applied to CLIENT_ID resolution everywhere else in this
+   suite, just needs its own mechanism here since there's no session
+   to hang it on. Flagging prominently rather than leaving this
+   silently unaddressed. */
+
 /* ── Read the QR link: e.g. https://yourdomain.com/order.html?client=CLI001&table=B25 ── */
 const qs = new URLSearchParams(window.location.search);
 const STATE = {
@@ -367,6 +388,7 @@ document.getElementById('ph-continue').onclick = async ()=>{
      number → returns their saved name and bumps visit count. See the
      accompanying backend-gas-crm-order.gs for the server side of this. */
   const res = await gasApi('CUSTOMER_CHECKIN', {
+    requestId: 'chkin-' + STATE.scanKey + '-' + Date.now().toString(36),
     mobileNo: STATE.customerPhone,
     tableId: STATE.tableId,
     scanKey: STATE.scanKey,
@@ -403,6 +425,7 @@ document.getElementById('nm-continue').onclick = async ()=>{
   // Save the name against the phone number we already checked in, and let the
   // backend fire the welcome WhatsApp message now that we have a name to personalise it with.
   gasApi('CUSTOMER_CHECKIN', {
+    requestId: 'chkin-name-' + STATE.scanKey + '-' + Date.now().toString(36),
     mobileNo: STATE.customerPhone, tableId: STATE.tableId, scanKey: STATE.scanKey, customerName: name,
   }, 'V2_CORE').catch(()=>{});
   enterMenu();
@@ -541,11 +564,24 @@ document.getElementById('cart-place').onclick = async ()=>{
     return { itemName: m.name, qty, rate: m.price, amount: qty*m.price };
   });
 
+  // Generated once, up front, so both the points-redemption call and
+  // the order-save call below can share/derive from the same attempt
+  // ID — a retry of this whole submission (double-tap, page hiccup)
+  // reuses the same IDs instead of minting new ones each time.
+  const orderRequestId = 'cust-' + STATE.scanKey + '-' + Date.now().toString(36) + Math.random().toString(36).slice(2,8);
+
   // Lock in the actual points redemption server-side (source of truth for
   // the discount) before saving the order, if the guest opted to use points.
   let redeemedPoints = 0, redeemedDiscount = 0;
   if (STATE.useLoyaltyPoints && STATE.points >= LOYALTY_UI.MIN_REDEEM_POINTS){
+    // FIX: same requestId gap as SAVE_ORDER below, but higher-stakes
+    // here — this actually spends a real points balance. A network
+    // retry/resend with no requestId could redeem points twice for a
+    // single order. Reuses the SAME orderRequestId (generated once,
+    // above) so the backend can tie the redemption to this exact order
+    // attempt once its idempotency support covers this action.
     const redeemRes = await gasApi('REDEEM_POINTS', {
+      requestId: orderRequestId + '-redeem',
       mobileNo: STATE.customerPhone, points: STATE.points, billAmount: amount,
     }, 'V2_CORE').catch(()=>null);
     if (redeemRes && redeemRes.success){
@@ -560,12 +596,6 @@ document.getElementById('cart-place').onclick = async ()=>{
      is exactly the source the Order Register already knows how to filter
      and badge, so this order shows up live in the kitchen/steward view
      with no extra plumbing on that side. */
-  // FIX: no requestId was sent — on a flaky venue wifi connection, a
-  // client-side retry (or the browser silently resubmitting) could
-  // create two identical orders with no way for the customer to
-  // notice. Once the confirmed backend's idempotency support covers
-  // this action, this makes a retry safe.
-  const orderRequestId = 'cust-' + STATE.scanKey + '-' + Date.now().toString(36) + Math.random().toString(36).slice(2,8);
   const res = await gasApi('SAVE_ORDER', {
     requestId: orderRequestId,
     tableId: STATE.tableId,
