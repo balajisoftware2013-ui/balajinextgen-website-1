@@ -269,14 +269,25 @@ tfoot td.td-r{padding:8px 14px;border-left:1px solid var(--border)}
    by name throughout both this file and inventory.html) needs to change. */
 .b-amber,.b-blue,.b-gray,.b-green,.b-orange,.b-purple,.b-red,.b-teal{background:#f1f5f9;color:#334155}
 .mb{display:none;position:fixed;inset:0;background:rgba(0,0,0,.52);z-index:5000;align-items:center;justify-content:center;padding:16px;backdrop-filter:blur(3px)}
-/* FIX ("all direct no local" — Aug 2026): mandatory-live-pull overlay —
-   same pattern added to inventory.html's showP() — shown while a fresh
-   pull from Google Sheets is in flight, on startup and every nav() page
-   switch, so nothing paints from stale cache before the real data lands. */
-#liveDataOverlay{position:fixed;inset:0;background:rgba(255,255,255,.9);z-index:9999;display:none;align-items:center;justify-content:center;flex-direction:column;gap:12px;backdrop-filter:blur(2px)}
+/* FIX ("data load google sheet problem take times every times" — Aug
+   2026, screenshot showed frozen white loading screen on Purchase
+   Module): this fired as a full-screen blocking modal not just on
+   page load but on EVERY nav() sidebar click too (see
+   _forcePullBeforeRender(), called at the top of nav() before that
+   page's rend*() call) — so switching from Dashboard to Vendor Master,
+   Registers, Analytics, etc. froze the whole screen for however long
+   that page's fresh pull took, every single time. Converted to a
+   small, non-blocking corner pill matching inventory.html's identical
+   fix: the target page still switches instantly and shows whatever
+   was last rendered while the pill signals a sync is in flight, then
+   the page's real rend*() call (already awaited right after this in
+   nav()) repaints it with fresh data the moment the pull lands. The
+   JS trigger logic itself (_forcePullBeforeRender(), nav(), init())
+   is unchanged — only this styling changed. */
+#liveDataOverlay{position:fixed;top:64px;right:16px;background:var(--card,#fff);border:1px solid var(--border,#e5e7eb);box-shadow:0 4px 16px rgba(0,0,0,.14);border-radius:999px;padding:7px 14px;z-index:9999;display:none;align-items:center;justify-content:center;flex-direction:row;gap:8px;pointer-events:none}
 #liveDataOverlay.show{display:flex}
-#liveDataOverlay .ld-spin{width:34px;height:34px;border:3px solid var(--border,#e5e7eb);border-top-color:var(--brand,#0d9488);border-radius:50%;animation:ldspin .7s linear infinite}
-#liveDataOverlay .ld-txt{font-size:12.5px;font-weight:700;color:var(--text3,#6b7280)}
+#liveDataOverlay .ld-spin{width:15px;height:15px;border:2px solid var(--border,#e5e7eb);border-top-color:var(--brand,#0d9488);border-radius:50%;animation:ldspin .7s linear infinite}
+#liveDataOverlay .ld-txt{font-size:11px;font-weight:700;color:var(--text3,#6b7280);white-space:nowrap}
 @keyframes ldspin{to{transform:rotate(360deg)}}
 .mb.on{display:flex}
 .md{background:var(--card);border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.3);padding:20px;width:90%;max-width:540px;max-height:92vh;overflow-y:auto;animation:popIn .2s ease}
@@ -450,7 +461,7 @@ div[style*="display:flex"]{flex-wrap:wrap}
 <body>
 <!-- FIX ("all direct no local" — Aug 2026): live-pull overlay, shown
      while fetching fresh data from Google Sheets — see nav()/DOMContentLoaded. -->
-<div id="liveDataOverlay"><div class="ld-spin"></div><div class="ld-txt">Loading live data from Google Sheets…</div></div>
+<div id="liveDataOverlay"><div class="ld-spin"></div><div class="ld-txt">Syncing…</div></div>
 <div id="app">
 <div class="sb-overlay" id="sbOv" onclick="closeSB()"></div>
 
@@ -1929,8 +1940,34 @@ async function pushPurchaseInvoicesToSyncTable(){
     waiters.forEach(res=>res());
   }
 }
-function save(){
+// FIX ("not have data in server but automatically load after data fix" —
+// Aug 2026, root-cause pass #4): save() below always calls
+// pushPurchaseInvoicesToSyncTable(), which pushes this tab's ENTIRE
+// current DB.purchases array as an upsert. pullInventorySyncData() (the
+// 20s background poll) called plain save() at the end of every single
+// cycle — just to persist the freshly-merged data to localStorage — which
+// meant every poll ALSO re-pushed the whole array back to the server,
+// whether or not this tab actually changed anything. Most of the time
+// that's harmless (the array matches the server already), but if this
+// tab was ever holding a row that got created locally and never actually
+// confirmed synced=true (a save that silently failed to reach the
+// server, or whose confirming pull never landed before the tab was
+// backgrounded) — the "keep any unconfirmed-synced row, it might still
+// be pending" rule in the merge below deliberately never prunes it, by
+// design, to protect genuinely brand-new saves. So that one phantom row
+// sat in this tab's memory forever, immune to server-side deletion, and
+// got blindly re-pushed to the shared sheet every 20 seconds — no matter
+// how many times it was deleted from the Register in another tab/device,
+// it would reappear within one poll cycle. A pull has nothing new to
+// push — it just received data FROM the server — so it should only ever
+// persist locally. Split save() into this local-only half (used by pulls)
+// and the full save() below (local persist + push, used by every actual
+// user-initiated create/edit/delete, which is correct and unchanged).
+function saveLocalOnly(){
   try{localStorage.setItem('BALAJI_PROCUREMENT',JSON.stringify(DB))}catch(e){}
+}
+function save(){
+  saveLocalOnly();
   // NOTE: previously also called InventoryBridge.syncSnapshot('procurement', DB)
   // here — that was part of an abandoned design (Drive-folder-based backend,
   // confirmed incompatible with this project's real rbClientSpreadsheetId_
@@ -2234,7 +2271,14 @@ function load(){
             pendingDel.has(p.id) || p.synced!==true || acctServerIds.has(p.id)
           );
         }
-        save();
+        // FIX (see "root-cause pass #4" note above save()/saveLocalOnly()):
+        // this used to call save(), which also pushes DB.purchases straight
+        // back to the server on every single poll — the actual mechanism
+        // that let a stale/phantom local row re-appear on the shared sheet
+        // no matter how many times it was deleted elsewhere. A pull only
+        // ever needs to persist what it just received; it never has a new
+        // local change of its own to push.
+        saveLocalOnly();
         try{ rendDash(); }catch(e){}
         try{ rendPurchaseList(); }catch(e){}
         try{ rendRegs(); }catch(e){}
@@ -2320,7 +2364,13 @@ function load(){
       changed=true;
     });
     if(!changed)return;
-    save();
+    // FIX (same root-cause pass #4 as pullInventorySyncData() above): this
+    // is a third, external pull path (called from outside this file — see
+    // its header comment) with the exact same hazard — calling save()
+    // here would push whatever's currently in DB.purchases straight back
+    // to the server on every external refresh, including any lingering
+    // never-confirmed phantom row this tab happens to be holding.
+    saveLocalOnly();
     try{ rendDash(); }catch(e){}
     try{ rendPurchaseList(); }catch(e){}
     try{ rendRegs(); }catch(e){}
@@ -6378,6 +6428,38 @@ function rejectP(id){const i=DB.purchases.findIndex(p=>p.id===id);if(i>=0){DB.pu
 function holdP(id){const i=DB.purchases.findIndex(p=>p.id===id);if(i>=0){DB.purchases[i].status='On Hold';save();rendApprovals();updateApprCount();toast('Purchase put on Hold','warn','⏸️');erpApi('UPDATE_PURCHASE_INVOICE', DB.purchases[i]).then(r=>{ if(r&&r.success===false) toast('⚠️ Hold status saved locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️'); });}}
 
 // ════ DASHBOARD ════
+// FIX ("duplicate fix and can all select and can delete and work" —
+// Aug 2026): identical invoices (same invoice no + vendor + date) were
+// showing as separate rows — genuine duplicate records in the backend
+// (e.g. from the CL00010 database-divergence issue: the same invoice
+// existed in two different physical spreadsheets under two different
+// ids, and the orphan-merge migration then appended both into one
+// canonical file). There's no reliable way to silently auto-delete one
+// twin (could be a legitimate second identical bill), so instead:
+// detect groups of matching records across the FULL purchase list, and
+// let callers flag every row in a group with a "⚠ Duplicate" badge and
+// pre-select every copy except the earliest for review + bulk delete.
+// Originally lived only inside rendRegs(); pulled out here so rendDash()'s
+// Recent Purchases widget flags the exact same duplicates instead of
+// silently showing them unlabeled (see rendDash() below).
+function _pinvComputeDupGroups(){
+  const _dupGroups={};
+  (DB.purchases||[]).forEach(p=>{
+    const key=`${p.no}||${p.vendorName}||${p.date}`;
+    (_dupGroups[key]=_dupGroups[key]||[]).push(p);
+  });
+  const pinvDupGroupSize={}; // id -> size of its duplicate group (1 = unique)
+  const pinvDuplicateIds=new Set(); // ids pre-selected by "Select Duplicates" — every copy except the earliest
+  Object.values(_dupGroups).forEach(group=>{
+    if(group.length<2)return;
+    const sorted=[...group].sort((a,b)=>new Date(a.createdAt||0)-new Date(b.createdAt||0)||String(a.id).localeCompare(String(b.id)));
+    sorted.forEach((p,i)=>{
+      pinvDupGroupSize[p.id]=group.length;
+      if(i>0)pinvDuplicateIds.add(p.id); // keep the earliest unchecked, flag the rest
+    });
+  });
+  return {pinvDupGroupSize,pinvDuplicateIds};
+}
 function rendDash(){
   const today=new Date();
   ss('dashDate',today.toLocaleDateString('en-IN',{weekday:'long',day:'numeric',month:'long',year:'numeric'}));
@@ -6388,10 +6470,16 @@ function rendDash(){
   ss('d-grns',DB.grns.length);ss('d-rets',DB.returns.length);ss('d-vends',DB.vendors.length);
   const recEl=el('d-recent');
   if(recEl){
+    // FIX ("duplicate showed on Register but not Dashboard's Recent
+    // Purchases" — Aug 2026): same duplicate-group detection rendRegs()
+    // uses, so a duplicate invoice (e.g. two PINV-00001 rows, same
+    // vendor/date, from the CL00010 migration merge) is flagged here
+    // too instead of silently appearing as two ordinary-looking rows.
+    const {pinvDupGroupSize:dashDupGroupSize}=_pinvComputeDupGroups();
     const recent=[...DB.purchases.map(p=>({...p,_mode:'inventory'})),...DB.acctInvs.map(p=>({...p,_mode:'accounting'}))]
       .sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).slice(0,6);
     if(!recent.length){recEl.innerHTML='<div style="text-align:center;padding:24px;color:var(--text3);font-style:italic">No purchases yet.</div>';}
-    else recEl.innerHTML='<div class="tw"><table><thead><tr><th>Invoice</th><th>Date</th><th>Vendor</th><th>Amount</th><th>Bill</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+recent.map(p=>`<tr><td><b>${p.no}</b>${p.syncUnconfirmed?` <span class="badge b-red" style="font-size:8px" title="This id was not found on the server — save may have failed">⚠ NOT SYNCED</span>`:(p.synced!==true?` <span class="badge b-amber" style="font-size:8px" title="Saved locally, waiting for server confirmation">⏳ syncing…</span>`:'')}</td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td><td class="td-r"><b>${fmt(p.grand)}</b></td><td>${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View enclosed bill">📎</a>`:'<span class="badge b-gray" style="font-size:9px">—</span>'}</td><td><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':p.status==='Approved'?'b-green':'b-red'}">${p.status}</span></td><td style="white-space:nowrap"><button class="btn btn-xs" onclick="viewPurchase('${p.id}','${p._mode}')">👁</button> <button class="btn btn-xs" onclick="editPurchase('${p.id}','${p._mode}')">✏️</button> <button class="btn btn-xs btn-red" onclick="deletePurchase('${p.id}','${p._mode}')">🗑️</button></td></tr>`).join('')+'</tbody></table></div>';
+    else recEl.innerHTML='<div class="tw"><table><thead><tr><th>Invoice</th><th>Date</th><th>Vendor</th><th>Amount</th><th>Bill</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+recent.map(p=>`<tr${dashDupGroupSize[p.id]?' style="background:rgba(220,38,38,0.06)"':''}><td><b>${p.no}</b>${p.syncUnconfirmed?` <span class="badge b-red" style="font-size:8px" title="This id was not found on the server — save may have failed">⚠ NOT SYNCED</span>`:(p.synced!==true?` <span class="badge b-amber" style="font-size:8px" title="Saved locally, waiting for server confirmation">⏳ syncing…</span>`:'')}${dashDupGroupSize[p.id]?` <span class="badge b-red" style="font-size:8px" title="${dashDupGroupSize[p.id]} invoices share this exact invoice no, vendor &amp; date — review in Purchase Invoice Register before deleting">⚠ Duplicate ×${dashDupGroupSize[p.id]}</span>`:''}</td><td>${fmtD(p.date)}</td><td>${p.vendorName}</td><td class="td-r"><b>${fmt(p.grand)}</b></td><td>${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View enclosed bill">📎</a>`:'<span class="badge b-gray" style="font-size:9px">—</span>'}</td><td><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':p.status==='Approved'?'b-green':'b-red'}">${p.status}</span></td><td style="white-space:nowrap"><button class="btn btn-xs" onclick="viewPurchase('${p.id}','${p._mode}')">👁</button> <button class="btn btn-xs" onclick="editPurchase('${p.id}','${p._mode}')">✏️</button> <button class="btn btn-xs btn-red" onclick="deletePurchase('${p.id}','${p._mode}')">🗑️</button></td></tr>`).join('')+'</tbody></table></div>';
   }
   updateApprCount();
 }
@@ -6908,21 +6996,14 @@ function rendRegs(){
   // here either. Now groups on Invoice No + Vendor + Date only — the
   // amount is shown in the badge tooltip instead, so a same-bill/
   // different-amount pair still gets caught for review.
-  const _dupGroups={};
-  (DB.purchases||[]).forEach(p=>{
-    const key=`${p.no}||${p.vendorName}||${p.date}`;
-    (_dupGroups[key]=_dupGroups[key]||[]).push(p);
-  });
-  const pinvDupGroupSize={}; // id -> size of its duplicate group (1 = unique)
-  const pinvDuplicateIds=new Set(); // ids pre-selected by "Select Duplicates" — every copy except the earliest
-  Object.values(_dupGroups).forEach(group=>{
-    if(group.length<2)return;
-    const sorted=[...group].sort((a,b)=>new Date(a.createdAt||0)-new Date(b.createdAt||0)||String(a.id).localeCompare(String(b.id)));
-    sorted.forEach((p,i)=>{
-      pinvDupGroupSize[p.id]=group.length;
-      if(i>0)pinvDuplicateIds.add(p.id); // keep the earliest unchecked, flag the rest
-    });
-  });
+  // FIX ("duplicate showed on Register but not Dashboard's Recent
+  // Purchases" — Aug 2026): this computation used to live only here,
+  // inline, so the Dashboard's Recent Purchases widget (rendDash())
+  // had no way to flag the same duplicates it was silently displaying.
+  // Pulled out into _pinvComputeDupGroups() below so both places use
+  // one identical definition of "duplicate" — see that function for
+  // the original reasoning (CL00010 database-divergence migration).
+  const {pinvDupGroupSize,pinvDuplicateIds}=_pinvComputeDupGroups();
   window._pinvDuplicateIds=pinvDuplicateIds;
   if(ptb){
     if(!purchasesPage.length)ptb.innerHTML='<tr class="empty-r"><td colspan="14">No records</td></tr>';
