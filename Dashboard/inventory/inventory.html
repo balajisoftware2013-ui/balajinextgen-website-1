@@ -4975,6 +4975,27 @@ window.addEventListener('DOMContentLoaded', async ()=>{
   // far worse failure than showing slightly-stale data for one load.
   const _ldSafetyTimer = setTimeout(()=>{ if(_ldOverlay) _ldOverlay.classList.remove('show'); }, 15000);
 
+  // FIX ("inventory also local clear" — Aug 2026): same principle just
+  // applied to purchase-module.html's load() — ported from Business
+  // OS's "DB lives only in memory, loaded fresh from the cloud on every
+  // app entry" (see balaji-business-os.html). The comment right above
+  // this block used to say the local-cache render was "deliberately
+  // left untouched" — hidden behind the overlay, but never actually
+  // cleared, so a stale duplicate/phantom/already-deleted row from a
+  // prior session could still be sitting in memory the instant the
+  // overlay lifted if the live pull happened to be slow. DB.clearAll()
+  // (existing helper, already used by the "Danger Zone" reset buttons)
+  // wipes every BNJERP_{CID}_* localStorage key for this client before
+  // anything reads from them, so the live pull right below is now
+  // genuinely the ONLY source for this session's data — same
+  // architecture principle, same reasoning as purchase-module.html.
+  // Gated on _hasRealSession(): with no session there's nothing to
+  // pull fresh data from, so clearing would just leave a blank app
+  // with no fallback — same condition the overlay above already uses.
+  if(_hasRealSession()){
+    try{ DB.clearAll(); }catch(e){ console.warn('[BNJ] DB.clearAll() on load failed:', e); }
+  }
+
   // ── Step 1: Load local data instantly, then purge any legacy demo
   // rows left over from before demo-seeding was disabled ──
   // REMOVED ("remove all prev"): seedData() call — it used to inject
@@ -6215,17 +6236,40 @@ function savePurchase() {
   const other=parseFloat(document.getElementById('pi-other')?.value||0);
   const total=taxable+cgst+sgst+other;
   const vendor=DB.findOne('vendors',{_id:supplier});
-  const pi={_id:uid('PI'),inv_no:invno,party_id:supplier,party_name:vendor?.name||supplier,inv_date:invdate,due_date:document.getElementById('pi-duedate').value,wh_id:document.getElementById('pi-wh').value,taxable,cgst,sgst,igst,other_charges:other,total,status:'unpaid',items:items_rows,
-    bill_attachments: (window._piBillAttachments||[]).map(a=>({name:a.name,type:a.type,size:a.size,data:a.data}))
+  // FIX ("delete and edit option also give can" — Aug 2026): if
+  // editingPiId is set (see editPI() above), this is an edit, not a
+  // new invoice — reuse the same _id and status/bill-attachments,
+  // update the existing record in place, and reverse the OLD item
+  // quantities' stock impact (via reversePurchaseStockImpact, same
+  // safe compensating-entry approach deletePI() uses) BEFORE posting
+  // the new quantities below, so editing an invoice's quantities can
+  // never silently double- or under-count stock.
+  const isEdit = !!editingPiId;
+  const origPi = isEdit ? DB.findOne('purchase_invoices',{_id:editingPiId}) : null;
+  if(isEdit && origPi) reversePurchaseStockImpact(origPi, 'Reversal for edit of invoice '+origPi.inv_no);
+  const pi={
+    _id: isEdit ? editingPiId : uid('PI'),
+    inv_no:invno,party_id:supplier,party_name:vendor?.name||supplier,inv_date:invdate,
+    due_date:document.getElementById('pi-duedate').value,wh_id:document.getElementById('pi-wh').value,
+    taxable,cgst,sgst,igst,other_charges:other,total,
+    status:(origPi&&origPi.status)||'unpaid',
+    items:items_rows,
+    bill_attachments: (window._piBillAttachments||[]).length ? (window._piBillAttachments||[]).map(a=>({name:a.name,type:a.type,size:a.size,data:a.data})) : ((origPi&&origPi.bill_attachments)||[])
   };
-  DB.insert('purchase_invoices',pi);
+  if(isEdit){
+    DB.update('purchase_invoices', editingPiId, pi);
+  }else{
+    DB.insert('purchase_invoices',pi);
+  }
   // FIX ("backend copies from business os files" — Aug 2026): authoritative
-  // per-row sync for this new invoice — see syncPurchaseInvoiceRowToServer()'s
-  // header comment above. DB.insert's own DB.save() full-array push (fired
-  // automatically) still runs too as the existing safety net.
+  // per-row sync for this invoice (create or edit — this action is an
+  // upsert either way) — see syncPurchaseInvoiceRowToServer()'s header
+  // comment above. The generic DB.save() full-array push (fired
+  // automatically by DB.insert/DB.update) still runs too as the
+  // existing safety net.
   syncPurchaseInvoiceRowToServer(pi);
   window._piBillAttachments = []; renderPIBillPreview();
-  // Post stock entries
+  // Post stock entries for the (new or edited) quantities
   const wh=pi.wh_id||'WH001';
   items_rows.forEach(ir=>{
     const prev=getStockBalance(ir.item_id,wh);
@@ -6245,11 +6289,18 @@ function savePurchase() {
     // every place that reads it.
     if(ir.rate>0){ DB.update('items',ir.item_id,{purchase_price:ir.rate}); }
   });
-  // Post voucher
+  // Post voucher — on edit, replace the old one rather than adding a
+  // second, so accounting reports don't double-count this invoice.
+  if(isEdit){
+    const remainingVouchers=DB.all('vouchers').filter(v=>!(v.ref_doc===pi._id && v.ref_type==='purchase_invoice'));
+    DB.save('vouchers', remainingVouchers);
+  }
   DB.insert('vouchers',{_id:uid('VCH'),type:'purchase',v_no:'PI/'+invno,date:invdate,narration:'Purchase from '+vendor?.name+' | Inv: '+invno,total,ref_doc:pi._id,ref_type:'purchase_invoice',entries:[{ledger:'Purchase',dr:taxable,cr:0},{ledger:'Input CGST',dr:cgst,cr:0},{ledger:'Input SGST',dr:sgst,cr:0},{ledger:vendor?.name||supplier,dr:0,cr:total}]});
-  toast('Purchase invoice saved & accounting posted ✓','s');
+  toast(isEdit?`${pi.inv_no} updated & stock adjusted ✓`:'Purchase invoice saved & accounting posted ✓','s');
+  editingPiId=null;
   document.getElementById('pi-items-body').innerHTML='';
   document.getElementById('pi-invno').value='';
+  loadPurchaseRegister();
   loadDashboard();
 }
 
@@ -6273,6 +6324,84 @@ function itemBalanceAsOf(itemId, asOfDate){
 }
 
 // ── Purchase Register ───────────────────────────
+// FIX ("delete and edit option also give can" — Aug 2026): Purchase
+// Register / the Dashboard's Purchase KPI modal had View and "Mark as
+// Paid" but no way to actually edit or delete a purchase invoice
+// anywhere in this file — a genuine missing feature, not a formatting
+// issue. editingPiId tracks which invoice (if any) savePurchase() below
+// is updating in place, instead of always creating a new record.
+let editingPiId = null;
+function editPI(id){
+  const pi = DB.findOne('purchase_invoices',{_id:id});
+  if(!pi){ toast('Invoice not found','e'); return; }
+  editingPiId = id;
+  showP('purchase', document.getElementById('nv-purchase'));
+  document.getElementById('pi-supplier').value = pi.party_id||'';
+  document.getElementById('pi-invno').value = pi.inv_no||'';
+  document.getElementById('pi-invdate').value = pi.inv_date||'';
+  if(document.getElementById('pi-duedate')) document.getElementById('pi-duedate').value = pi.due_date||'';
+  if(document.getElementById('pi-wh')) document.getElementById('pi-wh').value = pi.wh_id||'';
+  if(document.getElementById('pi-other')) document.getElementById('pi-other').value = pi.other_charges||0;
+  const body=document.getElementById('pi-items-body');
+  if(body) body.innerHTML='';
+  (pi.items||[]).forEach(it=>{
+    addPurchaseRow();
+    const rows=document.querySelectorAll('#pi-items-body .irow');
+    const row=rows[rows.length-1];
+    if(!row)return;
+    const rowId=row.id;
+    const sel=row.querySelector('select');
+    // Pre-fill from the ACTUAL saved invoice line, not the item master's
+    // current defaults (addPurchaseRow's <select> would otherwise leave
+    // HSN/Qty/Rate/GST at their fresh-row defaults until manually reset).
+    if(sel)sel.value=it.item_id;
+    const hsnEl=document.getElementById(rowId+'-hsn'); if(hsnEl)hsnEl.value=it.hsn||'';
+    const qtyEl=document.getElementById(rowId+'-qty'); if(qtyEl)qtyEl.value=it.qty||0;
+    const rateEl=document.getElementById(rowId+'-rate'); if(rateEl)rateEl.value=it.rate||0;
+    const gstEl=document.getElementById(rowId+'-gst'); if(gstEl)gstEl.value=it.gst_rate||0;
+  });
+  calcPurchaseTotals();
+  toast('Editing '+pi.inv_no+' — change items/amounts then Save','','✏️');
+}
+// FIX ("delete and edit option also give can" — Aug 2026): stock
+// history is never physically edited/deleted once posted — same
+// principle real accounting software follows (never rewrite the past,
+// post a correction instead). Reversing a purchase's stock impact
+// means posting a compensating OUT entry for each item, dated today,
+// rather than deleting or rewriting the original IN entries — because
+// getStockBalance() reads the LATEST entry's stored running balance,
+// deleting/editing an old entry would silently corrupt every later
+// entry's balance for that item+warehouse. A fresh reversal entry is
+// always safe: it's inserted last, so its own balance is computed
+// correctly from the current state, and every entry before it stays
+// exactly as it was — genuine, auditable history.
+function reversePurchaseStockImpact(pi, reasonNote){
+  const wh = pi.wh_id || 'WH001';
+  (pi.items||[]).forEach(ir=>{
+    const prev=getStockBalance(ir.item_id,wh);
+    DB.insert('stock_ledger',{_id:uid('SL'),item_id:ir.item_id,wh_id:wh,date:today(),txn_type:'purchase_reversal',ref_id:pi._id,ref_type:'purchase_invoice_reversal',qty_in:0,qty_out:ir.qty,balance:prev-ir.qty,rate:ir.rate,value:ir.qty*ir.rate,notes:reasonNote});
+  });
+}
+async function deletePI(id){
+  const pi = DB.findOne('purchase_invoices',{_id:id});
+  if(!pi){ toast('Invoice not found','e'); return; }
+  if(!confirm(`Delete invoice ${pi.inv_no} (${pi.party_name}, ${fmt(pi.total)})?\n\nThis will:\n• Remove it from Purchase Register and all reports\n• Reverse its stock impact (posts a compensating entry — the original entries stay in history, same as real accounting practice)\n\nThis cannot be undone.`))return;
+  reversePurchaseStockImpact(pi, 'Reversal for deleted invoice '+pi.inv_no);
+  const remaining = DB.all('purchase_invoices').filter(p=>p._id!==id);
+  DB.save('purchase_invoices', remaining);
+  const remainingVouchers = DB.all('vouchers').filter(v=>!(v.ref_doc===id && v.ref_type==='purchase_invoice'));
+  DB.save('vouchers', remainingVouchers);
+  // FIX ("backend copies from business os files" — Aug 2026): authoritative
+  // per-row delete on the shared table — see deletePurchaseInvoiceRowFrom
+  // Server()'s header comment above for why this is what actually keeps
+  // this deletion from being resurrected by another tab/session.
+  await deletePurchaseInvoiceRowFromServer(id);
+  toast(`${pi.inv_no} deleted. Stock reversed.`,'s');
+  loadPurchaseRegister();
+  loadDashboard();
+  const box=document.getElementById('pr-detail-box'); if(box)box.style.display='none';
+}
+
 function loadPurchaseRegister() {
   const from = document.getElementById('pr-from')?.value||'';
   const to = document.getElementById('pr-to')?.value||'';
@@ -6304,7 +6433,7 @@ function loadPurchaseRegister() {
       <td class="r" style="font-family:'JetBrains Mono','Noto Sans',monospace;">${fmt(p.igst||0)}</td>
       <td class="r" style="font-weight:800;font-family:'JetBrains Mono','Noto Sans',monospace;">${fmt(p.total)}</td>
       <td>${statusBadge(p.status)}</td>
-      <td class="no-print"><button class="btn" style="padding:2px 6px;font-size:10px;" onclick="event.stopPropagation();openPRDetail('${p._id}')">↵ Open</button></td>
+      <td class="no-print" style="white-space:nowrap"><button class="btn" style="padding:2px 6px;font-size:10px;" onclick="event.stopPropagation();openPRDetail('${p._id}')">↵ Open</button> <button class="btn" style="padding:2px 6px;font-size:10px;" onclick="event.stopPropagation();editPI('${p._id}')" title="Edit this invoice">✏️</button> <button class="btn" style="padding:2px 6px;font-size:10px;color:var(--red)" onclick="event.stopPropagation();deletePI('${p._id}')" title="Delete this invoice">🗑️</button></td>
     </tr>`;
   }).join('') : '<tr><td colspan="11" class="tbl-empty">No purchase invoices found for the selected period</td></tr>';
 }
@@ -6341,6 +6470,8 @@ function openPRDetail(piId) {
       <div style="display:flex;gap:8px;">
         <button class="btn" onclick="doPrint()">🖨 Print Invoice</button>
         <button class="btn s" onclick="markAsPaid('${pi._id}')">✅ Mark as Paid</button>
+        <button class="btn" onclick="editPI('${pi._id}')">✏️ Edit</button>
+        <button class="btn" style="color:var(--red)" onclick="deletePI('${pi._id}')">🗑️ Delete</button>
         <button class="btn tally" onclick="toast('Exporting to Tally...','s')">🔗 Push to Tally</button>
       </div>
       <div style="min-width:240px;background:var(--bg);padding:12px;border-radius:var(--rs);">
@@ -11003,9 +11134,9 @@ function showKPIDetail(type) {
           <button class="btn d" style="padding:3px 10px;font-size:11px;white-space:nowrap;" onclick="removeDuplicatePurchaseInvoices();try{showKPIDetail('purchase-mtd');}catch(e){console.error('[BNJ] modal refresh after cleanup failed:',e);}">🧹 Clean up now</button>
         </div>`;
       }
-      html+=`<table><thead><tr><th>Date</th><th>Invoice No</th><th>Supplier</th><th class="r">Taxable</th><th class="r">GST</th><th class="r">Total</th><th>Status</th></tr></thead><tbody>`;
-      mtdPis.forEach(p=>{ html+=`<tr><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${p.inv_date}</td><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${p.inv_no}</td><td>${p.party_name}</td><td class="r">${fmt(p.taxable||0)}</td><td class="r" style="color:var(--orange);">${fmt((p.cgst||0)+(p.sgst||0)+(p.igst||0))}</td><td class="r" style="font-weight:700;color:var(--ac);">${fmt(p.total||0)}</td><td><span class="badge ${p.status==='paid'?'g':p.status==='partial'?'o':'r'}">${p.status||'unpaid'}</span></td></tr>`; });
-      if(!mtdPis.length) html+=`<tr><td colspan="7" class="tbl-empty">No purchases in ${periodLabel}</td></tr>`;
+      html+=`<table><thead><tr><th>Date</th><th>Invoice No</th><th>Supplier</th><th class="r">Taxable</th><th class="r">GST</th><th class="r">Total</th><th>Status</th><th></th></tr></thead><tbody>`;
+      mtdPis.forEach(p=>{ html+=`<tr><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${p.inv_date}</td><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${p.inv_no}</td><td>${p.party_name}</td><td class="r">${fmt(p.taxable||0)}</td><td class="r" style="color:var(--orange);">${fmt((p.cgst||0)+(p.sgst||0)+(p.igst||0))}</td><td class="r" style="font-weight:700;color:var(--ac);">${fmt(p.total||0)}</td><td><span class="badge ${p.status==='paid'?'g':p.status==='partial'?'o':'r'}">${p.status||'unpaid'}</span></td><td style="white-space:nowrap"><button class="btn" style="padding:2px 6px;font-size:10px;" onclick="closeModal('kpi-detail-modal');editPI('${p._id}')" title="Edit">✏️</button> <button class="btn" style="padding:2px 6px;font-size:10px;color:var(--red)" onclick="deletePI('${p._id}');showKPIDetail('purchase-mtd')" title="Delete">🗑️</button></td></tr>`; });
+      if(!mtdPis.length) html+=`<tr><td colspan="8" class="tbl-empty">No purchases in ${periodLabel}</td></tr>`;
       html+=`</tbody></table>`;
 
     } else if(type==='issues-mtd') {
