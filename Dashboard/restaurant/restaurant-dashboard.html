@@ -5609,14 +5609,38 @@ async function erpApi(payload, type='V2_AUTH'){
    Bills save to localStorage instantly and sync in the background
    every 12s with retry, so a backend/network blip during service
    never blocks or loses a bill. See BillQueue.saveBillOffline().
+
+   P0 FIX (external audit round 4, #2/#3/#4 — all three confirmed
+   real, all fixed together since they're the same subsystem):
+
+   #3 CLIENT ISOLATION: QUEUE_KEY used to be the single global literal
+   'bnx_bill_sync_queue' — not client-scoped at all. On a shared
+   device this was worse than the audit's "exposure" framing: because
+   flushQueue() reads CLIENT_ID fresh from the active session at SEND
+   time (via erpApi()), Client A's still-queued offline bill, still
+   sitting in this global key after Client A logged out, could get
+   silently submitted and billed to Client B's account the moment
+   Client B logged in and the 12s flush timer fired — real financial
+   cross-tenant corruption, not just a visibility leak. Now scoped to
+   'bnx_bill_sync_queue_<CLIENT_ID>', same pattern as every other
+   outbox in this file (bnx_outbox_<CLIENT_ID>).
+   #2 IDEMPOTENCY: each entry now carries its own requestId (reused
+   across retries of the same attempt, same convention as the shared
+   outbox) instead of relying on billData alone.
+   #4 FAILED STATE: a bill that exhausted MAX_RETRY used to stay
+   status:'pending' forever, console.error'd (invisible to any actual
+   user) while the badge kept confidently claiming "⏳ N bill(s)
+   syncing..." — actively misleading. Now moves to a real 'failed'
+   status with a separate red badge (tap to retry), matching the
+   PENDING/SYNCING/SYNCED/FAILED states the audit specifies.
    ═══════════════════════════════════════════════════════════════════ */
 const BillQueue = (() => {
-  const QUEUE_KEY = 'bnx_bill_sync_queue';
+  function queueKey(){ return 'bnx_bill_sync_queue_' + (CLIENT_ID || 'default'); }
   const FLUSH_INTERVAL_MS = 12000;
   const MAX_RETRY = 8;
 
-  function getQueue(){ try{ return JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]'); }catch(e){ return []; } }
-  function setQueue(q){ localStorage.setItem(QUEUE_KEY, JSON.stringify(q)); }
+  function getQueue(){ try{ return JSON.parse(localStorage.getItem(queueKey()) || '[]'); }catch(e){ return []; } }
+  function setQueue(q){ localStorage.setItem(queueKey(), JSON.stringify(q)); }
   function genLocalId(){ return 'LOCAL_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8); }
 
   function ensureBadge(){
@@ -5629,10 +5653,22 @@ const BillQueue = (() => {
     }
     return badge;
   }
+  function ensureFailedBadge(){
+    let badge = document.getElementById('billFailedBadge');
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.id = 'billFailedBadge';
+      badge.style.cssText = 'position:fixed;bottom:56px;right:16px;z-index:99999;padding:8px 14px;border-radius:20px;font-size:12px;font-weight:700;color:#fff;background:var(--red,#c0392b);box-shadow:0 2px 8px rgba(0,0,0,.25);display:none;cursor:pointer;';
+      badge.onclick = retryFailed;
+      document.body.appendChild(badge);
+    }
+    return badge;
+  }
 
   function saveBillOffline(billData){
     const localId = genLocalId();
-    const entry = { localId, billData: Object.assign({}, billData, {localId}), status:'pending', attempts:0, queuedAt:new Date().toISOString() };
+    const requestId = (typeof bnxUuid === 'function') ? bnxUuid() : localId;
+    const entry = { localId, requestId, clientId: CLIENT_ID, billData: Object.assign({}, billData, {localId, requestId}), status:'pending', attempts:0, error:null, queuedAt:new Date().toISOString() };
     const q = getQueue(); q.push(entry); setQueue(q);
     // Printing intentionally NOT auto-triggered here — each dashboard
     // already has its own explicit print flow (printBill()/bmOpenPrintModal()
@@ -5654,18 +5690,39 @@ const BillQueue = (() => {
     await window.__bnxConfigReady;
     const q = getQueue();
     const pending = q.filter(e => e.status==='pending' && e.attempts < MAX_RETRY);
-    if (pending.length === 0) return;
+    if (pending.length === 0){ updateQueueBadge(); return; }
     for (const entry of pending) {
       try {
         entry.attempts++;
-        const res = await erpApi({action:'SAVE_BILL', bill: entry.billData}, 'V2_CORE');
-        if (res && (res.success || res.ok)) { entry.status='synced'; entry.syncedAt=new Date().toISOString(); }
-      } catch(err) { console.warn('Bill sync retry failed for', entry.localId, err); }
+        const res = await erpApi({action:'SAVE_BILL', bill: entry.billData, requestId: entry.requestId}, 'V2_CORE');
+        if (res && (res.success || res.ok)) { entry.status='synced'; entry.syncedAt=new Date().toISOString(); entry.error=null; }
+        else { entry.error = (res && (res.message || res.error)) || 'Server rejected the bill'; }
+      } catch(err) {
+        entry.error = err.message;
+        console.warn('Bill sync retry failed for', entry.localId, err);
+      }
+      // P0 FIX (#4): mark FAILED the instant this attempt exhausts the
+      // retry budget, in the same pass — not left as 'pending' for the
+      // badge to keep misreporting as "syncing" indefinitely.
+      if (entry.status !== 'synced' && entry.attempts >= MAX_RETRY) {
+        entry.status = 'failed';
+      }
     }
     const now = Date.now();
     const cleaned = q.filter(e => e.status!=='synced' || (now - new Date(e.syncedAt).getTime()) < 3600000);
     setQueue(cleaned);
     updateQueueBadge();
+  }
+
+  function retryFailed(){
+    const q = getQueue();
+    const failed = q.filter(e => e.status === 'failed');
+    if (!failed.length) return;
+    failed.forEach(e => { e.status='pending'; e.attempts=0; e.error=null; });
+    setQueue(q);
+    if (typeof showNotif === 'function') showNotif('Retrying '+failed.length+' failed bill(s)…', 'info');
+    updateQueueBadge();
+    flushQueue();
   }
 
   function updateQueueBadge(){
@@ -5674,15 +5731,20 @@ const BillQueue = (() => {
     const badge = ensureBadge();
     badge.textContent = pendingCount > 0 ? `⏳ ${pendingCount} bill(s) syncing...` : '';
     badge.style.display = pendingCount > 0 ? 'inline-block' : 'none';
-    const stuck = q.filter(e => e.status==='pending' && e.attempts >= MAX_RETRY);
-    if (stuck.length > 0) console.error(`${stuck.length} bill(s) failed to sync after ${MAX_RETRY} attempts — check backend/network manually.`, stuck);
+    // P0 FIX (#4): a real, visible FAILED state instead of an
+    // eternally-"syncing" badge + a console.error nobody on the floor
+    // will ever see. Tap the badge to retry.
+    const failedCount = q.filter(e => e.status==='failed').length;
+    const failedBadge = ensureFailedBadge();
+    failedBadge.textContent = failedCount > 0 ? `🔴 ${failedCount} bill(s) failed to sync — tap to retry` : '';
+    failedBadge.style.display = failedCount > 0 ? 'inline-block' : 'none';
   }
 
   setInterval(flushQueue, FLUSH_INTERVAL_MS);
   window.addEventListener('online', flushQueue);
   document.addEventListener('DOMContentLoaded', flushQueue);
 
-  return { saveBillOffline, flushQueue, getQueue, updateQueueBadge };
+  return { saveBillOffline, flushQueue, getQueue, updateQueueBadge, retryFailed };
 })();
 
 
@@ -7763,13 +7825,18 @@ const CATEGORY_TO_TAXCAT = {
 // (e.g. "Soft Drinks" category holds both fresh lime soda AND bottled
 // Pepsi/Coke — only the bottled one is actually the 28% slab).
 const ITEM_TAXCAT_OVERRIDE = { 'Pepsi / Coke':'SOFT_DRINKS' };
-// BM_MENU (New Bill quick-add) Bar items need Beer/Wine vs Spirits split;
-// BAR_CAT_OVERRIDE keyed by BM_MENU id.
-const BM_BAR_TAXCAT = { BA1:'BEER_WINE', BA2:'BEER_WINE', BA9:'BEER_WINE',
-  BA3:'SPIRITS', BA4:'SPIRITS', BA5:'SPIRITS', BA6:'SPIRITS', BA7:'SPIRITS', BA8:'SPIRITS', BA10:'SPIRITS' };
-function getItemTaxCat(name, category, bmId){
+// CODE-QUALITY FIX (external audit round 4, #10 — found while removing
+// BM_MENU above): this used to be a second bar-specific override map
+// (BM_BAR_TAXCAT) keyed on IDs like 'BA1'..'BA10' — but BM_MENU's real
+// items were always ITM001..ITM040, so bmId never matched any key in
+// that map and it was dead/unreachable code even before BM_MENU was
+// removed. The category-based mapping above (CATEGORY_TO_TAXCAT:
+// Beer→BEER_WINE, Whisky/Cocktail→SPIRITS) was already doing 100% of
+// the real work for these items; removed the dead map and the unused
+// bmId parameter rather than leave misleading dead code referencing
+// an ID scheme that no longer exists anywhere in this file.
+function getItemTaxCat(name, category){
   if (ITEM_TAXCAT_OVERRIDE[name]) return ITEM_TAXCAT_OVERRIDE[name];
-  if (bmId && BM_BAR_TAXCAT[bmId]) return BM_BAR_TAXCAT[bmId];
   return CATEGORY_TO_TAXCAT[category] || 'FOOD';
 }
 // Kept for the KOT-routing split (bar counter vs kitchen) — separate concern
@@ -8867,48 +8934,29 @@ function resetVoucherNumbering(){
 // ═══════════════════════════════════════════════════════
 //  BILLING MODULE JS (bm_ prefix to avoid conflicts)
 // ═══════════════════════════════════════════════════════
-const BM_MENU=[
-  {id:'ITM001',em:'🍗',name:'Butter Chicken',cat:'All Time Favourite',price:390},
-  {id:'ITM002',em:'🥘',name:'Dal Makhani',cat:'All Time Favourite',price:280},
-  {id:'ITM003',em:'🍃',name:'Palak Paneer',cat:'All Time Favourite',price:320},
-  {id:'ITM004',em:'🍢',name:'Seekh Kebab',cat:'Small Plates',price:360},
-  {id:'ITM005',em:'🧀',name:'Paneer Tikka',cat:'Small Plates',price:340},
-  {id:'ITM006',em:'🍗',name:'Chicken Wings',cat:'Small Plates',price:380},
-  {id:'ITM007',em:'🫙',name:'Hummus & Pita',cat:'Small Plates',price:250},
-  {id:'ITM008',em:'🥗',name:'Greek Salad',cat:'Small Plates',price:220},
-  {id:'ITM009',em:'🍖',name:'Mutton Rogan Josh',cat:'Indian',price:520},
-  {id:'ITM010',em:'🍱',name:'Chicken Biryani',cat:'Indian',price:380},
-  {id:'ITM011',em:'🧀',name:'Paneer Butter Masala',cat:'Indian',price:320},
-  {id:'ITM012',em:'🫓',name:'Naan (Butter)',cat:'Indian',price:60},
-  {id:'ITM013',em:'🫓',name:'Garlic Naan',cat:'Indian',price:80},
-  {id:'ITM014',em:'🍕',name:'Margherita Pizza',cat:'Pizza',price:380},
-  {id:'ITM015',em:'🍕',name:'BBQ Chicken Pizza',cat:'Pizza',price:450},
-  {id:'ITM016',em:'🍜',name:'Veg Hakka Noodles',cat:'Noodles',price:260},
-  {id:'ITM017',em:'🍜',name:'Chicken Chow Mein',cat:'Noodles',price:310},
-  {id:'ITM018',em:'🍱',name:'Veg Fried Rice',cat:'Rice',price:240},
-  {id:'ITM019',em:'🍱',name:'Egg Fried Rice',cat:'Rice',price:270},
-  {id:'ITM020',em:'🍟',name:'Classic Fries',cat:'Fries',price:160},
-  {id:'ITM021',em:'🍟',name:'Peri Peri Fries',cat:'Fries',price:200},
-  {id:'ITM022',em:'🍮',name:'Gulab Jamun',cat:'Sweet Indulgence',price:160},
-  {id:'ITM023',em:'🍰',name:'Chocolate Lava Cake',cat:'Sweet Indulgence',price:280},
-  {id:'ITM024',em:'🍨',name:'Kulfi Falooda',cat:'Sweet Indulgence',price:200},
-  {id:'ITM025',em:'🥛',name:'Mango Lassi',cat:'Soft Drinks',price:160},
-  {id:'ITM026',em:'🥤',name:'Lime Soda',cat:'Soft Drinks',price:100},
-  {id:'ITM027',em:'☕',name:'Masala Chai',cat:'Soft Drinks',price:80},
-  {id:'ITM028',em:'🥤',name:'Pepsi / Coke',cat:'Soft Drinks',price:90},
-  {id:'ITM029',em:'🍉',name:'Watermelon Juice',cat:'Fresh Juice',price:140},
-  {id:'ITM030',em:'🍊',name:'Orange Juice',cat:'Fresh Juice',price:150},
-  {id:'ITM031',em:'🍹',name:'Basil Smash',cat:'Cocktail',price:645},
-  {id:'ITM032',em:'🍸',name:'Bloody Mary',cat:'Cocktail',price:645},
-  {id:'ITM033',em:'🧉',name:'Agave Mule',cat:'Cocktail',price:795},
-  {id:'ITM034',em:'🍺',name:'Beer (Pint)',cat:'Beer',price:220},
-  {id:'ITM035',em:'🍺',name:'Kingfisher Prem',cat:'Beer',price:220},
-  {id:'ITM036',em:'🍺',name:'Biyara 600ml',cat:'Beer',price:690},
-  {id:'ITM037',em:'🥃',name:'100 Pipers 30ml',cat:'Whisky',price:395},
-  {id:'ITM038',em:'🥃',name:'Ballantine Finest 30ml',cat:'Whisky',price:445},
-  {id:'ITM039',em:'🥃',name:'Black & White 30ml',cat:'Whisky',price:395},
-  {id:'ITM040',em:'🍶',name:'Absolut 30ml',cat:'Whisky',price:445}
-];
+/* P0 FIX (external audit round 4, #1 — "Billing still has a hardcoded
+   BM_MENU" — confirmed real and serious): New Bill's item search,
+   quick-add product grid, and per-line GST category lookup all used
+   to read this completely separate, permanently-static 40-item array
+   instead of the live Menu Master (menuData, above) — the same
+   dataset the main POS screen syncs from the backend via
+   loadMenuData()/GET_MENU_ITEMS and warns about when stale
+   (usingDemoMenu banner). Two independent price/category sources for
+   the same items meant POS and New Bill could genuinely disagree on
+   price (e.g. Paneer ₹320 on POS vs ₹280 on New Bill) AND on GST
+   category, both would report success, and nothing would ever
+   reconcile them — exactly the "two prices for the same item" defect
+   flagged in the audit. The static array is gone; bnxGetBillMenu()
+   below derives the identical shape New Bill's code already expected
+   (id/em/name/cat/price) from the SAME live menuData every time it's
+   called, so a price change, a menu sync, or an Excel import is
+   instantly reflected in New Bill too — one Item Master, one price,
+   everywhere, with zero separate state that can go stale. */
+function bnxGetBillMenu(){
+  return menuData.map(m=>({
+    id: m.code, em: m.e || bnxDefaultIcon(m.c), name: m.n, cat: m.c, price: Number(m.p)||0
+  }));
+}
 let bmItemRowCount=0;
 
 /* ══════════════════════════════════════════════════════
@@ -8918,7 +8966,8 @@ let bmItemRowCount=0;
    items to pick from, and the rate had to be typed in by hand
    every time. This attaches a live search-as-you-type dropdown
    to any item-name input: type 2+ letters → a list of matching
-   BM_MENU items opens under the box → click (or Enter/arrow keys)
+   the SAME live Item Master (bnxGetBillMenu(), derived from menuData)
+   the POS screen uses opens under the box → click (or Enter/arrow keys)
    one → its name + rate are filled in automatically. Works with
    the mouse, keyboard (↑/↓/Enter/Esc), and touch/mobile taps.
 ══════════════════════════════════════════════════════ */
@@ -8972,11 +9021,11 @@ function bmAttachItemSearch(inputEl, onPick){
   inputEl.addEventListener('input', () => {
     const q = inputEl.value.trim().toLowerCase();
     if (q.length < 2){ closeBox(); return; }
-    openBox(BM_MENU.filter(m => m.name.toLowerCase().includes(q)).slice(0, 8));
+    openBox(bnxGetBillMenu().filter(m => m.name.toLowerCase().includes(q)).slice(0, 8));
   });
   inputEl.addEventListener('focus', () => {
     const q = inputEl.value.trim().toLowerCase();
-    if (q.length >= 2) openBox(BM_MENU.filter(m => m.name.toLowerCase().includes(q)).slice(0, 8));
+    if (q.length >= 2) openBox(bnxGetBillMenu().filter(m => m.name.toLowerCase().includes(q)).slice(0, 8));
   });
   inputEl.addEventListener('keydown', (e) => {
     if (!box) return;
@@ -9066,11 +9115,11 @@ function bmComputeTax(items, discPct, scPct){
   const taxRowsMap = {};
   let cgst=0, sgst=0, igst=0, taxOnAmt=0;
   items.forEach(i=>{
-    const bmItem = BM_MENU.find(m=>m.name===i.name);
+    const bmItem = bnxGetBillMenu().find(m=>m.name===i.name);
     const lineAmt = i.amt * discFactor;
     taxOnAmt += lineAmt;
     if (bmItem){
-      const tc = getItemTaxCat(i.name, bmItem.cat, bmItem.id);
+      const tc = getItemTaxCat(i.name, bmItem.cat);
       const rate = taxCfg[tc] || TAX_CONFIG_DEFAULT.FOOD;
       cgst += lineAmt*rate.cgst/100; sgst += lineAmt*rate.sgst/100;
       const key = tc;
@@ -9532,7 +9581,8 @@ let bmProdListSearch='';
 let bmProdListActiveCat='All';
 function bmBuildProductGrid(gridId,cat){
   const grid=document.getElementById(gridId);if(!grid)return;
-  let items=cat==='All'?BM_MENU:BM_MENU.filter(m=>m.cat===cat);
+  const billMenu = bnxGetBillMenu();
+  let items=cat==='All'?billMenu:billMenu.filter(m=>m.cat===cat);
   if(gridId==='bmProductGrid' && bmProdListSearch){
     const q=bmProdListSearch.toLowerCase();
     items=items.filter(m=>m.name.toLowerCase().includes(q));
@@ -9545,7 +9595,7 @@ function bmBuildProductGrid(gridId,cat){
     '<div class="prod-item" id="bm-pi-'+m.id+'" onclick="bmAddProductToQuickBill(\''+m.id+'\',\''+gridId+'\')">'+
     '<div class="prod-em">'+m.em+'</div>'+
     '<div class="prod-name">'+m.name+'</div>'+
-    '<div class="prod-price">₹'+m.price+'</div>'+
+    '<div class="prod-price">₹'+m.price.toLocaleString('en-IN')+'</div>'+
     '<div class="prod-cat">'+m.cat+'</div>'+
     '</div>'
   ).join('');
@@ -9582,7 +9632,7 @@ function bmFilterQuick(cat,btn){
    FOOD" or a custom line) — it no longer needs to be flipped when you
    add a catalogued item, so there's nothing to auto-switch here anymore. */
 function bmAddProductToQuickBill(id,gridId){
-  const m=BM_MENU.find(x=>x.id===id);if(!m)return;
+  const m=bnxGetBillMenu().find(x=>x.id===id);if(!m)return;
   let found=false;
   document.querySelectorAll('[id^="bm-irow-"]').forEach(row=>{
     const rowId=row.id.replace('bm-irow-','');
@@ -10210,9 +10260,21 @@ function renderCreditLedgerFromStore(){
   }
   const totalOutstanding = list.reduce((s,c)=>s+Math.max(0,Math.round(Number(c.outstanding)||0)),0);
   const activeCount = list.filter(c=>Math.round(Number(c.outstanding)||0)>0).length;
-  ['ccTotalOutstanding','dcTotalOutstanding','dcNetOutstanding'].forEach(id=>{
-    const el=document.getElementById(id); if (el) el.textContent = '₹'+totalOutstanding.toLocaleString('en-IN');
+  // P0 FIX (found while closing the "static financial dashboard tiles"
+  // gap): this loop updated the Customer Credit / Due Collection
+  // pages' own totals but never the Home dashboard's "Total
+  // Outstanding" tile (#d-credit) — so posting a NEW credit sale
+  // (bnxPostCreditSale → here) correctly updated those two pages but
+  // left Home showing a stale/lower number until an unrelated full
+  // reload. Home must always agree with the pages it links to (audit
+  // round 4's "cross-page consistency" rule) — added here, with the
+  // same bnxLive guard applyDuePayment() sets, so loadDashboard()'s
+  // honest-empty-state pass never overwrites this real total either.
+  ['ccTotalOutstanding','dcTotalOutstanding','dcNetOutstanding','d-credit'].forEach(id=>{
+    const el=document.getElementById(id); if (el){ el.textContent = '₹'+totalOutstanding.toLocaleString('en-IN'); el.dataset.bnxLive='1'; }
   });
+  const dCreditChg = document.getElementById('d-creditchg');
+  if (dCreditChg){ dCreditChg.textContent = activeCount + ' credit customer' + (activeCount===1?'':'s'); dCreditChg.dataset.bnxLive='1'; }
   const ccBanner = document.getElementById('ccDemoBanner'); if (ccBanner) ccBanner.style.display='none';
   const dcBanner = document.getElementById('dcDemoBanner'); if (dcBanner) dcBanner.style.display='none';
   document.querySelectorAll('#page-customer-credit .credit-stat-lbl .pill.p-gold, #page-due-collection .stat-lbl .pill.p-gold').forEach(p=>p.remove());
@@ -11214,10 +11276,24 @@ function applyDuePayment(customerName, amountPaid){
   });
 
   // 2) Roll the payment into every "Total Outstanding" figure currently on screen
+  // P0 FIX (found while checking dashboard round-3/#8 "static financial
+  // datasets" fix): this wrote a real, correctly-reduced number into
+  // d-credit but never set el.dataset.bnxLive='1' — the guard that
+  // loadDashboard()'s "clear to an honest —" pass checks before
+  // resetting these same IDs (see that function, a few hundred lines
+  // up). Without the flag, the very next periodic dashboard refresh
+  // would silently wipe this just-recorded real payment back to "—",
+  // AND worse: toNum('—') resolves to 0, so a second payment applied
+  // after that reset would compute "0 − amountPaid" (clamped to ₹0)
+  // instead of the real remaining balance — a silent understatement
+  // of real outstanding credit, not just a cosmetic display bug.
   ['dcTotalOutstanding', 'ccTotalOutstanding', 'd-credit'].forEach(id => {
     const el = document.getElementById(id);
     if (!el) return;
     el.textContent = '₹' + Math.max(0, toNum(el.textContent) - amountPaid).toLocaleString('en-IN');
+    el.dataset.bnxLive = '1';
+    const chg = document.getElementById(id+'chg');
+    if (chg) chg.dataset.bnxLive = '1';
   });
 
   // 3) Roll it into every "Received Today" figure currently on screen
@@ -11225,6 +11301,9 @@ function applyDuePayment(customerName, amountPaid){
     const el = document.getElementById(id);
     if (!el) return;
     el.textContent = '₹' + (toNum(el.textContent) + amountPaid).toLocaleString('en-IN');
+    el.dataset.bnxLive = '1';
+    const chg = document.getElementById(id+'chg');
+    if (chg) chg.dataset.bnxLive = '1';
   });
 
   // 4) Net Outstanding = Total Outstanding − Received Today (Due Collection page)
