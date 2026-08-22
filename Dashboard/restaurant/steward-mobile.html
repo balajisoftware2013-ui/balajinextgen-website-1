@@ -726,7 +726,12 @@ async function authApi(action,payload){
   }catch(e){ return {success:false,status:'error',error:e.message}; }
 }
 
-/* Fallback menu — used only if the server can't be reached, so the app still works offline */
+/* Fallback menu — P0 FIX (external audit round 3, #2 — "LIVE menu
+   must NEVER fall back to demo menu"): this array is now ONLY ever
+   assigned into MENU when IS_DEMO_MODE is explicitly true (see
+   `let MENU =` below). In a real live session it stays completely
+   unused — kept only as the actual demo-mode dataset, not as a
+   silent live-mode fallback. */
 const MENU_FALLBACK=[
   {id:'ITM001',name:'Butter Chicken',cat:'All Time Favourite',price:390,icon:'🍗',avail:true},
   {id:'ITM002',name:'Dal Makhani',cat:'All Time Favourite',price:280,icon:'🥘',avail:true},
@@ -769,7 +774,7 @@ const MENU_FALLBACK=[
   {id:'ITM039',name:'Black & White 30ml',cat:'Whisky',price:395,icon:'🥃',avail:true},
   {id:'ITM040',name:'Absolut 30ml',cat:'Whisky',price:445,icon:'🍶',avail:true}
 ];
-let MENU = MENU_FALLBACK.slice();
+let MENU = IS_DEMO_MODE ? MENU_FALLBACK.slice() : [];
 
 /* ══════════════════════════════════════════════════
    SHARED DATA STORE — same localStorage keys/shape as
@@ -843,6 +848,27 @@ function bnxMarkTableOrdersBilled(tableId, invoiceNo){
    PENDING SYNC OUTBOX: any write that fails goes here (not silently
    lost, not silently pretended successful) and retries automatically.
 ══════════════════════════════════════════════════ */
+/* P0 FIX (external audit #21 — central INR formatter, shared with
+   restaurant-dashboard.html's version of the same two functions).
+   Existing ₹ displays in this file already used correct Indian
+   grouping via en-IN at every site EXCEPT the ~16 that used bare
+   .toLocaleString() with no locale argument (western 1,23,456-style
+   grouping bug — fixed at those call sites) and a handful of bare
+   ₹${var} interpolations with no formatting at all (also fixed at
+   their call sites). These two functions are the source of truth for
+   any new money display. */
+function formatINR(amount, decimals){
+  const n = Number(amount) || 0;
+  return '₹' + n.toLocaleString('en-IN', {
+    minimumFractionDigits: decimals ? 2 : 0,
+    maximumFractionDigits: decimals ? 2 : 0
+  });
+}
+function formatSignedINR(amount){
+  const n = Number(amount) || 0;
+  const sign = n > 0 ? '+' : n < 0 ? '-' : '';
+  return sign + '₹' + Math.abs(n).toLocaleString('en-IN');
+}
 function bnxUuid(){
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c){
     var r = Math.random()*16|0, v = c==='x' ? r : (r&0x3|0x8);
@@ -990,7 +1016,19 @@ bnxUpdateSyncBadge(); // reflect any items already stuck in "failed" from a prev
 
 /* Pulls the SAME menu the POS dashboard uses (getMenuItems action, V2_FRONTEND) —
    so a category/item created in Settings → Menu Creation shows up here too. */
-let usingFallbackMenu = true; // becomes false once ANY real menu (local cache or server) loads
+// P0 FIX (external audit round 3, #2): replaced the old boolean
+// usingFallbackMenu (true = "showing the 40 fake demo items") with a
+// 3-state model so a genuinely real (but possibly stale) locally-
+// cached menu is treated completely differently from actual fake
+// demo data:
+//   'none'  — nothing loaded yet / IS_DEMO_MODE with the sample menu
+//   'cache' — real menu, but only confirmed from THIS device's local
+//             cache, not yet verified against the live server this
+//             session (shows a dismissible "Cached Menu" badge, not
+//             a "fake data" warning — this is real business data)
+//   'live'  — confirmed straight from the server this session
+let bnxMenuSource = IS_DEMO_MODE ? 'demo' : 'none';
+let bnxMenuLastUpdated = null;
 async function loadMenuFromServer(){
   // FIX ("same menu item show according"): this called a dead endpoint
   // ('getMenuItems'/V2_FRONTEND). It now first loads the SAME
@@ -1007,7 +1045,8 @@ async function loadMenuFromServer(){
         price: Number(m.p ?? m.price) || 0, icon: m.e || m.icon || bnxDefaultIcon(m.c||m.cat), avail: m.avail!==false,
         gst: Number(m.gst)||0
       }));
-      usingFallbackMenu = false;
+      bnxMenuSource = 'cache';
+      bnxMenuLastUpdated = new Date();
     }
   }catch(e){}
   const res = await gasApi('GET_MENU_ITEMS', {}, 'V2_CORE');
@@ -1021,21 +1060,19 @@ async function loadMenuFromServer(){
       avail: m.avail !== false,
       gst: Number(m.gst || m.GST)||0
     }));
-    usingFallbackMenu = false;
-  } // else: keep whatever was loaded above (shared local menu, or MENU_FALLBACK if none exists yet)
+    bnxMenuSource = 'live';
+    bnxMenuLastUpdated = new Date();
+  } // else: keep whatever was loaded above (real local cache, or [] in live mode if no cache exists yet — never MENU_FALLBACK outside IS_DEMO_MODE)
   if(document.getElementById('s-new-order')?.classList.contains('active')) renderMenu();
 }
-/* FIX ("if table also according load in system"): tables here used to
-   be a permanently hardcoded 18-row demo array with fake statuses —
-   never read from anywhere real, so a table the dashboard shows as
-   OCCUPIED could show AVAILABLE here forever. This now reads the same
-   04_TABLE_MASTER sheet the dashboard reads (same 'fetchSheet' action,
-   same column order), on the same schedule. Kept as a `let` (not
-   `const`) so loadTablesLive() below can replace it once the real
-   sync completes; the array below is now ONLY the offline fallback
-   shown before the first sync finishes or if the sheet can't be
-   reached — same honest-failure pattern the dashboard uses, never
-   silently pretending stale/fake data is live. */
+/* P0 FIX (external audit round 3, #1 — "NEVER show fake tables in
+   LIVE mode"): this array is now ONLY ever assigned into TABLES when
+   IS_DEMO_MODE is explicitly true (see `let TABLES =` below) — it no
+   longer serves as a silent live-mode placeholder shown "before the
+   first sync finishes". A live session with tables not yet loaded
+   now shows a real "Loading Tables…" state (see renderMobTables/
+   renderMyTables below), never 18 fake tables with fake bill amounts
+   that look exactly like real ones. */
 const TABLES_FALLBACK=Array.from({length:18},(_,i)=>({
   id:`T${String(i+1).padStart(2,'0')}`,no:i+1,
   status:['AVAILABLE','OCCUPIED','RUNNING','AVAILABLE','RESERVED','AVAILABLE','OCCUPIED','RUNNING','AVAILABLE','AVAILABLE','OCCUPIED','RUNNING','AVAILABLE','AVAILABLE','RESERVED','AVAILABLE','OCCUPIED','RUNNING'][i]||'AVAILABLE',
@@ -1043,7 +1080,12 @@ const TABLES_FALLBACK=Array.from({length:18},(_,i)=>({
   bill:[0,1840,920,0,0,0,2100,540,0,0,3200,760,0,0,0,0,4100,1200][i]||0,
   steward:['','Amit','Amit','','','','Amit','','','','Amit','Amit','','','','','',''][i]||''
 }));
-let TABLES = TABLES_FALLBACK.slice();
+let TABLES = IS_DEMO_MODE ? TABLES_FALLBACK.slice() : [];
+// Same 3(+demo)-state model as bnxMenuSource above: 'none' = live
+// mode, nothing loaded yet; 'live' = confirmed from server this
+// session; 'demo' = IS_DEMO_MODE sample data.
+let bnxTablesSource = IS_DEMO_MODE ? 'demo' : 'none';
+let bnxTablesLastUpdated = null;
 function bnxMapSheetStatusToTcard(status){
   const s=String(status||'').trim().toUpperCase();
   if(s==='OCCUPIED') return 'OCCUPIED';
@@ -1073,6 +1115,8 @@ async function loadTablesLive(){
   const known=new Set(fromSheet.map(t=>t.id));
   extra = extra.filter(t=>t.id && !known.has(t.id)).map(t=>({id:t.id||t.n,no:0,status:bnxMapSheetStatusToTcard(t.s),covers:t.pax||0,bill:t.billAmount||0,steward:t.captain||''}));
   TABLES = fromSheet.concat(extra);
+  bnxTablesSource = 'live';
+  bnxTablesLastUpdated = new Date();
   if(document.getElementById('s-tables')?.classList.contains('active')) renderMobTables();
   if(document.getElementById('s-home')?.classList.contains('active')) renderMyTables();
   return true;
@@ -1213,6 +1257,8 @@ async function loadBootstrapOrFallback(){
         id: m.id, name: m.name, cat: m.category||'Other', price: Number(m.price)||0,
         icon: m.icon || bnxDefaultIcon(m.category), avail: m.avail!==false, gst: Number(m.gst)||0
       }));
+      bnxMenuSource = 'live';
+      bnxMenuLastUpdated = new Date();
       if(document.getElementById('s-new-order')?.classList.contains('active')) renderMenu();
     }
     if(Array.isArray(res.data.tables) && res.data.tables.length){
@@ -1221,6 +1267,8 @@ async function loadBootstrapOrFallback(){
         id:String(r[0]).trim(), no:idx+1, status:bnxMapSheetStatusToTcard(r[3]),
         covers:Number(r[6])||0, bill:Number(r[11])||0, steward:r[5]||''
       }));
+      bnxTablesSource = 'live';
+      bnxTablesLastUpdated = new Date();
       if(document.getElementById('s-tables')?.classList.contains('active')) renderMobTables();
     }
     return;
@@ -1234,12 +1282,22 @@ async function loadBootstrapOrFallback(){
 function renderMobTables(){
   const g=document.getElementById('mob-table-grid');
   const sc={AVAILABLE:'var(--green)',OCCUPIED:'var(--red)',RUNNING:'var(--orange)',RESERVED:'var(--gold)',VIP:'var(--purple)'};
+  // P0 FIX (external audit round 3, #1): a live session with TABLES
+  // still empty (nothing loaded yet, or server unreachable with no
+  // local cache) used to render nothing — indistinguishable from "0
+  // real tables". Say plainly what's happening instead, with a retry.
+  if(!TABLES.length && bnxTablesSource !== 'demo'){
+    g.innerHTML = bnxTablesSource === 'none'
+      ? `<div style="grid-column:1/-1;text-align:center;padding:30px 10px;color:var(--text3);font-size:12.5px;">⏳ Loading Tables…</div>`
+      : `<div style="grid-column:1/-1;text-align:center;padding:30px 10px;color:var(--red);font-size:12.5px;">🔴 OFFLINE — could not load tables${bnxTablesLastUpdated?'<br>Last synced '+bnxTablesLastUpdated.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}):''}<br><button onclick="loadTablesLive()" style="margin-top:8px;background:var(--red,#c0392b);color:#fff;border:none;border-radius:6px;padding:6px 14px;font-size:11px;font-weight:700;cursor:pointer;">Retry</button></div>`;
+    return;
+  }
   g.innerHTML=TABLES.map(t=>`
     <div class="tcard ${t.status}" onclick="openTable('${t.id}')">
       <div class="tc-no">${t.no}</div>
       <div class="tc-status" style="color:${sc[t.status]||'var(--text3)'}">${t.status}</div>
       ${t.covers?`<div class="tc-info">${t.covers} guests</div>`:''}
-      ${t.bill?`<div class="tc-bill" style="color:var(--gold)">₹${t.bill.toLocaleString()}</div>`:''}
+      ${t.bill?`<div class="tc-bill" style="color:var(--gold)">₹${t.bill.toLocaleString('en-IN')}</div>`:''}
     </div>`).join('');
 }
 
@@ -1259,7 +1317,7 @@ function openTable(id){
         <div style="font-size:14px;font-weight:800;margin-top:2px;">${selTable.covers||0}</div>
       </div>
     </div>
-    ${selTable.bill?`<div style="background:var(--gold-bg);border:1px solid rgba(212,160,23,.25);border-radius:12px;padding:12px 16px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"><span style="font-size:13px;color:var(--gold);font-weight:700;">Running Bill</span><span style="font-size:22px;font-weight:900;font-family:'DM Mono',monospace;color:var(--gold);">₹${selTable.bill.toLocaleString()}</span></div>`:''}
+    ${selTable.bill?`<div style="background:var(--gold-bg);border:1px solid rgba(212,160,23,.25);border-radius:12px;padding:12px 16px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"><span style="font-size:13px;color:var(--gold);font-weight:700;">Running Bill</span><span style="font-size:22px;font-weight:900;font-family:'DM Mono',monospace;color:var(--gold);">₹${selTable.bill.toLocaleString('en-IN')}</span></div>`:''}
     ${selTable.steward?`<div style="font-size:12px;color:var(--text3);">👤 Steward: ${selTable.steward}</div>`:''}
   `;
   const settleBtn = document.getElementById('mob-settle-btn');
@@ -1304,7 +1362,7 @@ function renderMobOnline(){
         <div class="ob-items">${o.items}</div>
       </div>
       <div>
-        <div class="ob-amount" style="color:${o.color}">₹${o.amount}</div>
+        <div class="ob-amount" style="color:${o.color}">₹${(Number(o.amount)||0).toLocaleString('en-IN')}</div>
         <div class="ob-time">${o.time}</div>
         <div style="font-size:9px;font-weight:800;color:${o.color};text-align:right;margin-top:2px;">${o.status.replace(/_/g,' ')}</div>
       </div>
@@ -1326,14 +1384,37 @@ function renderHomeOnline(){
         <div class="ob-customer">${o.customer}</div>
         <div class="ob-items">${o.items}</div>
       </div>
-      <div><div class="ob-amount" style="color:${o.color}">₹${o.amount}</div><div class="ob-time">${o.time}</div></div>
+      <div><div class="ob-amount" style="color:${o.color}">₹${(Number(o.amount)||0).toLocaleString('en-IN')}</div><div class="ob-time">${o.time}</div></div>
     </div>`).join('');
 }
 
+// P0 FIX (real multi-user bug, found during external audit round 3
+// pass — not explicitly named in the audit but same root cause as
+// #7's "3-click workflow": the Home screen's "My Tables" always
+// filtered on the literal string 'Amit', so ANY other steward
+// logging into this same app saw "No running tables" even for their
+// own occupied tables, while a table actually captained by someone
+// literally named Amit would incorrectly show up under a different
+// logged-in steward. This reads the real logged-in user's name from
+// the session instead of a hardcoded literal, so this screen is
+// finally correct for more than one person.
+function bnxGetStewardName(){
+  try{
+    var u = JSON.parse(sessionStorage.getItem('ERP_USER')||localStorage.getItem('ERP_USER')||'{}');
+    return u.FULL_NAME || u.full_name || u.LOGIN_ID || u.loginId || '';
+  }catch(e){ return ''; }
+}
 function renderMyTables(){
   const el=document.getElementById('my-running-tables');
-  const myT=TABLES.filter(t=>t.steward==='Amit'&&(t.status==='OCCUPIED'||t.status==='RUNNING'));
+  const myName = bnxGetStewardName();
+  const myT=TABLES.filter(t=>myName && t.steward===myName && (t.status==='OCCUPIED'||t.status==='RUNNING'));
   const sc={OCCUPIED:'var(--red)',RUNNING:'var(--orange)'};
+  if(!TABLES.length && bnxTablesSource !== 'demo'){
+    el.innerHTML = bnxTablesSource === 'none'
+      ? `<div style="text-align:center;padding:20px;color:var(--text3);font-size:12px;">⏳ Loading Tables…</div>`
+      : `<div style="text-align:center;padding:20px;color:var(--red);font-size:12px;">🔴 OFFLINE — could not load tables <button onclick="loadTablesLive()" style="margin-left:4px;background:var(--red,#c0392b);color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:10.5px;font-weight:700;cursor:pointer;">Retry</button></div>`;
+    return;
+  }
   if(!myT.length){el.innerHTML=`<div style="text-align:center;padding:20px;color:var(--text3);font-size:12px;">No running tables</div>`;return;}
   el.innerHTML=myT.map(t=>`
     <div style="background:var(--surface2);border:1px solid var(--border);border-radius:14px;padding:14px;margin-bottom:8px;display:flex;align-items:center;gap:12px;" onclick="openTable('${t.id}')">
@@ -1342,7 +1423,7 @@ function renderMyTables(){
         <div style="font-size:13px;font-weight:700;">Table ${t.id}</div>
         <div style="font-size:11px;color:var(--text3);margin-top:2px;">${t.covers} guests</div>
       </div>
-      ${t.bill?`<div style="font-size:16px;font-weight:900;font-family:'DM Mono',monospace;color:var(--gold);">₹${t.bill.toLocaleString()}</div>`:''}
+      ${t.bill?`<div style="font-size:16px;font-weight:900;font-family:'DM Mono',monospace;color:var(--gold);">₹${t.bill.toLocaleString('en-IN')}</div>`:''}
     </div>`).join('');
 }
 
@@ -1357,7 +1438,7 @@ function openOnlineOrder(id){
     </div>
     <div style="background:var(--gold-bg);border:1px solid rgba(212,160,23,.25);border-radius:12px;padding:12px 16px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
       <span style="font-size:13px;font-weight:700;color:var(--gold);">Total Amount</span>
-      <span style="font-size:22px;font-weight:900;font-family:'DM Mono',monospace;color:var(--gold);">₹${selOnline.amount}</span>
+      <span style="font-size:22px;font-weight:900;font-family:'DM Mono',monospace;color:var(--gold);">₹${(Number(selOnline.amount)||0).toLocaleString('en-IN')}</span>
     </div>
     <div style="font-size:11px;color:var(--text3);">Status: <strong style="color:${selOnline.color}">${selOnline.status.replace(/_/g,' ')}</strong> • ${selOnline.time}</div>
   `;
@@ -1445,7 +1526,7 @@ function renderOrderHistory(){
           ${cancelBtn}
         </div>
         <div style="text-align:right;">
-          <div style="font-family:'DM Mono',monospace;font-weight:800;">₹${total}</div>
+          <div style="font-family:'DM Mono',monospace;font-weight:800;">₹${(Number(total)||0).toLocaleString('en-IN')}</div>
           <div style="font-size:9.5px;font-weight:800;color:${color};margin-top:3px;">${o.status}</div>
         </div>
       </div>
@@ -1611,12 +1692,12 @@ function openBillModal(){
       <div class="modal-handle"></div>
       <div class="modal-title">Settle — Table ${selTable.id}</div>
       <div style="max-height:200px;overflow-y:auto;margin:10px 0;">
-        ${items.map(i=>`<div style="display:flex;justify-content:space-between;font-size:12px;padding:4px 0;"><span>${i.qty} × ${i.name}</span><span>₹${(i.qty*i.price).toLocaleString()}</span></div>`).join('')}
+        ${items.map(i=>`<div style="display:flex;justify-content:space-between;font-size:12px;padding:4px 0;"><span>${i.qty} × ${i.name}</span><span>₹${(i.qty*i.price).toLocaleString('en-IN')}</span></div>`).join('')}
       </div>
       <div style="border-top:1px dashed var(--border2);padding-top:8px;font-size:12px;">
-        <div style="display:flex;justify-content:space-between;"><span>Subtotal</span><span>₹${sub.toLocaleString()}</span></div>
-        <div style="display:flex;justify-content:space-between;"><span>GST</span><span>₹${gst.toLocaleString()}</span></div>
-        <div style="display:flex;justify-content:space-between;font-weight:800;font-size:16px;margin-top:4px;"><span>Total</span><span>₹${total.toLocaleString()}</span></div>
+        <div style="display:flex;justify-content:space-between;"><span>Subtotal</span><span>₹${sub.toLocaleString('en-IN')}</span></div>
+        <div style="display:flex;justify-content:space-between;"><span>GST</span><span>₹${gst.toLocaleString('en-IN')}</span></div>
+        <div style="display:flex;justify-content:space-between;font-weight:800;font-size:16px;margin-top:4px;"><span>Total</span><span>₹${total.toLocaleString('en-IN')}</span></div>
       </div>
       <div class="sec-title">Payment Mode</div>
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px;">
@@ -1722,12 +1803,12 @@ async function confirmPayment(calc){
   bnxUpdateTableOverlay(selTable.id, { status:'AVAILABLE', covers:0, bill:0 });
 
   closeBillModal();
-  toast('✅ Bill '+billNo+' settled — confirmed on server · ₹'+calc.total.toLocaleString(),'success');
+  toast('✅ Bill '+billNo+' settled — confirmed on server · ₹'+calc.total.toLocaleString('en-IN'),'success');
   printReceipt(entry);
   renderMobTables(); renderMyTables(); renderKOT();
 }
 function printReceipt(bill){
-  const rows = (bill.itemsDetail||[]).map(i=>`<tr><td>${i.qty} × ${i.name}</td><td style="text-align:right;">₹${(i.qty*i.price).toLocaleString()}</td></tr>`).join('');
+  const rows = (bill.itemsDetail||[]).map(i=>`<tr><td>${i.qty} × ${i.name}</td><td style="text-align:right;">₹${(i.qty*i.price).toLocaleString('en-IN')}</td></tr>`).join('');
   const html = `<html><head><title>Receipt ${bill.no}</title><style>
     body{font-family:monospace;width:280px;margin:0 auto;padding:10px;font-size:12px;}
     h2{text-align:center;margin:0 0 4px;} table{width:100%;border-collapse:collapse;}
@@ -1737,9 +1818,9 @@ function printReceipt(bill){
     <h2>Balaji NextGen ERP</h2>
     <div style="text-align:center;">Bill No: ${bill.no}<br>${bill.dt} ${bill.tm} · Table ${bill.table}</div>
     <hr><table>${rows}</table><hr>
-    <div class="row"><span>Subtotal</span><span>₹${bill.sub.toLocaleString()}</span></div>
-    <div class="row"><span>GST</span><span>₹${bill.gst.toLocaleString()}</span></div>
-    <div class="row tot"><span>Total</span><span>₹${bill.total.toLocaleString()}</span></div>
+    <div class="row"><span>Subtotal</span><span>₹${bill.sub.toLocaleString('en-IN')}</span></div>
+    <div class="row"><span>GST</span><span>₹${bill.gst.toLocaleString('en-IN')}</span></div>
+    <div class="row tot"><span>Total</span><span>₹${bill.total.toLocaleString('en-IN')}</span></div>
     <div class="row"><span>Payment</span><span>${bill.pay}</span></div>
     <hr><div style="text-align:center;">Thank you — visit again!</div>
   </body></html>`;
@@ -1752,10 +1833,19 @@ let menuViewMode = 'grid'; // 'grid' or 'table'
 function renderMenu(){
   const cats=['All',...new Set(MENU.map(m=>m.cat))];
 
-  // FIX ("no dummy data if login"): if MENU is still the 40 hardcoded
-  // demo items (server unreachable AND no locally-saved menu found),
-  // a steward could take real customer orders against fake items and
-  // prices with zero indication anything was wrong. Warn visibly.
+  // P0 FIX (external audit round 3, #2 — "LIVE menu must NEVER fall
+  // back to demo menu"): replaces the old single fake-data warning
+  // with the audit's exact 3-state design —
+  //   'none'  (live mode, nothing loaded at all): "Menu temporarily
+  //           unavailable" + Retry, empty grid — never invents items
+  //           a steward could actually take a real order against.
+  //   'cache' (real business data, just not confirmed live this
+  //           session): a calm "Cached Menu — last updated HH:MM"
+  //           badge + Refresh, items are real and orderable.
+  //   'live'  confirmed straight from the server: no banner.
+  //   'demo'  IS_DEMO_MODE only: no banner (demo mode is expected to
+  //           show sample data — it's the LIVE-mode leak that was
+  //           the actual bug).
   (function(){
     const menuGridEl = document.getElementById('menu-grid');
     if(!menuGridEl) return;
@@ -1765,12 +1855,17 @@ function renderMenu(){
       bannerEl.id = 'menu-fallback-banner';
       menuGridEl.parentElement.insertBefore(bannerEl, menuGridEl);
     }
-    bannerEl.style.cssText = usingFallbackMenu
-      ? 'background:#fef3c7;border:1px solid #fbbf24;color:#92400e;font-size:11px;font-weight:700;padding:8px 12px;border-radius:8px;margin-bottom:10px;'
-      : 'display:none;';
-    bannerEl.textContent = usingFallbackMenu
-      ? '⚠️ Showing sample menu — could not load your real menu. Prices/items below are NOT real. Check your connection.'
-      : '';
+    if(bnxMenuSource === 'none'){
+      bannerEl.style.cssText = 'background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;font-size:11.5px;font-weight:700;padding:10px 12px;border-radius:8px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:8px;';
+      bannerEl.innerHTML = `<span>⚠️ Menu temporarily unavailable — could not reach the server and no cached menu exists on this device.</span><button onclick="loadMenuFromServer()" style="background:#991b1b;color:#fff;border:none;border-radius:6px;padding:5px 10px;font-size:10.5px;font-weight:700;cursor:pointer;white-space:nowrap;">Retry</button>`;
+    } else if(bnxMenuSource === 'cache'){
+      const t = bnxMenuLastUpdated ? bnxMenuLastUpdated.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}) : '';
+      bannerEl.style.cssText = 'background:#fef3c7;border:1px solid #fbbf24;color:#92400e;font-size:11.5px;font-weight:700;padding:8px 12px;border-radius:8px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:8px;';
+      bannerEl.innerHTML = `<span>🟡 Cached Menu${t?' — last updated '+t:''}</span><button onclick="loadMenuFromServer()" style="background:#92400e;color:#fff;border:none;border-radius:6px;padding:5px 10px;font-size:10.5px;font-weight:700;cursor:pointer;white-space:nowrap;">Refresh</button>`;
+    } else {
+      bannerEl.style.cssText = 'display:none;';
+      bannerEl.innerHTML = '';
+    }
   })();
 
   // Add view toggle buttons with category tabs
@@ -1810,7 +1905,7 @@ function renderMenu(){
         <div class="mc-icon">${m.icon}</div>
         <div class="mc-name">${m.name}</div>
         <div class="mc-cat">${m.cat}</div>
-        <div class="mc-price">₹${m.price}</div>
+        <div class="mc-price">₹${(Number(m.price)||0).toLocaleString('en-IN')}</div>
         ${m.avail?`<div class="mc-add">${order[m.id]?`<span style="font-size:11px;">${order[m.id]}</span>`:'+'}</div>`:''}
       </div>`).join('');
   }
@@ -1870,7 +1965,7 @@ function renderMenuTable(){
       
       html += `<tr class="menu-table-row${m.avail?'':' disabled'}">
         <td class="td-name">${m.name}</td>
-        <td class="td-price">₹${m.price}</td>
+        <td class="td-price">₹${(Number(m.price)||0).toLocaleString('en-IN')}</td>
         <td class="td-status"><span class="status-badge ${statusClass}">${status}</span></td>
         <td class="td-action">
           ${m.avail ? `
@@ -1910,7 +2005,7 @@ function updateOrderBadge(){
   const total=Object.values(order).reduce((a,b)=>a+b,0);
   const amt=Object.entries(order).reduce((a,[id,qty])=>a+(MENU.find(m=>m.id===id)?.price||0)*qty,0);
   document.getElementById('order-badge').textContent=`${total} items`;
-  document.getElementById('order-total-val').textContent=`₹${amt.toLocaleString()}`;
+  document.getElementById('order-total-val').textContent=`₹${amt.toLocaleString('en-IN')}`;
 }
 
 function clearOrder(){order={};renderMenu();}
@@ -2026,7 +2121,7 @@ function showOrderPlacedModal(orderId){
   const itemsList = placedOrder.items.map(i=>`<div class="opm-item">
     <span class="opm-qty">${i.qty}×</span>
     <span class="opm-name">${i.name}</span>
-    <span class="opm-price">₹${(i.qty * i.price).toLocaleString()}</span>
+    <span class="opm-price">₹${(i.qty * i.price).toLocaleString('en-IN')}</span>
   </div>`).join('');
   
   modal.innerHTML = `
@@ -2039,7 +2134,7 @@ function showOrderPlacedModal(orderId){
         <div class="opm-items">${itemsList}</div>
         <div class="opm-total">
           <span>Total:</span>
-          <span>₹${placedOrder.amount.toLocaleString()}</span>
+          <span>₹${placedOrder.amount.toLocaleString('en-IN')}</span>
         </div>
         <div class="opm-actions">
           <button class="btn btn-secondary" onclick="openOrderReplacementModal('${orderId}')">
@@ -2066,7 +2161,7 @@ function openOrderReplacementModal(orderId){
     <div class="orm-item-row">
       <div class="orm-item-info">
         <div class="orm-name">${item.name}</div>
-        <div class="orm-price">₹${item.price} each</div>
+        <div class="orm-price">₹${(Number(item.price)||0).toLocaleString('en-IN')} each</div>
       </div>
       <div class="orm-qty-control">
         <button class="qty-btn" onclick="adjustOrderQty('${orderId}', ${idx}, -1)">−</button>
@@ -2083,7 +2178,7 @@ function openOrderReplacementModal(orderId){
       <span class="orm-add-icon">+</span>
       <div>
         <div class="orm-add-name">${m.name}</div>
-        <div class="orm-add-price">₹${m.price}</div>
+        <div class="orm-add-price">₹${(Number(m.price)||0).toLocaleString('en-IN')}</div>
       </div>
     </div>
   `).join('');
@@ -2112,7 +2207,7 @@ function openOrderReplacementModal(orderId){
         <div class="orm-footer">
           <div class="orm-total">
             <span>New Total:</span>
-            <span>₹${calculateOrderTotal(orderId).toLocaleString()}</span>
+            <span>₹${calculateOrderTotal(orderId).toLocaleString('en-IN')}</span>
           </div>
           <button class="btn btn-primary" onclick="sendModifiedOrder('${orderId}')">
             📤 Send Updated KOT
