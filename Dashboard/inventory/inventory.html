@@ -4619,6 +4619,29 @@ window.addEventListener('focus',()=>{
 });
 
 const uid = (p='') => p+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
+// FIX ("item id ITEM001 so all id proper give capital" — Aug 2026): every
+// item display (Item Master list, CSV exports, Physical Stock Count,
+// Vendor Compare) already preferred i.item_code over the raw internal
+// _id (`i.item_code||i._id`) — but nothing anywhere in this file ever
+// actually SET item_code, so that preference always fell through to the
+// internal id, which is prefix+base36-timestamp+base36-random (e.g.
+// "ITMm3x8k2pa4f2") — not a clean, sequential, human-readable code.
+// The internal _id itself is left completely alone (still uid('ITM')) —
+// it's the real foreign key every stock_ledger/purchase/GRN row
+// references, and changing its format would mean touching every one of
+// those join points for no real benefit, since it was never meant to be
+// human-facing. This generates the clean, SEPARATE, sequential code
+// (ITM0001, ITM0002, ...) that display logic already wanted, scoped to
+// this client's own item list (DB.all('items') is already CID-scoped).
+function nextItemCode(){
+  const items = DB.all('items');
+  let max = 0;
+  items.forEach(i=>{
+    const m = String(i.item_code||'').match(/^ITM(\d+)$/);
+    if(m) max = Math.max(max, parseInt(m[1], 10));
+  });
+  return 'ITM' + String(max+1).padStart(4,'0');
+}
 // FIX ("all text same style auto capital or proper fix if items or
 // vendor master all" — Aug 2026): master data (Item, Vendor,
 // Warehouse, Category names) was saved exactly as typed, with no
@@ -5604,15 +5627,15 @@ async function showP(id, navEl) {
   const pgTitle = document.getElementById('pg-title');
   if(pgTitle) pgTitle.textContent = titles[id] || id.replace(/-/g,' ').replace(/\w/g,c=>c.toUpperCase());
   closeSB();
-  // FIX ("all direct no local" — Aug 2026): forces a fresh pull from
-  // Google Sheets before this panel's data renders — see
-  // _forcePullBeforeRender(). The pull's own renderAllVisiblePanels()
-  // already re-renders whichever panel is now active (this one, since
-  // it was just marked .active above); refreshPanelData(id) is still
-  // called explicitly afterward as a safety net so navigation never
-  // silently shows nothing if that internal call didn't line up.
-  await _forcePullBeforeRender();
-  refreshPanelData(id);
+  // FIX ("all direct no local" — Aug 2026, corrected — see
+  // _forcePullBeforeRender()'s comment): a real pull already re-renders
+  // this panel internally via renderAllVisiblePanels() — calling
+  // refreshPanelData(id) again here unconditionally used to double-render
+  // every navigation. Only call it explicitly when _forcePullBeforeRender
+  // reports no real pull ran (no session) — that's the one case nothing
+  // else renders the panel at all.
+  const pulled = await _forcePullBeforeRender();
+  if(!pulled) refreshPanelData(id);
 }
 
 // FIX ("sidebar closes itself" -- mobile, Aug 2026): renderAllVisiblePanels()
@@ -5629,6 +5652,7 @@ async function showP(id, navEl) {
 // navigation UI at all) can each call only what they actually need.
 function refreshPanelData(id) {
   if(id==='dashboard') loadDashboard();
+  else if(id==='ledger-rep') loadLedgerReport();
   else if(id==='purchase-reg') loadPurchaseRegister();
   else if(id==='supplier-rep') loadSupplierReport();
   else if(id==='stock') { loadStockView(); }
@@ -5693,15 +5717,22 @@ function setKpiValue(id, text){
 function loadDashboard() {
   const items = DB.all('items');
   const stock = DB.all('stock_ledger');
-  // FIX ("inventory duplicate invoice stop"): same dedup as the
-  // purchase-mtd detail modal — a purchase invoice accidentally saved
-  // twice (same invoice no + vendor + amount) was being counted twice
-  // in this KPI total too, so the headline number and the detail popup
-  // now always agree. View-level fix only — does not touch stored data.
+  // FIX ("dashboard check total not show all — Aug 2026"): this used to
+  // dedup on inv_no+vendor+TOTAL, which is a DIFFERENT key than the
+  // canonical one removeDuplicatePurchaseInvoices() (the real cleanup
+  // function) and the purchase-mtd detail popup both use (inv_no,
+  // normalized, + vendor — deliberately WITHOUT total, so a same-invoice
+  // row re-saved with a corrected/typo'd amount still counts as one
+  // duplicate, not two separate purchases). Two different dedup
+  // definitions meant this headline total and its own "click for
+  // details" breakdown could genuinely disagree on the count whenever
+  // that exact case existed — the comment below claiming they "always
+  // agree" was true of the CODE'S INTENT but not of what the code
+  // actually did. Now uses the exact same key as both of those.
   const pisRaw = DB.all('purchase_invoices');
   const _pisSeenKeys = new Set();
   const pis = pisRaw.filter(p=>{
-    const key = (p.inv_no||'')+'|'+_bnxDedupVendorKey(p.party_name)+'|'+(p.total||0);
+    const key = String(p.inv_no||'').trim().toLowerCase()+'|'+_bnxDedupVendorKey(p.party_name);
     if(_pisSeenKeys.has(key)) return false;
     _pisSeenKeys.add(key);
     return true;
@@ -5821,6 +5852,21 @@ function onSupplierChange() {
 }
 
 let _quickAddItemRowId=null;
+// FIX ("item ref category master" — Aug 2026): quickAddItem() and
+// openItemModal() below only ever suggested category names already used
+// by EXISTING items, completely ignoring the real 'categories' table
+// Category Master itself saves to. So a category properly created via
+// Category Master's "+ Add Category" — the whole point of having a real
+// master to standardize names — wouldn't show up as a suggestion when
+// creating a new item until some item happened to already use that
+// exact text, defeating the purpose. Same merge Category Master's own
+// list page (loadCategoryMaster()) already does, applied here too, so
+// item creation actually references the real master.
+function categorySuggestionList(){
+  const real = DB.all('categories').map(c=>c.name);
+  const fromItems = DB.all('items').map(i=>i.cat);
+  return [...new Set([...real, ...fromItems].filter(Boolean))];
+}
 function quickAddItem(rowId){
   _quickAddItemRowId=rowId;
   ['qi-name','qi-cat','qi-hsn'].forEach(id=>{const e=document.getElementById(id);if(e)e.value='';});
@@ -5829,7 +5875,7 @@ function quickAddItem(rowId){
   const r=document.getElementById('qi-rate');if(r)r.value=0;
   const s=document.getElementById('qi-sp');if(s)s.value=0;
   const catList=document.getElementById('qi-cat-list');
-  if(catList)catList.innerHTML=[...new Set(DB.all('items').map(i=>i.cat).filter(Boolean))].map(c=>`<option value="${c}">`).join('');
+  if(catList)catList.innerHTML=categorySuggestionList().map(c=>`<option value="${c}">`).join('');
   openModal('modal-quick-item');
 }
 function saveQuickItem(){
@@ -5852,7 +5898,7 @@ function saveQuickItem(){
     return;
   }
   const rec=DB.insert('items',{
-    _id:uid('ITM'),name,
+    _id:uid('ITM'),item_code:nextItemCode(),name,
     cat:document.getElementById('qi-cat').value.trim()||'Uncategorised',
     unit:document.getElementById('qi-unit').value,
     hsn:document.getElementById('qi-hsn').value.trim(),
@@ -5899,7 +5945,7 @@ function openItemModal(item){
   set('imm-alt-unit',item?.altUnit);
   set('imm-alt-factor',item?.altUnitFactor);
   const catList=document.getElementById('imm-cat-list');
-  if(catList)catList.innerHTML=[...new Set(DB.all('items').map(i=>i.cat).filter(Boolean))].map(c=>`<option value="${c}">`).join('');
+  if(catList)catList.innerHTML=categorySuggestionList().map(c=>`<option value="${c}">`).join('');
   openModal('modal-item-master');
   setTimeout(()=>document.getElementById('imm-name')?.focus(),50);
 }
@@ -5939,7 +5985,7 @@ function saveItemMasterForm(){
       toast('Item "'+name+'" already exists — edit it instead of creating a new one','e');
       return;
     }
-    DB.insert('items',{_id:uid('ITM'),...rec,opening:0});
+    DB.insert('items',{_id:uid('ITM'),item_code:nextItemCode(),...rec,opening:0});
     toast('Item "'+name+'" created ✓','s');
   }
   closeModal('modal-item-master');
@@ -7659,11 +7705,26 @@ function openModal(id){document.getElementById(id).classList.add('open');}
 // so nothing on screen is ever painted from a stale local cache first.
 // If there's no real session (demo/local-only), this is a no-op — there's
 // nothing on the server to be stale against.
+// FIX ("Pending Kitchen Indents not proper load" — Aug 2026, follow-up):
+// pullAllFromBackend() already calls renderAllVisiblePanels() internally
+// once the pull lands, which re-renders whatever panel showP() had just
+// marked active (loadKitchenHistory(), loadDashboard(), etc.) — but
+// showP() ALSO called refreshPanelData(id) itself right after awaiting
+// this, so every navigation rendered the panel TWICE in a row: once from
+// this pull's own internal refresh, once again from showP()'s redundant
+// follow-up call. For an async loader like loadKitchenHistory() (shows
+// "Loading…", fires a real network request, then paints the result),
+// that's a visible flicker — Loading → data → Loading → data — plus
+// double the network calls on every single navigation, exactly the
+// "not proper load" symptom. Now returns whether a real pull actually
+// ran, so showP() only falls back to calling refreshPanelData(id) itself
+// in the one case that genuinely still needs it: no real session, where
+// this function is a no-op and nothing else would render the panel at all.
 async function _forcePullBeforeRender(){
-  if(!_hasRealSession()) return;
+  if(!_hasRealSession()) return false;
   const ov=document.getElementById('liveDataOverlay');
   if(ov) ov.classList.add('show');
-  try{ await pullAllFromBackend(true); }
+  try{ await pullAllFromBackend(true); return true; }
   finally{ if(ov) ov.classList.remove('show'); }
 }
 // FIX ("setting page same style need inventory" — Aug 2026): Settings
@@ -8337,9 +8398,21 @@ function filterVendors() {
     tr.style.display=tr.textContent.toLowerCase().includes(q)?'':'none';
   });
 }
-function showVendorLedger(vid) {
+async function showVendorLedger(vid) {
   const el=document.getElementById('lr-ledger');
-  if(el) { el.value='vendor:'+vid; showP('ledger-rep',document.getElementById('nv-ledger-rep')); loadLedgerReport(); }
+  // FIX ("if any problems fix" — Aug 2026, regression check after
+  // making showP() async for the mandatory-live-pull fix): this used to
+  // call loadLedgerReport() immediately after showP(), which worked back
+  // when showP() was fully synchronous. Now that showP() awaits a fresh
+  // pull before rendering, that immediate call ran BEFORE the pull
+  // landed — and since refreshPanelData() had no 'ledger-rep' case at
+  // all, the panel was never re-rendered with the fresh data afterward
+  // either, silently opting this one entry point out of the "always
+  // live" guarantee every other panel now gets. Added a 'ledger-rep'
+  // branch to refreshPanelData() (so showP() covers it like every other
+  // panel) and now await showP() here before doing anything else, so
+  // the explicit call below always runs against genuinely fresh data.
+  if(el) { el.value='vendor:'+vid; await showP('ledger-rep',document.getElementById('nv-ledger-rep')); loadLedgerReport(); }
 }
 
 // ── CHANGE 12: Issue Register ACK functions ─────────────────
@@ -9232,7 +9305,7 @@ function importItemsFromExcel(input){
         if(!name){errors.push('Row '+(idx+2)+': missing name');return;}
         if(existing.has(name.toLowerCase())){skipped++;return;}
         DB.insert('items',{
-          _id:uid('ITM'),name,
+          _id:uid('ITM'),item_code:nextItemCode(),name,
           cat:String(get('category','cat')).trim()||'Uncategorised',
           unit:String(get('unit','uom')).trim()||'Nos',
           hsn:String(get('hsn','hsn code')).trim(),
@@ -10731,8 +10804,19 @@ function showKPIDetail(type) {
       html+=`</tbody></table>`;
 
     } else if(type==='purchase-mtd') {
-      t='🧾 Purchase This Month';
-      const month_str = today().slice(0,7);
+      // FIX ("dashboard check total not show all — Aug 2026"): this used
+      // to ALWAYS hardcode "this month" (month_str = today().slice(0,7))
+      // regardless of what period the dashboard's own date filter was
+      // actually set to — so if you had "This Week", "Today", "This
+      // Year", or "All Time" selected, the headline Purchase KPI showed
+      // one number for that period, and clicking it for details showed a
+      // completely different number for a completely different month.
+      // Now reads the exact same bnxGetRange('dash')/inRange the
+      // headline KPI itself uses, so the two always cover the same dates.
+      const range = bnxGetRange('dash');
+      const inRangeMtd = dateStr => bnxInRange(dateStr, range);
+      const periodLabel = document.getElementById('dash-label')?.textContent || 'Selected Period';
+      t='🧾 Purchase — '+periodLabel;
       // FIX ("fix" — Aug 2026): old dedup key here included p.total, so
       // two rows for the SAME inv_no + vendor with a slightly different
       // amount (e.g. ₹545.00 vs ₹544.10 — a re-entry/rounding correction)
@@ -10746,7 +10830,7 @@ function showKPIDetail(type) {
       // one-click "Clean up now" button wired to
       // removeDuplicatePurchaseInvoices() so fixing the real data doesn't
       // require the console.
-      const mtdPisRaw = pis.filter(p=>p.inv_date&&p.inv_date.startsWith(month_str));
+      const mtdPisRaw = pis.filter(p=>inRangeMtd(p.inv_date));
       const seenKeys = new Set();
       const mtdPis = mtdPisRaw.filter(p=>{
         // FIX ("inventory wrong data show ... purchase remove duplicate" —
@@ -10774,7 +10858,7 @@ function showKPIDetail(type) {
       }
       html+=`<table><thead><tr><th>Date</th><th>Invoice No</th><th>Supplier</th><th class="r">Taxable</th><th class="r">GST</th><th class="r">Total</th><th>Status</th></tr></thead><tbody>`;
       mtdPis.forEach(p=>{ html+=`<tr><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${p.inv_date}</td><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${p.inv_no}</td><td>${p.party_name}</td><td class="r">${fmt(p.taxable||0)}</td><td class="r" style="color:var(--orange);">${fmt((p.cgst||0)+(p.sgst||0)+(p.igst||0))}</td><td class="r" style="font-weight:700;color:var(--ac);">${fmt(p.total||0)}</td><td><span class="badge ${p.status==='paid'?'g':p.status==='partial'?'o':'r'}">${p.status||'unpaid'}</span></td></tr>`; });
-      if(!mtdPis.length) html+=`<tr><td colspan="7" class="tbl-empty">No purchases this month</td></tr>`;
+      if(!mtdPis.length) html+=`<tr><td colspan="7" class="tbl-empty">No purchases in ${periodLabel}</td></tr>`;
       html+=`</tbody></table>`;
 
     } else if(type==='issues-mtd') {
@@ -11169,7 +11253,7 @@ function loadCapacityTable() {
           <span style="font-weight:700;color:${color};font-family:'JetBrains Mono','Noto Sans',monospace;min-width:38px;">${pct}%</span>
         </div>
       </td>
-      <td><button class="btn" style="padding:2px 8px;font-size:11px;" onclick="openEditWarehouse('${w._id}')">Edit</button> <button class="btn" style="padding:2px 8px;font-size:11px;color:var(--red);" onclick="deleteWarehouse('${w._id}')">Delete</button></td>
+      <td><button class="btn" style="padding:2px 7px;font-size:11px;" onclick="openEditWarehouse('${w._id}')">Edit</button> <button class="btn" style="padding:2px 7px;font-size:11px;color:var(--red);" onclick="deleteWarehouse('${w._id}')">Delete</button></td>
     </tr>`;
   }).join('') || '<tr><td colspan="6" class="tbl-empty">No warehouses found</td></tr>';
 }
@@ -13365,7 +13449,22 @@ window.InventoryNavigationDebug = function () {
       else if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
       return;
     }
-    if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && t.tagName === 'INPUT') {
+    // FIX ("check both arrow down and up can workable" — Aug 2026): this
+    // only triggered for INPUT elements — but every .irow item-entry row
+    // (Purchase, GRN, Issue, Adjustment, PO, Transfer, and more) starts
+    // with a <select> item picker as its FIRST field. Arrow Up/Down on a
+    // focused <select> is natively intercepted by the browser to cycle
+    // through its own option list — completely unrelated to, and
+    // silently overriding, this row-to-row navigation. So on literally
+    // the first field of every one of these rows, arrow keys never
+    // moved rows at all; they just changed which item was selected.
+    // moveRow() itself already handles SELECT/TEXTAREA fine (it uses
+    // isDataField()/isField(), which both already include them) — the
+    // trigger condition here was the only gap. TEXTAREA deliberately
+    // stays excluded, same reasoning as Enter above: arrow keys inside
+    // a multi-line notes/remarks field should move the text cursor
+    // between lines, not jump to a different row entirely.
+    if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && (t.tagName === 'INPUT' || t.tagName === 'SELECT')) {
       if (moveRow(t, e.key === 'ArrowDown' ? 1 : -1)) e.preventDefault();
     }
   }, true);
