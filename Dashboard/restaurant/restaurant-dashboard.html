@@ -7489,20 +7489,109 @@ function buildMenu(){
 // Quick on-the-fly item creation directly from the POS grid (the "+ Add
 // New Item" tile). Saves to the permanent menu (same as Settings → Menu
 // Creation) and immediately adds one unit to the current cart.
+// P0 FIX ("fix also add item"): this used to be a chain of 4 native
+// browser prompt()/confirm() dialogs — ugly, no input validation (a
+// garbage price string silently became ₹0), free-text category prone
+// to typo-duplicate categories ("Food" next to "Foood"), and — the
+// real bug — it ONLY ever saved to this browser's own localStorage.
+// There was no backend call anywhere in this flow despite the old
+// success toast implying otherwise. An item added here was invisible
+// to every other till/steward device until/unless someone happened to
+// also add it there, directly contradicting the "ONE Menu Master, one
+// source of truth" principle this whole suite is built around. Now: a
+// real modal (matching addTableDlg's pattern elsewhere in this file),
+// validated inputs, a category dropdown built from the real existing
+// categories (with an explicit "add new category" option instead of
+// free-text typos), and an actual server write via
+// bnxSaveMenuItemToBackend() below — which queues to the SAME outbox
+// every other write in this file uses if the server can't be reached
+// right now, instead of just silently staying local forever.
 function bnxQuickAddItem(){
-  const name = prompt('New item name:');
-  if (!name || !name.trim()) return;
-  const priceStr = prompt('Price (₹):', '0');
-  const price = parseInt(priceStr)||0;
-  const cat = prompt('Category (e.g. Food, Bar, Beer, Soft Drinks):', currentMenuCat && currentMenuCat!=='All' ? currentMenuCat : 'Food') || 'Uncategorised';
-  const veg = confirm('Is this a Veg item? OK = Veg, Cancel = Non-Veg') ? 'V' : 'NV';
-  const item = {n:name.trim(), p:price, c:cat.trim(), v:veg, e:bnxDefaultIcon(cat.trim()), fav:false,
-    code:'ITM'+Date.now().toString().slice(-6)};
-  menuData.push(item);
-  bnxSaveMenuData();
-  bnxRebuildCategoryPills();
-  addToCart(item.n, item.p);
-  if (typeof showNotif==='function') showNotif('✅ '+item.n+' created and added to cart','success');
+  const cats = Array.from(new Set(menuData.map(i=>i.c).filter(Boolean))).sort();
+  const mo=document.createElement('div');
+  mo.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(6px);z-index:9999;display:flex;align-items:center;justify-content:center;';
+  mo.innerHTML=`
+  <div style="background:var(--surface);border-radius:16px;padding:24px;width:380px;max-width:92vw;box-shadow:0 20px 60px rgba(0,0,0,.3);font-family:'DM Sans',sans-serif;">
+    <div style="font-family:'Playfair Display',serif;font-size:17px;font-weight:700;margin-bottom:16px;">➕ Add New Item</div>
+    <label style="font-size:11px;font-weight:700;color:#555;">Item Name *</label>
+    <input id="qaName" type="text" class="fi" placeholder="e.g. Chicken Tikka" style="width:100%;margin:5px 0 12px;padding:9px 12px;border:1px solid #ddd;border-radius:8px;font-size:13px;" autofocus>
+    <label style="font-size:11px;font-weight:700;color:#555;">Category *</label>
+    <select id="qaCat" class="fi fsel" style="width:100%;margin:5px 0 12px;padding:9px 12px;border:1px solid #ddd;border-radius:8px;font-size:13px;">
+      ${cats.map(c=>`<option value="${c.replace(/"/g,'&quot;')}"${c===currentMenuCat?' selected':''}>${c}</option>`).join('')}
+      <option value="__NEW__">+ New category…</option>
+    </select>
+    <input id="qaCatNew" type="text" class="fi" placeholder="New category name" style="width:100%;margin:5px 0 12px;padding:9px 12px;border:1px solid #ddd;border-radius:8px;font-size:13px;display:none;">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+      <div>
+        <label style="font-size:11px;font-weight:700;color:#555;">Price (₹) *</label>
+        <input id="qaPrice" type="number" min="0" step="0.01" class="fi" placeholder="0" style="width:100%;margin:5px 0 12px;padding:9px 12px;border:1px solid #ddd;border-radius:8px;font-size:13px;">
+      </div>
+      <div>
+        <label style="font-size:11px;font-weight:700;color:#555;">GST %</label>
+        <input id="qaGst" type="number" min="0" step="0.1" value="5" class="fi" style="width:100%;margin:5px 0 12px;padding:9px 12px;border:1px solid #ddd;border-radius:8px;font-size:13px;">
+      </div>
+    </div>
+    <label style="font-size:11px;font-weight:700;color:#555;display:block;margin-bottom:5px;">Veg / Non-Veg</label>
+    <div style="display:flex;gap:8px;margin-bottom:18px;">
+      <button type="button" id="qaVegBtn" class="btn btn-sm" style="flex:1;background:var(--green);color:#fff;border:none;">🟢 Veg</button>
+      <button type="button" id="qaNvBtn" class="btn btn-sm btn-ghost" style="flex:1;">🔴 Non-Veg</button>
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;">
+      <button class="btn btn-sm btn-ghost" id="qaCancel">Cancel</button>
+      <button class="btn btn-sm btn-primary" id="qaSave">💾 Save &amp; Add to Cart</button>
+    </div>
+  </div>`;
+  document.body.appendChild(mo);
+  let qaVeg = 'V';
+  const vegBtn = mo.querySelector('#qaVegBtn'), nvBtn = mo.querySelector('#qaNvBtn');
+  vegBtn.onclick = ()=>{ qaVeg='V'; vegBtn.className='btn btn-sm'; vegBtn.style.cssText='flex:1;background:var(--green);color:#fff;border:none;'; nvBtn.className='btn btn-sm btn-ghost'; nvBtn.style.cssText='flex:1;'; };
+  nvBtn.onclick = ()=>{ qaVeg='NV'; nvBtn.className='btn btn-sm'; nvBtn.style.cssText='flex:1;background:var(--red,#dc2626);color:#fff;border:none;'; vegBtn.className='btn btn-sm btn-ghost'; vegBtn.style.cssText='flex:1;'; };
+  const catSel = mo.querySelector('#qaCat'), catNew = mo.querySelector('#qaCatNew');
+  catSel.onchange = ()=>{ catNew.style.display = catSel.value==='__NEW__' ? '' : 'none'; if(catSel.value==='__NEW__') catNew.focus(); };
+  mo.querySelector('#qaCancel').onclick = ()=>mo.remove();
+  mo.querySelector('#qaSave').onclick = async ()=>{
+    const name = mo.querySelector('#qaName').value.trim();
+    const cat = (catSel.value==='__NEW__' ? catNew.value.trim() : catSel.value) || 'Uncategorised';
+    const price = Number(mo.querySelector('#qaPrice').value);
+    const gst = Number(mo.querySelector('#qaGst').value)||0;
+    if (!name){ alert('Enter an item name.'); return; }
+    if (!price || price<=0){ alert('Enter a valid price greater than ₹0.'); return; }
+    if (menuData.some(m=>m.n.toLowerCase()===name.toLowerCase())){ alert('An item named "'+name+'" already exists.'); return; }
+    const item = {n:name, p:price, c:cat, v:qaVeg, e:bnxDefaultIcon(cat), fav:false,
+      code:'ITM'+Date.now().toString().slice(-6), gst};
+    menuData.push(item);
+    bnxSaveMenuData();
+    bnxRebuildCategoryPills();
+    buildMenu();
+    addToCart(item.n, item.p);
+    const saveBtn = mo.querySelector('#qaSave');
+    saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+    const r = await bnxSaveMenuItemToBackend(item);
+    if (typeof showNotif==='function'){
+      showNotif(r && r.success ? ('✅ '+item.n+' saved to Menu Master and added to cart') : ('✅ '+item.n+' added to cart — server sync pending, will retry automatically'), 'success');
+    }
+    mo.remove();
+  };
+}
+// P0 FIX: the actual server write for a newly-created menu item — used
+// by both the POS quick-add tile above and Settings → Menu Creation
+// below. Neither of those flows ever called the backend at all before
+// this; this is the real fix, not just a UI polish. Follows the exact
+// same guaranteed-write pattern as every other create action in this
+// file: requestId for idempotency, and on failure the item queues to
+// the SAME outbox SAVE_TABLE_STATUS/SAVE_KOT/SAVE_BILL already use, so
+// it retries automatically instead of silently staying local-only.
+// ⚠️ CONFIRM BEFORE RELYING ON THIS: needs a 'SAVE_MENU_ITEM' case
+// wired into the live backend router (same "add this case line" step
+// every other new action in this suite has needed) — until that
+// exists server-side, every save here will queue to the outbox and
+// retry harmlessly, but never actually reach the sheet. Check the
+// Apps Script Executions log for a SAVE_MENU_ITEM call to confirm.
+async function bnxSaveMenuItemToBackend(item){
+  return bnxGuaranteedSync('SAVE_MENU_ITEM', {
+    name: item.n, category: item.c, price: item.p, gst: item.gst||0,
+    isVeg: item.v==='V', icon: item.e, itemCode: item.code,
+  }, false);
 }
 function filterMenu(cat,btn){
   document.querySelectorAll('#posCats .pcat').forEach(b=>b.classList.remove('active'));
@@ -10914,7 +11003,17 @@ function saveNewMenuItem(){
   bnxSaveMenuData();
   bnxRebuildCategoryPills();
   buildMenu();
-  showNotif('✅ '+name+' saved to Menu · GST: '+gst+'% · now live on POS','success');
+  // P0 FIX ("fix also add item" — same gap found in the POS quick-add
+  // tile): this used to claim "now live on POS" while only ever
+  // touching local menuData/localStorage — no backend call at all, so
+  // the item was invisible to every other device. Now actually writes
+  // through bnxSaveMenuItemToBackend() (queues to the outbox on
+  // failure, same as everywhere else), and the success message is
+  // honest about which outcome actually happened.
+  showNotif('⏳ Saving '+name+' to Menu Master…', 'success');
+  bnxSaveMenuItemToBackend(newItem).then(r=>{
+    showNotif(r && r.success ? ('✅ '+name+' saved to Menu Master · GST: '+gst+'% · live on POS') : ('✅ '+name+' saved locally — server sync pending, will retry automatically'), 'success');
+  });
   clearNewItemForm();
 }
 function clearNewItemForm(){
