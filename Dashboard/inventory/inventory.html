@@ -4713,6 +4713,22 @@ window.addEventListener('focus',()=>{
 });
 
 const uid = (p='') => p+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
+// FIX ("ALL FULL AUDIT ALL CHECK PROPER FIX COMPLETE" — Aug 2026,
+// screenshot showed raw ids like "lmt4nah24d1bcfsm9g9" in the Item
+// column instead of a name): every report/ledger in this file that
+// resolves item_id -> item name used the same `item?.name||item_id`
+// fallback — if the lookup fails (orphaned reference, item deleted,
+// or a genuinely mismatched id from an import), the raw internal id
+// got shown directly to the screen. That's true regardless of WHY the
+// lookup failed — a raw id is never something a person reviewing
+// stock movements should have to look at. This is the ONE shared
+// place all of those now route through: a clear, honest "⚠️ Unknown
+// Item" instead of cryptic characters, with the real id kept in the
+// title attribute (hover) so support/debugging can still find it.
+function bnxItemDisplayName(item, itemId){
+  if(item && item.name) return item.name;
+  return `<span style="color:var(--red);cursor:help" title="Item not found in Item Master — id: ${String(itemId||'').replace(/"/g,'&quot;')}">⚠️ Unknown Item</span>`;
+}
 // FIX ("item id ITEM001 so all id proper give capital" — Aug 2026): every
 // item display (Item Master list, CSV exports, Physical Stock Count,
 // Vendor Compare) already preferred i.item_code over the raw internal
@@ -5990,9 +6006,29 @@ function loadDashboard() {
   // Change 3: Recent movements — now respects the period filter (was
   // always "latest 8 regardless of period", with a "No movements today"
   // empty-state that lied outside the Day filter).
+  // FIX ("IN BUT OUT SHOWN" — Aug 2026): purchase_reversal entries
+  // (posted by deletePI()/edit's reversePurchaseStockImpact() — see
+  // that function's header comment) are a genuine stock DECREASE, so
+  // qty_in>0 correctly evaluates false and they belong on the "Out"
+  // side of the ledger. But 'purchase_reversal' wasn't in deptMap, so
+  // it silently fell through to the generic "Store" label and a plain
+  // red "▼ Out" badge — visually IDENTICAL to a real Store Issue
+  // (stock leaving for a department to be used). That's what actually
+  // read as wrong: a data CORRECTION (removing stock that was
+  // over-counted from a duplicate/mis-edited invoice) looked exactly
+  // like stock genuinely walking out the door. Now labeled distinctly
+  // — an amber "↩ Correction" badge and a "Reversal" dept tag — so
+  // it's unmistakably a fix to a prior entry, not a new issue.
   const movements = DB.all('stock_ledger').filter(s=>s.txn_type!=='opening' && inRange(s.date)).sort((a,b)=>b._ts>a._ts?1:-1).slice(0,8);
-  const deptMap = {purchase:'Purchase',issue:'Kitchen',bar_issue:'Bar',transfer:'Stores',grn:'GRN',adjustment:'Stores'};
-  document.getElementById('movements-body').innerHTML = movements.length ? movements.map(s=>{ const item=items.find(i=>i._id===s.item_id); const isIn=s.qty_in>0; const dept=deptMap[s.txn_type]||s.dept||'Store'; return `<tr><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${s.date}</td><td><span class="badge ${isIn?'g':'r'}">${isIn?'▲ In':'▼ Out'}</span></td><td>${item?.name||s.item_id}</td><td class="r" style="font-weight:700;">${isIn?'+':'-'}${fmtQ(isIn?s.qty_in:s.qty_out,item?.unit)}</td><td><span class="badge gr" style="font-size:9px;">${dept}</span></td></tr>`; }).join('') : `<tr><td colspan="5" class="tbl-empty"><b>No stock movement in ${rangeLabel}</b><br><span style="font-weight:400;color:var(--muted);font-size:12px;">Purchases, issues, and transfers you record will show up here as soon as they're posted.</span></td></tr>`;
+  const deptMap = {purchase:'Purchase',issue:'Kitchen',bar_issue:'Bar',transfer:'Stores',grn:'GRN',adjustment:'Stores',purchase_reversal:'Reversal'};
+  document.getElementById('movements-body').innerHTML = movements.length ? movements.map(s=>{
+    const item=items.find(i=>i._id===s.item_id);
+    const isReversal = s.txn_type==='purchase_reversal';
+    const isIn=s.qty_in>0;
+    const dept=deptMap[s.txn_type]||s.dept||'Store';
+    const typeBadge = isReversal ? `<span class="badge o" title="${s.notes?String(s.notes).replace(/"/g,'&quot;'):'Stock correction — a prior purchase entry was edited or deleted'}">↩ Correction</span>` : `<span class="badge ${isIn?'g':'r'}">${isIn?'▲ In':'▼ Out'}</span>`;
+    return `<tr><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${s.date}</td><td>${typeBadge}</td><td>${bnxItemDisplayName(item,s.item_id)}</td><td class="r" style="font-weight:700;">${isIn?'+':'-'}${fmtQ(isIn?s.qty_in:s.qty_out,item?.unit)}</td><td><span class="badge gr" style="font-size:9px;">${dept}</span></td></tr>`;
+  }).join('') : `<tr><td colspan="5" class="tbl-empty"><b>No stock movement in ${rangeLabel}</b><br><span style="font-weight:400;color:var(--muted);font-size:12px;">Purchases, issues, and transfers you record will show up here as soon as they're posted.</span></td></tr>`;
 }
 
 // ── Purchase Entry ──────────────────────────────
@@ -6382,10 +6418,10 @@ function reversePurchaseStockImpact(pi, reasonNote){
     DB.insert('stock_ledger',{_id:uid('SL'),item_id:ir.item_id,wh_id:wh,date:today(),txn_type:'purchase_reversal',ref_id:pi._id,ref_type:'purchase_invoice_reversal',qty_in:0,qty_out:ir.qty,balance:prev-ir.qty,rate:ir.rate,value:ir.qty*ir.rate,notes:reasonNote});
   });
 }
-async function deletePI(id){
+async function deletePI(id, skipConfirm){
   const pi = DB.findOne('purchase_invoices',{_id:id});
   if(!pi){ toast('Invoice not found','e'); return; }
-  if(!confirm(`Delete invoice ${pi.inv_no} (${pi.party_name}, ${fmt(pi.total)})?\n\nThis will:\n• Remove it from Purchase Register and all reports\n• Reverse its stock impact (posts a compensating entry — the original entries stay in history, same as real accounting practice)\n\nThis cannot be undone.`))return;
+  if(!skipConfirm && !confirm(`Delete invoice ${pi.inv_no} (${pi.party_name}, ${fmt(pi.total)})?\n\nThis will:\n• Remove it from Purchase Register and all reports\n• Reverse its stock impact (posts a compensating entry — the original entries stay in history, same as real accounting practice)\n\nThis cannot be undone.`))return;
   reversePurchaseStockImpact(pi, 'Reversal for deleted invoice '+pi.inv_no);
   const remaining = DB.all('purchase_invoices').filter(p=>p._id!==id);
   DB.save('purchase_invoices', remaining);
@@ -6400,6 +6436,40 @@ async function deletePI(id){
   loadPurchaseRegister();
   loadDashboard();
   const box=document.getElementById('pr-detail-box'); if(box)box.style.display='none';
+}
+
+// FIX ("SELECT ALL" — Aug 2026): bulk-select support for the Purchase
+// KPI modal's table — mirrors purchase-module.html's Register (checkbox
+// column + header select-all + a bar that appears once anything's
+// checked), just scoped to this modal's own row/id set.
+function updatePurchaseMtdSelectionUI(){
+  const checks=[...document.querySelectorAll('.pmtd-row-chk')];
+  const selected=checks.filter(c=>c.checked);
+  const bar=document.getElementById('pmtd-bulkbar');
+  const countEl=document.getElementById('pmtd-sel-count');
+  const selectAll=document.getElementById('pmtd-select-all');
+  if(selectAll){
+    selectAll.checked = checks.length>0 && selected.length===checks.length;
+    selectAll.indeterminate = selected.length>0 && selected.length<checks.length;
+  }
+  if(bar) bar.style.display = selected.length ? 'flex' : 'none';
+  if(countEl) countEl.textContent = selected.length+' selected';
+}
+function togglePurchaseMtdSelectAll(cb){
+  document.querySelectorAll('.pmtd-row-chk').forEach(c=>{ c.checked=cb.checked; });
+  updatePurchaseMtdSelectionUI();
+}
+async function bulkDeletePurchaseMtdSelected(){
+  const ids=[...document.querySelectorAll('.pmtd-row-chk')].filter(c=>c.checked).map(c=>c.dataset.id);
+  if(!ids.length)return;
+  const recs=ids.map(id=>DB.findOne('purchase_invoices',{_id:id})).filter(Boolean);
+  if(!recs.length){ toast('Selected record(s) not found','e'); return; }
+  const totalAmt=recs.reduce((s,p)=>s+(+p.total||0),0);
+  const preview=recs.slice(0,5).map(p=>`• ${p.inv_no} — ${p.party_name} — ${fmt(p.total)}`).join('\n')+(recs.length>5?`\n…and ${recs.length-5} more`:'');
+  if(!confirm(`Delete ${recs.length} selected invoice(s), totaling ${fmt(totalAmt)}?\n\n${preview}\n\nThis will:\n• Remove them from Purchase Register and all reports\n• Reverse each one's stock impact (compensating entries — original entries stay in history)\n\nThis cannot be undone.`))return;
+  for(const id of ids){ await deletePI(id, true); }
+  toast(`${recs.length} invoice(s) deleted. Stock reversed.`,'s');
+  showKPIDetail('purchase-mtd');
 }
 
 function loadPurchaseRegister() {
@@ -7033,7 +7103,7 @@ function loadWarehouseCards(){
   document.getElementById('wh-cards-body').innerHTML=warehouses.map(w=>{
     const wd=whStock[w._id]||{items:[],val:0};
     const typeColors={main:'var(--ac)',kitchen:'var(--orange)',bar:'var(--purple)',cold:'var(--cyan)',housekeeping:'var(--teal)'};
-    return `<div class="card" style="margin-bottom:14px;"><div class="card-h"><h3 style="color:${typeColors[w.type]||'var(--ac)'};">🏗 ${w.name}</h3><div style="display:flex;gap:8px;align-items:center;"><span class="badge a">${fmt(wd.val)}</span><span class="badge gr">${wd.items.length} items</span></div></div><div class="tbl-wrap"><table><thead><tr><th>Item</th><th class="r">Stock</th><th>Unit</th><th class="r">Rate</th><th class="r">Value</th></tr></thead><tbody>${wd.items.slice(0,15).map(it=>`<tr><td>${it.name||it.item_id}</td><td class="r" style="font-weight:700;">${Number(it.balance).toFixed(2)}</td><td>${it.unit||''}</td><td class="r">${fmt(it.price||0)}</td><td class="r">${fmt(it.balance*(it.price||0))}</td></tr>`).join('')}${wd.items.length===0?'<tr><td colspan="5" class="tbl-empty">No stock in this warehouse</td></tr>':''}</tbody></table></div></div>`;
+    return `<div class="card" style="margin-bottom:14px;"><div class="card-h"><h3 style="color:${typeColors[w.type]||'var(--ac)'};">🏗 ${w.name}</h3><div style="display:flex;gap:8px;align-items:center;"><span class="badge a">${fmt(wd.val)}</span><span class="badge gr">${wd.items.length} items</span></div></div><div class="tbl-wrap"><table><thead><tr><th>Item</th><th class="r">Stock</th><th>Unit</th><th class="r">Rate</th><th class="r">Value</th></tr></thead><tbody>${wd.items.slice(0,15).map(it=>`<tr><td>${bnxItemDisplayName(it,it.item_id)}</td><td class="r" style="font-weight:700;">${Number(it.balance).toFixed(2)}</td><td>${it.unit||''}</td><td class="r">${fmt(it.price||0)}</td><td class="r">${fmt(it.balance*(it.price||0))}</td></tr>`).join('')}${wd.items.length===0?'<tr><td colspan="5" class="tbl-empty">No stock in this warehouse</td></tr>':''}</tbody></table></div></div>`;
   }).join('');
 }
 
@@ -9084,7 +9154,7 @@ function loadStockLedgerReport() {
     // per-row Value is the value of that transaction — qty moved × rate.
     const txnQty=(l.qty_in||0)-(l.qty_out||0);
     const txnVal=Math.abs(txnQty)*(l.rate||0);
-    return `<tr><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${l.date}</td><td><span style="background:${c}22;color:${c};border-radius:4px;padding:1px 6px;font-size:10px;font-weight:700;">${(l.txn_type||'').replace(/_/g,' ').toUpperCase()}</span></td><td><strong>${it?.name||l.item_id}</strong></td><td>${wh?.name||'—'}</td><td class="r" style="color:var(--green);font-weight:700;">${l.qty_in>0?fmtQ(l.qty_in,it?.unit):'—'}</td><td class="r" style="color:var(--red);font-weight:700;">${l.qty_out>0?fmtQ(l.qty_out,it?.unit):'—'}</td><td class="r" style="font-family:'JetBrains Mono','Noto Sans',monospace;font-weight:700;color:var(--ac);">${fmtQ(l.balance,it?.unit)}</td><td class="r">${fmt(l.rate||0)}</td><td class="r">${fmt(txnVal)}</td><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:10px;">${l.ref_no||'—'}</td><td>${l.dept||'—'}</td></tr>`;
+    return `<tr><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${l.date}</td><td><span style="background:${c}22;color:${c};border-radius:4px;padding:1px 6px;font-size:10px;font-weight:700;">${(l.txn_type||'').replace(/_/g,' ').toUpperCase()}</span></td><td><strong>${bnxItemDisplayName(it,l.item_id)}</strong></td><td>${wh?.name||'—'}</td><td class="r" style="color:var(--green);font-weight:700;">${l.qty_in>0?fmtQ(l.qty_in,it?.unit):'—'}</td><td class="r" style="color:var(--red);font-weight:700;">${l.qty_out>0?fmtQ(l.qty_out,it?.unit):'—'}</td><td class="r" style="font-family:'JetBrains Mono','Noto Sans',monospace;font-weight:700;color:var(--ac);">${fmtQ(l.balance,it?.unit)}</td><td class="r">${fmt(l.rate||0)}</td><td class="r">${fmt(txnVal)}</td><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:10px;">${l.ref_no||'—'}</td><td>${l.dept||'—'}</td></tr>`;
   }).join('')||'<tr><td colspan="11" class="tbl-empty">No records. Select filters and click View.</td></tr>';
   const se=(id,v)=>{const e=document.getElementById(id);if(e)e.textContent=v;};
   se('sl-total-in',fmt(lg.reduce((s,l)=>s+(l.qty_in||0)*(l.rate||0),0)));
@@ -10195,7 +10265,7 @@ function loadStockJournal(){
     const item=items.find(i=>i._id===s.item_id);
     const wh=warehouses.find(w=>w._id===s.wh_id);
     const txnLabels={opening:'Opening',purchase:'Purchase',grn:'GRN',kitchen_issue:'Kitchen Issue',bar_consumption:'Bar Issue',transfer:'Transfer',adjustment:'Adjustment',damage:'Damage'};
-    return`<tr><td>${s.date}</td><td><span class="badge gr" style="font-size:10px;">${txnLabels[s.txn_type]||s.txn_type}</span></td><td style="font-size:11px;font-family:'JetBrains Mono','Noto Sans',monospace;">${s.ref_id||s._id.slice(0,12)}</td><td><strong>${item?.name||s.item_id}</strong></td><td>${wh?.name||s.wh_id}</td><td class="r" style="color:var(--green);font-weight:700;">${s.qty_in>0?fmtQ(s.qty_in,item?.unit):'—'}</td><td class="r" style="color:var(--red);">${s.qty_out>0?fmtQ(s.qty_out,item?.unit):'—'}</td><td class="r" style="font-weight:800;">${fmtQ(s.balance,item?.unit)}</td><td class="r">${fmt(s.rate||0)}</td><td class="r" style="font-weight:700;">${fmt(s.value||0)}</td></tr>`;
+    return`<tr><td>${s.date}</td><td><span class="badge gr" style="font-size:10px;">${txnLabels[s.txn_type]||s.txn_type}</span></td><td style="font-size:11px;font-family:'JetBrains Mono','Noto Sans',monospace;">${s.ref_id||s._id.slice(0,12)}</td><td><strong>${bnxItemDisplayName(item,s.item_id)}</strong></td><td>${wh?.name||s.wh_id}</td><td class="r" style="color:var(--green);font-weight:700;">${s.qty_in>0?fmtQ(s.qty_in,item?.unit):'—'}</td><td class="r" style="color:var(--red);">${s.qty_out>0?fmtQ(s.qty_out,item?.unit):'—'}</td><td class="r" style="font-weight:800;">${fmtQ(s.balance,item?.unit)}</td><td class="r">${fmt(s.rate||0)}</td><td class="r" style="font-weight:700;">${fmt(s.value||0)}</td></tr>`;
   }).join(''):'<tr><td colspan="10" class="tbl-empty">No transactions in selected range</td></tr>';
 }
 
@@ -10205,11 +10275,11 @@ function loadItemLedger(){const itemId=document.getElementById('il-item')?.value
 
 // ── Category Ledger ────────────────────────────────────────
 function populateCategoryLedgerSelect(){const items=DB.all('items');const cats=[...new Set(items.map(i=>i.cat))].sort();const sel=document.getElementById('cl-cat');if(sel&&sel.options.length<=1)cats.forEach(c=>{const o=document.createElement('option');o.value=c;o.textContent=c;sel.appendChild(o);});const d1=document.getElementById('cl-from');const d2=document.getElementById('cl-to');if(d1&&!d1.value){const m=today().slice(0,7);d1.value=m+'-01';d2.value=today();}}
-function loadCatLedger(){const cat=document.getElementById('cl-cat')?.value;if(!cat){toast('Select category','w');return;}const from=document.getElementById('cl-from')?.value;const to=document.getElementById('cl-to')?.value;const items=DB.all('items').filter(i=>i.cat===cat);const sl=DB.all('stock_ledger').filter(s=>items.find(i=>i._id===s.item_id)&&s.date>=from&&s.date<=to).sort((a,b)=>a.date>b.date?1:-1);document.getElementById('cl-body').innerHTML=sl.length?sl.map(s=>{const item=items.find(i=>i._id===s.item_id);return`<tr><td>${s.date}</td><td>${item?.name||s.item_id}</td><td><span class="badge gr" style="font-size:10px;">${s.txn_type}</span></td><td style="font-size:11px;">${s.ref_id||'—'}</td><td class="r" style="color:var(--green);font-weight:700;">${s.qty_in>0?fmtQ(s.qty_in,item?.unit):'—'}</td><td class="r" style="color:var(--red);">${s.qty_out>0?fmtQ(s.qty_out,item?.unit):'—'}</td><td class="r" style="color:var(--green);font-weight:700;">${s.qty_in>0?fmt(s.value||0):'—'}</td><td class="r" style="color:var(--red);">${s.qty_out>0?fmt(s.value||0):'—'}</td></tr>`}).join(''):'<tr><td colspan="8" class="tbl-empty">No transactions for this category</td></tr>';}
+function loadCatLedger(){const cat=document.getElementById('cl-cat')?.value;if(!cat){toast('Select category','w');return;}const from=document.getElementById('cl-from')?.value;const to=document.getElementById('cl-to')?.value;const items=DB.all('items').filter(i=>i.cat===cat);const sl=DB.all('stock_ledger').filter(s=>items.find(i=>i._id===s.item_id)&&s.date>=from&&s.date<=to).sort((a,b)=>a.date>b.date?1:-1);document.getElementById('cl-body').innerHTML=sl.length?sl.map(s=>{const item=items.find(i=>i._id===s.item_id);return`<tr><td>${s.date}</td><td>${bnxItemDisplayName(item,s.item_id)}</td><td><span class="badge gr" style="font-size:10px;">${s.txn_type}</span></td><td style="font-size:11px;">${s.ref_id||'—'}</td><td class="r" style="color:var(--green);font-weight:700;">${s.qty_in>0?fmtQ(s.qty_in,item?.unit):'—'}</td><td class="r" style="color:var(--red);">${s.qty_out>0?fmtQ(s.qty_out,item?.unit):'—'}</td><td class="r" style="color:var(--green);font-weight:700;">${s.qty_in>0?fmt(s.value||0):'—'}</td><td class="r" style="color:var(--red);">${s.qty_out>0?fmt(s.value||0):'—'}</td></tr>`}).join(''):'<tr><td colspan="8" class="tbl-empty">No transactions for this category</td></tr>';}
 
 // ── Warehouse Ledger ───────────────────────────────────────
 function populateWHLedgerSelect(){const warehouses=DB.all('warehouses');const sel=document.getElementById('wl-wh');if(sel&&sel.options.length<=1){warehouses.forEach(w=>{const o=document.createElement('option');o.value=w._id;o.textContent=w.name;sel.appendChild(o);});const main=warehouses.find(w=>w.type==='main')||warehouses[0];if(main)sel.value=main._id;}const d1=document.getElementById('wl-from');const d2=document.getElementById('wl-to');if(d1&&!d1.value){const m=today().slice(0,7);d1.value=m+'-01';d2.value=today();}}
-function loadWHLedger(){const wh=document.getElementById('wl-wh')?.value;if(!wh){toast('Select warehouse','w');return;}const from=document.getElementById('wl-from')?.value;const to=document.getElementById('wl-to')?.value;const items=DB.all('items');const sl=DB.all('stock_ledger').filter(s=>s.wh_id===wh&&s.date>=from&&s.date<=to).sort((a,b)=>a.date>b.date?1:-1);document.getElementById('wl-body').innerHTML=sl.length?sl.map(s=>{const item=items.find(i=>i._id===s.item_id);return`<tr><td>${s.date}</td><td><strong>${item?.name||s.item_id}</strong></td><td><span class="badge gr" style="font-size:10px;">${item?.cat||'—'}</span></td><td><span class="badge gr" style="font-size:10px;">${s.txn_type}</span></td><td style="font-size:11px;">${s.ref_id||'—'}</td><td class="r" style="color:var(--green);font-weight:700;">${s.qty_in>0?fmtQ(s.qty_in,item?.unit):'—'}</td><td class="r" style="color:var(--red);">${s.qty_out>0?fmtQ(s.qty_out,item?.unit):'—'}</td><td class="r" style="font-weight:800;">${fmtQ(s.balance,item?.unit)}</td><td class="r">${fmt(s.value||0)}</td></tr>`}).join(''):'<tr><td colspan="9" class="tbl-empty">No transactions for this warehouse</td></tr>';}
+function loadWHLedger(){const wh=document.getElementById('wl-wh')?.value;if(!wh){toast('Select warehouse','w');return;}const from=document.getElementById('wl-from')?.value;const to=document.getElementById('wl-to')?.value;const items=DB.all('items');const sl=DB.all('stock_ledger').filter(s=>s.wh_id===wh&&s.date>=from&&s.date<=to).sort((a,b)=>a.date>b.date?1:-1);document.getElementById('wl-body').innerHTML=sl.length?sl.map(s=>{const item=items.find(i=>i._id===s.item_id);return`<tr><td>${s.date}</td><td><strong>${bnxItemDisplayName(item,s.item_id)}</strong></td><td><span class="badge gr" style="font-size:10px;">${item?.cat||'—'}</span></td><td><span class="badge gr" style="font-size:10px;">${s.txn_type}</span></td><td style="font-size:11px;">${s.ref_id||'—'}</td><td class="r" style="color:var(--green);font-weight:700;">${s.qty_in>0?fmtQ(s.qty_in,item?.unit):'—'}</td><td class="r" style="color:var(--red);">${s.qty_out>0?fmtQ(s.qty_out,item?.unit):'—'}</td><td class="r" style="font-weight:800;">${fmtQ(s.balance,item?.unit)}</td><td class="r">${fmt(s.value||0)}</td></tr>`}).join(''):'<tr><td colspan="9" class="tbl-empty">No transactions for this warehouse</td></tr>';}
 
 // ── Consumption Register ───────────────────────────────────
 // ════ DAY/WEEK/MONTH/YEAR/CUSTOM REPORT FILTER ENGINE ════
@@ -10363,7 +10433,7 @@ function loadConsumptionRegister(){
   document.getElementById('cr-kitchen').textContent=fmt(kitchen);
   document.getElementById('cr-bar').textContent=fmt(bar);
   document.getElementById('cr-other').textContent=fmt(other);
-  document.getElementById('cr-body').innerHTML=sl.length?sl.map((s,i)=>{const item=items.find(x=>x._id===s.item_id);const deptLabel=s.txn_type==='kitchen_issue'?'Kitchen':s.txn_type==='bar_consumption'?'Bar':'Other';if(dept&&deptLabel!==dept)return'';return`<tr><td>${s.date}</td><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${s._id.slice(0,12)}</td><td><span class="badge ${s.txn_type==='kitchen_issue'?'t':'p'}">${deptLabel}</span></td><td><strong>${item?.name||s.item_id}</strong></td><td class="r" style="font-weight:700;">${fmtQ(s.qty_out,item?.unit)}</td><td>${item?.unit||'—'}</td><td class="r">${fmt(s.rate||0)}</td><td class="r" style="font-weight:700;color:var(--red);">${fmt(s.value||0)}</td><td>Store Manager</td></tr>`;}).join(''):'<tr><td colspan="9" class="tbl-empty">No consumption records in selected period</td></tr>';
+  document.getElementById('cr-body').innerHTML=sl.length?sl.map((s,i)=>{const item=items.find(x=>x._id===s.item_id);const deptLabel=s.txn_type==='kitchen_issue'?'Kitchen':s.txn_type==='bar_consumption'?'Bar':'Other';if(dept&&deptLabel!==dept)return'';return`<tr><td>${s.date}</td><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${s._id.slice(0,12)}</td><td><span class="badge ${s.txn_type==='kitchen_issue'?'t':'p'}">${deptLabel}</span></td><td><strong>${bnxItemDisplayName(item,s.item_id)}</strong></td><td class="r" style="font-weight:700;">${fmtQ(s.qty_out,item?.unit)}</td><td>${item?.unit||'—'}</td><td class="r">${fmt(s.rate||0)}</td><td class="r" style="font-weight:700;color:var(--red);">${fmt(s.value||0)}</td><td>Store Manager</td></tr>`;}).join(''):'<tr><td colspan="9" class="tbl-empty">No consumption records in selected period</td></tr>';
 }
 
 // ── Audit Report ───────────────────────────────────────────
@@ -11134,9 +11204,22 @@ function showKPIDetail(type) {
           <button class="btn d" style="padding:3px 10px;font-size:11px;white-space:nowrap;" onclick="removeDuplicatePurchaseInvoices();try{showKPIDetail('purchase-mtd');}catch(e){console.error('[BNJ] modal refresh after cleanup failed:',e);}">🧹 Clean up now</button>
         </div>`;
       }
-      html+=`<table><thead><tr><th>Date</th><th>Invoice No</th><th>Supplier</th><th class="r">Taxable</th><th class="r">GST</th><th class="r">Total</th><th>Status</th><th></th></tr></thead><tbody>`;
-      mtdPis.forEach(p=>{ html+=`<tr><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${p.inv_date}</td><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${p.inv_no}</td><td>${p.party_name}</td><td class="r">${fmt(p.taxable||0)}</td><td class="r" style="color:var(--orange);">${fmt((p.cgst||0)+(p.sgst||0)+(p.igst||0))}</td><td class="r" style="font-weight:700;color:var(--ac);">${fmt(p.total||0)}</td><td><span class="badge ${p.status==='paid'?'g':p.status==='partial'?'o':'r'}">${p.status||'unpaid'}</span></td><td style="white-space:nowrap"><button class="btn" style="padding:2px 6px;font-size:10px;" onclick="closeModal('kpi-detail-modal');editPI('${p._id}')" title="Edit">✏️</button> <button class="btn" style="padding:2px 6px;font-size:10px;color:var(--red)" onclick="deletePI('${p._id}');showKPIDetail('purchase-mtd')" title="Delete">🗑️</button></td></tr>`; });
-      if(!mtdPis.length) html+=`<tr><td colspan="8" class="tbl-empty">No purchases in ${periodLabel}</td></tr>`;
+      // FIX ("SELECT ALL" — Aug 2026): this modal had per-row Edit/Delete
+      // but no way to act on several invoices at once — same bulk-select
+      // pattern purchase-module.html's Register already uses (checkbox
+      // column + header select-all + a bar that appears once anything's
+      // checked). Reuses deletePI() per selected row (same authoritative
+      // per-row delete + stock reversal as the single-row 🗑️ button),
+      // just fired for each checked id.
+      if(mtdPis.length){
+        html+=`<div id="pmtd-bulkbar" style="display:none;margin-bottom:8px;padding:6px 10px;background:var(--bg2,#f8fafc);border-radius:6px;font-size:11px;display:flex;align-items:center;justify-content:space-between;gap:8px;">
+          <span id="pmtd-sel-count">0 selected</span>
+          <button class="btn d" style="padding:3px 10px;font-size:11px;" onclick="bulkDeletePurchaseMtdSelected()">🗑️ Delete Selected</button>
+        </div>`;
+      }
+      html+=`<table><thead><tr><th style="width:26px"><input type="checkbox" id="pmtd-select-all" onchange="togglePurchaseMtdSelectAll(this)" title="Select all invoices currently shown"></th><th>Date</th><th>Invoice No</th><th>Supplier</th><th class="r">Taxable</th><th class="r">GST</th><th class="r">Total</th><th>Status</th><th></th></tr></thead><tbody>`;
+      mtdPis.forEach(p=>{ html+=`<tr><td><input type="checkbox" class="pmtd-row-chk" data-id="${p._id}" onchange="updatePurchaseMtdSelectionUI()"></td><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${p.inv_date}</td><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:11px;">${p.inv_no}</td><td>${p.party_name}</td><td class="r">${fmt(p.taxable||0)}</td><td class="r" style="color:var(--orange);">${fmt((p.cgst||0)+(p.sgst||0)+(p.igst||0))}</td><td class="r" style="font-weight:700;color:var(--ac);">${fmt(p.total||0)}</td><td><span class="badge ${p.status==='paid'?'g':p.status==='partial'?'o':'r'}">${p.status||'unpaid'}</span></td><td style="white-space:nowrap"><button class="btn" style="padding:2px 6px;font-size:10px;" onclick="closeModal('kpi-detail-modal');editPI('${p._id}')" title="Edit">✏️</button> <button class="btn" style="padding:2px 6px;font-size:10px;color:var(--red)" onclick="deletePI('${p._id}');showKPIDetail('purchase-mtd')" title="Delete">🗑️</button></td></tr>`; });
+      if(!mtdPis.length) html+=`<tr><td colspan="9" class="tbl-empty">No purchases in ${periodLabel}</td></tr>`;
       html+=`</tbody></table>`;
 
     } else if(type==='issues-mtd') {
@@ -11157,7 +11240,7 @@ function showKPIDetail(type) {
       t='🍳 Kitchen Consumption — Today';
       const ki = DB.all('kitchen_indents').filter(k=>k.date===today()&&k.status==='approved');
       html=`<table><thead><tr><th>Indent No</th><th>Kitchen</th><th>Item</th><th class="r">Qty</th><th>Unit</th><th class="r">Value</th></tr></thead><tbody>`;
-      ki.forEach(k=>{ (k.items||[]).forEach(it=>{ const item=items.find(i=>i._id===it.item_id); html+=`<tr><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:10px;">${k.indent_no||k._id}</td><td>${k.kitchen}</td><td>${it.name||item?.name||it.item_id}</td><td class="r">${fmtQ(it.issued||it.qty||0,item?.unit)}</td><td>${item?.unit||''}</td><td class="r">${fmt((it.issued||it.qty||0)*(item?.purchase_price||0))}</td></tr>`; }); });
+      ki.forEach(k=>{ (k.items||[]).forEach(it=>{ const item=items.find(i=>i._id===it.item_id); html+=`<tr><td style="font-family:'JetBrains Mono','Noto Sans',monospace;font-size:10px;">${k.indent_no||k._id}</td><td>${k.kitchen}</td><td>${it.name||bnxItemDisplayName(item,it.item_id)}</td><td class="r">${fmtQ(it.issued||it.qty||0,item?.unit)}</td><td>${item?.unit||''}</td><td class="r">${fmt((it.issued||it.qty||0)*(item?.purchase_price||0))}</td></tr>`; }); });
       if(!ki.length) html+=`<tr><td colspan="6" class="tbl-empty">No kitchen indents today</td></tr>`;
       html+=`</tbody></table>`;
 
@@ -11165,7 +11248,7 @@ function showKPIDetail(type) {
       t='🍺 Bar Consumption — Today';
       const bi = DB.all('bar_indents').filter(b=>b.date===today());
       html=`<table><thead><tr><th>Date</th><th>Shift</th><th>Item</th><th class="r">Qty</th><th>Unit</th><th class="r">Value</th></tr></thead><tbody>`;
-      bi.forEach(b=>{ (b.items||[]).forEach(it=>{ const item=items.find(i=>i._id===it.item_id); html+=`<tr><td>${b.date}</td><td>${b.shift||'—'}</td><td>${it.name||item?.name||it.item_id}</td><td class="r">${fmtQ(it.issued||it.qty||0,item?.unit)}</td><td>${item?.unit||''}</td><td class="r">${fmt((it.issued||it.qty||0)*(item?.purchase_price||0))}</td></tr>`; }); });
+      bi.forEach(b=>{ (b.items||[]).forEach(it=>{ const item=items.find(i=>i._id===it.item_id); html+=`<tr><td>${b.date}</td><td>${b.shift||'—'}</td><td>${it.name||bnxItemDisplayName(item,it.item_id)}</td><td class="r">${fmtQ(it.issued||it.qty||0,item?.unit)}</td><td>${item?.unit||''}</td><td class="r">${fmt((it.issued||it.qty||0)*(item?.purchase_price||0))}</td></tr>`; }); });
       if(!bi.length) html+=`<tr><td colspan="6" class="tbl-empty">No bar consumption today</td></tr>`;
       html+=`</tbody></table>`;
 
@@ -13124,7 +13207,7 @@ window.exportCurrentExcel = function() {
     const rows = sl.map(s => {
       const item = items.find(i=>i._id===s.item_id);
       const wh = whs.find(w=>w._id===s.wh_id);
-      return [s.date, s.item_id, item?.name||s.item_id, item?.cat||'', item?.unit||'', fmt2(s.qty_in), fmt2(s.rate), fmt2(s.value), wh?.name||s.wh_id];
+      return [s.date, s.item_id, item?.name||'⚠️ Unknown Item', item?.cat||'', item?.unit||'', fmt2(s.qty_in), fmt2(s.rate), fmt2(s.value), wh?.name||s.wh_id];
     });
     downloadCSV(headers, rows, 'opening_stock');
     return;
@@ -13161,7 +13244,7 @@ window.exportCurrentExcel = function() {
     const rows = sl.map(s => {
       const item = items.find(i=>i._id===s.item_id);
       const wh = whs.find(w=>w._id===s.wh_id);
-      return [s.date, s.ref_id||'', item?.name||s.item_id, fmt2(s.qty_out||s.qty_in), wh?.name||s.wh_id, '—', fmt2(s.value)];
+      return [s.date, s.ref_id||'', item?.name||'⚠️ Unknown Item ('+s.item_id+')', fmt2(s.qty_out||s.qty_in), wh?.name||s.wh_id, '—', fmt2(s.value)];
     });
     downloadCSV(headers, rows, 'transfer_register');
     return;
