@@ -4543,6 +4543,40 @@ async function pullAllFromBackend(silent=true){
         if(_pendingPushTables.has(table)) return; // this device's own push hasn't landed yet — skip this cycle
         DB.set(CID+'_'+table, _mergePulledTable(table, rows));
       });
+      // FIX ("already vendor have but not show" — Aug 2026): DB.all
+      // ('vendors') used to be fed ONLY by the generic SYNC_vendors
+      // sheet above — a store that was empty because nothing had ever
+      // pushed a vendor into it under that name. The real, populated
+      // vendor list (183 real rows) lives in MASTER_DB.VENDOR_MASTER,
+      // the exact same sheet purchase-module.html already reads —
+      // pull from there too now, mapped into this table's local shape
+      // by VendorMasterBridge.gs (GET_VENDORS).
+      // FIX v2 ("problems" — flicker video, Aug 2026): this used to
+      // run on EVERY pull, including the silent 4s background poll —
+      // stacking a third sequential network round-trip (183-row
+      // VENDOR_MASTER read) onto every single poll cycle, which is
+      // most of why loadKitchenHistory()'s "Loading…" flash got so
+      // much longer right after this was added (confirmed from the
+      // screen recording). Vendor master data doesn't need 4-second
+      // freshness — it changes rarely, and saveVendor() (below) now
+      // pushes any change straight to VENDOR_MASTER immediately
+      // anyway, not on a timer. Only pull it on a genuinely
+      // non-silent pull (initial page load, or the manual 🔄 Sync
+      // button) — background polls skip this entirely now.
+      if(!silent && !_pendingPushTables.has('vendors')){
+        try{
+          const vr = await erpApi('GET_VENDORS', {});
+          if(vr && vr.success && vr.data && Array.isArray(vr.data.vendors)){
+            // Keep opening_bal from whatever's already local — VENDOR_MASTER
+            // has no such column (see VendorMasterBridge.gs's own comment),
+            // so an opening balance entered elsewhere in this app must not
+            // be zeroed out just because this pull ran.
+            const oldById={}; DB.all('vendors').forEach(v=>{ if(v&&v._id) oldById[v._id]=v; });
+            const merged = vr.data.vendors.map(v=>({ ...v, opening_bal: (oldById[v._id]?.opening_bal) ?? 0 }));
+            DB.set(CID+'_vendors', merged);
+          }
+        }catch(e){ console.warn('[LiveSync] GET_VENDORS pull failed:',e); }
+      }
       // FIX ("no local save — all Google Sheet"): if another
       // device changed the client's industry mode since this
       // device last synced, apply it here too instead of leaving
@@ -4617,7 +4651,7 @@ function renderAllVisiblePanels(){
     // rewrites the page title, every single 8s background poll. A background
     // data refresh should only refresh data. See refreshPanelData()'s own
     // header comment (next to showP()) for the full symptom this caused.
-    else if(activeId) refreshPanelData(activeId);
+    else if(activeId) refreshPanelData(activeId, true); // true = background poll, don't flash Loading
   }catch(e){}
 }
 function updateLiveSyncBadge(kind){
@@ -5820,7 +5854,7 @@ async function showP(id, navEl) {
 // showP() (real navigation -- should close the sidebar, that's correct there)
 // and renderAllVisiblePanels() (background refresh -- should NOT touch
 // navigation UI at all) can each call only what they actually need.
-function refreshPanelData(id) {
+function refreshPanelData(id, silent) {
   if(id==='dashboard') loadDashboard();
   else if(id==='ledger-rep') loadLedgerReport();
   else if(id==='purchase-reg') loadPurchaseRegister();
@@ -5828,7 +5862,7 @@ function refreshPanelData(id) {
   else if(id==='stock') { loadStockView(); }
   else if(id==='stock-levels') { loadStockView(); setTimeout(()=>filterStockLevels('all'),100); }
   else if(id==='warehouse') loadWarehouseCards();
-  else if(id==='kitchen-ind') loadKitchenHistory();
+  else if(id==='kitchen-ind') loadKitchenHistory(silent);
   else if(id==='bar-ord') loadBarIndentHistory();
   else if(id==='pay-advice') loadPaymentAdvice();
   else if(id==='phy') generatePhyCount();
@@ -6679,33 +6713,39 @@ function loadLedgerReport() {
 // once. The old two-button Approve/Issue flow was purely local-DB
 // fiction; only one "Issue" action exists for real, so that's all
 // that's offered here now.
-async function loadKitchenHistory(){
+async function loadKitchenHistory(silent){
   const body = document.getElementById('ki-history-body');
   if (!body) return;
-  body.innerHTML = '<tr><td colspan="6" class="tbl-empty">Loading…</td></tr>';
-  // FIX ("KITCHEN INDENT LOADING PROBLEMS" — Aug 2026): everything
-  // after the fetch used to run with no try/catch. If res.success was
-  // true but ANYTHING in the ordering/mapping/render step below threw
-  // — a bad DATE value, a malformed row shape from the sheet, an
-  // unexpected null — the function died mid-way and body.innerHTML
-  // was left frozen on this exact "Loading…" placeholder forever,
-  // with zero visible error anywhere (nothing logged if the throw
-  // happened inside the .map() callback). That silent-hang shape is
-  // exactly this symptom. Now wraps both the fetch and the render in
-  // their own try/catch so any failure — network OR render — always
-  // ends with a real, visible message in this table instead of an
-  // indefinite spinner, and logs the real error to console so it's
-  // actually diagnosable next time instead of just "stuck".
+  // FIX ("problems" — flicker video, Aug 2026): this used to blank the
+  // table to "Loading…" unconditionally on EVERY call — including the
+  // background live-sync poll, which calls this every ~4s via
+  // renderAllVisiblePanels()/refreshPanelData(). That meant a person
+  // just looking at this screen saw real data flash to "Loading…" and
+  // back roughly every 4 seconds, forever — confirmed directly from
+  // the screen-recording: data visible → blank "Loading…" for several
+  // seconds → data reappears, repeating. `silent` (passed from
+  // refreshPanelData/renderAllVisiblePanels for background polls, NOT
+  // passed — so falsy — from a real navigation or the manual 🔄
+  // Refresh click) skips the blank-out: on a silent background
+  // refresh, whatever's already on screen just stays there until the
+  // new data is ready to swap in, no intermediate blank frame. A real
+  // "loading" state is still shown on first-ever load or an explicit
+  // manual refresh, since silent is falsy there.
+  if (!silent) body.innerHTML = '<tr><td colspan="6" class="tbl-empty">Loading…</td></tr>';
   let res;
   try {
     res = await erpApi('GET_PENDING_INDENTS', {});
   } catch (fetchErr) {
     console.error('[loadKitchenHistory] fetch failed:', fetchErr);
-    body.innerHTML = '<tr><td colspan="6" class="tbl-empty">Could not reach server: ' + (fetchErr.message || fetchErr) + '</td></tr>';
+    // FIX (same session): a background poll hiccup should never wipe
+    // out perfectly good data already on screen — only show the error
+    // state for a real (non-silent) load, where there's nothing good
+    // on screen to lose anyway.
+    if (!silent) body.innerHTML = '<tr><td colspan="6" class="tbl-empty">Could not reach server: ' + (fetchErr.message || fetchErr) + '</td></tr>';
     return;
   }
   if (!res || !res.success) {
-    body.innerHTML = '<tr><td colspan="6" class="tbl-empty">Could not reach server' + (res && res.message ? ' — ' + res.message : ' — check connection') + '</td></tr>';
+    if (!silent) body.innerHTML = '<tr><td colspan="6" class="tbl-empty">Could not reach server' + (res && res.message ? ' — ' + res.message : ' — check connection') + '</td></tr>';
     return;
   }
   try {
@@ -6735,7 +6775,7 @@ async function loadKitchenHistory(){
     }).join('') : '<tr><td colspan="6" class="tbl-empty">No indents found</td></tr>';
   } catch (renderErr) {
     console.error('[loadKitchenHistory] render failed:', renderErr);
-    body.innerHTML = '<tr><td colspan="6" class="tbl-empty">Error displaying indents: ' + (renderErr.message || renderErr) + '</td></tr>';
+    if (!silent) body.innerHTML = '<tr><td colspan="6" class="tbl-empty">Error displaying indents: ' + (renderErr.message || renderErr) + '</td></tr>';
   }
 }
 // FIX ("delay and replay problem" — Aug 2026): issueKI() had no
@@ -7162,6 +7202,7 @@ function saveVendor(){
   if(!name){toast('Enter vendor name','e');return;}
   const rec={name,gstin:document.getElementById('vm-gstin').value,pan:document.getElementById('vm-pan').value,phone:document.getElementById('vm-phone').value,email:document.getElementById('vm-email').value,credit_days:parseInt(document.getElementById('vm-credit').value||30),credit_limit:parseFloat(document.getElementById('vm-limit').value||0),opening_bal:parseFloat(document.getElementById('vm-opening').value||0),bal_type:document.getElementById('vm-baltype').value,address:document.getElementById('vm-address').value};
   const editId=document.getElementById('modal-vendor').dataset.editId;
+  let savedId=editId;
   if(editId){
     DB.update('vendors',editId,rec);
   }else{
@@ -7180,7 +7221,20 @@ function saveVendor(){
       toast('Vendor "'+existing.name+'" already exists'+(gstinNorm?' with this GSTIN':'')+' — edit it instead of creating a new one','e');
       return;
     }
-    DB.insert('vendors',{_id:uid('V'),...rec});
+    savedId=uid('V');
+    DB.insert('vendors',{_id:savedId,...rec});
+  }
+  // FIX ("already vendor have but not show" — Aug 2026): DB.save('vendors',...)
+  // above only ever reaches the old, separate SYNC_vendors sheet — never
+  // the real VENDOR_MASTER purchase-module.html reads. Without this, a
+  // vendor added/edited here would look fine locally until the next
+  // GET_VENDORS pull silently overwrote it back to nothing (see that
+  // pull's own comment). This is what actually makes a new/edited vendor
+  // here show up in purchase-module.html too, and survive.
+  if(typeof erpApi==='function' && _hasRealSession()){
+    erpApi('SAVE_VENDOR', { vendor: { _id: savedId, name: rec.name, gstin: rec.gstin, pan: rec.pan, phone: rec.phone, email: rec.email, address: rec.address, credit_days: rec.credit_days } })
+      .then(r=>{ if(!r||!r.success) console.warn('[SAVE_VENDOR] failed:', r&&r.message); })
+      .catch(e=>console.warn('[SAVE_VENDOR] error:', e.message));
   }
   closeModal('modal-vendor');loadVendorBody();populateDropdowns();toast('Vendor saved ✓','s');
 }
