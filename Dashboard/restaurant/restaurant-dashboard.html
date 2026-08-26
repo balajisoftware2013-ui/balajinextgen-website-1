@@ -5673,149 +5673,17 @@ async function erpApi(payload, type='V2_AUTH'){
   }catch(e){ console.warn('[ERP API '+type+']',e.message); return {success:false,offline:true}; }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
-   OFFLINE-FIRST BILLING QUEUE — auto-inserted, browser-only.
-   Bills save to localStorage instantly and sync in the background
-   every 12s with retry, so a backend/network blip during service
-   never blocks or loses a bill. See BillQueue.saveBillOffline().
-
-   P0 FIX (external audit round 4, #2/#3/#4 — all three confirmed
-   real, all fixed together since they're the same subsystem):
-
-   #3 CLIENT ISOLATION: QUEUE_KEY used to be the single global literal
-   'bnx_bill_sync_queue' — not client-scoped at all. On a shared
-   device this was worse than the audit's "exposure" framing: because
-   flushQueue() reads CLIENT_ID fresh from the active session at SEND
-   time (via erpApi()), Client A's still-queued offline bill, still
-   sitting in this global key after Client A logged out, could get
-   silently submitted and billed to Client B's account the moment
-   Client B logged in and the 12s flush timer fired — real financial
-   cross-tenant corruption, not just a visibility leak. Now scoped to
-   'bnx_bill_sync_queue_<CLIENT_ID>', same pattern as every other
-   outbox in this file (bnx_outbox_<CLIENT_ID>).
-   #2 IDEMPOTENCY: each entry now carries its own requestId (reused
-   across retries of the same attempt, same convention as the shared
-   outbox) instead of relying on billData alone.
-   #4 FAILED STATE: a bill that exhausted MAX_RETRY used to stay
-   status:'pending' forever, console.error'd (invisible to any actual
-   user) while the badge kept confidently claiming "⏳ N bill(s)
-   syncing..." — actively misleading. Now moves to a real 'failed'
-   status with a separate red badge (tap to retry), matching the
-   PENDING/SYNCING/SYNCED/FAILED states the audit specifies.
-   ═══════════════════════════════════════════════════════════════════ */
-const BillQueue = (() => {
-  function queueKey(){ return 'bnx_bill_sync_queue_' + (CLIENT_ID || 'default'); }
-  const FLUSH_INTERVAL_MS = 12000;
-  const MAX_RETRY = 8;
-
-  function getQueue(){ try{ return JSON.parse(localStorage.getItem(queueKey()) || '[]'); }catch(e){ return []; } }
-  function setQueue(q){ localStorage.setItem(queueKey(), JSON.stringify(q)); }
-  function genLocalId(){ return 'LOCAL_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8); }
-
-  function ensureBadge(){
-    let badge = document.getElementById('billSyncBadge');
-    if (!badge) {
-      badge = document.createElement('div');
-      badge.id = 'billSyncBadge';
-      badge.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:99999;padding:8px 14px;border-radius:20px;font-size:12px;font-weight:600;color:#fff;background:#f59e0b;box-shadow:0 2px 8px rgba(0,0,0,.25);display:none;';
-      document.body.appendChild(badge);
-    }
-    return badge;
-  }
-  function ensureFailedBadge(){
-    let badge = document.getElementById('billFailedBadge');
-    if (!badge) {
-      badge = document.createElement('div');
-      badge.id = 'billFailedBadge';
-      badge.style.cssText = 'position:fixed;bottom:56px;right:16px;z-index:99999;padding:8px 14px;border-radius:20px;font-size:12px;font-weight:700;color:#fff;background:var(--red,#c0392b);box-shadow:0 2px 8px rgba(0,0,0,.25);display:none;cursor:pointer;';
-      badge.onclick = retryFailed;
-      document.body.appendChild(badge);
-    }
-    return badge;
-  }
-
-  function saveBillOffline(billData){
-    const localId = genLocalId();
-    const requestId = (typeof bnxUuid === 'function') ? bnxUuid() : localId;
-    const entry = { localId, requestId, clientId: CLIENT_ID, billData: Object.assign({}, billData, {localId, requestId}), status:'pending', attempts:0, error:null, queuedAt:new Date().toISOString() };
-    const q = getQueue(); q.push(entry); setQueue(q);
-    // Printing intentionally NOT auto-triggered here — each dashboard
-    // already has its own explicit print flow (printBill()/bmOpenPrintModal()
-    // in restaurant-dashboard.html, bmPrintBill() in manager-dashboard.html)
-    // called by the code that saved the bill. Auto-printing here caused a
-    // double-print on POS settle and an unwanted print on plain Save.
-    updateQueueBadge();
-    return { success:true, localId, message:'Saved locally, syncing...' };
-  }
-
-  async function flushQueue(){
-    // FIX (P0 — "make config load blocking"): SAVE_BILL retries are the
-    // highest-stakes GAS call in this whole boot sequence — a wrong/
-    // stale V2_CORE URL here means a bill that failed once could get
-    // silently retried against the wrong deployment forever. Gating
-    // inside the function itself (not just its DOMContentLoaded call
-    // site) protects all three callers at once: boot, the online event,
-    // and the periodic interval.
-    await window.__bnxConfigReady;
-    const q = getQueue();
-    const pending = q.filter(e => e.status==='pending' && e.attempts < MAX_RETRY);
-    if (pending.length === 0){ updateQueueBadge(); return; }
-    for (const entry of pending) {
-      try {
-        entry.attempts++;
-        const res = await erpApi({action:'SAVE_BILL', bill: entry.billData, requestId: entry.requestId}, 'V2_CORE');
-        if (res && (res.success || res.ok)) { entry.status='synced'; entry.syncedAt=new Date().toISOString(); entry.error=null; }
-        else { entry.error = (res && (res.message || res.error)) || 'Server rejected the bill'; }
-      } catch(err) {
-        entry.error = err.message;
-        console.warn('Bill sync retry failed for', entry.localId, err);
-      }
-      // P0 FIX (#4): mark FAILED the instant this attempt exhausts the
-      // retry budget, in the same pass — not left as 'pending' for the
-      // badge to keep misreporting as "syncing" indefinitely.
-      if (entry.status !== 'synced' && entry.attempts >= MAX_RETRY) {
-        entry.status = 'failed';
-      }
-    }
-    const now = Date.now();
-    const cleaned = q.filter(e => e.status!=='synced' || (now - new Date(e.syncedAt).getTime()) < 3600000);
-    setQueue(cleaned);
-    updateQueueBadge();
-  }
-
-  function retryFailed(){
-    const q = getQueue();
-    const failed = q.filter(e => e.status === 'failed');
-    if (!failed.length) return;
-    failed.forEach(e => { e.status='pending'; e.attempts=0; e.error=null; });
-    setQueue(q);
-    if (typeof showNotif === 'function') showNotif('Retrying '+failed.length+' failed bill(s)…', 'info');
-    updateQueueBadge();
-    flushQueue();
-  }
-
-  function updateQueueBadge(){
-    const q = getQueue();
-    const pendingCount = q.filter(e => e.status==='pending').length;
-    const badge = ensureBadge();
-    badge.textContent = pendingCount > 0 ? `⏳ ${pendingCount} bill(s) syncing...` : '';
-    badge.style.display = pendingCount > 0 ? 'inline-block' : 'none';
-    // P0 FIX (#4): a real, visible FAILED state instead of an
-    // eternally-"syncing" badge + a console.error nobody on the floor
-    // will ever see. Tap the badge to retry.
-    const failedCount = q.filter(e => e.status==='failed').length;
-    const failedBadge = ensureFailedBadge();
-    failedBadge.textContent = failedCount > 0 ? `🔴 ${failedCount} bill(s) failed to sync — tap to retry` : '';
-    failedBadge.style.display = failedCount > 0 ? 'inline-block' : 'none';
-  }
-
-  setInterval(flushQueue, FLUSH_INTERVAL_MS);
-  window.addEventListener('online', flushQueue);
-  document.addEventListener('DOMContentLoaded', flushQueue);
-
-  return { saveBillOffline, flushQueue, getQueue, updateQueueBadge, retryFailed };
-})();
-
+/* [P0 CLEANUP] Removed: dead 'BillQueue' offline-bill sync engine.
+   Confirmed via full-file search that BillQueue.saveBillOffline() —
+   its only entry point for actually queueing a bill — was never
+   called anywhere. It was pure dead code: a second, unused bill-sync
+   engine running an inert setInterval(flushQueue,12000) forever
+   against an always-empty queue. The real, live bill-save path is
+   bnxQueuePending()/bnxOutbox (used by settleOrder() and bmSaveBill()
+   below, and shared with SAVE_KOT/SAVE_ORDER/SAVE_TABLE_STATUS) —
+   now the single offline-retry engine for bills too, per the
+   'ONE synchronization engine' rule. No behavior change: nothing
+   ever depended on BillQueue actually running. */
 
 /* ── PAGE NAVIGATION ── */
 const PAGE_META = {
@@ -9946,8 +9814,7 @@ async function bmSaveBill(reprintAfter){
   // per-browser — two terminals settling at the same instant could
   // generate the same number), record it into the local Bill
   // Register, and show "✅ Bill Saved!" — ALL before SAVE_BILL was
-  // even attempted, which only ran afterward via BillQueue,
-  // fire-and-forget. Now: send first, let the server generate the
+  // even attempted, saved fire-and-forget only afterward. Now: send first, let the server generate the
   // authoritative bill number (LockService-protected — cannot
   // collide across terminals/devices), and only record/show success
   // once confirmed. Editing an already-saved bill keeps sending its
@@ -10581,7 +10448,7 @@ function bnxRecordBill(d){
   // few days, at which point localStorage.setItem() starts throwing and
   // NEW BILLS SILENTLY STOP SAVING. It also meant every save got slower
   // through the day, since the entire growing history was re-stringified
-  // every time. Bills already sync to the backend via BillQueue above
+  // every time. Bills already sync to the backend via bnxQueuePending/gasApi
   // (the real permanent record), so the local copy only needs to be a
   // fast, bounded "recent bills" cache — capped here at the most recent
   // 6000 (roughly 2 days at this volume), which comfortably fits well
