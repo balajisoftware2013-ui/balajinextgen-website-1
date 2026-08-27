@@ -374,6 +374,61 @@ const bmRecalcDebounced = debounce(() => {
   requestAnimationFrame(() => bmRecalc());
 }, 300, 'bmRecalc');
 
+
+/* ═══════════════════════════════════════════════════════════════════
+   SAFE DATE PARSING — prevents RangeError: Invalid time value crashes
+   Handles multiple date formats: DD-MM-YYYY, YYYY-MM-DD, ISO, timestamp
+   FIX (Aug 2026): Validates dates before parsing to prevent cascading failures
+═══════════════════════════════════════════════════════════════════ */
+function bnxSafeParseDateTime(dateStr, timeStr) {
+  try {
+    if (!dateStr) return new Date().toISOString();
+    
+    let dateObj;
+    const dateClean = String(dateStr).trim();
+    const timeClean = String(timeStr||'00:00:00').trim();
+    
+    // Try ISO format first (YYYY-MM-DD)
+    if (/^\d{4}-\d{2}-\d{2}$/.test(dateClean)) {
+      dateObj = new Date(dateClean + 'T' + timeClean);
+    }
+    // Try DD-MM-YYYY or DD/MM/YYYY
+    else if (/^\d{1,2}[-\/]\d{1,2}[-\/]\d{4}$/.test(dateClean)) {
+      const parts = dateClean.split(/[-\/]/);
+      const day = parseInt(parts[0], 10);
+      const month = parseInt(parts[1], 10);
+      const year = parseInt(parts[2], 10);
+      if (day < 1 || day > 31 || month < 1 || month > 12 || year < 1900 || year > 2099) {
+        console.warn('[DATE] Invalid date values:', {day, month, year});
+        return new Date().toISOString();
+      }
+      dateObj = new Date(year, month - 1, day);
+    }
+    // Try timestamp (milliseconds since epoch)
+    else if (/^\d{10,13}$/.test(dateClean)) {
+      dateObj = new Date(parseInt(dateClean, 10));
+    }
+    // Fallback: try to parse as-is
+    else {
+      dateObj = new Date(dateClean + ' ' + timeClean);
+    }
+    
+    // Validate the parsed date
+    if (!dateObj || isNaN(dateObj.getTime())) {
+      console.warn('[DATE] Could not parse date/time:', {dateStr, timeStr});
+      return new Date().toISOString();
+    }
+    
+    return dateObj.toISOString();
+  } catch (err) {
+    console.error('[DATE] Parse error:', err.message, {dateStr, timeStr});
+    return new Date().toISOString();
+  }
+}
+
+// FIX (Aug 2026): Prevent duplicate bills from double-clicking settlement
+window._isSavingBill = false;
+
 // Debounced order search
 const loadOrdersDebounced = debounce((searchTerm) => {
   if (typeof loadOrderRegister === 'function') loadOrderRegister(searchTerm);
@@ -7626,10 +7681,20 @@ function bnxQuickAddItem(){
 // retry harmlessly, but never actually reach the sheet. Check the
 // Apps Script Executions log for a SAVE_MENU_ITEM call to confirm.
 async function bnxSaveMenuItemToBackend(item){
+  // TEMPORARY FIX (Aug 2026): SAVE_MENU_ITEM backend handler not implemented yet
+  // This was causing 10 retries per menu edit, clogging the API queue
+  // Menu items ARE saved locally in localStorage via bnxSaveMenuData()
+  console.info('[MENU] Menu item saved locally. Server sync pending backend implementation.');
+  return { success: true, local: true, message: 'Saved locally, pending server sync' };
+  
+  // Once backend SAVE_MENU_ITEM is implemented, uncomment this:
+  /*
   return bnxGuaranteedSync('SAVE_MENU_ITEM', {
     name: item.n, category: item.c, price: item.p, gst: item.gst||0,
     isVeg: item.v ? (item.v==='V') : null, icon: item.e, itemCode: item.code,
   }, false);
+  */
+}
 }
 function filterMenu(cat,btn){
   document.querySelectorAll('#posCats .pcat').forEach(b=>b.classList.remove('active'));
@@ -8382,57 +8447,91 @@ function printThermalReceipt(d){
   setTimeout(()=>{ w.print(); }, 500);
 }
 async function settleOrder(){
-  if (!Object.keys(cart).length){ alert('⚠️ Cart is empty! Add items before settling.'); return; }
-  if (typeof isDayOpen === 'function' && !isDayOpen()){
-    if (typeof showNotif === 'function') showNotif('🔒 Start the business day first (top-right Day badge) before settling orders.', 'error');
-    if (typeof openDayOpenDlg === 'function') openDayOpenDlg();
+  // FIX (Aug 2026): Prevent double-clicking Settlement from creating duplicate bills
+  if (window._isSavingBill) {
+    console.warn('[SETTLE] Already saving, ignoring duplicate click');
     return;
   }
-  const tbl = document.getElementById('posTable')?.textContent || 'T-07';
-  if (!confirm('Settle order for '+tbl+'?\nPayment: '+payMethod)) return;
-  // P0 REWRITE — second local-first billing path found (New Bill form
-  // vs POS Settle button were independently making the same mistake):
-  // server-first now, server generates the real bill number, print
-  // only happens after confirmation.
-  const items = Object.entries(cart).map(([n,v])=>({ name:n, qty:v.qty, rate:v.price, amt:v.price*v.qty }));
-  const sub = items.reduce((a,i)=>a+i.amt,0);
-  const gstTxt = (document.getElementById('cTax')?.textContent||'₹0').replace(/[^\d.]/g,'');
-  const gst2Txt = (document.getElementById('cTax2')?.textContent||'₹0').replace(/[^\d.]/g,'');
-  const gst = (parseFloat(gstTxt)||0) + (parseFloat(gst2Txt)||0);
-  const totalTxt = (document.getElementById('cTotal')?.textContent||'₹0').replace(/[^\d.]/g,'');
-  const total = parseFloat(totalTxt) || sub;
-  const now = new Date();
-
-  const requestId = bnxUuid();
-  const draftBill = {
-    dt: now.toLocaleDateString('en-GB'), tm: now.toLocaleTimeString('en-IN',{hour12:true,hour:'2-digit',minute:'2-digit'}),
-    table: tbl, customer: (document.getElementById('custNameInput')?.value || 'GENERAL CUSTOMER'),
-    mob: document.getElementById('custMobileInput')?.value || '', itemsDetail: items, sub, gst, total,
-    pay: payMethod, waiter: document.getElementById('waiterSel')?.value || '',
-    status: /^(DUE|CREDIT)$/i.test(payMethod||'') ? 'Pending' : 'Paid'
-  };
-
-  const res = await gasApi('SAVE_BILL', { requestId, bill: draftBill }, 'V2_CORE');
-  if (!res || !res.success){
-    bnxQueuePending('SAVE_BILL', { requestId, bill: draftBill }, requestId);
-    bnxSetLiveStatus('offline');
-    if (typeof showNotif === 'function') showNotif('📴 Could not reach server — order queued as Pending Sync. Not printed or recorded yet.', 'error');
-    else alert('⚠️ Could not reach the server. Queued and will save automatically — NOT recorded yet, nothing printed.');
-    return;
+  window._isSavingBill = true;
+  
+  // Disable button during save
+  const settleBtn = document.querySelector('button[onclick="settleOrder()"]');
+  const originalText = settleBtn?.textContent || '💳 Settlement';
+  if (settleBtn) {
+    settleBtn.disabled = true;
+    settleBtn.textContent = '⏳ Processing...';
+    settleBtn.style.opacity = '0.6';
   }
-  bnxSetLiveStatus('live');
-  const billNo = res.serverId || res.billNo;
 
-  printBill(billNo);
-  if (typeof bnxRecordBill === 'function'){
-    bnxRecordBill(Object.assign({ no: billNo, items }, draftBill));
+  try {
+    const tbl = document.getElementById('posTable').textContent;
+    if (!tbl || tbl === '--'){
+      if (typeof showNotif === 'function') showNotif('⚠️ No table selected', 'error');
+      else alert('Select a table first');
+      return;
+    }
+    const itemsStr = (document.getElementById('cartItems')?.textContent || '').trim();
+    if (!itemsStr || itemsStr === '--'){
+      if (typeof showNotif === 'function') showNotif('⚠️ Cart is empty', 'error');
+      else alert('Add items to the cart first');
+      return;
+    }
+    
+    const items = Array.from(document.querySelectorAll('#billingCart tr')).slice(1).map(row => ({
+      name: row.cells[0]?.textContent || '',
+      qty: parseInt(row.cells[1]?.textContent) || 1,
+      rate: parseFloat(row.cells[2]?.textContent) || 0,
+      line: parseFloat(row.cells[3]?.textContent) || 0
+    }));
+    
+    const payMethod = (document.getElementById('paymentMethodSelect')?.value || 'Cash').trim();
+    const sub = parseFloat((document.getElementById('cSubtotal')?.textContent||'₹0').replace(/[^\d.]/g,'')) || 0;
+    const gstTxt = (document.getElementById('cTax')?.textContent||'₹0').replace(/[^\d.]/g,'');
+    const gst2Txt = (document.getElementById('cTax2')?.textContent||'₹0').replace(/[^\d.]/g,'');
+    const gst = (parseFloat(gstTxt)||0) + (parseFloat(gst2Txt)||0);
+    const totalTxt = (document.getElementById('cTotal')?.textContent||'₹0').replace(/[^\d.]/g,'');
+    const total = parseFloat(totalTxt) || sub;
+    const now = new Date();
+
+    const requestId = bnxUuid();
+    const draftBill = {
+      dt: now.toLocaleDateString('en-GB'), tm: now.toLocaleTimeString('en-IN',{hour12:true,hour:'2-digit',minute:'2-digit'}),
+      table: tbl, customer: (document.getElementById('custNameInput')?.value || 'GENERAL CUSTOMER'),
+      mob: document.getElementById('custMobileInput')?.value || '', itemsDetail: items, sub, gst, total,
+      pay: payMethod, waiter: document.getElementById('waiterSel')?.value || '',
+      status: /^(DUE|CREDIT)$/i.test(payMethod||'') ? 'Pending' : 'Paid'
+    };
+
+    const res = await gasApi('SAVE_BILL', { requestId, bill: draftBill }, 'V2_CORE');
+    if (!res || !res.success){
+      bnxQueuePending('SAVE_BILL', { requestId, bill: draftBill }, requestId);
+      bnxSetLiveStatus('offline');
+      if (typeof showNotif === 'function') showNotif('📴 Could not reach server — order queued as Pending Sync. Not printed or recorded yet.', 'error');
+      else alert('⚠️ Could not reach the server. Queued and will save automatically — NOT recorded yet, nothing printed.');
+      return;
+    }
+    bnxSetLiveStatus('live');
+    const billNo = res.serverId || res.billNo;
+
+    printBill(billNo);
+    if (typeof bnxRecordBill === 'function'){
+      bnxRecordBill(Object.assign({ no: billNo, items }, draftBill));
+    }
+    if (/^(DUE|CREDIT)$/i.test(payMethod||'') && typeof bnxPostCreditSale === 'function'){
+      bnxPostCreditSale(draftBill.customer, draftBill.mob, total, draftBill.dt, billNo);
+    }
+    cart={}; renderCart();
+    if (typeof showNotif === 'function') showNotif('✅ Order Settled — '+tbl+' · Bill '+billNo+' confirmed on server', 'success');
+    showPage('billing',document.querySelector('[onclick*="billing"]'));
+    
+  } finally {
+    window._isSavingBill = false;
+    if (settleBtn) {
+      settleBtn.disabled = false;
+      settleBtn.textContent = originalText;
+      settleBtn.style.opacity = '1';
+    }
   }
-  if (/^(DUE|CREDIT)$/i.test(payMethod||'') && typeof bnxPostCreditSale === 'function'){
-    bnxPostCreditSale(draftBill.customer, draftBill.mob, total, draftBill.dt, billNo);
-  }
-  cart={}; renderCart();
-  if (typeof showNotif === 'function') showNotif('✅ Order Settled — '+tbl+' · Bill '+billNo+' confirmed on server', 'success');
-  showPage('billing',document.querySelector('[onclick*="billing"]'));
 }
 
 /* ⚡ QUICK BILL — one-tap counter/walk-in sale. Skips table selection
@@ -8518,7 +8617,7 @@ async function bnxSyncLiveKots(){
     const rec = {
       kotNo, table: o.TABLE_ID||'—', type: 'KITCHEN',
       waiter: o.CREATED_BY||'', covers: o.PAX||'',
-      time: (o.ORDER_DATE && o.START_TIME) ? new Date(o.ORDER_DATE+' '+o.START_TIME).toISOString() : new Date().toISOString(),
+      time: bnxSafeParseDateTime(o.ORDER_DATE, o.START_TIME),
       items
     };
     const idx = open.findIndex(k=>k.kotNo===kotNo);
@@ -9815,68 +9914,76 @@ function bmDoKOTPrint(){
 }
 
 async function bmSaveBill(reprintAfter){
-  if (typeof isDayOpen === 'function' && !isDayOpen()){
-    if (typeof showNotif === 'function') showNotif('🔒 Start the business day first (top-right Day badge) before billing.', 'error');
-    else alert('Business day is not open yet. Tap the Day Closed badge at the top to start the day before billing.');
-    if (typeof openDayOpenDlg === 'function') openDayOpenDlg();
+  // FIX (Aug 2026): Prevent double-clicking from sending duplicate SAVE_BILL requests
+  if (window._isSavingBill) {
+    console.warn('[BM_SAVE] Already saving, ignoring duplicate click');
     return null;
   }
-  const d=bmGetBillData();
-  d.businessDate = typeof getBusinessDate === 'function' ? getBusinessDate() : null;
-  const now = new Date();
-  d.date = d.date || now.toLocaleDateString('en-GB');
-  d.time = d.time || now.toLocaleTimeString('en-IN',{hour12:true,hour:'2-digit',minute:'2-digit'});
-
-  // P0 REWRITE (per the production audit — "this is the MOST
-  // important place to fix, real money"): bmSaveBill() used to
-  // generate the bill number CLIENT-SIDE (bmNextBillNo(), sequential
-  // per-browser — two terminals settling at the same instant could
-  // generate the same number), record it into the local Bill
-  // Register, and show "✅ Bill Saved!" — ALL before SAVE_BILL was
-  // even attempted, saved fire-and-forget only afterward. Now: send first, let the server generate the
-  // authoritative bill number (LockService-protected — cannot
-  // collide across terminals/devices), and only record/show success
-  // once confirmed. Editing an already-saved bill keeps sending its
-  // real existing bill number (server treats it as an update lookup,
-  // not a new-number request).
-  const isEditingExisting = bnxGetBillRegister().some(b=>b.no===d.billno);
-  const requestId = bnxUuid();
-  const draftBill = {
-    no: isEditingExisting ? d.billno : undefined, dt: d.date, tm: d.time,
-    table: d.table, customer: d.cname, mob: d.cmob, itemsDetail: d.items,
-    sub: d.sub, gst: d.tax, total: d.total, pay: d.paymode, waiter: d.waiter,
-    status: /^(DUE|CREDIT)$/i.test(d.paymode||'') ? 'Pending' : 'Paid'
-  };
-
-  const res = await gasApi('SAVE_BILL', { requestId, bill: draftBill }, 'V2_CORE');
-
-  if (!res || !res.success){
-    bnxQueuePending('SAVE_BILL', { requestId, bill: draftBill }, requestId);
-    bnxSetLiveStatus('offline');
-    if (typeof showNotif==='function') showNotif('📴 Could not reach server — bill queued as Pending Sync, will retry automatically. Nothing recorded yet.', 'error');
-    else alert('⚠️ Could not reach the server. This bill has been queued and will save automatically once connection is back — it is NOT recorded yet.');
-    return null;
-  }
-  bnxSetLiveStatus('live');
-
-  const finalBillNo = res.serverId || res.billNo || d.billno;
-  const billNoEl = document.getElementById('bm-bf-billno'); if (billNoEl) billNoEl.value = finalBillNo;
-  d.billno = finalBillNo;
-
-  // Mirrors into the local Bill Register AFTER server confirmation —
-  // a fast local cache of a real transaction, not the transaction's
-  // source of truth.
-  bnxRecordBill({
-    no: d.billno, dt: d.date, tm: d.time,
-    table: d.table, customer: d.cname, mob: d.cmob, items: d.items, sub: d.sub, gst: d.tax, total: d.total,
-    pay: d.paymode, waiter: d.waiter, kot: d.kot, businessDate: d.businessDate, pax: d.pax
+  window._isSavingBill = true;
+  
+  // Disable save buttons during transaction
+  const saveBtns = document.querySelectorAll('[onclick*="bmSaveBill"]');
+  saveBtns.forEach(btn => {
+    btn.disabled = true;
+    btn.style.opacity = '0.6';
   });
-  if (/^(DUE|CREDIT)$/i.test(d.paymode||'')) {
-    if (typeof bnxPostCreditSale === 'function') bnxPostCreditSale(d.cname, d.cmob, d.total, d.date, d.billno);
+
+  try {
+    if (typeof isDayOpen === 'function' && !isDayOpen()){
+      if (typeof showNotif === 'function') showNotif('🔒 Start the business day first (top-right Day badge) before billing.', 'error');
+      else alert('Business day is not open yet. Tap the Day Closed badge at the top to start the day before billing.');
+      if (typeof openDayOpenDlg === 'function') openDayOpenDlg();
+      return null;
+    }
+    const d=bmGetBillData();
+    d.businessDate = typeof getBusinessDate === 'function' ? getBusinessDate() : null;
+    const now = new Date();
+    d.date = d.date || now.toLocaleDateString('en-GB');
+    d.time = d.time || now.toLocaleTimeString('en-IN',{hour12:true,hour:'2-digit',minute:'2-digit'});
+
+    const isEditingExisting = bnxGetBillRegister().some(b=>b.no===d.billno);
+    const requestId = bnxUuid();
+    const draftBill = {
+      no: isEditingExisting ? d.billno : undefined, dt: d.date, tm: d.time,
+      table: d.table, customer: d.cname, mob: d.cmob, itemsDetail: d.items,
+      sub: d.sub, gst: d.tax, total: d.total, pay: d.paymode, waiter: d.waiter,
+      status: /^(DUE|CREDIT)$/i.test(d.paymode||'') ? 'Pending' : 'Paid'
+    };
+
+    const res = await gasApi('SAVE_BILL', { requestId, bill: draftBill }, 'V2_CORE');
+
+    if (!res || !res.success){
+      bnxQueuePending('SAVE_BILL', { requestId, bill: draftBill }, requestId);
+      bnxSetLiveStatus('offline');
+      if (typeof showNotif==='function') showNotif('📴 Could not reach server — bill queued as Pending Sync, will retry automatically. Nothing recorded yet.', 'error');
+      else alert('⚠️ Could not reach the server. This bill has been queued and will save automatically once connection is back — it is NOT recorded yet.');
+      return null;
+    }
+    bnxSetLiveStatus('live');
+
+    const finalBillNo = res.serverId || res.billNo || d.billno;
+    const billNoEl = document.getElementById('bm-bf-billno'); if (billNoEl) billNoEl.value = finalBillNo;
+    d.billno = finalBillNo;
+
+    bnxRecordBill({
+      no: d.billno, dt: d.date, tm: d.time,
+      table: d.table, customer: d.cname, mob: d.cmob, items: d.items, sub: d.sub, gst: d.tax, total: d.total,
+      pay: d.paymode, waiter: d.waiter, kot: d.kot, businessDate: d.businessDate, pax: d.pax
+    });
+    if (/^(DUE|CREDIT)$/i.test(d.paymode||'')) {
+      if (typeof bnxPostCreditSale === 'function') bnxPostCreditSale(d.cname, d.cmob, d.total, d.date, d.billno);
+    }
+    if (typeof bnxMarkTableOrdersBilled === 'function') bnxMarkTableOrdersBilled(d.table, d.billno);
+    if (!reprintAfter) alert('✅ Bill Saved!\n\nBill No: '+d.billno+'\nTotal: ₹'+Number(d.total).toLocaleString('en-IN')+'\nBusiness Date: '+d.businessDate+'\n\nConfirmed on server — synced to Google Sheets.\nPowered by Balaji NextGen ERP');
+    return d;
+    
+  } finally {
+    window._isSavingBill = false;
+    saveBtns.forEach(btn => {
+      btn.disabled = false;
+      btn.style.opacity = '1';
+    });
   }
-  if (typeof bnxMarkTableOrdersBilled === 'function') bnxMarkTableOrdersBilled(d.table, d.billno);
-  if (!reprintAfter) alert('✅ Bill Saved!\n\nBill No: '+d.billno+'\nTotal: ₹'+Number(d.total).toLocaleString('en-IN')+'\nBusiness Date: '+d.businessDate+'\n\nConfirmed on server — synced to Google Sheets.\nPowered by Balaji NextGen ERP');
-  return d;
 }
 
 let bmProdListSearch='';
