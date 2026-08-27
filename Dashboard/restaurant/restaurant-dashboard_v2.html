@@ -374,95 +374,6 @@ const bmRecalcDebounced = debounce(() => {
   requestAnimationFrame(() => bmRecalc());
 }, 300, 'bmRecalc');
 
-
-/* ═══════════════════════════════════════════════════════════════════
-   SAFE DATE PARSING — prevents RangeError: Invalid time value crashes
-   Handles multiple date formats: DD-MM-YYYY, YYYY-MM-DD, ISO, timestamp
-   FIX (Aug 2026): Validates dates before parsing to prevent cascading failures
-═══════════════════════════════════════════════════════════════════ */
-function bnxSafeParseDateTime(dateStr, timeStr) {
-  try {
-    if (!dateStr) return new Date().toISOString();
-    
-    let dateObj;
-    const dateClean = String(dateStr).trim();
-    const timeClean = String(timeStr||'00:00:00').trim();
-
-    // FIX (Aug 2026): the backend (Google Sheets via Apps Script) doesn't
-    // actually send plain "YYYY-MM-DD" / "HH:MM:SS" strings — a pure-date
-    // cell serializes as a full ISO datetime (e.g. '2026-08-26T18:30:00.000Z',
-    // the UTC instant for local midnight), and a pure-time cell serializes
-    // as a full ISO datetime anchored to Sheets' time-only epoch marker
-    // '1899-12-30' (e.g. '1899-12-30T00:46:53.000Z' for 00:46:53). Neither
-    // of those matched the YYYY-MM-DD-only / DD-MM-YYYY / timestamp checks
-    // below, so EVERY row fell through to the last-resort string-concat
-    // branch and failed — flooding the console and silently replacing
-    // every order's real date/time with "now". Detect and handle this
-    // real shape first, before the older format checks (which are kept
-    // for any caller that really does pass plain date/time strings).
-    const isoWithTime = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
-    if (isoWithTime.test(dateClean)) {
-      const d = new Date(dateClean);
-      if (!isNaN(d.getTime())) {
-        // Calendar date the sheet intended, read in UTC (matches how the
-        // date-only cell was serialized — no further timezone shifting).
-        const y = d.getUTCFullYear(), mo = d.getUTCMonth(), da = d.getUTCDate();
-        let hh = 0, mm = 0, ss = 0;
-        if (isoWithTime.test(timeClean)) {
-          // Time-only cell: ignore its (bogus 1899-12-30) date part, keep
-          // only the wall-clock time, read in UTC to match dateClean above.
-          const t = new Date(timeClean);
-          if (!isNaN(t.getTime())) { hh = t.getUTCHours(); mm = t.getUTCMinutes(); ss = t.getUTCSeconds(); }
-        } else {
-          const tParts = timeClean.split(':');
-          hh = parseInt(tParts[0], 10) || 0;
-          mm = parseInt(tParts[1], 10) || 0;
-          ss = parseInt(tParts[2], 10) || 0;
-        }
-        dateObj = new Date(Date.UTC(y, mo, da, hh, mm, ss));
-      }
-    }
-    // Try ISO format first (YYYY-MM-DD)
-    else if (/^\d{4}-\d{2}-\d{2}$/.test(dateClean)) {
-      dateObj = new Date(dateClean + 'T' + timeClean);
-    }
-    // Try DD-MM-YYYY or DD/MM/YYYY
-    else if (/^\d{1,2}[-\/]\d{1,2}[-\/]\d{4}$/.test(dateClean)) {
-      const parts = dateClean.split(/[-\/]/);
-      const day = parseInt(parts[0], 10);
-      const month = parseInt(parts[1], 10);
-      const year = parseInt(parts[2], 10);
-      if (day < 1 || day > 31 || month < 1 || month > 12 || year < 1900 || year > 2099) {
-        console.warn('[DATE] Invalid date values:', {day, month, year});
-        return new Date().toISOString();
-      }
-      dateObj = new Date(year, month - 1, day);
-    }
-    // Try timestamp (milliseconds since epoch)
-    else if (/^\d{10,13}$/.test(dateClean)) {
-      dateObj = new Date(parseInt(dateClean, 10));
-    }
-    // Fallback: try to parse as-is
-    else {
-      dateObj = new Date(dateClean + ' ' + timeClean);
-    }
-    
-    // Validate the parsed date
-    if (!dateObj || isNaN(dateObj.getTime())) {
-      console.warn('[DATE] Could not parse date/time:', {dateStr, timeStr});
-      return new Date().toISOString();
-    }
-    
-    return dateObj.toISOString();
-  } catch (err) {
-    console.error('[DATE] Parse error:', err.message, {dateStr, timeStr});
-    return new Date().toISOString();
-  }
-}
-
-// FIX (Aug 2026): Prevent duplicate bills from double-clicking settlement
-window._isSavingBill = false;
-
 // Debounced order search
 const loadOrdersDebounced = debounce((searchTerm) => {
   if (typeof loadOrderRegister === 'function') loadOrderRegister(searchTerm);
@@ -512,39 +423,25 @@ setInterval(() => {
 <script>
 /* ── ERP Config Loader ──
    v31 FIX: replaced the old async multi-path dynamic script injector
-   with a plain blocking <script> tag — a normal blocking tag
-   guarantees erp-config.js has fully loaded and executed before any
-   later script on this page runs, so there's no async race to have.
-   The old dynamic-injection system (trying ./  then ../  then ../../)
-   existed to hedge against folder-depth uncertainty, but that
-   uncertainty is what introduced the race: dynamically-inserted
-   scripts load asynchronously regardless of onload/onerror handling,
-   so code below could run before erp-config.js had actually arrived.
-   v32 FIX: the path itself was also wrong — this file lives 2 folders
-   deep (Dashboard/restaurant/restaurant-dashboard.html, same depth
-   every other relative path here already assumes, e.g. the Auth
-   Gate's '../../login.html' below), but this tag only went up 1
-   level. Fixed to '../../erp-config.js' to actually reach the
-   root-level file. The Auth Gate below still keeps its own short-poll
-   safety net (waiting for ERP.getUser to be a real function) in case
-   this tag ever 404s in some future deployment, but the common case
-   now loads correctly with no race and no polling needed. */
+   with a plain blocking <script> tag, matching the exact approach
+   chef-dashboard.html already uses reliably (confirmed: same folder
+   depth, Dashboard/<module>/<file>.html, so "../erp-config.js" is the
+   correct, known path here too — chef-dashboard.html never had the
+   "works first login, not the 2nd" bug in the first place, precisely
+   BECAUSE a normal blocking script tag guarantees erp-config.js has
+   fully loaded and executed before any later script on this page runs
+   — there's no async race to have. The old dynamic-injection system
+   (trying ./  then ../  then ../../) existed to hedge against folder-
+   depth uncertainty, but that uncertainty is what introduced the race:
+   dynamically-inserted scripts load asynchronously regardless of
+   onload/onerror handling, so code below could run before erp-config.js
+   had actually arrived. The Auth Gate below still keeps its own
+   short-poll safety net (waiting for ERP.getUser to be a real function)
+   in case this tag ever 404s in some deployment, but the common case
+   now behaves exactly like chef-dashboard.html: no race, no polling
+   needed, works the same on login #1, #2, and every time after. */
 </script>
-<!-- FIX ("welcome -> POS opens dashboard but doesn't stay, bounces back
-     to welcome"): every other relative path in this file (see the
-     login-redirect and logout paths below, e.g. '../../login.html')
-     correctly treats this file as 2 folders deep from the site root
-     (Dashboard/restaurant/restaurant-dashboard.html). This script tag
-     was the one place still going up only 1 level, resolving to
-     '.../Dashboard/erp-config.js' instead of the real root-level
-     '.../erp-config.js' (confirmed by login.html, which loads it with
-     no prefix at all since it sits at the root next to erp-config.js).
-     That 404 silently starved the Auth Gate below of a working
-     ERP.getUser — its ~2s poll-and-fallback then routed to
-     login.html?auth_error=1, which — since the session itself was
-     still perfectly valid — immediately auto-forwarded back to
-     welcome.html. Two folders up is correct here. -->
-<script src="../../erp-config.js"></script>
+<script src="../erp-config.js"></script>
 <script>
 
 /* Restaurant Auth Gate */
@@ -557,20 +454,7 @@ setInterval(() => {
       const u=ERP.getUser();
       if(!u){ window.location.assign('../../login.html'); return; }
       const r=(u.ROLE||u.role||'').toUpperCase();
-      // FIX ("welcome -> POS opens dashboard but doesn't stay, bounces
-      // back to welcome"): this list was missing several roles that
-      // legitimately exist elsewhere in this app (erp-config.js's
-      // ROLE_DASHBOARD map and welcome.html's ROLE_INFO both define
-      // ACCOUNTANT, STORE_MANAGER, HR, SUPERVISOR, PARTTIME, and ACCT
-      // as real staff roles). A logged-in user with any of those roles
-      // had a perfectly valid session, but this whitelist rejected
-      // them anyway and redirected to login.html?denied=1 — which
-      // login.html doesn't even inspect; it just sees a still-valid
-      // session and silently auto-forwards back to welcome.html. That
-      // silent round trip is exactly what looked like "POS click just
-      // returns to welcome, no error shown." Now matches the full
-      // role set used across the rest of the suite.
-      const allowed=['SUPER_ADMIN','DEVELOPER','ADMIN','OWNER','MANAGER','CASHIER','WAITER','STEWARD','CAPTAIN','CHEF','KITCHEN','BAR','STAFF','MD','CEO','ACCOUNTANT','STORE_MANAGER','HR','SUPERVISOR','PARTTIME','ACCT'];
+      const allowed=['SUPER_ADMIN','DEVELOPER','ADMIN','OWNER','MANAGER','CASHIER','WAITER','STEWARD','CAPTAIN','CHEF','KITCHEN','BAR','STAFF','MD','CEO'];
       // P0 FIX (external audit #18 — "Authentication fallback is still
       // too permissive"): this used to be `else { showPage(); }` — ANY
       // session with an unrecognized/blank ROLE still got the full
@@ -5715,19 +5599,21 @@ const ERP_APIS = {
   V2_CORE:     'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec',
 };
 // FIX: ERP_KEYS was declared here AND in erp-config.js (loaded earlier on
-// the page via <script src="../../erp-config.js">). Both are plain scripts
+// the page via <script src="../erp-config.js">). Both are plain scripts
 // sharing one global scope, so two `const ERP_KEYS` declarations collide
-// as "Identifier 'ERP_KEYS' has already been declared" -- a real
+// as "Identifier 'ERP_KEYS' has already been declared" — a real
 // SyntaxError that aborts this entire script block, silently undefining
 // every function declared after this point (doLogout, setDashRange,
-// bnxGetBillRegister, getTaxConfig, and more -- this is what made the
-// page open but stop working). Removed the duplicate; erp-config.js's
-// copy is the one actually used (see the "Use global ERP from
-// erp-config.js" note right below, which already assumed this file
-// wouldn't redeclare it).
+// bnxGetBillRegister, getTaxConfig, and more — exactly what was reported
+// as broken). Removed the duplicate; erp-config.js's copy is the one
+// actually used (see the "Use global ERP from erp-config.js" note right
+// below, which already assumed this file wouldn't redeclare it).
 //
-// Same collision existed for ROLE_DASHBOARD under a different variable
-// name -- also removed for the same reason.
+// FIX #2 (found after the ERP_KEYS fix above didn't fully resolve the
+// bounce-back — a systematic check comparing every top-level `const` name
+// in both files, not just re-checking the one already fixed): ROLE_DASHBOARD
+// had the EXACT SAME collision, just a different variable name. Same
+// removal, same reasoning — erp-config.js's copy is the one used.
 /* Use global ERP from erp-config.js if available.
    FIX: "works locally, breaks on live site, role/client checks fail".
    Root cause: this used to be `if(typeof ERP==='undefined') var ERP = {...}`,
@@ -7747,19 +7633,10 @@ function bnxQuickAddItem(){
 // retry harmlessly, but never actually reach the sheet. Check the
 // Apps Script Executions log for a SAVE_MENU_ITEM call to confirm.
 async function bnxSaveMenuItemToBackend(item){
-  // TEMPORARY FIX (Aug 2026): SAVE_MENU_ITEM backend handler not implemented yet
-  // This was causing 10 retries per menu edit, clogging the API queue
-  // Menu items ARE saved locally in localStorage via bnxSaveMenuData()
-  console.info('[MENU] Menu item saved locally. Server sync pending backend implementation.');
-  return { success: true, local: true, message: 'Saved locally, pending server sync' };
-  
-  // Once backend SAVE_MENU_ITEM is implemented, uncomment this:
-  /*
   return bnxGuaranteedSync('SAVE_MENU_ITEM', {
     name: item.n, category: item.c, price: item.p, gst: item.gst||0,
     isVeg: item.v ? (item.v==='V') : null, icon: item.e, itemCode: item.code,
   }, false);
-  */
 }
 function filterMenu(cat,btn){
   document.querySelectorAll('#posCats .pcat').forEach(b=>b.classList.remove('active'));
@@ -8512,91 +8389,57 @@ function printThermalReceipt(d){
   setTimeout(()=>{ w.print(); }, 500);
 }
 async function settleOrder(){
-  // FIX (Aug 2026): Prevent double-clicking Settlement from creating duplicate bills
-  if (window._isSavingBill) {
-    console.warn('[SETTLE] Already saving, ignoring duplicate click');
+  if (!Object.keys(cart).length){ alert('⚠️ Cart is empty! Add items before settling.'); return; }
+  if (typeof isDayOpen === 'function' && !isDayOpen()){
+    if (typeof showNotif === 'function') showNotif('🔒 Start the business day first (top-right Day badge) before settling orders.', 'error');
+    if (typeof openDayOpenDlg === 'function') openDayOpenDlg();
     return;
   }
-  window._isSavingBill = true;
-  
-  // Disable button during save
-  const settleBtn = document.querySelector('button[onclick="settleOrder()"]');
-  const originalText = settleBtn?.textContent || '💳 Settlement';
-  if (settleBtn) {
-    settleBtn.disabled = true;
-    settleBtn.textContent = '⏳ Processing...';
-    settleBtn.style.opacity = '0.6';
+  const tbl = document.getElementById('posTable')?.textContent || 'T-07';
+  if (!confirm('Settle order for '+tbl+'?\nPayment: '+payMethod)) return;
+  // P0 REWRITE — second local-first billing path found (New Bill form
+  // vs POS Settle button were independently making the same mistake):
+  // server-first now, server generates the real bill number, print
+  // only happens after confirmation.
+  const items = Object.entries(cart).map(([n,v])=>({ name:n, qty:v.qty, rate:v.price, amt:v.price*v.qty }));
+  const sub = items.reduce((a,i)=>a+i.amt,0);
+  const gstTxt = (document.getElementById('cTax')?.textContent||'₹0').replace(/[^\d.]/g,'');
+  const gst2Txt = (document.getElementById('cTax2')?.textContent||'₹0').replace(/[^\d.]/g,'');
+  const gst = (parseFloat(gstTxt)||0) + (parseFloat(gst2Txt)||0);
+  const totalTxt = (document.getElementById('cTotal')?.textContent||'₹0').replace(/[^\d.]/g,'');
+  const total = parseFloat(totalTxt) || sub;
+  const now = new Date();
+
+  const requestId = bnxUuid();
+  const draftBill = {
+    dt: now.toLocaleDateString('en-GB'), tm: now.toLocaleTimeString('en-IN',{hour12:true,hour:'2-digit',minute:'2-digit'}),
+    table: tbl, customer: (document.getElementById('custNameInput')?.value || 'GENERAL CUSTOMER'),
+    mob: document.getElementById('custMobileInput')?.value || '', itemsDetail: items, sub, gst, total,
+    pay: payMethod, waiter: document.getElementById('waiterSel')?.value || '',
+    status: /^(DUE|CREDIT)$/i.test(payMethod||'') ? 'Pending' : 'Paid'
+  };
+
+  const res = await gasApi('SAVE_BILL', { requestId, bill: draftBill }, 'V2_CORE');
+  if (!res || !res.success){
+    bnxQueuePending('SAVE_BILL', { requestId, bill: draftBill }, requestId);
+    bnxSetLiveStatus('offline');
+    if (typeof showNotif === 'function') showNotif('📴 Could not reach server — order queued as Pending Sync. Not printed or recorded yet.', 'error');
+    else alert('⚠️ Could not reach the server. Queued and will save automatically — NOT recorded yet, nothing printed.');
+    return;
   }
+  bnxSetLiveStatus('live');
+  const billNo = res.serverId || res.billNo;
 
-  try {
-    const tbl = document.getElementById('posTable').textContent;
-    if (!tbl || tbl === '--'){
-      if (typeof showNotif === 'function') showNotif('⚠️ No table selected', 'error');
-      else alert('Select a table first');
-      return;
-    }
-    const itemsStr = (document.getElementById('cartItems')?.textContent || '').trim();
-    if (!itemsStr || itemsStr === '--'){
-      if (typeof showNotif === 'function') showNotif('⚠️ Cart is empty', 'error');
-      else alert('Add items to the cart first');
-      return;
-    }
-    
-    const items = Array.from(document.querySelectorAll('#billingCart tr')).slice(1).map(row => ({
-      name: row.cells[0]?.textContent || '',
-      qty: parseInt(row.cells[1]?.textContent) || 1,
-      rate: parseFloat(row.cells[2]?.textContent) || 0,
-      line: parseFloat(row.cells[3]?.textContent) || 0
-    }));
-    
-    const payMethod = (document.getElementById('paymentMethodSelect')?.value || 'Cash').trim();
-    const sub = parseFloat((document.getElementById('cSubtotal')?.textContent||'₹0').replace(/[^\d.]/g,'')) || 0;
-    const gstTxt = (document.getElementById('cTax')?.textContent||'₹0').replace(/[^\d.]/g,'');
-    const gst2Txt = (document.getElementById('cTax2')?.textContent||'₹0').replace(/[^\d.]/g,'');
-    const gst = (parseFloat(gstTxt)||0) + (parseFloat(gst2Txt)||0);
-    const totalTxt = (document.getElementById('cTotal')?.textContent||'₹0').replace(/[^\d.]/g,'');
-    const total = parseFloat(totalTxt) || sub;
-    const now = new Date();
-
-    const requestId = bnxUuid();
-    const draftBill = {
-      dt: now.toLocaleDateString('en-GB'), tm: now.toLocaleTimeString('en-IN',{hour12:true,hour:'2-digit',minute:'2-digit'}),
-      table: tbl, customer: (document.getElementById('custNameInput')?.value || 'GENERAL CUSTOMER'),
-      mob: document.getElementById('custMobileInput')?.value || '', itemsDetail: items, sub, gst, total,
-      pay: payMethod, waiter: document.getElementById('waiterSel')?.value || '',
-      status: /^(DUE|CREDIT)$/i.test(payMethod||'') ? 'Pending' : 'Paid'
-    };
-
-    const res = await gasApi('SAVE_BILL', { requestId, bill: draftBill }, 'V2_CORE');
-    if (!res || !res.success){
-      bnxQueuePending('SAVE_BILL', { requestId, bill: draftBill }, requestId);
-      bnxSetLiveStatus('offline');
-      if (typeof showNotif === 'function') showNotif('📴 Could not reach server — order queued as Pending Sync. Not printed or recorded yet.', 'error');
-      else alert('⚠️ Could not reach the server. Queued and will save automatically — NOT recorded yet, nothing printed.');
-      return;
-    }
-    bnxSetLiveStatus('live');
-    const billNo = res.serverId || res.billNo;
-
-    printBill(billNo);
-    if (typeof bnxRecordBill === 'function'){
-      bnxRecordBill(Object.assign({ no: billNo, items }, draftBill));
-    }
-    if (/^(DUE|CREDIT)$/i.test(payMethod||'') && typeof bnxPostCreditSale === 'function'){
-      bnxPostCreditSale(draftBill.customer, draftBill.mob, total, draftBill.dt, billNo);
-    }
-    cart={}; renderCart();
-    if (typeof showNotif === 'function') showNotif('✅ Order Settled — '+tbl+' · Bill '+billNo+' confirmed on server', 'success');
-    showPage('billing',document.querySelector('[onclick*="billing"]'));
-    
-  } finally {
-    window._isSavingBill = false;
-    if (settleBtn) {
-      settleBtn.disabled = false;
-      settleBtn.textContent = originalText;
-      settleBtn.style.opacity = '1';
-    }
+  printBill(billNo);
+  if (typeof bnxRecordBill === 'function'){
+    bnxRecordBill(Object.assign({ no: billNo, items }, draftBill));
   }
+  if (/^(DUE|CREDIT)$/i.test(payMethod||'') && typeof bnxPostCreditSale === 'function'){
+    bnxPostCreditSale(draftBill.customer, draftBill.mob, total, draftBill.dt, billNo);
+  }
+  cart={}; renderCart();
+  if (typeof showNotif === 'function') showNotif('✅ Order Settled — '+tbl+' · Bill '+billNo+' confirmed on server', 'success');
+  showPage('billing',document.querySelector('[onclick*="billing"]'));
 }
 
 /* ⚡ QUICK BILL — one-tap counter/walk-in sale. Skips table selection
@@ -8682,7 +8525,7 @@ async function bnxSyncLiveKots(){
     const rec = {
       kotNo, table: o.TABLE_ID||'—', type: 'KITCHEN',
       waiter: o.CREATED_BY||'', covers: o.PAX||'',
-      time: bnxSafeParseDateTime(o.ORDER_DATE, o.START_TIME),
+      time: (o.ORDER_DATE && o.START_TIME) ? new Date(o.ORDER_DATE+' '+o.START_TIME).toISOString() : new Date().toISOString(),
       items
     };
     const idx = open.findIndex(k=>k.kotNo===kotNo);
@@ -9979,76 +9822,68 @@ function bmDoKOTPrint(){
 }
 
 async function bmSaveBill(reprintAfter){
-  // FIX (Aug 2026): Prevent double-clicking from sending duplicate SAVE_BILL requests
-  if (window._isSavingBill) {
-    console.warn('[BM_SAVE] Already saving, ignoring duplicate click');
+  if (typeof isDayOpen === 'function' && !isDayOpen()){
+    if (typeof showNotif === 'function') showNotif('🔒 Start the business day first (top-right Day badge) before billing.', 'error');
+    else alert('Business day is not open yet. Tap the Day Closed badge at the top to start the day before billing.');
+    if (typeof openDayOpenDlg === 'function') openDayOpenDlg();
     return null;
   }
-  window._isSavingBill = true;
-  
-  // Disable save buttons during transaction
-  const saveBtns = document.querySelectorAll('[onclick*="bmSaveBill"]');
-  saveBtns.forEach(btn => {
-    btn.disabled = true;
-    btn.style.opacity = '0.6';
-  });
+  const d=bmGetBillData();
+  d.businessDate = typeof getBusinessDate === 'function' ? getBusinessDate() : null;
+  const now = new Date();
+  d.date = d.date || now.toLocaleDateString('en-GB');
+  d.time = d.time || now.toLocaleTimeString('en-IN',{hour12:true,hour:'2-digit',minute:'2-digit'});
 
-  try {
-    if (typeof isDayOpen === 'function' && !isDayOpen()){
-      if (typeof showNotif === 'function') showNotif('🔒 Start the business day first (top-right Day badge) before billing.', 'error');
-      else alert('Business day is not open yet. Tap the Day Closed badge at the top to start the day before billing.');
-      if (typeof openDayOpenDlg === 'function') openDayOpenDlg();
-      return null;
-    }
-    const d=bmGetBillData();
-    d.businessDate = typeof getBusinessDate === 'function' ? getBusinessDate() : null;
-    const now = new Date();
-    d.date = d.date || now.toLocaleDateString('en-GB');
-    d.time = d.time || now.toLocaleTimeString('en-IN',{hour12:true,hour:'2-digit',minute:'2-digit'});
+  // P0 REWRITE (per the production audit — "this is the MOST
+  // important place to fix, real money"): bmSaveBill() used to
+  // generate the bill number CLIENT-SIDE (bmNextBillNo(), sequential
+  // per-browser — two terminals settling at the same instant could
+  // generate the same number), record it into the local Bill
+  // Register, and show "✅ Bill Saved!" — ALL before SAVE_BILL was
+  // even attempted, saved fire-and-forget only afterward. Now: send first, let the server generate the
+  // authoritative bill number (LockService-protected — cannot
+  // collide across terminals/devices), and only record/show success
+  // once confirmed. Editing an already-saved bill keeps sending its
+  // real existing bill number (server treats it as an update lookup,
+  // not a new-number request).
+  const isEditingExisting = bnxGetBillRegister().some(b=>b.no===d.billno);
+  const requestId = bnxUuid();
+  const draftBill = {
+    no: isEditingExisting ? d.billno : undefined, dt: d.date, tm: d.time,
+    table: d.table, customer: d.cname, mob: d.cmob, itemsDetail: d.items,
+    sub: d.sub, gst: d.tax, total: d.total, pay: d.paymode, waiter: d.waiter,
+    status: /^(DUE|CREDIT)$/i.test(d.paymode||'') ? 'Pending' : 'Paid'
+  };
 
-    const isEditingExisting = bnxGetBillRegister().some(b=>b.no===d.billno);
-    const requestId = bnxUuid();
-    const draftBill = {
-      no: isEditingExisting ? d.billno : undefined, dt: d.date, tm: d.time,
-      table: d.table, customer: d.cname, mob: d.cmob, itemsDetail: d.items,
-      sub: d.sub, gst: d.tax, total: d.total, pay: d.paymode, waiter: d.waiter,
-      status: /^(DUE|CREDIT)$/i.test(d.paymode||'') ? 'Pending' : 'Paid'
-    };
+  const res = await gasApi('SAVE_BILL', { requestId, bill: draftBill }, 'V2_CORE');
 
-    const res = await gasApi('SAVE_BILL', { requestId, bill: draftBill }, 'V2_CORE');
-
-    if (!res || !res.success){
-      bnxQueuePending('SAVE_BILL', { requestId, bill: draftBill }, requestId);
-      bnxSetLiveStatus('offline');
-      if (typeof showNotif==='function') showNotif('📴 Could not reach server — bill queued as Pending Sync, will retry automatically. Nothing recorded yet.', 'error');
-      else alert('⚠️ Could not reach the server. This bill has been queued and will save automatically once connection is back — it is NOT recorded yet.');
-      return null;
-    }
-    bnxSetLiveStatus('live');
-
-    const finalBillNo = res.serverId || res.billNo || d.billno;
-    const billNoEl = document.getElementById('bm-bf-billno'); if (billNoEl) billNoEl.value = finalBillNo;
-    d.billno = finalBillNo;
-
-    bnxRecordBill({
-      no: d.billno, dt: d.date, tm: d.time,
-      table: d.table, customer: d.cname, mob: d.cmob, items: d.items, sub: d.sub, gst: d.tax, total: d.total,
-      pay: d.paymode, waiter: d.waiter, kot: d.kot, businessDate: d.businessDate, pax: d.pax
-    });
-    if (/^(DUE|CREDIT)$/i.test(d.paymode||'')) {
-      if (typeof bnxPostCreditSale === 'function') bnxPostCreditSale(d.cname, d.cmob, d.total, d.date, d.billno);
-    }
-    if (typeof bnxMarkTableOrdersBilled === 'function') bnxMarkTableOrdersBilled(d.table, d.billno);
-    if (!reprintAfter) alert('✅ Bill Saved!\n\nBill No: '+d.billno+'\nTotal: ₹'+Number(d.total).toLocaleString('en-IN')+'\nBusiness Date: '+d.businessDate+'\n\nConfirmed on server — synced to Google Sheets.\nPowered by Balaji NextGen ERP');
-    return d;
-    
-  } finally {
-    window._isSavingBill = false;
-    saveBtns.forEach(btn => {
-      btn.disabled = false;
-      btn.style.opacity = '1';
-    });
+  if (!res || !res.success){
+    bnxQueuePending('SAVE_BILL', { requestId, bill: draftBill }, requestId);
+    bnxSetLiveStatus('offline');
+    if (typeof showNotif==='function') showNotif('📴 Could not reach server — bill queued as Pending Sync, will retry automatically. Nothing recorded yet.', 'error');
+    else alert('⚠️ Could not reach the server. This bill has been queued and will save automatically once connection is back — it is NOT recorded yet.');
+    return null;
   }
+  bnxSetLiveStatus('live');
+
+  const finalBillNo = res.serverId || res.billNo || d.billno;
+  const billNoEl = document.getElementById('bm-bf-billno'); if (billNoEl) billNoEl.value = finalBillNo;
+  d.billno = finalBillNo;
+
+  // Mirrors into the local Bill Register AFTER server confirmation —
+  // a fast local cache of a real transaction, not the transaction's
+  // source of truth.
+  bnxRecordBill({
+    no: d.billno, dt: d.date, tm: d.time,
+    table: d.table, customer: d.cname, mob: d.cmob, items: d.items, sub: d.sub, gst: d.tax, total: d.total,
+    pay: d.paymode, waiter: d.waiter, kot: d.kot, businessDate: d.businessDate, pax: d.pax
+  });
+  if (/^(DUE|CREDIT)$/i.test(d.paymode||'')) {
+    if (typeof bnxPostCreditSale === 'function') bnxPostCreditSale(d.cname, d.cmob, d.total, d.date, d.billno);
+  }
+  if (typeof bnxMarkTableOrdersBilled === 'function') bnxMarkTableOrdersBilled(d.table, d.billno);
+  if (!reprintAfter) alert('✅ Bill Saved!\n\nBill No: '+d.billno+'\nTotal: ₹'+Number(d.total).toLocaleString('en-IN')+'\nBusiness Date: '+d.businessDate+'\n\nConfirmed on server — synced to Google Sheets.\nPowered by Balaji NextGen ERP');
+  return d;
 }
 
 let bmProdListSearch='';
