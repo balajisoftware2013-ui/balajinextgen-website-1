@@ -8186,7 +8186,7 @@ async function sendKOT(){
   // visible Pending Sync outbox billing uses — retried automatically —
   // instead of a bare console.warn that silently gave up.
   alert('✅ KOT Sent to Kitchen!\n\nTable: '+tbl+'\nWaiter: '+waiter+'\nItems: '+items.length+' items\n\nPowered by Balaji NextGen ERP');
-  printKOTSplit(tbl, waiter, covers, items);
+  printKOTSplit(tbl, waiter, covers, items, posOrderNo);
   cart={}; renderCart();
   document.getElementById('kotBadge').textContent=String((parseInt(document.getElementById('kotBadge').textContent)||0)+1);
   if (typeof buildKOT === 'function') buildKOT();
@@ -8208,7 +8208,7 @@ async function sendKOT(){
    carries the waiter, covers and full item list, and a status flag —
    that's what lets the KOT page and dashboard render the REAL ticket
    instead of a hardcoded demo list. */
-function bnxRecordKOT(table, type, waiter, covers, items){
+function bnxRecordKOT(table, type, waiter, covers, items, orderNo){
   // FIX ("NEXT ID" — closing the gap this comment used to flag):
   // sequence numbers now come from bnxNextKotSeq(), which pops from a
   // small BATCH of numbers pre-fetched from the server ahead of time
@@ -8227,8 +8227,16 @@ function bnxRecordKOT(table, type, waiter, covers, items){
   open.unshift(entry);
   if (open.length>100) open = open.slice(0,100);
   bnxSetOpenKotsRaw(JSON.stringify(open));
+  // FIX ("order no wrong"): used to hardcode orderId:kotNo here, so
+  // every station split invented its OWN "order" server-side under its
+  // own KOT number — one real order fragmented into 2-3 unrelated
+  // ORDER_MASTER rows, none of them carrying the real order number
+  // shown in the POS header. Callers that have a real order in flight
+  // (sendKOT via printKOTSplit) now pass it through as `orderNo`; only
+  // standalone/manual KOTs with no real order behind them (e.g. Bar
+  // Management's "add KOT" modal) fall back to the KOT's own number.
   const orderRequestId = bnxUuid();
-  const orderReq = {requestId:orderRequestId, orderId:kotNo, tableId:table, orderType:type, waiter:waiter||'', covers:covers||'', items:items||[]};
+  const orderReq = {requestId:orderRequestId, orderId:(orderNo||kotNo), tableId:table, orderType:type, waiter:waiter||'', covers:covers||'', items:items||[]};
   gasApi('SAVE_ORDER', orderReq, 'V2_CORE').then(res=>{
     if(!res || !res.success) bnxQueuePending('SAVE_ORDER', orderReq, orderRequestId);
   }).catch(()=>bnxQueuePending('SAVE_ORDER', orderReq, orderRequestId));
@@ -8247,11 +8255,21 @@ function bnxRecordKOT(table, type, waiter, covers, items){
    ticket (Kitchen and/or Bar) with that ticket's own items, so both
    show up as separate cards in the KOT list, each routed to its own
    printer type. */
-function printKOTSplit(table, waiter, covers, items){
+/* FIX ("order no wrong"): printKOTSplit used to call bnxRecordKOT()
+   with no order reference at all, so each station split (Kitchen/Bar/
+   Counter) fell back to using ITS OWN kot number as the ORDER_NUMBER it
+   sent to the server. One real dine-in order with both food and drinks
+   was silently exploding into 2-3 disconnected ORDER_MASTER rows —
+   "KOT-1041" and "BAR-1042" each showing up as their OWN separate
+   "order" in Order Register / Active Orders, instead of one order under
+   the real ticket number shown in the POS header (posOrderNo, e.g.
+   #ORD-1040). Now the real order number is threaded through from
+   sendKOT() so every split is recorded against the SAME order. */
+function printKOTSplit(table, waiter, covers, items, orderNo){
   // If Bar module is switched off (small cafe/tea shop setup), there's
   // no separate bar routing — everything just goes to one ticket.
   if (window.BAR_MODULE_ENABLED === false){
-    printOneKOT('KOT', table, waiter, covers, items, bnxRecordKOT(table,'KITCHEN',waiter,covers,items));
+    printOneKOT('KOT', table, waiter, covers, items, bnxRecordKOT(table,'KITCHEN',waiter,covers,items,orderNo));
     return;
   }
   const catByName = {};
@@ -8264,9 +8282,9 @@ function printKOTSplit(table, waiter, covers, items){
     else kitchenItems.push(i);
   });
 
-  if (kitchenItems.length) printOneKOT('KITCHEN KOT', table, waiter, covers, kitchenItems, bnxRecordKOT(table,'KITCHEN',waiter,covers,kitchenItems));
-  if (barItems.length) printOneKOT('BAR KOT', table, waiter, covers, barItems, bnxRecordKOT(table,'BAR',waiter,covers,barItems));
-  if (counterItems.length) printOneKOT('COUNTER KOT', table, waiter, covers, counterItems, bnxRecordKOT(table,'COUNTER',waiter,covers,counterItems));
+  if (kitchenItems.length) printOneKOT('KITCHEN KOT', table, waiter, covers, kitchenItems, bnxRecordKOT(table,'KITCHEN',waiter,covers,kitchenItems,orderNo));
+  if (barItems.length) printOneKOT('BAR KOT', table, waiter, covers, barItems, bnxRecordKOT(table,'BAR',waiter,covers,barItems,orderNo));
+  if (counterItems.length) printOneKOT('COUNTER KOT', table, waiter, covers, counterItems, bnxRecordKOT(table,'COUNTER',waiter,covers,counterItems,orderNo));
 }
 
 function printOneKOT(title, table, waiter, covers, items, kotNo){
@@ -16674,8 +16692,26 @@ function warmBillingCache() {
             usingDemoMenu = false;
           }
           bootRes.data.menu.forEach(row=>{
-            const existing = menuData.find(m=>m.n.toLowerCase()===String(row.name||'').toLowerCase());
-            if(!existing && row.name){
+            if (!row.name) return;
+            const existing = menuData.find(m=>m.n.toLowerCase()===String(row.name).toLowerCase());
+            // FIX ("kot load to bill rates not come"): this only ever
+            // ADDED brand-new items — an item that already existed
+            // locally (e.g. cached from before its real SELLING_RATE
+            // was set, or from the 0-priced demo array) never had its
+            // price refreshed, so it stayed stuck at ₹0 forever on that
+            // device no matter what the server had. Only the manual
+            // "Sync Menu" button (loadMenuData()) updated existing
+            // items — this automatic boot-time warm-up now does the
+            // same, so a correct backend price actually reaches the POS
+            // without staff having to know to hit Sync Menu first.
+            if (existing){
+              existing.p = Number(row.price) || existing.p;
+              existing.gst = Number(row.gst) || existing.gst || 0;
+              if (row.category && row.category !== 'Uncategorised'){
+                existing.c = row.category;
+                existing.e = row.icon || existing.e || (typeof bnxDefaultIcon==='function'?bnxDefaultIcon(row.category):'🍽');
+              }
+            } else {
               menuData.push({ n:row.name, p:Number(row.price)||0, c:row.category||'Uncategorised',
                 v:'NV', e:row.icon||(typeof bnxDefaultIcon==='function'?bnxDefaultIcon(row.category):'🍽'), fav:false,
                 code: row.id||('ITM'+Date.now().toString().slice(-6)), gst: Number(row.gst)||0 });
@@ -16704,7 +16740,17 @@ function warmBillingCache() {
           const name = row.name || row.ITEM_NAME || row.n; if(!name) return;
           const cat = row.category || row.CATEGORY || row.c || 'Uncategorised';
           const existing = menuData.find(m=>m.n.toLowerCase()===name.toLowerCase());
-          if(!existing){
+          // FIX ("kot load to bill rates not come"): same fix as the
+          // GET_BOOTSTRAP branch above — refresh price/gst/category on
+          // an item that's already cached, not just brand-new ones.
+          if(existing){
+            existing.p = parseFloat(row.price ?? row.PRICE ?? row.p) || existing.p;
+            existing.gst = parseFloat(row.gst ?? row.GST) || existing.gst || 0;
+            if (cat && cat !== 'Uncategorised'){
+              existing.c = cat;
+              existing.e = row.icon || row.e || existing.e || (typeof bnxDefaultIcon==='function'?bnxDefaultIcon(cat):'🍽');
+            }
+          } else {
             menuData.push({ n:name, p:parseFloat(row.price ?? row.PRICE ?? row.p)||0, c:cat,
               v:(row.veg||row.v||'NV'), e:row.icon||row.e||(typeof bnxDefaultIcon==='function'?bnxDefaultIcon(cat):'🍽'), fav:false,
               code: row.id||row.ITEM_ID||('ITM'+Date.now().toString().slice(-6)), gst: parseFloat(row.gst ?? row.GST)||0 });
