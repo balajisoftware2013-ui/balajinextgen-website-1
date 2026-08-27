@@ -688,27 +688,26 @@ async function erpAuthApi(payload)     { return erpApiRequest(payload, 'V2_AUTH'
       document.addEventListener(ev, _touch, { passive: true, capture: true });
     });
 
-    /* ── Browser close/tab close → clear session ── */
-    window.addEventListener('pagehide', function(e) {
-      if (!e.persisted) {
-        /* Not going into bfcache — actual close or navigation away */
-        _clearStorage();
-        const token = localStorage.getItem(ERP_KEYS.SESSION) || '';
-        if (token) {
-          try {
-            navigator.sendBeacon(_ERP_API_URL, new Blob(
-              [JSON.stringify({ action: 'LOGOUT', token, reason: 'browser_close' })],
-              { type: 'text/plain' }
-            ));
-          } catch(ex) {}
-        }
-      }
-    });
-
-    /* Fallback for browsers that don't support pagehide well */
-    window.addEventListener('beforeunload', function() {
-      _clearStorage();
-    });
+    /* FIX ("welcome -> POS opens dashboard but doesn't stay, bounces
+       back to welcome"): this used to clear the session on 'pagehide'
+       and unconditionally on 'beforeunload'. Both events fire on EVERY
+       normal page navigation within this app (welcome.html ->
+       restaurant-dashboard.html is a full page load via location.href,
+       same as every other module link), not just when the tab/browser
+       is actually closed — and merely having a beforeunload listener
+       attached disables the bfcache in most browsers, so pagehide's
+       `e.persisted` check was effectively always false anyway. Net
+       effect: clicking ANY nav link cleared ERP_USER/SESSION/ROLE/
+       CLIENT/EXPIRY from localStorage a split second before the next
+       page's Auth Gate checked it — so every page load looked
+       unauthenticated and bounced straight back to login/welcome.
+       Session lifetime is already correctly handled by two other
+       mechanisms that don't have this false-positive problem: the
+       15-minute idle-activity watcher right here in this same file,
+       and the time-based ERP_EXPIRY (2h SUPER_ADMIN / 8h others) set
+       in ERP.saveSession(). Real close-tab logout isn't reliably
+       distinguishable from navigation in browsers, so it's dropped
+       rather than patched. */
 
     /* also reset on API calls (user is clearly active) */
     var _origErp = window.erpApiRequest;
