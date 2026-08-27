@@ -510,33 +510,32 @@ setInterval(() => {
 
 </script>
 <script>
-/* ── ERP Config Loader (v34 FIX — depth-agnostic, no eval) ──
-   v33 tried to be depth-agnostic AND hedge against multiple possible
-   erp-config.js folders by loading it via a synchronous XHR and then
-   eval()'ing the response into global scope. That introduced a NEW
-   failure mode: many hosts (Netlify's default headers included) send
-   a Content-Security-Policy that blocks eval() outright. On such a
-   host every candidate would fail the eval() step silently (caught,
-   swallowed, tried again) even though the XHR itself succeeded and
-   the path was 100% correct — indistinguishable from the original
-   "doesn't load, bounces to welcome" symptom, just from a different
-   cause. Confirmed independently (two separate screenshots of the
-   actual deployed folder) that erp-config.js exists in exactly ONE
-   place: the site root, sibling to login.html.
-
-   Fix: keep the depth-agnostic path math (still correct no matter how
-   deep this file is deployed — no more guessing folder depth), but
-   load erp-config.js the normal way — a real <script src> tag — which
-   is never subject to eval-blocking CSP rules. Writing that tag via
-   document.write() during initial parse keeps it fully synchronous
-   and blocking, same as a static <script src> tag would be, so there
-   is still no async race with the Auth Gate below. */
+/* ── ERP Config Loader (v35 FIX — matches erp-config.js's own path logic) ──
+   v34 computed the path to erp-config.js by counting ALL folder
+   segments in the URL as "depth" — correct for a plain nested folder,
+   but erp-config.js itself (loaded from the real live site) ships its
+   own path helper, _erpLoginPage(), that instead anchors on a specific
+   list of KNOWN top-level folder names (Dashboard, Balaji_staff, demo,
+   layouts, Components) and computes depth from THAT marker — which is
+   the actual convention this whole codebase already relies on
+   (confirmed against the real erp-config.js the site uses). Using a
+   different algorithm here than erp-config.js uses internally for its
+   OWN links is exactly the kind of inconsistency that causes this
+   file to work in some deployments and not others. Fixed to use the
+   identical known-roots algorithm, so both files agree by
+   construction — not by coincidence of a particular folder depth. */
 (function(){
+  var KNOWN_ROOTS = ['Dashboard','Balaji_staff','demo','layouts','Components'];
   function bnxRootPath(file){
-    var parts = window.location.pathname.split('/').filter(Boolean);
-    parts.pop(); // drop the current filename, keep only folder segments
-    var prefix = parts.length ? new Array(parts.length + 1).join('../') : './';
-    return prefix + file;
+    var path = window.location.pathname.replace(/\/+$/,'');
+    var parts = path.split('/').filter(Boolean);
+    var depth = 0;
+    for (var i = parts.length - 1; i >= 0; i--){
+      if (KNOWN_ROOTS.indexOf(parts[i]) !== -1){ depth = parts.length - i; break; }
+      depth++;
+    }
+    if (depth <= 1) return file;
+    return new Array(depth).join('../') + file; // '../'.repeat(depth-1)
   }
   window.bnxRootPath = bnxRootPath; // reused below for login.html links
 
@@ -547,85 +546,51 @@ setInterval(() => {
 <script>
 
 
-/* Restaurant Auth Gate */
+/* Restaurant Auth Gate — v35 FIX: this used to reimplement its own
+   session check, role whitelist, and login-redirect path math by hand
+   — a second, parallel copy of exactly what erp-config.js's own
+   ERP.requireLogin() already does (and is the single source of truth
+   ROLE_DASHBOARD/allowed-roles logic actually lives in). Two
+   independent copies of the same "who's allowed in" logic WILL drift
+   out of sync over time (this file's role whitelist already had
+   already drifted once — see the removed FIX comment history below).
+   Now simply delegates to the real ERP.requireLogin(), which already
+   fails safe (denies + redirects to login on any missing/invalid
+   session) and already uses the correct, tested _erpLoginPage() path
+   logic internally. */
 (function(){
   function showPage(){ if(document.body) document.body.style.visibility='visible'; }
   if(document.readyState==='loading'){ document.addEventListener('DOMContentLoaded', showPage); }
   if(window.location.protocol==='file:'){ showPage(); return; }
+
+  var ALLOWED_ROLES=['SUPER_ADMIN','DEVELOPER','ADMIN','OWNER','MANAGER','CASHIER','WAITER','STEWARD','CAPTAIN','CHEF','KITCHEN','BAR','STAFF','MD','CEO','ACCOUNTANT','STORE_MANAGER','HR','SUPERVISOR','PARTTIME','ACCT'];
+
   function decide(){
     try{
-      const u=ERP.getUser();
-      if(!u){ window.location.assign(window.bnxRootPath('login.html')); return; }
-      const r=(u.ROLE||u.role||'').toUpperCase();
-      // FIX ("welcome -> POS opens dashboard but doesn't stay, bounces
-      // back to welcome"): this list was missing several roles that
-      // legitimately exist elsewhere in this app (erp-config.js's
-      // ROLE_DASHBOARD map and welcome.html's ROLE_INFO both define
-      // ACCOUNTANT, STORE_MANAGER, HR, SUPERVISOR, PARTTIME, and ACCT
-      // as real staff roles). A logged-in user with any of those roles
-      // had a perfectly valid session, but this whitelist rejected
-      // them anyway and redirected to login.html?denied=1 — which
-      // login.html doesn't even inspect; it just sees a still-valid
-      // session and silently auto-forwards back to welcome.html. That
-      // silent round trip is exactly what looked like "POS click just
-      // returns to welcome, no error shown." Now matches the full
-      // role set used across the rest of the suite.
-      const allowed=['SUPER_ADMIN','DEVELOPER','ADMIN','OWNER','MANAGER','CASHIER','WAITER','STEWARD','CAPTAIN','CHEF','KITCHEN','BAR','STAFF','MD','CEO','ACCOUNTANT','STORE_MANAGER','HR','SUPERVISOR','PARTTIME','ACCT'];
-      // P0 FIX (external audit #18 — "Authentication fallback is still
-      // too permissive"): this used to be `else { showPage(); }` — ANY
-      // session with an unrecognized/blank ROLE still got the full
-      // restaurant dashboard rendered. A valid session is not the same
-      // as an authorized role; showing the page here means "no valid
-      // role for this module" silently becomes "full access anyway".
-      // Backend permission checks (audit #19) remain the real
-      // authority for every sensitive action regardless of this gate —
-      // this only stops an unrecognized role from ever seeing the UI
-      // at all. Failing session/role checks now route to login with a
-      // reason flag instead of rendering the dashboard.
-      if(allowed.includes(r)){ showPage(); }
-      else { window.location.assign(window.bnxRootPath('login.html')+'?denied=1'); }
+      // ERP.requireLogin() itself redirects to login on no-session or
+      // disallowed role, and returns null in that case — so a falsy
+      // return here means it already handled the redirect for us.
+      var user = ERP.requireLogin(ALLOWED_ROLES);
+      if(user) showPage();
     }catch(e){
-      // P0 FIX (external audit round 3, #5 — "Authentication still has
-      // one fail-open path"): an unexpected error reading the session
-      // used to call showPage() — rendering the full dashboard with
-      // NO verified user, NO verified role, nothing. "Something broke
-      // while checking who you are" is not the same as "you're
-      // authorized"; the safe default on any auth-path error is deny,
-      // not allow. Security principle: authentication failure = deny
-      // access, never fall through to open.
       console.error('[Auth Gate] session check failed:', e);
-      window.location.assign(window.bnxRootPath('login.html')+'?auth_error=1');
+      var dest = (typeof _erpLoginPage==='function') ? _erpLoginPage() : (window.bnxRootPath?window.bnxRootPath('login.html'):'../login.html');
+      window.location.assign(dest + (dest.indexOf('?')===-1?'?auth_error=1':'&auth_error=1'));
     }
   }
-  // v28 FIX: "works on first login, POS/dashboard looks dead on the
-  // 2nd click" — this check used to fire as soon as `ERP` merely
-  // EXISTED, then call ERP.getUser() immediately. But erp-config.js
-  // loads asynchronously (see __patchERP below) and can still be
-  // mid-load/mid-patch at that moment — ERP can exist as an incomplete
-  // stub whose .getUser isn't wired up yet. Calling it then throws,
-  // the catch silently falls through to showPage() with NO user/client
-  // data ever loaded, which is exactly what "dashboard doesn't open"
-  // looks like from the outside. Poll briefly for ERP.getUser to
-  // actually be a real function before deciding, same pattern already
-  // used for window.__patchERP a few lines below.
+  // v28 FIX (kept): erp-config.js loads via a blocking <script src> tag
+  // now (see loader above), so by the time this block runs ERP should
+  // already be fully defined — but keep a short bounded poll as a
+  // safety net for any edge case (slow synchronous parse, etc.)
+  // rather than assuming it's always instantaneous.
   function check(){
     var attemptsLeft=100; // ~2s at 20ms, generous but bounded
     (function waitForErp(){
-      if(typeof ERP!=='undefined' && typeof ERP.getUser==='function'){ decide(); return; }
+      if(typeof ERP!=='undefined' && typeof ERP.requireLogin==='function'){ decide(); return; }
       if(--attemptsLeft<=0){
-        // P0 FIX (external audit round 3, #5 — same fail-open class as
-        // the catch() above): this used to call showPage() when
-        // erp-config.js never finished loading in time — e.g. a slow
-        // connection or a genuine 404 on that script tag, both real
-        // possibilities the surrounding comments already call out.
-        // That path opened the full dashboard having verified NOTHING
-        // — no session, no role, nothing — which is a worse hole than
-        // the try/catch case since it doesn't even require an error,
-        // just a slow network. Route to login instead; a real session
-        // logs back in instantly, an absent/expired one correctly
-        // can't get in this way.
-        console.error('[Auth Gate] ERP.getUser never became available — treating as unauthenticated');
-        window.location.assign(window.bnxRootPath('login.html')+'?auth_error=1');
+        console.error('[Auth Gate] ERP.requireLogin never became available — erp-config.js failed to load. Treating as unauthenticated.');
+        var dest = window.bnxRootPath?window.bnxRootPath('login.html'):'../login.html';
+        window.location.assign(dest+'?auth_error=1');
         return;
       }
       setTimeout(waitForErp,20);
