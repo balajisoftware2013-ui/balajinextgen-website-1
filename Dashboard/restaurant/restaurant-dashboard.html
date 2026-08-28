@@ -5926,7 +5926,7 @@ function showPage(id, el){
   // render — same "real data or honest empty state, never a fake stand-
   // in that behaves like real" rule already applied everywhere else.
   if(id==='bills-list'){ blRenderTable(); bnxPullBillsFromServer().then(()=>blRenderTable()); }
-  if(id==='due-collection'){ bnxLoadDueCollection(); }
+  if(id==='due-collection' || id==='customer-credit'){ bnxLoadDueCollection(); }
   if(id==='reports'){ backToReportsGallery(); renderReportsGallery(); }
   if(id==='accounts-ledger'){ backToAcctGallery(); renderAcctGallery(); }
 }
@@ -6250,53 +6250,36 @@ async function bnxResolveClientBrand(){
 async function loadRealDashboardData() {
   try {
     if (typeof CLIENT_ID === 'undefined' || !CLIENT_ID) return;
-    
-    const dashRes = await gasApi('getDashboard', { clientId: CLIENT_ID });
-    
-    if (dashRes && dashRes.success && dashRes.transactions && Array.isArray(dashRes.transactions)) {
-      const transactions = dashRes.transactions;
-      // FIX ("dashboard data fix" — Today's Overview showing static demo
-      // numbers): this only ever computed one figure (totalCash) and, in
-      // doing so, lumped EVERY non-credit transaction — UPI and card
-      // included — into "Cash in Hand", which is wrong on its own. Worse,
-      // the UPI Collection (#d-upi) and Bank/Card Collection (#d-bank)
-      // cards next to it were never touched by ANY function in this file —
-      // ₹27,400 and ₹20,000 were hardcoded directly in the HTML and sat
-      // there permanently, alongside Cash in Hand which at least updated.
-      // Same real `transactions` array already has t.payment per row, so
-      // splitting it correctly by mode costs nothing extra — one pass,
-      // three real numbers instead of one real + two frozen fakes.
-      let totalCash = 0, totalUpi = 0, totalBank = 0, totalCreditToday = 0;
-      transactions.forEach(t => {
-        try {
-          if (!t.date || !t.amount) return;
-          const amount = parseFloat(t.amount) || 0;
-          const paymentMode = (t.payment || '').toString().trim().toLowerCase();
-          if (paymentMode === 'credit' || paymentMode === 'due') { totalCreditToday += amount; }
-          else if (paymentMode === 'upi') { totalUpi += amount; }
-          else if (paymentMode === 'card' || paymentMode === 'bank' || paymentMode === 'debit card' || paymentMode === 'credit card') { totalBank += amount; }
-          else { totalCash += amount; } // cash, or anything not otherwise recognised
-        } catch(err) {
-          // Skip malformed transaction
-        }
-      });
-      
-      const setTxt = (id, val) => { const el=document.getElementById(id); if(el){ el.textContent = '₹'+Math.max(val,0).toLocaleString('en-IN'); el.dataset.bnxLive='1'; } };
-      setTxt('d-cash', totalCash);
-      setTxt('d-upi', totalUpi);
-      setTxt('d-bank', totalBank);
-      setTxt('d-credit-sales', totalCreditToday);
-      
-      console.log('[Dashboard] Collections split loaded from transactions', { totalCash, totalUpi, totalBank, totalCreditToday, totalTransactions: transactions.length });
+
+    // FIX (PASS #7 — "Cash in Hand / UPI / Bank / Credit Sales stuck at
+    // ₹0"): this called a backend action named 'getDashboard' that has
+    // never existed in the GAS router (only GET_DASHBOARD_SUMMARY does)
+    // and expected a raw {transactions:[...]} array the backend never
+    // produced either — every call silently hit "Unknown action", fell
+    // into the honest-empty-state branch below, and stayed ₹0 forever,
+    // even on a fully live client with real sales. GET_DASHBOARD_SUMMARY
+    // now computes and returns this same split for real, as
+    // data.collectionsByMode — reading that here instead of inventing a
+    // second endpoint or a second full dashboard fetch.
+    const dashRes = await gasApi('GET_DASHBOARD_SUMMARY', { clientId: CLIENT_ID }, 'V2_CORE');
+
+    if (dashRes && dashRes.success && dashRes.data && dashRes.data.collectionsByMode) {
+      const cm = dashRes.data.collectionsByMode;
+      const setTxt = (id, val) => { const el=document.getElementById(id); if(el){ el.textContent = '₹'+Math.max(Number(val)||0,0).toLocaleString('en-IN'); el.dataset.bnxLive='1'; } };
+      setTxt('d-cash', cm.cash);
+      setTxt('d-upi', cm.upi);
+      setTxt('d-bank', cm.bank);
+      setTxt('d-credit-sales', cm.creditToday);
+
+      console.log('[Dashboard] Collections split loaded from GET_DASHBOARD_SUMMARY', cm);
     } else {
-      // FIX ("show all zero when not live" — Aug 2026): if getDashboard
-      // failed or returned no transactions array, d-cash/d-upi/d-bank/
-      // d-credit-sales were simply never touched — same gap as d-rev/
-      // d-ord/d-cov had, just for this separate backend call. Resets to
-      // an honest ₹0 instead of leaving the hardcoded HTML demo values
-      // (₹68,200/₹27,400/₹20,000/₹9,200) on screen looking real. Guarded
-      // so a real value from an earlier successful load is never
-      // overwritten by a later failed retry.
+      // FIX ("show all zero when not live" — Aug 2026, still valid after
+      // PASS #7's action-name fix): if GET_DASHBOARD_SUMMARY fails or the
+      // response has no collectionsByMode, d-cash/d-upi/d-bank/
+      // d-credit-sales are reset to an honest ₹0 instead of leaving the
+      // hardcoded HTML demo values (₹68,200/₹27,400/₹20,000/₹9,200) on
+      // screen looking real. Guarded so a real value from an earlier
+      // successful load is never overwritten by a later failed retry.
       ['d-cash','d-upi','d-bank','d-credit-sales'].forEach(id=>{
         const el=document.getElementById(id);
         if(el && !el.dataset.bnxLive) el.textContent='₹0';
@@ -11933,6 +11916,14 @@ async function bnxLoadDueCollection(){
     set('dcReceivedToday', '₹'+Number(d.receivedToday||0).toLocaleString('en-IN'));
     set('dcNetOutstanding', '₹'+Number(d.netOutstanding||0).toLocaleString('en-IN'));
     set('dcPaymentsToday', String(d.paymentsToday||0));
+    // FIX (PASS #7 — "Customer Credit page never confirmed live"): this
+    // function only ever set the Due Collection page's own dc* IDs — the
+    // Customer Credit page's ccTotalOutstanding/ccReceivedToday were left
+    // entirely to the local-only browser ledger (renderCreditLedgerFromStore),
+    // which could remove that page's Demo badge on data that had never
+    // actually synced with the server. Mirroring the same real numbers here.
+    set('ccTotalOutstanding', '₹'+Number(d.totalOutstanding||0).toLocaleString('en-IN'));
+    set('ccReceivedToday', '₹'+Number(d.receivedToday||0).toLocaleString('en-IN'));
 
     const tbody = document.querySelector('#dcOutstandingTbl tbody');
     if (tbody){
@@ -11954,7 +11945,11 @@ async function bnxLoadDueCollection(){
     if (dcBanner){
       dcBanner.style.display = 'none'; // real data confirmed loaded
     }
-    document.querySelectorAll('#page-due-collection .pill.p-gold').forEach(p=>{
+    const ccBanner = document.getElementById('ccDemoBanner');
+    if (ccBanner){
+      ccBanner.style.display = 'none'; // real data confirmed loaded
+    }
+    document.querySelectorAll('#page-due-collection .pill.p-gold, #page-customer-credit .credit-stat-lbl .pill.p-gold').forEach(p=>{
       if (p.textContent.trim()==='Demo') p.remove();
     });
   }catch(e){
