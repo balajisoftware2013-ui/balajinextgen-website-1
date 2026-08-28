@@ -565,7 +565,14 @@ onclick="localStorage.clear();sessionStorage.clear();window.location.href='../..
 // Connects: Restaurant POS ↔ Kitchen ↔ Chef ↔ Cashier
 // ═══════════════════════════════════════════════════════════
 
-const DB_KEY = 'BNJERP_C001_kot_data';
+// FIX ("client data isolation"): this was hardcoded to 'C001' regardless
+// of which client's session was actually active — on this shared-origin
+// multi-tenant domain that meant every client's KOT board read/wrote the
+// SAME browser-local key, so a device used for more than one client
+// (or a copy-pasted deployment) could show one client's local KOTs
+// mixed into another's. Keyed by the real session's KM_CLIENT_ID now,
+// same pattern the offline outbox key below already uses.
+const DB_KEY = 'BNJERP_' + (KM_CLIENT_ID || 'default') + '_kot_data';
 const today  = () => new Date().toISOString().slice(0,10);
 const now    = () => new Date().toISOString();
 const uid    = () => 'KOT' + Date.now().toString(36).toUpperCase();
@@ -677,8 +684,6 @@ let currentView = 'kanban';
 
 // ── INIT ──────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', async () => {
-  // Seed demo KOTs if empty
-  if(dbGet().length === 0) seedDemoKOTs();
   buildMenuCats();
   buildMenuGrid('All');
   renderAll();
@@ -753,31 +758,7 @@ async function syncLiveKOTs(){
   dbSave(local);
 }
 
-// ── SEED DEMO KOTs ────────────────────────────────────────
-function seedDemoKOTs() {
-  const base = new Date(); base.setHours(18, 0, 0, 0);
-  const demo = [
-    { id:uid(), no:'KOT-001', table:'T-04', waiter:'Ravi', covers:4, type:'dine-in', status:'pending', zone:'Main Hall',
-      items:[{n:'Butter Chicken',p:390,q:2,e:'🍗',v:'NV'},{n:'Garlic Naan',p:80,q:4,e:'🫓',v:'V'},{n:'Dal Makhani',p:280,q:1,e:'🥘',v:'V'}],
-      notes:'Less spicy', created:new Date(base.getTime()-42*60000).toISOString(), printed:true },
-    { id:uid(), no:'KOT-002', table:'T-07', waiter:'Amit', covers:2, type:'dine-in', status:'cooking', zone:'Family Dining',
-      items:[{n:'Seekh Kebab',p:360,q:1,e:'🍢',v:'NV'},{n:'Dal Makhani',p:280,q:1,e:'🥘',v:'V'},{n:'Butter Naan',p:60,q:2,e:'🫓',v:'V'}],
-      notes:'', created:new Date(base.getTime()-8*60000).toISOString(), printed:true },
-    { id:uid(), no:'KOT-003', table:'T-11', waiter:'Suresh', covers:4, type:'dine-in', status:'pending', zone:'Main Hall',
-      items:[{n:'Mutton Rogan Josh',p:520,q:1,e:'🍖',v:'NV'},{n:'Chicken Biryani',p:380,q:2,e:'🍱',v:'NV'},{n:'Garlic Naan',p:80,q:6,e:'🫓',v:'V'}],
-      notes:'Extra gravy', created:new Date(base.getTime()-28*60000).toISOString(), printed:true },
-    { id:uid(), no:'KOT-004', table:'VIP-1', waiter:'Rahul', covers:8, type:'dine-in', status:'cooking', zone:'VIP Lounge',
-      items:[{n:'Paneer Tikka',p:340,q:2,e:'🧀',v:'V'},{n:'Butter Chicken',p:390,q:3,e:'🍗',v:'NV'},{n:'Mango Lassi',p:100,q:4,e:'🥛',v:'V'}],
-      notes:'VIP Table — Priority', created:new Date(base.getTime()-55*60000).toISOString(), printed:true },
-    { id:uid(), no:'KOT-005', table:'T-15', waiter:'Dev', covers:3, type:'dine-in', status:'ready', zone:'Main Hall',
-      items:[{n:'Fish Tikka',p:420,q:1,e:'🐟',v:'NV'},{n:'Steamed Rice',p:120,q:2,e:'🍚',v:'V'},{n:'Fresh Lime Soda',p:80,q:3,e:'🍋',v:'V'}],
-      notes:'', created:new Date(base.getTime()-18*60000).toISOString(), printed:true },
-    { id:uid(), no:'KOT-006', table:'BAR-1', waiter:'Suman', covers:2, type:'bar', status:'served', zone:'Bar Counter',
-      items:[{n:'Masala Chai',p:60,q:2,e:'☕',v:'V'},{n:'Gulab Jamun',p:90,q:2,e:'🍮',v:'V'}],
-      notes:'', created:new Date(base.getTime()-90*60000).toISOString(), printed:true },
-  ];
-  dbSave(demo);
-}
+
 
 // ── RENDER ALL ────────────────────────────────────────────
 function renderAll() {
@@ -938,7 +919,7 @@ function updateKOTStatus(id, newStatus) {
   // 47_ChefKotBridge.gs) using the KOT's server-side number (kot.no),
   // not this browser's local id — so Chef Dashboard (a different
   // screen, different device) sees the same status change.
-  if(kot) kmApi('UPDATE_KOT_STATUS', { kotId: kot.no, status: newStatus }).catch(()=>{});
+  if(kot) kmApi('UPDATE_KOT_STATUS', { kotId: kot.serverId || kot.serverNo || kot.no, status: newStatus }).catch(()=>{});
 }
 
 function cancelKOT(id) {
@@ -947,7 +928,7 @@ function cancelKOT(id) {
   dbUpdate(id, { status: 'cancelled' });
   renderAll();
   toast('KOT cancelled', 'warn');
-  if(kot) kmApi('UPDATE_KOT_STATUS', { kotId: kot.no, status: 'cancelled' }).catch(()=>{});
+  if(kot) kmApi('UPDATE_KOT_STATUS', { kotId: kot.serverId || kot.serverNo || kot.no, status: 'cancelled' }).catch(()=>{});
 }
 
 // ── KOT DETAIL ────────────────────────────────────────────
@@ -1203,7 +1184,17 @@ function saveKOT() {
     requestId: kmRequestId,
   };
   kmApi('SAVE_KOT', kmPayload).then(res => {
-    if(!res || !res.success){
+    if(res && res.success){
+      // FIX ("KOT status changes never reach the kitchen server"):
+      // updateKOTStatus()/cancelKOT() below send kmApi('UPDATE_KOT_STATUS',
+      // {kotId: kot.no, ...}) — but kot.no here was only ever this
+      // device's local display label ('KOT-001', see note above), never
+      // the server's real KOT_ID/KOT_NUMBER. Every status change was
+      // silently targeting a row that doesn't exist server-side. Storing
+      // the real identifiers SAVE_KOT just confirmed, so later status
+      // updates can actually find and update the right KOT_MASTER row.
+      dbUpdate(newKOT.id, { serverId: res.transactionId || '', serverNo: res.kotNumber || '' });
+    } else {
       kmQueuePending('SAVE_KOT', kmPayload, kmRequestId);
       toast('⚠ Saved locally — kitchen server sync failed, queued for retry', 'warn');
     }
