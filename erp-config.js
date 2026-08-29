@@ -32,6 +32,25 @@ const ROLE_DASHBOARD = {
   MANAGER      : 'Dashboard/manager-dashboard.html',
   ACCOUNTANT   : 'Dashboard/accounts/accounts.html',
   CASHIER      : 'Dashboard/restaurant/restaurant-dashboard.html',
+  /* PASS #28 FIX ("Captain Report Dashboard not show"): CAPTAIN is a
+     fully real role everywhere ELSE in this system (ALLOWED_ROLES,
+     STAFF_ROLES, GET_STAFF_LIST's role filter, the Steward dropdown
+     itself lists "Amit Singh (CAPTAIN)") but had NO entry in this map
+     at all -- so a Captain login fell through to DEFAULT ('welcome.html',
+     the generic marketing/landing page) instead of any real dashboard.
+     That's the actual bug: not a report failing to render, but the
+     Captain never reaching a page that has reports on it in the first
+     place. No dedicated captain-dashboard.html file exists anywhere in
+     this codebase to point to -- building one blind risks guessing what
+     a Captain specifically needs to see. Routed to the same real,
+     data-rich restaurant-dashboard.html CASHIER/OWNER/ADMIN already use
+     (KOT, tables, orders, Steward Performance, reports) so a Captain at
+     least lands somewhere real today. If Captains need a DIFFERENT set
+     of cards/permissions than Cashier sees, that's a follow-up (the
+     dashboard already reads ERP_ROLE and could show/hide sections by
+     role, same pattern as SIDEBAR_HIDE_BY_INDUSTRY) -- tell me what a
+     Captain should and shouldn't see and I'll wire that distinction in. */
+  CAPTAIN      : 'Dashboard/restaurant/restaurant-dashboard.html',
   CHEF         : 'Dashboard/restaurant/chef-dashboard.html',
   WAITER       : 'Dashboard/employee-dashboard.html',
   STORE_MANAGER: 'Dashboard/inventory/inventory.html',
@@ -97,7 +116,16 @@ const INDUSTRY_DASHBOARD = {
 /* Roles that ALWAYS use ROLE_DASHBOARD (ignore industry) */
 const FIXED_ROLE_DASHBOARDS = [
   'CASHIER','CHEF','WAITER','STAFF','PARTTIME','ACCOUNTANT',
-  'ACCT','STORE_MANAGER','SUPER_ADMIN','DEVELOPER'
+  'ACCT','STORE_MANAGER','SUPER_ADMIN','DEVELOPER',
+  /* PASS #28 FIX ("Captain Report Dashboard not show"): adding CAPTAIN
+     to ROLE_DASHBOARD alone was NOT enough -- getTargetDashboard() does
+     `industryDash || ROLE_DASHBOARD[role]`, and _erpResolveIndustryDashboard
+     only returns null (deferring to ROLE_DASHBOARD) for roles listed
+     HERE. Without this, a Captain's industry would still resolve to
+     'welcome.html' via INDUSTRY_DASHBOARD and short-circuit the new
+     CAPTAIN entry before it was ever consulted -- same silent-fallthrough
+     bug, one layer deeper. */
+  'CAPTAIN'
 ];
 
 /* Map raw CLIENT_MASTER / USER.INDUSTRY strings → INDUSTRY_DASHBOARD keys.
