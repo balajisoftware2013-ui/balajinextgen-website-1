@@ -10127,12 +10127,22 @@ function kotOpenManualAdd(){
   </div>`;
   document.body.appendChild(mo);
 
+  // FIX ("2nd rate also show but rate not show"): kmaCart items used to
+  // only ever carry {name, qty} — no rate at all, even when the item was
+  // picked from the real menu search (which DOES know the price, m.price).
+  // addItem() silently dropped it because the caller only ever passed
+  // the name string. A KOT created here therefore always showed with no
+  // "@₹..." in the Pending KOTs list later, and — worse — got added into
+  // a bill at ₹0 instead of merging with the item's real rate. Now
+  // addItem() takes and stores a rate, the search-pick callback passes
+  // m.price through, and the modal itself shows the rate next to each
+  // item so it's visible before the ticket is even sent.
   function renderCart(){
     const el = mo.querySelector('#kmaItemList');
     if (!kmaCart.length){ el.innerHTML = '<div style="font-size:11.5px;color:#999;padding:6px 0;">No items added yet.</div>'; return; }
     el.innerHTML = kmaCart.map((it,i)=>
       '<div style="display:flex;align-items:center;gap:8px;padding:7px 9px;background:#f7f6f2;border-radius:8px;margin-bottom:5px;">'
-      +'<span style="flex:1;font-size:12.5px;font-weight:600;">'+it.name+'</span>'
+      +'<span style="flex:1;font-size:12.5px;font-weight:600;">'+it.name+(it.rate?' <span style="font-weight:600;color:var(--gold,#b8690e);">· ₹'+it.rate+'</span>':' <span style="font-weight:500;color:#c98a1f;">· no rate (custom item)</span>')+'</span>'
       +'<button data-act="dec" data-i="'+i+'" style="width:24px;height:24px;border-radius:6px;border:1px solid #ddd;background:var(--surface);cursor:pointer;font-size:13px;">−</button>'
       +'<span style="min-width:18px;text-align:center;font-size:12.5px;">'+it.qty+'</span>'
       +'<button data-act="inc" data-i="'+i+'" style="width:24px;height:24px;border-radius:6px;border:1px solid #ddd;background:var(--surface);cursor:pointer;font-size:13px;">+</button>'
@@ -10149,21 +10159,24 @@ function kotOpenManualAdd(){
       };
     });
   }
-  function addItem(name){
+  function addItem(name, rate){
     name=name.trim(); if(!name) return;
+    const r = Number(rate)||0;
     const existing = kmaCart.find(it=>it.name.toLowerCase()===name.toLowerCase());
-    if (existing) existing.qty++; else kmaCart.push({name, qty:1});
+    if (existing){ existing.qty++; if (!existing.rate && r) existing.rate = r; }
+    else kmaCart.push({name, qty:1, rate:r});
     renderCart();
   }
   renderCart();
 
   const searchInput = mo.querySelector('#kmaSearch');
-  bmAttachItemSearch(searchInput, function(m){ addItem(m.name); searchInput.value=''; });
+  bmAttachItemSearch(searchInput, function(m){ addItem(m.name, m.price); searchInput.value=''; });
   searchInput.addEventListener('keydown', (e)=>{
     // bmAttachItemSearch's own keydown handler (registered above) already
     // consumes Enter when a suggestion is highlighted, clearing the box —
     // this just catches the remaining case: Enter with no suggestion
-    // highlighted, which adds whatever was typed as a custom/open item.
+    // highlighted, which adds whatever was typed as a custom/open item
+    // (no menu match → no known rate, stays ₹0/editable later in the bill).
     if (e.key==='Enter'){
       setTimeout(()=>{ if (searchInput.value.trim()){ addItem(searchInput.value); searchInput.value=''; } }, 0);
     }
@@ -12082,7 +12095,11 @@ function bmHandleTableChange(){
   let open = [];
   try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
   const bareTbl = tblVal.replace('T-','');
-  const kots = open.filter(k => k.status!=='READY' && (k.table||'').trim().toUpperCase() === tblVal);
+  // FIX ("after added load remove ... otherwise multiple add"): exclude
+  // KOTs already pulled into a bill (see bmConfirmKotPicker's `billed`
+  // flag) so an auto-load on Table No change can't re-add the same
+  // ticket's items a second time.
+  const kots = open.filter(k => k.status!=='READY' && !k.billed && (k.table||'').trim().toUpperCase() === tblVal);
   const orders = (typeof orderRegData!=='undefined' ? orderRegData : []).filter(o => {
     if (o.ORDER_STATUS==='BILLED' || o.ORDER_STATUS==='CANCELLED') return false;
     const tid=(o.TABLE_ID||'').trim().toUpperCase();
@@ -12141,7 +12158,12 @@ function bmOpenKotPicker(){
   let open = [];
   try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
   const bareTbl = tblVal.replace('T-','');
-  const kots = open.filter(k => k.status!=='READY' && (!tblVal || (k.table||'').trim().toUpperCase() === tblVal));
+  // FIX ("after added load remove ... otherwise multiple add"): same
+  // `billed` exclusion as bmHandleTableChange — once a KOT's items have
+  // been pulled into a bill, it drops out of this list so re-opening
+  // "Pending KOTs & Orders" (or clicking Load again) can't offer it a
+  // second time and double the qty on the bill.
+  const kots = open.filter(k => k.status!=='READY' && !k.billed && (!tblVal || (k.table||'').trim().toUpperCase() === tblVal));
   const rawOrders = (typeof orderRegData!=='undefined' ? orderRegData : []).filter(o => {
     if (o.ORDER_STATUS==='BILLED' || o.ORDER_STATUS==='CANCELLED') return false;
     if (!tblVal) return true;
@@ -12253,11 +12275,13 @@ function bmConfirmKotPicker(){
   const refs = [];
   const pickedTables = [];
   const rawItems = []; // every line from every selected ticket, unmerged
+  const pickedKotNos = []; // FIX ("after added load remove ... otherwise multiple add"): see below
   p.sel.forEach(key=>{
     const kind = key[0], idx = parseInt(key.slice(1),10);
     if (kind==='k'){
       const k = p.kots[idx]; if (!k) return;
       refs.push(k.kotNo);
+      pickedKotNos.push(k.kotNo);
       if (k.table) pickedTables.push(k.table);
       (k.items||[]).forEach(it=>{ rawItems.push({ name: it.name||it.n, qty: it.qty||1, rate: it.rate||it.price||0 }); });
     } else {
@@ -12270,6 +12294,22 @@ function bmConfirmKotPicker(){
   const merged = bmMergeItemsByName_(rawItems);
   let added = 0;
   merged.forEach(it=>{ bmAddOrIncreaseItemRow_(it.name, it.qty, it.rate); added++; });
+  // FIX ("after added load remove fix other wise multiple add"): a KOT
+  // picked here used to just sit in bnx_open_kots forever, still marked
+  // NEW — so opening "Pending KOTs & Orders" again (or re-Loading the
+  // same table) offered the SAME ticket a second time, silently doubling
+  // its items onto the bill each time it was picked again. Tagging it
+  // `billed:true` the moment its items are pulled in removes it from
+  // every picker list below without touching Kitchen/KDS views (which
+  // don't check this flag) — so kitchen still sees its real prep status,
+  // it just can't be loaded into a bill twice.
+  if (pickedKotNos.length){
+    let open = [];
+    try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
+    let changed = false;
+    open.forEach(k=>{ if (pickedKotNos.includes(k.kotNo) && !k.billed){ k.billed = true; changed = true; } });
+    if (changed) bnxSetOpenKotsRaw(JSON.stringify(open));
+  }
   const kotEl = document.getElementById('bm-bf-kot');
   if (kotEl){
     const existing = kotEl.value ? kotEl.value.split(' + ').filter(Boolean) : [];
