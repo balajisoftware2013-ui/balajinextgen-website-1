@@ -29,7 +29,22 @@ const ROLE_DASHBOARD = {
   DEVELOPER    : 'Dashboard/developer-dashboard.html',
   OWNER        : 'Dashboard/owner-dashboard.html',
   ADMIN        : 'welcome.html',
-  MANAGER      : 'Dashboard/manager-dashboard.html',
+  /* PASS #33 FIX ("manager view then only reservation others not
+     allow"): MANAGER had a ROLE_DASHBOARD entry (manager-dashboard.html)
+     but was NOT in FIXED_ROLE_DASHBOARDS below -- same exact
+     silent-fallthrough bug already found and fixed for CAPTAIN in PASS
+     #28. getTargetDashboard() does `industryDash || ROLE_DASHBOARD[role]`,
+     and a RESTAURANT-industry client always resolves industryDash to
+     'welcome.html' for any role not listed in FIXED_ROLE_DASHBOARDS --
+     so every Manager login has actually been landing on welcome.html,
+     never on manager-dashboard.html at all. If welcome.html is a sparse
+     landing/onboarding page with limited navigation, that exactly
+     explains "only reservation shows, nothing else allowed" -- not a
+     permission restriction, a wrong page entirely. Pointed at the same
+     real, fully-featured restaurant-dashboard.html every other working
+     role (OWNER/CASHIER/CAPTAIN) already uses, rather than the separate
+     manager-dashboard.html whose contents were never verified. */
+  MANAGER      : 'Dashboard/restaurant/restaurant-dashboard.html',
   ACCOUNTANT   : 'Dashboard/accounts/accounts.html',
   CASHIER      : 'Dashboard/restaurant/restaurant-dashboard.html',
   /* PASS #28 FIX ("Captain Report Dashboard not show"): CAPTAIN is a
@@ -51,7 +66,21 @@ const ROLE_DASHBOARD = {
      role, same pattern as SIDEBAR_HIDE_BY_INDUSTRY) -- tell me what a
      Captain should and shouldn't see and I'll wire that distinction in. */
   CAPTAIN      : 'Dashboard/restaurant/restaurant-dashboard.html',
-  CHEF         : 'Dashboard/restaurant/chef-dashboard.html',
+  /* PASS #33 FIX ("steward ... chef can't access restaurant dashboard"):
+     STEWARD had NO entry anywhere in this map at all -- confirmed by
+     reading every key here -- even though STEWARD is this app's actual
+     real staff-role name everywhere else (the Steward dropdown, staff
+     lists, steward-mobile.html's whole login flow uses STEWARD, not
+     WAITER). Every steward login has been falling through to DEFAULT
+     the same way CAPTAIN did before PASS #28. CHEF already HAD a real
+     entry + a FIXED_ROLE_DASHBOARDS listing, so its routing logic
+     itself wasn't broken -- but it pointed at a separate
+     chef-dashboard.html whose existence was never confirmed (same
+     unverified-file risk CAPTAIN had with a nonexistent
+     captain-dashboard.html). Both now point at the same real,
+     fully-audited restaurant-dashboard.html instead. */
+  STEWARD      : 'Dashboard/restaurant/restaurant-dashboard.html',
+  CHEF         : 'Dashboard/restaurant/restaurant-dashboard.html',
   WAITER       : 'Dashboard/employee-dashboard.html',
   STORE_MANAGER: 'Dashboard/inventory/inventory.html',
   CEO          : 'Dashboard/Ceo-dashboard.html',
@@ -125,7 +154,15 @@ const FIXED_ROLE_DASHBOARDS = [
      'welcome.html' via INDUSTRY_DASHBOARD and short-circuit the new
      CAPTAIN entry before it was ever consulted -- same silent-fallthrough
      bug, one layer deeper. */
-  'CAPTAIN'
+  'CAPTAIN',
+  /* PASS #33 FIX ("steward and captain chef can't access restaurant
+     dashboard ... manager view then only reservation others not
+     allow"): same one-layer-deeper requirement as CAPTAIN above, now
+     applied to STEWARD and MANAGER too -- an entry in ROLE_DASHBOARD
+     is not enough by itself, it also has to be listed HERE or industry
+     resolution silently overrides it before ROLE_DASHBOARD is ever
+     checked. */
+  'STEWARD','MANAGER'
 ];
 
 /* Map raw CLIENT_MASTER / USER.INDUSTRY strings → INDUSTRY_DASHBOARD keys.
