@@ -6019,6 +6019,83 @@ window.__patchERP();
    every scattered button/onclick, since one central check per action
    is far more robust than trying to hide every occurrence across many
    tables including the demo rows. */
+/* ── PAGE-LEVEL ROLE LOCKS ("as per access role, also lock pages") ──
+   BNX_FULL_ACCESS_ROLES above only ever gated individual ACTIONS
+   (Void/Discount/Reservation etc) inside a page — any logged-in role
+   could still open every page in the sidebar/bottom-nav, including
+   Reports, Accounts Ledger, Settings, etc. This adds the missing
+   page-level lock: each page below is only reachable (nav item shown,
+   showPage() allowed) by the roles listed. Pages not listed here stay
+   open to any logged-in role (e.g. Dashboard, POS, KOT, Tables —
+   everyday operational screens every role needs).
+   SUPER_ADMIN and DEVELOPER always pass, same as the existing
+   Super Admin nav-item rule, so this can never lock out the top of
+   the hierarchy. Defaults follow the app's own documented hierarchy
+   (SUPER_ADMIN > DEVELOPER > OWNER > ADMIN > MANAGER > CASHIER/CHEF/
+   WAITER) — adjust the arrays below per-client if a role split
+   should differ. */
+const PAGE_ROLES = {
+  'settlement':             ['OWNER','ADMIN','MANAGER','CASHIER','ACCOUNTANT','STORE_MANAGER','SUPERVISOR','MD','CEO'],
+  'bills-list':             ['OWNER','ADMIN','MANAGER','CASHIER','ACCOUNTANT','STORE_MANAGER','SUPERVISOR','MD','CEO'],
+  'aggregator-settlement':  ['OWNER','ADMIN','MANAGER','ACCOUNTANT','STORE_MANAGER','MD','CEO'],
+  'customer-credit':        ['OWNER','ADMIN','MANAGER','CASHIER','ACCOUNTANT','STORE_MANAGER','MD','CEO'],
+  'due-collection':         ['OWNER','ADMIN','MANAGER','CASHIER','ACCOUNTANT','STORE_MANAGER','MD','CEO'],
+  'accounts-ledger':        ['OWNER','ADMIN','MANAGER','ACCOUNTANT','STORE_MANAGER','MD','CEO'],
+  'analytics':              ['OWNER','ADMIN','MANAGER','ACCOUNTANT','STORE_MANAGER','MD','CEO'],
+  'reports':                ['OWNER','ADMIN','MANAGER','ACCOUNTANT','STORE_MANAGER','MD','CEO'],
+  'whatsapp':                ['OWNER','ADMIN','MANAGER','STORE_MANAGER','MD','CEO'],
+  'dashboard-links':        ['OWNER','ADMIN','MANAGER','STORE_MANAGER','MD','CEO'],
+  'settings':               ['OWNER','ADMIN','MANAGER'],
+  'kitchen':                ['OWNER','ADMIN','MANAGER','CHEF','KITCHEN','CAPTAIN','STEWARD','SUPERVISOR','STORE_MANAGER','MD','CEO'],
+  'bar':                    ['OWNER','ADMIN','MANAGER','BAR','CAPTAIN','STEWARD','CHEF','KITCHEN','SUPERVISOR','STORE_MANAGER','MD','CEO']
+  // 'super-admin' stays handled by the existing navSuperAdmin logic below
+};
+function bnxPageAllowed(pageId, role){
+  const roleUp = String(role||'').toUpperCase();
+  if (roleUp==='SUPER_ADMIN' || roleUp==='DEVELOPER') return true; // top of hierarchy, always full access
+  if (pageId==='super-admin') return false; // never listed in PAGE_ROLES on purpose — SUPER_ADMIN/DEVELOPER only
+  const allowedRoles = PAGE_ROLES[pageId];
+  if (!allowedRoles) return true; // page not restricted -> open to any logged-in role
+  return allowedRoles.includes(roleUp);
+}
+function bnxGetRoleSafe(){
+  // ERP.getRole() reads ERP_KEYS, which only exists once erp-config.js has
+  // actually finished loading — calling it unguarded (like the two spots
+  // below used to) can throw ReferenceError: ERP_KEYS is not defined and
+  // take the whole page-lock check down with it. loadUserInfo() already
+  // wraps its own ERP.getRole() call in try/catch for exactly this reason;
+  // every other call site needs the same guard, not just that one.
+  try{
+    return (typeof ERP!=='undefined' && ERP.getRole ? String(ERP.getRole()||'') : '').toUpperCase();
+  }catch(e){
+    console.warn('[bnxGetRoleSafe] ERP.getRole() failed, treating as unknown role:', e.message);
+    return '';
+  }
+}
+function bnxApplyPageAccessLocks(){
+  const role = bnxGetRoleSafe();
+  // Sidebar nav items: id extracted from their own onclick="showPage('id',...)"
+  // rather than requiring a separate data-page attribute on every item —
+  // one less place for the page-id and its lock rule to drift apart.
+  document.querySelectorAll('.nav-item[onclick]').forEach(item=>{
+    if (item.id === 'navSuperAdmin') return; // that one already has its own dedicated rule
+    const m = (item.getAttribute('onclick')||'').match(/showPage\('([^']+)'/);
+    if(!m) return;
+    item.style.display = bnxPageAllowed(m[1], role) ? '' : 'none';
+  });
+  // Bottom mobile nav
+  document.querySelectorAll('.bnx-bn-item[data-page]').forEach(btn=>{
+    btn.style.display = bnxPageAllowed(btn.dataset.page, role) ? '' : 'none';
+  });
+  // If the page currently open just became locked for this role (e.g.
+  // after a re-login as a different role in the same tab), bounce to
+  // Dashboard rather than leaving a locked page on screen.
+  const activePage = document.querySelector('.page.active');
+  if (activePage && activePage.id && activePage.id.indexOf('page-')===0){
+    const curId = activePage.id.slice(5);
+    if (!bnxPageAllowed(curId, role)) showPage('dashboard', document.querySelector('.nav-item[onclick*="dashboard"]'));
+  }
+}
 const BNX_FULL_ACCESS_ROLES = ['SUPER_ADMIN','DEVELOPER','OWNER','ADMIN','MANAGER','CASHIER'];
 function bnxHasFullAccess(){
   const role = (typeof ERP!=='undefined' && ERP.getRole ? ERP.getRole() : '').toUpperCase();
@@ -6310,6 +6387,17 @@ function bnxSetBottomNavActive(id){
   document.querySelectorAll('.bnx-bn-item').forEach(b=>b.classList.toggle('active', b.dataset.page===id));
 }
 function showPage(id, el){
+  // PAGE-LEVEL ROLE LOCK: block before anything else renders/loads for
+  // this page. Covers the sidebar/bottom-nav (already hidden by
+  // bnxApplyPageAccessLocks) AND every in-page button/link that calls
+  // showPage('id',...) directly (e.g. "View All →", report card links) —
+  // those aren't hidden per-role, so this is the actual enforcement point.
+  const bnxRole = bnxGetRoleSafe();
+  if (!bnxPageAllowed(id, bnxRole)){
+    if (typeof showNotif === 'function') showNotif('🔒 Your role ('+(bnxRole||'—')+') does not have access to this page.', 'error');
+    else alert('You do not have access to this page.');
+    return;
+  }
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   const pg=document.getElementById('page-'+id); if(pg) pg.classList.add('active');
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
@@ -6476,6 +6564,11 @@ function loadUserInfo(){
     const roleUp = String(role||'').toUpperCase();
     saNav.style.display = (roleUp==='SUPER_ADMIN' || roleUp==='DEVELOPER') ? '' : 'none';
   }
+
+  // Extend the same "hide what this role can't reach" rule from just the
+  // Super Admin item to every page-locked nav item (Settings, Reports,
+  // Accounts Ledger, etc. — see PAGE_ROLES).
+  if (typeof bnxApplyPageAccessLocks === 'function') bnxApplyPageAccessLocks();
 }
 
 
@@ -12088,31 +12181,44 @@ function bmPickerToggle(kind, idx, checked){
    their items are appended to the item rows, and their references are
    joined in the KOT Reference field ("KOT-0041 + KOT-0042 + ORD-...")
    so it's traceable which tickets/orders this one bill covers. */
+/* FIX ("fix if add only one time if multiple time add not be add same
+   rate not come fix"): loading more than one KOT/order used to call
+   bmAddItemRow() once per item PER TICKET — the same item on 2
+   tickets became 2 separate rows, each carrying its own (often ₹0)
+   rate, instead of one row with the combined qty and a real rate.
+   Now every item from every ticket picked in this one "Load" is
+   merged by name first (qty summed, first non-zero rate kept via
+   bmMergeItemsByName_), and bmAddOrIncreaseItemRow_ also merges into
+   any row already on the bill — so loading a 2nd KOT later still
+   merges instead of duplicating. */
 function bmConfirmKotPicker(){
   const p = window._bmPicker || {kots:[],orders:[],sel:new Set()};
   if (!p.sel || !p.sel.size){ showNotif('Select at least one KOT or order first.', 'error'); return; }
   const refs = [];
   const pickedTables = [];
-  let added = 0;
+  const rawItems = []; // every line from every selected ticket, unmerged
   p.sel.forEach(key=>{
     const kind = key[0], idx = parseInt(key.slice(1),10);
     if (kind==='k'){
       const k = p.kots[idx]; if (!k) return;
       refs.push(k.kotNo);
       if (k.table) pickedTables.push(k.table);
-      (k.items||[]).forEach(it=>{ bmAddItemRow(it.name||it.n, it.qty||1, it.rate||it.price||0); added++; });
+      (k.items||[]).forEach(it=>{ rawItems.push({ name: it.name||it.n, qty: it.qty||1, rate: it.rate||it.price||0 }); });
     } else {
       const o = p.orders[idx]; if (!o) return;
       refs.push(o.ORDER_NO||o.ORDER_ID);
       if (o.TABLE_ID) pickedTables.push(o.TABLE_ID);
-      (o.items||[]).forEach(it=>{ bmAddItemRow(it.itemName||it.name, it.qty, it.rate||(it.amount&&it.qty?it.amount/it.qty:0)); added++; });
+      (o.items||[]).forEach(it=>{ rawItems.push({ name: it.itemName||it.name, qty: it.qty, rate: it.rate||(it.amount&&it.qty?it.amount/it.qty:0) }); });
     }
   });
+  const merged = bmMergeItemsByName_(rawItems);
+  let added = 0;
+  merged.forEach(it=>{ bmAddOrIncreaseItemRow_(it.name, it.qty, it.rate); added++; });
   const kotEl = document.getElementById('bm-bf-kot');
   if (kotEl){
     const existing = kotEl.value ? kotEl.value.split(' + ').filter(Boolean) : [];
-    const merged = existing.concat(refs).filter((v,i,a)=>a.indexOf(v)===i);
-    kotEl.value = merged.join(' + ');
+    const mergedRefs = existing.concat(refs).filter((v,i,a)=>a.indexOf(v)===i);
+    kotEl.value = mergedRefs.join(' + ');
   }
   /* Table No auto-fill: if the field was empty (picker was opened without
      a table pre-filled), take it from whichever ticket(s) were picked —
@@ -12127,6 +12233,49 @@ function bmConfirmKotPicker(){
   if (typeof bmRecalc==='function') bmRecalc();
   bmCloseKotPicker();
   showNotif('✅ Added '+added+' item(s) from '+refs.length+' reference(s) to this bill', 'success');
+}
+/* Merges a flat list of {name, qty, rate} by item name (trimmed,
+   case-insensitive). Quantities are summed; the rate kept is the
+   first NON-ZERO one found among the duplicates (so one duplicate
+   carrying ₹0 — e.g. a repeat line that synced before its price was
+   set — never wipes out a real rate found on another duplicate). */
+function bmMergeItemsByName_(rawItems){
+  const map = new Map();
+  rawItems.forEach(it=>{
+    const name = String(it.name||'').trim();
+    if (!name) return;
+    const key = name.toLowerCase();
+    const qty = Number(it.qty)||1;
+    const rate = Number(it.rate)||0;
+    if (!map.has(key)){
+      map.set(key, { name, qty, rate });
+    } else {
+      const existing = map.get(key);
+      existing.qty += qty;
+      if (!existing.rate && rate) existing.rate = rate; // keep first real rate found
+    }
+  });
+  return Array.from(map.values());
+}
+/* If a row for this item name is already on the bill (from an earlier
+   Load, or typed in manually), increases ITS qty instead of adding a
+   new row — this is what stops a 2nd "Load" from re-duplicating items
+   that are already there. Otherwise adds a fresh row as before. */
+function bmAddOrIncreaseItemRow_(name, qty, rate){
+  const rows = document.querySelectorAll('#bmItemRows [id^="bm-iname-"]');
+  const target = String(name||'').trim().toLowerCase();
+  for (const nameEl of rows){
+    if (String(nameEl.value||'').trim().toLowerCase() === target){
+      const id = nameEl.id.replace('bm-iname-','');
+      const qtyEl = document.getElementById('bm-iqty-'+id);
+      const rateEl = document.getElementById('bm-irate-'+id);
+      if (qtyEl) qtyEl.value = (parseFloat(qtyEl.value)||0) + (Number(qty)||1);
+      if (rateEl && !parseFloat(rateEl.value) && rate) rateEl.value = rate;
+      if (typeof bmCalcRowAmt === 'function') bmCalcRowAmt(id);
+      return;
+    }
+  }
+  bmAddItemRow(name, qty, rate);
 }
 // legacy name kept in case other code paths still call it directly
 function bmLoadKotsForTable(){ bmOpenKotPicker(); }
