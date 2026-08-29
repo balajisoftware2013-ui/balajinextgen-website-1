@@ -52,7 +52,38 @@ const ROLE_DASHBOARD = {
    (ADMIN, OWNER, MD, CLIENT, DEMO, MANAGER). Cashier/Chef/Waiter
    etc. always go to their ROLE_DASHBOARD above regardless of industry.
    Only map to industries that have a REAL working dashboard file —
-   everything else falls back to Dashboard/dashboard.html (common ERP). */
+   everything else falls back to Dashboard/dashboard.html (common ERP).
+   PASS #19 ("industry list, ALL rest pub same category"): Balaji
+   supplied the full ~55-code industry taxonomy this system needs to
+   recognize. GROUPING (RESTAURANT_DASHBOARD = welcome.html /
+   restaurant-dashboard.html, everything else this system has no
+   dedicated dashboard built for yet stays DEFAULT):
+     - RESTAURANT_GROUP: every food-and-hospitality business type —
+       RESTAURANT, RESTAURANT_PUB, BAR, HOTEL, BAKERY, CLOUD_KITCHEN,
+       SWEET_SHOP, CATERING — all route to the SAME restaurant dashboard,
+       per Balaji's explicit instruction. This is the fix that actually
+       matters here: RESTAURANT_PUB specifically (Hashtag Siliguri's own
+       real industry type, per DEMO_CLIENT_FALLBACK below) was NOT in
+       the old alias map at all, so a client whose real INDUSTRY is
+       "RESTAURANT_PUB" was being routed to the generic
+       Dashboard/dashboard.html instead of the restaurant-specific one
+       this whole suite is built around.
+     - RETAIL_GROUP: shop-counter businesses that already fit the
+       existing RETAIL dashboard's pattern (sell physical items over a
+       counter) — RETAIL, ELECTRONICS, CLOTHING, FOOTWEAR, JEWELLERY,
+       GIFT_SHOP, OPTICAL, SPORTS, MEDICAL_STORE.
+     - GROCERY_GROUP: SUPERMARKET (existing, unchanged).
+     - Everything else Balaji listed (CLINIC/DIAGNOSTIC/HOSPITAL/
+       FACTORY/FOOD_PROCESSING/GARMENT_MFG/PLASTIC/PRINTING/FURNITURE/
+       DISTRIBUTOR/WHOLESALER/TRANSPORT/COLD_CHAIN/TEA_GARDEN/FARM/
+       SEEDS_AGRI/CA_FIRM/ADVOCATE/ARCHITECT/CONSULTANT/EVENT/SCHOOL/
+       COACHING/DRIVING_SCHOOL/REAL_ESTATE/CONSTRUCTION/PROPERTY_MGMT/
+       AUTO_DEALER/SERVICE_CENTRE/PETROL_PUMP/IT_COMPANY/CYBER_CAFE/
+       MOBILE_REPAIR/NBFC/CHIT_FUND/INSURANCE/NGO/COOP/PHARMA_DIST) is
+       now explicitly mapped to DEFAULT rather than silently falling
+       through an unmatched lookup — same end result today, but explicit
+       and ready for a real dashboard to be pointed at any of them later
+       without hunting for where its alias needs to go. */
 const INDUSTRY_DASHBOARD = {
   RESTAURANT : 'welcome.html',
   CAFE       : 'welcome.html',
@@ -60,8 +91,6 @@ const INDUSTRY_DASHBOARD = {
   RETAIL     : 'welcome.html',
   GROCERY    : 'welcome.html',
   SUPERMARKET: 'welcome.html',
-  /* everything else (hotel, medical, school, pharmacy, construction,
-     fruit, juice, ecommerce, distribution, realestate, generic) → */
   DEFAULT    : 'Dashboard/dashboard.html',
 };
 
@@ -71,12 +100,38 @@ const FIXED_ROLE_DASHBOARDS = [
   'ACCT','STORE_MANAGER','SUPER_ADMIN','DEVELOPER'
 ];
 
-/* Map raw CLIENT_MASTER / USER.INDUSTRY strings → INDUSTRY_DASHBOARD keys */
+/* Map raw CLIENT_MASTER / USER.INDUSTRY strings → INDUSTRY_DASHBOARD keys.
+   Keys are lowercased with WHITESPACE stripped (see _erpResolveIndustry-
+   Dashboard's norm below) — underscores are kept as-is, so 'RESTAURANT_PUB'
+   normalises to 'restaurant_pub', not 'restaurantpub'. */
 const INDUSTRY_ALIAS = {
+  // -- Food & Hospitality -> RESTAURANT (same dashboard for all of these) --
   restaurant:'RESTAURANT', food:'RESTAURANT',
+  restaurant_pub:'RESTAURANT', pub:'RESTAURANT', bar:'RESTAURANT',
+  hotel:'RESTAURANT', bakery:'RESTAURANT', cloud_kitchen:'RESTAURANT',
+  cloudkitchen:'RESTAURANT', sweet_shop:'RESTAURANT', sweetshop:'RESTAURANT',
+  catering:'RESTAURANT',
   cafe:'CAFE', teacafe:'TEA', tea:'TEA', coffee:'TEA',
+  // -- Retail-pattern shops -> RETAIL --
   retail:'RETAIL', store:'RETAIL', shop:'RETAIL',
+  electronics:'RETAIL', clothing:'RETAIL', footwear:'RETAIL',
+  jewellery:'RETAIL', jewelry:'RETAIL', gift_shop:'RETAIL', giftshop:'RETAIL',
+  optical:'RETAIL', sports:'RETAIL', medical_store:'RETAIL', medicalstore:'RETAIL',
+  // -- Grocery / supermarket --
   grocery:'GROCERY', supermarket:'SUPERMARKET', kirana:'GROCERY',
+  // -- Everything else Balaji listed: no dedicated dashboard yet, explicit
+  //    DEFAULT so it's a deliberate mapping, not an unmatched fallthrough --
+  pharma_dist:'DEFAULT', clinic:'DEFAULT', diagnostic:'DEFAULT', hospital:'DEFAULT',
+  factory:'DEFAULT', food_processing:'DEFAULT', garment_mfg:'DEFAULT',
+  plastic:'DEFAULT', printing:'DEFAULT', furniture:'DEFAULT',
+  distributor:'DEFAULT', wholesaler:'DEFAULT', transport:'DEFAULT',
+  cold_chain:'DEFAULT', tea_garden:'DEFAULT', farm:'DEFAULT', seeds_agri:'DEFAULT',
+  ca_firm:'DEFAULT', advocate:'DEFAULT', architect:'DEFAULT', consultant:'DEFAULT',
+  event:'DEFAULT', school:'DEFAULT', coaching:'DEFAULT', driving_school:'DEFAULT',
+  real_estate:'DEFAULT', construction:'DEFAULT', property_mgmt:'DEFAULT',
+  auto_dealer:'DEFAULT', service_centre:'DEFAULT', petrol_pump:'DEFAULT',
+  it_company:'DEFAULT', cyber_cafe:'DEFAULT', mobile_repair:'DEFAULT',
+  nbfc:'DEFAULT', chit_fund:'DEFAULT', insurance:'DEFAULT', ngo:'DEFAULT', coop:'DEFAULT',
 };
 
 function _erpResolveIndustryDashboard(role, industryRaw){
@@ -669,9 +724,31 @@ async function erpAuthApi(payload)     { return erpApiRequest(payload, 'V2_AUTH'
 
     /* ── Browser close/tab close → clear session ── */
     window.addEventListener('pagehide', function(e) {
-      if (!e.persisted) {
-        /* Not going into bfcache — actual close or navigation away */
-        _clearStorage();
+      /* FIX ("clicking Reports Hub / Master Hub / Import Hub / Bar
+         Module silently logs the user out"): restaurant-dashboard.html
+         sets window._erpNavigating = true immediately before every one
+         of its in-app location.href navigations (openReportTile, Master
+         Hub, Import Hub, Bar Module, Daily Sales/DSR links — 9 call
+         sites, all doing the same thing) specifically so this handler
+         could tell "leaving to another page of this same app" apart
+         from "actually closing the tab/browser". This handler never
+         checked that flag -- !e.persisted alone can't tell those two
+         cases apart (pagehide fires for ordinary same-site navigation
+         too), so EVERY one of those navigations was already clearing
+         the session and sending a real LOGOUT beacon to the server
+         before the destination page even loaded. The person arrived at
+         Reports/Master Hub/Import Hub/Bar Module already logged out. */
+      if (!e.persisted && !window._erpNavigating) {
+        /* Not going into bfcache and not an in-app navigation — actual
+           close or navigation to somewhere outside this app. */
+        /* FIX ("_clearStorage is not defined" — thrown from here on
+           every navigation away from the page): this idle-timeout block
+           is its own IIFE, separate from the ERP object defined above —
+           there is no local _clearStorage() in this scope, only
+           ERP._clearStorage(). _doLogout() a few lines up already calls
+           it correctly guarded (`typeof ERP !== 'undefined' &&
+           ERP._clearStorage`); this bare call never had that. */
+        if (typeof ERP !== 'undefined' && ERP._clearStorage) ERP._clearStorage();
         const token = localStorage.getItem(ERP_KEYS.SESSION) || '';
         if (token) {
           try {
@@ -682,11 +759,18 @@ async function erpAuthApi(payload)     { return erpApiRequest(payload, 'V2_AUTH'
           } catch(ex) {}
         }
       }
+      /* Reset the flag either way so it doesn't leak into a genuine
+         close/navigation that happens to follow an in-app one without
+         a fresh click (e.g. the destination page itself unloading). */
+      window._erpNavigating = false;
     });
 
     /* Fallback for browsers that don't support pagehide well */
     window.addEventListener('beforeunload', function() {
-      _clearStorage();
+      /* Same _erpNavigating check and same undefined-function fix as
+         the pagehide handler just above. */
+      if (window._erpNavigating) return;
+      if (typeof ERP !== 'undefined' && ERP._clearStorage) ERP._clearStorage();
     });
 
     /* also reset on API calls (user is clearly active) */
