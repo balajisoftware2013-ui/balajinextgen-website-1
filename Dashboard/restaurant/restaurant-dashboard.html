@@ -6019,6 +6019,83 @@ window.__patchERP();
    every scattered button/onclick, since one central check per action
    is far more robust than trying to hide every occurrence across many
    tables including the demo rows. */
+/* ── PAGE-LEVEL ROLE LOCKS ("as per access role, also lock pages") ──
+   BNX_FULL_ACCESS_ROLES above only ever gated individual ACTIONS
+   (Void/Discount/Reservation etc) inside a page — any logged-in role
+   could still open every page in the sidebar/bottom-nav, including
+   Reports, Accounts Ledger, Settings, etc. This adds the missing
+   page-level lock: each page below is only reachable (nav item shown,
+   showPage() allowed) by the roles listed. Pages not listed here stay
+   open to any logged-in role (e.g. Dashboard, POS, KOT, Tables —
+   everyday operational screens every role needs).
+   SUPER_ADMIN and DEVELOPER always pass, same as the existing
+   Super Admin nav-item rule, so this can never lock out the top of
+   the hierarchy. Defaults follow the app's own documented hierarchy
+   (SUPER_ADMIN > DEVELOPER > OWNER > ADMIN > MANAGER > CASHIER/CHEF/
+   WAITER) — adjust the arrays below per-client if a role split
+   should differ. */
+const PAGE_ROLES = {
+  'settlement':             ['OWNER','ADMIN','MANAGER','CASHIER','ACCOUNTANT','STORE_MANAGER','SUPERVISOR','MD','CEO'],
+  'bills-list':             ['OWNER','ADMIN','MANAGER','CASHIER','ACCOUNTANT','STORE_MANAGER','SUPERVISOR','MD','CEO'],
+  'aggregator-settlement':  ['OWNER','ADMIN','MANAGER','ACCOUNTANT','STORE_MANAGER','MD','CEO'],
+  'customer-credit':        ['OWNER','ADMIN','MANAGER','CASHIER','ACCOUNTANT','STORE_MANAGER','MD','CEO'],
+  'due-collection':         ['OWNER','ADMIN','MANAGER','CASHIER','ACCOUNTANT','STORE_MANAGER','MD','CEO'],
+  'accounts-ledger':        ['OWNER','ADMIN','MANAGER','ACCOUNTANT','STORE_MANAGER','MD','CEO'],
+  'analytics':              ['OWNER','ADMIN','MANAGER','ACCOUNTANT','STORE_MANAGER','MD','CEO'],
+  'reports':                ['OWNER','ADMIN','MANAGER','ACCOUNTANT','STORE_MANAGER','MD','CEO'],
+  'whatsapp':                ['OWNER','ADMIN','MANAGER','STORE_MANAGER','MD','CEO'],
+  'dashboard-links':        ['OWNER','ADMIN','MANAGER','STORE_MANAGER','MD','CEO'],
+  'settings':               ['OWNER','ADMIN','MANAGER'],
+  'kitchen':                ['OWNER','ADMIN','MANAGER','CHEF','KITCHEN','SUPERVISOR','STORE_MANAGER','MD','CEO'],
+  'bar':                    ['OWNER','ADMIN','MANAGER','BAR','CAPTAIN','STEWARD','SUPERVISOR','STORE_MANAGER','MD','CEO']
+  // 'super-admin' stays handled by the existing navSuperAdmin logic below
+};
+function bnxPageAllowed(pageId, role){
+  const roleUp = String(role||'').toUpperCase();
+  if (roleUp==='SUPER_ADMIN' || roleUp==='DEVELOPER') return true; // top of hierarchy, always full access
+  if (pageId==='super-admin') return false; // never listed in PAGE_ROLES on purpose — SUPER_ADMIN/DEVELOPER only
+  const allowedRoles = PAGE_ROLES[pageId];
+  if (!allowedRoles) return true; // page not restricted -> open to any logged-in role
+  return allowedRoles.includes(roleUp);
+}
+function bnxGetRoleSafe(){
+  // ERP.getRole() reads ERP_KEYS, which only exists once erp-config.js has
+  // actually finished loading — calling it unguarded (like the two spots
+  // below used to) can throw ReferenceError: ERP_KEYS is not defined and
+  // take the whole page-lock check down with it. loadUserInfo() already
+  // wraps its own ERP.getRole() call in try/catch for exactly this reason;
+  // every other call site needs the same guard, not just that one.
+  try{
+    return (typeof ERP!=='undefined' && ERP.getRole ? String(ERP.getRole()||'') : '').toUpperCase();
+  }catch(e){
+    console.warn('[bnxGetRoleSafe] ERP.getRole() failed, treating as unknown role:', e.message);
+    return '';
+  }
+}
+function bnxApplyPageAccessLocks(){
+  const role = bnxGetRoleSafe();
+  // Sidebar nav items: id extracted from their own onclick="showPage('id',...)"
+  // rather than requiring a separate data-page attribute on every item —
+  // one less place for the page-id and its lock rule to drift apart.
+  document.querySelectorAll('.nav-item[onclick]').forEach(item=>{
+    if (item.id === 'navSuperAdmin') return; // that one already has its own dedicated rule
+    const m = (item.getAttribute('onclick')||'').match(/showPage\('([^']+)'/);
+    if(!m) return;
+    item.style.display = bnxPageAllowed(m[1], role) ? '' : 'none';
+  });
+  // Bottom mobile nav
+  document.querySelectorAll('.bnx-bn-item[data-page]').forEach(btn=>{
+    btn.style.display = bnxPageAllowed(btn.dataset.page, role) ? '' : 'none';
+  });
+  // If the page currently open just became locked for this role (e.g.
+  // after a re-login as a different role in the same tab), bounce to
+  // Dashboard rather than leaving a locked page on screen.
+  const activePage = document.querySelector('.page.active');
+  if (activePage && activePage.id && activePage.id.indexOf('page-')===0){
+    const curId = activePage.id.slice(5);
+    if (!bnxPageAllowed(curId, role)) showPage('dashboard', document.querySelector('.nav-item[onclick*="dashboard"]'));
+  }
+}
 const BNX_FULL_ACCESS_ROLES = ['SUPER_ADMIN','DEVELOPER','OWNER','ADMIN','MANAGER','CASHIER'];
 function bnxHasFullAccess(){
   const role = (typeof ERP!=='undefined' && ERP.getRole ? ERP.getRole() : '').toUpperCase();
@@ -6310,6 +6387,17 @@ function bnxSetBottomNavActive(id){
   document.querySelectorAll('.bnx-bn-item').forEach(b=>b.classList.toggle('active', b.dataset.page===id));
 }
 function showPage(id, el){
+  // PAGE-LEVEL ROLE LOCK: block before anything else renders/loads for
+  // this page. Covers the sidebar/bottom-nav (already hidden by
+  // bnxApplyPageAccessLocks) AND every in-page button/link that calls
+  // showPage('id',...) directly (e.g. "View All →", report card links) —
+  // those aren't hidden per-role, so this is the actual enforcement point.
+  const bnxRole = bnxGetRoleSafe();
+  if (!bnxPageAllowed(id, bnxRole)){
+    if (typeof showNotif === 'function') showNotif('🔒 Your role ('+(bnxRole||'—')+') does not have access to this page.', 'error');
+    else alert('You do not have access to this page.');
+    return;
+  }
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   const pg=document.getElementById('page-'+id); if(pg) pg.classList.add('active');
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
@@ -6476,6 +6564,11 @@ function loadUserInfo(){
     const roleUp = String(role||'').toUpperCase();
     saNav.style.display = (roleUp==='SUPER_ADMIN' || roleUp==='DEVELOPER') ? '' : 'none';
   }
+
+  // Extend the same "hide what this role can't reach" rule from just the
+  // Super Admin item to every page-locked nav item (Settings, Reports,
+  // Accounts Ledger, etc. — see PAGE_ROLES).
+  if (typeof bnxApplyPageAccessLocks === 'function') bnxApplyPageAccessLocks();
 }
 
 
