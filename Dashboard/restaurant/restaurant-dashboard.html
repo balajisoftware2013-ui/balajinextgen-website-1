@@ -7949,6 +7949,20 @@ async function bnxSaveTableStatus(tableNo, patch){
   if (patch.s !== undefined) serverPatch.status = String(patch.s).toUpperCase();
   if (patch.pax !== undefined) serverPatch.covers = patch.pax;
   if (patch.bill !== undefined) serverPatch.bill = patch.bill; // dashboard's simple tableData model doesn't track this yet — passthrough for any future caller that does
+  // FIX ("captain assignment ... according user master client database
+  // can load and add"): added so bnxAssignCaptain() (Table Management →
+  // table card → Assign Captain) can actually persist past a page
+  // reload. Sent as `captain`, matching 04_TABLE_MASTER's own CAPTAIN
+  // column (see the sheet layout comment above bnxSyncTableMasterFromBackend).
+  // FLAGGED, NOT GUESSED: the confirmed SAVE_TABLE_STATUS server contract
+  // (20_POSBillingHandlers.gs) only reads status/covers/bill today — it
+  // will need a matching `if (req.captain !== undefined) ...write to
+  // CAPTAIN column...` line added server-side for this to actually reach
+  // the sheet. Until then this still updates tableData + localStorage
+  // immediately (same honest-local-then-server pattern as every other
+  // field here), so nothing is lost, it just won't survive a hard sync
+  // from the sheet until that one server-side line is added.
+  if (patch.captain !== undefined) serverPatch.captain = patch.captain;
   const payload = Object.assign({ requestId, tableNo }, serverPatch);
   try{
     const r = await gasApi('SAVE_TABLE_STATUS', payload);
@@ -8148,7 +8162,15 @@ function bnxBuildRichTblsFromMaster(){
     const type = t.s==='occupied' ? (isRunning?'running':'occupied') : t.s; // status decides colour — zone is a label only, never overrides it
     const tags = [t.s, type, zone.toLowerCase().replace(/\s+/g,'')].filter((v,i,a)=>a.indexOf(v)===i);
     const guests = (t.s==='occupied'||t.s==='reserved') ? (t.c||'') : '';
-    const captain = bnxLastWaiterForTable(num) || 'Unassigned';
+    // FIX ("captain assignment ... according user master client database
+    // can load and add"): this used to ALWAYS overwrite whatever real
+    // CAPTAIN value came from 04_TABLE_MASTER (t.captain, set by
+    // bnxSyncTableMasterFromBackend / by the new Assign Captain control
+    // below) with a GUESS — whichever waiter's name happened to be on
+    // the last KOT sent for this table. An explicit assignment is now
+    // trusted first; the last-KOT-waiter guess is only used as a
+    // fallback when nobody has actually been assigned yet.
+    const captain = t.captain || bnxLastWaiterForTable(num) || 'Unassigned';
     let actions;
     if (t.s==='available') actions=[{l:'Start Order',p:'pos'},{l:'Reserve',p:'reservation'}];
     else if (t.s==='reserved') actions=[{l:'View',p:'reservation'},{l:'Start Order',p:'pos'}];
@@ -8312,7 +8334,17 @@ function renderTableGallery(){
         </div>
         <div style="background:var(--surface2,#f7f4ee);border-radius:10px;padding:10px 12px;">
           <div style="font-size:9.5px;font-weight:800;color:var(--text3);text-transform:uppercase;letter-spacing:.4px;">Captain</div>
-          <div style="font-size:13px;font-weight:700;margin-top:3px;">${t.captain}</div>
+          <!-- FIX ("captain assignment ... according user master client
+               database can load and add"): Captain used to be a plain
+               read-only label, guessed from whichever waiter last sent a
+               KOT for this table — no actual way to assign one. Now a
+               real dropdown, populated from the SAME live USER_MASTER
+               staff source the Steward dropdown uses (bnxFetchStaffList),
+               with "+ Add New Steward…" if the person isn't in the list
+               yet. Selecting one saves immediately via bnxAssignCaptain(). -->
+          <select id="tgalCaptainSel" class="fi fsel" style="width:100%;margin-top:5px;font-size:12.5px;padding:6px 8px;" onchange="bnxAssignCaptain('${t.id}', this.value)">
+            <option value="">Loading staff…</option>
+          </select>
         </div>
       </div>
       <div style="font-size:11px;color:var(--text3);margin-bottom:16px;">${t.guests?`Guests: ${t.guests} · `:''}${t.extra}</div>
@@ -8337,6 +8369,55 @@ function renderTableGallery(){
     </div>
     <div style="padding:14px 22px 20px;display:flex;gap:8px;flex-wrap:wrap;border-top:1px solid var(--border,#eee);">${acts}</div>
   `;
+  bnxPopulateCaptainSelect(t.id, t.captain||'');
+}
+/* Fills the Table Detail modal's Assign Captain dropdown from the real
+   live staff list (same source as the Steward dropdown — see
+   bnxFetchStaffList). Runs async, after the modal's own innerHTML is
+   already on screen, so opening the modal never blocks on the network. */
+async function bnxPopulateCaptainSelect(tableId, currentCaptain){
+  const sel = document.getElementById('tgalCaptainSel');
+  if (!sel) return; // modal was closed/changed before this resolved
+  const staff = await bnxFetchStaffList(['CAPTAIN','STEWARD','WAITER']);
+  const optsHtml = staff.map(s=>{
+    const val = s.USER_CODE || s.FULL_NAME;
+    return `<option value="${val}" data-name="${s.FULL_NAME}">${s.FULL_NAME}${s.ROLE?' ('+s.ROLE+')':''}</option>`;
+  }).join('');
+  sel.innerHTML = '<option value="">Unassigned</option>' + optsHtml + '<option value="__add_new__">+ Add New Steward…</option>';
+  if (currentCaptain){
+    const match = Array.from(sel.options).find(o=>o.value===currentCaptain || o.dataset.name===currentCaptain);
+    if (match){ match.selected = true; }
+    else {
+      // whatever's currently assigned isn't in the live staff list (e.g. a
+      // legacy free-text name from before this dropdown existed) — keep it
+      // VISIBLE and selected instead of silently reverting the table to
+      // "Unassigned" the moment this control loads.
+      const opt = document.createElement('option');
+      opt.value = currentCaptain; opt.textContent = currentCaptain + ' (not in staff list)'; opt.selected = true;
+      sel.appendChild(opt);
+    }
+  }
+}
+/* Saves a Captain assignment for one table: updates the on-screen card
+   immediately, then persists via bnxSaveTableStatus (captain field —
+   see the FLAGGED note on that function for the one server-side line
+   still needed for this to survive a hard resync from the sheet). */
+async function bnxAssignCaptain(tableId, value){
+  if (value === '__add_new__'){
+    addStewardDlg(function(name){ bnxAssignCaptain(tableId, name); });
+    return;
+  }
+  const sel = document.getElementById('tgalCaptainSel');
+  const opt = sel ? Array.from(sel.options).find(o=>o.value===value) : null;
+  const name = value ? (opt?.dataset.name || opt?.textContent || value) : '';
+  const t = tableData.find(x=>x.n===tableId);
+  if (t) t.captain = name;
+  if (typeof buildRichTbls === 'function') buildRichTbls();
+  if (typeof buildFloor === 'function'){ buildFloor('floorMap'); buildFloor('dashMap'); }
+  await bnxSaveTableStatus(tableId, { captain: name });
+  if (typeof showNotif === 'function'){
+    showNotif(name ? ('✅ '+name+' assigned as Captain for '+tableId) : ('Captain unassigned for '+tableId), 'success');
+  }
 }
 
 /* FIX ("+table record in table master, if click then print then
@@ -18396,12 +18477,17 @@ function bnxGetEmployees(){
   try{ return JSON.parse(localStorage.getItem(bnxEmpKey())||'[]'); }catch(e){ return []; }
 }
 function bnxSaveEmployees(list){ localStorage.setItem(bnxEmpKey(), JSON.stringify(list)); }
-async function loadWaiterList(){
-  const selBm = document.getElementById('bm-bf-waiter');
-  const selPos = document.getElementById('waiterSel');
+/* FIX ("captain assignment ... according user master client database can
+   load and add"): pulled the real-then-local staff lookup that used to
+   live only inside loadWaiterList() out into its own reusable function,
+   so the new Table Management "Assign Captain" control (see
+   bnxPopulateCaptainSelect() below) reads from the EXACT SAME live
+   USER_MASTER source — no separate/duplicated staff list to drift out
+   of sync with the Steward dropdown. */
+async function bnxFetchStaffList(roles){
   let staff = [];
   try{
-    const res = await erpApi({action:'GET_STAFF_LIST', roles:['STEWARD','WAITER','CAPTAIN']}, 'V2_CORE');
+    const res = await erpApi({action:'GET_STAFF_LIST', roles: roles||['STEWARD','WAITER','CAPTAIN']}, 'V2_CORE');
     if (res && res.success && res.data && res.data.staff && res.data.staff.length){
       staff = res.data.staff;
     }
@@ -18410,6 +18496,12 @@ async function loadWaiterList(){
     const localStaff = bnxGetEmployees();
     if (localStaff.length) staff = localStaff;
   }
+  return staff;
+}
+async function loadWaiterList(){
+  const selBm = document.getElementById('bm-bf-waiter');
+  const selPos = document.getElementById('waiterSel');
+  const staff = await bnxFetchStaffList(['STEWARD','WAITER','CAPTAIN']);
   const optsHtml = staff.map(s=>`<option value="${s.USER_CODE||s.FULL_NAME}">${s.FULL_NAME}${s.ROLE?' ('+s.ROLE+')':''}</option>`).join('');
   const addOpt = '<option value="__add_new__">+ Add New Steward…</option>';
   const emptyLabel = 'No staff added yet — use "+ Add New Steward…"';
@@ -18420,6 +18512,7 @@ async function loadWaiterList(){
    dropdown — opens a tiny prompt, saves into the Employee
    Master, and reloads both dropdowns with the real name
    selected (no page reload, no separate screen needed). */
+
 function bnxHandleWaiterSelect(sel){
   if (sel.value !== '__add_new__') return;
   addStewardDlg(function(newName, code){
