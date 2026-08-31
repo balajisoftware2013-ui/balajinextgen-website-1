@@ -10,7 +10,24 @@ const ASSETS = [
 
 self.addEventListener('install', (e) => {
   self.skipWaiting();
-  e.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(ASSETS)));
+  // FIX ("install app not show" — while other pages in the suite
+  // install fine): cache.addAll() is all-or-nothing — if even ONE of
+  // these 4 files 404s on the server (a typo'd path, an icon that
+  // was never actually uploaded), the whole install event rejects and
+  // this service worker never finishes installing. A browser's native
+  // "Add to Home Screen" / install prompt requires an ACTIVE service
+  // worker as one of its installability criteria — so one missing
+  // icon file could silently block the real install prompt entirely,
+  // not just this app's own shell caching. Caches each asset
+  // independently instead: one missing file is logged and skipped,
+  // it no longer takes the rest down with it.
+  e.waitUntil(
+    caches.open(CACHE).then((cache) =>
+      Promise.all(ASSETS.map((url) =>
+        cache.add(url).catch((err) => console.warn('[sw] could not cache', url, err))
+      ))
+    )
+  );
 });
 
 self.addEventListener('activate', (e) => {
