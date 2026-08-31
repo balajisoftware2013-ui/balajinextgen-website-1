@@ -1856,16 +1856,30 @@ function renderOrderHistory(){
   const source = realBills.length ? realBills.map(bnxBillToHistRow) : ORDER_HISTORY;
   const myName = bnxCurrentStewardName();
   let filtered = realBills.length ? source.filter(o=>ordHistInRange(o.rawDate)) : source.filter(o=>ordHistInRange(o.date));
-  // "his order only" — real bills are matched against the logged-in
-  // steward/captain's own name (same field bnxSaveBill already stores
-  // as CREATED_BY/waiter). Demo rows are left unfiltered — there's no
-  // real identity to match a hardcoded sample against.
-  if (realBills.length && myName) filtered = filtered.filter(o => (o.createdBy||'').trim().toLowerCase() === myName.trim().toLowerCase());
+  /* PASS #39 FIX ("steward his own order can check according filter
+     order"): the previous guard was `if (realBills.length && myName)`
+     — if myName ever came back empty (session not fully loaded yet,
+     a genuinely blank profile, storage cleared mid-session), the
+     per-steward filter was SKIPPED ENTIRELY, and every real bill in
+     the restaurant was shown instead of none — the exact opposite of
+     "he can check only his own order." This fails CLOSED instead:
+     an unresolved identity now shows zero real bills (with an honest
+     message) rather than silently falling open to everyone else's. */
+  const identityKnown = !!myName;
+  if (realBills.length) {
+    filtered = identityKnown
+      ? filtered.filter(o => (o.createdBy||'').trim().toLowerCase() === myName.trim().toLowerCase())
+      : [];
+  }
   if (orderHistStatus) filtered = filtered.filter(o => o.status === orderHistStatus);
   document.getElementById('hist-count').textContent=`${filtered.length} order${filtered.length===1?'':'s'}`;
   const demoBanner = (!realBills.length && filtered.length)
     ? '<div style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;border-radius:8px;padding:8px 12px;margin-bottom:9px;font-size:11px;font-weight:700;text-align:center;">⚠️ DEMO DATA — not real orders</div>'
     : '';
+  if (realBills.length && !identityKnown) {
+    list.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text3);font-size:12.5px;">⚠️ Could not verify your login — please log out and back in to see your order history.</div>';
+    return;
+  }
   if(!filtered.length){ list.innerHTML=demoBanner+'<div style="text-align:center;padding:40px;color:var(--text3);font-size:12.5px;">No orders in this range</div>'; return; }
   list.innerHTML=demoBanner+filtered.map(o=>{
     const total = o.total!==undefined ? o.total : o.items.reduce((s,i)=>s+i.qty*i.rate,0);
@@ -2099,7 +2113,43 @@ async function confirmPayment(calc){
   const now = new Date();
   const dt = now.toLocaleDateString('en-GB').split('/').join('-'); // dd-mm-yyyy, matches dashboard's b.dt format
   const tm = now.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});
-  const stewardName = document.getElementById('prof-name')?.textContent || 'Steward';
+  /* PASS #38 FIX ("his order history filter fix ... can check only his
+     order also"): this used to read document.getElementById('prof-name')
+     .textContent for the name written onto the bill (CREATED_BY/waiter),
+     while renderOrderHistory()/bnxRenderMyStats() compare against
+     bnxGetStewardName() (reads FULL_NAME/LOGIN_ID straight from the
+     stored ERP_USER session object). These are TWO SEPARATE fallback
+     chains that can silently disagree: at login (see the LOGIN handler
+     above), prof-name is set to `result.FULL_NAME || result.full_name
+     || u` where `u` is whatever raw text the person typed into the
+     login box, while bnxGetStewardName() falls back to `u.LOGIN_ID ||
+     u.loginId` read off the STORED account object instead — a
+     different value whenever FULL_NAME isn't set on that account, or
+     differs by case/whitespace from what was typed. For any steward
+     account without a FULL_NAME, this meant every bill they created
+     saved a name the History filter could never match — so "his order
+     only" showed a permanently empty list for exactly the accounts
+     most likely to trigger the bug. Now sourced from the same single
+     function the filters already use, so the two can never diverge. */
+  const stewardName = bnxGetStewardName() || document.getElementById('prof-name')?.textContent || 'Steward';
+  /* PASS #38 NEW ("backdated order" — a bill taken while offline only
+     reaches the server once bnxQueuePending's retry succeeds, which can
+     be hours or a full calendar day later): draftBill.dt/tm below were
+     always computed correctly at the moment the steward actually took
+     the order, but bnxSaveBill() on the backend has never read them —
+     it unconditionally stamps BILL_DATE/BILL_TIME from the SERVER's
+     "now" at whatever moment the request finally executes (confirmed by
+     reading bnxSaveBill's own bnxNowParts_() call). A bill genuinely
+     taken on Day 1 but synced on Day 2 was silently re-dated to Day 2 —
+     it could never show up correctly as "his" Day-1 order in History,
+     no matter how the filter itself is fixed, because the underlying
+     BILL_DATE was already wrong by the time it reached the sheet. These
+     two explicit, unambiguous fields let a patched backend (see the
+     companion backend fix) honor the real order date instead of the
+     sync date, without touching the dt/tm fields the local register and
+     bnxBillToHistRow already rely on. */
+  const billDateISO = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');
+  const billTimeISO = String(now.getHours()).padStart(2,'0')+':'+String(now.getMinutes()).padStart(2,'0')+':'+String(now.getSeconds()).padStart(2,'0');
 
   // P0 REWRITE ("Never tell the user 'Saved' when only localStorage
   // has saved it" — the audit specifically called this out as the
@@ -2119,7 +2169,14 @@ async function confirmPayment(calc){
   const draftBill = {
     dt, tm, table: selTable.id, customer: custName||'GENERAL CUSTOMER', mob: custMobile,
     sub: calc.sub, gst: calc.gst, total: calc.total, pay: mode,
-    status: mode==='DUE' ? 'Pending' : 'Paid', waiter: stewardName, itemsDetail: calc.items
+    status: mode==='DUE' ? 'Pending' : 'Paid', waiter: stewardName, itemsDetail: calc.items,
+    // PASS #38 — see the comment above where these are computed: the
+    // real date/time the order was taken, sent explicitly so a delayed
+    // (offline-queued) sync doesn't get silently re-dated to whenever
+    // the retry happens to succeed. bnxQueuePending re-sends this exact
+    // object unchanged on retry, so these stay correct no matter how
+    // long the bill sits in the outbox.
+    billDate: billDateISO, billTime: billTimeISO
   };
 
   const res = await gasApi('SAVE_BILL', { requestId, bill: draftBill }, 'V2_CORE');
@@ -2415,7 +2472,21 @@ async function placeOrder(){
     return { id, name:m?m.name:id, qty, price:m?m.price:0, cat:m?m.cat:'', gst:m?(m.gst||0):0 };
   });
   const amount = items.reduce((a,i)=>a+i.price*i.qty,0);
-  const stewardName = document.getElementById('prof-name')?.textContent || 'Steward';
+  // PASS #38 — same fix as confirmPayment() above: source the name that
+  // gets written onto the order (STARTED_BY/waiter) from the same
+  // function the History/My-Tables/My-Stats filters compare against,
+  // so an order this steward places can never fail to match "his own"
+  // later just because prof-name's login-time fallback differed from
+  // bnxGetStewardName()'s.
+  const stewardName = bnxGetStewardName() || document.getElementById('prof-name')?.textContent || 'Steward';
+  // PASS #38 — same backdate-preservation fix as confirmPayment()'s
+  // billDate/billTime: captured once, here, at the moment the order is
+  // actually placed, so a queued/delayed sync (bnxQueuePending resends
+  // this exact object unchanged on retry) can't get silently re-dated
+  // to whenever the retry happens to reach the server.
+  const _placeNow = new Date();
+  const orderDateISO = _placeNow.getFullYear()+'-'+String(_placeNow.getMonth()+1).padStart(2,'0')+'-'+String(_placeNow.getDate()).padStart(2,'0');
+  const orderTimeISO = String(_placeNow.getHours()).padStart(2,'0')+':'+String(_placeNow.getMinutes()).padStart(2,'0')+':'+String(_placeNow.getSeconds()).padStart(2,'0');
 
   // P0 REWRITE ("Never tell the user 'Saved' when only localStorage
   // has saved it"): this used to generate a local KOT number, write
@@ -2433,7 +2504,8 @@ async function placeOrder(){
   toast('Sending KOT…','info');
 
   const res = await gasApi('SAVE_ORDER', {
-    requestId, tableId:selTable.id, orderType:'KITCHEN', waiter:stewardName, covers:'', items
+    requestId, tableId:selTable.id, orderType:'KITCHEN', waiter:stewardName, covers:'', items,
+    orderDate: orderDateISO, orderTime: orderTimeISO
   }, 'V2_CORE');
 
   if(btn){ btn.disabled = false; btn.textContent = '📤 Send KOT'; }
@@ -2441,7 +2513,7 @@ async function placeOrder(){
   if(!res || !res.success){
     // Genuine failure or offline — queue it, tell the truth about the
     // state ("Pending Sync"), never pretend it's on the dashboard yet.
-    bnxQueuePending('SAVE_ORDER', { requestId, tableId:selTable.id, orderType:'KITCHEN', waiter:stewardName, covers:'', items }, requestId, 'kot');
+    bnxQueuePending('SAVE_ORDER', { requestId, tableId:selTable.id, orderType:'KITCHEN', waiter:stewardName, covers:'', items, orderDate: orderDateISO, orderTime: orderTimeISO }, requestId, 'kot');
     toast('📴 Could not reach server — order queued, will send when back online','error');
     bnxSetLiveStatus('offline');
     // Still reflected locally so THIS device's own screens are usable
