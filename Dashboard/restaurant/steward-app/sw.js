@@ -1,6 +1,6 @@
 // Steward App — service worker
 // Caches the app shell so it installs as a PWA and opens even with a flaky connection.
-const CACHE = 'steward-app-v1';
+const CACHE = 'steward-app';
 const ASSETS = [
   './steward-mobile.html',
   './manifest.json',
