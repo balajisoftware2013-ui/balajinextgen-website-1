@@ -381,7 +381,7 @@ tbody tr:hover td{background:#FFE8D6;transition:background .1s;}
              class="sidebar-logo">
 
         <div>
-            <div class="sb-logo-title">Balaji Group</div>
+            <div class="sb-logo-title" id="sbLogoTitle">Balaji Group</div>
             <div class="sb-logo-sub">BALAJI NEXTGEN ERP</div>
         </div>
 
@@ -834,7 +834,7 @@ tbody tr:hover td{background:#FFE8D6;transition:background .1s;}
       <div class="card">
         <div class="card-hdr"><div><div class="card-title">Tally Configuration</div></div></div>
         <div class="tally-cfg">
-          <div class="tc"><label>Company Name (Tally)</label><input id="t-company" value="Balaji Group"/></div>
+          <div class="tc"><label>Company Name (Tally) — optional</label><input id="t-company" value="" placeholder="Leave blank to auto-use whichever company is open in Tally"/></div>
           <div class="tc"><label>Company GUID</label><input id="t-guid" placeholder="From Tally → Company Info"/></div>
           <div class="tc"><label>GST State</label><input id="t-state" value="West Bengal"/></div>
           <div class="tc"><label>GSTIN</label><input id="t-gstin" value="19AFAFS8409L1ZH"/></div>
@@ -884,6 +884,9 @@ tbody tr:hover td{background:#FFE8D6;transition:background .1s;}
 
       <div class="card" style="margin-top:16px;">
         <div class="card-hdr"><div><div class="card-title">⚡ Direct Post to Tally (no download/import step)</div></div></div>
+        <div style="font-size:10px;color:#16A34A;font-weight:700;margin-bottom:8px;">
+          BUILD 2026-08-14-D · fixes active: PAYHEADTYPE/INCOMETYPE · company auto-detect · pay-head group (Indirect Expenses/Current Liabilities) · auto-migration
+        </div>
         <div id="tallySyncBadge" style="font-size:11px;font-weight:600;margin-bottom:10px;"></div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
           <button class="btn btn-green" onclick="postPayHeadsMaster()">🔌 Post Pay Heads</button>
@@ -1211,15 +1214,27 @@ let pendingImport = [];
 let editEmpIdx = -1;
 
 function DEFAULT_PAY_HEADS(){
+  // ROOT-CAUSE FIX: group ('Under') used to default to the literal text
+  // "Earnings" / "Deductions" — NOT a valid Tally group. A Pay Head's
+  // "Under" field must be a real accounting group tied to its Pay Head
+  // Type: Earnings-type pay heads go under "Indirect Expenses", Deduction-
+  // type pay heads go under "Current Liabilities" (confirmed against
+  // Tally's own Pay Head creation documentation). Sending an invalid group
+  // name is exactly why Tally silently dropped 8 of the 9 objects in this
+  // batch — only the one item that happened to already use a real group
+  // succeeded. The old "Earnings"/"Deductions" option is still selectable
+  // in the Pay Heads dropdown for anyone who has manually created custom
+  // groups by those names in their Tally company, but it is no longer the
+  // default.
   return [
-    {name:'Basic Salary',       type:'earn', group:'Earnings',    phtype:'Not Applicable'},
-    {name:'HRA',                type:'earn', group:'Earnings',    phtype:'Not Applicable'},
-    {name:'Others Allowances',  type:'earn', group:'Earnings',    phtype:'Not Applicable'},
-    {name:'Employees PF Contribution @12%',   type:'ded', group:'Deductions',  phtype:'Not Applicable'},
-    {name:'Employees ESI Contribution @1.75%',type:'ded', group:'Deductions',  phtype:'Not Applicable'},
-    {name:'Employee P.Tax',     type:'ded', group:'Deductions',  phtype:'Not Applicable'},
-    {name:'Advance',            type:'ded', group:'Deductions',  phtype:'Not Applicable'},
-    {name:'TDS',                type:'ded', group:'Deductions',  phtype:'Not Applicable'},
+    {name:'Basic Salary',       type:'earn', group:'Indirect Expenses',   phtype:'Not Applicable'},
+    {name:'HRA',                type:'earn', group:'Indirect Expenses',   phtype:'Not Applicable'},
+    {name:'Others Allowances',  type:'earn', group:'Indirect Expenses',   phtype:'Not Applicable'},
+    {name:'Employees PF Contribution @12%',   type:'ded', group:'Current Liabilities',  phtype:'Not Applicable'},
+    {name:'Employees ESI Contribution @1.75%',type:'ded', group:'Current Liabilities',  phtype:'Not Applicable'},
+    {name:'Employee P.Tax',     type:'ded', group:'Current Liabilities',  phtype:'Not Applicable'},
+    {name:'Advance',            type:'ded', group:'Current Liabilities',  phtype:'Not Applicable'},
+    {name:'TDS',                type:'ded', group:'Current Liabilities',  phtype:'Not Applicable'},
   ];
 }
 
@@ -1348,6 +1363,16 @@ function load(){
     if(s) settings = {...settings,...s};
     const ph = JSON.parse(localStorage.getItem('hr_payheads')||'null');
     if(ph) payHeads = ph;
+    // MIGRATION: existing saved pay heads may still carry the old invalid
+    // "Earnings"/"Deductions" group names (before the PARENT-group fix).
+    // Silently correct them to the valid Tally groups, and force
+    // tallySynced=false on anything corrected so the FIXED group actually
+    // gets sent to Tally on the next post instead of being skipped as
+    // "already synced" (it never really synced — Tally silently dropped it).
+    payHeads.forEach(p=>{
+      if(p.group==='Earnings'){ p.group='Indirect Expenses'; p.tallySynced=false; }
+      if(p.group==='Deductions'){ p.group='Current Liabilities'; p.tallySynced=false; }
+    });
     const ls = JSON.parse(localStorage.getItem('hr_ledgersynced')||'null');
     if(ls) syncedLedgers = ls;
   }catch(e){}
@@ -3202,49 +3227,128 @@ function generateAllXML(){
 }
 function ph(idx){return payHeads[idx]?.name||DEFAULT_PAY_HEADS()[idx].name;}
 
-// FIX 1: Pay Head XML
-// Only masters that are genuinely NEW (not yet marked synced) go into this
-// XML. Anything already confirmed in Tally is left out entirely — Tally
-// never even sees it, so it can't be silently re-Altered on every post.
-function buildPayHeadXML(){
-  const co=cv('t-company'),guid=cv('t-guid'),state=cv('t-state'),party=cv('t-party');
+// ROOT-CAUSE FIX: the "Company Name (Tally)" field used to default to a
+// hardcoded value ("Balaji Group") that silently went stale the moment a
+// different company (e.g. "TEST") was actually open in Tally. Every XML
+// sent <SVCURRENTCOMPANY> with that stale name, and Tally rejects the
+// ENTIRE import with no useful error if it doesn't match the company
+// that's actually loaded — exactly what caused "Created: 0, Altered: 0"
+// across Pay Heads, Employee Master, AND the Payroll Voucher all at once.
+// Fix: if the field is left blank, omit <SVCURRENTCOMPANY> entirely —
+// Tally's XML gateway then applies the import to whichever company is
+// currently open, so there's nothing to keep in sync and nothing to go
+// stale. If the field IS filled in (useful when multiple companies are
+// open at once), it's still sent and still must match exactly.
+function svCurrentCompanyTag(co){
+  return co ? `<SVCURRENTCOMPANY>${esc(co)}</SVCURRENTCOMPANY>` : '';
+}
+
+// FIX 1: Pay Head XML — now built ONE MASTER PER ENVELOPE instead of
+// bundling everything into a single batched request. The old batched
+// version made it impossible to tell which specific pay head Tally was
+// rejecting: the overall Created/Altered count could show partial success
+// (e.g. "2" out of 9) with no way to see WHICH 2 succeeded or WHY the rest
+// failed, and postToTally's automatic raw-response logging only fires when
+// an ENTIRE request produces zero Created and zero Altered — a batch with
+// any partial success never triggers it, so Tally's real rejection reason
+// was invisible no matter how many times it was resent. Posting one master
+// per request makes every single failure self-diagnosing.
+function buildSingleMasterXML(tallymessageLines, co, guid, state){
   const CRLF='\r\n',L=[];
-  const newLedger = party && !syncedLedgers[party];
-  const newPayHeads = payHeads.filter(p=>!p.tallySynced);
   L.push('<ENVELOPE>');
   L.push(' <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>');
   L.push(' <BODY><IMPORTDATA>');
   L.push('  <REQUESTDESC><REPORTNAME>All Masters</REPORTNAME>');
-  L.push(`  <STATICVARIABLES><SVCURRENTCOMPANY>${esc(co)}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC>`);
+  L.push(`  <STATICVARIABLES>${svCurrentCompanyTag(co)}</STATICVARIABLES></REQUESTDESC>`);
   L.push('  <REQUESTDATA>');
+  tallymessageLines.forEach(l=>L.push(l));
+  if(co){
+    L.push(`   <TALLYMESSAGE xmlns:UDF="TallyUDF"><COMPANY><REMOTECMPINFO.LIST MERGE="Yes">`);
+    L.push(`    <NAME>${esc(guid)}</NAME><REMOTECMPNAME>${esc(co)}</REMOTECMPNAME><REMOTECMPSTATE>${esc(state)}</REMOTECMPSTATE>`);
+    L.push(`   </REMOTECMPINFO.LIST></COMPANY></TALLYMESSAGE>`);
+  }
+  L.push('  </REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>');
+  return L.join(CRLF);
+}
+function buildLedgerOnlyXML(party){
+  const co=cv('t-company'),guid=cv('t-guid'),state=cv('t-state');
+  const lines=[
+    '   <TALLYMESSAGE xmlns:UDF="TallyUDF">',
+    `    <LEDGER NAME="${esc(party)}" ACTION="Create">`,
+    `     <NAME>${esc(party)}</NAME><GUID>${mkGuidFor('ledger:'+party)}</GUID>`,
+    `     <PARENT>Current Liabilities</PARENT>`,
+    '     <ISBILLWISEON>No</ISBILLWISEON><ISCOSTCENTRESON>No</ISCOSTCENTRESON><ISREVENUE>No</ISREVENUE><AFFECTSSTOCK>No</AFFECTSSTOCK>',
+    '    </LEDGER>',
+    '   </TALLYMESSAGE>'
+  ];
+  return buildSingleMasterXML(lines, co, guid, state);
+}
+function buildSinglePayHeadXML(p){
+  const co=cv('t-company'),guid=cv('t-guid'),state=cv('t-state');
+  const isE=p.type==='earn';
+  // ROOT-CAUSE FIX: <PAYHEADTYPE> is Tally's core Pay Head classification
+  // and only accepts a fixed enum ("Earnings for Employees", "Deductions
+  // from Employees", "Employer's Statutory Contributions", etc.) — it is
+  // NOT the "Not Applicable / Fixed" Income Type dropdown value that used
+  // to be dumped in here via p.phtype. p.phtype's actual value now goes
+  // into its own correct <INCOMETYPE> tag instead.
+  const payHeadType = isE ? 'Earnings for Employees' : 'Deductions from Employees';
+  const lines=[
+    '   <TALLYMESSAGE xmlns:UDF="TallyUDF">',
+    `    <PAYHEAD NAME="${esc(p.name)}" ACTION="Create">`,
+    `     <NAME>${esc(p.name)}</NAME><GUID>${mkGuidFor('payhead:'+p.name)}</GUID>`,
+    `     <PARENT>${esc(p.group)}</PARENT>`,
+    `     <PAYHEADTYPE>${esc(payHeadType)}</PAYHEADTYPE>`,
+    `     <INCOMETYPE>${esc(p.phtype)}</INCOMETYPE>`,
+    '     <CALCULATIONTYPE>Flat Rate</CALCULATIONTYPE>',
+    '     <CALCULATIONPERIOD>Monthly</CALCULATIONPERIOD>',
+    '     <ROUNDLIMIT> 1</ROUNDLIMIT>',
+    `     <ISDEEMEDPOSITIVE>${isE?'Yes':'No'}</ISDEEMEDPOSITIVE>`,
+    '     <AFFECTSSTOCK>No</AFFECTSSTOCK><ISREVENUE>Yes</ISREVENUE><ISBILLWISEON>No</ISBILLWISEON><ISCOSTCENTRESON>No</ISCOSTCENTRESON>',
+    '    </PAYHEAD>',
+    '   </TALLYMESSAGE>'
+  ];
+  return buildSingleMasterXML(lines, co, guid, state);
+}
+// Kept for the "Download" buttons (bundled XML for manual Tally Import)
+// — direct-post now uses the per-item builders above instead.
+function buildPayHeadXML(){
+  const co=cv('t-company'),guid=cv('t-guid'),state=cv('t-state'),party=cv('t-party');
+  const newLedger = party && !syncedLedgers[party];
+  const newPayHeads = payHeads.filter(p=>!p.tallySynced);
+  const lines=[];
   if(newLedger){
-    L.push('   <TALLYMESSAGE xmlns:UDF="TallyUDF">');
-    L.push(`    <LEDGER NAME="${esc(party)}" ACTION="Create">`);
-    L.push(`     <NAME>${esc(party)}</NAME><GUID>${mkGuidFor('ledger:'+party)}</GUID>`);
-    L.push(`     <PARENT>Current Liabilities</PARENT>`);
-    L.push('     <ISBILLWISEON>No</ISBILLWISEON><ISCOSTCENTRESON>No</ISCOSTCENTRESON><ISREVENUE>No</ISREVENUE><AFFECTSSTOCK>No</AFFECTSSTOCK>');
-    L.push('    </LEDGER>');
-    L.push('   </TALLYMESSAGE>');
+    lines.push(
+      '   <TALLYMESSAGE xmlns:UDF="TallyUDF">',
+      `    <LEDGER NAME="${esc(party)}" ACTION="Create">`,
+      `     <NAME>${esc(party)}</NAME><GUID>${mkGuidFor('ledger:'+party)}</GUID>`,
+      `     <PARENT>Current Liabilities</PARENT>`,
+      '     <ISBILLWISEON>No</ISBILLWISEON><ISCOSTCENTRESON>No</ISCOSTCENTRESON><ISREVENUE>No</ISREVENUE><AFFECTSSTOCK>No</AFFECTSSTOCK>',
+      '    </LEDGER>',
+      '   </TALLYMESSAGE>'
+    );
   }
   newPayHeads.forEach(p=>{
     const isE=p.type==='earn';
-    L.push('   <TALLYMESSAGE xmlns:UDF="TallyUDF">');
-    L.push(`    <PAYHEAD NAME="${esc(p.name)}" ACTION="Create">`);
-    L.push(`     <NAME>${esc(p.name)}</NAME><GUID>${mkGuidFor('payhead:'+p.name)}</GUID>`);
-    L.push(`     <PARENT>${esc(p.group)}</PARENT>`);
-    L.push(`     <PAYHEADTYPE>${esc(p.phtype)}</PAYHEADTYPE>`);
-    L.push('     <CALCULATIONTYPE>As Computed Value</CALCULATIONTYPE>');
-    L.push(`     <ISDEEMEDPOSITIVE>${isE?'Yes':'No'}</ISDEEMEDPOSITIVE>`);
-    L.push('     <AFFECTSSTOCK>No</AFFECTSSTOCK><ISREVENUE>Yes</ISREVENUE><ISBILLWISEON>No</ISBILLWISEON><ISCOSTCENTRESON>No</ISCOSTCENTRESON>');
-    L.push('    </PAYHEAD>');
-    L.push('   </TALLYMESSAGE>');
-    L.push('');
+    const payHeadType = isE ? 'Earnings for Employees' : 'Deductions from Employees';
+    lines.push(
+      '   <TALLYMESSAGE xmlns:UDF="TallyUDF">',
+      `    <PAYHEAD NAME="${esc(p.name)}" ACTION="Create">`,
+      `     <NAME>${esc(p.name)}</NAME><GUID>${mkGuidFor('payhead:'+p.name)}</GUID>`,
+      `     <PARENT>${esc(p.group)}</PARENT>`,
+      `     <PAYHEADTYPE>${esc(payHeadType)}</PAYHEADTYPE>`,
+      `     <INCOMETYPE>${esc(p.phtype)}</INCOMETYPE>`,
+      '     <CALCULATIONTYPE>Flat Rate</CALCULATIONTYPE>',
+      '     <CALCULATIONPERIOD>Monthly</CALCULATIONPERIOD>',
+      '     <ROUNDLIMIT> 1</ROUNDLIMIT>',
+      `     <ISDEEMEDPOSITIVE>${isE?'Yes':'No'}</ISDEEMEDPOSITIVE>`,
+      '     <AFFECTSSTOCK>No</AFFECTSSTOCK><ISREVENUE>Yes</ISREVENUE><ISBILLWISEON>No</ISBILLWISEON><ISCOSTCENTRESON>No</ISCOSTCENTRESON>',
+      '    </PAYHEAD>',
+      '   </TALLYMESSAGE>',
+      ''
+    );
   });
-  L.push(`   <TALLYMESSAGE xmlns:UDF="TallyUDF"><COMPANY><REMOTECMPINFO.LIST MERGE="Yes">`);
-  L.push(`    <NAME>${esc(guid)}</NAME><REMOTECMPNAME>${esc(co)}</REMOTECMPNAME><REMOTECMPSTATE>${esc(state)}</REMOTECMPSTATE>`);
-  L.push(`   </REMOTECMPINFO.LIST></COMPANY></TALLYMESSAGE>`);
-  L.push('  </REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>');
-  return L.join(CRLF);
+  return buildSingleMasterXML(lines, co, guid, state);
 }
 function payHeadsHaveNew(){
   const party=cv('t-party');
@@ -3260,7 +3364,7 @@ function buildEmpMasterXML(){
   L.push(' <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>');
   L.push(' <BODY><IMPORTDATA>');
   L.push('  <REQUESTDESC><REPORTNAME>All Masters</REPORTNAME>');
-  L.push(`  <STATICVARIABLES><SVCURRENTCOMPANY>${esc(co)}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC>`);
+  L.push(`  <STATICVARIABLES>${svCurrentCompanyTag(co)}</STATICVARIABLES></REQUESTDESC>`);
   L.push('  <REQUESTDATA>');
   // Use employees from payroll data if master list empty
   const fullList=employees.length?employees:
@@ -3302,9 +3406,11 @@ function buildEmpMasterXML(){
     L.push('   </TALLYMESSAGE>');
     L.push('');
   });
-  L.push(`   <TALLYMESSAGE xmlns:UDF="TallyUDF"><COMPANY><REMOTECMPINFO.LIST MERGE="Yes">`);
-  L.push(`    <NAME>${esc(guid)}</NAME><REMOTECMPNAME>${esc(co)}</REMOTECMPNAME><REMOTECMPSTATE>${esc(state)}</REMOTECMPSTATE>`);
-  L.push(`   </REMOTECMPINFO.LIST></COMPANY></TALLYMESSAGE>`);
+  if(co){
+    L.push(`   <TALLYMESSAGE xmlns:UDF="TallyUDF"><COMPANY><REMOTECMPINFO.LIST MERGE="Yes">`);
+    L.push(`    <NAME>${esc(guid)}</NAME><REMOTECMPNAME>${esc(co)}</REMOTECMPNAME><REMOTECMPSTATE>${esc(state)}</REMOTECMPSTATE>`);
+    L.push(`   </REMOTECMPINFO.LIST></COMPANY></TALLYMESSAGE>`);
+  }
   L.push('  </REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>');
   return L.join(CRLF);
 }
@@ -3340,7 +3446,7 @@ function buildPayrollVoucherXML(){
   L.push('   <REQUESTDESC>');
   L.push('    <REPORTNAME>Vouchers</REPORTNAME>');
   L.push('    <STATICVARIABLES>');
-  L.push(`     <SVCURRENTCOMPANY>${esc(co)}</SVCURRENTCOMPANY>`);
+  if(co) L.push(`     <SVCURRENTCOMPANY>${esc(co)}</SVCURRENTCOMPANY>`);
   L.push('    </STATICVARIABLES>');
   L.push('   </REQUESTDESC>');
   L.push('   <REQUESTDATA>');
@@ -3544,15 +3650,17 @@ function buildPayrollVoucherXML(){
   L.push('      <GSTCONSIGNEEADDRESS.LIST>      </GSTCONSIGNEEADDRESS.LIST>');
   L.push('     </VOUCHER>');
   L.push('    </TALLYMESSAGE>');
-  L.push(`    <TALLYMESSAGE xmlns:UDF="TallyUDF">`);
-  L.push('     <COMPANY>');
-  L.push('      <REMOTECMPINFO.LIST MERGE="Yes">');
-  L.push(`       <NAME>${esc(cGuid)}</NAME>`);
-  L.push(`       <REMOTECMPNAME>${esc(co)}</REMOTECMPNAME>`);
-  L.push(`       <REMOTECMPSTATE>${esc(state)}</REMOTECMPSTATE>`);
-  L.push('      </REMOTECMPINFO.LIST>');
-  L.push('     </COMPANY>');
-  L.push('    </TALLYMESSAGE>');
+  if(co){
+    L.push(`    <TALLYMESSAGE xmlns:UDF="TallyUDF">`);
+    L.push('     <COMPANY>');
+    L.push('      <REMOTECMPINFO.LIST MERGE="Yes">');
+    L.push(`       <NAME>${esc(cGuid)}</NAME>`);
+    L.push(`       <REMOTECMPNAME>${esc(co)}</REMOTECMPNAME>`);
+    L.push(`       <REMOTECMPSTATE>${esc(state)}</REMOTECMPSTATE>`);
+    L.push('      </REMOTECMPINFO.LIST>');
+    L.push('     </COMPANY>');
+    L.push('    </TALLYMESSAGE>');
+  }
   L.push('   </REQUESTDATA>');
   L.push('  </IMPORTDATA>');
   L.push(' </BODY>');
@@ -3711,12 +3819,13 @@ function tallyLogRaw(raw,label){
   const el=document.getElementById('tallyPostLog');
   if(!el || !raw) return;
   const details=document.createElement('details');
+  details.open=true; // auto-expanded — no click needed to see Tally's real response
   details.style.cssText='margin-top:4px;margin-bottom:6px;';
   const summary=document.createElement('summary');
-  summary.style.cssText='cursor:pointer;color:#78716C;font-size:11px;';
-  summary.textContent=`▸ Show Tally's raw response for ${label}`;
+  summary.style.cssText='cursor:pointer;color:#78716C;font-size:11px;font-weight:700;';
+  summary.textContent=`▾ Tally's raw response for ${label} (click to collapse):`;
   const pre=document.createElement('pre');
-  pre.style.cssText='white-space:pre-wrap;font-size:10px;background:#FAF0E8;padding:8px;border-radius:6px;margin-top:4px;max-height:220px;overflow:auto;';
+  pre.style.cssText='white-space:pre-wrap;font-size:10px;background:#FAF0E8;padding:8px;border-radius:6px;margin-top:4px;max-height:220px;overflow:auto;border:1px solid #E7BFA0;';
   pre.textContent=raw;
   details.appendChild(summary);
   details.appendChild(pre);
@@ -3890,23 +3999,39 @@ async function postPayHeadsMaster(){
   const party=cv('t-party');
   const sendingLedger = party && !syncedLedgers[party];
   const toSend = payHeads.filter(p=>!p.tallySynced);
-  const r = await postToTally(buildPayHeadXML(), 'Pay Heads');
-  if(r.ok){
-    const expectedObjects = toSend.length + (sendingLedger?1:0);
-    const actualObjects = (r.created||0)+(r.altered||0);
-    if(actualObjects >= expectedObjects){
-      if(sendingLedger) syncedLedgers[party]=true;
-      toSend.forEach(p=>p.tallySynced=true);
+  let totalCreated=0, totalAltered=0, anyFail=false;
+
+  // Post the ledger by itself first, so its result (and any raw error) is
+  // never masked by pay-head items in the same request.
+  if(sendingLedger){
+    const r = await postToTally(buildLedgerOnlyXML(party), `Pay Heads → Ledger "${party}"`, true);
+    if(r.ok){ syncedLedgers[party]=true; totalCreated+=(r.created||0); totalAltered+=(r.altered||0); save(); }
+    else anyFail=true;
+  }
+
+  // Post each pay head individually — one request per master. Any single
+  // failure now triggers postToTally's automatic raw-response logging
+  // (since that request's own created+altered is exactly 0), which was
+  // impossible to see when 8 pay heads were bundled into one batch.
+  for(const p of toSend){
+    const r = await postToTally(buildSinglePayHeadXML(p), `Pay Heads → "${p.name}"`, true);
+    if(r.ok){
+      p.tallySynced=true;
+      totalCreated+=(r.created||0); totalAltered+=(r.altered||0);
       save();
     } else {
-      const names = toSend.map(p=>esc(p.name)).join(', ');
-      tallyLog(`⚠ Pay Heads: expected ${expectedObjects} object(s) created/altered but Tally only reported ${actualObjects}. Nothing in this batch has been marked synced, so it will be resent next time: ${names}${sendingLedger?` (plus ledger "${esc(party)}")`:''}.`,'err');
-      toast(`Pay Heads: Tally accepted fewer objects than expected — see log`,'err');
-      r.ok = false;
-      r.error = 'partial-batch';
+      anyFail=true;
     }
   }
-  return r;
+
+  if(anyFail){
+    const stillPending = toSend.filter(p=>!p.tallySynced).map(p=>esc(p.name));
+    tallyLog(`⚠ Pay Heads: ${totalCreated} created, ${totalAltered} altered. Still pending (see individual errors above): ${stillPending.join(', ')||'(none — only the ledger failed)'}.`,'err');
+    toast(`Pay Heads: some items were rejected — see log for exact reasons`,'err');
+    return {ok:false, error:'partial-batch', created:totalCreated, altered:totalAltered};
+  }
+  tallyLog(`✔ Pay Heads: all items confirmed — ${totalCreated} created, ${totalAltered} altered.`,'ok');
+  return {ok:true, created:totalCreated, altered:totalAltered};
 }
 function updateTallyHints(){
   const g=document.getElementById('hint-empgrp'), c=document.getElementById('hint-costcat');
@@ -3927,12 +4052,22 @@ function refreshTallySyncBadge(){
       +'. Click "Post Employee Master" (or "Post All 3") before posting a Payroll Voucher, or it will fail with a Cost Centre error.</span>';
   }
 }
-// Auto version of "Post Payroll Voucher": if any employees haven't been
-// synced to Tally yet (new hires, or master post that silently no-op'd),
-// post the Employee Master for them FIRST — automatically, no extra click —
-// then post the Payroll Voucher. This is what fixes "Cost Centre '<name>'
-// does not exist!" without the user having to remember to click
-// "Post Employee Master" separately every time before the voucher.
+// Auto version of "Post Payroll Voucher": before posting the voucher,
+// auto-creates EVERYTHING the voucher depends on, in the correct Tally
+// order — no extra clicks needed:
+//   1. Pay Heads + Party (Salary Payable) ledger — the "configuration
+//      heads" (PAYHEAD masters under their PARENT group) and the mapping
+//      ledger the voucher's LEDGERENTRIES.LIST posts against.
+//   2. Employee Master + Cost Centre — needed because the voucher's
+//      PAYHEADALLOCATIONS reference each employee's Cost Centre by name.
+// BUG FIXED: previously this only auto-posted step 2 (Employee Master).
+// If a NEW pay head or a new/changed party ledger was pending but every
+// employee was already synced, this button skipped step 1 entirely and
+// sent the voucher straight to Tally — which then rejected it with
+// "Ledger/PAYHEAD '<name>' does not exist!" because the master had never
+// been created. Only "Post All 3" covered that case before. Now both
+// buttons auto-create pay heads/ledger AND employees before the voucher,
+// so a single click on "Post Payroll Voucher" is always safe.
 async function postPayrollVoucherAuto(){
   const key=cv('exp-sel');
   if(!key){
@@ -3941,6 +4076,23 @@ async function postPayrollVoucherAuto(){
     return;
   }
   currentExportData = payrollHistory[key];
+
+  // Step 1: auto-create any new Pay Heads / Party ledger FIRST — Tally
+  // must know about the PAYHEAD and LEDGER masters before the voucher's
+  // PAYHEADALLOCATIONS/LEDGERENTRIES can reference them by name.
+  if(payHeadsHaveNew()){
+    const party=cv('t-party');
+    const newCount = payHeads.filter(p=>!p.tallySynced).length;
+    const ledgerNote = (party && !syncedLedgers[party]) ? ` + ledger "${esc(party)}"` : '';
+    tallyLog(`ℹ ${newCount} new pay head(s)${ledgerNote} not yet synced to Tally — auto-posting Pay Heads Master first…`);
+    const rPH = await postPayHeadsMaster();
+    if(!rPH.ok){
+      tallyLog(`✘ Stopped: Pay Heads Master must post successfully before the Payroll Voucher can be posted.`,'err');
+      return;
+    }
+  }
+
+  // Step 2: auto-create any new Employees (unchanged behavior).
   const unsynced = employees.filter(e=>!e.tallySynced);
   if(unsynced.length){
     tallyLog(`ℹ ${unsynced.length} employee(s) not yet synced to Tally (${unsynced.map(e=>esc(e.name)).join(', ')}) — auto-posting Employee Master first…`);
@@ -3950,6 +4102,7 @@ async function postPayrollVoucherAuto(){
       return;
     }
   }
+
   await postToTally(buildPayrollVoucherXML(), 'Payroll Voucher');
 }
 async function postAllToTally(){

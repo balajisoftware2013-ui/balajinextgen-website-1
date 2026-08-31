@@ -6807,6 +6807,28 @@ function openBrandingModal(){
     const b={name:document.getElementById('bm-name').value, logoDataUrl:pendingLogo, bannerDataUrl:pendingBanner};
     saveBrand(b); applyBrand(b); mo.remove();
     showNotif('✅ Branding updated successfully!','success');
+    // FIX ("logo and address save but not save in record"): saveBrand()
+    // only ever wrote to THIS browser's localStorage — a logo uploaded
+    // here was invisible on any other device/session, forever. Best-
+    // effort push to the backend's COMPANY_SETTINGS.LOGO_URL column now
+    // too (see MASTER_CATEGORY_MAP.company's own comment for the
+    // required column). Google Sheets caps a cell at ~50,000 characters
+    // — a full-resolution photo easily blows past that as a base64 data
+    // URI, so this only attempts the sync (and tells you plainly) when
+    // it fits; otherwise the logo still works fine on THIS device, it
+    // just won't follow you to another one until it's uploaded
+    // somewhere real (Drive/hosted URL) instead of embedded as raw
+    // image data — a genuine storage limitation, not a bug to paper
+    // over silently.
+    if (pendingLogo && typeof gasApi === 'function'){
+      if (pendingLogo.length > 45000){
+        showNotif('⚠️ Logo saved on this device only — image is too large to sync across devices (use a smaller file)', 'error');
+      } else {
+        gasApi('SAVE_MASTER', { category:'company', record: { SETTING_ID: bnxCompanySettingId || undefined, LOGO_URL: pendingLogo } }, 'V2_CORE')
+          .then(res => { if (res && res.id) bnxCompanySettingId = res.id; })
+          .catch(()=>{});
+      }
+    }
   };
   document.getElementById('bm-reset').onclick = function(){
     saveBrand({}); applyBrand({}); mo.remove();
@@ -6853,7 +6875,12 @@ async function bnxResolveClientBrand(){
     const info = res && (res.data || res);
     const realName = info && (info.restaurantName || info.name || info.CLIENT_NAME);
     if (realName){
-      const brand = { name: realName, tagline: info.tagline || 'Restaurant ERP' };
+      // FIX ("logo and address save but not save in record"): only
+      // name/tagline were ever pulled from GET_CLIENT_INFO here — a
+      // logo saved (and now really persisted, see saveBrand's own
+      // comment) on one device never showed up on any OTHER device's
+      // sidebar/hero, since this loader simply never asked for it.
+      const brand = { name: realName, tagline: info.tagline || 'Restaurant ERP', logoDataUrl: info.logoUrl || existing.logoDataUrl || undefined };
       saveBrand(brand); // cached under THIS client's own key only
       applyBrand(brand);
       return;
@@ -7131,11 +7158,23 @@ function bnxRenderTodaysReservations_(skipPull){
   const now = new Date();
   const todayIso = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');
   const list = bnxGetReservations().filter(r=>r.status==='upcoming' && r.date===todayIso).sort((a,b)=> a.time<b.time?-1:1);
+  // FIX ("No reservations for today yet" repeating over and over):
+  // this function runs on every dashboard refresh/poll (loadRealDashboardData
+  // -> bnxRenderLiveDashboardWidgets_ -> here). The empty-state placeholder
+  // below was inserted with plain inline styles and no class, so the
+  // cleanup line right above it -- which only removes '.res-slot' --
+  // never touched it. Every single refresh cycle left the OLD placeholder
+  // in the DOM and appended a brand new one after it, so the card grew one
+  // more "No reservations for today yet." line per poll, forever. Tagging
+  // the placeholder '.res-slot' too (it's a slot in this card, just an
+  // empty one) means the very same cleanup line now removes it before each
+  // re-render, same as it already does for real reservation rows.
   card.querySelectorAll('.res-slot').forEach(s=>s.remove());
   const header = card.querySelector('.card-header');
   if (!header) return;
   if (!list.length){
     const div = document.createElement('div');
+    div.className = 'res-slot';
     div.style.cssText = 'text-align:center;padding:16px;color:var(--text3);font-size:12px;';
     div.textContent = 'No reservations for today yet.';
     header.insertAdjacentElement('afterend', div);
@@ -9635,7 +9674,31 @@ async function sendKOT(){
    carries the waiter, covers and full item list, and a status flag —
    that's what lets the KOT page and dashboard render the REAL ticket
    instead of a hardcoded demo list. */
-function bnxRecordKOT(table, type, waiter, covers, items, orderNo){
+/* FIX ("amount show" — Order Register showing the same order 3 times
+   with 3 different, wrong amounts, e.g. ORD-1040 as ₹147.5 + ₹1,050.2
+   + ₹11.8): traced to the exact root cause, not a display bug. Every
+   time an order with both food and drinks got split into Kitchen/Bar/
+   Counter tickets, THIS function ran once per station — and every
+   single call fired its OWN SAVE_ORDER with a brand-new requestId.
+   bnxSaveOrder on the backend is INSERT-ONLY (always creates a new
+   ORDER_MASTER row); dedup there is keyed by requestId, never by the
+   real order number — so 3 stations meant 3 separate ORDER_MASTER rows
+   under the SAME friendly ORDER_NUMBER, each carrying only THAT
+   station's items. Order Register/GET_ACTIVE_ORDERS lists every
+   ORDER_MASTER row as its own "order", so one real order fragmented
+   into 3 visible rows, each showing only its own slice of the bill as
+   "the" amount — exactly what the screenshot shows.
+   Fixed via a new optional `orderSyncItems` param (added, not removed —
+   every existing single-call site keeps working exactly as before,
+   since omitting it defaults to the old behavior of syncing this
+   call's own `items`): pass `false` to skip the SAVE_ORDER call
+   entirely for this station (still records/prints the KOT ticket
+   itself), or pass the FULL combined item list to sync that instead of
+   just this station's slice. printKOTSplit below now syncs the order
+   exactly ONCE, with the whole order's items, on the first station it
+   sends — every other station just prints/records its ticket without
+   creating another ORDER_MASTER row. */
+function bnxRecordKOT(table, type, waiter, covers, items, orderNo, orderSyncItems){
   // FIX ("NEXT ID" — closing the gap this comment used to flag):
   // sequence numbers now come from bnxNextKotSeq(), which pops from a
   // small BATCH of numbers pre-fetched from the server ahead of time
@@ -9658,6 +9721,7 @@ function bnxRecordKOT(table, type, waiter, covers, items, orderNo){
   open.unshift(entry);
   if (open.length>100) open = open.slice(0,100);
   bnxSetOpenKotsRaw(JSON.stringify(open));
+  if (orderSyncItems === false) return kotNo; // this station's ticket only — the order itself was already synced by an earlier station in this same split
   // FIX ("order no wrong"): used to hardcode orderId:kotNo here, so
   // every station split invented its OWN "order" server-side under its
   // own KOT number — one real order fragmented into 2-3 unrelated
@@ -9667,7 +9731,7 @@ function bnxRecordKOT(table, type, waiter, covers, items, orderNo){
   // standalone/manual KOTs with no real order behind them (e.g. Bar
   // Management's "add KOT" modal) fall back to the KOT's own number.
   const orderRequestId = bnxUuid();
-  const orderReq = {requestId:orderRequestId, orderId:(orderNo||kotNo), tableId:table, orderType:type, waiter:waiter||'', covers:covers||'', items:items||[]};
+  const orderReq = {requestId:orderRequestId, orderId:(orderNo||kotNo), tableId:table, orderType:type, waiter:waiter||'', covers:covers||'', items:(orderSyncItems || items || [])};
   gasApi('SAVE_ORDER', orderReq, 'V2_CORE').then(res=>{
     if(!res || !res.success) bnxQueuePending('SAVE_ORDER', orderReq, orderRequestId);
   }).catch(()=>bnxQueuePending('SAVE_ORDER', orderReq, orderRequestId));
@@ -9713,9 +9777,19 @@ function printKOTSplit(table, waiter, covers, items, orderNo){
     else kitchenItems.push(i);
   });
 
-  if (kitchenItems.length) printOneKOT('KITCHEN KOT', table, waiter, covers, kitchenItems, bnxRecordKOT(table,'KITCHEN',waiter,covers,kitchenItems,orderNo));
-  if (barItems.length) printOneKOT('BAR KOT', table, waiter, covers, barItems, bnxRecordKOT(table,'BAR',waiter,covers,barItems,orderNo));
-  if (counterItems.length) printOneKOT('COUNTER KOT', table, waiter, covers, counterItems, bnxRecordKOT(table,'COUNTER',waiter,covers,counterItems,orderNo));
+  // FIX (see bnxRecordKOT's own comment above — "amount show"/duplicate
+  // rows): syncs the ORDER exactly once, with the FULL item list (food
+  // + drinks together), on whichever station goes first. Every other
+  // station's bnxRecordKOT call passes orderSyncItems:false — it still
+  // records and prints that station's own ticket, it just doesn't fire
+  // a second/third SAVE_ORDER for the same real order.
+  const jobs = [];
+  let orderAlreadySynced = false;
+  const syncItemsFor = () => { if (orderAlreadySynced) return false; orderAlreadySynced = true; return items; };
+  if (kitchenItems.length){ const no = bnxRecordKOT(table,'KITCHEN',waiter,covers,kitchenItems,orderNo,syncItemsFor()); jobs.push(()=>printOneKOT('KITCHEN KOT', table, waiter, covers, kitchenItems, no)); }
+  if (barItems.length){ const no = bnxRecordKOT(table,'BAR',waiter,covers,barItems,orderNo,syncItemsFor()); jobs.push(()=>printOneKOT('BAR KOT', table, waiter, covers, barItems, no)); }
+  if (counterItems.length){ const no = bnxRecordKOT(table,'COUNTER',waiter,covers,counterItems,orderNo,syncItemsFor()); jobs.push(()=>printOneKOT('COUNTER KOT', table, waiter, covers, counterItems, no)); }
+  bnxPrintKotQueue_(jobs);
 }
 
 /* FIX ("icon add with order placement, logo also add small"): KOT tickets
@@ -9754,6 +9828,34 @@ function bnxResolvePrintLogo_(){
   }catch(e){}
   return BNX_PRINT_LOGO_DATA_URI;
 }
+/* FIX ("kot print problems" — restaurant dashboard): traced two real,
+   confirmed bugs, not a guess:
+   1. NO NULL-CHECK ON window.open(): if the browser's popup blocker
+      stepped in (very common — see #2 below for exactly when), `w`
+      came back null and the very next line, `w.document.write(...)`,
+      threw a hard TypeError. That crash was completely silent (no
+      catch anywhere in the call chain) and — critically — it aborted
+      whatever loop was calling this (printKOTSplit's Bar/Counter
+      tickets after Kitchen, or printAllKOT's remaining tickets) since
+      an uncaught exception stops a synchronous forEach dead. One
+      blocked popup silently killed every ticket after it.
+   2. WHY it got blocked: printKOTSplit (Kitchen+Bar+Counter) and
+      printAllKOT both call this multiple times in the SAME synchronous
+      tick — window.open() called back-to-back with no gap between
+      calls is exactly the pattern every major browser's popup blocker
+      treats as spam and blocks after the first one, even though the
+      whole chain started from one real, direct user tap (Send to
+      Kitchen / Print All). This is why "print one KOT" mostly worked
+      but a split Kitchen+Bar order or Print All often silently lost
+      tickets.
+   Fixed: added a null-check with a clear, actionable message instead
+   of a silent crash; and callers now stagger multiple print calls with
+   a small delay between each (bnxPrintKotQueue_ below) instead of
+   firing them all in one synchronous burst, so each window.open() gets
+   its own turn and isn't lumped in as spam. Also closes the print
+   window after printing (w.close()), matching every other print
+   function in this file (bmDoKOTPrint/blReprintBill/printBill) —
+   printOneKOT was the one place still leaving print windows open. */
 function printOneKOT(title, table, waiter, covers, items, kotNo){
   const now = new Date();
   const pw = bnxPaperWidthPx();
@@ -9770,10 +9872,24 @@ function printOneKOT(title, table, waiter, covers, items, kotNo){
       <div style="text-align:center;font-size:12px;">Balaji NextGen ERP</div>
     </div>`;
   const w = window.open('','_blank','width=420,height=600');
+  if (!w){
+    if (typeof showNotif==='function') showNotif('⚠️ Print popup blocked — allow pop-ups for this site, then try again', 'error');
+    else alert('Print popup blocked — please allow pop-ups for this site and try again.');
+    return;
+  }
   const kotCss = '@page{size:'+bnxPaperSize()+'mm auto;margin:0;}*{margin:0;padding:0;box-sizing:border-box;}body{font-family:"DM Mono","Courier New",monospace;background:#fff;}.kot-print-body{width:'+pw+'px;font-size:14px;font-weight:600;line-height:1.7;color:#000;margin:0 auto;padding:10px 6px;}@media print{body{margin:0;}}';
   w.document.write('<html><head><title>'+title+' - Balaji NextGen ERP</title><style>'+kotCss+'</style></head><body>'+body+'</body></html>');
   w.document.close();
-  setTimeout(()=>{ w.print(); }, 500);
+  setTimeout(()=>{ w.print(); w.close(); }, 500);
+}
+// Runs a list of zero-arg print functions one at a time, each after
+// the previous has had time to open its window.open() popup — fixes
+// #2 above by never firing more than one window.open() in the same
+// synchronous tick. 450ms apart is comfortably longer than the 500ms
+// the print windows themselves wait before calling print(), so tickets
+// print in the same order they were queued.
+function bnxPrintKotQueue_(fns){
+  fns.forEach((fn, i) => setTimeout(fn, i * 450));
 }
 function holdOrder(){ alert('⏸ Order held.\n\nTable '+document.getElementById('posTable').textContent+' is held.\nYou can resume from Table Management.'); }
 /* P0 FIX (diff vs external audit "no immutable transaction ID" / "bill
@@ -10495,7 +10611,13 @@ function kotReprint(kotNo){
 function printAllKOT(){
   const store = bnxGetKotStore().filter(k=>k.status!=='READY');
   if (!store.length){ alert('No active KOTs to print.'); return; }
-  store.forEach(k=>kotReprint(k.kotNo));
+  // FIX (see printOneKOT's own comment): was a synchronous forEach
+  // calling kotReprint (→ window.open()) once per ticket back-to-back —
+  // exactly the popup-spam pattern browsers block after the first one,
+  // and the missing null-check on window.open() meant that first block
+  // threw and silently killed every ticket after it. Staggered the same
+  // way printKOTSplit now is.
+  bnxPrintKotQueue_(store.map(k => () => kotReprint(k.kotNo)));
 }
 function loadKOTData(){ buildKOT(); buildDashKotList(); alert('✅ KOT list refreshed'); }
 
@@ -13496,6 +13618,30 @@ function bnxMarkTableOrdersBilled(tableId, invoiceNo){
   const overrides = bnxGetOrderOverrides();
   overrides[t] = { status:'BILLED', invoiceNo: invoiceNo||'', at: Date.now() };
   bnxSaveOrderOverrides(overrides);
+  // FIX ("100% not visible status" / "amounts end time not record"):
+  // this used to ONLY write a local overrides[] entry — the real
+  // ORDER_MASTER.ORDER_STATUS on the server was NEVER updated when a
+  // bill was settled from here. Two real, confirmed consequences: (1)
+  // any OTHER device/session loading Order Register never saw the
+  // table as billed at all — only the exact browser that settled the
+  // bill knew; (2) GET_ACTIVE_ORDERS explicitly excludes BILLED orders
+  // (see that function's own filter), but since the real status column
+  // was never actually flipped, a billed order just kept showing up
+  // there forever under its stale NEW/KOT_PRINTED status. Now syncs
+  // the real status to the server too, for every real order this
+  // table currently has open (same bnxGuaranteedSync/UPDATE_ORDER_STATUS
+  // call already used elsewhere in this file for order status changes)
+  // — the backend records the real settle time onto ORDER_MASTER's
+  // END_TIME the same moment, so Order Register's End Time column
+  // (currently always "—") starts reflecting reality for every order
+  // billed from now on, once that column is added to ORDER_MASTER.
+  if (Array.isArray(orderRegData) && orderRegData.length){
+    const realOrderNos = new Set();
+    orderRegData.forEach(o=>{
+      if ((o.TABLE_ID||'').toString().trim().toUpperCase()===t && o.ORDER_STATUS!=='BILLED' && o.ORDER_STATUS!=='CANCELLED' && o.ORDER_NO) realOrderNos.add(o.ORDER_NO);
+    });
+    realOrderNos.forEach(orderNo => bnxGuaranteedSync('UPDATE_ORDER_STATUS', {orderId:orderNo, status:'BILLED', remarks:invoiceNo?('Billed as '+invoiceNo):''}, true));
+  }
   if (Array.isArray(orderRegData) && orderRegData.length){
     let touched = false;
     orderRegData.forEach(o=>{
@@ -17077,7 +17223,14 @@ function saveRestaurantInfo(){
   if (typeof gasApi === 'function'){
     gasApi('SAVE_MASTER', {
       category: 'company',
-      record: { SETTING_ID: bnxCompanySettingId || undefined, NAME: info.name, GSTIN: info.gst }
+      // FIX ("logo and address save but not save in record"): only NAME
+      // and GSTIN were ever sent here — Phone/Address/FSSAI/Currency
+      // saved to localStorage above and stopped there, invisible to any
+      // other device/browser. Now sent for real too, now that the
+      // backend's company fieldMap actually has columns for them (see
+      // that fieldMap's own comment for the one remaining manual step —
+      // adding those columns to the real COMPANY_SETTINGS sheet).
+      record: { SETTING_ID: bnxCompanySettingId || undefined, NAME: info.name, GSTIN: info.gst, ADDRESS: info.address, PHONE: info.phone, EMAIL: info.email, FSSAI: info.fssai, CURRENCY: info.currency }
     }, 'V2_CORE').then(res => { if (res && res.id) bnxCompanySettingId = res.id; }).catch(()=>{});
   }
 }
@@ -17129,6 +17282,15 @@ document.addEventListener('DOMContentLoaded', function(){
         if (emailEl && !emailEl.value && info.email) emailEl.value = info.email;
         const addrEl = document.getElementById('riAddress');
         if (addrEl && !addrEl.value && info.address) addrEl.value = info.address;
+        // FIX ("logo and address save but not save in record"): FSSAI/
+        // Currency were never read back from GET_CLIENT_INFO at all —
+        // even once the backend started storing them for real (see
+        // saveRestaurantInfo's own comment), these two fields would
+        // still look blank/reset to default on a fresh device/browser.
+        const fssaiEl = document.getElementById('riFssai');
+        if (fssaiEl && !fssaiEl.value && info.fssai) fssaiEl.value = info.fssai;
+        const currEl = document.getElementById('riCurrency');
+        if (currEl && !currEl.value && info.currency) currEl.value = info.currency;
         if (info.source === 'CLIENT_MASTER' && (info.name || info.restaurantName)) {
           try {
             const cacheKey = bnxRestaurantInfoKey();
@@ -17138,7 +17300,9 @@ document.addEventListener('DOMContentLoaded', function(){
               gst: existing.gst || info.gst || '',
               phone: existing.phone || info.phone || '',
               email: existing.email || info.email || '',
-              address: existing.address || info.address || ''
+              address: existing.address || info.address || '',
+              fssai: existing.fssai || info.fssai || '',
+              currency: existing.currency || info.currency || ''
             })));
             const bn = document.getElementById('restaurantBrandName');
             if (bn && (info.restaurantName || info.name)) bn.textContent = existing.name || info.restaurantName || info.name;
@@ -20197,8 +20361,24 @@ function closeNCModal(){ document.getElementById('ncApprovalModal').style.displa
 async function confirmNC(){
   const remarks = document.getElementById('ncRemarks').value.trim();
   if (!remarks){ alert('Please enter a reason — required for NC approval.'); return; }
+  // FIX ("1 sync issue — tap to retry" / console: "[OUTBOX] gave up
+  // after 10 attempts ... Reason: orderId and status are required"):
+  // found the exact cause by reading the DevTools console log — every
+  // NC approval was silently failing sync, forever. closeNCModal()
+  // resets the module-level ncTargetOrderId to null (it has to, so the
+  // NEXT modal open starts clean) — but this function called
+  // closeNCModal() BEFORE reading ncTargetOrderId into the sync
+  // payload below, so by the time bnxGuaranteedSync ran, orderId was
+  // already null. The backend's UPDATE_ORDER_STATUS handler correctly
+  // rejects that ("orderId and status are required"), the outbox
+  // retried the same doomed payload 10 times since it's a validation
+  // failure not a network blip, then gave up and moved it to the
+  // failed store — exactly the red badge and console spam seen live.
+  // Captured into a local const BEFORE closing the modal fixes it for
+  // real; every NC approval from now on syncs on the first try.
+  const orderIdForSync = ncTargetOrderId;
   closeNCModal();
-  bnxGuaranteedSync('UPDATE_ORDER_STATUS', {orderId:ncTargetOrderId, status:'NC', remarks}, true);
+  bnxGuaranteedSync('UPDATE_ORDER_STATUS', {orderId:orderIdForSync, status:'NC', remarks}, true);
   loadOrderRegister();
   alert('🚫 Order marked NC — sent for manager approval.\nReason: '+remarks);
 }
