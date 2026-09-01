@@ -1657,6 +1657,17 @@ body.pos-machine .pos-wrap{grid-template-columns:1fr 380px;}
 .mi-name{font-size:10px;font-weight:600;line-height:1.3;margin-bottom:3px;}
 .mi-price{font-family:'DM Mono',monospace;font-size:11px;color:var(--gold);font-weight:700;}
 .mi-fav{position:absolute;top:7px;right:7px;font-size:10px;}
+/* FIX ("menu load bug"): Menu Availability page (menu-availability.html)
+   toggles an item's avail status, but the POS grid here never read or
+   showed it — an item switched OFF there was still fully orderable at
+   POS with zero indication, contradicting that page's own "live —
+   visible to waiters & POS immediately" claim. .mi-unavail/.mi-off-badge
+   make an unavailable item visibly greyed-out and unclickable here. */
+.mi.mi-unavail{cursor:not-allowed;opacity:.5;filter:grayscale(.6);}
+@media (hover:hover) and (pointer:fine){.mi.mi-unavail:hover{border-color:var(--border);box-shadow:none;}}
+.mi-off-badge{position:absolute;top:6px;right:6px;font-size:8px;font-weight:800;letter-spacing:.4px;
+  padding:2px 5px;border-radius:5px;background:var(--red,#dc2626);color:#fff;z-index:1;}
+.mi-off-badge.mi-limited-badge{background:var(--gold,#d97706);color:#1c1208;}
 
 /* ═══ CART ═══ */
 .cart-panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;
@@ -9327,14 +9338,25 @@ function buildMenu(){
     <div class="mi-em">➕</div>
     <div class="mi-name">Add New Item</div>
   </div>` : '';
-  g.innerHTML = quickAddTile + items.map(item=>`<div class="mi ${cart[item.n]?'added':''}" onclick="addToCart('${item.n.replace(/'/g,"\\'")}',${item.p})" title="Code: ${item.code||'-'} · HSN: ${bnxItemHSN(item)}">
+  g.innerHTML = quickAddTile + items.map(item=>{
+    // FIX ("menu load bug"): respect the avail status synced in from
+    // Menu Availability / GET_MENU_ITEMS instead of ignoring it — see
+    // the .mi-unavail CSS note above for why this exists.
+    const avail = item.avail || 'available';
+    const isOff = avail === 'unavailable';
+    const isLtd = avail === 'limited';
+    const clickAttr = isOff ? '' : `onclick="addToCart('${item.n.replace(/'/g,"\\'")}',${item.p})"`;
+    const titleTxt = isOff ? 'Marked unavailable in Menu Availability' : `Code: ${item.code||'-'} · HSN: ${bnxItemHSN(item)}`;
+    return `<div class="mi ${cart[item.n]?'added':''}${isOff?' mi-unavail':''}" ${clickAttr} title="${titleTxt}">
     <div class="veg-dot ${item.v}"></div>
     ${item.fav?'<div class="mi-fav">⭐</div>':''}
+    ${isOff?'<div class="mi-off-badge">OFF</div>':isLtd?'<div class="mi-off-badge mi-limited-badge">LOW</div>':''}
     <div class="mi-em">${item.e||bnxDefaultIcon(item.c)}</div>
     <div class="mi-name">${item.n}</div>
     <div class="mi-code">${item.code||''}</div>
     <div class="mi-price">₹${(Number(item.p)||0).toLocaleString('en-IN')}</div>
-  </div>`).join('');
+  </div>`;
+  }).join('');
 }
 // Quick on-the-fly item creation directly from the POS grid (the "+ Add
 // New Item" tile). Saves to the permanent menu (same as Settings → Menu
@@ -9502,6 +9524,11 @@ document.addEventListener('keydown', function(e){
   }
 });
 function addToCart(name,price){
+  // FIX ("menu load bug"): guard the actual cart-add too, not just the
+  // grid tile's onclick — belt-and-braces in case something else ever
+  // calls addToCart() directly for an item marked unavailable.
+  const mItem = typeof menuData!=='undefined' ? menuData.find(m=>m.n===name) : null;
+  if (mItem && mItem.avail==='unavailable'){ if(typeof showNotif==='function') showNotif('🔴 "'+name+'" is marked unavailable — enable it in Menu Availability first.','error'); return; }
   if(!cart[name]) cart[name]={price,qty:0};
   cart[name].qty++;
   bnxRecordRecentItem(name);
@@ -14371,9 +14398,15 @@ function loadMenuData(){
         if(!name) return;
         const cat = row.category || row.CATEGORY || row.c || 'Uncategorised';
         const existing = menuData.find(m=>m.n.toLowerCase()===name.toLowerCase());
+        // FIX ("menu load bug"): availability (set from Menu Availability
+        // page → SAVE_MENU_AVAILABILITY → ITEM_MASTER) was never pulled
+        // back in here, so Sync Menu never told the POS grid an item had
+        // been switched off. Reads whatever field name the backend sends.
+        const rowAvail = row.avail || row.status || row.availability || row.AVAILABILITY;
         if(existing){
           existing.p = parseFloat(row.price ?? row.PRICE ?? row.p) || existing.p;
           existing.gst = parseFloat(row.gst ?? row.GST) || existing.gst || 0;
+          if (rowAvail) existing.avail = rowAvail;
           // FIX ("category and group problem"): category was never
           // re-synced on an existing cached item — only price/gst were.
           // So once a device had cached an item under its old raw
@@ -14393,7 +14426,8 @@ function loadMenuData(){
         } else {
           menuData.push({ n:name, p:parseFloat(row.price ?? row.PRICE ?? row.p)||0, c:cat,
             v: (row.veg||row.v||'NV'), e: row.icon||row.e||bnxDefaultIcon(cat), fav:false,
-            code: row.id||row.ITEM_ID||('ITM'+Date.now().toString().slice(-6)), gst: parseFloat(row.gst ?? row.GST)||0 });
+            code: row.id||row.ITEM_ID||('ITM'+Date.now().toString().slice(-6)), gst: parseFloat(row.gst ?? row.GST)||0,
+            avail: rowAvail || 'available' });
           added++;
         }
       });
@@ -21190,6 +21224,9 @@ function warmBillingCache() {
           bootRes.data.menu.forEach(row=>{
             if (!row.name) return;
             const existing = menuData.find(m=>m.n.toLowerCase()===String(row.name).toLowerCase());
+            // FIX ("menu load bug"): same avail carry-through as
+            // loadMenuData() — see that FIX note for why this matters.
+            const rowAvail = row.avail || row.status || row.availability;
             // FIX ("kot load to bill rates not come"): this only ever
             // ADDED brand-new items — an item that already existed
             // locally (e.g. cached from before its real SELLING_RATE
@@ -21203,6 +21240,7 @@ function warmBillingCache() {
             if (existing){
               existing.p = Number(row.price) || existing.p;
               existing.gst = Number(row.gst) || existing.gst || 0;
+              if (rowAvail) existing.avail = rowAvail;
               if (row.category && row.category !== 'Uncategorised'){
                 existing.c = row.category;
                 existing.e = row.icon || existing.e || (typeof bnxDefaultIcon==='function'?bnxDefaultIcon(row.category):'🍽');
@@ -21210,7 +21248,8 @@ function warmBillingCache() {
             } else {
               menuData.push({ n:row.name, p:Number(row.price)||0, c:row.category||'Uncategorised',
                 v:'NV', e:row.icon||(typeof bnxDefaultIcon==='function'?bnxDefaultIcon(row.category):'🍽'), fav:false,
-                code: row.id||('ITM'+Date.now().toString().slice(-6)), gst: Number(row.gst)||0 });
+                code: row.id||('ITM'+Date.now().toString().slice(-6)), gst: Number(row.gst)||0,
+                avail: rowAvail || 'available' });
             }
           });
           if(typeof bnxSaveMenuData==='function') bnxSaveMenuData();
@@ -21236,12 +21275,16 @@ function warmBillingCache() {
           const name = row.name || row.ITEM_NAME || row.n; if(!name) return;
           const cat = row.category || row.CATEGORY || row.c || 'Uncategorised';
           const existing = menuData.find(m=>m.n.toLowerCase()===name.toLowerCase());
+          // FIX ("menu load bug"): same avail carry-through as
+          // loadMenuData() above.
+          const rowAvail = row.avail || row.status || row.availability || row.AVAILABILITY;
           // FIX ("kot load to bill rates not come"): same fix as the
           // GET_BOOTSTRAP branch above — refresh price/gst/category on
           // an item that's already cached, not just brand-new ones.
           if(existing){
             existing.p = parseFloat(row.price ?? row.PRICE ?? row.p) || existing.p;
             existing.gst = parseFloat(row.gst ?? row.GST) || existing.gst || 0;
+            if (rowAvail) existing.avail = rowAvail;
             if (cat && cat !== 'Uncategorised'){
               existing.c = cat;
               existing.e = row.icon || row.e || existing.e || (typeof bnxDefaultIcon==='function'?bnxDefaultIcon(cat):'🍽');
@@ -21249,7 +21292,8 @@ function warmBillingCache() {
           } else {
             menuData.push({ n:name, p:parseFloat(row.price ?? row.PRICE ?? row.p)||0, c:cat,
               v:(row.veg||row.v||'NV'), e:row.icon||row.e||(typeof bnxDefaultIcon==='function'?bnxDefaultIcon(cat):'🍽'), fav:false,
-              code: row.id||row.ITEM_ID||('ITM'+Date.now().toString().slice(-6)), gst: parseFloat(row.gst ?? row.GST)||0 });
+              code: row.id||row.ITEM_ID||('ITM'+Date.now().toString().slice(-6)), gst: parseFloat(row.gst ?? row.GST)||0,
+              avail: rowAvail || 'available' });
           }
         });
         if(typeof bnxSaveMenuData==='function') bnxSaveMenuData();
