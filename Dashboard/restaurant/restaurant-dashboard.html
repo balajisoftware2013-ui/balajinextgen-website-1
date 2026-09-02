@@ -10631,13 +10631,26 @@ async function settleOrder(){
     const gst = (parseFloat(gstTxt)||0) + (parseFloat(gst2Txt)||0);
     const totalTxt = (document.getElementById('cTotal')?.textContent||'₹0').replace(/[^\d.]/g,'');
     const total = parseFloat(totalTxt) || sub;
+    // PASS #51 FIX ("discount not recorded properly / round-off
+    // problem"): this screen has no discount field of its own, but if
+    // a manual price edit or promo ever lowers cTotal noticeably below
+    // sub+gst, that gap needs a real home — sending it as `disc` (not
+    // leaving it for the backend to guess) stops the backend from
+    // treating "whatever's left over" as ROUND_OFF, which is exactly
+    // what was silently swallowing real discounts into ROUND_OFF
+    // before this pass (see bnxSaveBill's own fix). A genuine
+    // sub-rupee gap (paise rounding only) is left at 0 here and still
+    // lands in ROUND_OFF, same as before — only a real, >₹1 gap counts
+    // as a discount.
+    const rawGap = (sub + gst) - total;
+    const discAmt = rawGap > 1 ? +rawGap.toFixed(2) : 0;
     const now = new Date();
 
     const requestId = bnxUuid();
     const draftBill = {
       dt: now.toLocaleDateString('en-GB'), tm: now.toLocaleTimeString('en-IN',{hour12:true,hour:'2-digit',minute:'2-digit'}),
       table: tbl, customer: (document.getElementById('custNameInput')?.value || 'GENERAL CUSTOMER'),
-      mob: document.getElementById('custMobileInput')?.value || '', itemsDetail: items, sub, gst, total,
+      mob: document.getElementById('custMobileInput')?.value || '', itemsDetail: items, sub, gst, total, disc: discAmt,
       pay: payMethod, waiter: document.getElementById('waiterSel')?.value || '',
       status: /^(DUE|CREDIT)$/i.test(payMethod||'') ? 'Pending' : 'Paid',
       /* PASS #41 NEW ("Avg Table Turn ... fix"): checked the real
@@ -10685,6 +10698,13 @@ async function settleOrder(){
     // invoice. Now calls the exact same function bmSaveBill() already
     // uses, closing the one path where this protection was missing.
     if (typeof bnxMarkTableOrdersBilled === 'function') bnxMarkTableOrdersBilled(tbl, billNo);
+    // PASS #51 FIX ("release table also after bill") — same gap as
+    // bmSaveBill's New Bill screen: settling here never released the
+    // table either. Walk-in/Quick Bill pseudo-tables have nothing to
+    // release.
+    if (tbl && !/^(COUNTER|DELIVERY|#QB)/i.test(tbl) && typeof bnxSaveTableStatus === 'function') {
+      bnxSaveTableStatus(tbl, { s:'available', c:'', t:'' }).catch(()=>{});
+    }
     if (/^(DUE|CREDIT)$/i.test(payMethod||'') && typeof bnxPostCreditSale === 'function'){
       bnxPostCreditSale(draftBill.customer, draftBill.mob, total, draftBill.dt, billNo);
     }
@@ -12899,7 +12919,20 @@ async function bmSaveBill(reprintAfter){
     const draftBill = {
       no: isEditingExisting ? d.billno : undefined, dt: d.date, tm: d.time,
       table: d.table, customer: d.cname, mob: d.cmob, itemsDetail: d.items,
-      sub: d.sub, gst: d.tax, total: d.total, pay: d.paymode, waiter: d.waiter,
+      // PASS #51 FIX ("discount not recorded properly" / "round off
+      // problem" — confirmed against a real BILL_MASTER row: SUBTOTAL
+      // 3275, TAX_AMOUNT 15.44 (correctly computed on the DISCOUNTED
+      // taxable amount by bmComputeTax), GRAND_TOTAL 3189, and the
+      // entire ~₹101.44 difference landed in ROUND_OFF with
+      // ITEM_DISCOUNT/BILL_DISCOUNT both blank): bmGetBillData() (d)
+      // already computes the real discount as d.disc/d.discPct via
+      // bmComputeTax — this draftBill just never included it. The
+      // backend hardcoded ITEM_DISCOUNT/BILL_DISCOUNT to 0 and had no
+      // way to know a discount existed, so it fell out of the
+      // subtotal+tax-vs-total gap and got mislabeled as ROUND_OFF
+      // (see bnxSaveBill's own fix for the other half of this).
+      sub: d.sub, gst: d.tax, total: d.total, disc: d.disc, discPct: d.discPct,
+      pay: d.paymode, waiter: d.waiter,
       status: /^(DUE|CREDIT)$/i.test(d.paymode||'') ? 'Pending' : 'Paid',
       // PASS #41: same real order-number link as the other draftBill site — see that one's own comment.
       orderId: typeof posOrderNo !== 'undefined' ? posOrderNo : ''
@@ -12949,6 +12982,17 @@ async function bmSaveBill(reprintAfter){
       if (idx > -1){ list[idx].advanceSettled = true; list[idx].settledBillNo = d.billno; bnxSetReservations(list); }
     }
     if (typeof bnxMarkTableOrdersBilled === 'function') bnxMarkTableOrdersBilled(d.table, d.billno);
+    // PASS #51 FIX ("release table also after bill"): a finalized bill
+    // marked the table's ORDERS as billed but never touched the
+    // table's own status — TABLE_LIVE_STATE / tableData stayed
+    // OCCUPIED forever, so the table never became available for the
+    // next guest without a manual clear. Skips COUNTER/walk-in
+    // pseudo-tables (nothing to release) and skips when a reservation
+    // advance still shows a balance due (table intentionally stays
+    // held for that guest until settled in full).
+    if (d.table && !/^(COUNTER|DELIVERY|#QB)/i.test(d.table) && !(d.advanceAdjusted>0 && d.balanceDue>0) && typeof bnxSaveTableStatus === 'function') {
+      bnxSaveTableStatus(d.table, { s:'available', c:'', t:'' }).catch(()=>{});
+    }
     if (!reprintAfter){
       const advLine = d.advanceAdjusted>0
         ? '\nAdvance Adjusted: -₹'+Number(d.advanceAdjusted).toLocaleString('en-IN')+'\nBalance Due: ₹'+Number(d.balanceDue).toLocaleString('en-IN')
