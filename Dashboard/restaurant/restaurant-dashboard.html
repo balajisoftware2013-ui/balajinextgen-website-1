@@ -228,6 +228,43 @@ const CLIENT_INDUSTRY=(function(){
 const REQUEST_QUEUE = { pending: [], active: 0, maxConcurrent: 5 };
 const API_RETRY_CONFIG = { maxAttempts: 3, baseDelay: 300, maxDelay: 5000 };
 
+// FIX (authorization): the confirmed backend returns a real,
+// distinguishable auth failure — respondError(401, 'Invalid or expired
+// session', ...) when the session token is rejected, or
+// respondError(403, 'Unauthorized access', ...) when the token's
+// CLIENT_ID doesn't match the one this page is sending — but neither
+// gasApi() nor erpApi() below ever checked for it. Every screen (KOT
+// board, POS, billing, floor plan, reports) just silently failed or
+// fell back to stale/empty data, with nothing telling staff their
+// SESSION was the problem rather than the network. A stale session
+// mid-shift meant every save appeared to "not work" with no
+// explanation. This mirrors the same fix already shipped in
+// kot-management.html (kmForceReauth): any 401/403 now clears the
+// stale session and sends the user back to login with a clear reason,
+// instead of leaving a half-broken screen where every action quietly
+// fails forever.
+let _bnxReauthTriggered = false;
+function bnxForceReauth(message){
+  if (_bnxReauthTriggered) return;
+  _bnxReauthTriggered = true;
+  try{ if (typeof showNotif === 'function') showNotif('🔒 ' + message, 'error'); }catch(e){}
+  setTimeout(function(){
+    try{
+      if (typeof ERP !== 'undefined' && ERP.logout) { ERP.logout(window.bnxRootPath ? window.bnxRootPath('login.html') : '../login.html'); return; }
+    }catch(e){}
+    ['ERP_USER','ERP_SESSION','ERP_ROLE','ERP_CLIENT','ERP_EXPIRY','erp_session','erp_token','erpUser','erpToken'].forEach(function(k){ try{ localStorage.removeItem(k); }catch(e){} });
+    try{ sessionStorage.clear(); }catch(e){}
+    window.location.href = window.bnxRootPath ? window.bnxRootPath('login.html') : '../login.html';
+  }, 900);
+}
+function bnxCheckAuthFailure_(data){
+  if (data && data.success === false && (data.statusCode === 401 || data.statusCode === 403)) {
+    bnxForceReauth(data.statusCode === 401 ? 'Your session has expired — please log in again.' : 'This session is not authorized for this client — please log in again.');
+    return true;
+  }
+  return false;
+}
+
 let _bnxWarnedNoSession = false;
 async function gasApi(action, payload, endpoint) {
   payload = payload || {};
@@ -288,6 +325,7 @@ async function gasApi(action, payload, endpoint) {
             
             if (!r.ok && r.status !== 200) throw new Error(`HTTP ${r.status}`);
             const data = await r.json();
+            bnxCheckAuthFailure_(data);
             resolve(data);
             return;
           } catch (err) {
@@ -6463,6 +6501,7 @@ async function erpApi(payload, type='V2_AUTH'){
       data.success = data.ok;
       if(!data.data && data.todaySales!==undefined) data.data = data;
     }
+    if (typeof bnxCheckAuthFailure_ === 'function') bnxCheckAuthFailure_(data);
     return data;
   }catch(e){ console.warn('[ERP API '+type+']',e.message); return {success:false,offline:true}; }
 }
@@ -10010,6 +10049,28 @@ async function sendKOT(){
   const covers=document.getElementById('coversInput')?.value||'2';
   const remarks=document.getElementById('remarksInput')?.value||'';
   const items=Object.entries(cart).map(([n,v])=>({name:n,qty:v.qty,price:v.price}));
+  // FIX ("duplicate KOT shown"): nothing here ever checked whether this
+  // table already had a live, un-billed ticket before sending another
+  // one. Re-sending (stale tab, retry, a second device) silently
+  // created a second real order for the same table/items. This does
+  // NOT block a genuine add-on — posOrderNo being already set means
+  // this send is correctly threaded onto the SAME order (see
+  // bnxRecordKOT/printKOTSplit above); the warning only fires when
+  // there's an existing LOCAL ticket for this table under a DIFFERENT
+  // order reference, which is the actual duplicate-order scenario.
+  try{
+    const existingOpen = (JSON.parse(bnxGetOpenKotsRaw()||'[]')||[])
+      .filter(k => (k.table||'').trim().toUpperCase() === tbl.trim().toUpperCase()
+        && !['READY','SERVED','BILLED','CANCELLED'].includes(k.status)
+        && k.orderNo && posOrderNo && k.orderNo !== posOrderNo);
+    if (existingOpen.length){
+      const mins = bnxKotElapsedMin(existingOpen[0].time);
+      const proceed = confirm('Table '+tbl+' already has an active ticket ('+existingOpen[0].kotNo+', '+mins+'m ago) under a different order reference.\n\n'+
+        'Sending another KOT will create a SEPARATE order for this table, not merge with the existing one.\n\n'+
+        'Continue anyway?');
+      if (!proceed) return;
+    }
+  }catch(e){}
   // DELIBERATELY KEPT INSTANT (not awaited) — unlike billing, this file's
   // own history shows this was already made instant once before after
   // kitchen staff complained the click froze waiting on network ("click
@@ -10043,11 +10104,26 @@ async function sendKOT(){
     if (typeof buildRichTbls==='function') buildRichTbls();
     if (typeof bnxUpdateTableStats==='function') bnxUpdateTableStats();
   }
-  const kotRequestId = bnxUuid();
-  const kotReq = {requestId:kotRequestId, table:tbl,waiter,covers,remarks,items,orderNo:posOrderNo};
-  gasApi('SAVE_KOT', kotReq, 'V2_CORE').then(res=>{
-    if(!res || !res.success) bnxQueuePending('SAVE_KOT', kotReq, kotRequestId);
-  }).catch(()=>bnxQueuePending('SAVE_KOT', kotReq, kotRequestId));
+  // FIX ("duplicate KOT shown / bill loads items 3x — Kitchen, Bar,
+  // Hashfreezer Counter, and New Bill's KOT Reference picker"): this
+  // used to ALSO fire its own independent gasApi('SAVE_KOT', ...) call
+  // right here, on top of printKOTSplit() above already recording the
+  // real, authoritative order via bnxRecordKOT -> SAVE_ORDER (which is
+  // what GET_ACTIVE_ORDERS / Order Register / the New Bill picker's
+  // "Pending Orders" list actually read back). Confirmed via full-file
+  // search: nothing in this codebase ever calls GET_KOT to read back
+  // whatever this wrote — it was creating a second, completely
+  // orphaned KOT_MASTER row for the exact same ticket every single
+  // time, under its own server-generated KOT number, with no link back
+  // to the ORDER_MASTER row bnxRecordKOT already created. That's the
+  // confirmed root cause of the "#ORD-1040 + KOT-3187, same items,
+  // shown twice" duplicate on the Kitchen KOT board, and of New Bill's
+  // "Load" picker summing the same items twice (once from the order,
+  // once from this KOT) when both were selected. Applies identically
+  // to Kitchen, Bar, and Hashfreezer/Counter tickets, since all three
+  // go through this same sendKOT() -> printKOTSplit() path. Removed —
+  // printKOTSplit()/bnxRecordKOT() above is the single source of truth
+  // now; nothing else needs to change to pick this up.
 }
 
 /* KOT numbers were never stored anywhere after printing — New Bill's
@@ -13216,16 +13292,23 @@ function bmHandleTableChange(){
   let open = [];
   try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
   const bareTbl = tblVal.replace('T-','');
-  // FIX ("after added load remove ... otherwise multiple add"): exclude
-  // KOTs already pulled into a bill (see bmConfirmKotPicker's `billed`
-  // flag) so an auto-load on Table No change can't re-add the same
-  // ticket's items a second time.
-  const kots = open.filter(k => k.status!=='READY' && !k.billed && (k.table||'').trim().toUpperCase() === tblVal);
   const orders = (typeof orderRegData!=='undefined' ? orderRegData : []).filter(o => {
     if (o.ORDER_STATUS==='BILLED' || o.ORDER_STATUS==='CANCELLED') return false;
     const tid=(o.TABLE_ID||'').trim().toUpperCase();
     return tid===tblVal || tid===bareTbl;
   });
+  // FIX ("after added load remove ... otherwise multiple add" / "bill
+  // loads items 3x"): exclude KOTs already pulled into a bill (the
+  // `billed` flag), AND exclude a local KOT entry whenever the SAME
+  // physical ticket is already present as an order above (matched by
+  // orderNo) — same reasoning as bmOpenKotPicker's dedupe below; this
+  // auto-load path used its own separate, undeduped filter and could
+  // silently double-count a ticket's items on the single-match
+  // auto-load branch just below.
+  const orderNosHere = new Set(orders.map(o => o.ORDER_NO || o.ORDER_ID).filter(Boolean));
+  const kots = open.filter(k => k.status!=='READY' && !k.billed
+    && (k.table||'').trim().toUpperCase() === tblVal
+    && !(k.orderNo && orderNosHere.has(k.orderNo)));
   const total = kots.length + orders.length;
   if (total === 1){
     window._bmPicker = { kots, orders, sel: new Set([kots.length ? 'k0' : 'o0']) };
@@ -13307,7 +13390,6 @@ function bmOpenKotPicker(){
   // been pulled into a bill, it drops out of this list so re-opening
   // "Pending KOTs & Orders" (or clicking Load again) can't offer it a
   // second time and double the qty on the bill.
-  const kots = open.filter(k => k.status!=='READY' && !k.billed && (!tblVal || (k.table||'').trim().toUpperCase() === tblVal));
   const pickedOrderIds = bnxGetPickedOrderIds();
   const rawOrders = (typeof orderRegData!=='undefined' ? orderRegData : []).filter(o => {
     if (o.ORDER_STATUS==='BILLED' || o.ORDER_STATUS==='CANCELLED') return false;
@@ -13317,6 +13399,22 @@ function bmOpenKotPicker(){
     return tid===tblVal || tid===bareTbl;
   });
   const orders = bmGroupOrdersByNo(rawOrders);
+  // FIX ("bill loads items 3x" / New Bill KOT Reference picker): a local
+  // bnx_open_kots entry and a server ORDER_MASTER row can represent the
+  // exact SAME physical ticket (the local entry carries the order's
+  // orderNo — see bnxRecordKOT). Offering both here let staff tick BOTH
+  // boxes for one ticket, and bmConfirmKotPicker's merge then summed
+  // that ticket's items twice on top of whatever bmGroupOrdersByNo had
+  // already correctly summed across genuine add-on order rows — this is
+  // what produced items showing qty x3 on the bill for food that was
+  // only ever cooked once. A local KOT entry is now excluded from this
+  // list whenever an order sharing its orderNo is already being shown
+  // in "Pending Orders" below, so each real ticket can only be picked
+  // from ONE place.
+  const shownOrderNos = new Set(orders.map(o => o.ORDER_NO || o.ORDER_ID).filter(Boolean));
+  const kots = open.filter(k => k.status!=='READY' && !k.billed
+    && (!tblVal || (k.table||'').trim().toUpperCase() === tblVal)
+    && !(k.orderNo && shownOrderNos.has(k.orderNo)));
   window._bmPicker = { kots, orders, sel: new Set() };
   const body = document.getElementById('bmKotPickerBody');
   if (!kots.length && !orders.length){
