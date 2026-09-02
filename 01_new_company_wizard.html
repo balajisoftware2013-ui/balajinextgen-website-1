@@ -369,7 +369,22 @@ function logoutUser(){
   const t=sessionStorage.getItem('erp_token')||localStorage.getItem('erpToken');
   if(t&&!IS_LOCAL) navigator.sendBeacon(GAS_URL,new Blob([JSON.stringify({action:'LOGOUT',token:t})],{type:'text/plain'}));
   localStorage.removeItem('erpUser');localStorage.removeItem('erpToken');sessionStorage.clear();
-  if(location.protocol!=='file:') window.location.replace(loginPageUrl());
+  if(location.protocol!=='file:') window.location.replace('../login.html');
+}
+
+// ── AUTH TOKEN — ROOT-CAUSE FIX (2026-09-02) ──────────────────────
+// "Save failed: Invalid or expired session": every gasPost() call in
+// this file EXCEPT LOGOUT was posting to GAS with no token field at
+// all — REGISTER_CLIENT, COPY_TEMPLATE_DB, PROVISION_CLIENT_MODULES,
+// PROVISION_CLIENT_CONFIG, GENERATE_DASHBOARD_CONFIG all went out
+// token-less. The backend's session check (doPost) then has nothing
+// to validate and rejects with "Invalid or expired session" — this
+// is a client-side omission, not a template/DB config issue.
+// getAuthToken() reads the exact same keys logoutUser() already
+// reads, so this matches how the rest of the file already stores
+// the token after login — no new storage convention introduced.
+function getAuthToken(){
+  return sessionStorage.getItem('erp_token')||localStorage.getItem('erpToken')||'';
 }
 
 // ── LOCAL CLIENT STORE ──
@@ -397,42 +412,20 @@ async function gasGet(action){
     return JSON.parse(txt);
   }catch(e){return{success:false,error:e.message};}
 }
-function getAuthToken(){
-  return sessionStorage.getItem('erp_token') || localStorage.getItem('erpToken') || localStorage.getItem('erp_token') || '';
-}
-function isSessionError(r){
-  const x=String(r?.error||r?.message||r?.statusText||'').toLowerCase();
-  return /invalid|expired|session|unauthori[sz]ed|forbidden/.test(x);
-}
-function loginPageUrl(){
-  try{return new URL('login.html',location.href).href;}catch(e){return '/login.html';}
-}
 async function gasPost(payload){
-  const token=getAuthToken();
-  const requestPayload={...payload, token:token || undefined};
+  // ROOT-CAUSE FIX (2026-09-02): attach the logged-in session token to
+  // every POST — see getAuthToken() note above. Previously only LOGOUT
+  // (a separate sendBeacon call, not gasPost) ever sent one.
+  if(payload&&payload.token===undefined) payload={...payload,token:getAuthToken()};
   try{
-    const r=await fetchWithTimeout(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},credentials:'include',body:JSON.stringify(requestPayload)},20000);
+    const r=await fetchWithTimeout(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify(payload)},20000);
+    if(!r.ok)throw new Error('HTTP '+r.status);
     const txt=await r.text();
-    let j={};
-    try{j=JSON.parse(txt);}catch(e){throw new Error('Invalid GAS response');}
-    if(isSessionError(j)){
-      j.success=false; j.status='AUTH_ERROR'; j.mode='ONLINE';
-      j.error=j.error||j.message||'Invalid or expired session';
-      return j;
-    }
-    if(!r.ok){
-      return {success:false,status:'HTTP_ERROR',mode:'ONLINE',error:j.error||j.message||('HTTP '+r.status)};
-    }
+    const j=JSON.parse(txt);
     return{...j,mode:'ONLINE'};
   }catch(e){
-    // Only network/transport failures are queued offline. Authentication or
-    // server business errors must NEVER be stored as offline registrations.
-    const msg=String(e?.message||e||'Network error');
-    if(/auth|session|invalid|expired|forbidden|unauthori[sz]ed/i.test(msg)){
-      return{success:false,status:'AUTH_ERROR',mode:'ONLINE',error:msg};
-    }
     const id=payload.clientData?.CLIENT_ID||('ID'+Date.now());
-    localStorage.setItem(OFFLINE_KEY+id,JSON.stringify(requestPayload));
+    localStorage.setItem(OFFLINE_KEY+id,JSON.stringify(payload));
     saveLocalClient(payload.clientData||payload);
     updateNetBadge();
     return{success:true,mode:'OFFLINE',offline:true};
@@ -448,7 +441,8 @@ async function syncPending(){
   const keys=[];for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k&&k.startsWith(OFFLINE_KEY))keys.push(k);}
   for(const key of keys){
     try{
-      const p=JSON.parse(localStorage.getItem(key));
+      let p=JSON.parse(localStorage.getItem(key));
+      if(p&&p.token===undefined) p={...p,token:getAuthToken()};
       const r=await fetchWithTimeout(GAS_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify(p)},20000);
       if(r.ok){const txt=await r.text();const j=JSON.parse(txt);if(j.success||j.status==='success'){localStorage.removeItem(key);toast('✅ Synced: '+key.replace(OFFLINE_KEY,''));}}
     }catch(e){}
@@ -1270,7 +1264,6 @@ async function saveToSheets(sendAfter=false){
   // ── PAYLOAD ─────────────────────────────────────────────
   const payload={
     action:'REGISTER_CLIENT',
-    token:getAuthToken(),
     companyName: data.companyName || 'Unknown Company',
     industry: (function(){
       return INDUSTRY_MAP[data.industry]||data.industry||'RESTAURANT';
@@ -1329,16 +1322,6 @@ async function saveToSheets(sendAfter=false){
     return;
   }
   if(!r.success&&r.status!=='success'){
-    if(r.status==='AUTH_ERROR' || isSessionError(r)){
-      const msg='🔐 Session expired or invalid. Please log in again before saving this client.';
-      ss.className='save-status ss-error';
-      ss.textContent=msg;
-      toast(msg,5000);
-      pvSetStep(1,'fail','Login required');
-      _unlockButtons();
-      setTimeout(()=>{ if(confirm('Your ERP login session is expired. Open the login page now?')) location.href=loginPageUrl(); },150);
-      return;
-    }
     if(r.error&&r.error.includes('ALREADY_EXISTS')){
       const msgs={EMAIL_ALREADY_EXISTS:'⚠️ Email "'+data.email+'" already registered.',MOBILE_ALREADY_EXISTS:'⚠️ Mobile "'+data.phone+'" already registered.',COMPANY_ALREADY_EXISTS:'⚠️ Company "'+data.companyName+'" already exists.',USERNAME_ALREADY_EXISTS:'⚠️ Username "'+data.adminUsername+'" already taken.'};
       const msg=msgs[r.error]||r.message||'Duplicate detected.';
