@@ -1400,32 +1400,69 @@ async function flushOutbox(){
     if(now < dueAt){ remaining.push(entry); continue; }
     entry.attempts++;
     entry.lastAttemptAt = now;
-    const res = await gasApi(entry.action, entry.payload, 'V2_CORE');
-    if(res && res.success){
-      // Successfully synced late — apply any follow-up UI update tagged on this entry
-      if(entry.onSuccessTag==='kot') bnxLoadOpenKots();
-      if(typeof entry.onSuccessTag==='string' && entry.onSuccessTag.startsWith('kot-edit:')){
-        const kotNo = entry.onSuccessTag.slice('kot-edit:'.length);
-        bnxLoadOpenKots();
-        const k = KOT.find(x=>x.kotNo===kotNo);
-        if(k){ k.pendingLocalEdit = false; bnxSetOpenKotsRaw(JSON.stringify(KOT)); }
-      }
-    } else if(entry.attempts < 10){
+    // FIX ("38 pending sync" frozen forever while the LIVE badge stays
+    // green): gasApi() itself never throws, but the success-path
+    // follow-up below it (bnxLoadOpenKots / KOT.find / JSON.stringify)
+    // does real DOM/array work with no guard. One bad entry throwing
+    // there used to abort this whole for-loop mid-iteration — every
+    // entry after it in `list` silently never got re-added to
+    // `remaining`, bnxSetOutbox(remaining) on the last line never ran,
+    // and the status update below it never ran either. The badge and
+    // count then stay frozen at whatever they were, indefinitely,
+    // because the interval below re-runs this same function every 15s
+    // and hits the identical exception every time. Wrapping the body
+    // per-entry means one bad entry degrades to "still pending" and
+    // gets logged, instead of freezing every other entry's retry
+    // progress and the whole status badge along with it.
+    let res;
+    try {
+      res = await gasApi(entry.action, entry.payload, 'V2_CORE');
+    } catch (e) {
+      console.error('[OUTBOX] gasApi threw for entry', entry.action, e && e.message ? e.message : e);
       remaining.push(entry);
       anyFailed = true;
-    } else {
-      console.error('[OUTBOX] gave up after 10 attempts, moved to failed store:', entry);
-      const failed = bnxGetFailedOutbox();
-      failed.push(entry);
-      bnxSetFailedOutbox(failed);
-      toast('⚠️ A '+(entry.action==='SAVE_BILL'?'bill':entry.action==='SAVE_ORDER'?'order':'update')+' failed to sync after many tries — see "Sync issues" below','error');
+      continue;
+    }
+    try {
+      if(res && res.success){
+        // Successfully synced late — apply any follow-up UI update tagged on this entry
+        if(entry.onSuccessTag==='kot') bnxLoadOpenKots();
+        if(typeof entry.onSuccessTag==='string' && entry.onSuccessTag.startsWith('kot-edit:')){
+          const kotNo = entry.onSuccessTag.slice('kot-edit:'.length);
+          bnxLoadOpenKots();
+          const k = KOT.find(x=>x.kotNo===kotNo);
+          if(k){ k.pendingLocalEdit = false; bnxSetOpenKotsRaw(JSON.stringify(KOT)); }
+        }
+      } else if(entry.attempts < 10){
+        remaining.push(entry);
+        anyFailed = true;
+      } else {
+        console.error('[OUTBOX] gave up after 10 attempts, moved to failed store:', entry);
+        const failed = bnxGetFailedOutbox();
+        failed.push(entry);
+        bnxSetFailedOutbox(failed);
+        toast('⚠️ A '+(entry.action==='SAVE_BILL'?'bill':entry.action==='SAVE_ORDER'?'order':'update')+' failed to sync after many tries — see "Sync issues" below','error');
+      }
+    } catch (e) {
+      // The sync itself succeeded/failed cleanly above — this only
+      // guards the follow-up UI bookkeeping so a bad KOT lookup can't
+      // re-queue an already-synced entry forever or crash the loop.
+      console.error('[OUTBOX] post-sync handling threw for entry', entry.action, e && e.message ? e.message : e);
     }
   }
   bnxSetOutbox(remaining);
   if(!remaining.length && !bnxGetFailedOutbox().length) bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
   else if(anyFailed) bnxSetLiveStatus('syncing');
 }
-setInterval(flushOutbox, 15000);
+// FIX (companion to the per-entry guard above): bnxSafeBoot_'s
+// try/catch is synchronous and can never catch a rejection from an
+// async function like flushOutbox — a throw after its first `await`
+// becomes an unhandled promise rejection instead, invisible in the UI.
+// Same gap existed here nakedly: setInterval(flushOutbox, 15000) had
+// no rejection handling at all. Both call sites now attach a .catch so
+// a genuine bug in a future edit logs instead of silently going dark
+// on a phone with no visible console.
+setInterval(() => { flushOutbox().catch(e => console.error('[OUTBOX] flushOutbox interval rejected:', e && e.message ? e.message : e)); }, 15000);
 window.addEventListener('online', ()=>{ bnxSetLiveStatus('live'); flushOutbox(); });
 window.addEventListener('offline', ()=> bnxSetLiveStatus('offline'));
 bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
@@ -3802,7 +3839,7 @@ bnxSafeBoot_(renderKOT, 'renderKOT');
 bnxSafeBoot_(loadMenuFromServer, 'loadMenuFromServer');
 bnxSafeBoot_(loadKOTFromServer, 'loadKOTFromServer');
 bnxSafeBoot_(loadTablesLive, 'loadTablesLive');
-bnxSafeBoot_(flushOutbox, 'flushOutbox');
+bnxSafeBoot_(() => { flushOutbox().catch(e => console.error('[BOOT] flushOutbox rejected:', e && e.message ? e.message : e)); }, 'flushOutbox');
 bnxSafeBoot_(() => setInterval(loadKOTFromServer, 20000), 'KOT polling interval'); // light polling so steward app & POS stay in sync
 bnxSafeBoot_(() => setInterval(loadTablesLive, 20000), 'table polling interval'); // same for the live floor/table status
 </script>
