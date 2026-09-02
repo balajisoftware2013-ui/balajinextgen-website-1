@@ -850,9 +850,31 @@ async function syncLiveKOTs(){
 
 
 
+// FIX: flags tickets that are very likely duplicates of each other so
+// staff can catch and cancel one instead of the kitchen quietly cooking
+// the same order twice. Heuristic only (same table + still active +
+// same item names) — it never auto-merges or deletes anything, it just
+// surfaces a warning on the card, because merging two backend rows that
+// aren't actually linked by ORDER_ID would risk silently dropping a real
+// second order.
+function flagLikelyDuplicates(kots) {
+  const active = kots.filter(k => k.status==='pending' || k.status==='cooking' || k.status==='ready');
+  active.forEach(k => { k._dupWarning = false; });
+  for (let i = 0; i < active.length; i++) {
+    for (let j = i+1; j < active.length; j++) {
+      const a = active[i], b = active[j];
+      if (a.table !== b.table) continue;
+      const aNames = a.items.map(x=>x.n).sort().join('|');
+      const bNames = b.items.map(x=>x.n).sort().join('|');
+      if (aNames && aNames === bNames) { a._dupWarning = true; b._dupWarning = true; }
+    }
+  }
+  return kots;
+}
+
 // ── RENDER ALL ────────────────────────────────────────────
 function renderAll() {
-  const kots = dbGet().filter(k => k.created.slice(0,10) === today());
+  const kots = flagLikelyDuplicates(dbGet().filter(k => k.created.slice(0,10) === today()));
   updateKPIs(kots);
   renderKanban(kots);
   renderList(kots);
@@ -921,6 +943,7 @@ function buildKOTCard(k) {
       <span class="kot-timer ${timerCls}">⏱ ${timerTxt}</span>
     </div>
     <div class="kot-waiter">👤 ${k.waiter} · ${k.covers} covers · <em>${k.zone||'Main Hall'}</em></div>
+    ${k._dupWarning?`<div style="font-size:10px;font-weight:700;color:#fff;background:var(--red,#c0392b);padding:4px 8px;border-radius:6px;margin-bottom:6px;">⚠️ Same table + same items as another active ticket — likely a duplicate. Verify before cooking both.</div>`:''}
     <div class="kot-items">${itemsHtml}</div>
     ${k.notes?`<div style="font-size:10px;color:var(--orange);margin-bottom:6px;">📝 ${k.notes}</div>`:''}
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
@@ -979,6 +1002,7 @@ function renderKitchenView(kots) {
         <span class="kot-timer ${timerCls}" style="font-size:13px;padding:4px 10px;">⏱ ${mins}m</span>
       </div>
       <div style="font-size:13px;font-weight:700;margin-bottom:4px;">📍 ${k.table} · ${k.waiter}</div>
+      ${k._dupWarning?`<div style="font-size:10px;font-weight:700;color:#fff;background:var(--red,#c0392b);padding:4px 8px;border-radius:6px;margin-bottom:6px;">⚠️ Possible duplicate of another active ticket on this table</div>`:''}
       <div style="border-top:1px dashed var(--border);padding-top:8px;margin-top:8px;">
         ${k.items.map(i=>`<div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px dotted var(--border);font-size:13px;">
           <span style="font-weight:800;font-size:16px;">${i.q}</span>
@@ -1300,6 +1324,27 @@ function saveKOT() {
   const notes  = document.getElementById('kot-notes')?.value || '';
   if(!table) { toast('Select a table first!', 'error'); return; }
   if(!activeCart.length) { toast('Add at least one item!', 'error'); return; }
+  // FIX ("multiple KOTs shown at billing time / duplicated to kitchen"):
+  // nothing here ever checked whether the selected table already had a
+  // live, unbilled ticket before creating another one. A stale ticket
+  // (e.g. an order sitting unbilled for hours) or a re-print after a
+  // sync hiccup silently created a second, fully independent KOT_MASTER
+  // row for the same food — no shared ORDER_ID links the two rows, so
+  // the kitchen board, list view, and kitchen display (all three render
+  // off the same merged array) each showed the same items twice. This
+  // guard blocks that at the source: creating a duplicate now requires
+  // an explicit confirm instead of happening silently.
+  const existingActive = dbGet().filter(k => k.table === table && (k.status==='pending' || k.status==='cooking' || k.status==='ready'));
+  if (existingActive.length) {
+    const ageMins = Math.floor((new Date() - new Date(existingActive[0].created)) / 60000);
+    const proceed = confirm(
+      `Table ${table} already has an active ticket (${existingActive[0].no}, ${ageMins}m ago) with ${existingActive[0].items.length} item(s) not yet served.\n\n` +
+      `Creating another KOT for this table will send a SEPARATE ticket to the kitchen — it will NOT merge with the existing one. ` +
+      `If this is meant to be an add-on to the same order, close this and use "+ Item" on the existing ticket instead.\n\n` +
+      `Continue and create a new, separate KOT anyway?`
+    );
+    if (!proceed) return;
+  }
   // P0 FIX ("no dummy data if login" — same principle as
   // customer-order.html/steward-mobile.html): refuse to send a KOT
   // built against the hardcoded fallback menu to the real kitchen —
