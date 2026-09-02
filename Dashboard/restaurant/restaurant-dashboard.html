@@ -1718,6 +1718,7 @@ body.pos-machine .pos-wrap{grid-template-columns:1fr 380px;}
   padding:12px;transition:.2s;position:relative;}
 .kot-card.urgent{border-color:rgba(212,43,43,.5);background:rgba(212,43,43,.02);}
 .kot-card.new{border-color:rgba(38,85,200,.4);background:rgba(38,85,200,.02);}
+.kot-card.progress{border-color:rgba(230,140,20,.45);background:rgba(230,140,20,.03);}
 .kot-card.ready{border-color:rgba(26,148,86,.4);background:rgba(26,148,86,.02);}
 .kot-num{position:absolute;top:10px;right:10px;font-family:'DM Mono',monospace;font-size:10px;
   color:var(--text3);}
@@ -10765,15 +10766,23 @@ function bnxGetKotStore(){
    Locally-recorded KOTs not yet reflected server-side are left alone. */
 async function bnxSyncLiveKots(){
   if (typeof erpApi !== 'function' || !CLIENT_ID) return;
+  // PASS #50 FIX (companion to the steward app's own loadKOTFromServer
+  // fix — "KOT CHECK FALSE" / "In Progress always 0"): COOKING/
+  // PREPARING/IN_PROGRESS all used to collapse to 'NEW', so a ticket
+  // being cooked on another terminal would show back up here as brand
+  // new; SERVED collapsed to 'READY', hiding that it had actually
+  // already been served. Both now map to their own real stage so this
+  // dashboard's Kanban (New/Progress/Ready columns, see buildKOT) can
+  // actually show a ticket at the stage it's really in.
   const STATUS_MAP = { NEW:'NEW', KOT_PRINTED:'NEW', PENDING:'NEW',
-    COOKING:'NEW', PREPARING:'NEW', IN_PROGRESS:'NEW',
-    READY:'READY', SERVED:'READY' };
+    COOKING:'PROGRESS', PREPARING:'PROGRESS', IN_PROGRESS:'PROGRESS', PROGRESS:'PROGRESS',
+    READY:'READY', SERVED:'SERVED' };
   let res;
   try{ res = await erpApi({action:'GET_ACTIVE_ORDERS'}, 'V2_CORE'); }catch(e){ return; }
   const orders = res && res.success && res.data && Array.isArray(res.data.orders) ? res.data.orders : null;
   if (!orders || !orders.length) return; // no live data — leave local store as-is
 
-  const STATUS_RANK = { NEW:0, READY:1 };
+  const STATUS_RANK = { NEW:0, PROGRESS:1, READY:2, SERVED:3 };
   let open = [];
   try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
   orders.forEach(o=>{
@@ -10831,7 +10840,12 @@ function bnxKotElapsedMin(iso){
    cards render from, so the tiles and the cards always agree. */
 function bnxSyncKotBadge(){
   const all = bnxGetKotStore();
-  const active = all.filter(k=>k.status!=='READY');
+  // PASS #50 FIX: now that a pulled SERVED status is preserved instead
+  // of being collapsed into READY/NEW (see bnxSyncLiveKots above),
+  // SERVED/BILLED/CANCELLED tickets need excluding here too, or they'd
+  // silently inflate the "active"/badge count without ever showing up
+  // in any Kanban column (none of New/Progress/Ready match them).
+  const active = all.filter(k=>!['READY','SERVED','BILLED','CANCELLED'].includes(k.status));
   const n = active.length;
   const badge = document.getElementById('kotBadge');
   if (badge){ badge.textContent = String(n); badge.style.display = n ? '' : 'none'; }
@@ -10840,10 +10854,19 @@ function bnxSyncKotBadge(){
       el.nextElementSibling.textContent = String(n);
     }
   });
-  // New = just fired (<10m), In Progress = 10-19m old, Ready = status READY,
-  // Delayed = active 20m+ (matches the "Urgent" badge shown on the card itself).
-  const freshCount = active.filter(k=>bnxKotElapsedMin(k.time) < 10).length;
-  const midCount = active.filter(k=>{ const m=bnxKotElapsedMin(k.time); return m>=10 && m<20; }).length;
+  // PASS #50 FIX ("KOT CHECK FALSE" — stat tiles disagreeing with the
+  // Kanban columns below them, e.g. "1 Ready to Serve" tile next to a
+  // "No orders" Ready column): New/In Progress used to be guessed from
+  // elapsed time (<10m / 10-19m) while the Kanban columns further down
+  // split the exact same tickets by their real `status` field
+  // (NEW/PROGRESS/READY) — two different definitions of "New" that
+  // could never agree, since a ticket sitting untouched for 12 minutes
+  // counted as "In Progress" here but stayed in the "New" Kanban column.
+  // Both now read the same status field, so a tile and its column can
+  // never disagree again. Delayed/"Urgent" stays time-based below (that
+  // really is about elapsed time, not workflow stage).
+  const freshCount = active.filter(k=>k.status==='NEW' || !k.status).length;
+  const midCount = active.filter(k=>k.status==='PROGRESS' || k.status==='IN_PROGRESS').length;
   const readyCount = all.filter(k=>k.status==='READY').length;
   const delayedCount = active.filter(k=>bnxKotElapsedMin(k.time) >= 20).length;
   const setTxt=(id,v)=>{ const el=document.getElementById(id); if (el) el.textContent = String(v); };
@@ -10877,22 +10900,50 @@ function buildKOT(){
   if (!kanbanContainer && !gridContainer) return;
   
   bnxSyncKotBadge();
-  const store = bnxGetKotStore().filter(k=>k.status!=='READY' || k.demo);
+  // PASS #50 FIX ("KOT CHECK FALSE" — Ready to Serve tile says 1 but the
+  // Ready column under it says "No orders"): this used to filter OUT
+  // every real (non-demo) READY ticket before the Kanban split below
+  // ever ran — so `readyKots = store.filter(k=>k.status==='READY')`
+  // a few lines down was filtering a list that could never contain a
+  // real READY ticket in the first place. bnxSyncKotBadge()'s readyCount
+  // (used for the tile) reads the UNFILTERED store, so the tile was
+  // always right and the column was always empty — exactly the
+  // mismatch in the screenshot. Kanban now splits the real, full store.
+  const store = bnxGetKotStore();
+  // Flat/grid fallback (narrow screens) intentionally still hides
+  // completed tickets — that's a different, correct use of this filter,
+  // kept as its own variable so it can't leak back into the Kanban split.
+  // PASS #50 FIX: also excludes SERVED/BILLED/CANCELLED now that those
+  // are real possible statuses here (see bnxSyncLiveKots) — previously
+  // only READY was excluded, so a served ticket would sit in this list
+  // wrongly offering a "Start Cooking" button.
+  const gridStore = store.filter(k=>!['READY','SERVED','BILLED','CANCELLED'].includes(k.status) || k.demo);
   
   // Generate KOT card HTML
   const generateCard = (k, idx) => {
     const mins = bnxKotElapsedMin(k.time);
     const isUrgent = mins>=20;
-    const statusCls = k.status==='READY' ? '' : isUrgent ? 'urgent' : 'new';
-    const statusBadge = k.status==='READY' ? '<span class="pill p-gold" style="font-size:9px">✅ Ready</span>' : isUrgent ? '<span class="pill p-r" style="font-size:9px">⚠️ Urgent</span>' : '<span class="pill p-b" style="font-size:9px">🆕 New</span>';
+    const statusCls = k.status==='READY' ? '' : k.status==='PROGRESS'||k.status==='IN_PROGRESS' ? 'progress' : isUrgent ? 'urgent' : 'new';
+    const statusBadge = k.status==='READY' ? '<span class="pill p-gold" style="font-size:9px">✅ Ready</span>' : (k.status==='PROGRESS'||k.status==='IN_PROGRESS') ? '<span class="pill p-b" style="font-size:9px">🔥 Cooking</span>' : isUrgent ? '<span class="pill p-r" style="font-size:9px">⚠️ Urgent</span>' : '<span class="pill p-b" style="font-size:9px">🆕 New</span>';
     const typeTag = k.type==='BAR' ? '🍸 Bar' : '🍳 Kitchen';
+    // PASS #50 FIX ("In Progress always 0"): no button anywhere ever set
+    // a KOT's status to PROGRESS/IN_PROGRESS — every ticket jumped
+    // straight from NEW to READY, so the "In Progress" tile/column could
+    // never show a real ticket even after the tile/column mismatch above
+    // was fixed. A New ticket now gets a "Start Cooking" step first;
+    // only a ticket already marked as cooking gets the "Ready" button.
+    const actionBtn = k.status==='READY'
+      ? `<button class="btn btn-sm btn-primary" style="font-size:10px;flex:1;" disabled>✅ Done</button>`
+      : (k.status==='PROGRESS'||k.status==='IN_PROGRESS')
+        ? `<button class="btn btn-sm btn-primary" style="font-size:10px;flex:1;" onclick="kotReady(this,'${k.kotNo}')">✅ Ready</button>`
+        : `<button class="btn btn-sm btn-primary" style="font-size:10px;flex:1;" onclick="kotStartCooking(this,'${k.kotNo}')">🔥 Start Cooking</button>`;
     return `<div class="kot-card ${statusCls}">
       <div class="kot-num">${k.kotNo} <span style="font-size:9px;font-weight:600;color:var(--text3);">· ${typeTag}</span></div>
       <div class="kot-table">📍 ${k.table}${k.waiter?' · '+k.waiter:''}</div>
       <div class="kot-time">⏱ ${mins}m ago · ${statusBadge}</div>
       <ul class="kot-items">${(k.items||[]).map(i=>`<li>${i.name||i.n} x${i.qty||1}</li>`).join('')}</ul>
       <div class="kot-foot">
-        <button class="btn btn-sm btn-primary" style="font-size:10px;flex:1;" ${k.status==='READY'?'disabled':''} onclick="kotReady(this,'${k.kotNo}')">${k.status==='READY'?'✅ Done':'✅ Ready'}</button>
+        ${actionBtn}
         <button class="btn btn-sm btn-ghost" style="font-size:10px;" onclick="kotReprint('${k.kotNo}')">🖨 Print</button>
       </div>
       <div class="kot-foot" style="margin-top:5px;">
@@ -10920,11 +10971,11 @@ function buildKOT(){
   
   // Grid layout: Flat list (fallback for narrower screens)
   if (gridContainer){
-    if (!store.length){ 
+    if (!gridStore.length){ 
       gridContainer.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:30px;color:var(--text3);font-size:13px;">No active KOTs — new tickets sent from POS will appear here, or tap "+ New KOT" to add one manually.</div>'; 
       return; 
     }
-    gridContainer.innerHTML=store.map((k,idx)=>generateCard(k,idx)).join('');
+    gridContainer.innerHTML=gridStore.map((k,idx)=>generateCard(k,idx)).join('');
   }
 }
 /* FIX ("auto show kot pending list"): the page only ever refreshed on
@@ -10962,6 +11013,22 @@ setInterval(()=>{
    coming back to this tab won't lose the update (previously the
    Ready button only changed its own label in memory and forgot
    everything on reload). */
+// PASS #50 NEW — the other half of the dead "In Progress" column fix:
+// moves a ticket from NEW to PROGRESS (kitchen has started cooking it),
+// persists it the same way kotReady() does, and best-effort syncs the
+// same status to the backend via UPDATE_ORDER_STATUS so other
+// devices/the steward app agree on which stage this ticket is at.
+function kotStartCooking(btn,kotNo){
+  if (btn){ btn.textContent='🔥 Cooking…'; btn.disabled=true; }
+  try{
+    let open = JSON.parse(bnxGetOpenKotsRaw()||'[]');
+    const rec = open.find(k=>k.kotNo===kotNo);
+    if (rec){ rec.status='PROGRESS'; bnxSetOpenKotsRaw(JSON.stringify(open)); }
+  }catch(e){}
+  bnxSyncKotBadge();
+  if (typeof buildKOT === 'function') buildKOT();
+  if (typeof bnxGuaranteedSync === 'function') bnxGuaranteedSync('UPDATE_ORDER_STATUS', {orderId:kotNo, status:'PROGRESS'}, true);
+}
 function kotReady(btn,kotNo){
   btn.textContent='✅ Done!'; btn.disabled=true; btn.style.background='var(--green)';
   try{
