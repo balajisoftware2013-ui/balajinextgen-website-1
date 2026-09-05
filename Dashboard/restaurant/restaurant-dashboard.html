@@ -7334,6 +7334,7 @@ function showPage(id, el){
   if(id==='bills-list'){ blRenderTable(); bnxPullBillsFromServer().then(()=>blRenderTable()); }
   if(id==='due-collection' || id==='customer-credit'){ bnxLoadDueCollection(); }
   if(id==='aggregator-settlement' && typeof bnxLoadAggregatorSettlement==='function'){ bnxLoadAggregatorSettlement(); }
+  if(id==='online-orders' && typeof loadOnlineOrders==='function'){ loadOnlineOrders(); }
   // FIX ("can select reports" — confirmed root cause, Sep 2026): this
   // called rhInit() — a function that does not exist ANYWHERE in this
   // file. The typeof guard meant it silently no-op'd instead of
@@ -7344,7 +7345,7 @@ function showPage(id, el){
   // right init (resets filters/category state, then calls
   // renderReportsGallery() itself) — just never got wired here.
   if(id==='reports'){ if (typeof resetReportsHub === 'function') resetReportsHub(); }
-  if(id==='accounts-ledger'){ backToAcctGallery(); renderAcctGallery(); }
+  if(id==='accounts-ledger'){ backToAcctGallery(); renderAcctGallery(); if (typeof bnxPullPettyCashFromServer === 'function') bnxPullPettyCashFromServer(); }
 }
 /* Pulls real bill history from the backend's already-wired LIST_BILLS
    action and merges it into the local bill register (existingIdx match
@@ -16531,9 +16532,77 @@ PAGE_META['s-menu-create'] = ['Menu Creation','Chef menu · Bar menu · Item-wis
 /* ══════════════════════════════════════════════════
    ONLINE ORDERS MODULE
 ══════════════════════════════════════════════════ */
-function loadOnlineOrders(){
+/* FIX ("online order demo data" — confirmed root cause): this used to
+   just show a fake "Syncing… 19 orders today" toast and never touch the
+   DOM at all — the "All Online Orders" table below (#onlineOrdersBody)
+   and the Zomato/Swiggy/ONDC+Others summary stats stayed hardcoded
+   forever, on every client, regardless of what actually happened that
+   day. Now calls the real GET_ONLINE_ORDERS_LIST backend action (reads
+   real ONLINE_ORDER_MASTER rows, the same table SAVE_ONLINE_ORDER/"Log
+   Online Order" already writes to) and renders the table and stat cards
+   from the actual response — or an honest empty state if nothing's been
+   logged for the day, never a fabricated row. EazyDiner and DotPe are
+   reservation-type and QR-order-type cards respectively, not delivery
+   aggregators this backend's ONLINE_ORDER_MASTER tracks (only ZOMATO/
+   SWIGGY/ONDC/MAGICPIN) — their cards are left as-is rather than guessed. */
+async function loadOnlineOrders(date){
+  const day = date || new Date().toISOString().slice(0,10);
   showNotif('🔄 Syncing online orders…','success');
-  setTimeout(()=>showNotif('✅ Online orders updated — 19 orders today','success'),800);
+  let res;
+  try { res = await erpApi({ action:'GET_ONLINE_ORDERS_LIST', date: day }, 'V2_CORE'); }
+  catch(e){ res = { success:false, offline:true }; }
+
+  const tbody = document.getElementById('onlineOrdersBody');
+  if (!res || !res.success || !res.data){
+    if (typeof showNotif === 'function') showNotif('⚠️ Could not reach server — online orders not refreshed', 'error');
+    return;
+  }
+  const rows = Array.isArray(res.data.rows) ? res.data.rows : [];
+  const AGG_META = {
+    ZOMATO:  { badgeClass:'pb-zomato',  icon:'🍅', color:'#ef4444' },
+    SWIGGY:  { badgeClass:'pb-swiggy',  icon:'🚀', color:'#f97316' },
+    ONDC:    { badgeClass:'pb-ondc',    icon:'🟢', color:'#10b981' },
+    MAGICPIN:{ badgeClass:'pb-magicpin',icon:'✨', color:'#a855f7' }
+  };
+  if (tbody){
+    if (!rows.length){
+      tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:var(--text3);padding:18px;">No online orders logged for ${day} yet — use "Log Online Order" to record one.</td></tr>`;
+    } else {
+      tbody.innerHTML = rows.map(o=>{
+        const meta = AGG_META[String(o.aggregator||'').toUpperCase()] || { badgeClass:'pb-ondc', icon:'📦', color:'var(--text3)' };
+        const gst = 0, packing = 0; // not tracked per-order in ONLINE_ORDER_MASTER yet — shown as 0, never guessed
+        return `<tr><td><span class="platform-badge ${meta.badgeClass}">${meta.icon} ${o.aggregator||''}</span></td>
+          <td class="mono">${o.orderRef||''}</td><td>${o.time||''}</td>
+          <td class="mono">₹${(o.billAmount||0).toLocaleString('en-IN')}</td>
+          <td class="mono" style="color:var(--red)">₹${(o.platformFee||0).toLocaleString('en-IN')}</td>
+          <td class="mono">₹${gst}</td><td class="mono">₹${packing}</td>
+          <td class="mono" style="color:var(--green);font-weight:700">₹${(o.netAmount||0).toLocaleString('en-IN')}</td>
+          <td><span class="settle-status ss-pending">⏳ Pending</span></td>
+          <td><span class="pill p-g">${o.orderStatus||'—'}</span></td></tr>`;
+      }).join('');
+    }
+  }
+  // Top summary stat cards — real totals for the aggregators this
+  // backend actually tracks (Zomato/Swiggy/ONDC+Others). EazyDiner/DotPe
+  // cards further down the page are a different domain (reservations /
+  // QR table orders) and are left untouched by this refresh.
+  const totals = res.data.totalsByAgg || {};
+  const zomato = totals.ZOMATO || { orders:0, revenue:0 };
+  const swiggy = totals.SWIGGY || { orders:0, revenue:0 };
+  const ondcOthers = Object.keys(totals).filter(k=>k!=='ZOMATO' && k!=='SWIGGY')
+    .reduce((acc,k)=>({ orders: acc.orders+(totals[k].orders||0), revenue: acc.revenue+(totals[k].revenue||0) }), { orders:0, revenue:0 });
+  const setStat = (selector, val, count) => {
+    const els = document.querySelectorAll(selector);
+    els.forEach(el=>{
+      const valEl = el.querySelector('.stat-val'); const chgEl = el.querySelector('.stat-chg');
+      if (valEl) valEl.textContent = '₹'+Math.round(val).toLocaleString('en-IN');
+      if (chgEl) chgEl.textContent = '↑ '+count+' order'+(count===1?'':'s');
+    });
+  };
+  setStat('#page-online-orders .grid.g4 .stat:nth-child(1)', zomato.revenue, zomato.orders);
+  setStat('#page-online-orders .grid.g4 .stat:nth-child(2)', swiggy.revenue, swiggy.orders);
+  setStat('#page-online-orders .grid.g4 .stat:nth-child(3)', ondcOthers.revenue, ondcOthers.orders);
+  if (typeof showNotif === 'function') showNotif('✅ Online orders updated — '+rows.length+' order'+(rows.length===1?'':'s')+' today', 'success');
 }
 /* FIX ("online order also fix"): "View Orders" on every platform card,
    and the Platform/Status dropdowns above the order table, used to just
@@ -19643,7 +19712,20 @@ document.addEventListener('DOMContentLoaded', function(){
   if (typeof renderPettyCatBreakdown === 'function') renderPettyCatBreakdown();
   if (typeof renderCashBookCatBreakdown === 'function') renderCashBookCatBreakdown();
 });
-function pettySave(){
+/* FIX ("Petty Cash not save" — confirmed root cause): this used to only
+   append a <tr> to the DOM and bump a localStorage counter
+   (bnx_petty_seq) — it never called the backend at all. Refresh the
+   page, or open it on another device, and every voucher ever entered
+   was gone. Now calls the real SAVE_PETTY_CASH backend action (same
+   erpApi/'V2_CORE' pattern bnxSubmitLogOnlineOrder already uses) and
+   trusts the server's own voucher number and running balance in the
+   response — never the local counters — so two devices entering
+   vouchers back-to-back can't silently disagree. If the network call
+   fails, the entry is not silently dropped: the form is left filled in
+   and an honest error is shown so the value isn't lost, matching the
+   rest of the app's "real data or honest failure, never a fake
+   success" rule. */
+async function pettySave(){
   const account = document.getElementById('pettyAccount').value;
   const name = document.getElementById('pettyName').value.trim();
   const purpose = document.getElementById('pettyPurpose').value.trim();
@@ -19654,18 +19736,39 @@ function pettySave(){
     return;
   }
 
-  const signed = pettyType === 'receipt' ? amount : -amount;
-  pettyBalance += signed;
+  const saveBtn = document.querySelector('[onclick="pettySave()"]');
+  if (saveBtn) { saveBtn.disabled = true; saveBtn.dataset._origText = saveBtn.textContent; saveBtn.textContent = 'Saving…'; }
+
+  let res;
+  try {
+    res = await erpApi({
+      action: 'SAVE_PETTY_CASH', requestId: (typeof generateUUID==='function'?generateUUID():('petty_'+Date.now()+'_'+Math.random().toString(16).slice(2))),
+      type: pettyType, account: account, name: name, purpose: purpose, amount: amount
+    }, 'V2_CORE');
+  } catch (e) {
+    res = { success:false, offline:true };
+  } finally {
+    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = saveBtn.dataset._origText || 'Save Voucher'; }
+  }
+
+  if (!res || !res.success){
+    const msg = res && res.offline ? '⚠️ Network error — voucher not saved. Try again.' : '❌ ' + ((res && res.error) || 'Could not save voucher');
+    if (typeof showNotif === 'function') showNotif(msg, 'error'); else alert(msg);
+    return; // nothing added to the DOM/localStorage — never fake a save that didn't happen
+  }
+
+  const voucherNo = res.voucherNo || '';
+  const newBalance = Number(res.balance);
+  pettyBalance = !isNaN(newBalance) ? newBalance : pettyBalance + (pettyType === 'receipt' ? amount : -amount);
   pettyVoucherCount++;
   localStorage.setItem('bnx_petty_seq', String(pettyVoucherCount));
-  const pettyPrefix = localStorage.getItem('bnx_pettyno_prefix') || 'PC';
-  const fy = new Date().getFullYear().toString().slice(-2);
-  const voucherNo = pettyPrefix+'-'+fy+'-'+(Number(fy)+1)+'-'+String(pettyVoucherCount).padStart(3,'0');
+  const signed = pettyType === 'receipt' ? amount : -amount;
   const today = new Date().toLocaleDateString('en-GB', {day:'2-digit', month:'short'});
-  const narration = pettyUpdateNarration();
+  const narration = (res.data && res.data.NARRATION) || pettyUpdateNarration();
   const typeLabel = pettyType === 'receipt' ? 'Receipt' : 'Payment';
 
-  // 1. Add row to Petty Cash Register
+  // 1. Add row to Petty Cash Register — using the server's real voucher
+  // number and running balance, not a locally-guessed one.
   const pettyRow = `<tr><td>${today}</td><td class="mono">${voucherNo}</td><td>${typeLabel}</td><td>${account}</td>
     <td class="mono" style="color:${signed>=0?'var(--green)':'var(--red)'}">${signed>=0?'₹':'−₹'}${Math.abs(signed).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
     <td class="mono">₹${pettyBalance.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td><td style="font-size:11px;">${narration}</td><td>${name||'—'}</td></tr>`;
@@ -19675,17 +19778,11 @@ function pettySave(){
   document.getElementById('pettyVoucherStat').textContent = pettyVoucherCount;
 
   // 2. Same entry also appears in Cash Book — same underlying cash
-  // movement. FIX ("petty cash and cash book auto"): this used to
-  // hand-build its own <tr> with a hardcoded "—" Balance cell and no
-  // Mode badge — it never touched cbClosingBalance/cbCashBalance at
-  // all, so the Cash Book's own running totals silently drifted out of
-  // sync with Petty Cash the moment a voucher was saved, and the row
-  // was missing the CASH/BANK badge every other Cash Book row has.
-  // Routed through the same cbAppendEntry() helper the manual "New Cash
-  // Book Entry" form and Daily Collection auto-capture already use, so
-  // the balance, mode badge, and Category/Day-wise breakdown all stay
-  // correctly in sync. Petty cash is always physical cash-in-hand, so
-  // mode is fixed to 'cash'.
+  // movement. Routed through the same cbAppendEntry() helper the manual
+  // "New Cash Book Entry" form and Daily Collection auto-capture already
+  // use, so the balance, mode badge, and Category/Day-wise breakdown all
+  // stay correctly in sync. Petty cash is always physical cash-in-hand,
+  // so mode is fixed to 'cash'.
   if (document.getElementById('cashBookBody') && typeof cbAppendEntry === 'function'){
     const cbDateLabel = new Date().toLocaleDateString('en-GB',{day:'2-digit',month:'2-digit',year:'numeric'}).split('/').join('-');
     cbAppendEntry(cbDateLabel, 'Petty Cash: '+account+(name?' — '+name:''), typeLabel, signed>=0?amount:0, signed<0?amount:0, 'cash');
@@ -19695,7 +19792,43 @@ function pettySave(){
   const idEl = document.getElementById('pettyId'); if (idEl) idEl.value = 'PC-' + Math.random().toString(16).slice(2,10);
   if (typeof renderPettyCatBreakdown === 'function') renderPettyCatBreakdown();
   if (typeof renderCashBookCatBreakdown === 'function') renderCashBookCatBreakdown();
-  if (typeof showNotif === 'function') showNotif('✅ '+voucherNo+' saved — also updated in Cash Book', 'success');
+  if (typeof showNotif === 'function') showNotif('✅ '+voucherNo+' saved to server — also updated in Cash Book', 'success');
+}
+
+/* NEW — pulls the real Petty Cash ledger from the backend
+   (GET_PETTY_CASH_LEDGER) and replaces the hardcoded demo opening row
+   ("PC/001 … Petty Cash Imprest … ₹5,000") with real, server-side
+   vouchers. Pattern-matched to bnxPullBillsFromServer() below. Hooked
+   into showPage()'s accounts-ledger branch so it runs every time that
+   page is opened. */
+async function bnxPullPettyCashFromServer(){
+  const body = document.getElementById('pettyCashBody');
+  if (!body) return;
+  try {
+    const res = await erpApi({ action: 'GET_PETTY_CASH_LEDGER' }, 'V2_CORE');
+    if (!res || !res.success || !res.data) return; // backend unreachable or table not created yet — leave whatever is on screen, never fake a wipe
+    const rows = Array.isArray(res.data.rows) ? res.data.rows : [];
+    body.innerHTML = ''; // clear the hardcoded demo row (and any prior render) — real data or an honest empty state, never a stale demo row left standing
+    let voucherCount = 0;
+    rows.forEach(row => {
+      voucherCount++;
+      const amt = Number(row.AMOUNT) || 0;
+      const bal = Number(row.RUNNING_BALANCE) || 0;
+      const typeLabel = row.ENTRY_TYPE === 'RECEIPT' ? 'Receipt' : 'Payment';
+      const dateLabel = row.ENTRY_DATE ? new Date(row.ENTRY_DATE).toLocaleDateString('en-GB', {day:'2-digit', month:'short'}) : '';
+      body.insertAdjacentHTML('beforeend', `<tr><td>${dateLabel}</td><td class="mono">${row.VOUCHER_NO||''}</td><td>${typeLabel}</td><td>${row.ACCOUNT||''}</td>
+        <td class="mono" style="color:${amt>=0?'var(--green)':'var(--red)'}">${amt>=0?'₹':'−₹'}${Math.abs(amt).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
+        <td class="mono">₹${bal.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td><td style="font-size:11px;">${row.NARRATION||''}</td><td>${row.PARTY_NAME||'—'}</td></tr>`);
+    });
+    pettyBalance = Number(res.data.closingBalance) || 0;
+    pettyVoucherCount = voucherCount;
+    localStorage.setItem('bnx_petty_seq', String(pettyVoucherCount));
+    document.getElementById('pettyBalanceCell').textContent = '₹'+pettyBalance.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+    document.getElementById('pettyBalanceStat').textContent = '₹'+pettyBalance.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+    document.getElementById('pettyVoucherStat').textContent = pettyVoucherCount;
+    if (typeof renderPettyCatBreakdown === 'function') renderPettyCatBreakdown();
+    if (typeof renderCashBookCatBreakdown === 'function') renderCashBookCatBreakdown();
+  } catch (e) { console.warn('[bnxPullPettyCashFromServer] failed:', e.message); }
 }
 
 function showRptCat(cat, btn) {
