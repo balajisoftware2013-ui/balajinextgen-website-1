@@ -1646,7 +1646,15 @@ async function loadTablesLive(){
   // as []) — this screen never showed a single real table, ever.
   try {
     const res = await gasApi('RD_FETCH_SHEET', { tab: '04_TABLE_MASTER' });
-    if(!res || !res.success || !Array.isArray(res.data) || !res.data.length) return false;
+    if(!res || !res.success || !Array.isArray(res.data) || !res.data.length){
+      // IMPORTANT: an unsuccessful/empty response is a completed attempt,
+      // not an endless "Loading" state. Keep any real table data already
+      // on this device; otherwise expose an honest offline/error state.
+      if(!TABLES.length && !IS_DEMO_MODE) bnxTablesSource = 'offline';
+      if(document.getElementById('s-tables')?.classList.contains('active')) renderMobTables();
+      if(document.getElementById('s-home')?.classList.contains('active')) renderMyTables();
+      return false;
+    }
     // Column order matches 04_TABLE_MASTER exactly, same mapping the
     // dashboard uses: [TABLE_NO, TABLE_NAME, TABLE_TYPE, STATUS, PAX,
     // CAPTAIN, GUESTS, START_TIME, KITCHEN_STATUS, BAR_STATUS,
@@ -1677,6 +1685,7 @@ async function loadTablesLive(){
     extra = extra.filter(t=>t.id && !known.has(t.id)).map(t=>({id:t.id||t.n,no:0,status:bnxMapSheetStatusToTcard(t.s),covers:t.pax||0,bill:t.billAmount||0,steward:t.captain||''}));
     TABLES = fromSheet.concat(extra);
     bnxTablesSource = 'live';
+    if(typeof __bnx_loading_timeout !== 'undefined') clearTimeout(__bnx_loading_timeout);
     bnxTablesLastUpdated = new Date();
     if(document.getElementById('s-tables')?.classList.contains('active')) renderMobTables();
     if(document.getElementById('s-home')?.classList.contains('active')) renderMyTables();
@@ -1686,6 +1695,7 @@ async function loadTablesLive(){
     // fail and let polling retry in 20s. Render any locally-cached tables
     // so steward isn't stuck with a blank screen while network recovers.
     console.error('[TABLE_LOAD] Failed to load tables from server:', e && e.message ? e.message : e);
+    if(!TABLES.length && !IS_DEMO_MODE) bnxTablesSource = 'offline';
     if(TABLES && TABLES.length && document.getElementById('s-tables')?.classList.contains('active')) {
       try { renderMobTables(); } catch(re) { /* render may also fail, that's ok */ }
     }
@@ -1896,7 +1906,7 @@ async function doLogin(){
   const btn=document.getElementById('login-btn');
   if(btn){ btn.disabled=true; btn.textContent='Checking…'; }
   const result = await authApi('LOGIN',{loginId:u,password:p});
-  if(btn){ btn.disabled=false; btn.textContent='Login'; }
+  if(btn){ btn.disabled=false; btn.textContent='Login to Steward App'; }
   if(!(result && result.status==='success' && result.ROLE)){
     toast(result && (result.message||result.error) || 'Invalid credentials','error');
     return;
@@ -3274,7 +3284,7 @@ function renderMenu(){
       <span id="menuSearchClear" onclick="document.getElementById('menuSearchInput').value='';filterMenuSearch('');" style="display:${menuSearchQuery?'':'none'};position:absolute;right:10px;top:50%;transform:translateY(-50%);cursor:pointer;color:var(--text3);font-size:13px;">✕</span>
     </div>
     <div class="cat-tabs-wrapper">
-      ${cats.map(c=>`<button class="cat-tab${c===activeCat?' active':''}" onclick="filterCat('${c}',this)">${c}</button>`).join('')}
+      ${cats.map(c=>`<button class="cat-tab${c===activeCat?' active':''}" onclick="filterCat(${JSON.stringify(c)},this)">${bnxEscapeHtml_(c)}</button>`).join('')}
     </div>
     <div class="view-toggle-btn">
       <button class="menu-view-toggle${menuViewMode==='grid'?' active':''}" data-view="grid" onclick="toggleMenuView('grid')">⊞ Grid</button>
@@ -3319,7 +3329,7 @@ function renderMenu(){
   } else {
     // Grid view (default)
     document.getElementById('menu-grid').innerHTML=filtered.map(m=>`
-      <div class="menu-card${!m.avail?' unavailable':''}" onclick="${m.avail?`addItem('${m.id}')`:'toast(\"Out of stock\",\"error\")'}">
+      <div class="menu-card${!m.avail?' unavailable':''}" onclick="${m.avail?`addItem(${JSON.stringify(m.id)})`:'toast(\"Out of stock\",\"error\")'}">
         <div class="mc-icon">${bnxEscapeHtml_(m.icon)}</div>
         <div class="mc-name">${bnxEscapeHtml_(m.name)}</div>
         <div class="mc-cat">${bnxEscapeHtml_(m.cat)}</div>
@@ -3404,9 +3414,9 @@ function renderMenuTable(itemsList){
         <td class="td-action">
           ${m.avail ? `
             <div class="qty-control">
-              <button class="qty-btn" onclick="decreaseItem('${m.id}')"${qty===0?'disabled':''}>−</button>
+              <button class="qty-btn" onclick="decreaseItem(${JSON.stringify(m.id)})"${qty===0?'disabled':''}>−</button>
               <span class="qty-display">${qty}</span>
-              <button class="qty-btn" onclick="addItem('${m.id}')">+</button>
+              <button class="qty-btn" onclick="addItem(${JSON.stringify(m.id)})">+</button>
             </div>
           ` : '<span class="text-unavail">N/A</span>'}
         </td>
@@ -3531,7 +3541,22 @@ async function placeOrder(){
   // reports back as ORDER_NO, and the same key loadKOTFromServer()
   // merges by — keeps this entry and the polled-in one as one ticket,
   // not two.
-  const orderId = (res.data && res.data.ORDER_NUMBER) || res.transactionId;
+  const orderId = (res.data && (res.data.ORDER_NUMBER || res.data.ORDER_NO || res.data.ORDER_ID)) ||
+                   res.orderId || res.orderNumber || res.transactionId;
+  // A successful SAVE_ORDER without an authoritative identifier is not
+  // safe to treat as a normal KOT: retrying it could duplicate a real order.
+  // Do not enqueue it again; refresh the server state and ask the steward
+  // to verify the ticket instead.
+  if(!orderId){
+    console.error('[ORDER] SAVE_ORDER succeeded but returned no authoritative order ID:', res);
+    bnxSetLiveStatus('offline');
+    toast('⚠️ Server accepted the order but returned no KOT number — refreshing kitchen status','error');
+    await loadKOTFromServer().catch(()=>{});
+    order={};
+    selectOccasion('None');
+    setTimeout(() => showScreen('s-home'), 1200);
+    return;
+  }
   lastOrderId = orderId;
   bnxLoadOpenKots();
   const entry = { kotNo:orderId, table:selTable.id, type:'KITCHEN', time:res.serverTimestamp||new Date().toISOString(), waiter:stewardName, covers:'', items, amount, occasion:selectedOccasion, status:'NEW' };
@@ -3988,7 +4013,7 @@ function bnxSafeBoot_(fn, label){
 // Set a timeout on the initial loading state — if tables haven't rendered
 // within 8 seconds, show an error instead of infinite splash
 var __bnx_loading_timeout = setTimeout(function(){
-  var loadingSplash = document.querySelector('#s-tables .loading-splash');
+  var loadingSplash = document.querySelector('#s-tables .loading-splash, #s-tables [data-loading-state="tables"]');
   if(loadingSplash && loadingSplash.offsetParent !== null){
     console.warn('[BOOT] Tables failed to load within 8s timeout');
     loadingSplash.innerHTML = '<div style="text-align:center;padding:40px 20px;"><div style="color:#dc2626;font-size:18px;margin-bottom:12px;font-weight:600;">⚠️ Failed to load</div><div style="color:#666;font-size:14px;margin-bottom:24px;line-height:1.5;">Check your internet connection or contact support if the issue persists</div><button onclick="location.reload()" style="padding:12px 24px;background:#a04000;color:white;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;">↻ Retry</button></div>';
