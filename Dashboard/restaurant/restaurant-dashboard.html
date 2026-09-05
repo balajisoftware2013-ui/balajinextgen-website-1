@@ -15937,23 +15937,23 @@ function tallyGetExportData(){
   return data;
 }
 function bnxGetRestaurantInfo(){
-  // FIX ("client name accounting user master company name and address
-  // fix"): the Tally XML/CSV/JSON exports below, and the Data Tools
-  // company/GSTIN readout, always stamped Balaji NextGen's OWN company
-  // name and GSTIN — hardcoded, never reading what a client actually
-  // saved in Settings > Restaurant Info. Every client's accounting
-  // export carried the wrong company identity. This is the single
-  // source of truth every accounting/export function below now reads.
-  let ri = {};
-  try { ri = JSON.parse(localStorage.getItem(bnxRestaurantInfoKey()) || 'null') || {}; } catch(e) {}
+  // Invoice/company identity is live CLIENT_MASTER data first. LocalStorage is
+  // only the offline fallback for the current client.
+  let local = {};
+  try { local = JSON.parse(localStorage.getItem(bnxRestaurantInfoKey()) || 'null') || {}; } catch(e) {}
+  const live = (window.BNX_LIVE_CLIENT_INFO && typeof window.BNX_LIVE_CLIENT_INFO === 'object') ? window.BNX_LIVE_CLIENT_INFO : {};
   return {
-    name: ri.name || '',
-    gst: ri.gst || '',
-    address: ri.address || '',
-    phone: ri.phone || '',
-    email: ri.email || ''
+    name: live.name || live.restaurantName || live.companyName || local.name || '',
+    gst: live.gst || local.gst || '',
+    address: live.address || local.address || '',
+    phone: live.phone || local.phone || '',
+    email: live.email || local.email || '',
+    fssai: live.fssai || local.fssai || '',
+    currency: live.currency || local.currency || '',
+    logoUrl: live.logoUrl || local.logoUrl || ''
   };
 }
+
 function tallyExportXML(){
   const ri=bnxGetRestaurantInfo();
   const company=document.getElementById('tally-company')?.value||ri.name;
@@ -19137,7 +19137,7 @@ function setUserMode(mode, btn){
 // localStorage-only for now rather than guessing a column name that may
 // not exist. Add ADDRESS/PHONE/FSSAI/CURRENCY to COMPANY_SETTINGS +
 // MASTER_CATEGORY_MAP.company.fieldMap to make those persist for real too.
-function saveRestaurantInfo(){
+async function saveRestaurantInfo(){
   const info = {
     name: document.getElementById('riName').value.trim(),
     gst: document.getElementById('riGst').value.trim(),
@@ -19152,34 +19152,45 @@ function saveRestaurantInfo(){
     else alert('Restaurant name is required');
     return;
   }
+
+  // Immediate local cache for offline continuity.
   localStorage.setItem(bnxRestaurantInfoKey(), JSON.stringify(info));
-  // Reflect the name change immediately in the sidebar brand + hero banner
+  window.BNX_LIVE_CLIENT_INFO = Object.assign({}, window.BNX_LIVE_CLIENT_INFO || {}, info);
   const bn = document.getElementById('restaurantBrandName');
   if (bn) bn.textContent = info.name;
-  // ...and in every accounting/export readout that shows the company
-  // name/GSTIN, so Data Tools and Tally exports pick it up right away
-  // instead of needing a page reload.
   const tc = document.getElementById('tally-company');
   if (tc && (!tc.value || tc.dataset.autofilled)) { tc.value = info.name; tc.dataset.autofilled = '1'; }
   const sc = document.getElementById('tallySyncCompany'); if (sc) sc.textContent = info.name;
   const sg = document.getElementById('tallySyncGstin'); if (sg) sg.textContent = info.gst;
-  if (typeof showNotif === 'function') showNotif('✅ Restaurant info saved', 'success');
-  else alert('Restaurant info saved');
-  // Real backend persistence for the two fields COMPANY_SETTINGS actually
-  // has a column for. Best-effort — localStorage above already covers
-  // this device even if the network call fails.
-  if (typeof gasApi === 'function'){
-    gasApi('SAVE_MASTER', {
+
+  // Permanent save: client COMPANY_SETTINGS + central USER_SECURITY_MASTER_DB
+  // CLIENT_MASTER are written by the backend in one operation. Do not claim
+  // success when the central master write failed.
+  if (typeof gasApi !== 'function') {
+    if (typeof showNotif === 'function') showNotif('⚠️ Saved locally only — backend is not connected', 'error');
+    return;
+  }
+  try {
+    const res = await gasApi('SAVE_MASTER', {
       category: 'company',
-      // FIX ("logo and address save but not save in record"): only NAME
-      // and GSTIN were ever sent here — Phone/Address/FSSAI/Currency
-      // saved to localStorage above and stopped there, invisible to any
-      // other device/browser. Now sent for real too, now that the
-      // backend's company fieldMap actually has columns for them (see
-      // that fieldMap's own comment for the one remaining manual step —
-      // adding those columns to the real COMPANY_SETTINGS sheet).
-      record: { SETTING_ID: bnxCompanySettingId || undefined, NAME: info.name, GSTIN: info.gst, ADDRESS: info.address, PHONE: info.phone, EMAIL: info.email, FSSAI: info.fssai, CURRENCY: info.currency }
-    }, 'V2_CORE').then(res => { if (res && res.id) bnxCompanySettingId = res.id; }).catch(()=>{});
+      record: {
+        SETTING_ID: bnxCompanySettingId || undefined,
+        NAME: info.name, GSTIN: info.gst, ADDRESS: info.address,
+        PHONE: info.phone, EMAIL: info.email, FSSAI: info.fssai,
+        CURRENCY: info.currency
+      }
+    }, 'V2_CORE');
+    if (!res || !res.success) throw new Error((res && res.error) || 'Company settings save failed');
+    if (res.id) bnxCompanySettingId = res.id;
+    if (res.clientMasterSaved !== true) {
+      throw new Error(res.clientMasterError || 'Client Master was not updated');
+    }
+    window.BNX_LIVE_CLIENT_INFO = Object.assign({}, window.BNX_LIVE_CLIENT_INFO || {}, info, { source:'CLIENT_MASTER' });
+    if (typeof showNotif === 'function') showNotif('✅ Saved to Client Master + Client Database', 'success');
+    else alert('Restaurant info saved to Client Master + Client Database');
+  } catch (e) {
+    if (typeof showNotif === 'function') showNotif('❌ Save failed: ' + (e.message || e), 'error');
+    else alert('Save failed: ' + (e.message || e));
   }
 }
 
@@ -19201,15 +19212,28 @@ document.addEventListener('DOMContentLoaded', function(){
     // COMPANY_SETTINGS row for THIS CLIENT_ID) instead of leaving the
     // field on a hardcoded example. Never falls back to another
     // client's data — blank stays blank if the backend has nothing either.
-    if ((!saved || !saved.name || !saved.gst) && typeof gasApi === 'function' && typeof CLIENT_ID !== 'undefined' && CLIENT_ID){
+    if (typeof gasApi === 'function' && typeof CLIENT_ID !== 'undefined' && CLIENT_ID){
       gasApi('GET_CLIENT_INFO', { clientId: CLIENT_ID }, 'V2_CORE').then(res=>{
         const info = res && (res.data || res);
         if (!info) return;
         if (info.settingId) bnxCompanySettingId = info.settingId;
+        // CLIENT_MASTER is authoritative: refresh the live invoice identity and
+        // overwrite stale browser cache with the server's current values.
+        window.BNX_LIVE_CLIENT_INFO = Object.assign({}, info);
+        try {
+          localStorage.setItem(bnxRestaurantInfoKey(), JSON.stringify({
+            name: info.restaurantName || info.name || info.companyName || '',
+            gst: info.gst || '', phone: info.phone || '', email: info.email || '',
+            address: info.address || '', fssai: info.fssai || '',
+            currency: info.currency || '', logoUrl: info.logoUrl || ''
+          }));
+        } catch(eCache) {}
+        
+
         const nameEl = document.getElementById('riName');
-        if (nameEl && !nameEl.value && (info.restaurantName||info.name)) nameEl.value = info.restaurantName||info.name;
+        if (nameEl && (info.restaurantName||info.name)) nameEl.value = info.restaurantName||info.name;
         const gstEl = document.getElementById('riGst');
-        if (gstEl && !gstEl.value && info.gst) gstEl.value = info.gst;
+        if (gstEl && info.gst) gstEl.value = info.gst;
         /* FIX ("copy from user master to client database, keep synced
            if master changes"): GET_CLIENT_INFO now also returns
            phone/email/address straight from USER_SECURITY_MASTER_DB
@@ -19225,37 +19249,22 @@ document.addEventListener('DOMContentLoaded', function(){
            cache key so a reprint immediately reflects it too, without
            needing someone to open Settings and hit Save first. */
         const phoneEl = document.getElementById('riPhone');
-        if (phoneEl && !phoneEl.value && info.phone) phoneEl.value = info.phone;
+        if (phoneEl && info.phone) phoneEl.value = info.phone;
         const emailEl = document.getElementById('riEmail');
-        if (emailEl && !emailEl.value && info.email) emailEl.value = info.email;
+        if (emailEl && info.email) emailEl.value = info.email;
         const addrEl = document.getElementById('riAddress');
-        if (addrEl && !addrEl.value && info.address) addrEl.value = info.address;
+        if (addrEl && info.address) addrEl.value = info.address;
         // FIX ("logo and address save but not save in record"): FSSAI/
         // Currency were never read back from GET_CLIENT_INFO at all —
         // even once the backend started storing them for real (see
         // saveRestaurantInfo's own comment), these two fields would
         // still look blank/reset to default on a fresh device/browser.
         const fssaiEl = document.getElementById('riFssai');
-        if (fssaiEl && !fssaiEl.value && info.fssai) fssaiEl.value = info.fssai;
+        if (fssaiEl && info.fssai) fssaiEl.value = info.fssai;
         const currEl = document.getElementById('riCurrency');
-        if (currEl && !currEl.value && info.currency) currEl.value = info.currency;
-        if (info.source === 'CLIENT_MASTER' && (info.name || info.restaurantName)) {
-          try {
-            const cacheKey = bnxRestaurantInfoKey();
-            const existing = JSON.parse(localStorage.getItem(cacheKey) || 'null') || {};
-            localStorage.setItem(cacheKey, JSON.stringify(Object.assign({}, existing, {
-              name: existing.name || info.restaurantName || info.name,
-              gst: existing.gst || info.gst || '',
-              phone: existing.phone || info.phone || '',
-              email: existing.email || info.email || '',
-              address: existing.address || info.address || '',
-              fssai: existing.fssai || info.fssai || '',
-              currency: existing.currency || info.currency || ''
-            })));
-            const bn = document.getElementById('restaurantBrandName');
-            if (bn && (info.restaurantName || info.name)) bn.textContent = existing.name || info.restaurantName || info.name;
-          } catch(e2){}
-        }
+        if (currEl && info.currency) currEl.value = info.currency;
+        const bn2 = document.getElementById('restaurantBrandName');
+        if (bn2 && (info.restaurantName || info.name)) bn2.textContent = info.restaurantName || info.name;
       }).catch(()=>{});
     }
   } catch(e){}
