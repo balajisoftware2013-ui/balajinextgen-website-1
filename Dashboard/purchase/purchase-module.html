@@ -4616,7 +4616,11 @@ async function deletePurchase(id,mode){
   // matter how many polls land before the server confirms.
   window._pendingDeletes = window._pendingDeletes || new Set();
   window._pendingDeletes.add(id);
-  save();rendDash();rendRegs();rendPurchaseList();updateApprCount();
+  // IMPORTANT: persist locally WITHOUT triggering the legacy full-array
+  // purchase_invoices push. The row-level delete below is the authoritative
+  // server mutation; a full-array push here can race it and resurrect the
+  // deleted invoice from this or another stale tab.
+  saveLocalOnly();rendDash();rendRegs();rendPurchaseList();updateApprCount();
   toast(`${p.no} deleted locally. Syncing with server...`,'ok','🗑️');
   // FIX ("backend copies from business os files" — Aug 2026, replaces
   // the "root-cause pass" fix below): pushPurchaseInvoicesToSyncTable()
@@ -4631,37 +4635,30 @@ async function deletePurchase(id,mode){
   // removes just this one id, so no other tab's stale snapshot can
   // resurrect it afterward, regardless of what that tab still has
   // cached locally.
-  await deletePurchaseInvoiceRowFromServer(id);
-  // FIX ("purchase delete and blank but after sec same data reflect —
-  // not deleted" — Aug 2026, root-cause pass): save() above kicks off
-  // pushPurchaseInvoicesToSyncTable() fire-and-forget too, as the
-  // existing safety net for every other mutation path — awaiting it
-  // here as well costs one more round trip but guarantees this
-  // specific deletion's local removal is reflected in that push too,
-  // rather than racing it.
-  await pushPurchaseInvoicesToSyncTable();
+  if(mode==='inventory'){
+    const rowDeleteResult=await deletePurchaseInvoiceRowFromServer(id);
+    if(!rowDeleteResult || rowDeleteResult.success===false){
+      // Server deletion failed: restore the local record immediately so the
+      // UI cannot claim a successful delete while the authoritative table
+      // still contains the invoice.
+      arr.splice(idx,0,p);
+      saveLocalOnly();
+      window._pendingDeletes.delete(id);
+      rendDash();rendRegs();rendPurchaseList();updateApprCount();
+      toast(`⚠️ ${p.no} was NOT deleted from the server: ${(rowDeleteResult&&rowDeleteResult.message)||'unknown sync error'}`,'err','☁️');
+      return;
+    }
+  }
   // FIX ("delete bills but wrong shown in some places / not match"): this
-  // used to only remove the record locally — deleteGRN() right below already
+  // used to remove only the record locally — deleteGRN() right below already
   // calls the backend on delete, this never did, so a "deleted" invoice
   // stayed in the backend/sheet forever and kept showing up anywhere else
   // that reads from there. Now matches deleteGRN's pattern exactly.
   // NEW: Enhanced delete with inventory rollback + Drive cleanup
-  // FIX ("deleted invoices keep coming back" — Aug 2026, root-cause pass):
-  // the pushPurchaseInvoicesToSyncTable() call just above (now awaited)
-  // IS the real, confirmed deletion — it writes the authoritative
-  // SYNC_purchase_invoices table that every read path (this file's own
-  // poll, inventory.html, reports) actually pulls from. This
-  // DELETE_PURCHASE_INVOICE call targets a separate, largely-unused
-  // backend table (PURCHASE_DB.PURCHASE_INVOICE — confirmed zero real
-  // rows), so it fails EVERY time with "Invoice not found (sheet empty)"
-  // — there was never a row there to find. The old code treated that
-  // failure as "the delete didn't work" and pushed the row back into
-  // DB.purchases + called save(), which re-synced it straight back into
-  // the real SYNC_purchase_invoices table — undoing the deletion that had
-  // already genuinely succeeded. This is only used now for its side
-  // effects (inventory rollback bookkeeping, Drive file cleanup) — its
-  // failure is surfaced as a non-restoring warning, never as a reason to
-  // bring the invoice back.
+  // The row-level delete above is the authoritative deletion for
+  // inventory-mode purchase invoices. DELETE_PURCHASE_INVOICE below is
+  // retained only for its legacy side effects (inventory rollback / Drive
+  // cleanup); its failure must never restore the deleted row.
   erpApi('DELETE_PURCHASE_INVOICE', {id:p.id, no:p.no, mode, billFileUrl:p.billFileUrl}).then(r=>{
     if(r&&r.success===false){
       window._pendingDeletes.delete(id);
@@ -4751,7 +4748,9 @@ async function bulkDeleteSelectedPurchases(){
   });
   if(!removed.length)return;
   if(typeof editingPurchaseId!=='undefined' && ids.includes(editingPurchaseId)){editingPurchaseId=null;editingPurchaseMode=null;}
-  save();rendDash();rendRegs();rendPurchaseList();updateApprCount();
+  // Persist the local deletion only. Do not launch a full-array
+  // SYNC_PUSH_TABLE; each selected id is deleted authoritatively below.
+  saveLocalOnly();rendDash();rendRegs();rendPurchaseList();updateApprCount();
   toast(`${removed.length} invoice(s) deleted locally. Syncing with server...`,'ok','🗑️');
   // FIX ("backend copies from business os files" — Aug 2026, replaces
   // the "root-cause pass" fix below): same reasoning as deletePurchase()
@@ -4762,26 +4761,25 @@ async function bulkDeleteSelectedPurchases(){
   // single-row, server-side-locked delete — fired for every removed row
   // in parallel, each one reading the CURRENT server state at the
   // moment it runs rather than trusting any tab's local memory.
-  await Promise.allSettled(removed.map(p=>deletePurchaseInvoiceRowFromServer(p.id)));
-  // FIX (same root cause as deletePurchase() above — "purchase delete and
-  // blank but after sec same data reflect"): still also await the
-  // full-array push as the existing safety net for every other mutation
-  // path this tab makes.
-  await pushPurchaseInvoicesToSyncTable();
-  // FIX ("deleted invoices keep coming back" — Aug 2026, root-cause pass):
-  // same root cause as the single-row deletePurchase() above. The
-  // pushPurchaseInvoicesToSyncTable() call just above (now awaited) is
-  // the real, confirmed deletion against the authoritative
-  // SYNC_purchase_invoices table. DELETE_PURCHASE_INVOICE below targets a
-  // separate, largely-unused backend table (PURCHASE_DB.PURCHASE_INVOICE
-  // — confirmed zero real rows), so it fails EVERY time with "Invoice not
-  // found (sheet empty)" — there was never a row there. The old code
-  // treated that failure as "the delete didn't work" and pushed every
-  // selected row back into DB.purchases — undoing deletions that had
-  // already genuinely succeeded (this is why bulk-deleted invoices kept
-  // reappearing). Now only used for its side effects (inventory rollback
-  // bookkeeping, Drive file cleanup); its failure is reported as a
-  // non-restoring warning, never as a reason to bring rows back.
+  const inventoryRemoved=removed.filter(p=>p.mode==='inventory');
+  const rowDeleteResults=await Promise.all(inventoryRemoved.map(async p=>({p,result:await deletePurchaseInvoiceRowFromServer(p.id)})));
+  const rowDeleteFailed=rowDeleteResults.filter(x=>!x.result || x.result.success===false);
+  if(rowDeleteFailed.length){
+    rowDeleteFailed.forEach(x=>{
+      const existing=DB.purchases.findIndex(p=>p.id===x.p.id);
+      if(existing<0)DB.purchases.push(x.p);
+      window._pendingDeletes.delete(x.p.id);
+    });
+    saveLocalOnly();
+    rendDash();rendRegs();rendPurchaseList();updateApprCount();
+    const reason=rowDeleteFailed.map(x=>(x.result&&x.result.message)||'server delete failed').slice(0,2).join('; ');
+    toast(`⚠️ ${rowDeleteFailed.length} invoice(s) were NOT deleted from the server: ${reason}`,'err','☁️');
+  }
+  const rowDeleteFailedIds=new Set(rowDeleteFailed.map(x=>x.p.id));
+  const confirmedRemoved=removed.filter(p=>p.mode!=='inventory' || !rowDeleteFailedIds.has(p.id));
+  removed.splice(0,removed.length,...confirmedRemoved);
+  // Legacy DELETE_PURCHASE_INVOICE below is retained only for side effects;
+  // it must never restore a row after the authoritative row delete.
   const results=await Promise.allSettled(removed.map(p=>
     erpApi('DELETE_PURCHASE_INVOICE',{id:p.id, no:p.no, mode:p.mode||'inventory', billFileUrl:p.billFileUrl})
   ));
@@ -4798,7 +4796,7 @@ async function bulkDeleteSelectedPurchases(){
       warned++;
     }
   });
-  save();rendDash();rendRegs();rendPurchaseList();
+  saveLocalOnly();rendDash();rendRegs();rendPurchaseList();
   if(sideEffectFailed){
     const reasonText=[...failReasons].slice(0,2).join('; ')+(failReasons.size>2?` (+${failReasons.size-2} more distinct reason(s))`:'');
     toast(`✅ ${removed.length} invoice(s) deleted. ${sideEffectFailed} may need a manual inventory/Drive cleanup check: ${reasonText}`,'warn','⚠️');
