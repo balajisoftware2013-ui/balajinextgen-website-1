@@ -58,7 +58,20 @@
     try{
       if ('serviceWorker' in navigator){
         window.addEventListener('load', function(){
-          navigator.serviceWorker.register('sw.js').catch(function(){ /* file:// or unsupported host — ignore */ });
+          navigator.serviceWorker.register('sw.js').catch(function(e){
+            // FIX (external review — "PWA failure is intentionally
+            // invisible"): swallowing this completely means a missing
+            // or misconfigured sw.js on a real deployment gives no
+            // signal to anyone. Still never blocks the app (a steward
+            // taking orders shouldn't see an error dialog over this),
+            // but now logs to console so it's checkable, and only on
+            // a real http(s) host -- file:// always fails service-
+            // worker registration by browser design, so that specific,
+            // expected case stays silent rather than logging noise on
+            // every local test open.
+            if (location.protocol === 'file:') return;
+            console.warn('[PWA] Service worker registration failed -- offline/install support may not work:', e && e.message ? e.message : e);
+          });
         });
       }
 
@@ -602,7 +615,18 @@ if (window.visualViewport) window.visualViewport.addEventListener('resize', setA
 // improve on the old behavior, never regress it.
 function bnxSwFindLogo(cb){
   try{
-    var cid = localStorage.getItem('bnx_client_id') || 'default';
+    // FIX (external review — "client logo lookup less robust than
+    // session identity"): only checked localStorage.bnx_client_id,
+    // while every other client-ID resolution in this file (the theme-
+    // flash IIFE at the very top, getCurrentStaffIdentity, etc.) checks
+    // ERP_USER (session then local) first and falls back through
+    // ERP_CLIENT/bnx_client_id. On a fresh/shared device where
+    // bnx_client_id hasn't been set yet but a login already populated
+    // ERP_USER, this used to silently show no client logo even though
+    // the client was fully known. Same fallback chain as the rest of
+    // the file now.
+    var u = JSON.parse(sessionStorage.getItem('ERP_USER') || localStorage.getItem('ERP_USER') || '{}');
+    var cid = u.CLIENT_ID || u.clientId || u.client_id || localStorage.getItem('ERP_CLIENT') || localStorage.getItem('bnx_client_id') || 'default';
     var raw = localStorage.getItem('erp_restaurant_brand_' + cid);
     var brand = raw ? JSON.parse(raw) : null;
     if (brand && brand.logoDataUrl){ cb(brand.logoDataUrl); return; }
@@ -1427,7 +1451,27 @@ function bnxUpdateSyncBadge(){
     fel.onclick = bnxHandleFailedBadgeTap;
   }
 }
+// FIX (external review — "outbox polling can overlap"): flushOutbox is
+// called from 4 independent places (the 15s interval, the 'online'
+// event, bnxRetryFailedOutbox, and boot) with no guard against two
+// calls running at once. If one flush takes longer than 15s (a slow
+// network is exactly when this is most likely), the interval fires
+// again mid-flush and both copies read the same bnxGetOutbox() list
+// and race to sync the same entries — wasted duplicate network calls
+// at best, confusing overlapping UI/badge updates at worst. Single-
+// flight guard: a flush already in progress makes any new call return
+// immediately instead of starting a second parallel pass.
+let bnxFlushInProgress = false;
 async function flushOutbox(){
+  if (bnxFlushInProgress) return;
+  bnxFlushInProgress = true;
+  try {
+    await flushOutbox_impl_();
+  } finally {
+    bnxFlushInProgress = false;
+  }
+}
+async function flushOutbox_impl_(){
   const list = bnxGetOutbox();
   if(!list.length) return;
   let anyFailed = false;
@@ -2838,7 +2882,20 @@ function bnxPrintHtml(html){
   if (!w){ toast('Print blocked — allow pop-ups for this site and try again','error'); return; }
   w.document.write(html);
   w.document.close();
-  setTimeout(()=>{ w.focus(); w.print(); }, 300);
+  // FIX (external review — "printing not actually fully fixed"): the
+  // comment above this function used to claim print() was moved out of
+  // a setTimeout specifically to avoid losing the browser's recent-
+  // user-gesture context, but it still called w.print() inside a blind
+  // setTimeout(...,300) — the exact pattern that comment says was
+  // fixed. Same onload-first / capped-fallback pattern already used
+  // for the main invoice print in restaurant-dashboard.html: prints as
+  // soon as the popup actually finishes loading (often faster than
+  // 300ms), with a capped fallback so it still fires if onload never
+  // does, instead of always waiting a fixed delay regardless.
+  let bnxPrinted = false;
+  const bnxDoPrint = () => { if (bnxPrinted) return; bnxPrinted = true; try { w.focus(); w.print(); } catch(e){} };
+  w.onload = bnxDoPrint;
+  setTimeout(bnxDoPrint, 800);
 }
 
 /* ══════════════════════════════════════════════════
@@ -3146,6 +3203,18 @@ let menuViewMode = 'grid'; // 'grid' or 'table'
    scale: matches item name OR category, case-insensitive. */
 let menuSearchQuery = '';
 
+// FIX (external review — "menu HTML is built directly with database
+// values"): item name/category (and the client logo elsewhere) went
+// into innerHTML unescaped. These values come from Menu Manager/Excel
+// import, not a public form, so this isn't a live public-facing XSS
+// hole today — but a production ERP shouldn't rely on "nothing has put
+// a stray < or & in an item name yet" as its only protection, and a
+// literal & or < in a real item name (e.g. "Fish & Chips") would
+// already render wrong without this. Applied to every place menu item
+// text reaches innerHTML: renderMenu's grid cards and renderMenuTable.
+function bnxEscapeHtml_(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 function renderMenu(){
   const cats=['All',...new Set(MENU.map(m=>m.cat))];
 
@@ -3215,7 +3284,14 @@ function renderMenu(){
   }
   
   const q = menuSearchQuery.trim().toLowerCase();
-  let filtered=activeCat==='All'?MENU:MENU.filter(m=>m.cat===activeCat);
+  // FIX (external review — "category filtering is exact-match only"):
+  // search already lowercases both sides, but this comparison was a
+  // strict === — "Beverages" and "beverages" (e.g. one typed by hand in
+  // Menu Manager, one from an Excel import) would be treated as two
+  // different categories here even though the cat-tabs list above
+  // dedupes them by exact string too. Matching case-insensitively like
+  // the search does, right below.
+  let filtered=activeCat==='All'?MENU:MENU.filter(m=>String(m.cat||'').toLowerCase()===String(activeCat||'').toLowerCase());
   if (q) filtered = filtered.filter(m => (m.name||'').toLowerCase().includes(q) || (m.cat||'').toLowerCase().includes(q));
 
   if(menuViewMode === 'table'){
@@ -3230,9 +3306,9 @@ function renderMenu(){
     // Grid view (default)
     document.getElementById('menu-grid').innerHTML=filtered.map(m=>`
       <div class="menu-card${!m.avail?' unavailable':''}" onclick="${m.avail?`addItem('${m.id}')`:'toast(\"Out of stock\",\"error\")'}">
-        <div class="mc-icon">${m.icon}</div>
-        <div class="mc-name">${m.name}</div>
-        <div class="mc-cat">${m.cat}</div>
+        <div class="mc-icon">${bnxEscapeHtml_(m.icon)}</div>
+        <div class="mc-name">${bnxEscapeHtml_(m.name)}</div>
+        <div class="mc-cat">${bnxEscapeHtml_(m.cat)}</div>
         <div class="mc-price">₹${(Number(m.price)||0).toLocaleString('en-IN')}</div>
         ${m.avail?`<div class="mc-add">${order[m.id]?`<span style="font-size:11px;">${order[m.id]}</span>`:'+'}</div>`:''}
       </div>`).join('');
@@ -3290,7 +3366,7 @@ function renderMenuTable(itemsList){
   
   Object.entries(cats).forEach(([catName, items]) => {
     html += `<div class="menu-table-section">
-      <div class="menu-table-title">${catName}</div>
+      <div class="menu-table-title">${bnxEscapeHtml_(catName)}</div>
       <table class="menu-table">
         <thead>
           <tr>
@@ -3308,7 +3384,7 @@ function renderMenuTable(itemsList){
       const statusClass = m.avail ? 'status-avail' : 'status-unavail';
       
       html += `<tr class="menu-table-row${m.avail?'':' disabled'}">
-        <td class="td-name">${m.name}</td>
+        <td class="td-name">${bnxEscapeHtml_(m.name)}</td>
         <td class="td-price">₹${(Number(m.price)||0).toLocaleString('en-IN')}</td>
         <td class="td-status"><span class="status-badge ${statusClass}">${status}</span></td>
         <td class="td-action">
@@ -3331,17 +3407,22 @@ function renderMenuTable(itemsList){
   updateOrderBadge();
 }
 
+function refreshCurrentMenuView_(){
+  if(menuViewMode === 'table') renderMenuTable();
+  else renderMenu();
+}
+
 function decreaseItem(id){
   if(order[id] && order[id] > 0){
     order[id]--;
     if(order[id] === 0) delete order[id];
-    renderMenuTable();
+    refreshCurrentMenuView_();
   }
 }
 
 function addItem(id){
   order[id]=(order[id]||0)+1;
-  renderMenu();
+  refreshCurrentMenuView_();
   toast(`Added to order`,'success');
 }
 
@@ -3352,7 +3433,7 @@ function updateOrderBadge(){
   document.getElementById('order-total-val').textContent=`₹${amt.toLocaleString('en-IN')}`;
 }
 
-function clearOrder(){order={};selectOccasion('None');renderMenu();}
+function clearOrder(){order={};selectOccasion('None');refreshCurrentMenuView_();}
 // Track placed orders for replacement/modification
 const PLACED_ORDERS = {};
 let lastOrderId = null;
