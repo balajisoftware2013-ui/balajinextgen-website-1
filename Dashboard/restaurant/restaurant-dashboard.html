@@ -2435,6 +2435,13 @@ body.pos-machine .pos-wrap{grid-template-columns:1fr 380px;}
 }
 </style>
 
+<style id="reports-live-data-final-fix">
+/* FINAL REPORT DATA FIX: never let an empty local cache look like a broken report. */
+#page-reports .rpt-anchor-active{display:block!important;visibility:visible!important;opacity:1!important;min-height:120px;}
+#page-reports .rpt-anchor-active table{width:100%;display:table!important;}
+#page-reports .rpt-anchor-active .card-header{display:flex!important;visibility:visible!important;}
+#page-reports .rpt-live-note{display:block!important;}
+</style>
 </head>
 <body>
 
@@ -7374,7 +7381,15 @@ function showPage(id, el){
   // called that on load. resetReportsHub() already does exactly the
   // right init (resets filters/category state, then calls
   // renderReportsGallery() itself) — just never got wired here.
-  if(id==='reports'){ if (typeof resetReportsHub === 'function') resetReportsHub(); }
+  if(id==='reports'){
+    /* REPORT DATA FIX — the dashboard KPI is backend-live, but the report
+       tables use the local bill cache.  Opening Reports previously called
+       resetReportsHub() only, so a manager device with no local bill cache
+       showed KPI numbers but every report said 0 bills.  Always initialise
+       the Hub AND pull the real LIST_BILLS history before rendering. */
+    if (typeof rhInit === 'function') rhInit();
+    else if (typeof resetReportsHub === 'function') resetReportsHub();
+  }
   if(id==='accounts-ledger'){ backToAcctGallery(); renderAcctGallery(); if (typeof bnxPullPettyCashFromServer === 'function') bnxPullPettyCashFromServer(); }
 }
 /* Pulls real bill history from the backend's already-wired LIST_BILLS
@@ -7387,47 +7402,63 @@ function showPage(id, el){
 async function bnxPullBillsFromServer(){
   try{
     const res = await gasApi('LIST_BILLS', { clientId: (typeof CLIENT_ID!=='undefined'?CLIENT_ID:undefined) });
-    const serverBills = res && (res.bills || res.data || (Array.isArray(res) ? res : null));
-    if(!Array.isArray(serverBills) || !serverBills.length) return;
+    /* Accept every response envelope used by the current frontend/backend
+       versions: {bills:[...]}, {data:[...]}, or {data:{bills:[...]}}. */
+    let serverBills = null;
+    if (Array.isArray(res)) serverBills = res;
+    else if (res && Array.isArray(res.bills)) serverBills = res.bills;
+    else if (res && Array.isArray(res.data)) serverBills = res.data;
+    else if (res && res.data && Array.isArray(res.data.bills)) serverBills = res.data.bills;
+    if(!Array.isArray(serverBills)) return {success:false,count:0,error:'LIST_BILLS returned no bill array'};
+
     const local = bnxGetBillRegister();
+    const byNo = new Map(local.map((b,i)=>[String(b.no||''),i]));
     serverBills.forEach(sb=>{
-      // Defensive field-name mapping — this file's own real bill shape
-      // (no/dt/tm/table/customer/mob/items/sub/gst/total/pay/status/
-      // waiter/kot) vs whatever the backend actually names them.
-      const no = sb.no || sb.billNo || sb.bill_no;
+      const no = sb.no || sb.billNo || sb.bill_no || sb.BILL_NUMBER;
       if(!no) return;
-      const idx = local.findIndex(b=>b.no===no);
-      const mode = (sb.pay || sb.paymode || 'CASH').toUpperCase();
-      // FIX ("dashboard payBreakdown missing" — Sep 2026): once PASS #65
-      // v2 is deployed backend-side, LIST_BILLS returns a real per-bill
-      // payBreakdown ({CASH,CARD,UPI,OTHER}) built from actual
-      // PAYMENT_MASTER rows. Until then (or for any bill synced before
-      // that deploy), sb.payBreakdown won't exist — this synthesizes an
-      // honest single-bucket fallback (the bill's one known mode gets
-      // the full total, every other bucket 0), which is exactly what a
-      // real non-split bill's breakdown looks like anyway. This means
-      // every consumer below can always read payBreakdown safely,
-      // whether it came from the real backend field or this fallback,
-      // without needing two code paths.
-      const bucket = mode === 'CASH' ? 'CASH' : mode === 'UPI' ? 'UPI' : mode === 'CARD' ? 'CARD' : 'OTHER';
-      const fallbackTotal = Number(sb.total ?? sb.grand ?? 0);
-      const payBreakdown = sb.payBreakdown
-        ? { CASH: Number(sb.payBreakdown.CASH)||0, CARD: Number(sb.payBreakdown.CARD)||0, UPI: Number(sb.payBreakdown.UPI)||0, OTHER: Number(sb.payBreakdown.OTHER)||0 }
-        : { CASH: 0, CARD: 0, UPI: 0, OTHER: 0, [bucket]: fallbackTotal };
+      const idx = byNo.has(String(no)) ? byNo.get(String(no)) : -1;
+      const mode = String(sb.pay || sb.paymode || sb.PAYMENT_MODE || 'CASH').toUpperCase();
+      const bucket = mode === 'CASH' ? 'CASH' : mode === 'UPI' ? 'UPI' : (mode === 'CARD' || mode === 'DEBIT CARD' || mode === 'CREDIT CARD' || mode === 'BANK') ? 'CARD' : 'OTHER';
+      const fallbackTotal = Number(sb.total ?? sb.grand ?? sb.GRAND_TOTAL ?? 0) || 0;
+      const pb = sb.payBreakdown || sb.pay_breakdown;
+      const payBreakdown = pb
+        ? {CASH:Number(pb.CASH)||0,CARD:Number(pb.CARD)||0,UPI:Number(pb.UPI)||0,OTHER:Number(pb.OTHER)||0}
+        : {CASH:0,CARD:0,UPI:0,OTHER:0,[bucket]:fallbackTotal};
+      const rawStatus = sb.status || sb.PAYMENT_STATUS || sb.BILL_STATUS || 'Paid';
       const mapped = {
-        no, dt: sb.dt || sb.date, tm: sb.tm || sb.time,
-        table: sb.table || sb.tableNo || '-', customer: sb.customer || sb.cname || 'GENERAL CUSTOMER',
-        mob: sb.mob || sb.mobile || '', items: sb.items ?? (sb.itemsDetail||[]).length,
-        itemsDetail: sb.itemsDetail || sb.items || [], sub: sb.sub ?? sb.subtotal ?? 0,
-        gst: sb.gst ?? sb.tax ?? 0, total: sb.total ?? sb.grand ?? 0,
-        pay: mode, payBreakdown, isSplitPayment: !!sb.isSplitPayment, status: sb.status || 'Paid',
-        waiter: sb.waiter || '-', kot: sb.kot || '', live: true
+        no:String(no),
+        dt:sb.dt || sb.date || sb.BILL_DATE || sb.billDate || '',
+        tm:sb.tm || sb.time || sb.BILL_TIME || sb.billTime || '',
+        table:sb.table || sb.tableNo || sb.TABLE_ID || '-',
+        customer:sb.customer || sb.cname || sb.CUSTOMER_NAME || 'GENERAL CUSTOMER',
+        mob:sb.mob || sb.mobile || '',
+        items:sb.items ?? (Array.isArray(sb.itemsDetail)?sb.itemsDetail.length:0),
+        itemsDetail:Array.isArray(sb.itemsDetail)?sb.itemsDetail:(Array.isArray(sb.items)?sb.items:[]),
+        sub:sb.sub ?? sb.subtotal ?? sb.SUBTOTAL ?? 0,
+        gst:sb.gst ?? sb.tax ?? sb.TAX_AMOUNT ?? 0,
+        total:fallbackTotal,
+        pay:mode,payBreakdown,isSplitPayment:!!sb.isSplitPayment,
+        status:/cancel/i.test(String(rawStatus))?'Cancelled':(/paid|finalized|success/i.test(String(rawStatus))?'Paid':'Pending'),
+        waiter:sb.waiter || sb.CREATED_BY || '-',
+        kot:sb.kot || '',live:true,
+        businessDate:sb.businessDate || sb.dt || sb.date || sb.BILL_DATE || ''
       };
-      if(idx>-1) local[idx] = Object.assign({}, mapped, local[idx]); // local status/edits win if present
-      else local.push(mapped);
+      if(idx>-1){
+        /* Server is authoritative for report fields. Preserve only local
+           user-state fields that are genuinely local (none of the numeric
+           report fields are allowed to mask fresh server data). */
+        local[idx]=Object.assign({},local[idx],mapped);
+      }else{
+        byNo.set(String(no),local.length);
+        local.push(mapped);
+      }
     });
-    bnxSaveBillRegister(local);
-  }catch(e){ console.warn('[bnxPullBillsFromServer] failed:', e.message); }
+    bnxSaveBillRegister(local.slice(0,6000));
+    return {success:true,count:serverBills.length};
+  }catch(e){
+    console.warn('[bnxPullBillsFromServer] failed:', e.message);
+    return {success:false,count:0,error:e.message};
+  }
 }
 function toggleSidebar(){
   if (window.innerWidth <= 768){
@@ -20551,7 +20582,13 @@ function printVisibleReport(){
 // use, detected by which segment is 4 digits rather than by position,
 // so it can no longer confuse one format for the other.
 function bnxParseBillDate(dt){
-  return (typeof bnxParseFlexDt === 'function') ? bnxParseFlexDt(dt) : null;
+  if (dt instanceof Date && !isNaN(dt)) return new Date(dt.getFullYear(),dt.getMonth(),dt.getDate());
+  const raw=String(dt||'').trim();
+  if(!raw) return null;
+  const flex=(typeof bnxParseFlexDt==='function') ? bnxParseFlexDt(raw.split('T')[0]) : null;
+  if(flex) return flex;
+  const iso=new Date(raw);
+  return isNaN(iso) ? null : new Date(iso.getFullYear(),iso.getMonth(),iso.getDate());
 }
 function bnxTodayDDMMYYYY(){ return new Date().toLocaleDateString('en-GB'); }
 // Shared date-range resolver + honest scope-limit check for all 3
