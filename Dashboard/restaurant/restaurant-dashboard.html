@@ -7337,13 +7337,30 @@ async function bnxPullBillsFromServer(){
       const no = sb.no || sb.billNo || sb.bill_no;
       if(!no) return;
       const idx = local.findIndex(b=>b.no===no);
+      const mode = (sb.pay || sb.paymode || 'CASH').toUpperCase();
+      // FIX ("dashboard payBreakdown missing" — Sep 2026): once PASS #65
+      // v2 is deployed backend-side, LIST_BILLS returns a real per-bill
+      // payBreakdown ({CASH,CARD,UPI,OTHER}) built from actual
+      // PAYMENT_MASTER rows. Until then (or for any bill synced before
+      // that deploy), sb.payBreakdown won't exist — this synthesizes an
+      // honest single-bucket fallback (the bill's one known mode gets
+      // the full total, every other bucket 0), which is exactly what a
+      // real non-split bill's breakdown looks like anyway. This means
+      // every consumer below can always read payBreakdown safely,
+      // whether it came from the real backend field or this fallback,
+      // without needing two code paths.
+      const bucket = mode === 'CASH' ? 'CASH' : mode === 'UPI' ? 'UPI' : mode === 'CARD' ? 'CARD' : 'OTHER';
+      const fallbackTotal = Number(sb.total ?? sb.grand ?? 0);
+      const payBreakdown = sb.payBreakdown
+        ? { CASH: Number(sb.payBreakdown.CASH)||0, CARD: Number(sb.payBreakdown.CARD)||0, UPI: Number(sb.payBreakdown.UPI)||0, OTHER: Number(sb.payBreakdown.OTHER)||0 }
+        : { CASH: 0, CARD: 0, UPI: 0, OTHER: 0, [bucket]: fallbackTotal };
       const mapped = {
         no, dt: sb.dt || sb.date, tm: sb.tm || sb.time,
         table: sb.table || sb.tableNo || '-', customer: sb.customer || sb.cname || 'GENERAL CUSTOMER',
         mob: sb.mob || sb.mobile || '', items: sb.items ?? (sb.itemsDetail||[]).length,
         itemsDetail: sb.itemsDetail || sb.items || [], sub: sb.sub ?? sb.subtotal ?? 0,
         gst: sb.gst ?? sb.tax ?? 0, total: sb.total ?? sb.grand ?? 0,
-        pay: (sb.pay || sb.paymode || 'CASH').toUpperCase(), status: sb.status || 'Paid',
+        pay: mode, payBreakdown, isSplitPayment: !!sb.isSplitPayment, status: sb.status || 'Paid',
         waiter: sb.waiter || '-', kot: sb.kot || '', live: true
       };
       if(idx>-1) local[idx] = Object.assign({}, mapped, local[idx]); // local status/edits win if present
@@ -15049,10 +15066,18 @@ function bnxRecordBill(d){
   const list = bnxGetBillRegister();
   const existingIdx = list.findIndex(b=>b.no===d.no);
   const payMode = (d.pay||'CASH').toUpperCase();
+  // FIX ("dashboard payBreakdown missing" — Sep 2026): same synthetic
+  // single-bucket fallback as bnxPullBillsFromServer's own fix — this is
+  // the OTHER path bills land in the local register through (a bill
+  // created on THIS device, before ever round-tripping through LIST_
+  // BILLS), so every bill in the register carries payBreakdown either
+  // way, regardless of which of the two paths created it.
+  const bnxBucket = payMode === 'CASH' ? 'CASH' : payMode === 'UPI' ? 'UPI' : payMode === 'CARD' ? 'CARD' : 'OTHER';
   const entry = {
     no: d.no, dt: d.dt, tm: d.tm, table: d.table||'-', customer: d.customer||'GENERAL CUSTOMER',
     mob: d.mob||'', items: (d.items||[]).length, itemsDetail: d.items||[], sub: d.sub||0, gst: d.gst||0,
-    total: d.total||0, pay: payMode, status: payMode==='DUE'||payMode==='CREDIT' ? 'Pending' : (payMode==='COMPLIMENTARY'?'Complimentary':'Paid'),
+    total: d.total||0, pay: payMode, payBreakdown: { CASH:0, CARD:0, UPI:0, OTHER:0, [bnxBucket]: Number(d.total)||0 }, isSplitPayment: false,
+    status: payMode==='DUE'||payMode==='CREDIT' ? 'Pending' : (payMode==='COMPLIMENTARY'?'Complimentary':'Paid'),
     waiter: d.waiter||'-', kot: d.kot||'', live:true,
     // FIX ("according dashboard also update"): businessDate/pax weren't
     // stored on the bill entry at all, so nothing reading the Bill
@@ -20334,7 +20359,16 @@ function bnxResolveReportRange(from, to){
   const tableVal=document.getElementById('rptFilterTable')?.value||'';
   const custVal=(document.getElementById('rptFilterCustomer')?.value||'').trim().toLowerCase();
   const minAmt=Number(document.getElementById('rptFilterMinAmt')?.value||0);
-  if(payVal) filtered=filtered.filter(b=>String(b.pay||'').toUpperCase()===payVal);
+  // FIX ("payment filters — split mode filtering" — Sep 2026): matched
+  // only the bill's single dominant `pay` mode, so a split bill (Cash
+  // ₹500 + UPI ₹700) filtered by "UPI" would never show up even though
+  // ₹700 of it genuinely was UPI. Every bill in the register now always
+  // has a payBreakdown (real, from LIST_BILLS once PASS #65 v2 is
+  // deployed, or a synthesized single-bucket one otherwise — see
+  // bnxPullBillsFromServer/bnxRecordBill) — a bill matches a payment-
+  // mode filter whenever that mode has a positive amount on it, split
+  // or not.
+  if(payVal) filtered=filtered.filter(b=>Number((b.payBreakdown||{})[payVal]||0) > 0 || (!b.payBreakdown && String(b.pay||'').toUpperCase()===payVal));
   if(stewardVal) filtered=filtered.filter(b=>String(b.waiter||'')===stewardVal);
   if(tableVal) filtered=filtered.filter(b=>String(b.table||'')===tableVal);
   if(custVal) filtered=filtered.filter(b=>String(b.customer||'').toLowerCase().includes(custVal)||String(b.mob||'').includes(custVal));
@@ -20437,12 +20471,30 @@ function bnxRenderMonthlySalesReport(from, to){
     const key = pad(d.getDate())+'-'+d.toLocaleDateString('en-GB',{month:'short'});
     if (!byDay[key]) byDay[key] = { day: d.getDate(), bills:0, cash:0, upi:0, card:0, total:0 };
     byDay[key].bills += 1;
-    const amt = Number(b.total)||0;
-    const mode = String(b.pay||'').toUpperCase();
-    if (mode==='CASH') byDay[key].cash += amt;
-    else if (mode==='UPI'||mode==='GPAY') byDay[key].upi += amt;
-    else if (mode==='CARD') byDay[key].card += amt;
-    byDay[key].total += amt;
+    // FIX ("sales summary/payment-mode statistics — split payments
+    // misclassified" — Sep 2026): assigned the bill's ENTIRE amount to
+    // whichever single `pay` mode was set, so a split bill's UPI portion
+    // used to get counted as Cash (or vice versa) depending only on
+    // which mode happened to be marked dominant. Summing each real
+    // bucket from payBreakdown instead means a split bill now
+    // contributes correctly to more than one column, same as it
+    // actually happened at the till.
+    const pb = b.payBreakdown;
+    if (pb){
+      byDay[key].cash += Number(pb.CASH)||0;
+      byDay[key].upi += Number(pb.UPI)||0;
+      byDay[key].card += Number(pb.CARD)||0;
+      byDay[key].total += (Number(pb.CASH)||0) + (Number(pb.UPI)||0) + (Number(pb.CARD)||0) + (Number(pb.OTHER)||0);
+    } else {
+      // Bill cached before payBreakdown existed on this device — same
+      // single-mode assumption as before, only as a last-resort fallback.
+      const amt = Number(b.total)||0;
+      const mode = String(b.pay||'').toUpperCase();
+      if (mode==='CASH') byDay[key].cash += amt;
+      else if (mode==='UPI'||mode==='GPAY') byDay[key].upi += amt;
+      else if (mode==='CARD') byDay[key].card += amt;
+      byDay[key].total += amt;
+    }
   });
   const days = Object.keys(byDay).sort((a,b)=>byDay[a].day-byDay[b].day);
   const money = v => '₹'+Number(v||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
