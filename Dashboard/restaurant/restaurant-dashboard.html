@@ -183,12 +183,23 @@ async function bnxFetchJson_(endpoint, options){
   for (let i=0; i<urls.length; i++) {
     const url=urls[i];
     try {
-      const r=await fetch(url,Object.assign({
+      const fetchOpts = Object.assign({
         method:'POST',
         headers:{'Content-Type':'text/plain;charset=utf-8'},
         credentials:'same-origin',
         redirect:'follow'
-      },options));
+      },options);
+      // HANG FIX: hard timeout. A broken /api/core proxy can never keep a
+      // button, dashboard or startup Promise pending indefinitely.
+      const parsedAction = (()=>{ try{return JSON.parse(fetchOpts.body||'{}').action||'';}catch(e){return '';} })();
+      const timeoutMs = Number(fetchOpts.timeoutMs) || (/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? 8000 : 4500);
+      delete fetchOpts.timeoutMs;
+      const timeoutCtrl = new AbortController();
+      const timer = setTimeout(()=>timeoutCtrl.abort(), timeoutMs);
+      if(fetchOpts.signal){ try{fetchOpts.signal.addEventListener('abort',()=>timeoutCtrl.abort(),{once:true});}catch(e){} }
+      fetchOpts.signal=timeoutCtrl.signal;
+      let r;
+      try{r=await fetch(url,fetchOpts);}finally{clearTimeout(timer);}
       const text=await r.text();
 
       if(!r.ok){
@@ -243,7 +254,7 @@ async function bnxRefreshConfig(){
   // forever. Still falls back to the hardcoded bootstrap IDs either
   // way (never blocks startup), but now every outcome is logged.
   try{
-    const res = await bnxFetchJson_('V2_CORE', {body: JSON.stringify({action:'GET_CONFIG'})});
+    const res = await bnxFetchJson_('V2_CORE', {body: JSON.stringify({action:'GET_CONFIG'}), timeoutMs:2500});
     if(res && res.success && res.data){
       if(res.data.v2CoreId) localStorage.setItem('bnx_api_core', res.data.v2CoreId);
       if(res.data.v2AuthId) localStorage.setItem('bnx_api_auth', res.data.v2AuthId);
@@ -337,6 +348,11 @@ const CLIENT_INDUSTRY=(function(){
 ═══════════════════════════════════════════════════════ */
 const REQUEST_QUEUE = { pending: [], active: 0, maxConcurrent: 5 };
 const API_RETRY_CONFIG = { maxAttempts: 3, baseDelay: 300, maxDelay: 5000 };
+// HANG FIX: identical GET/summary requests fired by multiple startup listeners
+// are coalesced into ONE network request. This page previously requested
+// GET_DASHBOARD_SUMMARY several times during startup, filling the queue when
+// /api/core was unavailable and making the screen feel frozen.
+const BNX_INFLIGHT_API = new Map();
 
 // FIX (authorization): the confirmed backend returns a real,
 // distinguishable auth failure — respondError(401, 'Invalid or expired
@@ -383,7 +399,18 @@ async function gasApi(action, payload, endpoint) {
     _bnxWarnedNoSession = true;
     console.error('[AUTH] No ERP_SESSION token — session-gated API calls may fail until login.');
   }
-  return new Promise((resolve) => {
+
+  // HANG FIX: coalesce identical in-flight requests. Startup used to fire the
+  // same dashboard summary through several DOMContentLoaded handlers and the
+  // 2.5s startup timer. Only the first request should hit the queue/network.
+  let inflightKey = '';
+  try {
+    inflightKey = ep + '|' + String(action||'') + '|' + JSON.stringify(payload) + '|' +
+      (localStorage.getItem('ERP_SESSION') || sessionStorage.getItem('ERP_SESSION') || '') + '|' + CLIENT_ID;
+  } catch(e) {}
+  if (inflightKey && BNX_INFLIGHT_API.has(inflightKey)) return BNX_INFLIGHT_API.get(inflightKey);
+
+  const promise = new Promise((resolve) => {
     const task = async () => {
       try {
         let attempt = 0;
@@ -396,10 +423,8 @@ async function gasApi(action, payload, endpoint) {
             resolve(data);
             return;
           } catch(err) {
-            /* Never retry a permanent client-side HTTP error such as 400/401/403/404/405.
-               The old three-attempt retry made a bad /api/core route feel like a
-               frozen Save/Invoice button for several seconds. Retry only network
-               failures and 5xx responses where another attempt can actually help. */
+            /* Permanent 4xx errors are never retried. Network/5xx errors get
+               only a bounded retry so a dead endpoint cannot freeze the UI. */
             const status=Number(err && err.status)||0;
             if (status>=400 && status<500) {
               resolve({success:false, error:err.message, statusCode:status});
@@ -421,8 +446,12 @@ async function gasApi(action, payload, endpoint) {
     else REQUEST_QUEUE.pending.push(task);
     processRequestQueue();
   });
+  if (inflightKey) {
+    BNX_INFLIGHT_API.set(inflightKey, promise);
+    promise.finally(()=>{ if(BNX_INFLIGHT_API.get(inflightKey)===promise) BNX_INFLIGHT_API.delete(inflightKey); });
+  }
+  return promise;
 }
-
 async function processRequestQueue() {
   while (REQUEST_QUEUE.active < REQUEST_QUEUE.maxConcurrent && REQUEST_QUEUE.pending.length > 0) {
     REQUEST_QUEUE.active++;
@@ -904,6 +933,8 @@ html[data-fontscale="xlarge"] .prod-name,html[data-fontscale="huge"] .prod-name{
 .ps-reason{font-size:9px;color:var(--text3);}
 .ps-qty{font-size:10px;font-weight:700;color:var(--gold);margin-left:auto;white-space:nowrap;}
 /* Toast/notification banner shown by showNotif() — desktop default */
+/* HANG FIX: never allow a loading overlay to block clicks after an API failure. */
+#bnxSplash.fade-out{pointer-events:none!important;}
 .app-toast{position:fixed;top:80px;right:20px;z-index:9999;color:#fff;padding:10px 18px;
   border-radius:10px;font-size:13px;font-weight:600;font-family:'DM Sans',sans-serif;
   box-shadow:0 6px 20px rgba(0,0,0,.25);max-width:360px;}
@@ -8206,6 +8237,8 @@ async function loadRealDashboardData() {
     // now computes and returns this same split for real, as
     // data.collectionsByMode — reading that here instead of inventing a
     // second endpoint or a second full dashboard fetch.
+    // HANG FIX: loadDashboard() already requests this exact summary. Reuse its
+    // in-flight/result promise instead of starting another network call.
     const dashRes = await gasApi('GET_DASHBOARD_SUMMARY', Object.assign({ clientId: CLIENT_ID }, rangeParams), 'V2_CORE');
 
     if (dashRes && dashRes.success && dashRes.data && dashRes.data.collectionsByMode) {
@@ -8414,7 +8447,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 document.addEventListener('DOMContentLoaded', async ()=>{ await window.__bnxConfigReady; bnxResolveClientBrand(); });
-document.addEventListener('DOMContentLoaded', async ()=>{ await window.__bnxConfigReady; if (typeof loadDashboard === 'function') loadDashboard(); });
+/* HANG FIX: dashboard is loaded by the single startup coordinator below;
+   do not fire a second identical GET_DASHBOARD_SUMMARY here. */
 document.addEventListener('DOMContentLoaded', async ()=>{ await window.__bnxConfigReady; if (typeof bnxSyncKotBadge === 'function') bnxSyncKotBadge(); });
 document.addEventListener('DOMContentLoaded', async ()=>{
   await window.__bnxConfigReady;
@@ -8567,8 +8601,8 @@ async function checkDB(id, label, apiType){
   el.className='db-pill checking'; el.innerHTML=`<span class="db-dot pulse"></span>${label}…`;
   try{
     const ctrl=new AbortController();
-    const to=setTimeout(()=>ctrl.abort(),7000);
-    const res=await fetch(bnxApiUrl_(apiType)+'?action=PING',{signal:ctrl.signal});
+    const to=setTimeout(()=>ctrl.abort(),2500);
+    const res=await fetch(bnxApiUrl_(apiType),{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},credentials:'same-origin',body:JSON.stringify({action:'PING',clientId:CLIENT_ID||'',sessionToken:localStorage.getItem('ERP_SESSION')||sessionStorage.getItem('ERP_SESSION')||''}),signal:ctrl.signal});
     clearTimeout(to);
     if(res.ok){ el.className='db-pill online'; el.innerHTML=`<span class="db-dot"></span>${label} ✓`; return true; }
   }catch(e){}
