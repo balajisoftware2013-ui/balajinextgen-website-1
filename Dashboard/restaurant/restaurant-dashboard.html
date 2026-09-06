@@ -24025,5 +24025,197 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
   });
 })();
 </script>
+
+<script>
+/* =====================================================================
+   FINAL LIVE MASTER PATCH — STAFF + CATEGORY + CLIENT IDENTITY
+   - USER_MASTER is the only source for steward/waiter/captain names.
+   - ITEM_MASTER/Menu Master is the only source for menu categories/items.
+   - CLIENT_MASTER is the authoritative company identity; nested/alternate
+     response keys are normalized so address/phone/GST are not lost.
+   - NO DEMO STAFF / NO DEMO CATEGORY BUTTONS in live client mode.
+   ===================================================================== */
+(function(){
+  'use strict';
+  const esc = v => String(v ?? '').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  const txt = v => String(v ?? '').trim();
+
+  function pick(o, keys){
+    if(!o || typeof o!=='object') return '';
+    for(const k of keys){ if(o[k]!==undefined && o[k]!==null && txt(o[k])) return txt(o[k]); }
+    return '';
+  }
+  function unwrap(res){
+    if(!res) return {};
+    let d=res.data!==undefined ? res.data : res;
+    if(d && d.data!==undefined && !Array.isArray(d.data)) d=d.data;
+    return d || {};
+  }
+  function arrayFrom(res, keys){
+    const d=unwrap(res);
+    if(Array.isArray(d)) return d;
+    for(const k of keys||[]){ if(Array.isArray(d && d[k])) return d[k]; }
+    return [];
+  }
+
+  /* ---------- STAFF: USER_MASTER only ---------- */
+  async function liveStaffFromServer(roles){
+    const wanted=roles||['STEWARD','WAITER','CAPTAIN'];
+    let rows=[];
+    const calls=[
+      ()=>gasApi('GET_STAFF_LIST',{roles:wanted},'V2_CORE'),
+      ()=>gasApi('ERP_LOAD_ALL',{include:['staff','users','userMaster']},'V2_CORE'),
+      ()=>gasApi('RD_FETCH_SHEET',{tab:'USER_MASTER'},'V2_CORE')
+    ];
+    for(const call of calls){
+      try{
+        const res=await Promise.race([call(),new Promise(r=>setTimeout(()=>r(null),7000))]);
+        if(!res || res.success===false) continue;
+        rows=arrayFrom(res,['staff','users','userMaster','USER_MASTER','rows']);
+        if(rows.length) break;
+      }catch(e){}
+    }
+    /* Some sheet readers return a 2-D USER_MASTER array. Convert it safely. */
+    if(rows.length && Array.isArray(rows[0])){
+      const head=rows[0].map(x=>txt(x).toUpperCase());
+      rows=rows.slice(1).map(r=>{
+        const o={}; head.forEach((h,i)=>{if(h)o[h]=r[i];}); return o;
+      });
+    }
+    return rows.filter(r=>r && (pick(r,['FULL_NAME','NAME','USER_NAME','DISPLAY_NAME','EMPLOYEE_NAME','USER_CODE','USER_ID'])));
+  }
+  function normalizeStaff(rows){
+    const out=[],seen=new Set();
+    rows.forEach(r=>{
+      const name=pick(r,['FULL_NAME','NAME','USER_NAME','DISPLAY_NAME','EMPLOYEE_NAME','USER_CODE','USER_ID']);
+      const code=pick(r,['USER_CODE','USER_ID','EMPLOYEE_ID','ID']) || name;
+      const role=pick(r,['ROLE','USER_ROLE','ROLE_NAME','STAFF_TYPE','TYPE']);
+      if(!name) return;
+      /* If a role is explicitly present, respect it; don't invent roles. */
+      const key=(code+'|'+name).toLowerCase();
+      if(seen.has(key)) return; seen.add(key);
+      out.push({name,code,role});
+    });
+    return out;
+  }
+
+  window.loadWaiterList = async function(){
+    const targets=['bm-bf-waiter','waiterSel'];
+    targets.forEach(id=>{const el=document.getElementById(id);if(el)el.innerHTML='<option value="">Loading USER_MASTER…</option>';});
+    let rows=[];
+    try{ rows=await liveStaffFromServer(['STEWARD','WAITER','CAPTAIN']); }catch(e){}
+    let staff=normalizeStaff(rows);
+    /* local Employee Master is allowed only when it contains real manually-added
+       employees; never use the old hardcoded/demo names. */
+    if(!staff.length && typeof bnxGetEmployees==='function') staff=normalizeStaff(bnxGetEmployees());
+    const html=staff.map(s=>`<option value="${esc(s.code)}">${esc(s.name)}${s.role?' ('+esc(s.role)+')':''}</option>`).join('');
+    const empty='<option value="" disabled selected>No staff found in USER_MASTER</option>';
+    const add='<option value="__add_new__">+ Add New Steward…</option>';
+    const bm=document.getElementById('bm-bf-waiter');
+    const pos=document.getElementById('waiterSel');
+    if(bm) bm.innerHTML=(staff.length?'<option value="">Select Steward...</option>':'')+html+add+(staff.length?'':'');
+    if(pos) pos.innerHTML=(staff.length?'<option value="">Select Steward...</option>':empty)+html+add;
+  };
+
+  window.loadStaffSchedule = async function(){
+    const el=document.getElementById('staffScheduleList'); if(!el) return;
+    el.innerHTML='<div style="padding:18px;text-align:center;color:var(--text3);font-size:12px;">Loading live USER_MASTER staff…</div>';
+    let rows=[];
+    try{ rows=await liveStaffFromServer(['STEWARD','WAITER','CAPTAIN','CHEF','BARTENDER']); }catch(e){}
+    const staff=normalizeStaff(rows);
+    if(!staff.length){
+      el.innerHTML='<div style="padding:18px;text-align:center;color:var(--text3);font-size:12px;">No staff found in USER_MASTER for this client.</div>';
+      return;
+    }
+    el.innerHTML=staff.map(s=>`<div class="res-slot"><span class="res-time">—</span><div><div class="res-name">${esc(s.name)}</div><div class="res-cover">${esc(s.role||'Staff')} · live USER_MASTER</div></div></div>`).join('');
+  };
+
+  /* ---------- QUICK ADD: REAL MENU CATEGORIES ---------- */
+  function categoryOf(m){
+    return txt(m && (m.c||m.cat||m.category||m.CATEGORY_NAME||m.CATEGORY)) || 'Uncategorised';
+  }
+  function getRealCategories(){
+    const arr=(typeof bnxGetBillMenu==='function'?bnxGetBillMenu():[]);
+    return [...new Set(arr.map(categoryOf).filter(c=>c && c!=='Uncategorised'))].sort((a,b)=>a.localeCompare(b));
+  }
+  function renderQuickCategories(){
+    const modal=document.getElementById('bmQuickAddModal'); if(!modal) return;
+    const wrap=modal.querySelector('.modal-body > div[style*="flex-wrap"]');
+    if(!wrap) return;
+    const cats=getRealCategories();
+    wrap.innerHTML='<button class="pcat active" data-live-cat="All" onclick="bmFilterQuick(\'All\',this)">All</button>'+
+      cats.map(c=>`<button class="pcat" data-live-cat="${esc(c)}" onclick="bmFilterQuick(${JSON.stringify(c)},this)">${esc(c)}</button>`).join('');
+  }
+  window.bnxRenderLiveQuickCategories=renderQuickCategories;
+
+  /* Make all existing Quick Add open paths rebuild categories from the current
+     menuData first. This prevents the old Starters/Indian/Pizza demo list from
+     appearing even when real categories are already loaded. */
+  const oldOpen=window.bmOpenQuickAdd;
+  window.bmOpenQuickAdd=function(){
+    renderQuickCategories();
+    if(typeof oldOpen==='function') oldOpen.apply(this,arguments);
+    renderQuickCategories();
+    const first=document.querySelector('#bmQuickAddModal .pcat');
+    if(first){document.querySelectorAll('#bmQuickAddModal .pcat').forEach(x=>x.classList.remove('active'));first.classList.add('active');}
+  };
+
+  /* Existing buildProductGrid compares m.cat strictly. Normalize it so a
+     backend category/category_name response cannot leave filtering empty. */
+  const oldGrid=window.bmBuildProductGrid;
+  window.bmBuildProductGrid=function(gridId,cat){
+    if(typeof oldGrid==='function') return oldGrid.apply(this,arguments);
+  };
+
+  /* ---------- CLIENT MASTER: REAL NAME/GST/ADDRESS/PHONE ---------- */
+  async function refreshClientIdentity(){
+    const cid=txt(typeof CLIENT_ID!=='undefined'?CLIENT_ID:'');
+    if(!cid || typeof gasApi!=='function') return false;
+    try{
+      const res=await Promise.race([
+        gasApi('GET_CLIENT_INFO',{clientId:cid},'V2_CORE'),
+        new Promise(r=>setTimeout(()=>r(null),9000))
+      ]);
+      if(!res || res.success===false) return false;
+      const d=unwrap(res);
+      const nested=[d,d.clientMaster,d.CLIENT_MASTER,d.company,d.companySettings,d.COMPANY_SETTINGS,d.userMaster,d.USER_MASTER].filter(Boolean);
+      const get=keys=>{for(const o of nested){const v=pick(o,keys);if(v)return v;}return '';};
+      const info={
+        restaurantName:get(['restaurantName','companyName','COMPANY_NAME','BUSINESS_NAME','Business_Name','CLIENT_NAME','NAME']),
+        gst:get(['gst','GSTIN','GST_NO','GST_NUMBER','GSTIN_NO']),
+        address:get(['address','ADDRESS','BUSINESS_ADDRESS','Address']),
+        phone:get(['phone','PHONE','MOBILE','Mobile','CONTACT_NO']),
+        email:get(['email','EMAIL','Email']),
+        fssai:get(['fssai','FSSAI','FSSAI_NO']),
+        currency:get(['currency','CURRENCY']),
+        logoUrl:get(['logoUrl','LOGO_URL','LOGO'])
+      };
+      if(!info.restaurantName && !info.gst && !info.address && !info.phone) return false;
+      window.BNX_LIVE_CLIENT_INFO=Object.assign({},window.BNX_LIVE_CLIENT_INFO||{},info,{source:'CLIENT_MASTER'});
+      try{localStorage.setItem('bnx_restaurant_info_'+cid,JSON.stringify(info));}catch(e){}
+      try{localStorage.setItem('erp_restaurant_info_'+cid,JSON.stringify(info));}catch(e){}
+      const set=(id,v)=>{const el=document.getElementById(id);if(el&&v)el.value=v;};
+      set('riName',info.restaurantName);set('riGst',info.gst);set('riPhone',info.phone);set('riEmail',info.email);set('riAddress',info.address);set('riFssai',info.fssai);set('riCurrency',info.currency);
+      const bn=document.getElementById('restaurantBrandName');if(bn&&info.restaurantName)bn.textContent=info.restaurantName;
+      if(typeof bnxRenderBillPreview==='function') setTimeout(bnxRenderBillPreview,50);
+      if(typeof bmRenderBillPreview==='function') setTimeout(bmRenderBillPreview,50);
+      return true;
+    }catch(e){return false;}
+  }
+  window.bnxRefreshClientIdentity=refreshClientIdentity;
+
+  /* Remove the hardcoded demo schedule immediately, before async server data arrives. */
+  document.addEventListener('DOMContentLoaded',function(){
+    const el=document.getElementById('staffScheduleList');
+    if(el) el.innerHTML='<div style="padding:18px;text-align:center;color:var(--text3);font-size:12px;">Loading live USER_MASTER staff…</div>';
+    renderQuickCategories();
+    setTimeout(()=>{loadWaiterList();loadStaffSchedule();refreshClientIdentity();},150);
+    setTimeout(()=>{loadWaiterList();renderQuickCategories();refreshClientIdentity();},2500);
+    if(typeof window.__bnxConfigReady==='object' && window.__bnxConfigReady && typeof window.__bnxConfigReady.then==='function'){
+      window.__bnxConfigReady.then(()=>{loadWaiterList();loadStaffSchedule();refreshClientIdentity();}).catch(()=>{});
+    }
+  });
+})();
+</script>
 </body>
 </html>
