@@ -147,12 +147,6 @@ const BNX_SAME_ORIGIN_API = (function(){
 function bnxApiUrl_(endpoint){
   return (BNX_SAME_ORIGIN_API && BNX_SAME_ORIGIN_API[endpoint]) || GAS_APIS_DASH[endpoint || 'V2_CORE'];
 }
-function bnxApiCandidates_(endpoint){
-  const key=endpoint||'V2_CORE';
-  const proxy=BNX_SAME_ORIGIN_API&&BNX_SAME_ORIGIN_API[key];
-  const direct=GAS_APIS_DASH[key];
-  return [proxy,direct].filter((u,i,a)=>u&&a.indexOf(u)===i);
-}
 
 /* CENTRALIZED CONFIG — same mechanism as steward-mobile.html, see its
    comment for the full explanation. Once DEPLOYMENT_CONFIG exists in
@@ -301,7 +295,7 @@ function bnxCheckAuthFailure_(data){
 let _bnxWarnedNoSession = false;
 async function gasApi(action, payload, endpoint) {
   payload = payload || {};
-  const urls = bnxApiCandidates_(endpoint || 'V2_CORE');
+  const url = bnxApiUrl_(endpoint || 'V2_CORE');
   // FIX: every write handler in 20_POSBillingHandlers.gs rejects with
   // "Invalid or expired session" the instant sessionToken is missing
   // or stale — but that only ever showed up buried in an aggregate
@@ -347,26 +341,17 @@ async function gasApi(action, payload, endpoint) {
             // have failed the instant that backend went live. Mirrors
             // steward-mobile.html's getSessionToken(), which already
             // does this correctly.
-            let r=null, data=null, lastError=null;
-            for (const url of urls){
-              try{
-                r = await fetch(url, {
-                  method: 'POST',
-                  body: JSON.stringify(Object.assign({ action: action, clientId: CLIENT_ID, sessionToken: (localStorage.getItem('ERP_SESSION')||'') }, payload)),
-                  signal: ctrl.signal,
-                  headers: { 'Content-Type': 'text/plain;charset=utf-8' }
-                });
-                if (!r.ok && r.status !== 200) throw new Error(`HTTP ${r.status}`);
-                data = await r.json();
-                if (data && (data.success !== undefined || data.error !== undefined || data.statusCode !== undefined)) break;
-                throw new Error('Invalid ERP response');
-              }catch(e){
-                lastError=e;
-                if (url===urls[urls.length-1]) throw e;
-              }
-            }
+            const r = await fetch(url, {
+              method: 'POST',
+              body: JSON.stringify(Object.assign({ action: action, clientId: CLIENT_ID, sessionToken: (localStorage.getItem('ERP_SESSION')||'') }, payload)),
+              signal: ctrl.signal,
+              headers: { 'Content-Type': 'text/plain;charset=utf-8' }
+            });
+            
             clearTimeout(timeoutId);
-            if (!data) throw (lastError || new Error('No ERP API endpoint available'));
+            
+            if (!r.ok && r.status !== 200) throw new Error(`HTTP ${r.status}`);
+            const data = await r.json();
             bnxCheckAuthFailure_(data);
             resolve(data);
             return;
@@ -8541,26 +8526,15 @@ async function doLogout(){
 async function checkDB(id, label, apiType){
   const el=document.getElementById(id); if(!el) return false;
   el.className='db-pill checking'; el.innerHTML=`<span class="db-dot pulse"></span>${label}…`;
-  const urls=bnxApiCandidates_(apiType);
-  for(const url of urls){
-    try{
-      const ctrl=new AbortController();
-      const timer=setTimeout(()=>ctrl.abort(),5000);
-      const res=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:'GET_CONFIG',requestId:'dbcheck-'+Date.now()}),signal:ctrl.signal});
-      clearTimeout(timer);
-      if(!res.ok) continue;
-      let data=null; try{data=await res.json();}catch(e){}
-      if(data && (data.success===true || data.error!==undefined || data.statusCode!==undefined)){
-        el.className='db-pill online';
-        el.innerHTML=`<span class="db-dot"></span>${label} ✓`;
-        return true;
-      }
-    }catch(e){}
-  }
-  el.className='db-pill offline'; el.innerHTML=`<span class="db-dot"></span>${label} ✗`;
-  return false;
+  try{
+    const ctrl=new AbortController();
+    const to=setTimeout(()=>ctrl.abort(),7000);
+    const res=await fetch(bnxApiUrl_(apiType)+'?action=PING',{signal:ctrl.signal});
+    clearTimeout(to);
+    if(res.ok){ el.className='db-pill online'; el.innerHTML=`<span class="db-dot"></span>${label} ✓`; return true; }
+  }catch(e){}
+  el.className='db-pill offline'; el.innerHTML=`<span class="db-dot"></span>${label} ✗`; return false;
 }
-
 async function checkAllDBs(verbose=false){
   document.getElementById('dbSync').textContent='Checking…';
   await Promise.allSettled([
@@ -14389,7 +14363,8 @@ let bmQuickActiveCat='All';
 function bmBuildProductGrid(gridId,cat){
   const grid=document.getElementById(gridId);if(!grid)return;
   const billMenu = bnxGetBillMenu();
-  let items=cat==='All'?billMenu:billMenu.filter(m=>m.cat===cat);
+  const wantedCat=String(cat==null?'All':cat).trim();
+  let items=wantedCat==='All'?billMenu:billMenu.filter(m=>String(m.cat||m.category||'').trim().toLowerCase()===wantedCat.toLowerCase());
   if(gridId==='bmProductGrid' && bmProdListSearch){
     const q=bmProdListSearch.toLowerCase();
     items=items.filter(m=>m.name.toLowerCase().includes(q));
@@ -14429,10 +14404,19 @@ function bmFilterProducts(cat,btn){
 }
 
 function bmFilterQuick(cat,btn){
+  /* P0 FIX: Quick Add category buttons were rendered inside the Billing form.
+     Because they had no type=button, Edge/Chrome could treat a category click
+     as a form submit, so the active category changed visually but the product
+     filter did not reliably remain applied. Also normalize category values so
+     CATEGORY_MASTER / ITEM_MASTER spacing and casing differences cannot make a
+     real category appear empty. */
+  try{ if(window.event){ window.event.preventDefault(); window.event.stopPropagation(); } }catch(e){}
+  const wanted=String(cat==null?'All':cat).trim();
   document.querySelectorAll('#bmQuickAddModal .pcat').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
-  bmQuickActiveCat=cat;
-  bmBuildProductGrid('bmQuickProdGrid',cat);
+  if(btn) btn.classList.add('active');
+  bmQuickActiveCat=wanted || 'All';
+  bmBuildProductGrid('bmQuickProdGrid',bmQuickActiveCat);
+  return false;
 }
 function bmSearchQuick(term){
   bmQuickSearch=(term||'').trim();
@@ -17677,16 +17661,16 @@ function renderAIBars(){
       <input type="text" id="bmQuickSearchInput" placeholder="🔍 Search item name…" oninput="bmSearchQuick(this.value)"
         style="width:100%;padding:9px 12px;border:1px solid var(--border2,#ddd);border-radius:8px;font-size:13px;font-family:'DM Sans',sans-serif;margin-bottom:10px;">
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
-        <button class="pcat active" onclick="bmFilterQuick('All',this)">All</button>
-        <button class="pcat" onclick="bmFilterQuick('Starters',this)">Starters</button>
-        <button class="pcat" onclick="bmFilterQuick('Indian',this)">Indian</button>
-        <button class="pcat" onclick="bmFilterQuick('Pizza',this)">Pizza</button>
-        <button class="pcat" onclick="bmFilterQuick('Noodles',this)">Noodles</button>
-        <button class="pcat" onclick="bmFilterQuick('Rice',this)">Rice</button>
-        <button class="pcat" onclick="bmFilterQuick('Breads',this)">Breads</button>
-        <button class="pcat" onclick="bmFilterQuick('Desserts',this)">Desserts</button>
-        <button class="pcat" onclick="bmFilterQuick('Beverages',this)">Beverages</button>
-        <button class="pcat" onclick="bmFilterQuick('Bar',this)">Bar</button>
+        <button type="button" class="pcat active" onclick="return bmFilterQuick('All',this)">All</button>
+        <button type="button" class="pcat" onclick="return bmFilterQuick('Starters',this)">Starters</button>
+        <button type="button" class="pcat" onclick="return bmFilterQuick('Indian',this)">Indian</button>
+        <button type="button" class="pcat" onclick="return bmFilterQuick('Pizza',this)">Pizza</button>
+        <button type="button" class="pcat" onclick="return bmFilterQuick('Noodles',this)">Noodles</button>
+        <button type="button" class="pcat" onclick="return bmFilterQuick('Rice',this)">Rice</button>
+        <button type="button" class="pcat" onclick="return bmFilterQuick('Breads',this)">Breads</button>
+        <button type="button" class="pcat" onclick="return bmFilterQuick('Desserts',this)">Desserts</button>
+        <button type="button" class="pcat" onclick="return bmFilterQuick('Beverages',this)">Beverages</button>
+        <button type="button" class="pcat" onclick="return bmFilterQuick('Bar',this)">Bar</button>
       </div>
       <div class="prod-grid" id="bmQuickProdGrid"></div>
     </div>
@@ -24207,8 +24191,16 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
     const wrap=modal.querySelector('.modal-body > div[style*="flex-wrap"]');
     if(!wrap) return;
     const cats=Array.isArray(categories) ? categories : getRealCategories();
-    wrap.innerHTML='<button class="pcat active" data-live-cat="All" onclick="bmFilterQuick(\'All\',this)">All</button>'+
-      cats.map(c=>`<button class="pcat" data-live-cat="${esc(c)}" onclick="bmFilterQuick(${JSON.stringify(c)},this)">${esc(c)}</button>`).join('');
+    wrap.innerHTML='<button type="button" class="pcat active" data-live-cat="All">All</button>'+
+      cats.map(c=>`<button type="button" class="pcat" data-live-cat="${esc(c)}">${esc(c)}</button>`).join('');
+    /* Use delegated click handling so category filters cannot be swallowed by
+       a parent form and special category names never become broken inline JS. */
+    wrap.querySelectorAll('.pcat').forEach(btn=>{
+      btn.addEventListener('click', function(ev){
+        ev.preventDefault(); ev.stopPropagation();
+        bmFilterQuick(this.dataset.liveCat||'All', this);
+      });
+    });
   }
   window.bnxRenderLiveQuickCategories=renderQuickCategories;
 
