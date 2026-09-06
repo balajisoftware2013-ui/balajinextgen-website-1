@@ -148,63 +148,52 @@ function bnxApiUrl_(endpoint){
   return (BNX_SAME_ORIGIN_API && BNX_SAME_ORIGIN_API[endpoint]) || GAS_APIS_DASH[endpoint || 'V2_CORE'];
 }
 
-/* ═══ ROBUST API TRANSPORT — proxy 405/HTML fallback ═══
-   The live site currently returns HTTP 405 for POST /api/core. That is a
-   hosting/proxy method problem, not a Google Apps Script router problem.
-   Never retry the broken proxy 44 times while the real GAS endpoint is
-   available. Try same-origin first, then automatically fall back to the
-   configured GAS deployment when the proxy returns 405/4xx HTML or invalid
-   JSON. text/plain keeps the request CORS-simple for GAS web apps.
-*/
-async function bnxFetchApi_(endpoint, payload, timeoutMs){
-  endpoint = endpoint || 'V2_CORE';
-  payload = payload || {};
-  const primary = bnxApiUrl_(endpoint);
-  const direct = GAS_APIS_DASH[endpoint];
-  const urls = [];
-  [primary, direct].forEach(u=>{ if(u && !urls.includes(u)) urls.push(u); });
-  let lastErr = null;
-  for (let i=0;i<urls.length;i++){
-    const url = urls[i];
-    const ctrl = new AbortController();
-    const timer = setTimeout(()=>ctrl.abort(), timeoutMs || 15000);
-    try{
-      const body = JSON.stringify(payload);
-      const r = await fetch(url, {
-        method:'POST',
-        headers:{'Content-Type':'text/plain;charset=utf-8'},
-        body,
-        signal:ctrl.signal,
-        redirect:'follow'
-      });
-      const text = await r.text();
-      clearTimeout(timer);
-      const ct = (r.headers.get('content-type')||'').toLowerCase();
-      let data = null;
-      try { data = JSON.parse(text); } catch(e) {
-        data = {success:false, error:'API returned non-JSON response', httpStatus:r.status, raw:text.slice(0,180)};
-      }
-      if (r.ok && data && (ct.includes('json') || typeof data === 'object')) {
-        if (i>0) console.info('[ERP API] Direct GAS fallback active for '+endpoint+' — '+url);
-        return data;
-      }
-      lastErr = new Error('HTTP '+r.status+(data && data.error ? ' — '+data.error : ''));
-      // 405/HTML from /api/core means the proxy cannot accept POST. Do not
-      // waste the remaining retry budget; immediately try direct GAS.
-      if (i === 0 && direct && direct !== primary) continue;
-    } catch(e){
-      clearTimeout(timer);
-      lastErr = e;
-      if (i === 0 && direct && direct !== primary) continue;
-    }
-  }
-  throw lastErr || new Error('API unavailable');
-}
-
 /* CENTRALIZED CONFIG — same mechanism as steward-mobile.html, see its
    comment for the full explanation. Once DEPLOYMENT_CONFIG exists in
    your security DB, both apps' V2_CORE/V2_AUTH stay in sync from one
    place instead of each carrying an independent, driftable copy. */
+async function bnxFetchJson_(endpoint, options){
+  options = options || {};
+  const primary = bnxApiUrl_(endpoint || 'V2_CORE');
+  const direct = GAS_APIS_DASH[endpoint || 'V2_CORE'];
+  const urls = [];
+  if(primary) urls.push(primary);
+  if(direct && direct !== primary) urls.push(direct);
+  let lastErr = null;
+  for(let i=0;i<urls.length;i++){
+    const url = urls[i];
+    try{
+      const r = await fetch(url, Object.assign({
+        method:'POST',
+        headers:{'Content-Type':'text/plain;charset=utf-8'},
+        redirect:'follow'
+      }, options));
+      const text = await r.text();
+      if(!r.ok){
+        const err = new Error('HTTP '+r.status);
+        err.status=r.status; lastErr=err;
+        // A same-origin proxy returning 405/404 is a routing problem; try direct GAS.
+        if((r.status===405 || r.status===404 || r.status===502 || r.status===503) && i+1<urls.length) continue;
+        throw err;
+      }
+      let data;
+      try{ data=JSON.parse(text); }
+      catch(e){
+        const err=new Error('Invalid JSON response'+(text && text.slice(0,120)?': '+text.slice(0,120):''));
+        err.status=r.status; lastErr=err;
+        if(i+1<urls.length) continue;
+        throw err;
+      }
+      if(data && data.success===false && (data.statusCode===405 || data.statusCode===404) && i+1<urls.length) continue;
+      return data;
+    }catch(e){
+      lastErr=e;
+      if(i+1<urls.length) continue;
+    }
+  }
+  throw lastErr || new Error('API request failed');
+}
+
 async function bnxRefreshConfig(){
   // FIX (audit #6, P1 — "bnxRefreshConfig fails silently"): a failed
   // or unsuccessful GET_CONFIG used to vanish with zero trace, so an
@@ -212,8 +201,8 @@ async function bnxRefreshConfig(){
   // forever. Still falls back to the hardcoded bootstrap IDs either
   // way (never blocks startup), but now every outcome is logged.
   try{
-    const res = await bnxFetchApi_('V2_CORE', {action:'GET_CONFIG'}, 10000);
-    if(res && (res.success === true || res.ok === true) && res.data){
+    const res = await bnxFetchJson_('V2_CORE', {body: JSON.stringify({action:'GET_CONFIG'})});
+    if(res && res.success && res.data){
       if(res.data.v2CoreId) localStorage.setItem('bnx_api_core', res.data.v2CoreId);
       if(res.data.v2AuthId) localStorage.setItem('bnx_api_auth', res.data.v2AuthId);
       // FIX (P1 — "GAS_URL can become stale"): writing to localStorage
@@ -347,72 +336,35 @@ function bnxCheckAuthFailure_(data){
 let _bnxWarnedNoSession = false;
 async function gasApi(action, payload, endpoint) {
   payload = payload || {};
-  const url = bnxApiUrl_(endpoint || 'V2_CORE');
-  // FIX: every write handler in 20_POSBillingHandlers.gs rejects with
-  // "Invalid or expired session" the instant sessionToken is missing
-  // or stale — but that only ever showed up buried in an aggregate
-  // [BN_HEALTH] failures:N count, with nothing pointing at the cause.
-  // Flag it loudly, once per page load, the first time it's true.
-  if (!_bnxWarnedNoSession && action !== 'GET_CONFIG' && !(localStorage.getItem('ERP_SESSION')||'')) {
+  const ep = endpoint || 'V2_CORE';
+  if (!_bnxWarnedNoSession && action !== 'GET_CONFIG' && !(localStorage.getItem('ERP_SESSION')||sessionStorage.getItem('ERP_SESSION')||'')) {
     _bnxWarnedNoSession = true;
-    console.error('[AUTH] No ERP_SESSION token in localStorage — every session-gated API call (SAVE_KOT/SAVE_ORDER/SAVE_BILL/SAVE_TABLE_STATUS/etc.) will fail with "Invalid or expired session" until the user logs in again.');
+    console.error('[AUTH] No ERP_SESSION token — session-gated API calls may fail until login.');
   }
-  
   return new Promise((resolve) => {
     const task = async () => {
       try {
         let attempt = 0;
         while (attempt < API_RETRY_CONFIG.maxAttempts) {
           try {
-            const ctrl = new AbortController();
-            const timeoutId = setTimeout(() => ctrl.abort(), 15000); // 15s timeout
-            
-            // BUG FIX: 'Content-Type: application/json' forces the browser
-            // to send a CORS preflight (OPTIONS) request first — and Google
-            // Apps Script web apps don't answer OPTIONS requests with the
-            // CORS headers browsers require, so the preflight fails and the
-            // browser blocks the real request before it ever reaches the
-            // script. This is exactly the "blocked by CORS policy... No
-            // 'Access-Control-Allow-Origin' header" error, on every single
-            // call this dashboard makes through gasApi(). 'text/plain' is a
-            // CORS-simple content type — no preflight, request goes straight
-            // through — and doPost() reads e.postData.contents as raw text
-            // regardless of what Content-Type says, so the JSON.stringify'd
-            // body still parses correctly server-side. Same fix already
-            // used correctly elsewhere in this file (line ~5399) and in
-            // saveDBWithRetry() in balaji-business-os.html — just missing
-            // here, in the one function nearly everything on this page
-            // actually calls.
-            // FIX — CRITICAL: this body never included sessionToken at
-            // all. The confirmed backend (20_POSBillingHandlers.gs)
-            // requires sessionToken on every call via
-            // bnxRequireSession_() and returns "Invalid or expired
-            // session" if it's missing — every gasApi() call from this
-            // dashboard (SAVE_ORDER, SAVE_KOT, SAVE_BILL,
-            // SAVE_TABLE_STATUS, menu/order reads, everything) would
-            // have failed the instant that backend went live. Mirrors
-            // steward-mobile.html's getSessionToken(), which already
-            // does this correctly.
-            clearTimeout(timeoutId);
-            const data = await bnxFetchApi_(endpoint || 'V2_CORE', Object.assign({ action: action, clientId: CLIENT_ID, sessionToken: (localStorage.getItem('ERP_SESSION')||'') }, payload), 15000);
+            const session = localStorage.getItem('ERP_SESSION') || sessionStorage.getItem('ERP_SESSION') || '';
+            const body = JSON.stringify(Object.assign({action:action, clientId:CLIENT_ID, sessionToken:session}, payload));
+            const data = await bnxFetchJson_(ep, {body:body});
             bnxCheckAuthFailure_(data);
             resolve(data);
             return;
-          } catch (err) {
+          } catch(err) {
             attempt++;
             if (attempt >= API_RETRY_CONFIG.maxAttempts) {
-              resolve({ success: false, error: err.message });
+              resolve({success:false, error:err.message, statusCode:err.status||0});
               return;
             }
-            const delay = Math.min(API_RETRY_CONFIG.baseDelay * Math.pow(2, attempt - 1), API_RETRY_CONFIG.maxDelay);
-            await new Promise(r => setTimeout(r, delay));
+            const delay=Math.min(API_RETRY_CONFIG.baseDelay*Math.pow(2,attempt-1),API_RETRY_CONFIG.maxDelay);
+            await new Promise(r=>setTimeout(r,delay));
           }
         }
-      } catch (e) {
-        resolve({ success: false, error: e.message });
-      }
+      } catch(e){ resolve({success:false,error:e.message,statusCode:e.status||0}); }
     };
-    
     REQUEST_QUEUE.pending.push(task);
     processRequestQueue();
   });
@@ -2851,7 +2803,7 @@ document.addEventListener('DOMContentLoaded', function(){
         </div>
       </div>
       <div class="hero-stats-row" id="heroStatsRow">
-        <div class="hero-stat"><div class="hero-stat-val" id="h-rev">₹1,24,800</div><div class="hero-stat-lbl">Today Revenue</div></div>
+        <div class="hero-stat"><div class="hero-stat-val" id="h-rev">—</div><div class="hero-stat-lbl">Today Revenue</div></div>
         <div class="hero-stat"><div class="hero-stat-val" id="h-ord">214</div><div class="hero-stat-lbl">Orders</div></div>
         <div class="hero-stat"><div class="hero-stat-val" id="h-cov">583</div><div class="hero-stat-lbl">Covers</div></div>
       </div>
@@ -2954,7 +2906,7 @@ document.addEventListener('DOMContentLoaded', function(){
        minimum instead so 4 fit per row at this width, giving a clean
        4+3 split with no empty trailing space. -->
   <div class="grid kpi-row" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr));">
-    <div class="stat gold" style="cursor:pointer;" onclick="goToDetail('reports','sales')"><div class="stat-val stat-val-ic"><span class="stat-ic">💰</span><span id="d-rev">₹1,24,800</span></div><div class="stat-lbl">Net Revenue <span style="font-size:8.5px;color:var(--text3);">Excl. GST</span></div><div class="stat-chg up" id="d-revchg">↑ 12.4% vs yesterday</div><div class="spark"><svg viewBox="0 0 100 28"><polyline fill="none" stroke="var(--gold)" stroke-width="1.5" points="0,24 15,17 30,20 45,8 60,12 75,6 90,9 100,4"/></svg></div></div>
+    <div class="stat gold" style="cursor:pointer;" onclick="goToDetail('reports','sales')"><div class="stat-val stat-val-ic"><span class="stat-ic">💰</span><span id="d-rev">—</span></div><div class="stat-lbl">Net Revenue <span style="font-size:8.5px;color:var(--text3);">Excl. GST</span></div><div class="stat-chg up" id="d-revchg">—</div><div class="spark"><svg viewBox="0 0 100 28"><polyline fill="none" stroke="var(--gold)" stroke-width="1.5" points="0,24 15,17 30,20 45,8 60,12 75,6 90,9 100,4"/></svg></div></div>
     <div class="stat green" style="cursor:pointer;" onclick="goToDetail('reports','sales')"><div class="stat-val stat-val-ic"><span class="stat-ic">🧮</span><span id="d-gross">—</span></div><div class="stat-lbl">Gross Sales <span style="font-size:8.5px;color:var(--text3);">Incl. GST</span></div><div class="stat-chg" id="d-grosschg">vs yesterday</div></div>
     <div class="stat" style="cursor:pointer;" onclick="bnxDashQuickReport_('tax','tax-summary')"><div class="stat-val stat-val-ic"><span class="stat-ic">🏛</span><span id="d-gst">—</span></div><div class="stat-lbl">GST Collected <span id="d-gst-split" style="font-size:8.5px;color:var(--text3);">CGST + SGST/IGST</span></div><div class="stat-chg" id="d-gstchg">vs yesterday</div></div>
     <div class="stat blue" style="cursor:pointer;" onclick="goToDetail('order-register')"><div class="stat-val stat-val-ic"><span class="stat-ic">🧾</span><span id="d-ord">214</span></div><div class="stat-lbl">Bills <span style="font-size:8.5px;color:var(--text3);">Completed</span></div><div class="stat-chg up" id="d-ordchg">↑ 8 more than avg</div><div class="spark"><svg viewBox="0 0 100 28"><polyline fill="none" stroke="var(--green)" stroke-width="1.5" points="0,22 15,16 30,24 45,11 60,14 75,8 90,12 100,6"/></svg></div></div>
@@ -3469,7 +3421,7 @@ document.addEventListener('DOMContentLoaded', function(){
           <span style="color:var(--text3)">Customer:</span>
           <input class="waiter-sel" id="custNameInput" placeholder="GENERAL CUSTOMER" style="flex:1;">
           <span style="color:var(--text3);margin-left:8px;">Mobile:</span>
-          <input class="waiter-sel" id="custMobileInput" type="tel" placeholder="1111111111" style="width:110px;">
+          <input class="waiter-sel" id="custMobileInput" type="tel" placeholder="Customer mobile" style="width:110px;">
         </div>
         <div class="waiter-row">
           <span style="color:var(--text3)">Covers:</span>
@@ -4716,11 +4668,11 @@ document.addEventListener('DOMContentLoaded', function(){
       <div class="stg-panel-title">Data Tools</div>
       <div class="stg-panel-sub">Master data management and bulk imports — moved here to keep the main menu focused on daily operations. Sales reports (DSR, Monthly) are under Reports Hub.</div>
       <div class="grid g2">
-        <div class="card" style="cursor:pointer;" onclick="window._erpNavigating=true;location.href='master-hub.html?client='+encodeURIComponent(CLIENT_ID)+'&industry='+encodeURIComponent(CLIENT_INDUSTRY)">
+        <div class="card" style="cursor:pointer;" onclick="window._erpNavigating=true;location.href='master-hub.html?client='+CLIENT_ID+'&industry='+CLIENT_INDUSTRY">
           <div class="card-header"><span class="card-title">🗂️ Master Hub</span></div>
           <div style="font-size:12px;color:var(--text3);padding:4px 0 8px;">Menu, recipes, staff, suppliers, tables — all master categories in one place</div>
         </div>
-        <div class="card" style="cursor:pointer;" onclick="window._erpNavigating=true;location.href='import-hub.html?client='+encodeURIComponent(CLIENT_ID)">
+        <div class="card" style="cursor:pointer;" onclick="window._erpNavigating=true;location.href='import-hub.html?client='+CLIENT_ID">
           <div class="card-header"><span class="card-title">📥 Import Hub</span></div>
           <div style="font-size:12px;color:var(--text3);padding:4px 0 8px;">Upload Excel exports — POS data, purchase register, bank statements</div>
         </div>
@@ -4832,7 +4784,7 @@ document.addEventListener('DOMContentLoaded', function(){
       <span class="card-title">📋 Client Registry — Select to Access Database <span class="pill p-gold" id="clientRegistryDemoPill" style="font-size:8.5px;">Demo</span></span>
       <div style="display:flex;gap:6px;">
         <input class="fi" placeholder="Search client…" style="width:180px;font-size:11px;padding:5px 9px;" oninput="filterSuperClients(this.value)">
-        <button class="btn btn-sm btn-primary" onclick="showNotif('➕ New Client is not enabled in this build. Use Master Hub / onboarding to create the client.', 'info')">+ New Client</button>
+        <button class="btn btn-sm btn-primary" onclick="showNotif('➕ Add new client coming soon','success')">+ New Client</button>
       </div>
     </div>
     <div style="overflow-x:auto;">
@@ -5583,7 +5535,7 @@ document.addEventListener('DOMContentLoaded', function(){
       <div class="card-header" style="flex-wrap:wrap;gap:10px;">
         <span class="card-title">🏦 Bank Statement — Sync with UPI/Card Settlements</span>
         <div style="display:flex;gap:6px;">
-          <button class="btn btn-sm btn-primary" onclick="window._erpNavigating=true;location.href='import-hub.html?client='+encodeURIComponent(CLIENT_ID)">📥 Import Bank Statement</button>
+          <button class="btn btn-sm btn-primary" onclick="window._erpNavigating=true;location.href='import-hub.html?client='+CLIENT_ID">📥 Import Bank Statement</button>
           <div class="rpt-actions"><button class="btn btn-sm btn-ghost rpt-icon-btn" data-export-trigger title="Export" aria-label="Export" onclick="openExportFormatMenu(this,'bank-statement')">📥<span class="rpt-caret">▾</span></button><button class="btn btn-sm btn-ghost rpt-icon-btn" data-print-trigger title="Print" aria-label="Print" onclick="openPrintFormatMenu(this)">🖨<span class="rpt-caret">▾</span></button><span data-send-menu="sendMenu_bank"></span></div>
         </div>
       </div>
@@ -5938,17 +5890,17 @@ document.addEventListener('DOMContentLoaded', function(){
   <!-- DAILY SALES REPORT (DSR) -->
   <div id="rpt-cat-dsr" style="display:none;">
     <div class="grid g3" style="margin-bottom:14px;">
-      <div class="card" style="cursor:pointer;text-align:center;" onclick="window._erpNavigating=true;location.href='daily-sales-report.html?client='+encodeURIComponent(CLIENT_ID)">
+      <div class="card" style="cursor:pointer;text-align:center;" onclick="window._erpNavigating=true;location.href='daily-sales-report.html?client='+CLIENT_ID">
         <div style="font-size:26px;margin-bottom:4px;">📅</div>
         <div style="font-weight:700;font-size:13px;">Daily Sales Report</div>
         <div style="font-size:11px;color:var(--text3);margin-top:2px;">Full day-end breakdown →</div>
       </div>
-      <div class="card" style="cursor:pointer;text-align:center;" onclick="window._erpNavigating=true;location.href='dsr-client.html?client='+encodeURIComponent(CLIENT_ID)">
+      <div class="card" style="cursor:pointer;text-align:center;" onclick="window._erpNavigating=true;location.href='dsr-client.html?client='+CLIENT_ID">
         <div style="font-size:26px;margin-bottom:4px;">👤</div>
         <div style="font-weight:700;font-size:13px;">Client DSR</div>
         <div style="font-size:11px;color:var(--text3);margin-top:2px;">Per-client daily view →</div>
       </div>
-      <div class="card" style="cursor:pointer;text-align:center;" onclick="window._erpNavigating=true;location.href='monthly-dsr.html?client='+encodeURIComponent(CLIENT_ID)">
+      <div class="card" style="cursor:pointer;text-align:center;" onclick="window._erpNavigating=true;location.href='monthly-dsr.html?client='+CLIENT_ID">
         <div style="font-size:26px;margin-bottom:4px;">📆</div>
         <div style="font-weight:700;font-size:13px;">Monthly DSR</div>
         <div style="font-size:11px;color:var(--text3);margin-top:2px;">Month-to-date consolidated →</div>
@@ -5991,7 +5943,7 @@ document.addEventListener('DOMContentLoaded', function(){
         <span class="card-title">🔄 DSR Sale vs Bank Transaction — Reconciliation</span>
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
           <input type="month" id="reconMonthPicker" class="fi" style="font-size:11px;padding:5px 8px;" onchange="loadReconTable()">
-          <button class="btn btn-sm btn-ghost" onclick="window._erpNavigating=true;location.href='import-hub.html?client='+encodeURIComponent(CLIENT_ID)">📥 Upload Bank Report</button>
+          <button class="btn btn-sm btn-ghost" onclick="window._erpNavigating=true;location.href='import-hub.html?client='+CLIENT_ID">📥 Upload Bank Report</button>
           <div class="rpt-actions"><button class="btn btn-sm btn-ghost rpt-icon-btn" data-export-trigger title="Export" aria-label="Export" onclick="openExportFormatMenu(this,'recon-csv')">📥<span class="rpt-caret">▾</span></button><button class="btn btn-sm btn-ghost rpt-icon-btn" data-print-trigger title="Print" aria-label="Print" onclick="openPrintFormatMenu(this)">🖨<span class="rpt-caret">▾</span></button><span data-send-menu="sendMenu_recon_csv"></span></div>
         </div>
       </div>
@@ -7102,33 +7054,25 @@ document.addEventListener('DOMContentLoaded', function(){
 });
 async function erpApi(payload, type='V2_AUTH'){
   try{
-    // FIX (audit P1 — "centralized API config" / "remove duplicated
-    // deployment IDs"): this used to resolve its URL from a completely
-    // separate ERP_APIS object with its own hardcoded IDs (never
-    // refreshed by bnxRefreshConfig/GET_CONFIG, and never picking up a
-    // localStorage deployment-ID override the way gasApi() does) — so
-    // a deployment ID rotation would update gasApi() calls but silently
-    // leave every erpApi() call on the old, stale ID forever. Now reads
-    // from the SAME GAS_APIS_DASH single source of truth as gasApi().
-    // ERP_APIS kept only as a last-resort fallback if GAS_APIS_DASH is
-    // somehow unavailable.
-    const url=bnxApiUrl_(type) || (typeof ERP_API_URLS!=='undefined'?ERP_API_URLS[type]:null) || ERP_APIS[type] || ERP_APIS.V2_AUTH;
     const session = (localStorage.getItem('ERP_SESSION') || sessionStorage.getItem('ERP_SESSION') ||
       (typeof ERP!=='undefined' && ERP.getSession ? ERP.getSession() : '') ||
       (typeof ERP!=='undefined' && ERP.getToken ? ERP.getToken() : '')) || '';
-    const client  = (typeof CLIENT_ID!=='undefined' && CLIENT_ID) ||
+    const client = (typeof CLIENT_ID!=='undefined' && CLIENT_ID) ||
       (typeof ERP!=='undefined' && ERP.getClient ? ERP.getClient() : '') ||
       localStorage.getItem('ERP_CLIENT') || '';
-    if (!client) return {success:false,error:'No authenticated client ID'};
-    const data=await bnxFetchApi_(type || 'V2_AUTH', {...payload,sessionToken:session,clientId:client,module:'RESTAURANT'}, 15000);
-    /* Normalize: GAS returns {ok,status} but restaurant expects {success,data} */
-    if(data.ok!==undefined && data.success===undefined){
-      data.success = data.ok;
-      if(!data.data && data.todaySales!==undefined) data.data = data;
+    if(!client) return {success:false,error:'No authenticated client ID'};
+    const body=JSON.stringify(Object.assign({},payload||{},{sessionToken:session,clientId:client,module:'RESTAURANT'}));
+    const data=await bnxFetchJson_(type,{body:body});
+    if(data && data.ok!==undefined && data.success===undefined){
+      data.success=data.ok;
+      if(!data.data && data.todaySales!==undefined) data.data=data;
     }
-    if (typeof bnxCheckAuthFailure_ === 'function') bnxCheckAuthFailure_(data);
+    if(typeof bnxCheckAuthFailure_==='function') bnxCheckAuthFailure_(data);
     return data;
-  }catch(e){ console.warn('[ERP API '+type+']',e.message); return {success:false,offline:true}; }
+  }catch(e){
+    console.warn('[ERP API '+type+']',e.message);
+    return {success:false,offline:true,error:e.message,statusCode:e.status||0};
+  }
 }
 
 /* [P0 CLEANUP] Removed: dead 'BillQueue' offline-bill sync engine.
@@ -8568,18 +8512,12 @@ async function checkDB(id, label, apiType){
   const el=document.getElementById(id); if(!el) return false;
   el.className='db-pill checking'; el.innerHTML=`<span class="db-dot pulse"></span>${label}…`;
   try{
-    // IMPORTANT: do not use GET ?action=PING. The consolidated backend is
-    // POST/JSON based and the live /api/core proxy currently rejects POST
-    // with 405. Use the real GET_CONFIG action through the robust transport.
-    const res = await bnxFetchApi_(apiType || 'V2_CORE', {action:'GET_CONFIG'}, 10000);
-    const ok = !!(res && (res.success === true || res.ok === true) &&
-      (res.data || res.v2CoreId || res.v2AuthId || res.message || res.success));
-    if(ok){
-      el.className='db-pill online'; el.innerHTML=`<span class="db-dot"></span>${label} ✓`; return true;
-    }
-  }catch(e){
-    console.warn('[DB '+label+'] '+e.message);
-  }
+    const ctrl=new AbortController();
+    const to=setTimeout(()=>ctrl.abort(),7000);
+    const res=await fetch(bnxApiUrl_(apiType)+'?action=PING',{signal:ctrl.signal});
+    clearTimeout(to);
+    if(res.ok){ el.className='db-pill online'; el.innerHTML=`<span class="db-dot"></span>${label} ✓`; return true; }
+  }catch(e){}
   el.className='db-pill offline'; el.innerHTML=`<span class="db-dot"></span>${label} ✗`; return false;
 }
 async function checkAllDBs(verbose=false){
@@ -8794,10 +8732,7 @@ function bnxComputeDashExtras_(){
     // already resolve the real selected range correctly — this only
     // affects the NEW extras computed here.
     const { bills } = (typeof bnxResolveReportRange === 'function') ? bnxResolveReportRange(from, to) : { bills: [] };
-    const live = bills.filter(b => {
-      const st = String(b.status||'').trim().toUpperCase();
-      return st !== 'CANCELLED' && st !== 'VOID';
-    });
+    const live = bills.filter(b => b.status !== 'Cancelled');
 
     // FIX (bug caught during this pass, not user-reported): Gross Sales
     // is labeled "Incl. GST" but was summing b.sub (the pre-tax
@@ -9263,12 +9198,7 @@ async function loadDashboard(){
       if (todaysBills.length){
         haveOfflineBills = true;
         offlineOrd = todaysBills.length;
-        offlineRev = todaysBills.reduce((s,b)=>{
-          const total = Number(b.total)||0, tax = Number(b.gst)||0, round = Number(b.roundOff)||0;
-          const taxable = Number(b.taxableAmount);
-          const net = Number.isFinite(taxable) && (taxable !== 0 || total === 0) ? taxable : Math.max(0, total-tax-round);
-          return s + net;
-        },0);
+        offlineRev = todaysBills.reduce((s,b)=>s+Number(b.total||0),0);
         offlineCov = todaysBills.reduce((s,b)=>s+Number(b.pax||0),0) || offlineOrd;
       }
     }
@@ -11486,7 +11416,7 @@ function printOneKOT(title, table, waiter, covers, items, kotNo){
       <div>Steward: ${waiter||'-'}</div>
       <div>Time: ${now.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})} · ${now.toLocaleDateString('en-GB')}</div>
       <hr style="border:none;border-top:1px dashed #000;margin:6px 0;">
-      ${items.map(i=>`<div style="display:flex;justify-content:space-between;font-size:16px;font-weight:700;padding:3px 0;"><span>${i.name}</span><span>x${i.qty}</span></div>`).join('')}
+      ${items.map(i=>`<div style="display:flex;justify-content:space-between;font-size:16px;font-weight:700;padding:3px 0;"><span>${bnxPrintEsc_(i.name)}</span><span>x${i.qty}</span></div>`).join('')}
       <hr style="border:none;border-top:1px dashed #000;margin:6px 0;">
       <div style="text-align:center;font-size:12px;">Balaji NextGen ERP</div>
     </div>`;
@@ -11657,77 +11587,155 @@ function bnxSetPosSize(sz){
 }
 document.addEventListener('DOMContentLoaded', bnxApplyPosSizeUI);
 
-function bnxPrintEsc_(v){
-  return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-}
-function bnxMoney_(v){ return '₹'+Number(v||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}); }
-function bnxTaxRateLabel_(r){
-  if (r && r.taxName) return r.taxName;
-  return 'GST';
-}
+function bnxPrintEsc_(v){return String(v==null?'':v).replace(/[&<>\"']/g,function(m){return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[m];});}
 function buildThermalBodyHTML(d){
-  d=d||{};
-  const items=Array.isArray(d.items)?d.items:[];
-  const sub=Number(d.sub)||0, discPct=Number(d.discPct)||0, disc=Number(d.disc)||0;
-  const scPct=Number(d.scPct)||0, sc=Number(d.sc)||0;
-  const cgst=Number(d.cgst)||0, sgst=Number(d.sgst)||0, igst=Number(d.igst)||0;
-  let taxAmt=cgst+sgst+igst;
-  if(!taxAmt && Array.isArray(d.taxRows)) taxAmt=d.taxRows.reduce((a,r)=>a+(Number(r.taxAmt)||0),0);
-  const taxOnAmt=Number(d.taxBase)!=null ? Number(d.taxBase)||0 : Math.max(0,sub-disc);
-  const total=Number(d.total)!=null ? Number(d.total)||0 : taxOnAmt+sc+taxAmt;
-  const rounded=Math.round(total), roff=Number(d.roundOff!=null?d.roundOff:d.roff)||rounded-total;
-  const qty=items.reduce((a,i)=>a+(Number(i.qty)||0),0);
-  const rows=Array.isArray(d.taxRows)&&d.taxRows.length?d.taxRows:[{hsn:d.sac||d.hsn||'—',taxName:igst?'IGST':(taxAmt?'GST':'Exempted'),onAmt:taxOnAmt,taxAmt:taxAmt}];
-  const logo=bnxResolvePrintLogo_();
-  const entity=bnxPrintEsc_(d.entity||'Restaurant');
-  const addr=bnxPrintEsc_(d.addr||'');
-  const phone=bnxPrintEsc_(d.phone||'');
-  const gstin=bnxPrintEsc_(d.gstin||'');
-  const bill=bnxPrintEsc_(d.billNo||d.billno||'');
-  const customer=bnxPrintEsc_(d.cname||'GENERAL CUSTOMER');
-  const mobile=bnxPrintEsc_(d.cmob||'');
-  const table=bnxPrintEsc_(d.table||'TAKEAWAY');
-  const waiter=bnxPrintEsc_(d.waiter||'');
-  const paymode=bnxPrintEsc_(d.paymode||'CASH').toUpperCase();
-  const kot=bnxPrintEsc_(d.kot||'');
-  const remarks=bnxPrintEsc_(d.remarks||'');
-  return `
-    <div class="pos-invoice-head">
-      <img src="${logo}" class="pos-logo" alt="">
-      <div class="pos-brand">${entity}</div>
-      ${addr?`<div class="pos-muted">${addr}</div>`:''}
-      ${phone?`<div class="pos-muted">Ph: ${phone}</div>`:''}
-      ${gstin?`<div class="pos-muted"><b>GSTIN:</b> ${gstin}</div>`:''}
-    </div>
-    <div class="pos-invoice-title">${d.isEstimate?'ESTIMATE':'TAX INVOICE'}</div>
-    <div class="pos-meta">
-      <div><b>${d.isEstimate?'Estimate':'Invoice No'}</b><span>${bill||'—'}</span></div>
-      <div><b>Date</b><span>${bnxPrintEsc_(d.date||'—')} ${bnxPrintEsc_(d.time||'')}</span></div>
-      <div><b>Table / Pax</b><span>${table} / ${bnxPrintEsc_(d.pax||1)}</span></div>
-      ${waiter?`<div><b>Steward</b><span>${waiter}</span></div>`:''}
-      <div><b>Customer</b><span>${customer}</span></div>
-      ${mobile?`<div><b>Mobile</b><span>${mobile}</span></div>`:''}
-    </div>
-    <div class="pos-rule"></div>
-    <div class="pos-items-head"><span>ITEM</span><span>QTY</span><span>RATE</span><span>AMT</span></div>
-    ${items.map(i=>`<div class="pos-item"><span>${bnxPrintEsc_(i.name||'Item')}</span><span>${Number(i.qty)||0}</span><span>${bnxMoney_(i.rate)}</span><span>${bnxMoney_(i.amt)}</span></div>${i.mrpNote?`<div class="pos-mrp">MRP ${bnxPrintEsc_(i.mrpNote)}</div>`:''}`).join('')}
-    <div class="pos-rule"></div>
-    <div class="pos-total-line"><span>Subtotal</span><b>${bnxMoney_(sub)}</b></div>
-    ${disc?`<div class="pos-total-line"><span>Discount ${discPct}%</span><span>-${bnxMoney_(disc)}</span></div>`:''}
-    ${sc?`<div class="pos-total-line"><span>Service Charge ${scPct}%</span><span>${bnxMoney_(sc)}</span></div>`:''}
-    <div class="pos-total-line"><span>Tax</span><span>${bnxMoney_(taxAmt)}</span></div>
-    ${Math.abs(roff)>0.001?`<div class="pos-total-line"><span>Round Off</span><span>${roff>=0?'+':'-'}${bnxMoney_(Math.abs(roff)).slice(1)}</span></div>`:''}
-    <div class="pos-grand"><span>GRAND TOTAL</span><b>${bnxMoney_(rounded)}</b></div>
-    <div class="pos-rule"></div>
-    <div class="pos-section">TAX SUMMARY</div>
-    <div class="pos-tax-head"><span>HSN</span><span>TAX</span><span>VALUE</span><span>TAX</span></div>
-    ${rows.map(r=>`<div class="pos-tax-row"><span>${bnxPrintEsc_(r.hsn||'—')}</span><span>${bnxPrintEsc_(bnxTaxRateLabel_(r))}</span><span>${bnxMoney_(r.onAmt)}</span><span>${bnxMoney_(r.taxAmt)}</span></div>`).join('')}
-    <div class="pos-rule"></div>
-    <div class="pos-payment"><span>PAYMENT</span><b>${paymode}</b><strong>${bnxMoney_(rounded)}</strong></div>
-    ${kot?`<div class="pos-small"><b>KOT:</b> ${kot}</div>`:''}
-    ${remarks?`<div class="pos-note"><b>NOTE:</b> ${remarks}</div>`:''}
-    <div class="pos-footer">Thank you for dining with us<br><b>Visit Again</b><br><span>Computer Generated Invoice</span></div>`;
+  const sub = Number(d.sub)||0;
+  const discPct = Number(d.discPct)||0;
+  const disc = Number(d.disc)||0;
+  const scPct = Number(d.scPct)||0;
+  const sc = Number(d.sc)||0;
+  const cgst = Number(d.cgst)||0, sgst = Number(d.sgst)||0, igst = Number(d.igst)||0;
+  let taxAmt = cgst+sgst+igst;
+  if (!taxAmt && d.taxRows && d.taxRows.length) taxAmt = d.taxRows.reduce((s,r)=>s+(Number(r.taxAmt)||0),0);
+  const taxOnAmt = d.taxBase!=null ? Number(d.taxBase) : (sub-disc);
+  const total = d.total!=null ? Number(d.total) : (taxOnAmt+sc+taxAmt);
+  const totalRounded = Math.round(total);
+  const roundOff = d.roundOff!=null ? Number(d.roundOff) : (totalRounded-total);
+  const items = Array.isArray(d.items) ? d.items : [];
+  const itemQty = items.reduce((a,i)=>a+(Number(i.qty)||0),0);
+  const taxName = taxAmt>0
+    ? (igst>0 ? 'IGST @'+(d.igstPct||18)+'%' : 'GST @'+((cgst+sgst)/Math.max(taxOnAmt,1)*100).toFixed(1)+'%')
+    : 'Exempted';
+  const money = v => '₹'+(Number(v)||0).toFixed(2);
+  const esc = bnxPrintEsc_;
+
+  /*
+   * INVOICE PRINT LAYOUT FIX — 2026-09-06
+   * The old receipt used four fixed grid columns (including 68px AMT).
+   * With M/L font scaling, values such as ₹10000.00 became wider than the
+   * RATE/AMT cells and visibly overlapped. Customer/Table rows also packed
+   * multiple fields into one flex line, causing collisions on narrow paper.
+   *
+   * New layout rules:
+   *  - Every header/value row has a dedicated label and value area.
+   *  - Customer + mobile are separate lines.
+   *  - Item table uses a CSS class with responsive columns; RATE/AMT are
+   *    never allowed to shrink or overlap.
+   *  - Long item names wrap only inside ITEM; numeric columns stay intact.
+   *  - 58mm uses smaller numeric columns; 80mm gets wider columns.
+   *  - Tax breakup uses the same protected numeric-column approach.
+   */
+  const itemRows = items.map(i=>{
+    const qty = Number(i.qty)||0, rate = Number(i.rate)||0, amt = Number(i.amt!=null?i.amt:rate*qty)||0;
+    return `<div class="bnx-item-row">
+      <span class="bnx-item-name">${esc(i.name||'')}</span>
+      <span class="bnx-num bnx-qty">${qty}</span>
+      <span class="bnx-num bnx-rate">${money(rate)}</span>
+      <span class="bnx-num bnx-amt">${money(amt)}</span>
+    </div>${i.mrpNote?`<div class="bnx-mrp">MRP : ${esc(i.mrpNote)}</div>`:''}`;
+  }).join('');
+  const taxRows = (d.taxRows && d.taxRows.length ? d.taxRows : [{hsn:d.hsn||'—',taxName,onAmt:taxOnAmt,taxAmt}]);
+  const taxHtml = taxRows.map(r=>`<div class="bnx-tax-row">
+      <span class="bnx-tax-hsn">${esc(r.hsn||'—')}</span>
+      <span class="bnx-tax-name">${esc(r.taxName||'')}</span>
+      <span class="bnx-num bnx-tax-on">${money(r.onAmt)}</span>
+      <span class="bnx-num bnx-tax-amt">${money(r.taxAmt)}</span>
+    </div>`).join('');
+
+  const layoutCss = `<style>
+    .bnx-receipt{width:100%;font-family:"DM Mono","Courier New",monospace;font-weight:700;color:#000;line-height:1.55;overflow:hidden;}
+    .bnx-receipt *{box-sizing:border-box;max-width:100%;} .bnx-receipt hr{border:none;border-top:1px dashed #000;margin:7px 0;}
+    .bnx-logo{text-align:center;margin-bottom:4px}.bnx-logo img{width:40px;height:40px;border-radius:9px;object-fit:contain;}
+    .bnx-company{text-align:center;font-weight:900;font-size:calc(16px * var(--posScale,1));letter-spacing:.04em;overflow-wrap:anywhere;}
+    .bnx-company-sub{text-align:center;font-size:calc(11px * var(--posScale,1));font-weight:700;overflow-wrap:anywhere;}
+    .bnx-invoice-title{text-align:center;font-weight:900;font-size:calc(13px * var(--posScale,1));letter-spacing:.10em;}
+    .bnx-meta-row{display:grid;grid-template-columns:70px minmax(0,1fr);gap:4px;align-items:start;font-size:calc(12px * var(--posScale,1));padding:1px 0;}
+    .bnx-meta-row>span{white-space:nowrap}.bnx-meta-row>b{min-width:0;overflow-wrap:anywhere;word-break:break-word;}
+    .bnx-meta-wrap>b{white-space:normal;}
+    .bnx-item-head,.bnx-item-row,.bnx-tax-head,.bnx-tax-row{display:grid;align-items:start;gap:2px;}
+    .bnx-item-head,.bnx-item-row{grid-template-columns:minmax(0,1fr) 30px 72px 78px;}
+    .bnx-item-head{font-size:calc(11px * var(--posScale,1));font-weight:900;}
+    .bnx-item-row{font-size:calc(12px * var(--posScale,1));font-weight:700;padding:2px 0;}
+    .bnx-item-name{min-width:0;overflow-wrap:anywhere;word-break:break-word;}
+    .bnx-num{white-space:nowrap;text-align:right;font-variant-numeric:tabular-nums;}
+    .bnx-qty{text-align:center}.bnx-rate,.bnx-amt{overflow:hidden;}
+    .bnx-mrp{font-size:calc(10px * var(--posScale,1));font-weight:600;overflow-wrap:anywhere;}
+    .bnx-money-row{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;font-size:calc(12px * var(--posScale,1));padding:2px 0;}
+    .bnx-money-row>span:first-child,.bnx-money-row>b:first-child{min-width:0;overflow-wrap:anywhere;}
+    .bnx-money-row>span:last-child,.bnx-money-row>b:last-child{white-space:nowrap;text-align:right;}
+    .bnx-total-row{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;font-size:calc(15px * var(--posScale,1));font-weight:900;padding:2px 0;}
+    .bnx-total-row span{min-width:0;overflow-wrap:anywhere}.bnx-total-row b{white-space:nowrap;text-align:right;}
+    .bnx-section-title{font-size:calc(11px * var(--posScale,1));font-weight:900;margin-bottom:4px;}
+    .bnx-tax-head,.bnx-tax-row{grid-template-columns:42px minmax(0,1fr) 63px 63px;}
+    .bnx-tax-head{font-size:calc(10px * var(--posScale,1));font-weight:900;}
+    .bnx-tax-row{font-size:calc(10px * var(--posScale,1));font-weight:700;padding:1px 0;}
+    .bnx-tax-name{min-width:0;overflow-wrap:anywhere;word-break:break-word;}
+    .bnx-tax-hsn{white-space:nowrap;overflow:hidden;text-overflow:clip;}
+    .bnx-empty{font-size:calc(12px * var(--posScale,1));padding:5px 0;}
+    .bnx-note{font-size:calc(11px * var(--posScale,1));font-weight:700;overflow-wrap:anywhere;word-break:break-word;padding:1px 0;}
+    .bnx-footer-rule{border-top:2px double #000!important;} .bnx-footer{text-align:center;font-size:calc(11px * var(--posScale,1));font-weight:800;margin-top:6px;}
+    /* 58mm roll: protect numeric columns first; item name gets remaining width. */
+    .thermal-body.paper-58 .bnx-item-head,.thermal-body.paper-58 .bnx-item-row{grid-template-columns:minmax(0,1fr) 24px 54px 62px;}
+    .thermal-body.paper-58 .bnx-tax-head,.thermal-body.paper-58 .bnx-tax-row{grid-template-columns:35px minmax(0,1fr) 50px 50px;}
+    .thermal-body.paper-58 .bnx-item-row{font-size:calc(10.5px * var(--posScale,1));}
+    .thermal-body.paper-58 .bnx-item-head{font-size:calc(9.5px * var(--posScale,1));}
+    .thermal-body.paper-58 .bnx-tax-row,.thermal-body.paper-58 .bnx-tax-head{font-size:calc(9px * var(--posScale,1));}
+    /* L size must never make a number overlap its neighbour. */
+    .bnx-rate,.bnx-amt,.bnx-tax-on,.bnx-tax-amt{font-variant-numeric:tabular-nums;letter-spacing:-.02em;}
+  </style>`;
+
+  return `${layoutCss}
+    <div class="bnx-receipt">
+      <div class="bnx-logo"><img src="${bnxResolvePrintLogo_()}" alt=""></div>
+      <div class="bnx-company">${esc((d.entity||'').toUpperCase())}</div>
+      ${d.addr?`<div class="bnx-company-sub">${esc(d.addr)}</div>`:''}
+      ${d.phone?`<div class="bnx-company-sub">Ph: ${esc(d.phone)}</div>`:''}
+      ${d.gstin?`<div class="bnx-company-sub">GSTIN: ${esc(d.gstin)}</div>`:''}
+      <hr>
+      <div class="bnx-invoice-title">${d.isEstimate?'ESTIMATE — NOT A TAX INVOICE':'TAX INVOICE'}</div>
+      <hr>
+
+      <div class="bnx-meta-row"><span>Bill No</span><b>: ${d.isEstimate?'(not yet settled)':esc(d.billNo||d.billno||'')}</b></div>
+      <div class="bnx-meta-row"><span>Date</span><b>: ${esc(d.date||'')}${d.time?' '+esc(d.time):''}</b></div>
+      <div class="bnx-meta-row"><span>Table</span><b>: ${esc(d.table||'-')}</b></div>
+      <div class="bnx-meta-row"><span>Pax</span><b>: ${esc(d.pax||1)}</b></div>
+      <div class="bnx-meta-row bnx-meta-wrap"><span>Customer</span><b>: ${esc(d.cname||'GENERAL CUSTOMER')}</b></div>
+      <div class="bnx-meta-row"><span>MOB</span><b>: ${esc(d.cmob||'-')}</b></div>
+      ${d.waiter?`<div class="bnx-meta-row bnx-meta-wrap"><span>Steward</span><b>: ${esc(d.waiter)}</b></div>`:''}
+
+      <hr>
+      <div class="bnx-item-head"><span>ITEM</span><span class="bnx-num">QTY</span><span class="bnx-num">RATE</span><span class="bnx-num">AMT</span></div>
+      <hr>
+      ${itemRows || '<div class="bnx-empty">No items</div>'}
+      <hr>
+
+      <div class="bnx-money-row"><span>Sub Total</span><b>${money(sub)}</b></div>
+      <div class="bnx-money-row"><span>Discount (${esc(discPct)}%)</span><b>${money(disc)}</b></div>
+      <div class="bnx-money-row"><span>SC (Optional) (${esc(scPct)}%)</span><b>${money(sc)}</b></div>
+      <div class="bnx-money-row"><span>Tax</span><b>${money(taxAmt)}</b></div>
+      <div class="bnx-money-row"><span>Round Off</span><b>${money(roundOff)}</b></div>
+      <hr>
+
+      <div class="bnx-total-row"><span>Items ${items.length} &nbsp; Qty ${itemQty}</span><b>TOTAL&nbsp; ${money(totalRounded)}</b></div>
+      <hr>
+
+      <div class="bnx-section-title">Tax Break up</div>
+      <div class="bnx-tax-head"><span>HSN</span><span>TaxName</span><span class="bnx-num">OnAmt</span><span class="bnx-num">TaxAmt</span></div>
+      ${taxHtml}
+      <hr>
+
+      <div class="bnx-section-title">Payment Adjustment</div>
+      <div class="bnx-money-row"><b>PAYMODE</b><b>AdjustAmt</b></div>
+      <div class="bnx-money-row"><b>${esc((d.paymode||'').toUpperCase())}</b><b>${money(totalRounded)}</b></div>
+      <hr>
+      <div class="bnx-note">User : ${esc(d.user||'STAFF')}</div>
+      <div class="bnx-note">KOT : ${esc(d.kot||'-')}</div>
+      <div class="bnx-note bnx-meta-wrap">Remarks : ${esc(d.remarks||'-')}</div>
+      <hr class="bnx-footer-rule">
+      <div class="bnx-footer">We Support round table<br>THANK YOU, VISIT AGAIN</div>
+    </div>`;
 }
+
 /* FIX ("fix printer pos and ip printer pos also"): "Test Print" / "Test KOT"
    in Settings > Print Settings only showed a toast — nothing was ever sent
    anywhere, so there was no way to actually confirm a printer (network/IP,
@@ -11795,10 +11803,7 @@ function bnxTestPrint(label){
 function printThermalReceipt(d){
   const html = `<div class="thermal-body ${bnxPaperClass()}">${buildThermalBodyHTML(d)}</div>`;
   const w = window.open('','_blank','width=420,height=760');
-  if (!w) {
-    if (typeof showNotif === 'function') showNotif('⚠️ Print popup blocked — allow pop-ups for this site.', 'error');
-    return;
-  }
+  if(!w){ if(typeof showNotif==='function') showNotif('⚠️ Print popup blocked — allow pop-ups for this site and try again','error'); else alert('Print popup blocked — allow pop-ups for this site and try again.'); return; }
   /* FIX ("print not clear, size very small, not clear in pos machine"):
      this window never told the printer what paper size it was — with no
      @page rule the browser/printer driver falls back to its default page
@@ -11812,7 +11817,7 @@ function printThermalReceipt(d){
   const css = '@page{size:'+bnxPaperSize()+'mm auto;margin:0;}'+
     '*{margin:0;padding:0;box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact;}'+
     'body{font-family:"DM Mono","Courier New","Noto Sans",monospace;background:#fff;}'+
-    '.thermal-body{--posScale:'+bnxPosScaleVal()+';width:'+pw+'px;font-size:calc(13px * var(--posScale));font-weight:700;line-height:1.6;color:#000;margin:0 auto;padding:10px 6px;}'+
+    '.thermal-body{--posScale:'+bnxPosScaleVal()+';width:'+pw+'px;max-width:100%;font-size:calc(13px * var(--posScale));font-weight:700;line-height:1.6;color:#000;margin:0 auto;padding:10px 6px;}'+
     '@media print{body{margin:0;}}';
   // FIX ("₹ problem" — Aug 2026): this is a standalone popup via
   // window.open()/document.write() — it does NOT inherit the main
@@ -13227,8 +13232,10 @@ function bnxSeatReservation(id){
   // Mirrors the exact same best-effort pattern bnxCancelReservation()
   // already uses for CANCEL_RESERVATION below — same {id} shape, same
   // silent-catch (never blocks the UI on a network blip).
-  // BACKEND: SEAT_RESERVATION is wired in the merged Code.gs; the call below
-  // updates RESERVATION_MASTER server-side when the deployed backend is current.
+  // BACKEND TODO: add a SEAT_RESERVATION case next to your existing
+  // CANCEL_RESERVATION handler in the GAS router that sets STATUS='seated'
+  // on the matching RESERVATION_MASTER row (same lookup as CANCEL_RESERVATION
+  // — CLIENT_ID + RESERVATION_ID) — I don't have that .gs file to edit directly.
   if (typeof gasApi === 'function'){
     gasApi('SEAT_RESERVATION', {id}, 'V2_CORE').catch(()=>{});
   }
@@ -14058,52 +14065,36 @@ function bmNumToWords(n){
 function bmRenderA4(elId){
   const d=bmGetBillData();
   const el=document.getElementById(elId);if(!el)return;
-  const items=Array.isArray(d.items)?d.items:[];
-  const taxRows=Array.isArray(d.taxRows)&&d.taxRows.length?d.taxRows:[{hsn:d.sac||'—',taxName:d.tax>0?'GST':'Exempted',onAmt:d.taxBase||0,taxAmt:d.tax||0}];
-  const logo=bnxResolvePrintLogo_();
-  const esc=bnxPrintEsc_;
-  const money=bnxMoney_;
-  const itemQty=items.reduce((a,i)=>a+(Number(i.qty)||0),0);
-  const billTotal=Number(d.total)||0;
-  const pay=esc(d.paymode||'CASH').toUpperCase();
-  el.innerHTML=`
-  <div class="a4-wrap professional-invoice">
-    <div class="a4-header">
-      <div class="a4-brand-block">
-        <img src="${logo}" class="a4-logo" alt="">
-        <div><div class="a4-co">${esc(d.entity||'RESTAURANT').toUpperCase()}</div>
-        <div class="a4-addr">${esc(d.addr||'')}${d.phone?'<br>Phone: '+esc(d.phone):''}${d.email?'<br>Email: '+esc(d.email):''}${d.gstin?'<br><b>GSTIN:</b> '+esc(d.gstin):''}</div></div>
-      </div>
-      <div class="a4-invoice-badge"><div>TAX INVOICE</div><small>ORIGINAL FOR RECIPIENT</small></div>
-    </div>
-    <div class="a4-info-grid">
-      <div class="a4-info-box"><label>Invoice No.</label><strong>${esc(d.billno||'—')}</strong><label>Date & Time</label><span>${esc(d.date||'—')} ${esc(d.time||'')}</span></div>
-      <div class="a4-info-box"><label>Table / Covers</label><strong>${esc(d.table||'TAKEAWAY')} / ${esc(d.pax||1)}</strong><label>Steward</label><span>${esc(d.waiter||'—')}</span></div>
-      <div class="a4-info-box"><label>Customer</label><strong>${esc(d.cname||'GENERAL CUSTOMER')}</strong><label>Mobile</label><span>${esc(d.cmob||'—')}</span></div>
-      <div class="a4-info-box"><label>Client / Branch</label><strong>${esc(d.branchName||'—')}</strong><label>Client ID</label><span>${esc(d.clientId||'—')}</span></div>
-    </div>
-    <table class="a4-tbl"><thead><tr><th>#</th><th>Description</th><th>HSN/SAC</th><th>Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead><tbody>
-      ${items.map((i,idx)=>`<tr><td>${idx+1}</td><td><b>${esc(i.name||'Item')}</b>${i.mrpNote?'<div class="a4-item-note">MRP '+esc(i.mrpNote)+'</div>':''}</td><td>${esc(d.sac||'—')}</td><td>${Number(i.qty)||0}</td><td class="r">${money(i.rate)}</td><td class="r"><b>${money(i.amt)}</b></td></tr>`).join('')}
-    </tbody></table>
-    <div class="a4-lower">
-      <div class="a4-tax-card"><div class="a4-card-title">Tax Summary</div><table class="a4-tax-tbl"><thead><tr><th>HSN/SAC</th><th>Taxable Value</th><th>Tax</th><th>Tax Amount</th></tr></thead><tbody>
-        ${taxRows.map(r=>`<tr><td>${esc(r.hsn||'—')}</td><td>${money(r.onAmt)}</td><td>${esc(r.taxName||'GST')}</td><td>${money(r.taxAmt)}</td></tr>`).join('')}
-      </tbody></table></div>
-      <div class="a4-totals"><div class="a4-card-title">Amount Details</div>
-        <div class="a4-tot-row"><span>Subtotal</span><span>${money(d.sub)}</span></div>
-        ${d.disc?`<div class="a4-tot-row"><span>Discount (${esc(d.discPct)}%)</span><span>- ${money(d.disc)}</span></div>`:''}
-        ${d.sc?`<div class="a4-tot-row"><span>Service Charge (${esc(d.scPct)}%)</span><span>${money(d.sc)}</span></div>`:''}
-        <div class="a4-tot-row"><span>Tax</span><span>${money(d.tax)}</span></div>
-        ${Math.abs(Number(d.roff)||0)>0.001?`<div class="a4-tot-row"><span>Round Off</span><span>${(d.roff>=0?'+':'-')+' '+money(Math.abs(d.roff))}</span></div>`:''}
-        <div class="a4-tot-row grand"><span>GRAND TOTAL</span><span>${money(Math.round(billTotal))}</span></div>
-        <div class="a4-pay"><span>Payment Mode</span><b>${pay}</b></div>
-      </div>
-    </div>
-    <div class="a4-words"><b>Amount in words:</b> ${bmNumToWords(Math.round(billTotal))} Rupees Only</div>
-    <div class="a4-note-row">${d.kot?'<span><b>KOT:</b> '+esc(d.kot)+'</span>':''}${d.remarks?'<span><b>Remarks:</b> '+esc(d.remarks)+'</span>':''}</div>
-    <div class="a4-footer"><b>Thank you for choosing us. We look forward to serving you again.</b><br><span>Computer Generated Invoice · This invoice is valid subject to the applicable GST configuration.</span></div>
-    <div class="a4-sign"><span>For <b>${esc(d.entity||'Restaurant').toUpperCase()}</b></span><span>Authorised Signatory</span></div>
-  </div>`;
+  const irn='IRN'+Date.now().toString(36).toUpperCase();
+  el.innerHTML=
+    '<div class="a4-header"><div><div class="a4-co">'+d.entity.toUpperCase()+'</div><div class="a4-addr">'+d.addr+'<br>GSTIN/UIN: '+d.gstin+'<br>E-Mail: '+d.email+' | Ph: '+d.phone+'</div></div>'+
+    '<div style="width:60px;height:60px;background:#f0f0f0;border:1px solid #ddd;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:8px;color:#999;text-align:center;">QR<br>Code</div></div>'+
+    '<div class="a4-title">Tax Invoice</div>'+
+    '<div class="a4-irn">IRN: '+irn+'</div>'+
+    '<div class="a4-grid2">'+
+    '<div class="a4-info-box"><div class="a4-info-lbl">Invoice No.</div><div class="a4-info-val">'+d.billno+'</div><div class="a4-info-lbl" style="margin-top:4px;">Dated</div><div class="a4-info-val">'+d.date+'</div></div>'+
+    '<div class="a4-info-box"><div class="a4-info-lbl">Table / Time / PAX</div><div class="a4-info-val">'+(d.table||'-')+' / '+d.time+' / '+d.pax+' covers</div><div class="a4-info-lbl" style="margin-top:4px;">Steward</div><div class="a4-info-val">'+(d.waiter||'-')+'</div></div>'+
+    '<div class="a4-info-box"><div class="a4-info-lbl">Customer</div><div class="a4-info-val">'+d.cname+'</div><div class="a4-info-lbl" style="margin-top:4px;">Mobile</div><div class="a4-info-val">'+d.cmob+'</div></div>'+
+    '<div class="a4-info-box"><div class="a4-info-lbl">Branch</div><div class="a4-info-val">'+d.branchName+'</div><div class="a4-info-lbl" style="margin-top:4px;">Client ID</div><div class="a4-info-val" style="font-family:monospace;font-size:9px;">'+d.clientId+'</div></div>'+
+    '</div>'+
+    '<table class="a4-tbl"><thead><tr><th>Sl</th><th>Description</th><th>HSN/SAC</th><th>Qty</th><th>Rate</th><th class="r">Amount</th></tr></thead><tbody>'+
+    d.items.map((i,idx)=>'<tr><td>'+(idx+1)+'</td><td>'+i.name+'</td><td>'+d.sac+'</td><td>'+i.qty+'</td><td>₹'+i.rate.toFixed(2)+'</td><td class="r">₹'+i.amt.toLocaleString('en-IN',{minimumFractionDigits:2})+'</td></tr>').join('')+
+    '</tbody></table>'+
+    '<div class="a4-totals">'+
+    '<div class="a4-tot-row" style="color:#555;"><span>BASIC AMOUNT</span><span>₹'+d.sub.toLocaleString('en-IN',{minimumFractionDigits:2})+'</span></div>'+
+    (d.disc>0?'<div class="a4-tot-row" style="color:#555;"><span>Discount ('+d.discPct+'%)</span><span>-₹'+d.disc.toFixed(2)+'</span></div>':'')+
+    (d.sc>0?'<div class="a4-tot-row" style="color:#555;"><span>Service Charge ('+d.scPct+'%)</span><span>₹'+d.sc.toFixed(2)+'</span></div>':'')+
+    '<div class="a4-tot-row" style="color:#555;"><span>NET AMOUNT (Taxable)</span><span>₹'+d.taxBase.toLocaleString('en-IN',{minimumFractionDigits:2})+'</span></div>'+
+    (d.cgst>0?'<div class="a4-tot-row" style="color:#555;"><span>CGST @ '+(d.tt==='5'?'2.50':'9.00')+'%</span><span>₹'+d.cgst.toFixed(2)+'</span></div><div class="a4-tot-row" style="color:#555;"><span>SGST @ '+(d.tt==='5'?'2.50':'9.00')+'%</span><span>₹'+d.sgst.toFixed(2)+'</span></div>':'')+
+    (d.igst>0?'<div class="a4-tot-row" style="color:#555;"><span>IGST @ 18%</span><span>₹'+d.igst.toFixed(2)+'</span></div>':'')+
+    (d.roff!==0?'<div class="a4-tot-row" style="color:#555;"><span>Round Off</span><span>₹'+d.roff.toFixed(2)+'</span></div>':'')+
+    '<div class="a4-tot-row grand"><span>GRAND TOTAL</span><span style="color:var(--gold)">₹'+d.total.toLocaleString('en-IN',{minimumFractionDigits:2})+'</span></div></div>'+
+    '<div class="a4-words"><b>Amount in words:</b> '+bmNumToWords(d.total)+' Only</div>'+
+    '<div style="margin-top:8px;"><div style="font-size:10px;font-weight:700;margin-bottom:4px;">Tax Summary</div>'+
+    '<table class="a4-tax-tbl"><thead><tr><th>HSN/SAC</th><th>Taxable Value</th><th>Rate</th><th>Tax Amount</th></tr></thead><tbody>'+
+    '<tr><td>'+d.sac+'</td><td>₹'+d.taxBase.toFixed(2)+'</td><td>'+(d.tt==='5'?'CGST 2.5%+SGST 2.5%':d.tt==='18'?'CGST 9%+SGST 9%':'IGST 18%')+'</td><td>₹'+d.tax.toFixed(2)+'</td></tr></tbody></table></div>'+
+    '<div class="a4-footer">IT WAS A PLEASURE SERVING YOU<br>GSTIN: '+d.gstin+' | SAC: '+d.sac+' | Payment: '+d.paymode+(d.remarks?'<br>Remarks: '+d.remarks:'')+'</div>'+
+    '<div class="a4-sig"><div style="margin-bottom:18px;">for <b>'+d.entity.toUpperCase()+'</b></div>Authorised Signatory<div style="font-size:8px;color:#777;margin-top:3px;">Computer Generated Invoice - Balaji NextGen ERP</div></div>';
 }
 
 function bmRenderBillPreview(){
@@ -14195,15 +14186,8 @@ async function bmDoPrint(){
   const css = pageRule +
     '*{margin:0;padding:0;box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact;}' +
     'body{font-family:Arial,"Noto Sans",sans-serif;background:#fff;}' +
-    '.thermal-body{--posScale:'+bnxPosScaleVal()+';width:'+pw+'px;font-family:Arial,"Noto Sans",sans-serif;font-size:calc(12px * var(--posScale));font-weight:600;line-height:1.42;color:#000;margin:0 auto;padding:8px 5px;}'+
-    '.pos-invoice-head{text-align:center}.pos-logo{width:46px;height:46px;object-fit:contain;margin-bottom:3px}.pos-brand{font-size:calc(16px * var(--posScale));font-weight:900;letter-spacing:.04em}.pos-muted{font-size:calc(9px * var(--posScale));font-weight:600}.pos-invoice-title{text-align:center;border-top:2px solid #000;border-bottom:2px solid #000;padding:5px 0;margin:7px 0;font-size:calc(12px * var(--posScale));font-weight:900;letter-spacing:.12em}.pos-meta{font-size:calc(9px * var(--posScale));}.pos-meta>div{display:flex;justify-content:space-between;gap:8px;padding:1px 0}.pos-meta b{font-weight:800}.pos-meta span{text-align:right;max-width:68%;overflow-wrap:anywhere}.pos-rule{border-top:1px dashed #000;margin:6px 0}.pos-items-head,.pos-item{display:grid;grid-template-columns:minmax(0,1fr) 28px 55px 64px;gap:3px;align-items:start}.pos-items-head{font-size:calc(9px * var(--posScale));font-weight:900;padding-bottom:2px}.pos-item{font-size:calc(10px * var(--posScale));font-weight:700;padding:2px 0}.pos-item span:nth-child(n+2),.pos-items-head span:nth-child(n+2){text-align:right}.pos-mrp{font-size:calc(8px * var(--posScale));padding-left:2px}.pos-total-line{display:flex;justify-content:space-between;font-size:calc(10px * var(--posScale));padding:2px 0}.pos-grand{display:flex;justify-content:space-between;align-items:center;font-size:calc(15px * var(--posScale));font-weight:900;padding:6px 0}.pos-section{text-align:center;font-size:calc(9px * var(--posScale));font-weight:900;letter-spacing:.08em;margin-bottom:3px}.pos-tax-head,.pos-tax-row{display:grid;grid-template-columns:43px minmax(0,1fr) 57px 57px;gap:3px;font-size:calc(8px * var(--posScale));}.pos-tax-head{font-weight:900}.pos-tax-row{font-weight:600;padding:2px 0}.pos-tax-head span:nth-child(n+3),.pos-tax-row span:nth-child(n+3){text-align:right}.pos-payment{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;font-size:calc(10px * var(--posScale));font-weight:800}.pos-payment strong{font-size:calc(12px * var(--posScale));}.pos-small{font-size:calc(8px * var(--posScale));margin-top:4px}.pos-note{font-size:calc(8px * var(--posScale));border-left:2px solid #000;padding-left:5px;margin-top:5px}.pos-footer{text-align:center;font-size:calc(9px * var(--posScale));font-weight:700;margin-top:8px;padding-top:6px;border-top:1px dashed #000}.pos-footer span{font-size:calc(7px * var(--posScale));font-weight:500}'+
-    '.a4-wrap{padding:26px 30px;font-size:11px;color:#111;background:#fff;}'+
-    '.professional-invoice{max-width:100%;font-family:Arial,"Noto Sans",sans-serif;}'+
-    '.a4-brand-block{display:flex;align-items:center;gap:12px;}.a4-logo{width:58px;height:58px;object-fit:contain;border:1px solid #ddd;border-radius:8px;}'+
-    '.a4-invoice-badge{text-align:right;font-weight:800;font-size:18px;letter-spacing:.08em;}.a4-invoice-badge small{display:block;font-size:8px;font-weight:600;letter-spacing:.05em;margin-top:5px;color:#666;}'+
-    '.a4-info-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin:14px 0;}.a4-info-box{background:#fafafa;border:1px solid #ddd;border-radius:5px;padding:8px;min-height:57px;}.a4-info-box label{display:block;font-size:7px;text-transform:uppercase;letter-spacing:.08em;color:#777;margin-bottom:2px;}.a4-info-box strong{display:block;font-size:10px;margin-bottom:7px;}.a4-info-box span{font-size:9px;}'+
-    '.a4-tbl{width:100%;border-collapse:collapse;margin:12px 0;font-size:9px;}.a4-tbl th{background:#222;color:#fff;padding:7px;text-align:left;font-size:8px;text-transform:uppercase;letter-spacing:.04em;}.a4-tbl td{padding:7px;border-bottom:1px solid #ddd;vertical-align:top;}.a4-item-note{font-size:7px;color:#777;margin-top:2px;}.a4-lower{display:grid;grid-template-columns:1.3fr .9fr;gap:14px;margin-top:8px;}.a4-tax-card{border:1px solid #ddd;border-radius:5px;padding:8px;}.a4-card-title{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;}.a4-totals{border:1px solid #ddd;border-radius:5px;padding:9px;background:#fafafa;}.a4-tot-row{display:flex;justify-content:space-between;font-size:9px;padding:4px 0;}.a4-tot-row.grand{font-size:13px;font-weight:900;border-top:2px solid #222;margin-top:5px;padding-top:8px;}.a4-pay{display:flex;justify-content:space-between;margin-top:8px;padding-top:7px;border-top:1px dashed #bbb;font-size:9px;}.a4-words{font-size:8px;padding:8px;border-left:3px solid #222;background:#fafafa;margin-top:10px;}.a4-note-row{display:flex;gap:20px;font-size:8px;margin-top:9px;}.a4-footer{text-align:center;font-size:8px;color:#666;margin-top:18px;padding-top:9px;border-top:1px dashed #bbb;}.a4-sign{display:flex;justify-content:space-between;align-items:flex-end;font-size:8px;margin-top:30px;color:#555;}.a4-tax-tbl{width:100%;border-collapse:collapse;font-size:8px;}.a4-tax-tbl th{background:#555;color:#fff;padding:5px;text-align:left;}.a4-tax-tbl td{padding:5px;border:1px solid #ddd;}'+
-    '.a4-header{display:flex;justify-content:space-between;margin-bottom:14px;padding-bottom:12px;border-bottom:2px solid #222;}'+
+    '.thermal-body{--posScale:'+bnxPosScaleVal()+';width:'+pw+'px;max-width:100%;font-size:calc(13px * var(--posScale));font-weight:700;line-height:1.6;color:#000;margin:0 auto;padding:10px 6px;}' +
+    '.a4-wrap{padding:30px;font-size:11px;color:#000;}' +
     '.a4-header{display:flex;justify-content:space-between;margin-bottom:14px;padding-bottom:12px;border-bottom:2px solid #000;}' +
     '.a4-co{font-size:16px;font-weight:800;}.a4-addr{font-size:9px;color:#555;}' +
     '.a4-title{text-align:center;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.15em;margin:10px 0;padding:5px;border-top:1px solid #000;border-bottom:1px solid #000;}' +
@@ -14247,10 +14231,6 @@ function bmCloseKOTModal(){document.getElementById('bmKOTModal').classList.remov
 function bmDoKOTPrint(){
   const content=document.getElementById('bmModalKOT').outerHTML;
   const w=window.open('','_blank','width=420,height=600');
-  if (!w) {
-    if (typeof showNotif === 'function') showNotif('⚠️ KOT print popup blocked — allow pop-ups for this site.', 'error');
-    return;
-  }
   const pw = bnxPaperWidthPx();
   w.document.write('<html><head><title>KOT - Balaji NextGen ERP</title><style>@page{size:'+bnxPaperSize()+'mm auto;margin:0;}*{margin:0;padding:0;box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact;}body{font-family:"DM Mono","Courier New",monospace;background:#fff;}.kot-print-body{width:'+pw+'px;font-size:14px;font-weight:600;line-height:1.7;color:#000;margin:0 auto;padding:10px 6px;}@media print{body{margin:0;}}</style></head><body>'+content+'</body></html>');
   w.document.close();
@@ -14418,8 +14398,7 @@ let bmQuickActiveCat='All';
 function bmBuildProductGrid(gridId,cat){
   const grid=document.getElementById(gridId);if(!grid)return;
   const billMenu = bnxGetBillMenu();
-  const wantedCat=String(cat==null?'All':cat).trim();
-  let items=wantedCat==='All'?billMenu:billMenu.filter(m=>String(m.cat||m.category||'').trim().toLowerCase()===wantedCat.toLowerCase());
+  let items=bmNormCat_(cat)==='all'?billMenu:billMenu.filter(m=>bmNormCat_(m.cat)===bmNormCat_(cat));
   if(gridId==='bmProductGrid' && bmProdListSearch){
     const q=bmProdListSearch.toLowerCase();
     items=items.filter(m=>m.name.toLowerCase().includes(q));
@@ -14458,20 +14437,29 @@ function bmFilterProducts(cat,btn){
   bmBuildProductGrid('bmProductGrid',cat);
 }
 
+function bmNormCat_(v){ return String(v??'').trim().replace(/\s+/g,' ').toLowerCase(); }
 function bmFilterQuick(cat,btn){
-  /* P0 FIX: Quick Add category buttons were rendered inside the Billing form.
-     Because they had no type=button, Edge/Chrome could treat a category click
-     as a form submit, so the active category changed visually but the product
-     filter did not reliably remain applied. Also normalize category values so
-     CATEGORY_MASTER / ITEM_MASTER spacing and casing differences cannot make a
-     real category appear empty. */
-  try{ if(window.event){ window.event.preventDefault(); window.event.stopPropagation(); } }catch(e){}
-  const wanted=String(cat==null?'All':cat).trim();
   document.querySelectorAll('#bmQuickAddModal .pcat').forEach(b=>b.classList.remove('active'));
   if(btn) btn.classList.add('active');
-  bmQuickActiveCat=wanted || 'All';
-  bmBuildProductGrid('bmQuickProdGrid',bmQuickActiveCat);
-  return false;
+  const requested=String(cat||'All').trim();
+  bmQuickActiveCat=requested;
+  const grid=document.getElementById('bmQuickProdGrid');
+  if(!grid) return;
+  const menu=bnxGetBillMenu();
+  const key=bmNormCat_(requested);
+  let items=key==='all'?menu:menu.filter(m=>bmNormCat_(m.cat||m.category||m.c)===key);
+  const q=(bmQuickSearch||'').trim().toLowerCase();
+  if(q) items=items.filter(m=>String(m.name||'').toLowerCase().includes(q));
+  if(!items.length){
+    grid.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:26px 10px;color:var(--text3);font-size:13px;">😕 No products in this category.</div>';
+    return;
+  }
+  grid.innerHTML=items.map(m=>
+    '<div class="prod-item" id="bm-pi-'+String(m.id).replace(/[^a-zA-Z0-9_-]/g,'_')+'" onclick="bmAddProductToQuickBill('+JSON.stringify(String(m.id))+',\'bmQuickProdGrid\')">'+
+    '<div class="prod-em">'+m.em+'</div><div class="prod-name">'+m.name+'</div>'+
+    '<div class="prod-price">₹'+Number(m.price||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})+'</div>'+
+    '<div class="prod-cat">'+m.cat+'</div></div>'
+  ).join('');
 }
 function bmSearchQuick(term){
   bmQuickSearch=(term||'').trim();
@@ -15756,12 +15744,8 @@ function bnxParseFlexDt(dt){
   let y, m, d;
   if (p[0].length === 4) { y = +p[0]; m = +p[1] - 1; d = +p[2]; }       // ISO yyyy-mm-dd
   else { d = +p[0]; m = +p[1] - 1; y = +p[2]; }                         // DD-MM-YYYY / DD/MM/YYYY
-  if (!Number.isInteger(y) || !Number.isInteger(m) || !Number.isInteger(d) || y < 1900 || y > 2099 || m < 0 || m > 11 || d < 1 || d > 31) return null;
   const date = new Date(y, m, d);
-  // JS normalizes invalid dates (e.g. 31-Feb -> Mar-03), so validate the
-  // components after construction instead of accepting a silently shifted date.
-  if (date.getFullYear() !== y || date.getMonth() !== m || date.getDate() !== d) return null;
-  return date;
+  return isNaN(date) ? null : date;
 }
 function blDateInRange(dt){
   if (blActiveRange === 'all') return true;
@@ -17716,16 +17700,16 @@ function renderAIBars(){
       <input type="text" id="bmQuickSearchInput" placeholder="🔍 Search item name…" oninput="bmSearchQuick(this.value)"
         style="width:100%;padding:9px 12px;border:1px solid var(--border2,#ddd);border-radius:8px;font-size:13px;font-family:'DM Sans',sans-serif;margin-bottom:10px;">
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
-        <button type="button" class="pcat active" onclick="return bmFilterQuick('All',this)">All</button>
-        <button type="button" class="pcat" onclick="return bmFilterQuick('Starters',this)">Starters</button>
-        <button type="button" class="pcat" onclick="return bmFilterQuick('Indian',this)">Indian</button>
-        <button type="button" class="pcat" onclick="return bmFilterQuick('Pizza',this)">Pizza</button>
-        <button type="button" class="pcat" onclick="return bmFilterQuick('Noodles',this)">Noodles</button>
-        <button type="button" class="pcat" onclick="return bmFilterQuick('Rice',this)">Rice</button>
-        <button type="button" class="pcat" onclick="return bmFilterQuick('Breads',this)">Breads</button>
-        <button type="button" class="pcat" onclick="return bmFilterQuick('Desserts',this)">Desserts</button>
-        <button type="button" class="pcat" onclick="return bmFilterQuick('Beverages',this)">Beverages</button>
-        <button type="button" class="pcat" onclick="return bmFilterQuick('Bar',this)">Bar</button>
+        <button class="pcat active" onclick="bmFilterQuick('All',this)">All</button>
+        <button class="pcat" onclick="bmFilterQuick('Starters',this)">Starters</button>
+        <button class="pcat" onclick="bmFilterQuick('Indian',this)">Indian</button>
+        <button class="pcat" onclick="bmFilterQuick('Pizza',this)">Pizza</button>
+        <button class="pcat" onclick="bmFilterQuick('Noodles',this)">Noodles</button>
+        <button class="pcat" onclick="bmFilterQuick('Rice',this)">Rice</button>
+        <button class="pcat" onclick="bmFilterQuick('Breads',this)">Breads</button>
+        <button class="pcat" onclick="bmFilterQuick('Desserts',this)">Desserts</button>
+        <button class="pcat" onclick="bmFilterQuick('Beverages',this)">Beverages</button>
+        <button class="pcat" onclick="bmFilterQuick('Bar',this)">Bar</button>
       </div>
       <div class="prod-grid" id="bmQuickProdGrid"></div>
     </div>
@@ -21201,7 +21185,7 @@ function bnxRenderGstrReports(from, to){
       const tbody = card1.querySelector('table tbody');
       if (tbody){
         tbody.innerHTML = rows.length ? rows.map(r=>
-          `<tr><td class="mono">${r.hsn}</td><td>${r.ratePct}%</td><td class="mono">—</td><td class="mono">${money(r.taxableValue)}</td>`+
+          `<tr><td class="mono">${bnxPrintEsc_(r.hsn)}</td><td>${r.ratePct}%</td><td class="mono">—</td><td class="mono">${money(r.taxableValue)}</td>`+
           `<td class="mono">${money(r.taxAmount/2)}</td><td class="mono">${money(r.taxAmount/2)}</td><td>—</td><td class="mono" style="color:var(--gold)">${money(r.taxableValue+r.taxAmount)}</td></tr>`
         ).join('') + `<tr class="rpt-total-row"><td colspan="3">TOTAL</td><td class="mono">${money(d.grossTaxable)}</td><td class="mono">${money(d.grossTax/2)}</td><td class="mono">${money(d.grossTax/2)}</td><td>—</td><td class="mono" style="color:var(--gold)">${money(d.grossTaxable+d.grossTax)}</td></tr>`
           : '<tr><td colspan="8" style="text-align:center;color:var(--text3);padding:14px;">No sales in this range yet.</td></tr>';
@@ -22199,28 +22183,12 @@ async function saveWASettings() {
     showNotif('✅ WhatsApp settings saved locally','success');
   }
 }
-function editTemplate(type) { showNotif('✏ Template editor is not enabled in this build: ' + type, 'info'); }
+function editTemplate(type) { showNotif('ℹ Template editor is not connected to a saved template backend yet · ' + type, 'error'); }
 
 /* ── DASHBOARD LINKS ── */
 function openDash(file) { window.open(file, '_blank'); }
-async function copyText(text) {
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(String(text));
-      showNotif('📋 Copied: ' + text, 'success');
-      return;
-    }
-  } catch (e) {}
-  try {
-    const ta = document.createElement('textarea');
-    ta.value = String(text); ta.setAttribute('readonly','');
-    ta.style.position='fixed'; ta.style.opacity='0';
-    document.body.appendChild(ta); ta.select();
-    const ok = document.execCommand('copy');
-    ta.remove();
-    if (ok) { showNotif('📋 Copied: ' + text, 'success'); return; }
-  } catch (e) {}
-  showNotif('⚠️ Copy failed — please copy the text manually.', 'error');
+function copyText(text) {
+  navigator.clipboard.writeText(text).then(() => showNotif('📋 Copied: ' + text, 'success'));
 }
 
 /* ── INIT NEW PAGES ON SHOW ── */
@@ -22532,7 +22500,7 @@ function renderTaxConfigTable(){
       <td><input class="fi" id="tc-cgst-${key}" value="${r.cgst}" style="width:60px;padding:4px;font-size:11px;" oninput="updateTaxTotalDisplay('${key}')"></td>
       <td><input class="fi" id="tc-sgst-${key}" value="${r.sgst}" style="width:60px;padding:4px;font-size:11px;" oninput="updateTaxTotalDisplay('${key}')"></td>
       <td class="mono">${totalDisplay}</td>
-      <td><input class="fi" id="tc-hsn-${key}" value="${r.hsn}" style="width:80px;padding:4px;font-size:11px;"></td>
+      <td><input class="fi" id="tc-hsn-${key}" value="${bnxPrintEsc_(r.hsn)}" style="width:80px;padding:4px;font-size:11px;"></td>
     </tr>`;
   }).join('');
 }
@@ -24240,84 +24208,26 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
     const arr=(typeof bnxGetBillMenu==='function'?bnxGetBillMenu():[]);
     return [...new Set(arr.map(categoryOf).filter(c=>c && c!=='Uncategorised'))].sort((a,b)=>a.localeCompare(b));
   }
-
-  function renderQuickCategories(categories){
+  function renderQuickCategories(){
     const modal=document.getElementById('bmQuickAddModal'); if(!modal) return;
     const wrap=modal.querySelector('.modal-body > div[style*="flex-wrap"]');
     if(!wrap) return;
-    const cats=Array.isArray(categories) ? categories : getRealCategories();
-    wrap.innerHTML='<button type="button" class="pcat active" data-live-cat="All">All</button>'+
-      cats.map(c=>`<button type="button" class="pcat" data-live-cat="${esc(c)}">${esc(c)}</button>`).join('');
-    /* Use delegated click handling so category filters cannot be swallowed by
-       a parent form and special category names never become broken inline JS. */
-    wrap.querySelectorAll('.pcat').forEach(btn=>{
-      btn.addEventListener('click', function(ev){
-        ev.preventDefault(); ev.stopPropagation();
-        bmFilterQuick(this.dataset.liveCat||'All', this);
-      });
-    });
+    const cats=getRealCategories();
+    wrap.innerHTML='<button class="pcat active" data-live-cat="All" onclick="bmFilterQuick(\'All\',this)">All</button>'+
+      cats.map(c=>`<button class="pcat" data-live-cat="${esc(c)}" onclick="bmFilterQuick(${JSON.stringify(c)},this)">${esc(c)}</button>`).join('');
   }
   window.bnxRenderLiveQuickCategories=renderQuickCategories;
 
-  /* REAL CATEGORY MASTER LOAD
-     Quick Add categories must come from CATEGORY_MASTER, not from the
-     hardcoded HTML buttons and not only from categories that happen to be
-     present in the current item cache. This is important when CATEGORY_MASTER
-     contains categories whose items are temporarily inactive, newly created,
-     or when the menu cache has not finished loading yet. */
-  async function bnxLoadRealQuickCategories(){
-    let masterCats=[];
-    try{
-      const res=await Promise.race([
-        gasApi('GET_MASTER',{category:'menucat'},'V2_CORE'),
-        new Promise(resolve=>setTimeout(()=>resolve(null),7000))
-      ]);
-      if(res && res.success){
-        const rows=Array.isArray(res.data) ? res.data : [];
-        masterCats=rows.map(r=>categoryOf(r)).filter(c=>c && c!=='Uncategorised');
-      }
-    }catch(e){
-      console.warn('[QUICK ADD] CATEGORY_MASTER load failed:',e);
-    }
-
-    /* If CATEGORY_MASTER is temporarily unavailable, use categories from the
-       already-loaded real ITEM_MASTER as a safe secondary source. Never use
-       the old demo category list. */
-    const itemCats=getRealCategories();
-    const cats=[...new Set(masterCats.concat(itemCats))].sort((a,b)=>a.localeCompare(b));
-    return cats;
-  }
-
-  /* Make all existing Quick Add open paths rebuild from the real CATEGORY_MASTER.
-     The modal opens immediately, then replaces the old static buttons as soon as
-     the live category request returns. */
+  /* Make all existing Quick Add open paths rebuild categories from the current
+     menuData first. This prevents the old Starters/Indian/Pizza demo list from
+     appearing even when real categories are already loaded. */
   const oldOpen=window.bmOpenQuickAdd;
-  window.bmOpenQuickAdd=async function(){
-    bmQuickSearch=''; bmQuickActiveCat='All';
-    const modal=document.getElementById('bmQuickAddModal');
-    const si=document.getElementById('bmQuickSearchInput');
-    if(si) si.value='';
-
-    if(modal){
-      modal.classList.add('open');
-      const wrap=modal.querySelector('.modal-body > div[style*="flex-wrap"]');
-      if(wrap) wrap.innerHTML='<span style="font-size:11px;color:var(--text3);padding:6px 2px;">⏳ Loading actual categories from CATEGORY_MASTER…</span>';
-      const grid=document.getElementById('bmQuickProdGrid');
-      if(grid) grid.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:26px 10px;color:var(--text3);font-size:13px;">⏳ Loading live menu…</div>';
-    }
-
-    /* Do not call the old opener because it rebuilds the static/demo category
-       buttons. We reproduce only its useful behavior here. */
-    const cats=await bnxLoadRealQuickCategories();
-    renderQuickCategories(cats);
+  window.bmOpenQuickAdd=function(){
+    renderQuickCategories();
+    if(typeof oldOpen==='function') oldOpen.apply(this,arguments);
+    renderQuickCategories();
     const first=document.querySelector('#bmQuickAddModal .pcat');
-    if(first){
-      document.querySelectorAll('#bmQuickAddModal .pcat').forEach(x=>x.classList.remove('active'));
-      first.classList.add('active');
-    }
-    bmQuickActiveCat='All';
-    bmBuildProductGrid('bmQuickProdGrid','All');
-    if(si) setTimeout(()=>si.focus(),50);
+    if(first){document.querySelectorAll('#bmQuickAddModal .pcat').forEach(x=>x.classList.remove('active'));first.classList.add('active');}
   };
 
   /* Existing buildProductGrid compares m.cat strictly. Normalize it so a
