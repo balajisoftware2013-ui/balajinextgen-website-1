@@ -452,32 +452,67 @@ function bnxCheckAuthFailure_(data){
 }
 
 /* FINAL FIX: live ERP session/client resolver.
-   This function must be declared before gasApi uses it. */
+   The previous resolver had a subtle loop-brace bug: it normalized every
+   value but tested only vals[i] AFTER the loop, so it returned no session
+   even when ERP_USER / ERP_SESSION contained a valid token. That produced
+   "[AUTH] No ERP_SESSION token" and then every core call failed.
+*/
+function bnxReadStoredObject_(key){
+  try{
+    var raw = localStorage.getItem(key) || sessionStorage.getItem(key) || '';
+    if(!raw) return null;
+    try { return JSON.parse(raw); } catch(e){ return raw; }
+  }catch(e){ return null; }
+}
+function bnxPickToken_(v){
+  if(!v) return '';
+  if(typeof v === 'string') return v.trim();
+  if(typeof v === 'object'){
+    return String(
+      v.sessionToken || v.SESSION_TOKEN || v.token || v.TOKEN ||
+      v.session || v.SESSION || v.erpSession || v.ERP_SESSION || ''
+    ).trim();
+  }
+  return '';
+}
 function bnxCurrentSession_(){
   try{
-    var vals=[];
-    try{ if(typeof ERP!=='undefined' && typeof ERP.getSession==='function') vals.push(ERP.getSession()); }catch(e){}
-    try{ if(typeof ERP!=='undefined' && typeof ERP.getToken==='function') vals.push(ERP.getToken()); }catch(e){}
-    vals.push(localStorage.getItem('ERP_SESSION'));
-    vals.push(sessionStorage.getItem('ERP_SESSION'));
-    vals.push(localStorage.getItem('erp_session'));
-    vals.push(sessionStorage.getItem('erp_session'));
-    vals.push(localStorage.getItem('erp_token'));
-    vals.push(sessionStorage.getItem('erp_token'));
-    for(var i=0;i<vals.length;i++) if(vals[i] && typeof vals[i]==='object'){ vals[i]=vals[i].token||vals[i].sessionToken||vals[i].SESSION_TOKEN||vals[i].clientId||vals[i].CLIENT_ID||''; } if(vals[i] && String(vals[i]).trim()) return String(vals[i]).trim();
+    var candidates = [];
+    try{ if(typeof ERP!=='undefined' && typeof ERP.getSession==='function') candidates.push(ERP.getSession()); }catch(e){}
+    try{ if(typeof ERP!=='undefined' && typeof ERP.getToken==='function') candidates.push(ERP.getToken()); }catch(e){}
+    candidates.push(localStorage.getItem('ERP_SESSION'));
+    candidates.push(sessionStorage.getItem('ERP_SESSION'));
+    candidates.push(localStorage.getItem('erp_session'));
+    candidates.push(sessionStorage.getItem('erp_session'));
+    candidates.push(localStorage.getItem('erp_token'));
+    candidates.push(sessionStorage.getItem('erp_token'));
+    candidates.push(bnxReadStoredObject_('ERP_USER'));
+    candidates.push(bnxReadStoredObject_('erpUser'));
+    for(var i=0;i<candidates.length;i++){
+      var token = bnxPickToken_(candidates[i]);
+      if(token) return token;
+    }
   }catch(e){}
   return '';
 }
 function bnxCurrentClient_(){
   try{
-    var vals=[];
-    try{ if(typeof ERP!=='undefined' && typeof ERP.getClient==='function') vals.push(ERP.getClient()); }catch(e){}
-    try{ if(typeof ERP!=='undefined' && typeof ERP.getClientId==='function') vals.push(ERP.getClientId()); }catch(e){}
-    try{ vals.push(CLIENT_ID); }catch(e){}
-    vals.push(localStorage.getItem('ERP_CLIENT'));
-    vals.push(sessionStorage.getItem('ERP_CLIENT'));
-    vals.push(localStorage.getItem('bnx_client_id'));
-    for(var i=0;i<vals.length;i++) if(vals[i] && typeof vals[i]==='object'){ vals[i]=vals[i].token||vals[i].sessionToken||vals[i].SESSION_TOKEN||vals[i].clientId||vals[i].CLIENT_ID||''; } if(vals[i] && String(vals[i]).trim()) return String(vals[i]).trim();
+    var candidates = [];
+    try{ if(typeof ERP!=='undefined' && typeof ERP.getClient==='function') candidates.push(ERP.getClient()); }catch(e){}
+    try{ if(typeof ERP!=='undefined' && typeof ERP.getClientId==='function') candidates.push(ERP.getClientId()); }catch(e){}
+    try{ if(typeof CLIENT_ID!=='undefined') candidates.push(CLIENT_ID); }catch(e){}
+    candidates.push(localStorage.getItem('ERP_CLIENT'));
+    candidates.push(sessionStorage.getItem('ERP_CLIENT'));
+    candidates.push(localStorage.getItem('bnx_client_id'));
+    candidates.push(bnxReadStoredObject_('ERP_USER'));
+    candidates.push(bnxReadStoredObject_('erpUser'));
+    for(var i=0;i<candidates.length;i++){
+      var v=candidates[i];
+      if(v && typeof v==='object'){
+        v=v.CLIENT_ID || v.clientId || v.client_id || v.CLIENT || v.client || '';
+      }
+      if(v && String(v).trim()) return String(v).trim();
+    }
   }catch(e){}
   return '';
 }
@@ -486,9 +521,12 @@ let _bnxWarnedNoSession = false;
 async function gasApi(action, payload, endpoint) {
   payload = payload || {};
   const ep = endpoint || 'V2_CORE';
+  if (action !== 'GET_CONFIG' && !bnxCurrentClient_()) {
+    return Promise.resolve({success:false,error:'No authenticated client session',statusCode:401,offline:true});
+  }
   if (!_bnxWarnedNoSession && action !== 'GET_CONFIG' && !bnxCurrentSession_()) {
     _bnxWarnedNoSession = true;
-    console.error('[AUTH] No ERP_SESSION token — session-gated API calls may fail until login.');
+    console.warn('[AUTH] No active ERP session token found in ERP helper/storage — session-gated API call skipped/failure is expected until login.');
   }
 
   // HANG FIX: coalesce identical in-flight requests. Startup used to fire the
@@ -743,7 +781,7 @@ window.gasApi = async function(action, payload, endpoint) {
 setInterval(() => {
   const uptime = ((Date.now() - PERF_METRICS.startTime) / 1000 / 60).toFixed(1);
   const healthStr = `[BN_HEALTH] uptime:${uptime}m bills:${PERF_METRICS.billsCreated} api_calls:${PERF_METRICS.apiCallsTotal} failures:${PERF_METRICS.apiCallsFailed} avg_response:${PERF_METRICS.avgResponseTime.toFixed(0)}ms queue:${PERF_METRICS.queueLength()}`;
-  console.log(healthStr);
+  if (!bnxApiCircuitOpen_('V2_CORE')) console.log(healthStr);
   // Store latest metric in localStorage for dashboard widget
   try {
     localStorage.setItem('_bnHealthMetrics', JSON.stringify({
@@ -8319,7 +8357,7 @@ function bnxGetDashboardSummaryShared_(rangeParams){
 
 async function loadRealDashboardData() {
   try {
-    if (typeof CLIENT_ID === 'undefined' || !CLIENT_ID) return;
+    if (!bnxCurrentClient_() || !bnxCurrentSession_()) return;
 
     // FIX ("this month click but data not show"): this call used to be
     // hardcoded to the client's default/"today" server-side range no
