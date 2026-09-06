@@ -145,7 +145,14 @@ const BNX_SAME_ORIGIN_API = (function(){
   return null;
 })();
 function bnxApiUrl_(endpoint){
-  return (BNX_SAME_ORIGIN_API && BNX_SAME_ORIGIN_API[endpoint]) || GAS_APIS_DASH[endpoint || 'V2_CORE'];
+  endpoint = endpoint || 'V2_CORE';
+  // Production must use the same-origin website proxy. Direct Apps Script
+  // is only used when this HTML is opened locally (file://).
+  if (window.location && window.location.protocol !== 'file:' &&
+      BNX_SAME_ORIGIN_API && BNX_SAME_ORIGIN_API[endpoint]) {
+    return BNX_SAME_ORIGIN_API[endpoint];
+  }
+  return GAS_APIS_DASH[endpoint];
 }
 
 /* CENTRALIZED CONFIG — same mechanism as steward-mobile.html, see its
@@ -154,44 +161,79 @@ function bnxApiUrl_(endpoint){
    place instead of each carrying an independent, driftable copy. */
 async function bnxFetchJson_(endpoint, options){
   options = options || {};
-  const primary = bnxApiUrl_(endpoint || 'V2_CORE');
-  const direct = GAS_APIS_DASH[endpoint || 'V2_CORE'];
+  endpoint = endpoint || 'V2_CORE';
+
+  const isLocalFile = !!(window.location && window.location.protocol === 'file:');
+  const primary = bnxApiUrl_(endpoint);
+  const direct = GAS_APIS_DASH[endpoint];
   const urls = [];
-  if(primary) urls.push(primary);
-  if(direct && direct !== primary) urls.push(direct);
+
+  if (!isLocalFile) {
+    // Production: same-origin proxy only. Browser CORS prevents reliable
+    // reading of Apps Script ContentService responses cross-origin.
+    if (primary) urls.push(primary);
+  } else {
+    if (primary) urls.push(primary);
+    if (direct && direct !== primary) urls.push(direct);
+  }
+
+  if (!urls.length) throw new Error('No API endpoint configured for ' + endpoint);
+
   let lastErr = null;
-  for(let i=0;i<urls.length;i++){
-    const url = urls[i];
-    try{
-      const r = await fetch(url, Object.assign({
+  for (let i=0; i<urls.length; i++) {
+    const url=urls[i];
+    try {
+      const r=await fetch(url,Object.assign({
         method:'POST',
         headers:{'Content-Type':'text/plain;charset=utf-8'},
+        credentials:'same-origin',
         redirect:'follow'
-      }, options));
-      const text = await r.text();
+      },options));
+      const text=await r.text();
+
       if(!r.ok){
-        const err = new Error('HTTP '+r.status);
-        err.status=r.status; lastErr=err;
-        // A same-origin proxy returning 405/404 is a routing problem; try direct GAS.
-        if((r.status===405 || r.status===404 || r.status===502 || r.status===503) && i+1<urls.length) continue;
-        throw err;
-      }
-      let data;
-      try{ data=JSON.parse(text); }
-      catch(e){
-        const err=new Error('Invalid JSON response'+(text && text.slice(0,120)?': '+text.slice(0,120):''));
-        err.status=r.status; lastErr=err;
+        const err=new Error('API proxy HTTP '+r.status+' at '+url);
+        err.status=r.status;
+        err.responseText=text.slice(0,300);
+        lastErr=err;
+        if(!isLocalFile) throw err;
         if(i+1<urls.length) continue;
         throw err;
       }
-      if(data && data.success===false && (data.statusCode===405 || data.statusCode===404) && i+1<urls.length) continue;
+
+      let data;
+      try { data=JSON.parse(text); }
+      catch(e){
+        const err=new Error('API returned non-JSON ('+r.status+'): '+text.slice(0,180));
+        err.status=r.status;
+        err.responseText=text.slice(0,300);
+        lastErr=err;
+        if(i+1<urls.length) continue;
+        throw err;
+      }
       return data;
-    }catch(e){
+    } catch(e) {
       lastErr=e;
       if(i+1<urls.length) continue;
+      throw e;
     }
   }
   throw lastErr || new Error('API request failed');
+}
+
+function bnxShowApiTransportError_(err, endpoint){
+  try{
+    const id='_bnxApiTransportError';
+    let el=document.getElementById(id);
+    if(!el){
+      el=document.createElement('div');
+      el.id=id;
+      el.style.cssText='position:fixed;left:12px;right:12px;bottom:12px;z-index:99999;background:#7f1d1d;color:#fff;padding:10px 14px;border-radius:10px;font:600 12px/1.4 Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.25);';
+      document.body.appendChild(el);
+    }
+    const route=endpoint==='V2_AUTH'?'/api/auth':'/api/core';
+    el.textContent='ERP API '+endpoint+' unavailable ('+(err&&err.status?('HTTP '+err.status):'network error')+'). Configure '+route+' as a POST proxy. Live data is not replaced with demo data.';
+  }catch(e){}
 }
 
 async function bnxRefreshConfig(){
@@ -354,9 +396,18 @@ async function gasApi(action, payload, endpoint) {
             resolve(data);
             return;
           } catch(err) {
+            /* Never retry a permanent client-side HTTP error such as 400/401/403/404/405.
+               The old three-attempt retry made a bad /api/core route feel like a
+               frozen Save/Invoice button for several seconds. Retry only network
+               failures and 5xx responses where another attempt can actually help. */
+            const status=Number(err && err.status)||0;
+            if (status>=400 && status<500) {
+              resolve({success:false, error:err.message, statusCode:status});
+              return;
+            }
             attempt++;
             if (attempt >= API_RETRY_CONFIG.maxAttempts) {
-              resolve({success:false, error:err.message, statusCode:err.status||0});
+              resolve({success:false, error:err.message, statusCode:status});
               return;
             }
             const delay=Math.min(API_RETRY_CONFIG.baseDelay*Math.pow(2,attempt-1),API_RETRY_CONFIG.maxDelay);
@@ -365,7 +416,9 @@ async function gasApi(action, payload, endpoint) {
         }
       } catch(e){ resolve({success:false,error:e.message,statusCode:e.status||0}); }
     };
-    REQUEST_QUEUE.pending.push(task);
+    const critical = /^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(String(action||''));
+    if (critical) REQUEST_QUEUE.pending.unshift(task);
+    else REQUEST_QUEUE.pending.push(task);
     processRequestQueue();
   });
 }
@@ -7071,6 +7124,7 @@ async function erpApi(payload, type='V2_AUTH'){
     return data;
   }catch(e){
     console.warn('[ERP API '+type+']',e.message);
+    bnxShowApiTransportError_(e,type);
     return {success:false,offline:true,error:e.message,statusCode:e.status||0};
   }
 }
@@ -10024,36 +10078,75 @@ function bnxUpdateTableStats(){
   const hdr=document.querySelector('#page-tables .card-title'); if(hdr) hdr.textContent='Quick Floor Map — All '+tableData.length+' Tables';
   const dashFloorMapCount=document.getElementById('floorMapTableCount'); if(dashFloorMapCount) dashFloorMapCount.textContent=tableData.length;
 }
-function filterRTC(val, btn){
-  if(btn){ document.querySelectorAll('#page-tables .fcat').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); }
+/* FINAL TABLE FILTER ENGINE
+   Search, Status and Zone are independent filters. The previous version
+   passed zone names through the same `filterRTC()` path as status/search,
+   which made a zone click overwrite the status selection. Worse, the
+   generated zone button contained a literal `${safe}`, so clicking it could
+   never match a real zone. Keep one state object and always filter from the
+   original tableData-derived cards. */
+window._rtcFilterState = window._rtcFilterState || {search:'', status:'', zone:''};
+function bnxApplyTableFilters_(){
   const g=document.getElementById('richTblGrid'); if(!g) return;
-  const f=(val||'').toLowerCase();
+  const st=window._rtcFilterState;
+  const q=String(st.search||'').trim().toLowerCase();
+  const status=String(st.status||'').trim().toLowerCase();
+  const zone=String(st.zone||'').trim().toLowerCase();
   const all=bnxBuildRichTblsFromMaster();
-  const cards=!f?all:all.filter(t=>t.type===f||(t.tags||[]).includes(f)||t.id.toLowerCase().includes(f)||t.zone.toLowerCase().includes(f)||(t.captain||'').toLowerCase().includes(f));
+  const cards=all.filter(t=>{
+    const raw=tableData.find(x=>String(x.n).toLowerCase()===String(t.id).toLowerCase()) || {};
+    const rawStatus=String(raw.s||'').toLowerCase();
+    const cardType=String(t.type||'').toLowerCase();
+    const statusOk=!status || (status==='running' ? cardType==='running' : rawStatus===status || cardType===status);
+    const zoneOk=!zone || String(t.zone||'').trim().toLowerCase()===zone;
+    if(!statusOk || !zoneOk) return false;
+    if(!q) return true;
+    return String(t.id).toLowerCase().includes(q) ||
+      String(t.zone||'').toLowerCase().includes(q) ||
+      String(t.captain||'').toLowerCase().includes(q) ||
+      String(t.guests||'').toLowerCase().includes(q);
+  });
   renderRTC(g,cards);
 
-  // Also search the Quick Floor Map — this is where every table in
-  // tableData actually lives (all 58 CLI10 tables: legacy RD/RDL/B/FL/FR/SW
-  // plus the real floor-plan DJ/ST/BP-RT/CB/BN/SN/HK codes),
-  // separate from the featured cards above. Previously the search box
-  // only touched richTblGrid, so searching a floor-map-only table found
-  // nothing even though it was right there. Matches on the real code
-  // (case-insensitive) rather than assuming numeric T-01..T-24.
+  // Highlight the matching table in the complete floor map without changing
+  // its data. Only the text search drives this highlight.
   document.querySelectorAll('#floorMap .fc').forEach(el=>el.classList.remove('search-hit'));
-  if (f && typeof tableData !== 'undefined'){
-    const norm = f.replace(/[^0-9a-z]/g,'');
-    const match = tableData.find(t => {
-      const tno = String(t.n).toLowerCase().replace(/[^0-9a-z]/g,'');
-      return norm === tno || norm === ('t'+tno) || (t.c||'').toLowerCase().includes(f);
+  if(q && typeof tableData!=='undefined'){
+    const norm=q.replace(/[^0-9a-z]/g,'');
+    const match=tableData.find(t=>{
+      const tno=String(t.n).toLowerCase().replace(/[^0-9a-z]/g,'');
+      return norm===tno || norm===('t'+tno) || String(t.c||'').toLowerCase().includes(q);
     });
-    if (match){
-      const el = document.querySelector(`#floorMap .fc[title*="${String(match.n)} "]`);
-      if (el){
-        el.classList.add('search-hit');
-        el.scrollIntoView({behavior:'smooth', block:'center'});
-      }
+    if(match){
+      const el=Array.from(document.querySelectorAll('#floorMap .fc')).find(x=>String(x.title||'').toLowerCase().includes(String(match.n).toLowerCase()));
+      if(el){ el.classList.add('search-hit'); el.scrollIntoView({behavior:'smooth',block:'center'}); }
     }
   }
+}
+function filterRTC(val, btn){
+  const text=String(val||'');
+  const isStatus=['','available','running','occupied','reserved','cleaning'].includes(text.toLowerCase());
+  const isZone=btn && btn.dataset && btn.dataset.tableZone!==undefined;
+  if(isZone){
+    document.querySelectorAll('#tableZoneFilters .fcat').forEach(b=>b.classList.remove('active'));
+    if(btn) btn.classList.add('active');
+    window._rtcFilterState.zone=text;
+  }else if(isStatus){
+    document.querySelectorAll('#tableStatusFilters .fcat').forEach(b=>b.classList.remove('active'));
+    if(btn) btn.classList.add('active');
+    window._rtcFilterState.status=text.toLowerCase();
+  }else{
+    window._rtcFilterState.search=text;
+  }
+  bnxApplyTableFilters_();
+}
+function bnxClearTableFilters_(){
+  window._rtcFilterState={search:'',status:'',zone:''};
+  document.querySelectorAll('#page-tables .fcat').forEach(b=>b.classList.remove('active'));
+  const allBtn=document.querySelector('#tableStatusFilters [data-table-filter=""]');
+  if(allBtn) allBtn.classList.add('active');
+  const inp=document.getElementById('tableMgmtSearch'); if(inp) inp.value='';
+  bnxApplyTableFilters_();
 }
 /* ── SINGLE-TABLE GALLERY ("give single table wise gallery show all
    table one by one full architucture map and bill and details") ──
@@ -10271,6 +10364,22 @@ let currentMenuCat='All', menuSearchTerm='';
    combines with whatever category tab is active. F2 jumps straight into
    the search box from anywhere on the POS screen (Tally-style shortcut).
    Clearing the box (or the ✕ button) goes back to the plain category view. */
+/* LIVE VEG/NON-VEG NORMALIZER
+   ITEM_MASTER data is not guaranteed to use one spelling: real rows may
+   return V/NV, VEG/NON-VEG, VEGETARIAN/NON VEGETARIAN, Y/N, YES/NO or
+   numeric flags. The old exact `i.v===currentVegFilter` comparison made
+   the Veg button look broken whenever the sheet used any other form. */
+function bnxNormalizeVeg_(v){
+  const x=String(v==null?'':v).trim().toUpperCase().replace(/[\s_-]+/g,'');
+  if(['V','VEG','VEGETARIAN','YES','Y','TRUE','1','GREEN'].includes(x)) return 'V';
+  if(['NV','NONVEG','NONVEGETARIAN','NO','N','FALSE','0','RED'].includes(x)) return 'NV';
+  if(['EGG','EG','E'].includes(x)) return 'EG';
+  return '';
+}
+function bnxNormalizeMenuVeg_(){
+  if(typeof menuData==='undefined') return;
+  menuData.forEach(i=>{ i.v=bnxNormalizeVeg_(i.v||i.veg||i.VEG||i.VEG_NONVEG||i.foodType||''); });
+}
 let currentVegFilter = 'All'; // All | V | NV
 function bnxItemHSN(item){
   try{ return (getTaxConfig()[getItemTaxCat(item.n,item.c)]||{}).hsn || ''; }catch(e){ return ''; }
@@ -10395,8 +10504,9 @@ function bnxLoadSavedMenu(){
       usingDemoMenu = false;
     }
   }catch(e){}
-  menuData.forEach(it=>{ if(!it.e) it.e = bnxDefaultIcon(it.c); });
+  menuData.forEach(it=>{ if(!it.e) it.e = bnxDefaultIcon(it.c); it.v=bnxNormalizeVeg_(it.v||it.veg||it.VEG||it.foodType)||'NV'; });
 }
+
 // Rebuild the category tab row from whatever's really in menuData, so a
 // newly-uploaded/created category always gets its own working tab.
 function bnxRebuildCategoryPills(){
@@ -10437,7 +10547,7 @@ function buildMenu(){
     items = menuData;
   }
   if (currentVegFilter!=='All'){
-    items = items.filter(i=>i.v===currentVegFilter);
+    items = items.filter(i=>bnxNormalizeVeg_(i.v||i.veg||i.VEG)===currentVegFilter);
   }
   if (menuSearchTerm){
     items = items.filter(i =>
@@ -11826,7 +11936,7 @@ function printThermalReceipt(d){
   // ₹ glyph (Courier New doesn't have it) without loading the font
   // here too. Same fix already applied to inventory.html's print
   // windows this session.
-  w.document.write('<!DOCTYPE html><html><head><title>Bill Print - Balaji NextGen ERP</title><link href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;700&display=swap" rel="stylesheet"><style>'+css+'</style></head><body>'+html+'</body></html>');
+  w.document.write('<!DOCTYPE html><html><head><title>Bill Print - Balaji NextGen ERP</title><style>'+css+'</style></head><body>'+html+'</body></html>');
   w.document.close();
   // FIX ("resturent dashboard slow print invoice" — Sep 2026): this
   // always waited a blind, fixed 500ms after opening the window before
@@ -11843,7 +11953,7 @@ function printThermalReceipt(d){
   let bnxPrinted = false;
   const bnxDoPrint = () => { if (bnxPrinted) return; bnxPrinted = true; try { w.print(); } catch(e){} };
   w.onload = bnxDoPrint;
-  setTimeout(bnxDoPrint, 1200);
+  setTimeout(bnxDoPrint, 650);
 }
 async function settleOrder(){
   // FIX (Aug 2026): Prevent double-clicking Settlement from creating duplicate bills
@@ -14165,8 +14275,11 @@ async function bmDoPrint(){
 
   // Render AFTER save so the printed document contains the server-confirmed invoice no.
   try{
-    bmRenderThermal('bmModalThermal');
-    bmRenderA4('bmModalA4');
+    // Render only the format the user selected. The previous version built
+    // both thermal and A4 DOM trees on every invoice print, adding avoidable
+    // work on POS terminals before the print window could be filled.
+    if(isA4) bmRenderA4('bmModalA4');
+    else bmRenderThermal('bmModalThermal');
   }catch(e){
     console.error('[PRINT] Invoice render failed:', e);
     try { w.close(); } catch(ignore){}
@@ -14222,7 +14335,7 @@ async function bmDoPrint(){
     setTimeout(() => { try { w.close(); } catch(e){} }, 300);
   };
   w.onload = doPrint;
-  setTimeout(doPrint, 700);
+  setTimeout(doPrint, 450);
 
   if (typeof bmClosePrintModal === 'function') bmClosePrintModal();
 }
@@ -16058,6 +16171,7 @@ function loadMenuData(){
           existing.p = parseFloat(row.price ?? row.PRICE ?? row.p) || existing.p;
           existing.gst = parseFloat(row.gst ?? row.GST) || existing.gst || 0;
           if (rowAvail) existing.avail = rowAvail;
+          existing.v = bnxNormalizeVeg_(row.veg || row.v || row.VEG || row.VEG_NONVEG || row.foodType || existing.v);
           // FIX ("category and group problem"): category was never
           // re-synced on an existing cached item — only price/gst were.
           // So once a device had cached an item under its old raw
@@ -16076,7 +16190,7 @@ function loadMenuData(){
           updated++;
         } else {
           menuData.push({ n:name, p:parseFloat(row.price ?? row.PRICE ?? row.p)||0, c:cat,
-            v: (row.veg||row.v||'NV'), e: row.icon||row.e||bnxDefaultIcon(cat), fav:false,
+            v: bnxNormalizeVeg_(row.veg||row.v||row.VEG||row.VEG_NONVEG||row.foodType) || 'NV', e: row.icon||row.e||bnxDefaultIcon(cat), fav:false,
             code: row.id||row.ITEM_ID||('ITM'+Date.now().toString().slice(-6)), gst: parseFloat(row.gst ?? row.GST)||0,
             avail: rowAvail || 'available' });
           added++;
@@ -23890,13 +24004,14 @@ function warmBillingCache() {
               existing.p = Number(row.price) || existing.p;
               existing.gst = Number(row.gst) || existing.gst || 0;
               if (rowAvail) existing.avail = rowAvail;
+              existing.v = bnxNormalizeVeg_(row.veg || row.v || row.VEG || row.VEG_NONVEG || row.foodType || existing.v);
               if (row.category && row.category !== 'Uncategorised'){
                 existing.c = row.category;
                 existing.e = row.icon || existing.e || (typeof bnxDefaultIcon==='function'?bnxDefaultIcon(row.category):'🍽');
               }
             } else {
               menuData.push({ n:row.name, p:Number(row.price)||0, c:row.category||'Uncategorised',
-                v:'NV', e:row.icon||(typeof bnxDefaultIcon==='function'?bnxDefaultIcon(row.category):'🍽'), fav:false,
+                v:bnxNormalizeVeg_(row.veg||row.v||row.VEG||row.VEG_NONVEG||row.foodType)||'NV', e:row.icon||(typeof bnxDefaultIcon==='function'?bnxDefaultIcon(row.category):'🍽'), fav:false,
                 code: row.id||('ITM'+Date.now().toString().slice(-6)), gst: Number(row.gst)||0,
                 avail: rowAvail || 'available' });
             }
@@ -23934,13 +24049,14 @@ function warmBillingCache() {
             existing.p = parseFloat(row.price ?? row.PRICE ?? row.p) || existing.p;
             existing.gst = parseFloat(row.gst ?? row.GST) || existing.gst || 0;
             if (rowAvail) existing.avail = rowAvail;
+            existing.v = bnxNormalizeVeg_(row.veg || row.v || row.VEG || row.VEG_NONVEG || row.foodType || existing.v);
             if (cat && cat !== 'Uncategorised'){
               existing.c = cat;
               existing.e = row.icon || row.e || existing.e || (typeof bnxDefaultIcon==='function'?bnxDefaultIcon(cat):'🍽');
             }
           } else {
             menuData.push({ n:name, p:parseFloat(row.price ?? row.PRICE ?? row.p)||0, c:cat,
-              v:(row.veg||row.v||'NV'), e:row.icon||row.e||(typeof bnxDefaultIcon==='function'?bnxDefaultIcon(cat):'🍽'), fav:false,
+              v:bnxNormalizeVeg_(row.veg||row.v||row.VEG||row.VEG_NONVEG||row.foodType)||'NV', e:row.icon||row.e||(typeof bnxDefaultIcon==='function'?bnxDefaultIcon(cat):'🍽'), fav:false,
               code: row.id||row.ITEM_ID||('ITM'+Date.now().toString().slice(-6)), gst: parseFloat(row.gst ?? row.GST)||0,
               avail: rowAvail || 'available' });
           }
@@ -23959,6 +24075,7 @@ function warmBillingCache() {
 }
 
 // Warm cache when DOM is ready
+document.addEventListener('DOMContentLoaded', function(){ try{ bnxNormalizeMenuVeg_(); if(typeof buildMenu==='function' && document.getElementById('page-pos')?.classList.contains('active')) buildMenu(); }catch(e){} }, { once: true });
 document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
 </script>
 <div class="rpt-print-menu" id="rptPrintMenu">
@@ -24073,8 +24190,8 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
     const rows=(typeof tableData!=='undefined'?tableData:[]);
     const zones=[...new Set(rows.map(t=>String(t.zone||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
     const status=[['','All'],['available','🟢 Available'],['running','🟡 Running'],['occupied','🔴 Occupied'],['reserved','🟠 Reserved'],['cleaning','🔵 Cleaning']];
-    sf.innerHTML=status.map(([v,l],i)=>`<button class="fcat${i===0?' active':''}" data-table-filter="${v}" onclick="filterRTC('${v}',this)">${l}</button>`).join('');
-    zf.innerHTML=zones.map(z=>{ const safe=String(z).replace(/'/g,"\\'"); return `<button class="fcat" data-table-zone="${esc(z)}" onclick="filterRTC('\${safe}',this)">📍 ${esc(z)}</button>`; }).join('');
+    sf.innerHTML=status.map(([v,l],i)=>`<button type="button" class="fcat${i===0?' active':''}" data-table-filter="${v}" onclick="filterRTC('${v}',this)">${l}</button>`).join('');
+    zf.innerHTML=zones.map(z=>{ const safe=String(z).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); return `<button type="button" class="fcat" data-table-zone="${esc(z)}" onclick="filterRTC(${JSON.stringify(String(z))},this)">📍 ${esc(z)}</button>`; }).join('');
   };
   const oldBuild=window.buildRichTbls;
   window.buildRichTbls=function(){ if(typeof oldBuild==='function') oldBuild(); window.bnxRefreshLiveTableFilters(); };
