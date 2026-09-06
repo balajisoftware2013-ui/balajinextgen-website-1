@@ -148,6 +148,59 @@ function bnxApiUrl_(endpoint){
   return (BNX_SAME_ORIGIN_API && BNX_SAME_ORIGIN_API[endpoint]) || GAS_APIS_DASH[endpoint || 'V2_CORE'];
 }
 
+/* ═══ ROBUST API TRANSPORT — proxy 405/HTML fallback ═══
+   The live site currently returns HTTP 405 for POST /api/core. That is a
+   hosting/proxy method problem, not a Google Apps Script router problem.
+   Never retry the broken proxy 44 times while the real GAS endpoint is
+   available. Try same-origin first, then automatically fall back to the
+   configured GAS deployment when the proxy returns 405/4xx HTML or invalid
+   JSON. text/plain keeps the request CORS-simple for GAS web apps.
+*/
+async function bnxFetchApi_(endpoint, payload, timeoutMs){
+  endpoint = endpoint || 'V2_CORE';
+  payload = payload || {};
+  const primary = bnxApiUrl_(endpoint);
+  const direct = GAS_APIS_DASH[endpoint];
+  const urls = [];
+  [primary, direct].forEach(u=>{ if(u && !urls.includes(u)) urls.push(u); });
+  let lastErr = null;
+  for (let i=0;i<urls.length;i++){
+    const url = urls[i];
+    const ctrl = new AbortController();
+    const timer = setTimeout(()=>ctrl.abort(), timeoutMs || 15000);
+    try{
+      const body = JSON.stringify(payload);
+      const r = await fetch(url, {
+        method:'POST',
+        headers:{'Content-Type':'text/plain;charset=utf-8'},
+        body,
+        signal:ctrl.signal,
+        redirect:'follow'
+      });
+      const text = await r.text();
+      clearTimeout(timer);
+      const ct = (r.headers.get('content-type')||'').toLowerCase();
+      let data = null;
+      try { data = JSON.parse(text); } catch(e) {
+        data = {success:false, error:'API returned non-JSON response', httpStatus:r.status, raw:text.slice(0,180)};
+      }
+      if (r.ok && data && (ct.includes('json') || typeof data === 'object')) {
+        if (i>0) console.info('[ERP API] Direct GAS fallback active for '+endpoint+' — '+url);
+        return data;
+      }
+      lastErr = new Error('HTTP '+r.status+(data && data.error ? ' — '+data.error : ''));
+      // 405/HTML from /api/core means the proxy cannot accept POST. Do not
+      // waste the remaining retry budget; immediately try direct GAS.
+      if (i === 0 && direct && direct !== primary) continue;
+    } catch(e){
+      clearTimeout(timer);
+      lastErr = e;
+      if (i === 0 && direct && direct !== primary) continue;
+    }
+  }
+  throw lastErr || new Error('API unavailable');
+}
+
 /* CENTRALIZED CONFIG — same mechanism as steward-mobile.html, see its
    comment for the full explanation. Once DEPLOYMENT_CONFIG exists in
    your security DB, both apps' V2_CORE/V2_AUTH stay in sync from one
@@ -159,9 +212,8 @@ async function bnxRefreshConfig(){
   // forever. Still falls back to the hardcoded bootstrap IDs either
   // way (never blocks startup), but now every outcome is logged.
   try{
-    const r = await fetch(bnxApiUrl_('V2_CORE'), {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({action:'GET_CONFIG'})});
-    const res = await r.json();
-    if(res && res.success && res.data){
+    const res = await bnxFetchApi_('V2_CORE', {action:'GET_CONFIG'}, 10000);
+    if(res && (res.success === true || res.ok === true) && res.data){
       if(res.data.v2CoreId) localStorage.setItem('bnx_api_core', res.data.v2CoreId);
       if(res.data.v2AuthId) localStorage.setItem('bnx_api_auth', res.data.v2AuthId);
       // FIX (P1 — "GAS_URL can become stale"): writing to localStorage
@@ -341,17 +393,8 @@ async function gasApi(action, payload, endpoint) {
             // have failed the instant that backend went live. Mirrors
             // steward-mobile.html's getSessionToken(), which already
             // does this correctly.
-            const r = await fetch(url, {
-              method: 'POST',
-              body: JSON.stringify(Object.assign({ action: action, clientId: CLIENT_ID, sessionToken: (localStorage.getItem('ERP_SESSION')||'') }, payload)),
-              signal: ctrl.signal,
-              headers: { 'Content-Type': 'text/plain;charset=utf-8' }
-            });
-            
             clearTimeout(timeoutId);
-            
-            if (!r.ok && r.status !== 200) throw new Error(`HTTP ${r.status}`);
-            const data = await r.json();
+            const data = await bnxFetchApi_(endpoint || 'V2_CORE', Object.assign({ action: action, clientId: CLIENT_ID, sessionToken: (localStorage.getItem('ERP_SESSION')||'') }, payload), 15000);
             bnxCheckAuthFailure_(data);
             resolve(data);
             return;
@@ -7077,9 +7120,7 @@ async function erpApi(payload, type='V2_AUTH'){
       (typeof ERP!=='undefined' && ERP.getClient ? ERP.getClient() : '') ||
       localStorage.getItem('ERP_CLIENT') || '';
     if (!client) return {success:false,error:'No authenticated client ID'};
-    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},
-      body:JSON.stringify({...payload,sessionToken:session,clientId:client,module:'RESTAURANT'}),redirect:'follow'});
-    const data=await r.json();
+    const data=await bnxFetchApi_(type || 'V2_AUTH', {...payload,sessionToken:session,clientId:client,module:'RESTAURANT'}, 15000);
     /* Normalize: GAS returns {ok,status} but restaurant expects {success,data} */
     if(data.ok!==undefined && data.success===undefined){
       data.success = data.ok;
@@ -8527,12 +8568,18 @@ async function checkDB(id, label, apiType){
   const el=document.getElementById(id); if(!el) return false;
   el.className='db-pill checking'; el.innerHTML=`<span class="db-dot pulse"></span>${label}…`;
   try{
-    const ctrl=new AbortController();
-    const to=setTimeout(()=>ctrl.abort(),7000);
-    const res=await fetch(bnxApiUrl_(apiType)+'?action=PING',{signal:ctrl.signal});
-    clearTimeout(to);
-    if(res.ok){ el.className='db-pill online'; el.innerHTML=`<span class="db-dot"></span>${label} ✓`; return true; }
-  }catch(e){}
+    // IMPORTANT: do not use GET ?action=PING. The consolidated backend is
+    // POST/JSON based and the live /api/core proxy currently rejects POST
+    // with 405. Use the real GET_CONFIG action through the robust transport.
+    const res = await bnxFetchApi_(apiType || 'V2_CORE', {action:'GET_CONFIG'}, 10000);
+    const ok = !!(res && (res.success === true || res.ok === true) &&
+      (res.data || res.v2CoreId || res.v2AuthId || res.message || res.success));
+    if(ok){
+      el.className='db-pill online'; el.innerHTML=`<span class="db-dot"></span>${label} ✓`; return true;
+    }
+  }catch(e){
+    console.warn('[DB '+label+'] '+e.message);
+  }
   el.className='db-pill offline'; el.innerHTML=`<span class="db-dot"></span>${label} ✗`; return false;
 }
 async function checkAllDBs(verbose=false){
@@ -8747,7 +8794,10 @@ function bnxComputeDashExtras_(){
     // already resolve the real selected range correctly — this only
     // affects the NEW extras computed here.
     const { bills } = (typeof bnxResolveReportRange === 'function') ? bnxResolveReportRange(from, to) : { bills: [] };
-    const live = bills.filter(b => b.status !== 'Cancelled');
+    const live = bills.filter(b => {
+      const st = String(b.status||'').trim().toUpperCase();
+      return st !== 'CANCELLED' && st !== 'VOID';
+    });
 
     // FIX (bug caught during this pass, not user-reported): Gross Sales
     // is labeled "Incl. GST" but was summing b.sub (the pre-tax
@@ -9213,7 +9263,12 @@ async function loadDashboard(){
       if (todaysBills.length){
         haveOfflineBills = true;
         offlineOrd = todaysBills.length;
-        offlineRev = todaysBills.reduce((s,b)=>s+Number(b.total||0),0);
+        offlineRev = todaysBills.reduce((s,b)=>{
+          const total = Number(b.total)||0, tax = Number(b.gst)||0, round = Number(b.roundOff)||0;
+          const taxable = Number(b.taxableAmount);
+          const net = Number.isFinite(taxable) && (taxable !== 0 || total === 0) ? taxable : Math.max(0, total-tax-round);
+          return s + net;
+        },0);
         offlineCov = todaysBills.reduce((s,b)=>s+Number(b.pax||0),0) || offlineOrd;
       }
     }
