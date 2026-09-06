@@ -147,6 +147,12 @@ const BNX_SAME_ORIGIN_API = (function(){
 function bnxApiUrl_(endpoint){
   return (BNX_SAME_ORIGIN_API && BNX_SAME_ORIGIN_API[endpoint]) || GAS_APIS_DASH[endpoint || 'V2_CORE'];
 }
+function bnxApiCandidates_(endpoint){
+  const key=endpoint||'V2_CORE';
+  const proxy=BNX_SAME_ORIGIN_API&&BNX_SAME_ORIGIN_API[key];
+  const direct=GAS_APIS_DASH[key];
+  return [proxy,direct].filter((u,i,a)=>u&&a.indexOf(u)===i);
+}
 
 /* CENTRALIZED CONFIG — same mechanism as steward-mobile.html, see its
    comment for the full explanation. Once DEPLOYMENT_CONFIG exists in
@@ -295,7 +301,7 @@ function bnxCheckAuthFailure_(data){
 let _bnxWarnedNoSession = false;
 async function gasApi(action, payload, endpoint) {
   payload = payload || {};
-  const url = bnxApiUrl_(endpoint || 'V2_CORE');
+  const urls = bnxApiCandidates_(endpoint || 'V2_CORE');
   // FIX: every write handler in 20_POSBillingHandlers.gs rejects with
   // "Invalid or expired session" the instant sessionToken is missing
   // or stale — but that only ever showed up buried in an aggregate
@@ -341,17 +347,26 @@ async function gasApi(action, payload, endpoint) {
             // have failed the instant that backend went live. Mirrors
             // steward-mobile.html's getSessionToken(), which already
             // does this correctly.
-            const r = await fetch(url, {
-              method: 'POST',
-              body: JSON.stringify(Object.assign({ action: action, clientId: CLIENT_ID, sessionToken: (localStorage.getItem('ERP_SESSION')||'') }, payload)),
-              signal: ctrl.signal,
-              headers: { 'Content-Type': 'text/plain;charset=utf-8' }
-            });
-            
+            let r=null, data=null, lastError=null;
+            for (const url of urls){
+              try{
+                r = await fetch(url, {
+                  method: 'POST',
+                  body: JSON.stringify(Object.assign({ action: action, clientId: CLIENT_ID, sessionToken: (localStorage.getItem('ERP_SESSION')||'') }, payload)),
+                  signal: ctrl.signal,
+                  headers: { 'Content-Type': 'text/plain;charset=utf-8' }
+                });
+                if (!r.ok && r.status !== 200) throw new Error(`HTTP ${r.status}`);
+                data = await r.json();
+                if (data && (data.success !== undefined || data.error !== undefined || data.statusCode !== undefined)) break;
+                throw new Error('Invalid ERP response');
+              }catch(e){
+                lastError=e;
+                if (url===urls[urls.length-1]) throw e;
+              }
+            }
             clearTimeout(timeoutId);
-            
-            if (!r.ok && r.status !== 200) throw new Error(`HTTP ${r.status}`);
-            const data = await r.json();
+            if (!data) throw (lastError || new Error('No ERP API endpoint available'));
             bnxCheckAuthFailure_(data);
             resolve(data);
             return;
@@ -3643,7 +3658,7 @@ document.addEventListener('DOMContentLoaded', function(){
         </div>
         <div class="bf-g"><label>PAX (Covers)</label><input class="fi" type="number" id="bm-bf-pax" value="2" min="1" max="50"></div>
         <div class="bf-g"><label>Customer Name</label><input class="fi" id="bm-bf-cname" value="GENERAL CUSTOMER"></div>
-        <div class="bf-g"><label>Mobile</label><input class="fi" type="tel" id="bm-bf-mobile" value="1111111111"></div>
+        <div class="bf-g"><label>Mobile</label><input class="fi" type="tel" id="bm-bf-mobile" value=""></div>
         <div class="bf-g"><label>Steward / Server</label>
           <select class="fi fsel" id="bm-bf-waiter" onchange="bnxHandleWaiterSelect(this)">
             <option value="">Select Steward...</option>
@@ -8526,15 +8541,26 @@ async function doLogout(){
 async function checkDB(id, label, apiType){
   const el=document.getElementById(id); if(!el) return false;
   el.className='db-pill checking'; el.innerHTML=`<span class="db-dot pulse"></span>${label}…`;
-  try{
-    const ctrl=new AbortController();
-    const to=setTimeout(()=>ctrl.abort(),7000);
-    const res=await fetch(bnxApiUrl_(apiType)+'?action=PING',{signal:ctrl.signal});
-    clearTimeout(to);
-    if(res.ok){ el.className='db-pill online'; el.innerHTML=`<span class="db-dot"></span>${label} ✓`; return true; }
-  }catch(e){}
-  el.className='db-pill offline'; el.innerHTML=`<span class="db-dot"></span>${label} ✗`; return false;
+  const urls=bnxApiCandidates_(apiType);
+  for(const url of urls){
+    try{
+      const ctrl=new AbortController();
+      const timer=setTimeout(()=>ctrl.abort(),5000);
+      const res=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:'GET_CONFIG',requestId:'dbcheck-'+Date.now()}),signal:ctrl.signal});
+      clearTimeout(timer);
+      if(!res.ok) continue;
+      let data=null; try{data=await res.json();}catch(e){}
+      if(data && (data.success===true || data.error!==undefined || data.statusCode!==undefined)){
+        el.className='db-pill online';
+        el.innerHTML=`<span class="db-dot"></span>${label} ✓`;
+        return true;
+      }
+    }catch(e){}
+  }
+  el.className='db-pill offline'; el.innerHTML=`<span class="db-dot"></span>${label} ✗`;
+  return false;
 }
+
 async function checkAllDBs(verbose=false){
   document.getElementById('dbSync').textContent='Checking…';
   await Promise.allSettled([
@@ -11488,7 +11514,7 @@ function printBill(confirmedBillNo){
   }
   const covers = document.getElementById('coversInput')?.value || '2';
   const cname = (document.getElementById('custNameInput')?.value || 'GENERAL CUSTOMER').toUpperCase();
-  const cmob = document.getElementById('custMobileInput')?.value || '1111111111';
+  const cmob = document.getElementById('custMobileInput')?.value || '';
   const items = Object.entries(cart).map(([n,v])=>({ name:n, qty:v.qty, rate:v.price, amt:v.price*v.qty }));
   const sub = items.reduce((a,i)=>a+i.amt,0);
   const discPct = parseFloat(document.getElementById('discInput')?.value||0);
@@ -11602,87 +11628,76 @@ function bnxSetPosSize(sz){
 }
 document.addEventListener('DOMContentLoaded', bnxApplyPosSizeUI);
 
+function bnxPrintEsc_(v){
+  return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function bnxMoney_(v){ return '₹'+Number(v||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function bnxTaxRateLabel_(r){
+  if (r && r.taxName) return r.taxName;
+  return 'GST';
+}
 function buildThermalBodyHTML(d){
-  const sub = d.sub||0;
-  const discPct = d.discPct||0;
-  const disc = d.disc||0;
-  const scPct = d.scPct||0;
-  const sc = d.sc||0;
-  const cgst = d.cgst||0, sgst = d.sgst||0, igst = d.igst||0;
-  /* PASS #27 FIX ("invoice print invoice total not proper print place
-     fix"): confirmed against the real reprinted PDF (BN/00005) — the
-     "Tax" line in this summary block showed ₹0 while the Tax Break
-     up table two lines below it correctly showed GST ₹0 for the
-     exact same bill. Root cause: taxAmt here was ONLY ever cgst+sgst+
-     igst, and any caller that passes tax via d.taxRows instead (e.g.
-     blReprintBill, PASS #15) never sets cgst/sgst/igst -- so this line
-     silently showed 0 even though the real tax was sitting right there
-     in d.taxRows. Now falls back to summing d.taxRows' own taxAmt
-     values when cgst/sgst/igst weren't set, so the summary line and the
-     breakup table underneath it can never disagree again. */
-  let taxAmt = cgst+sgst+igst;
-  if (!taxAmt && d.taxRows && d.taxRows.length) taxAmt = d.taxRows.reduce((s,r)=>s+(Number(r.taxAmt)||0), 0);
-  const taxOnAmt = d.taxBase!=null ? d.taxBase : (sub - disc);
-  const total = d.total!=null ? d.total : (taxOnAmt + sc + taxAmt);
-  const totalRounded = Math.round(total);
-  const roundOff = d.roundOff!=null ? d.roundOff : (totalRounded-total);
-  const itemQty = d.items.reduce((a,i)=>a+i.qty,0);
-  const taxName = taxAmt>0 ? (igst>0?'IGST @'+(d.igstPct||18)+'%':'GST @'+(discPct>=0?((cgst+sgst)/Math.max(taxOnAmt,1)*100).toFixed(1):'')+'%') : 'Exempted';
-  /* FIX ("print not clear due to size, very small, crease, not clear in
-     pos machine"): every line on the physical receipt was set at 9–11px,
-     which on an 80mm thermal printhead prints so small and faint it's
-     unreadable once the paper creases or fades slightly. All sizes below
-     are bumped up (roughly +2–3px each) and set to at least medium weight
-     so the print comes out bold and legible; the ITEM/QTY/RATE/AMT and
-     HSN table columns are widened to match so nothing wraps or overlaps. */
+  d=d||{};
+  const items=Array.isArray(d.items)?d.items:[];
+  const sub=Number(d.sub)||0, discPct=Number(d.discPct)||0, disc=Number(d.disc)||0;
+  const scPct=Number(d.scPct)||0, sc=Number(d.sc)||0;
+  const cgst=Number(d.cgst)||0, sgst=Number(d.sgst)||0, igst=Number(d.igst)||0;
+  let taxAmt=cgst+sgst+igst;
+  if(!taxAmt && Array.isArray(d.taxRows)) taxAmt=d.taxRows.reduce((a,r)=>a+(Number(r.taxAmt)||0),0);
+  const taxOnAmt=Number(d.taxBase)!=null ? Number(d.taxBase)||0 : Math.max(0,sub-disc);
+  const total=Number(d.total)!=null ? Number(d.total)||0 : taxOnAmt+sc+taxAmt;
+  const rounded=Math.round(total), roff=Number(d.roundOff!=null?d.roundOff:d.roff)||rounded-total;
+  const qty=items.reduce((a,i)=>a+(Number(i.qty)||0),0);
+  const rows=Array.isArray(d.taxRows)&&d.taxRows.length?d.taxRows:[{hsn:d.sac||d.hsn||'—',taxName:igst?'IGST':(taxAmt?'GST':'Exempted'),onAmt:taxOnAmt,taxAmt:taxAmt}];
+  const logo=bnxResolvePrintLogo_();
+  const entity=bnxPrintEsc_(d.entity||'Restaurant');
+  const addr=bnxPrintEsc_(d.addr||'');
+  const phone=bnxPrintEsc_(d.phone||'');
+  const gstin=bnxPrintEsc_(d.gstin||'');
+  const bill=bnxPrintEsc_(d.billNo||d.billno||'');
+  const customer=bnxPrintEsc_(d.cname||'GENERAL CUSTOMER');
+  const mobile=bnxPrintEsc_(d.cmob||'');
+  const table=bnxPrintEsc_(d.table||'TAKEAWAY');
+  const waiter=bnxPrintEsc_(d.waiter||'');
+  const paymode=bnxPrintEsc_(d.paymode||'CASH').toUpperCase();
+  const kot=bnxPrintEsc_(d.kot||'');
+  const remarks=bnxPrintEsc_(d.remarks||'');
   return `
-      <div style="text-align:center;margin-bottom:4px;"><img src="${bnxResolvePrintLogo_()}" alt="" style="width:40px;height:40px;border-radius:9px;"></div>
-      <div style="text-align:center;font-weight:800;font-size:calc(17px * var(--posScale,1));letter-spacing:.06em;">${(d.entity||'').toUpperCase()}</div>
-      <div style="text-align:center;font-size:calc(12px * var(--posScale,1));font-weight:700;">${d.addr||''}</div>
-      <div style="text-align:center;font-size:calc(12px * var(--posScale,1));font-weight:700;">Ph: ${d.phone||''}</div>
-      <div style="text-align:center;font-size:calc(12px * var(--posScale,1));font-weight:700;">GSTIN: ${d.gstin||''}</div>
-      <hr style="border:none;border-top:1px dashed #000;margin:7px 0;">
-      <div style="text-align:center;font-weight:700;font-size:calc(14px * var(--posScale,1));letter-spacing:.12em;">${d.isEstimate ? 'ESTIMATE — NOT A TAX INVOICE' : 'TAX INVOICE'}</div>
-      <hr style="border:none;border-top:1px dashed #000;margin:7px 0;">
-      <div style="display:flex;justify-content:space-between;font-size:calc(13px * var(--posScale,1));"><span>${d.isEstimate ? 'Estimate' : 'Bill No'}</span><span>: ${d.isEstimate ? '(not yet settled)' : (d.billNo||d.billno||'')}</span></div>
-      <div style="display:flex;justify-content:space-between;font-size:calc(13px * var(--posScale,1));"><span>Date</span><span>: ${d.date||''}${d.time?' '+d.time:''}</span></div>
-      <div style="display:flex;justify-content:space-between;font-size:calc(13px * var(--posScale,1));"><span>Table</span><span>: ${d.table||'-'} &nbsp; Pax: ${d.pax||1}</span></div>
-      <div style="display:flex;justify-content:space-between;font-size:calc(13px * var(--posScale,1));"><span>Customer</span><span>: ${d.cname||'GENERAL CUSTOMER'} : MOB: ${d.cmob||''}</span></div>
-      ${d.waiter?`<div style="display:flex;justify-content:space-between;font-size:calc(13px * var(--posScale,1));"><span>Steward</span><span>: ${d.waiter}</span></div>`:''}
-      <hr style="border:none;border-top:1px dashed #000;margin:7px 0;">
-      <div style="display:grid;grid-template-columns:1fr 30px 60px 66px;gap:3px;font-size:calc(12px * var(--posScale,1));font-weight:700;">
-        <span>ITEM</span><span style="text-align:center;">QTY</span><span style="text-align:right;">RATE</span><span style="text-align:right;">AMT</span>
-      </div>
-      <hr style="border:none;border-top:1px dashed #000;margin:5px 0;">
-      ${d.items.map(i=>`<div style="display:grid;grid-template-columns:1fr 30px 60px 66px;gap:3px;font-size:calc(13px * var(--posScale,1));font-weight:700;">
-        <span>${i.name}</span><span style="text-align:center;">${i.qty}</span><span style="text-align:right;">₹${i.rate.toFixed(2)}</span><span style="text-align:right;">₹${i.amt.toFixed(2)}</span>
-      </div>${i.mrpNote?`<div style="font-size:calc(11px * var(--posScale,1));color:#333;">MRP :${i.mrpNote}</div>`:''}`).join('')}
-      <hr style="border:none;border-top:1px dashed #000;margin:7px 0;">
-      <div style="display:flex;justify-content:space-between;font-size:calc(13px * var(--posScale,1));"><span>Sub Total</span><span>₹${sub.toFixed(2)}</span></div>
-      <div style="display:flex;justify-content:space-between;font-size:calc(13px * var(--posScale,1));"><span>Discount (${discPct}%)</span><span>₹${disc.toFixed(2)}</span></div>
-      <div style="display:flex;justify-content:space-between;font-size:calc(13px * var(--posScale,1));"><span>SC (Optional) (${scPct}%)</span><span>₹${sc.toFixed(2)}</span></div>
-      <div style="display:flex;justify-content:space-between;font-size:calc(13px * var(--posScale,1));"><span>Tax</span><span>₹${taxAmt.toFixed(2)}</span></div>
-      <div style="display:flex;justify-content:space-between;font-size:calc(13px * var(--posScale,1));"><span>Round Off</span><span>₹${roundOff.toFixed(2)}</span></div>
-      <hr style="border:none;border-top:1px dashed #000;margin:7px 0;">
-      <div style="display:flex;justify-content:space-between;font-size:calc(16px * var(--posScale,1));font-weight:800;">
-        <span>Items ${d.items.length} &nbsp; Qty ${itemQty}</span><span>TOTAL &nbsp; ₹${totalRounded.toFixed(2)}</span>
-      </div>
-      <hr style="border:none;border-top:1px dashed #000;margin:7px 0;">
-      <div style="font-size:calc(12px * var(--posScale,1));font-weight:700;margin-bottom:4px;">Tax Break up</div>
-      <div style="display:grid;grid-template-columns:50px 1fr 62px 62px;font-size:calc(12px * var(--posScale,1));font-weight:700;"><span>HSN</span><span>TaxName</span><span style="text-align:right;">OnAmt</span><span style="text-align:right;">TaxAmt</span></div>
-      ${(d.taxRows && d.taxRows.length ? d.taxRows : [{hsn:d.hsn||'—', taxName:taxName, onAmt:taxOnAmt, taxAmt:taxAmt}]).map(r=>
-        `<div style="display:grid;grid-template-columns:50px 1fr 62px 62px;font-size:calc(12px * var(--posScale,1));font-weight:700;"><span>${r.hsn}</span><span>${r.taxName}</span><span style="text-align:right;">₹${r.onAmt.toFixed(2)}</span><span style="text-align:right;">₹${r.taxAmt.toFixed(2)}</span></div>`
-      ).join('')}
-      <hr style="border:none;border-top:1px dashed #000;margin:7px 0;">
-      <div style="font-size:calc(12px * var(--posScale,1));font-weight:700;margin-bottom:4px;">Payment Adjustment</div>
-      <div style="display:flex;justify-content:space-between;font-size:calc(13px * var(--posScale,1));font-weight:700;"><span>PAYMODE</span><span>AdjustAmt</span></div>
-      <div style="display:flex;justify-content:space-between;font-size:calc(13px * var(--posScale,1));font-weight:700;"><span>${(d.paymode||'').toUpperCase()}</span><span>₹${totalRounded.toFixed(2)}</span></div>
-      <hr style="border:none;border-top:1px dashed #000;margin:7px 0;">
-      <div style="font-size:calc(12px * var(--posScale,1));font-weight:700;">User : ${d.user||'STAFF'}</div>
-      <div style="font-size:calc(12px * var(--posScale,1));font-weight:700;">KOT : ${d.kot||'-'}</div>
-      <div style="font-size:calc(12px * var(--posScale,1));font-weight:700;">Remarks : ${d.remarks||''}</div>
-      <hr style="border:none;border-top:2px double #000;margin:7px 0;">
-      <div style="text-align:center;font-size:calc(12px * var(--posScale,1));font-weight:700;margin-top:6px;">We Support round table<br>THANK YOU, VISIT AGAIN</div>`;
+    <div class="pos-invoice-head">
+      <img src="${logo}" class="pos-logo" alt="">
+      <div class="pos-brand">${entity}</div>
+      ${addr?`<div class="pos-muted">${addr}</div>`:''}
+      ${phone?`<div class="pos-muted">Ph: ${phone}</div>`:''}
+      ${gstin?`<div class="pos-muted"><b>GSTIN:</b> ${gstin}</div>`:''}
+    </div>
+    <div class="pos-invoice-title">${d.isEstimate?'ESTIMATE':'TAX INVOICE'}</div>
+    <div class="pos-meta">
+      <div><b>${d.isEstimate?'Estimate':'Invoice No'}</b><span>${bill||'—'}</span></div>
+      <div><b>Date</b><span>${bnxPrintEsc_(d.date||'—')} ${bnxPrintEsc_(d.time||'')}</span></div>
+      <div><b>Table / Pax</b><span>${table} / ${bnxPrintEsc_(d.pax||1)}</span></div>
+      ${waiter?`<div><b>Steward</b><span>${waiter}</span></div>`:''}
+      <div><b>Customer</b><span>${customer}</span></div>
+      ${mobile?`<div><b>Mobile</b><span>${mobile}</span></div>`:''}
+    </div>
+    <div class="pos-rule"></div>
+    <div class="pos-items-head"><span>ITEM</span><span>QTY</span><span>RATE</span><span>AMT</span></div>
+    ${items.map(i=>`<div class="pos-item"><span>${bnxPrintEsc_(i.name||'Item')}</span><span>${Number(i.qty)||0}</span><span>${bnxMoney_(i.rate)}</span><span>${bnxMoney_(i.amt)}</span></div>${i.mrpNote?`<div class="pos-mrp">MRP ${bnxPrintEsc_(i.mrpNote)}</div>`:''}`).join('')}
+    <div class="pos-rule"></div>
+    <div class="pos-total-line"><span>Subtotal</span><b>${bnxMoney_(sub)}</b></div>
+    ${disc?`<div class="pos-total-line"><span>Discount ${discPct}%</span><span>-${bnxMoney_(disc)}</span></div>`:''}
+    ${sc?`<div class="pos-total-line"><span>Service Charge ${scPct}%</span><span>${bnxMoney_(sc)}</span></div>`:''}
+    <div class="pos-total-line"><span>Tax</span><span>${bnxMoney_(taxAmt)}</span></div>
+    ${Math.abs(roff)>0.001?`<div class="pos-total-line"><span>Round Off</span><span>${roff>=0?'+':'-'}${bnxMoney_(Math.abs(roff)).slice(1)}</span></div>`:''}
+    <div class="pos-grand"><span>GRAND TOTAL</span><b>${bnxMoney_(rounded)}</b></div>
+    <div class="pos-rule"></div>
+    <div class="pos-section">TAX SUMMARY</div>
+    <div class="pos-tax-head"><span>HSN</span><span>TAX</span><span>VALUE</span><span>TAX</span></div>
+    ${rows.map(r=>`<div class="pos-tax-row"><span>${bnxPrintEsc_(r.hsn||'—')}</span><span>${bnxPrintEsc_(bnxTaxRateLabel_(r))}</span><span>${bnxMoney_(r.onAmt)}</span><span>${bnxMoney_(r.taxAmt)}</span></div>`).join('')}
+    <div class="pos-rule"></div>
+    <div class="pos-payment"><span>PAYMENT</span><b>${paymode}</b><strong>${bnxMoney_(rounded)}</strong></div>
+    ${kot?`<div class="pos-small"><b>KOT:</b> ${kot}</div>`:''}
+    ${remarks?`<div class="pos-note"><b>NOTE:</b> ${remarks}</div>`:''}
+    <div class="pos-footer">Thank you for dining with us<br><b>Visit Again</b><br><span>Computer Generated Invoice</span></div>`;
 }
 /* FIX ("fix printer pos and ip printer pos also"): "Test Print" / "Test KOT"
    in Settings > Print Settings only showed a toast — nothing was ever sent
@@ -13932,7 +13947,7 @@ function bmGetBillData(){
     table:document.getElementById('bm-bf-table').value||'',
     pax:document.getElementById('bm-bf-pax').value||'2',
     cname:document.getElementById('bm-bf-cname').value||'GENERAL CUSTOMER',
-    cmob:document.getElementById('bm-bf-mobile').value||'1111111111',
+    cmob:document.getElementById('bm-bf-mobile').value||'',
     waiter:document.getElementById('bm-bf-waiter').value||bnxCurrentUserName_()||'',
     kot:document.getElementById('bm-bf-kot').value||'',
     paymode:document.getElementById('bm-bf-paymode').value||'CASH',
@@ -14014,36 +14029,52 @@ function bmNumToWords(n){
 function bmRenderA4(elId){
   const d=bmGetBillData();
   const el=document.getElementById(elId);if(!el)return;
-  const irn='IRN'+Date.now().toString(36).toUpperCase();
-  el.innerHTML=
-    '<div class="a4-header"><div><div class="a4-co">'+d.entity.toUpperCase()+'</div><div class="a4-addr">'+d.addr+'<br>GSTIN/UIN: '+d.gstin+'<br>E-Mail: '+d.email+' | Ph: '+d.phone+'</div></div>'+
-    '<div style="width:60px;height:60px;background:#f0f0f0;border:1px solid #ddd;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:8px;color:#999;text-align:center;">QR<br>Code</div></div>'+
-    '<div class="a4-title">Tax Invoice</div>'+
-    '<div class="a4-irn">IRN: '+irn+'</div>'+
-    '<div class="a4-grid2">'+
-    '<div class="a4-info-box"><div class="a4-info-lbl">Invoice No.</div><div class="a4-info-val">'+d.billno+'</div><div class="a4-info-lbl" style="margin-top:4px;">Dated</div><div class="a4-info-val">'+d.date+'</div></div>'+
-    '<div class="a4-info-box"><div class="a4-info-lbl">Table / Time / PAX</div><div class="a4-info-val">'+(d.table||'-')+' / '+d.time+' / '+d.pax+' covers</div><div class="a4-info-lbl" style="margin-top:4px;">Steward</div><div class="a4-info-val">'+(d.waiter||'-')+'</div></div>'+
-    '<div class="a4-info-box"><div class="a4-info-lbl">Customer</div><div class="a4-info-val">'+d.cname+'</div><div class="a4-info-lbl" style="margin-top:4px;">Mobile</div><div class="a4-info-val">'+d.cmob+'</div></div>'+
-    '<div class="a4-info-box"><div class="a4-info-lbl">Branch</div><div class="a4-info-val">'+d.branchName+'</div><div class="a4-info-lbl" style="margin-top:4px;">Client ID</div><div class="a4-info-val" style="font-family:monospace;font-size:9px;">'+d.clientId+'</div></div>'+
-    '</div>'+
-    '<table class="a4-tbl"><thead><tr><th>Sl</th><th>Description</th><th>HSN/SAC</th><th>Qty</th><th>Rate</th><th class="r">Amount</th></tr></thead><tbody>'+
-    d.items.map((i,idx)=>'<tr><td>'+(idx+1)+'</td><td>'+i.name+'</td><td>'+d.sac+'</td><td>'+i.qty+'</td><td>₹'+i.rate.toFixed(2)+'</td><td class="r">₹'+i.amt.toLocaleString('en-IN',{minimumFractionDigits:2})+'</td></tr>').join('')+
-    '</tbody></table>'+
-    '<div class="a4-totals">'+
-    '<div class="a4-tot-row" style="color:#555;"><span>BASIC AMOUNT</span><span>₹'+d.sub.toLocaleString('en-IN',{minimumFractionDigits:2})+'</span></div>'+
-    (d.disc>0?'<div class="a4-tot-row" style="color:#555;"><span>Discount ('+d.discPct+'%)</span><span>-₹'+d.disc.toFixed(2)+'</span></div>':'')+
-    (d.sc>0?'<div class="a4-tot-row" style="color:#555;"><span>Service Charge ('+d.scPct+'%)</span><span>₹'+d.sc.toFixed(2)+'</span></div>':'')+
-    '<div class="a4-tot-row" style="color:#555;"><span>NET AMOUNT (Taxable)</span><span>₹'+d.taxBase.toLocaleString('en-IN',{minimumFractionDigits:2})+'</span></div>'+
-    (d.cgst>0?'<div class="a4-tot-row" style="color:#555;"><span>CGST @ '+(d.tt==='5'?'2.50':'9.00')+'%</span><span>₹'+d.cgst.toFixed(2)+'</span></div><div class="a4-tot-row" style="color:#555;"><span>SGST @ '+(d.tt==='5'?'2.50':'9.00')+'%</span><span>₹'+d.sgst.toFixed(2)+'</span></div>':'')+
-    (d.igst>0?'<div class="a4-tot-row" style="color:#555;"><span>IGST @ 18%</span><span>₹'+d.igst.toFixed(2)+'</span></div>':'')+
-    (d.roff!==0?'<div class="a4-tot-row" style="color:#555;"><span>Round Off</span><span>₹'+d.roff.toFixed(2)+'</span></div>':'')+
-    '<div class="a4-tot-row grand"><span>GRAND TOTAL</span><span style="color:var(--gold)">₹'+d.total.toLocaleString('en-IN',{minimumFractionDigits:2})+'</span></div></div>'+
-    '<div class="a4-words"><b>Amount in words:</b> '+bmNumToWords(d.total)+' Only</div>'+
-    '<div style="margin-top:8px;"><div style="font-size:10px;font-weight:700;margin-bottom:4px;">Tax Summary</div>'+
-    '<table class="a4-tax-tbl"><thead><tr><th>HSN/SAC</th><th>Taxable Value</th><th>Rate</th><th>Tax Amount</th></tr></thead><tbody>'+
-    '<tr><td>'+d.sac+'</td><td>₹'+d.taxBase.toFixed(2)+'</td><td>'+(d.tt==='5'?'CGST 2.5%+SGST 2.5%':d.tt==='18'?'CGST 9%+SGST 9%':'IGST 18%')+'</td><td>₹'+d.tax.toFixed(2)+'</td></tr></tbody></table></div>'+
-    '<div class="a4-footer">IT WAS A PLEASURE SERVING YOU<br>GSTIN: '+d.gstin+' | SAC: '+d.sac+' | Payment: '+d.paymode+(d.remarks?'<br>Remarks: '+d.remarks:'')+'</div>'+
-    '<div class="a4-sig"><div style="margin-bottom:18px;">for <b>'+d.entity.toUpperCase()+'</b></div>Authorised Signatory<div style="font-size:8px;color:#777;margin-top:3px;">Computer Generated Invoice - Balaji NextGen ERP</div></div>';
+  const items=Array.isArray(d.items)?d.items:[];
+  const taxRows=Array.isArray(d.taxRows)&&d.taxRows.length?d.taxRows:[{hsn:d.sac||'—',taxName:d.tax>0?'GST':'Exempted',onAmt:d.taxBase||0,taxAmt:d.tax||0}];
+  const logo=bnxResolvePrintLogo_();
+  const esc=bnxPrintEsc_;
+  const money=bnxMoney_;
+  const itemQty=items.reduce((a,i)=>a+(Number(i.qty)||0),0);
+  const billTotal=Number(d.total)||0;
+  const pay=esc(d.paymode||'CASH').toUpperCase();
+  el.innerHTML=`
+  <div class="a4-wrap professional-invoice">
+    <div class="a4-header">
+      <div class="a4-brand-block">
+        <img src="${logo}" class="a4-logo" alt="">
+        <div><div class="a4-co">${esc(d.entity||'RESTAURANT').toUpperCase()}</div>
+        <div class="a4-addr">${esc(d.addr||'')}${d.phone?'<br>Phone: '+esc(d.phone):''}${d.email?'<br>Email: '+esc(d.email):''}${d.gstin?'<br><b>GSTIN:</b> '+esc(d.gstin):''}</div></div>
+      </div>
+      <div class="a4-invoice-badge"><div>TAX INVOICE</div><small>ORIGINAL FOR RECIPIENT</small></div>
+    </div>
+    <div class="a4-info-grid">
+      <div class="a4-info-box"><label>Invoice No.</label><strong>${esc(d.billno||'—')}</strong><label>Date & Time</label><span>${esc(d.date||'—')} ${esc(d.time||'')}</span></div>
+      <div class="a4-info-box"><label>Table / Covers</label><strong>${esc(d.table||'TAKEAWAY')} / ${esc(d.pax||1)}</strong><label>Steward</label><span>${esc(d.waiter||'—')}</span></div>
+      <div class="a4-info-box"><label>Customer</label><strong>${esc(d.cname||'GENERAL CUSTOMER')}</strong><label>Mobile</label><span>${esc(d.cmob||'—')}</span></div>
+      <div class="a4-info-box"><label>Client / Branch</label><strong>${esc(d.branchName||'—')}</strong><label>Client ID</label><span>${esc(d.clientId||'—')}</span></div>
+    </div>
+    <table class="a4-tbl"><thead><tr><th>#</th><th>Description</th><th>HSN/SAC</th><th>Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead><tbody>
+      ${items.map((i,idx)=>`<tr><td>${idx+1}</td><td><b>${esc(i.name||'Item')}</b>${i.mrpNote?'<div class="a4-item-note">MRP '+esc(i.mrpNote)+'</div>':''}</td><td>${esc(d.sac||'—')}</td><td>${Number(i.qty)||0}</td><td class="r">${money(i.rate)}</td><td class="r"><b>${money(i.amt)}</b></td></tr>`).join('')}
+    </tbody></table>
+    <div class="a4-lower">
+      <div class="a4-tax-card"><div class="a4-card-title">Tax Summary</div><table class="a4-tax-tbl"><thead><tr><th>HSN/SAC</th><th>Taxable Value</th><th>Tax</th><th>Tax Amount</th></tr></thead><tbody>
+        ${taxRows.map(r=>`<tr><td>${esc(r.hsn||'—')}</td><td>${money(r.onAmt)}</td><td>${esc(r.taxName||'GST')}</td><td>${money(r.taxAmt)}</td></tr>`).join('')}
+      </tbody></table></div>
+      <div class="a4-totals"><div class="a4-card-title">Amount Details</div>
+        <div class="a4-tot-row"><span>Subtotal</span><span>${money(d.sub)}</span></div>
+        ${d.disc?`<div class="a4-tot-row"><span>Discount (${esc(d.discPct)}%)</span><span>- ${money(d.disc)}</span></div>`:''}
+        ${d.sc?`<div class="a4-tot-row"><span>Service Charge (${esc(d.scPct)}%)</span><span>${money(d.sc)}</span></div>`:''}
+        <div class="a4-tot-row"><span>Tax</span><span>${money(d.tax)}</span></div>
+        ${Math.abs(Number(d.roff)||0)>0.001?`<div class="a4-tot-row"><span>Round Off</span><span>${(d.roff>=0?'+':'-')+' '+money(Math.abs(d.roff))}</span></div>`:''}
+        <div class="a4-tot-row grand"><span>GRAND TOTAL</span><span>${money(Math.round(billTotal))}</span></div>
+        <div class="a4-pay"><span>Payment Mode</span><b>${pay}</b></div>
+      </div>
+    </div>
+    <div class="a4-words"><b>Amount in words:</b> ${bmNumToWords(Math.round(billTotal))} Rupees Only</div>
+    <div class="a4-note-row">${d.kot?'<span><b>KOT:</b> '+esc(d.kot)+'</span>':''}${d.remarks?'<span><b>Remarks:</b> '+esc(d.remarks)+'</span>':''}</div>
+    <div class="a4-footer"><b>Thank you for choosing us. We look forward to serving you again.</b><br><span>Computer Generated Invoice · This invoice is valid subject to the applicable GST configuration.</span></div>
+    <div class="a4-sign"><span>For <b>${esc(d.entity||'Restaurant').toUpperCase()}</b></span><span>Authorised Signatory</span></div>
+  </div>`;
 }
 
 function bmRenderBillPreview(){
@@ -14135,8 +14166,15 @@ async function bmDoPrint(){
   const css = pageRule +
     '*{margin:0;padding:0;box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact;}' +
     'body{font-family:Arial,"Noto Sans",sans-serif;background:#fff;}' +
-    '.thermal-body{--posScale:'+bnxPosScaleVal()+';width:'+pw+'px;font-size:calc(13px * var(--posScale));font-weight:700;line-height:1.6;color:#000;margin:0 auto;padding:10px 6px;}' +
-    '.a4-wrap{padding:30px;font-size:11px;color:#000;}' +
+    '.thermal-body{--posScale:'+bnxPosScaleVal()+';width:'+pw+'px;font-family:Arial,"Noto Sans",sans-serif;font-size:calc(12px * var(--posScale));font-weight:600;line-height:1.42;color:#000;margin:0 auto;padding:8px 5px;}'+
+    '.pos-invoice-head{text-align:center}.pos-logo{width:46px;height:46px;object-fit:contain;margin-bottom:3px}.pos-brand{font-size:calc(16px * var(--posScale));font-weight:900;letter-spacing:.04em}.pos-muted{font-size:calc(9px * var(--posScale));font-weight:600}.pos-invoice-title{text-align:center;border-top:2px solid #000;border-bottom:2px solid #000;padding:5px 0;margin:7px 0;font-size:calc(12px * var(--posScale));font-weight:900;letter-spacing:.12em}.pos-meta{font-size:calc(9px * var(--posScale));}.pos-meta>div{display:flex;justify-content:space-between;gap:8px;padding:1px 0}.pos-meta b{font-weight:800}.pos-meta span{text-align:right;max-width:68%;overflow-wrap:anywhere}.pos-rule{border-top:1px dashed #000;margin:6px 0}.pos-items-head,.pos-item{display:grid;grid-template-columns:minmax(0,1fr) 28px 55px 64px;gap:3px;align-items:start}.pos-items-head{font-size:calc(9px * var(--posScale));font-weight:900;padding-bottom:2px}.pos-item{font-size:calc(10px * var(--posScale));font-weight:700;padding:2px 0}.pos-item span:nth-child(n+2),.pos-items-head span:nth-child(n+2){text-align:right}.pos-mrp{font-size:calc(8px * var(--posScale));padding-left:2px}.pos-total-line{display:flex;justify-content:space-between;font-size:calc(10px * var(--posScale));padding:2px 0}.pos-grand{display:flex;justify-content:space-between;align-items:center;font-size:calc(15px * var(--posScale));font-weight:900;padding:6px 0}.pos-section{text-align:center;font-size:calc(9px * var(--posScale));font-weight:900;letter-spacing:.08em;margin-bottom:3px}.pos-tax-head,.pos-tax-row{display:grid;grid-template-columns:43px minmax(0,1fr) 57px 57px;gap:3px;font-size:calc(8px * var(--posScale));}.pos-tax-head{font-weight:900}.pos-tax-row{font-weight:600;padding:2px 0}.pos-tax-head span:nth-child(n+3),.pos-tax-row span:nth-child(n+3){text-align:right}.pos-payment{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;font-size:calc(10px * var(--posScale));font-weight:800}.pos-payment strong{font-size:calc(12px * var(--posScale));}.pos-small{font-size:calc(8px * var(--posScale));margin-top:4px}.pos-note{font-size:calc(8px * var(--posScale));border-left:2px solid #000;padding-left:5px;margin-top:5px}.pos-footer{text-align:center;font-size:calc(9px * var(--posScale));font-weight:700;margin-top:8px;padding-top:6px;border-top:1px dashed #000}.pos-footer span{font-size:calc(7px * var(--posScale));font-weight:500}'+
+    '.a4-wrap{padding:26px 30px;font-size:11px;color:#111;background:#fff;}'+
+    '.professional-invoice{max-width:100%;font-family:Arial,"Noto Sans",sans-serif;}'+
+    '.a4-brand-block{display:flex;align-items:center;gap:12px;}.a4-logo{width:58px;height:58px;object-fit:contain;border:1px solid #ddd;border-radius:8px;}'+
+    '.a4-invoice-badge{text-align:right;font-weight:800;font-size:18px;letter-spacing:.08em;}.a4-invoice-badge small{display:block;font-size:8px;font-weight:600;letter-spacing:.05em;margin-top:5px;color:#666;}'+
+    '.a4-info-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin:14px 0;}.a4-info-box{background:#fafafa;border:1px solid #ddd;border-radius:5px;padding:8px;min-height:57px;}.a4-info-box label{display:block;font-size:7px;text-transform:uppercase;letter-spacing:.08em;color:#777;margin-bottom:2px;}.a4-info-box strong{display:block;font-size:10px;margin-bottom:7px;}.a4-info-box span{font-size:9px;}'+
+    '.a4-tbl{width:100%;border-collapse:collapse;margin:12px 0;font-size:9px;}.a4-tbl th{background:#222;color:#fff;padding:7px;text-align:left;font-size:8px;text-transform:uppercase;letter-spacing:.04em;}.a4-tbl td{padding:7px;border-bottom:1px solid #ddd;vertical-align:top;}.a4-item-note{font-size:7px;color:#777;margin-top:2px;}.a4-lower{display:grid;grid-template-columns:1.3fr .9fr;gap:14px;margin-top:8px;}.a4-tax-card{border:1px solid #ddd;border-radius:5px;padding:8px;}.a4-card-title{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;}.a4-totals{border:1px solid #ddd;border-radius:5px;padding:9px;background:#fafafa;}.a4-tot-row{display:flex;justify-content:space-between;font-size:9px;padding:4px 0;}.a4-tot-row.grand{font-size:13px;font-weight:900;border-top:2px solid #222;margin-top:5px;padding-top:8px;}.a4-pay{display:flex;justify-content:space-between;margin-top:8px;padding-top:7px;border-top:1px dashed #bbb;font-size:9px;}.a4-words{font-size:8px;padding:8px;border-left:3px solid #222;background:#fafafa;margin-top:10px;}.a4-note-row{display:flex;gap:20px;font-size:8px;margin-top:9px;}.a4-footer{text-align:center;font-size:8px;color:#666;margin-top:18px;padding-top:9px;border-top:1px dashed #bbb;}.a4-sign{display:flex;justify-content:space-between;align-items:flex-end;font-size:8px;margin-top:30px;color:#555;}.a4-tax-tbl{width:100%;border-collapse:collapse;font-size:8px;}.a4-tax-tbl th{background:#555;color:#fff;padding:5px;text-align:left;}.a4-tax-tbl td{padding:5px;border:1px solid #ddd;}'+
+    '.a4-header{display:flex;justify-content:space-between;margin-bottom:14px;padding-bottom:12px;border-bottom:2px solid #222;}'+
     '.a4-header{display:flex;justify-content:space-between;margin-bottom:14px;padding-bottom:12px;border-bottom:2px solid #000;}' +
     '.a4-co{font-size:16px;font-weight:800;}.a4-addr{font-size:9px;color:#555;}' +
     '.a4-title{text-align:center;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.15em;margin:10px 0;padding:5px;border-top:1px solid #000;border-bottom:1px solid #000;}' +
