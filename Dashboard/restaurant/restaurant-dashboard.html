@@ -159,6 +159,31 @@ function bnxApiUrl_(endpoint){
    comment for the full explanation. Once DEPLOYMENT_CONFIG exists in
    your security DB, both apps' V2_CORE/V2_AUTH stay in sync from one
    place instead of each carrying an independent, driftable copy. */
+
+/* ═══ FINAL HANG / REQUEST-STORM FIX ═══
+   A bad /api/core or /api/auth route used to make every page action start
+   another failing request. During a proxy outage that created a request
+   storm and made the ERP feel frozen. Keep one in-flight request per
+   identical POST body and temporarily open a short circuit after a
+   permanent 4xx/405 response. Manual Refresh/Save can clear it.
+*/
+const BNX_API_FLIGHT = new Map();
+const BNX_API_CIRCUIT = new Map();
+
+function bnxApiCircuitOpen_(endpoint){
+  const until = Number(BNX_API_CIRCUIT.get(endpoint)||0);
+  if (until && until > Date.now()) return true;
+  if (until) BNX_API_CIRCUIT.delete(endpoint);
+  return false;
+}
+function bnxResetApiCircuit_(endpoint){
+  if(endpoint) BNX_API_CIRCUIT.delete(endpoint);
+  else BNX_API_CIRCUIT.clear();
+}
+function bnxApiFlightKey_(endpoint, options){
+  return String(endpoint||'V2_CORE') + '|' + String(options && options.body || '');
+}
+
 async function bnxFetchJson_(endpoint, options){
   options = options || {};
   endpoint = endpoint || 'V2_CORE';
@@ -169,8 +194,6 @@ async function bnxFetchJson_(endpoint, options){
   const urls = [];
 
   if (!isLocalFile) {
-    // Production: same-origin proxy only. Browser CORS prevents reliable
-    // reading of Apps Script ContentService responses cross-origin.
     if (primary) urls.push(primary);
   } else {
     if (primary) urls.push(primary);
@@ -179,57 +202,90 @@ async function bnxFetchJson_(endpoint, options){
 
   if (!urls.length) throw new Error('No API endpoint configured for ' + endpoint);
 
-  let lastErr = null;
-  for (let i=0; i<urls.length; i++) {
-    const url=urls[i];
-    try {
-      const fetchOpts = Object.assign({
-        method:'POST',
-        headers:{'Content-Type':'text/plain;charset=utf-8'},
-        credentials:'same-origin',
-        redirect:'follow'
-      },options);
-      // HANG FIX: hard timeout. A broken /api/core proxy can never keep a
-      // button, dashboard or startup Promise pending indefinitely.
-      const parsedAction = (()=>{ try{return JSON.parse(fetchOpts.body||'{}').action||'';}catch(e){return '';} })();
-      const timeoutMs = Number(fetchOpts.timeoutMs) || (/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? 8000 : 4500);
-      delete fetchOpts.timeoutMs;
-      const timeoutCtrl = new AbortController();
-      const timer = setTimeout(()=>timeoutCtrl.abort(), timeoutMs);
-      if(fetchOpts.signal){ try{fetchOpts.signal.addEventListener('abort',()=>timeoutCtrl.abort(),{once:true});}catch(e){} }
-      fetchOpts.signal=timeoutCtrl.signal;
-      let r;
-      try{r=await fetch(url,fetchOpts);}finally{clearTimeout(timer);}
-      const text=await r.text();
+  /* Never let identical GET/read requests pile up while one is pending. */
+  const flightKey = bnxApiFlightKey_(endpoint, options);
+  if (BNX_API_FLIGHT.has(flightKey)) return BNX_API_FLIGHT.get(flightKey);
 
-      if(!r.ok){
-        const err=new Error('API proxy HTTP '+r.status+' at '+url);
-        err.status=r.status;
-        err.responseText=text.slice(0,300);
-        lastErr=err;
-        if(!isLocalFile) throw err;
-        if(i+1<urls.length) continue;
-        throw err;
-      }
-
-      let data;
-      try { data=JSON.parse(text); }
-      catch(e){
-        const err=new Error('API returned non-JSON ('+r.status+'): '+text.slice(0,180));
-        err.status=r.status;
-        err.responseText=text.slice(0,300);
-        lastErr=err;
-        if(i+1<urls.length) continue;
-        throw err;
-      }
-      return data;
-    } catch(e) {
-      lastErr=e;
-      if(i+1<urls.length) continue;
-      throw e;
+  const work = (async()=>{
+    /* If this endpoint has just returned a permanent 4xx (especially 405),
+       fail immediately for a short period instead of repeatedly waiting. */
+    if (!isLocalFile && bnxApiCircuitOpen_(endpoint)) {
+      const err = new Error('API circuit open for ' + endpoint);
+      err.status = 503;
+      err.circuitOpen = true;
+      throw err;
     }
-  }
-  throw lastErr || new Error('API request failed');
+
+    let lastErr = null;
+    for (let i=0; i<urls.length; i++) {
+      const url=urls[i];
+      try {
+        const fetchOpts = Object.assign({
+          method:'POST',
+          headers:{'Content-Type':'text/plain;charset=utf-8'},
+          credentials:'same-origin',
+          redirect:'follow'
+        },options);
+
+        const parsedAction = (()=>{ try{return JSON.parse(fetchOpts.body||'{}').action||'';}catch(e){return '';} })();
+        const timeoutMs = Number(fetchOpts.timeoutMs) ||
+          (/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? 7000 : 2800);
+        delete fetchOpts.timeoutMs;
+
+        const timeoutCtrl = new AbortController();
+        const timer = setTimeout(()=>timeoutCtrl.abort(), timeoutMs);
+        if(fetchOpts.signal){
+          try{fetchOpts.signal.addEventListener('abort',()=>timeoutCtrl.abort(),{once:true});}catch(e){}
+        }
+        fetchOpts.signal=timeoutCtrl.signal;
+
+        let r;
+        try{ r=await fetch(url,fetchOpts); }
+        finally{ clearTimeout(timer); }
+
+        const text=await r.text();
+
+        if(!r.ok){
+          const err=new Error('API proxy HTTP '+r.status+' at '+url);
+          err.status=r.status;
+          err.responseText=text.slice(0,300);
+          lastErr=err;
+
+          /* 4xx is permanent for this page session. Do not keep hammering
+             the same broken proxy route. 405 is the exact live-site issue. */
+          if(!isLocalFile && r.status>=400 && r.status<500){
+            BNX_API_CIRCUIT.set(endpoint, Date.now()+30000);
+          }
+          if(!isLocalFile) throw err;
+          if(i+1<urls.length) continue;
+          throw err;
+        }
+
+        let data;
+        try { data=JSON.parse(text); }
+        catch(e){
+          const err=new Error('API returned non-JSON ('+r.status+'): '+text.slice(0,180));
+          err.status=r.status;
+          err.responseText=text.slice(0,300);
+          lastErr=err;
+          if(i+1<urls.length) continue;
+          throw err;
+        }
+
+        BNX_API_CIRCUIT.delete(endpoint);
+        return data;
+      } catch(e) {
+        lastErr=e;
+        if(i+1<urls.length) continue;
+        throw e;
+      }
+    }
+    throw lastErr || new Error('API request failed');
+  })();
+
+  BNX_API_FLIGHT.set(flightKey, work);
+  try { return await work; }
+  finally { BNX_API_FLIGHT.delete(flightKey); }
 }
 
 function bnxShowApiTransportError_(err, endpoint){
@@ -243,7 +299,9 @@ function bnxShowApiTransportError_(err, endpoint){
       document.body.appendChild(el);
     }
     const route=endpoint==='V2_AUTH'?'/api/auth':'/api/core';
-    el.textContent='ERP API '+endpoint+' unavailable ('+(err&&err.status?('HTTP '+err.status):'network error')+'). Configure '+route+' as a POST proxy. Live data is not replaced with demo data.';
+    el.textContent=(window.location && window.location.protocol==='file:')
+  ? 'LOCAL TEST MODE: browser cannot read Google Apps Script directly from file://. Upload this HTML to balajinextgen.in (with /api/core and /api/auth POST proxies) for live DB data.'
+  : 'ERP API '+endpoint+' unavailable ('+(err&&err.status?('HTTP '+err.status):'network error')+'). Live screen remains usable; configure '+route+' as a POST proxy for live DB sync. Live data is not replaced with demo data.';
   }catch(e){}
 }
 
@@ -296,7 +354,9 @@ async function bnxRefreshConfig(){
 // independent of whether this config fetch has finished. Now the
 // promise is captured so every GAS-dependent init below can genuinely
 // wait on it first, instead of racing it.
-window.__bnxConfigReady = bnxRefreshConfig();
+window.__bnxConfigReady = (window.location && window.location.protocol !== 'file:')
+  ? Promise.resolve({success:true, skipped:true, reason:'same-origin proxy uses bootstrap deployment config'})
+  : bnxRefreshConfig();
 const GAS_URL = GAS_APIS_DASH.V2_CORE;
 const CLIENT_ID=(function(){
   try{
@@ -395,7 +455,7 @@ let _bnxWarnedNoSession = false;
 async function gasApi(action, payload, endpoint) {
   payload = payload || {};
   const ep = endpoint || 'V2_CORE';
-  if (!_bnxWarnedNoSession && action !== 'GET_CONFIG' && !(localStorage.getItem('ERP_SESSION')||sessionStorage.getItem('ERP_SESSION')||'')) {
+  if (!_bnxWarnedNoSession && action !== 'GET_CONFIG' && !bnxCurrentSession_()) {
     _bnxWarnedNoSession = true;
     console.error('[AUTH] No ERP_SESSION token — session-gated API calls may fail until login.');
   }
@@ -416,8 +476,8 @@ async function gasApi(action, payload, endpoint) {
         let attempt = 0;
         while (attempt < API_RETRY_CONFIG.maxAttempts) {
           try {
-            const session = localStorage.getItem('ERP_SESSION') || sessionStorage.getItem('ERP_SESSION') || '';
-            const body = JSON.stringify(Object.assign({action:action, clientId:CLIENT_ID, sessionToken:session}, payload));
+            const session = bnxCurrentSession_();
+            const body = JSON.stringify(Object.assign({action:action, clientId:bnxCurrentClient_(), sessionToken:session}, payload));
             const data = await bnxFetchJson_(ep, {body:body});
             bnxCheckAuthFailure_(data);
             resolve(data);
@@ -7154,9 +7214,9 @@ async function erpApi(payload, type='V2_AUTH'){
     if(typeof bnxCheckAuthFailure_==='function') bnxCheckAuthFailure_(data);
     return data;
   }catch(e){
-    console.warn('[ERP API '+type+']',e.message);
-    bnxShowApiTransportError_(e,type);
-    return {success:false,offline:true,error:e.message,statusCode:e.status||0};
+    if (!e || !e.circuitOpen) console.warn('[ERP API '+type+']',e.message);
+    if (!e || !e.circuitOpen) bnxShowApiTransportError_(e,type);
+    return {success:false,offline:true,error:e.message,statusCode:e.status||0,circuitOpen:!!(e&&e.circuitOpen)};
   }
 }
 
@@ -8211,6 +8271,21 @@ function bnxRenderLiveDashboardWidgets_(d){
     bnxRenderTodaysReservations_();
   } catch(e){ console.error('[bnxRenderLiveDashboardWidgets_] Error:', e.message); }
 }
+
+let _bnxDashSummaryPromise = null;
+let _bnxDashSummaryKey = '';
+
+function bnxGetDashboardSummaryShared_(rangeParams){
+  const key = String(CLIENT_ID||'') + '|' + JSON.stringify(rangeParams||{});
+  if (_bnxDashSummaryPromise && _bnxDashSummaryKey === key) return _bnxDashSummaryPromise;
+  _bnxDashSummaryKey = key;
+  _bnxDashSummaryPromise = erpApi(
+    Object.assign({action:'GET_DASHBOARD_SUMMARY'}, rangeParams||{}),
+    'V2_CORE'
+  ).finally(()=>{ setTimeout(()=>{ if(_bnxDashSummaryKey===key) _bnxDashSummaryPromise=null; }, 1000); });
+  return _bnxDashSummaryPromise;
+}
+
 async function loadRealDashboardData() {
   try {
     if (typeof CLIENT_ID === 'undefined' || !CLIENT_ID) return;
@@ -8239,7 +8314,7 @@ async function loadRealDashboardData() {
     // second endpoint or a second full dashboard fetch.
     // HANG FIX: loadDashboard() already requests this exact summary. Reuse its
     // in-flight/result promise instead of starting another network call.
-    const dashRes = await gasApi('GET_DASHBOARD_SUMMARY', Object.assign({ clientId: CLIENT_ID }, rangeParams), 'V2_CORE');
+    const dashRes = await bnxGetDashboardSummaryShared_(rangeParams);
 
     if (dashRes && dashRes.success && dashRes.data && dashRes.data.collectionsByMode) {
       const cm = dashRes.data.collectionsByMode;
@@ -8602,7 +8677,7 @@ async function checkDB(id, label, apiType){
   try{
     const ctrl=new AbortController();
     const to=setTimeout(()=>ctrl.abort(),2500);
-    const res=await fetch(bnxApiUrl_(apiType),{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},credentials:'same-origin',body:JSON.stringify({action:'PING',clientId:CLIENT_ID||'',sessionToken:localStorage.getItem('ERP_SESSION')||sessionStorage.getItem('ERP_SESSION')||''}),signal:ctrl.signal});
+    const res=await fetch(bnxApiUrl_(apiType),{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},credentials:'same-origin',body:JSON.stringify({action:'PING',clientId:bnxCurrentClient_(),sessionToken:bnxCurrentSession_()}),signal:ctrl.signal});
     clearTimeout(to);
     if(res.ok){ el.className='db-pill online'; el.innerHTML=`<span class="db-dot"></span>${label} ✓`; return true; }
   }catch(e){}
@@ -9043,8 +9118,9 @@ function bnxRenderDashAlerts_(){
 
 async function loadDashboard(){
   try{
+    bnxResetApiCircuit_('V2_CORE');
     const rangeParams = bnxDashRangeParams_();
-    const r=await erpApi(Object.assign({action:'GET_DASHBOARD_SUMMARY'}, rangeParams),'V2_CORE');
+    const r=await bnxGetDashboardSummaryShared_(rangeParams);
     if(r&&r.success&&r.data){
       const d=r.data;
       /* FIX ("restaurant dashboard sales and manager dashboard sales both
@@ -12477,7 +12553,13 @@ setInterval(()=>{
    loadDashboard() used everywhere else, so it goes through the exact same
    real-data-or-honest-empty-state logic fixed above, never fake numbers. */
 setInterval(()=>{
-  if (document.getElementById('page-dashboard')?.classList.contains('active') && typeof loadDashboard==='function') loadDashboard();
+  if (document.getElementById('page-dashboard')?.classList.contains('active') &&
+      typeof loadDashboard==='function' &&
+      !bnxApiCircuitOpen_('V2_CORE') &&
+      !window.__bnxDashboardPollBusy) {
+    window.__bnxDashboardPollBusy = true;
+    Promise.resolve(loadDashboard()).finally(()=>{ window.__bnxDashboardPollBusy=false; });
+  }
 }, 45000);
 /* Marks a ticket Ready and persists it — refreshing the page or
    coming back to this tab won't lose the update (previously the
@@ -22380,7 +22462,7 @@ async function loadClientBadge(){
   const dot = document.getElementById('clientBadgeDot');
   const text = document.getElementById('clientBadgeText');
   if (!dot || !text) return;
-  const cid = String(typeof CLIENT_ID !== 'undefined' ? CLIENT_ID : '').trim();
+  const cid = bnxCurrentClient_();
   if (!cid){
     dot.style.background='var(--red)';
     text.textContent='No client session';
