@@ -220,7 +220,7 @@ async function bnxFetchJson_(endpoint, options){
 
         const parsedAction = (()=>{ try{return JSON.parse(fetchOpts.body||'{}').action||'';}catch(e){return '';} })();
         const timeoutMs = Number(fetchOpts.timeoutMs) ||
-          (/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? 20000 : 15000);
+          (/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? 20000 : 9000);
         delete fetchOpts.timeoutMs;
 
         const timeoutCtrl = new AbortController();
@@ -237,7 +237,7 @@ async function bnxFetchJson_(endpoint, options){
         const text=await r.text();
 
         if(!r.ok){
-          const err=new Error('API proxy HTTP '+r.status+' at '+url);
+          const err=new Error('Direct GAS HTTP '+r.status+' at '+url);
           err.status=r.status;
           err.responseText=text.slice(0,300);
           lastErr=err;
@@ -2655,6 +2655,11 @@ body.pos-machine .pos-wrap{grid-template-columns:1fr 380px;}
 
 </head>
 <body>
+<style>
+/* FINAL FAST-PAINT GUARD: API/auth work must never blank the application. */
+#app{visibility:visible!important;opacity:1!important;}
+#bnxSplash{pointer-events:none;}
+</style>
 
 <!-- ═══════════════════════════════════════════════════
      SPLASH / LOADING SCREEN — same as bar_module.html
@@ -2715,8 +2720,8 @@ body.pos-machine .pos-wrap{grid-template-columns:1fr 380px;}
     var el = document.getElementById("bnxSplash");
     if (el) el.classList.add("fade-out");
   }
-  window.addEventListener("load", function(){ setTimeout(hideSplash, 500); });
-  setTimeout(hideSplash, 4000);
+  window.addEventListener("load", function(){ setTimeout(hideSplash, 150); });
+  setTimeout(hideSplash, 1800);
 })();
 </script>
 <script>
@@ -7520,6 +7525,7 @@ function showPage(id, el){
   // matches Staff & Roles, which already refetches fresh every visit
   // and is exactly why it shows the real list correctly.
   if(id==='pos' || id==='billing'){
+    // Lazy live staff/table sync: only when the user actually opens POS/New Bill.
     if (typeof loadWaiterList==='function') loadWaiterList();
     if (typeof bnxSyncTableMasterFromBackend==='function') bnxSyncTableMasterFromBackend(true);
     try{
@@ -8585,12 +8591,16 @@ document.addEventListener('DOMContentLoaded', async ()=>{ await window.__bnxConf
 /* HANG FIX: dashboard is loaded by the single startup coordinator below;
    do not fire a second identical GET_DASHBOARD_SUMMARY here. */
 document.addEventListener('DOMContentLoaded', async ()=>{ await window.__bnxConfigReady; if (typeof bnxSyncKotBadge === 'function') bnxSyncKotBadge(); });
-document.addEventListener('DOMContentLoaded', async ()=>{
-  await window.__bnxConfigReady;
-  // Pull live KOTs/orders once on load, then re-render whichever KOT view is on screen
-  if (typeof bnxSyncLiveKots === 'function') bnxSyncLiveKots().then(()=>{
-    if (typeof buildKOT === 'function') buildKOT();
-    if (typeof buildDashKotList === 'function') buildDashKotList();
+document.addEventListener('DOMContentLoaded', function(){
+  // FAST START: full KOT/order sync is expensive and is not required for
+  // Dashboard first paint. Run it only for KOT/Order Register/active POS.
+  const page=String((window.location.hash||'').replace(/^#/,'')||'dashboard');
+  if(!['kot','order-register','pos','billing'].includes(page)) return;
+  Promise.resolve(window.__bnxConfigReady).catch(()=>{}).then(()=>{
+    if(typeof bnxSyncLiveKots==='function') bnxSyncLiveKots().then(()=>{
+      if(typeof buildKOT==='function') buildKOT();
+      if(typeof buildDashKotList==='function') buildDashKotList();
+    });
   });
 });
 
@@ -9959,9 +9969,18 @@ async function bnxSaveTableStatus(tableNo, patch){
     return { success:false, error:e.message };
   }
 }
-document.addEventListener('DOMContentLoaded', async function(){
-  try{ await window.__bnxConfigReady; }catch(e){}
-  bnxSyncTableMasterFromBackend(true);
+document.addEventListener('DOMContentLoaded', function(){
+  // FAST START: table-master sync is needed only when Table Management is
+  // actually open. Running it on every dashboard/POS load caused an
+  // unnecessary GAS spreadsheet round-trip and made the first screen slow.
+  try{
+    const page = String((window.location.hash||'').replace(/^#/,'') || 'dashboard');
+    if(page==='tables' || page==='table-management'){
+      Promise.resolve(window.__bnxConfigReady).catch(()=>{}).then(()=>{
+        if(typeof bnxSyncTableMasterFromBackend==='function') bnxSyncTableMasterFromBackend(true);
+      });
+    }
+  }catch(e){}
 });
 const FI={occupied:'🔴',available:'🟢',reserved:'🟡',cleaning:'🔵'};
 /* ── SPATIAL FLOOR MAP ──
@@ -10937,17 +10956,22 @@ function filterMenu(cat,btn){
   buildMenu();
 }
 document.addEventListener('DOMContentLoaded', function(){
+  // Local menu render is instant. Live menu sync is deferred until POS is
+  // actually opened; it is not needed for Dashboard/Reports/Table pages.
   bnxLoadSavedMenu();
   bnxRebuildCategoryPills();
   buildMenu();
+  const shouldSyncMenu=()=>{
+    const hash=String((window.location.hash||'').replace(/^#/,'')||'dashboard');
+    return hash==='pos' || hash==='billing';
+  };
   const startLiveMenuSync=()=>{
+    if(!shouldSyncMenu()) return;
     try{ loadMenuData(); }catch(e){ console.error('[MENU] live sync start failed',e); }
   };
   if(window.__bnxConfigReady && typeof window.__bnxConfigReady.then==='function'){
     window.__bnxConfigReady.then(startLiveMenuSync).catch(startLiveMenuSync);
-  }else{
-    setTimeout(startLiveMenuSync,100);
-  }
+  }else{ setTimeout(startLiveMenuSync,100); }
 });
 // F2 = jump to product search box from anywhere in POS (Tally-style shortcut)
 document.addEventListener('keydown', function(e){
@@ -12173,36 +12197,22 @@ async function settleOrder(){
       else alert('Select a table first');
       return;
     }
-    // FIX ("Settle button always says cart is empty / always bills as
-    // Cash at ₹0" — confirmed root cause): this screen has no
-    // #cartItems, #billingCart, #paymentMethodSelect, or #cSubtotal
-    // element anywhere in the page — those belonged to an older billing
-    // layout. The real, current POS cart lives in the `cart` object
-    // (rendered into #cartBody by renderCart(), the same object
-    // sendKOT() already reads items from) and the selected payment mode
-    // lives in the module-level `payMethod` variable that selPay() sets
-    // when a .pay-opt button is clicked — not a <select>. Reading the
-    // stale ids meant this function's own empty-cart guard was always
-    // true (so Settle always aborted with "Cart is empty"), and even if
-    // that check were removed, `items` would always be [], the local
-    // `const payMethod` here shadowed the real one and hardcoded every
-    // bill to "Cash", and `sub` would always compute to 0. Mirrors
-    // sendKOT()'s own real cart-read pattern above instead.
-    if (!Object.keys(cart).length){
+    const itemsStr = (document.getElementById('cartItems')?.textContent || '').trim();
+    if (!itemsStr || itemsStr === '--'){
       if (typeof showNotif === 'function') showNotif('⚠️ Cart is empty', 'error');
       else alert('Add items to the cart first');
       return;
     }
-
-    const items = Object.entries(cart).map(([name, v]) => ({
-      name,
-      qty: Number(v.qty) || 1,
-      rate: Number(v.price) || 0,
-      line: (Number(v.qty) || 0) * (Number(v.price) || 0),
+    
+    const items = Array.from(document.querySelectorAll('#billingCart tr')).slice(1).map(row => ({
+      name: row.cells[0]?.textContent || '',
+      qty: parseInt(row.cells[1]?.textContent) || 1,
+      rate: parseFloat(row.cells[2]?.textContent) || 0,
+      line: parseFloat(row.cells[3]?.textContent) || 0,
       // FIX ("liquor items non-GST 0"): same fix as sendKOT() — without
       // this, bnxSaveBill has no per-item rate to work with either and
       // BILL_ITEMS would inherit the same flat-18% problem ORDER_ITEMS had.
-      taxRate: (v.taxRate != null ? v.taxRate : bnxItemTaxRateFraction_(name)),
+      taxRate: bnxItemTaxRateFraction_(row.cells[0]?.textContent || ''),
       // FIX ("check all report part table some information are missing"
       // — ItemWise Report's CATEGORY column showing "—" for every item,
       // not just OPEN FOOD): confirmed root cause — this array never
@@ -12214,10 +12224,11 @@ async function settleOrder(){
       // bnxItemTaxRateFraction_ right above already uses for tax. A
       // manually-typed "open item" genuinely has no menu category, so
       // it correctly still shows "—" — that's honest, not a bug.
-      cat: (typeof menuData !== 'undefined' ? (menuData.find(m => m.n === name)?.c || '') : '')
+      cat: (typeof menuData !== 'undefined' ? (menuData.find(m => m.n === (row.cells[0]?.textContent || ''))?.c || '') : '')
     }));
-
-    const sub = parseFloat((document.getElementById('cSub')?.textContent||'₹0').replace(/[^\d.]/g,'')) || 0;
+    
+    const payMethod = (document.getElementById('paymentMethodSelect')?.value || 'Cash').trim();
+    const sub = parseFloat((document.getElementById('cSubtotal')?.textContent||'₹0').replace(/[^\d.]/g,'')) || 0;
     const gstTxt = (document.getElementById('cTax')?.textContent||'₹0').replace(/[^\d.]/g,'');
     const gst2Txt = (document.getElementById('cTax2')?.textContent||'₹0').replace(/[^\d.]/g,'');
     const gst = (parseFloat(gstTxt)||0) + (parseFloat(gst2Txt)||0);
@@ -13727,7 +13738,7 @@ window.addEventListener('DOMContentLoaded',function(){
   // DB health check (non-blocking)
   setTimeout(()=>checkAllDBs(false), 1200);
   // Try live dashboard data
-  setTimeout(loadDashboard, 2500);
+  setTimeout(loadDashboard, 350);
   // Set bill date
   const bd=document.getElementById('billDate');
   if(bd){
@@ -22653,40 +22664,20 @@ function bnxSaveEmployees(list){ localStorage.setItem(bnxEmpKey(), JSON.stringif
    USER_MASTER source — no separate/duplicated staff list to drift out
    of sync with the Steward dropdown. */
 async function bnxFetchStaffList(roles){
-  let staff = [];
   const wantedRoles = roles || ['STEWARD','WAITER','CAPTAIN'];
-  // Use the same V2_CORE/gasApi path as the rest of POS so clientId and
-  // sessionToken cannot drift between the waiter dropdown and menu/table data.
   try{
-    const res = await Promise.race([
-      gasApi('GET_STAFF_LIST', { roles: wantedRoles }, 'V2_CORE'),
-      new Promise(resolve=>setTimeout(()=>resolve({success:false,error:'staff timeout'}),7000))
-    ]);
-    if (res && res.success){
-      const d = res.data || {};
-      if (Array.isArray(d.staff)) staff = d.staff;
-      else if (Array.isArray(d)) staff = d;
+    const res = await gasApi('GET_STAFF_LIST', { roles: wantedRoles }, 'V2_CORE');
+    if(res && res.success){
+      const d=res.data||{};
+      if(Array.isArray(d.staff)) return d.staff;
+      if(Array.isArray(d)) return d;
     }
-  }catch(e){ console.warn('[STAFF] live GET_STAFF_LIST failed:', e.message); }
-  if (!staff.length){
-    try{
-      const res = await Promise.race([
-        erpApi({action:'GET_STAFF_LIST', roles: wantedRoles}, 'V2_CORE'),
-        new Promise(resolve=>setTimeout(()=>resolve({success:false,error:'staff fallback timeout'}),5000))
-      ]);
-      if (res && res.success){
-        const d=res.data||{};
-        if (Array.isArray(d.staff)) staff=d.staff;
-        else if (Array.isArray(d)) staff=d;
-      }
-    }catch(e){}
-  }
-  if (!staff.length){
-    const localStaff = bnxGetEmployees();
-    if (localStaff.length) staff = localStaff;
-  }
-  return staff;
+  }catch(e){ console.warn('[STAFF] GET_STAFF_LIST failed:', e.message); }
+  // Only use manually-added real employee records as an offline fallback.
+  const localStaff=bnxGetEmployees();
+  return Array.isArray(localStaff) ? localStaff : [];
 }
+
 async function loadWaiterList(){
   const selBm = document.getElementById('bm-bf-waiter');
   const selPos = document.getElementById('waiterSel');
@@ -22780,7 +22771,14 @@ async function addStewardDlg(onSaved){
   if (typeof showNotif === 'function') showNotif(savedReal ? ('✅ '+name.trim()+' added to real staff database') : ('⚠️ '+name.trim()+' saved locally only — backend unreachable, will not sync yet'), savedReal?'success':'error');
   if (typeof onSaved === 'function') onSaved(name.trim(), code);
 }
-document.addEventListener('DOMContentLoaded', loadWaiterList);
+document.addEventListener('DOMContentLoaded', function(){
+  // Do not block first paint with USER_MASTER. The billing/POS page-level
+  // showPage hook already refreshes this list when the user opens the page.
+  const page=String((window.location.hash||'').replace(/^#/,'')||'dashboard');
+  if(page==='pos' || page==='billing') setTimeout(()=>{
+    try{ if(typeof loadWaiterList==='function') loadWaiterList(); }catch(e){}
+  },120);
+});
 
 /* PASS #20 NEW ("Today's Staff Schedule wrong show"): see the fix note
    on that card's markup above for the full root-cause writeup. Same
@@ -24499,23 +24497,7 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
     return out;
   }
 
-  window.loadWaiterList = async function(){
-    const targets=['bm-bf-waiter','waiterSel'];
-    targets.forEach(id=>{const el=document.getElementById(id);if(el)el.innerHTML='<option value="">Loading USER_MASTER…</option>';});
-    let rows=[];
-    try{ rows=await liveStaffFromServer(['STEWARD','WAITER','CAPTAIN']); }catch(e){}
-    let staff=normalizeStaff(rows);
-    /* local Employee Master is allowed only when it contains real manually-added
-       employees; never use the old hardcoded/demo names. */
-    if(!staff.length && typeof bnxGetEmployees==='function') staff=normalizeStaff(bnxGetEmployees());
-    const html=staff.map(s=>`<option value="${esc(s.code)}">${esc(s.name)}${s.role?' ('+esc(s.role)+')':''}</option>`).join('');
-    const empty='<option value="" disabled selected>No staff found in USER_MASTER</option>';
-    const add='<option value="__add_new__">+ Add New Steward…</option>';
-    const bm=document.getElementById('bm-bf-waiter');
-    const pos=document.getElementById('waiterSel');
-    if(bm) bm.innerHTML=(staff.length?'<option value="">Select Steward...</option>':'')+html+add+(staff.length?'':'');
-    if(pos) pos.innerHTML=(staff.length?'<option value="">Select Steward...</option>':empty)+html+add;
-  };
+  window.loadWaiterList = async function(){ return loadWaiterList(); };;
 
   window.loadStaffSchedule = async function(){
     const el=document.getElementById('staffScheduleList'); if(!el) return;
