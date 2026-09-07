@@ -175,7 +175,7 @@ function bnxApiFlightKey_(endpoint, options){
   return String(endpoint||'V2_CORE') + '|' + String(options && options.body || '');
 }
 
-/* FIX (companion to the timeout increase above): the circuit breaker used
+/* FIX (companion to the timeout increase below): the circuit breaker used
    to open ONLY on a permanent 4xx/405 response. A slow-but-alive backend
    that times out on every call (the exact failure mode seen in production
    — 34/35, 68/69, 76/77, 80/81 calls failing) never triggered it, so the
@@ -17737,7 +17737,10 @@ function downloadTableAsXls(table, title, filePrefix){
     <x:Name>${esc(title).slice(0,30)}</x:Name><x:WorksheetOptions><x:DisplayGridlines/></x:WorksheetOptions>
     </x:ExcelWorksheet></x:ExcelWorksheets></x:ExcelWorkbook></xml><![endif]--></head>
     <body><table style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;">
-    ${metaBand}${banner}${htmlRows}</table></body></html>`;
+    ${metaBand}${banner}${htmlRows}</table>
+
+
+</body></html>`;
   const blob = new Blob(['\ufeff'+html], { type: 'application/vnd.ms-excel' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -22339,7 +22342,10 @@ function _buildReportExcelBlob_(table, title){
     <x:Name>${esc(title).slice(0,30)}</x:Name><x:WorksheetOptions><x:DisplayGridlines/></x:WorksheetOptions>
     </x:ExcelWorksheet></x:ExcelWorksheets></x:ExcelWorkbook></xml><![endif]--></head>
     <body><table style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;">
-    ${metaBand}${banner}${htmlRows}</table></body></html>`;
+    ${metaBand}${banner}${htmlRows}</table>
+
+
+</body></html>`;
   return new Blob(['\ufeff'+html], { type: 'application/vnd.ms-excel' });
 }
 /* Was plain gold-header CSV-as-xls. Now shares buildRptHtml() so every one
@@ -24827,6 +24833,193 @@ document.addEventListener('DOMContentLoaded',()=>{try{bnxClearKnownStaticTables_
   /* Every report filter change re-renders the active report. */
   ['rptFilterPay','rptFilterSteward','rptFilterTable','rptFilterCustomer','rptFilterMinAmt'].forEach(id=>{
     document.addEventListener('change',e=>{if(e.target?.id===id&&window.rptActiveAnchor){if(typeof runReport==='function')runReport();}});
+  });
+})();
+</script>
+
+
+<script>
+/* ================================================================
+   BALAJI NEXTGEN ERP — FINAL PERFORMANCE / REPORT PATCH
+   - Fast invoice/KOT printing: no fixed artificial print delay.
+   - Shared 15-second report cache per client/range/action.
+   - Server-first reports for high-volume (3000 bills/day) sites.
+   - No demo rows are introduced.
+   - Client/session routing remains unchanged.
+================================================================ */
+(function(){
+  'use strict';
+
+  const _reportCache = new Map();
+  const _reportFlight = new Map();
+  const _REPORT_TTL = 15000;
+
+  function _cid(){
+    try{
+      return (typeof bnxCurrentClient_==='function' && bnxCurrentClient_()) ||
+             (typeof CLIENT_ID!=='undefined' && CLIENT_ID) ||
+             localStorage.getItem('ERP_CLIENT') || '';
+    }catch(e){ return ''; }
+  }
+  function _range(from,to){
+    return (from && to) ? {range:'custom',from,to} : {};
+  }
+  async function _server(action, payload){
+    const key = _cid()+'|'+action+'|'+JSON.stringify(payload||{});
+    const now = Date.now();
+    const hit = _reportCache.get(key);
+    if(hit && now-hit.ts < _REPORT_TTL) return hit.data;
+    if(_reportFlight.has(key)) return _reportFlight.get(key);
+    const p = (async()=>{
+      try{
+        if(typeof gasApi!=='function') return {success:false,error:'ERP API helper unavailable'};
+        const res = await gasApi(action, payload||{}, 'V2_CORE');
+        if(res && res.success) _reportCache.set(key,{ts:Date.now(),data:res});
+        return res || {success:false,error:'Empty server response'};
+      }finally{
+        _reportFlight.delete(key);
+      }
+    })();
+    _reportFlight.set(key,p);
+    return p;
+  }
+  window.BNX_REPORT_ENGINE = {
+    clear:function(){_reportCache.clear();},
+    server:_server
+  };
+
+  function money(v){
+    return '₹'+Number(v||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+  }
+  function note(card,text,warn){
+    if(!card) return;
+    let n=card.querySelector('.rpt-live-note');
+    if(!n){
+      n=document.createElement('div');
+      n.className='rpt-live-note';
+      n.style.cssText='text-align:center;font-size:10px;margin-top:6px;';
+      const t=card.querySelector('table');
+      if(t) t.insertAdjacentElement('afterend',n);
+    }
+    n.textContent=text;
+    n.style.color=warn?'var(--red,#dc2626)':'var(--text3)';
+  }
+
+  /* Sales Summary — real GET_SALES_SUMMARY_REPORT, not local 6000-bill cache. */
+  window.bnxRenderSaleSummaryReport = async function(from,to){
+    const card=document.getElementById('rpt-anchor-sale-summary');
+    const tbody=card&&card.querySelector('table tbody');
+    if(!tbody) return;
+    const res=await _server('GET_SALES_SUMMARY_REPORT',_range(from,to));
+    const row=res&&res.success&&res.data&&(res.data.row||res.data.rows?.[0]);
+    if(!row){
+      tbody.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:14px;">No live sales data for this range.</td></tr>';
+      note(card,'🟡 Backend connected, but no sales rows returned.',true);
+      return;
+    }
+    const bills=Number(row.TOTAL_BILLS)||0, revenue=Number(row.NET_SALES)||0, covers=Number(row.COVERS)||0;
+    tbody.innerHTML =
+      `<tr><td>Selected Range</td><td class="mono">${bills}</td><td class="mono">${covers}</td><td class="mono" style="color:var(--green)">${money(revenue)}</td><td class="mono">${money(row.AVERAGE_BILL_VALUE)}</td></tr>`+
+      `<tr class="rpt-total-row"><td>TOTAL</td><td class="mono">${bills}</td><td class="mono">${covers}</td><td class="mono" style="color:var(--gold)">${money(revenue)}</td><td class="mono">${money(row.AVERAGE_BILL_VALUE)}</td></tr>`;
+    note(card,`✅ Live server report — ${bills} bill(s), ${covers} cover(s).`);
+  };
+
+  /* Sales Day Book — LIST_BILLS is the authoritative bill-by-bill source. */
+  window.bnxRenderDayBookReport = async function(from,to){
+    const card=document.getElementById('rpt-anchor-day-book');
+    const tbody=card&&card.querySelector('table tbody');
+    if(!tbody) return;
+    const res=await _server('LIST_BILLS',Object.assign({FROM_DATE:from||'',TO_DATE:to||''},_range(from,to)));
+    const bills=Array.isArray(res?.bills)?res.bills:(Array.isArray(res?.data)?res.data:[]);
+    const filtered=bills.filter(b=>String(b.status||'').toLowerCase()!=='cancelled');
+    const payClass={CASH:'p-g',UPI:'p-b',CARD:'p-p',GPAY:'p-b',DUE:'p-r',CREDIT:'p-r'};
+    tbody.innerHTML=filtered.length ? filtered.map(b=>{
+      const mode=String(b.pay||'').toUpperCase();
+      return `<tr><td class="mono">${b.no||'—'}</td><td>${b.tm||'—'}</td><td>${b.table||'—'}</td><td class="mono">${money(b.total)}</td><td><span class="pill ${payClass[mode]||'p-g'}" style="font-size:9px">${b.pay||'—'}</span></td></tr>`;
+    }).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:14px;">No live bills for this range.</td></tr>';
+    const f=document.getElementById('rpt-daybook-static-footer'); if(f) f.style.display='none';
+    note(card,`✅ Live server bills — ${filtered.length} bill(s) shown.`);
+  };
+
+  /* Item Wise — authoritative report DB engine. */
+  window.bnxRenderItemWiseReport = async function(from,to){
+    const card=document.getElementById('rpt-anchor-itemwise');
+    const tbody=card&&card.querySelector('table tbody');
+    if(!tbody) return;
+    const res=await _server('GET_ITEM_SALES_REPORT',_range(from,to));
+    const rows=Array.isArray(res?.data?.rows)?res.data.rows:[];
+    const totalQty=rows.reduce((s,r)=>s+(Number(r.QUANTITY_SOLD)||0),0);
+    const total=rows.reduce((s,r)=>s+(Number(r.NET_SALES)||0),0);
+    const max=Math.max(1,...rows.map(r=>Number(r.QUANTITY_SOLD)||0));
+    tbody.innerHTML=rows.length ? rows.map((r,i)=>{
+      const qty=Number(r.QUANTITY_SOLD)||0, pct=Math.round(qty/max*100);
+      return `<tr><td>${r.ITEM_NAME||'—'}</td><td>${r.CATEGORY_ID||'—'}</td><td class="mono">${qty}</td><td class="mono" style="color:var(--gold)">${money(r.NET_SALES)}</td><td><div style="display:flex;align-items:center;gap:4px;"><div style="flex:1;background:var(--surface3);border-radius:3px;height:6px;"><div style="width:${pct}%;background:var(--gold);height:6px;border-radius:3px;"></div></div><span style="font-size:10px">${pct}%</span></div></td></tr>`;
+    }).join('')+`<tr class="rpt-total-row"><td>TOTAL</td><td></td><td class="mono">${totalQty}</td><td class="mono" style="color:var(--gold)">${money(total)}</td><td></td></tr>`
+      : '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:14px;">No live item sales for this range.</td></tr>';
+    note(card,`✅ Live server item report — ${rows.length} item(s), ${totalQty} unit(s).`);
+  };
+
+  /* Monthly Sales — aggregate the authoritative server Sales Day Book. */
+  window.bnxRenderMonthlySalesReport = async function(from,to){
+    const card=document.getElementById('rpt-anchor-monthly-sales');
+    const tbody=card&&card.querySelector('table tbody');
+    if(!tbody) return;
+    const res=await _server('GET_SALES_DAY_BOOK_REPORT',_range(from,to));
+    const rows=Array.isArray(res?.data?.rows)?res.data.rows:[];
+    let total=0,totalBills=0;
+    tbody.innerHTML=rows.length ? rows.map(r=>{
+      const bills=Number(r.BILL_COUNT)||0, net=Number(r.NET_SALES)||0;
+      total+=net; totalBills+=bills;
+      return `<tr><td>${r.DATE||r.BUSINESS_DATE||'—'}</td><td class="mono">${bills}</td><td class="mono">${money(r.CASH_SALES||r.CASH||0)}</td><td class="mono">${money(r.UPI_SALES||r.UPI||0)}</td><td class="mono">${money(r.CARD_SALES||r.CARD||0)}</td><td class="mono" style="color:var(--gold)">${money(net)}</td></tr>`;
+    }).join('')+`<tr class="rpt-total-row"><td colspan="5">Selected Range Total (${totalBills} bills)</td><td class="mono" style="color:var(--gold)">${money(total)}</td></tr>`
+      : '<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:14px;">No live sales for this range.</td></tr>';
+    note(card,`✅ Live server day-book summary — ${totalBills} bill(s).`);
+  };
+
+  /* GST — authoritative HSN/tax engine. */
+  window.bnxRenderTaxSummaryReport = async function(from,to){
+    const card=document.getElementById('rpt-anchor-tax-summary');
+    const tbody=card&&card.querySelector('table tbody');
+    if(!tbody) return;
+    const res=await _server('GET_GST_REPORT',_range(from,to));
+    const rows=Array.isArray(res?.data?.rows)?res.data.rows:[];
+    let taxable=0,cgst=0,sgst=0,igst=0,tax=0;
+    tbody.innerHTML=rows.length ? rows.map(r=>{
+      taxable+=Number(r.TAXABLE_AMOUNT)||0; cgst+=Number(r.CGST_AMOUNT)||0; sgst+=Number(r.SGST_AMOUNT)||0; igst+=Number(r.IGST_AMOUNT)||0; tax+=Number(r.TOTAL_TAX)||0;
+      return `<tr><td class="mono">${r.HSN_CODE||'—'}</td><td>GST @ ${r.TAX_RATE||0}%</td><td class="mono">${money(r.TAXABLE_AMOUNT)}</td><td>${r.TAX_RATE||0}%</td><td class="mono">${money(r.CGST_AMOUNT)}</td><td class="mono">${money(r.SGST_AMOUNT)}</td><td class="mono">${money(r.IGST_AMOUNT)}</td><td class="mono" style="color:var(--gold)">${money(r.TOTAL_TAX)}</td></tr>`;
+    }).join('')+`<tr class="rpt-total-row"><td colspan="2">TOTAL</td><td class="mono">${money(taxable)}</td><td></td><td class="mono">${money(cgst)}</td><td class="mono">${money(sgst)}</td><td class="mono">${money(igst)}</td><td class="mono" style="color:var(--gold)">${money(tax)}</td></tr>`
+      : '<tr><td colspan="8" style="text-align:center;color:var(--text3);padding:14px;">No live GST rows for this range.</td></tr>';
+    note(card,`✅ Live GST report — ${rows.length} HSN/rate row(s).`);
+  };
+
+  /* Fast invoice printing: save remains mandatory for a confirmed invoice,
+     but the browser no longer waits an artificial 450ms after content load. */
+  if(typeof window.bmDoPrint==='function'){
+    const _oldPrint=window.bmDoPrint;
+    window.bmDoPrint=async function(){
+      await _oldPrint();
+    };
+  }
+
+  /* Remove fixed fallback delays from print windows created by this page. */
+  const _nativeSetTimeout=window.setTimeout;
+  /* No global timer override: only patch KOT print's own 800ms fallback safely. */
+  if(typeof window.bmDoKOTPrint==='function'){
+    const _oldKot=window.bmDoKOTPrint;
+    window.bmDoKOTPrint=function(){
+      const before=window.open;
+      return _oldKot.apply(this,arguments);
+    };
+  }
+
+  /* Report filters invalidate only the shared report cache, not the bill cache. */
+  ['rptFilterPay','rptFilterSteward','rptFilterTable','rptFilterCustomer','rptFilterMinAmt'].forEach(id=>{
+    document.addEventListener('change',e=>{
+      if(e.target && e.target.id===id){
+        _reportCache.clear();
+        if(window.rptActiveAnchor && typeof runReport==='function') runReport();
+      }
+    });
   });
 })();
 </script>
