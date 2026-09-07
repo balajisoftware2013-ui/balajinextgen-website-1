@@ -124,13 +124,21 @@ const GAS_APIS_DASH = {
   V2_AUTH:     'https://script.google.com/macros/s/' + (function(){try{return localStorage.getItem('bnx_api_auth');}catch(e){}}()||'AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx') + '/exec',
 };
 
-/* ═══ FINAL LIVE API — DIRECT GOOGLE APPS SCRIPT ═══
-   No Netlify / Cloudflare / Google Apps Script V2_CORE /exec proxy.
-   Production and local development use the real V2_CORE/V2_AUTH /exec URLs.
-   Requests are sent as simple text/plain POSTs so the browser does not
-   trigger an OPTIONS preflight. Google Apps Script web-app redirects are
-   followed by fetch automatically.
+/* ═══ LIVE-SITE SAME-ORIGIN API PROXY FIX ═══
+   Google Apps Script web-app responses do not expose the CORS header required
+   by browsers when this dashboard is served from balajinextgen.in. The result
+   is the exact console error: "No Access-Control-Allow-Origin header" and
+   every Master/Transaction/Report load falls back to Offline / DB unavailable.
+   Netlify proxies these two paths server-side, so browser requests remain
+   same-origin and both reads AND writes work normally. Local file:// keeps the
+   direct GAS URL as a development fallback.
 */
+/* ================================================================
+   LIVE API — RESTORED ORIGINAL DIRECT GOOGLE APPS SCRIPT PATTERN
+   No Netlify / Cloudflare / Worker dependency.
+   Browser POSTs to the real GAS /exec URL.  Apps Script may return
+   a 302 ContentService redirect; browser fetch follows it automatically.
+   ================================================================ */
 const BNX_SAME_ORIGIN_API = null;
 
 function bnxApiUrl_(endpoint){
@@ -212,7 +220,7 @@ async function bnxFetchJson_(endpoint, options){
 
         const parsedAction = (()=>{ try{return JSON.parse(fetchOpts.body||'{}').action||'';}catch(e){return '';} })();
         const timeoutMs = Number(fetchOpts.timeoutMs) ||
-          (/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? 7000 : 2800);
+          (/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? 20000 : 15000);
         delete fetchOpts.timeoutMs;
 
         const timeoutCtrl = new AbortController();
@@ -281,10 +289,10 @@ function bnxShowApiTransportError_(err, endpoint){
       el.style.cssText='position:fixed;left:12px;right:12px;bottom:12px;z-index:99999;background:#7f1d1d;color:#fff;padding:10px 14px;border-radius:10px;font:600 12px/1.4 Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.25);';
       document.body.appendChild(el);
     }
-    const route=GAS_APIS_DASH[endpoint] || endpoint;
+    const route=endpoint==='V2_AUTH'?'V2_AUTH /exec':'V2_CORE /exec';
     el.textContent=(window.location && window.location.protocol==='file:')
-  ? 'LOCAL TEST MODE: browser cannot read Google Apps Script directly from file://. Use the configured Google Apps Script /exec API for live DB data.'
-  : 'ERP API '+endpoint+' unavailable ('+(err&&err.status?('HTTP '+err.status):'network error')+'). Live screen remains usable; configure '+route+' as a POST Netlify Function for live DB sync. Live data is not replaced with demo data.';
+  ? 'LOCAL TEST MODE: upload this HTML to balajinextgen.in before testing live Google Apps Script DB sync.'
+  : 'ERP API '+endpoint+' unavailable ('+(err&&err.status?('HTTP '+err.status):'network error')+'). Direct Google Apps Script /exec is configured; live DB data was not replaced with demo data.';
   }catch(e){}
 }
 
@@ -295,7 +303,7 @@ async function bnxRefreshConfig(){
   // forever. Still falls back to the hardcoded bootstrap IDs either
   // way (never blocks startup), but now every outcome is logged.
   try{
-    const res = await bnxFetchJson_('V2_CORE', {body: JSON.stringify({action:'GET_CONFIG'}), timeoutMs:2500});
+    const res = await bnxFetchJson_('V2_CORE', {body: JSON.stringify({action:'GET_CONFIG'}), timeoutMs:15000});
     if(res && res.success && res.data){
       if(res.data.v2CoreId) localStorage.setItem('bnx_api_core', res.data.v2CoreId);
       if(res.data.v2AuthId) localStorage.setItem('bnx_api_auth', res.data.v2AuthId);
@@ -338,7 +346,7 @@ async function bnxRefreshConfig(){
 // promise is captured so every GAS-dependent init below can genuinely
 // wait on it first, instead of racing it.
 window.__bnxConfigReady = (window.location && window.location.protocol !== 'file:')
-  ? Promise.resolve({success:true, skipped:true, reason:'direct Google Apps Script deployment config'})
+  ? Promise.resolve({success:true, skipped:true, reason:'same-origin proxy uses bootstrap deployment config'})
   : bnxRefreshConfig();
 const GAS_URL = GAS_APIS_DASH.V2_CORE;
 const CLIENT_ID=(function(){
@@ -390,11 +398,11 @@ const CLIENT_INDUSTRY=(function(){
    • Auto-archive: old bills (>7 days) cleaned from sessionStorage
 ═══════════════════════════════════════════════════════ */
 const REQUEST_QUEUE = { pending: [], active: 0, maxConcurrent: 5 };
-const API_RETRY_CONFIG = { maxAttempts: 3, baseDelay: 300, maxDelay: 5000 };
+const API_RETRY_CONFIG = { maxAttempts: 2, baseDelay: 400, maxDelay: 1500 };
 // HANG FIX: identical GET/summary requests fired by multiple startup listeners
 // are coalesced into ONE network request. This page previously requested
 // GET_DASHBOARD_SUMMARY several times during startup, filling the queue when
-// Google Apps Script V2_CORE /exec was unavailable and making the screen feel frozen.
+// /api/core was unavailable and making the screen feel frozen.
 const BNX_INFLIGHT_API = new Map();
 
 // FIX (authorization): the confirmed backend returns a real,
@@ -10310,61 +10318,22 @@ function bnxApplyTableFilters_(){
   }
 }
 function filterRTC(val, btn){
-  const text=String(val ?? '').trim();
-  const low=text.toLowerCase();
-  const statusValues=['','available','running','occupied','reserved','cleaning'];
-
-  /* LIVE ZONE FILTER
-     Zone buttons are generated from the actual client's TABLE_MASTER.
-     Never rely only on the button dataset because older cached HTML may
-     call filterRTC('Bar', this) without data-table-zone. If the supplied
-     value matches any live zone, it is a zone filter. This makes Bar, Lounge,
-     Brew Pub, Family, etc. work exactly the same way. */
-  const liveRows=(typeof tableData!=='undefined' && Array.isArray(tableData)) ? tableData : [];
-  const liveZones=[...new Set(liveRows.map(t=>String(t.zone ?? '').trim()).filter(Boolean))];
-  const matchedZone=liveZones.find(z=>z.toLowerCase()===low);
-  const isExplicitZone=!!(btn && btn.dataset && btn.dataset.tableZone!==undefined);
-  const isZone=isExplicitZone || (!!matchedZone && !statusValues.includes(low));
-
+  const text=String(val||'');
+  const isStatus=['','available','running','occupied','reserved','cleaning'].includes(text.toLowerCase());
+  const isZone=btn && btn.dataset && btn.dataset.tableZone!==undefined;
   if(isZone){
     document.querySelectorAll('#tableZoneFilters .fcat').forEach(b=>b.classList.remove('active'));
-
-    /* Clicking the already-selected zone toggles back to All zones. */
-    const current=String(window._rtcFilterState.zone||'').trim().toLowerCase();
-    if(current && current===low){
-      window._rtcFilterState.zone='';
-      const allZone=document.querySelector('#tableZoneFilters [data-table-zone=""]');
-      if(allZone) allZone.classList.add('active');
-    }else{
-      window._rtcFilterState.zone=matchedZone || text;
-      if(btn) btn.classList.add('active');
-      else {
-        const hit=[...document.querySelectorAll('#tableZoneFilters .fcat')].find(b=>
-          String(b.dataset.tableZone||'').trim().toLowerCase()===low
-        );
-        if(hit) hit.classList.add('active');
-      }
-    }
-  }else if(statusValues.includes(low)){
+    if(btn) btn.classList.add('active');
+    window._rtcFilterState.zone=text;
+  }else if(isStatus){
     document.querySelectorAll('#tableStatusFilters .fcat').forEach(b=>b.classList.remove('active'));
     if(btn) btn.classList.add('active');
-    window._rtcFilterState.status=low;
+    window._rtcFilterState.status=text.toLowerCase();
   }else{
     window._rtcFilterState.search=text;
   }
   bnxApplyTableFilters_();
 }
-/* Direct zone API: bnxFilterTableZone('Bar') filters the live table map to
-   the client's actual Bar zone. Useful for sidebar/quick links as well as
-   the zone pills. */
-window.bnxFilterTableZone=function(zone){
-  const wanted=String(zone??'').trim();
-  const btn=[...document.querySelectorAll('#tableZoneFilters .fcat')].find(b=>
-    String(b.dataset.tableZone||'').trim().toLowerCase()===wanted.toLowerCase()
-  );
-  filterRTC(wanted,btn||null);
-};
-
 function bnxClearTableFilters_(){
   window._rtcFilterState={search:'',status:'',zone:''};
   document.querySelectorAll('#page-tables .fcat').forEach(b=>b.classList.remove('active'));
