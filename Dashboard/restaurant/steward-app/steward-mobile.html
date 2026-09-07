@@ -1637,41 +1637,84 @@ bnxUpdateSyncBadge(); // reflect any items already stuck in "failed" from a prev
 //   'live'  — confirmed straight from the server this session
 let bnxMenuSource = IS_DEMO_MODE ? 'demo' : 'none';
 let bnxMenuLastUpdated = null;
-async function loadMenuFromServer(){
-  // FIX ("same menu item show according"): this called a dead endpoint
-  // ('getMenuItems'/V2_FRONTEND). It now first loads the SAME
-  // localStorage menu (bnx_menu_data_<CLIENT_ID>) the dashboard's
-  // Menu Manager saves to — so an item created or Excel-imported on
-  // the dashboard shows up here immediately on the same device — then
-  // still attempts the real backend action as an enhancement/merge for
-  // cross-device sync once/if the backend actually persists menu data.
-  try{
-    const saved = JSON.parse(localStorage.getItem(bnxMenuKey())||'null');
-    if(Array.isArray(saved) && saved.length){
-      MENU = saved.map(m=>({
-        id: m.code || m.id || m.n, name: m.n || m.name, cat: m.c || m.cat || 'Other',
-        price: Number(m.p ?? m.price) || 0, icon: m.e || m.icon || bnxDefaultIcon(m.c||m.cat), avail: m.avail!==false,
-        gst: Number(m.gst)||0
-      }));
-      bnxMenuSource = 'cache';
+/* BNX_MENU_PERF — menu reads are client-scoped and should not be re-fetched
+   every time the New Order screen is opened. Keep one in-flight request and
+   a short live freshness window; manual Sync/Refresh can still force a read. */
+let bnxMenuLoadingPromise = null;
+let bnxMenuLastFetchAt = 0;
+const BNX_MENU_FRESH_MS = 60000;
+
+async function loadMenuFromServer(force){
+  force = force === true;
+  const now = Date.now();
+  if(!force && bnxMenuSource === 'live' && bnxMenuLastFetchAt &&
+     (now - bnxMenuLastFetchAt) < BNX_MENU_FRESH_MS){
+    if(document.getElementById('s-new-order')?.classList.contains('active')) renderMenu();
+    return true;
+  }
+  if(bnxMenuLoadingPromise) return bnxMenuLoadingPromise;
+
+  bnxMenuLoadingPromise = (async function(){
+    // Real client-scoped cache is displayed immediately while the live read
+    // is in flight. Never introduce MENU_FALLBACK in live mode.
+    try{
+      const saved = JSON.parse(localStorage.getItem(bnxMenuKey())||'null');
+      if(Array.isArray(saved) && saved.length && (!MENU.length || bnxMenuSource==='none')){
+        MENU = saved.map(m=>({
+          id: m.code || m.id || m.n,
+          name: m.n || m.name,
+          cat: m.c || m.cat || 'Other',
+          price: Number(m.p ?? m.price) || 0,
+          icon: m.e || m.icon || bnxDefaultIcon(m.c||m.cat),
+          avail: m.avail!==false,
+          gst: Number(m.gst)||0
+        })).filter(m=>m.id && m.name);
+        bnxMenuSource = 'cache';
+        bnxMenuLastUpdated = new Date();
+        if(document.getElementById('s-new-order')?.classList.contains('active')) renderMenu();
+      }
+    }catch(e){}
+
+    const res = await gasApi('GET_MENU_ITEMS', {}, 'V2_CORE');
+    bnxMenuLastFetchAt = Date.now();
+
+    if(res && res.success && Array.isArray(res.data)){
+      const mapped = res.data.map(m=>({
+        id: m.id || m.ITEM_ID || m.code || m.name,
+        name: m.name || m.ITEM_NAME || m.n,
+        cat: m.category || m.CATEGORY || m.c || 'Other',
+        price: parseFloat(m.price ?? m.PRICE ?? m.p) || 0,
+        icon: m.icon || m.e || bnxDefaultIcon(m.category||m.CATEGORY||m.c),
+        avail: m.avail !== false,
+        gst: Number(m.gst ?? m.GST)||0
+      })).filter(m=>m.id && m.name);
+
+      // A successful empty menu is valid business data. Do not keep stale
+      // cached items in that case; the server is authoritative.
+      MENU = mapped;
+      bnxMenuSource = 'live';
       bnxMenuLastUpdated = new Date();
+
+      // Keep the same client-scoped cache in sync for fast next open.
+      try{
+        localStorage.setItem(bnxMenuKey(), JSON.stringify(MENU.map(m=>({
+          code:m.id,n:m.name,c:m.cat,p:m.price,e:m.icon,avail:m.avail,gst:m.gst
+        }))));
+      }catch(e){}
+    } else if(!MENU.length && !IS_DEMO_MODE){
+      bnxMenuSource = 'none';
     }
-  }catch(e){}
-  const res = await gasApi('GET_MENU_ITEMS', {}, 'V2_CORE');
-  if(res && res.success && Array.isArray(res.data) && res.data.length){
-    MENU = res.data.map(m=>({
-      id: m.id || m.ITEM_ID || m.code || m.name,
-      name: m.name || m.ITEM_NAME || m.n,
-      cat: m.category || m.CATEGORY || m.c || 'Other',
-      price: parseFloat(m.price || m.PRICE || m.p) || 0,
-      icon: m.icon || m.e || bnxDefaultIcon(m.category||m.CATEGORY||m.c),
-      avail: m.avail !== false,
-      gst: Number(m.gst || m.GST)||0
-    }));
-    bnxMenuSource = 'live';
-    bnxMenuLastUpdated = new Date();
-  } // else: keep whatever was loaded above (real local cache, or [] in live mode if no cache exists yet — never MENU_FALLBACK outside IS_DEMO_MODE)
-  if(document.getElementById('s-new-order')?.classList.contains('active')) renderMenu();
+
+    if(document.getElementById('s-new-order')?.classList.contains('active')) renderMenu();
+    return !!(res && res.success);
+  })().catch(e=>{
+    console.error('[MENU_LOAD] Failed to load menu:',e && e.message?e.message:e);
+    if(!MENU.length && !IS_DEMO_MODE) bnxMenuSource='none';
+    if(document.getElementById('s-new-order')?.classList.contains('active')) renderMenu();
+    return false;
+  }).finally(()=>{ bnxMenuLoadingPromise=null; });
+
+  return bnxMenuLoadingPromise;
 }
 /* P0 FIX (external audit round 3, #1 — "NEVER show fake tables in
    LIVE mode"): this array is now ONLY ever assigned into TABLES when
@@ -1847,7 +1890,7 @@ function showScreen(id,navEl){
   // PASS #48: Profile screen's Today Orders/Sales/Tables cards are now
   // real (see bnxRenderMyStats) — refresh them whenever this screen opens.
   if(id==='s-profile'){ bnxRenderMyStats(); }
-  if(id==='s-new-order'){ renderMenu(); loadMenuFromServer(); }
+  if(id==='s-new-order'){ renderMenu(); loadMenuFromServer(false); }
   if(id==='s-history'){
     const btn=document.querySelector(`#hist-range-btns .plt-tab[onclick*="'${orderHistRange}'"]`);
     document.querySelectorAll('#hist-range-btns .plt-tab').forEach(b=>b.classList.remove('all-active'));
@@ -2886,7 +2929,7 @@ function filterPlatform(plt,el){
 function bnxKotTimeLabel(iso){
   try{ return new Date(iso).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}); }catch(e){ return iso||''; }
 }
-function bnxKotElapsedMin_(iso){
+function bnxKotElapsedIsoMin_(iso){
   try{ const d=(Date.now()-new Date(iso).getTime())/60000; return d>=0?Math.round(d):0; }catch(e){ return 0; }
 }
 function renderKOT(){
@@ -2906,7 +2949,7 @@ function renderKOT(){
   if(kotSub) kotSub.textContent = active.length+' active order'+(active.length===1?'':'s');
   if(!active.length){ listEl.innerHTML=`<div style="text-align:center;padding:30px 10px;color:var(--text3);font-size:12px;">No active KOTs</div>`; bnxRenderQuickActionCounts(); return; }
   listEl.innerHTML=active.map(k=>{
-    const mins=bnxKotElapsedMin_(k.time);
+    const mins=bnxKotElapsedIsoMin_(k.time);
     return `
     <div class="kot-card">
       <div class="kot-header">
@@ -3525,48 +3568,67 @@ let menuSearchQuery = '';
 function bnxEscapeHtml_(s){
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+function bnxGetFilteredMenu_(){
+  const q = String(menuSearchQuery||'').trim().toLowerCase();
+  let filtered = activeCat==='All'
+    ? MENU
+    : MENU.filter(m=>String(m.cat||'').toLowerCase()===String(activeCat||'').toLowerCase());
+  if(q){
+    filtered = filtered.filter(m=>
+      String(m.name||'').toLowerCase().includes(q) ||
+      String(m.cat||'').toLowerCase().includes(q)
+    );
+  }
+  return filtered;
+}
+
+function renderMenuItems_(itemsList){
+  const grid = document.getElementById('menu-grid');
+  if(!grid) return;
+  const filtered = itemsList || bnxGetFilteredMenu_();
+
+  if(menuViewMode === 'table'){
+    renderMenuTable(filtered);
+    return;
+  }
+
+  grid.innerHTML = filtered.map(m=>`
+    <div class="menu-card${!m.avail?' unavailable':''}" data-menu-id="${bnxEscapeHtml_(m.id)}"
+         onclick="${m.avail?`addItem(${JSON.stringify(m.id)})`:'toast("Out of stock","error")'}">
+      <div class="mc-icon">${bnxEscapeHtml_(m.icon)}</div>
+      <div class="mc-name">${bnxEscapeHtml_(m.name)}</div>
+      <div class="mc-cat">${bnxEscapeHtml_(m.cat)}</div>
+      <div class="mc-price">₹${(Number(m.price)||0).toLocaleString('en-IN')}</div>
+      ${m.avail?`<div class="mc-add" data-menu-qty="${bnxEscapeHtml_(m.id)}">${order[m.id]?`<span style="font-size:11px;">${order[m.id]}</span>`:'+'}</div>`:''}
+    </div>`).join('');
+}
+
 function renderMenu(){
   const cats=['All',...new Set(MENU.map(m=>m.cat))];
+  const menuGridEl=document.getElementById('menu-grid');
+  if(!menuGridEl) return;
 
-  // P0 FIX (external audit round 3, #2 — "LIVE menu must NEVER fall
-  // back to demo menu"): replaces the old single fake-data warning
-  // with the audit's exact 3-state design —
-  //   'none'  (live mode, nothing loaded at all): "Menu temporarily
-  //           unavailable" + Retry, empty grid — never invents items
-  //           a steward could actually take a real order against.
-  //   'cache' (real business data, just not confirmed live this
-  //           session): a calm "Cached Menu — last updated HH:MM"
-  //           badge + Refresh, items are real and orderable.
-  //   'live'  confirmed straight from the server: no banner.
-  //   'demo'  IS_DEMO_MODE only: no banner (demo mode is expected to
-  //           show sample data — it's the LIVE-mode leak that was
-  //           the actual bug).
-  (function(){
-    const menuGridEl = document.getElementById('menu-grid');
-    if(!menuGridEl) return;
-    let bannerEl = document.getElementById('menu-fallback-banner');
-    if(!bannerEl){
-      bannerEl = document.createElement('div');
-      bannerEl.id = 'menu-fallback-banner';
-      menuGridEl.parentElement.insertBefore(bannerEl, menuGridEl);
-    }
-    if(bnxMenuSource === 'none'){
-      bannerEl.style.cssText = 'background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;font-size:11.5px;font-weight:700;padding:10px 12px;border-radius:8px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:8px;';
-      bannerEl.innerHTML = `<span>⚠️ Menu temporarily unavailable — could not reach the server and no cached menu exists on this device.</span><button onclick="loadMenuFromServer()" style="background:#991b1b;color:#fff;border:none;border-radius:6px;padding:5px 10px;font-size:10.5px;font-weight:700;cursor:pointer;white-space:nowrap;">Retry</button>`;
-    } else if(bnxMenuSource === 'cache'){
-      const t = bnxMenuLastUpdated ? bnxMenuLastUpdated.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}) : '';
-      bannerEl.style.cssText = 'background:#fef3c7;border:1px solid #fbbf24;color:#92400e;font-size:11.5px;font-weight:700;padding:8px 12px;border-radius:8px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:8px;';
-      bannerEl.innerHTML = `<span>🟡 Cached Menu${t?' — last updated '+t:''}</span><button onclick="loadMenuFromServer()" style="background:#92400e;color:#fff;border:none;border-radius:6px;padding:5px 10px;font-size:10.5px;font-weight:700;cursor:pointer;white-space:nowrap;">Refresh</button>`;
-    } else {
-      bannerEl.style.cssText = 'display:none;';
-      bannerEl.innerHTML = '';
-    }
-  })();
+  let bannerEl=document.getElementById('menu-fallback-banner');
+  if(!bannerEl){
+    bannerEl=document.createElement('div');
+    bannerEl.id='menu-fallback-banner';
+    menuGridEl.parentElement.insertBefore(bannerEl,menuGridEl);
+  }
+  if(bnxMenuSource==='none'){
+    bannerEl.style.cssText='background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;font-size:11.5px;font-weight:700;padding:10px 12px;border-radius:8px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:8px;';
+    bannerEl.innerHTML='<span>⚠️ Menu temporarily unavailable — could not reach the server and no cached menu exists on this device.</span><button onclick="loadMenuFromServer(true)" style="background:#991b1b;color:#fff;border:none;border-radius:6px;padding:5px 10px;font-size:10.5px;font-weight:700;cursor:pointer;white-space:nowrap;">Retry</button>';
+  }else if(bnxMenuSource==='cache'){
+    const t=bnxMenuLastUpdated?bnxMenuLastUpdated.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}):'';
+    bannerEl.style.cssText='background:#fef3c7;border:1px solid #fbbf24;color:#92400e;font-size:11.5px;font-weight:700;padding:8px 12px;border-radius:8px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:8px;';
+    bannerEl.innerHTML='<span>🟡 Cached Menu'+(t?' — last updated '+t:'')+'</span><button onclick="loadMenuFromServer(true)" style="background:#92400e;color:#fff;border:none;border-radius:6px;padding:5px 10px;font-size:10.5px;font-weight:700;cursor:pointer;white-space:nowrap;">Refresh</button>';
+  }else{
+    bannerEl.style.cssText='display:none;';
+    bannerEl.innerHTML='';
+  }
 
-  // Add view toggle buttons with category tabs
-  const viewToggle = `<div class="menu-view-controls">
+  const viewToggle=`<div class="menu-view-controls">
     <div class="menu-search-wrap">
-      <input type="search" id="menuSearchInput" class="menu-search-input" placeholder="🔍 Search item or category…" value="${menuSearchQuery.replace(/"/g,'&quot;')}" oninput="filterMenuSearch(this.value)">
+      <input type="search" id="menuSearchInput" class="menu-search-input" placeholder="🔍 Search item or category…" value="${String(menuSearchQuery||'').replace(/"/g,'&quot;')}" oninput="filterMenuSearch(this.value)">
       <span id="menuSearchClear" onclick="document.getElementById('menuSearchInput').value='';filterMenuSearch('');" style="display:${menuSearchQuery?'':'none'};position:absolute;right:10px;top:50%;transform:translateY(-50%);cursor:pointer;color:var(--text3);font-size:13px;">✕</span>
     </div>
     <div class="cat-tabs-wrapper">
@@ -3577,52 +3639,15 @@ function renderMenu(){
       <button class="menu-view-toggle${menuViewMode==='table'?' active':''}" data-view="table" onclick="toggleMenuView('table')">≣ Table</button>
     </div>
   </div>`;
-  
-  let catTabsContainer = document.getElementById('cat-tabs');
-  if(!catTabsContainer){
-    // Create it if it doesn't exist
-    const gridContainer = document.getElementById('menu-grid');
-    if(gridContainer){
-      catTabsContainer = document.createElement('div');
-      catTabsContainer.id = 'cat-tabs';
-      gridContainer.parentElement.insertBefore(catTabsContainer, gridContainer);
-    }
-  }
-  
-  if(catTabsContainer){
-    catTabsContainer.innerHTML = viewToggle;
-  }
-  
-  const q = menuSearchQuery.trim().toLowerCase();
-  // FIX (external review — "category filtering is exact-match only"):
-  // search already lowercases both sides, but this comparison was a
-  // strict === — "Beverages" and "beverages" (e.g. one typed by hand in
-  // Menu Manager, one from an Excel import) would be treated as two
-  // different categories here even though the cat-tabs list above
-  // dedupes them by exact string too. Matching case-insensitively like
-  // the search does, right below.
-  let filtered=activeCat==='All'?MENU:MENU.filter(m=>String(m.cat||'').toLowerCase()===String(activeCat||'').toLowerCase());
-  if (q) filtered = filtered.filter(m => (m.name||'').toLowerCase().includes(q) || (m.cat||'').toLowerCase().includes(q));
 
-  if(menuViewMode === 'table'){
-    /* PASS #29 FIX ("view proper fix"): renderMenuTable() used to
-       always group the FULL, unfiltered MENU by category — switching
-       to Table view silently ignored whichever category tab (or now,
-       search) was active, showing every category's items regardless.
-       Now takes the same `filtered` list Grid view already uses, so
-       both views agree with the category/search controls above them. */
-    renderMenuTable(filtered);
-  } else {
-    // Grid view (default)
-    document.getElementById('menu-grid').innerHTML=filtered.map(m=>`
-      <div class="menu-card${!m.avail?' unavailable':''}" onclick="${m.avail?`addItem(${JSON.stringify(m.id)})`:'toast(\"Out of stock\",\"error\")'}">
-        <div class="mc-icon">${bnxEscapeHtml_(m.icon)}</div>
-        <div class="mc-name">${bnxEscapeHtml_(m.name)}</div>
-        <div class="mc-cat">${bnxEscapeHtml_(m.cat)}</div>
-        <div class="mc-price">₹${(Number(m.price)||0).toLocaleString('en-IN')}</div>
-        ${m.avail?`<div class="mc-add">${order[m.id]?`<span style="font-size:11px;">${order[m.id]}</span>`:'+'}</div>`:''}
-      </div>`).join('');
+  let catTabsContainer=document.getElementById('cat-tabs');
+  if(!catTabsContainer){
+    catTabsContainer=document.createElement('div');
+    catTabsContainer.id='cat-tabs';
+    menuGridEl.parentElement.insertBefore(catTabsContainer,menuGridEl);
   }
+  catTabsContainer.innerHTML=viewToggle;
+  renderMenuItems_();
   updateOrderBadge();
 }
 
@@ -3642,12 +3667,12 @@ function toggleMenuView(view){
    and restores cursor to the end right after the re-render so typing
    feels continuous instead of losing the field after each character. */
 function filterMenuSearch(val){
-  menuSearchQuery = val;
-  renderMenu();
-  const el = document.getElementById('menuSearchInput');
-  if (el){ el.focus(); const len = el.value.length; el.setSelectionRange(len, len); }
-  const clearBtn = document.getElementById('menuSearchClear');
-  if (clearBtn) clearBtn.style.display = menuSearchQuery ? '' : 'none';
+  menuSearchQuery = val || '';
+  renderMenuItems_();
+  const clearBtn=document.getElementById('menuSearchClear');
+  if(clearBtn) clearBtn.style.display=menuSearchQuery?'':'none';
+  const el=document.getElementById('menuSearchInput');
+  if(el && document.activeElement!==el) el.focus();
 }
 
 function filterCat(cat,el){
@@ -3663,7 +3688,7 @@ function filterCat(cat,el){
 function renderMenuTable(itemsList){
   const grid = document.getElementById('menu-grid');
   if(!grid) return;
-  const source = itemsList || MENU;
+  const source = itemsList || bnxGetFilteredMenu_();
 
   // Group menu by category and show as table
   const cats = {};
@@ -3693,7 +3718,7 @@ function renderMenuTable(itemsList){
       const status = m.avail ? '✓ Available' : '✗ Out of Stock';
       const statusClass = m.avail ? 'status-avail' : 'status-unavail';
       
-      html += `<tr class="menu-table-row${m.avail?'':' disabled'}">
+      html += `<tr class="menu-table-row${m.avail?'':' disabled'}" data-menu-id="${bnxEscapeHtml_(m.id)}">
         <td class="td-name">${bnxEscapeHtml_(m.name)}</td>
         <td class="td-price">₹${(Number(m.price)||0).toLocaleString('en-IN')}</td>
         <td class="td-status"><span class="status-badge ${statusClass}">${status}</span></td>
@@ -3718,22 +3743,43 @@ function renderMenuTable(itemsList){
 }
 
 function refreshCurrentMenuView_(){
-  if(menuViewMode === 'table') renderMenuTable();
-  else renderMenu();
+  renderMenuItems_();
+  updateOrderBadge();
+}
+
+function updateMenuQtyUI_(id){
+  const key=String(id);
+  const qty=Number(order[id]||0);
+  document.querySelectorAll('[data-menu-qty]').forEach(el=>{
+    if(String(el.getAttribute('data-menu-qty'))!==key) return;
+    el.innerHTML = qty ? `<span style="font-size:11px;">${qty}</span>` : '+';
+  });
+  document.querySelectorAll('.menu-table-row[data-menu-id]').forEach(row=>{
+    if(String(row.getAttribute('data-menu-id'))!==key) return;
+    const q=row.querySelector('.qty-display');
+    const minus=row.querySelector('.qty-btn');
+    if(q) q.textContent=String(qty);
+    if(minus) minus.disabled=qty===0;
+  });
 }
 
 function decreaseItem(id){
-  if(order[id] && order[id] > 0){
+  if(order[id] && order[id]>0){
     order[id]--;
-    if(order[id] === 0) delete order[id];
-    refreshCurrentMenuView_();
+    if(order[id]===0) delete order[id];
+    updateMenuQtyUI_(id);
+    updateOrderBadge();
   }
 }
 
 function addItem(id){
+  const m=MENU.find(x=>String(x.id)===String(id));
+  if(!m){ toast('Menu item not available','error'); return; }
+  if(m.avail===false){ toast('Out of stock','error'); return; }
   order[id]=(order[id]||0)+1;
-  refreshCurrentMenuView_();
-  toast(`Added to order`,'success');
+  updateMenuQtyUI_(id);
+  updateOrderBadge();
+  toast('Added to order','success');
 }
 
 function updateOrderBadge(){
@@ -3871,7 +3917,7 @@ async function placeOrder(){
   // data from the backend today). Tagging steward here means the
   // table is correctly recognized as "mine" the instant the KOT is
   // sent, with zero dependency on that backend gap.
-  bnxUpdateTableOverlay(selTable.id, { status:'RUNNING', covers: selTable.covers||0, bill: (selTable.bill||0)+amount, steward: stewardName });
+  bnxUpdateTableOverlay(selTable.id, { status:'RUNNING', covers: selTable.covers||0, bill: (selTable.bill||0)+amount, steward: stewardName }).catch(()=>{});
 
   showOrderPlacedModal(orderId);
   setTimeout(() => showScreen('s-home'), 1500);
@@ -4389,7 +4435,7 @@ bnxSafeBoot_(() => setInterval(loadTablesLive, 20000), 'table polling interval')
     try{
       if(typeof flushOutbox==='function')await flushOutbox();
       if(typeof loadKOTFromServer==='function')await loadKOTFromServer();
-      if(typeof loadMenuFromServer==='function')await loadMenuFromServer();
+      if(typeof loadMenuFromServer==='function')await loadMenuFromServer(true);
       if(typeof bnxRenderQuickActionCounts==='function')bnxRenderQuickActionCounts();
       toast('✅ Sync check completed','success');bnxStewardHaptic('success');
     }catch(e){toast('Sync could not complete — queued work is protected','error');}
