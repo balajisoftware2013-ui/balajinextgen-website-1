@@ -3514,7 +3514,7 @@ document.addEventListener('DOMContentLoaded', function(){
     <div class="stat" style="background:#eef6fb;color:#1f6f96;border:1px solid #d3e9f2;"><div style="font-size:10.5px;font-weight:800;opacity:.85;margin-bottom:6px;letter-spacing:.4px;">TOTAL PAX (SEATING CAPACITY)</div><div style="font-family:'Playfair Display',serif;font-size:26px;font-weight:800;line-height:1;" id="tm-pax">00</div></div>
   </div>
   <div class="fbar" id="tableFilterBar">
-    <div class="search"><span>🔍</span><input id="tableMgmtSearch" placeholder="Search Table / Steward / Zone…" oninput="filterRTC(this.value)"></div>
+    <div class="search"><span>🔍</span><input id="tableMgmtSearch" placeholder="Search Table / Steward / Zone…" oninput="filterRTC(this.value,this)"></div>
     <div id="tableStatusFilters" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;"></div>
     <div id="tableZoneFilters" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;"></div>
   </div>
@@ -8754,10 +8754,11 @@ async function bnxLoad3DbStatusOnce(){
     const res = await gasApi('GET_CLIENT_DATABASE_STATUS', {}, 'V2_CORE');
     if(res && res.success && res.databases){
       window.__BNX_3DB_STATUS = res;
-      console.log('[3DB] Client '+cid+' database routing ready:',
-        'MASTER='+res.databases.MASTER.spreadsheetName,
-        'TRANSACTION='+res.databases.TRANSACTION.spreadsheetName,
-        'REPORT='+res.databases.REPORT.spreadsheetName);
+      console.log('[3DB] Client '+cid+' database routing:',
+        'MASTER='+(res.databases.MASTER.connected ? 'OK' : 'FAIL'),
+        'TRANSACTION='+(res.databases.TRANSACTION.connected ? 'OK' : 'FAIL'),
+        'REPORT='+(res.databases.REPORT.connected ? 'OK' : 'FAIL'),
+        res.warnings || []);
     }else{
       console.error('[3DB] Client database routing failed:', res && res.error);
     }
@@ -10279,69 +10280,216 @@ function bnxUpdateTableStats(){
    generated zone button contained a literal `${safe}`, so clicking it could
    never match a real zone. Keep one state object and always filter from the
    original tableData-derived cards. */
-window._rtcFilterState = window._rtcFilterState || {search:'', status:'', zone:''};
+/* ================================================================
+   FINAL TABLE FILTER FIX — LIVE TABLE MASTER
+   Search + Status + Zone are real filters over the same live tableData.
+   - Search never gets mistaken for a status value.
+   - Status buttons only modify status.
+   - Zone buttons only modify zone.
+   - Filtering never mutates tableData or the floor map data.
+   - Re-rendering the table master rebuilds the filter controls safely.
+   ================================================================ */
+window._rtcFilterState = window._rtcFilterState || {search:'',status:'',zone:''};
+
 function bnxApplyTableFilters_(){
-  const g=document.getElementById('richTblGrid'); if(!g) return;
-  const st=window._rtcFilterState;
+  const g=document.getElementById('richTblGrid');
+  if(!g) return;
+
+  const st=window._rtcFilterState || {};
   const q=String(st.search||'').trim().toLowerCase();
   const status=String(st.status||'').trim().toLowerCase();
   const zone=String(st.zone||'').trim().toLowerCase();
-  const all=bnxBuildRichTblsFromMaster();
-  const cards=all.filter(t=>{
-    const raw=tableData.find(x=>String(x.n).toLowerCase()===String(t.id).toLowerCase()) || {};
-    const rawStatus=String(raw.s||'').toLowerCase();
-    const cardType=String(t.type||'').toLowerCase();
-    const statusOk=!status || (status==='running' ? cardType==='running' : rawStatus===status || cardType===status);
-    const zoneOk=!zone || String(t.zone||'').trim().toLowerCase()===zone;
-    if(!statusOk || !zoneOk) return false;
-    if(!q) return true;
-    return String(t.id).toLowerCase().includes(q) ||
-      String(t.zone||'').toLowerCase().includes(q) ||
-      String(t.captain||'').toLowerCase().includes(q) ||
-      String(t.guests||'').toLowerCase().includes(q);
+
+  const source=(typeof tableData!=='undefined' && Array.isArray(tableData))
+    ? tableData.slice()
+    : [];
+
+  const all=source.map(t=>{
+    const num=String(t.n??'').trim();
+    const z=String(bnxZoneForTable(t)||'').trim();
+    const rawStatus=String(t.s||'').trim().toLowerCase();
+    const elapsed=parseInt(t.t,10)||0;
+    const cardType=rawStatus==='occupied' ? (elapsed<20?'running':'occupied') : rawStatus;
+    const captain=String(t.captain||'').trim();
+    const guests=String(t.c||'').trim();
+
+    return {
+      raw:t,
+      id:num,
+      zone:z,
+      rawStatus,
+      type:cardType,
+      captain,
+      guests,
+      pax:t.pax||4,
+      // Keep the complete rich-card data exactly as the existing renderer creates it.
+    };
   });
+
+  const matches=all.filter(x=>{
+    const statusOk=!status ||
+      (status==='running'
+        ? x.type==='running'
+        : x.rawStatus===status || x.type===status);
+
+    const zoneOk=!zone || x.zone.toLowerCase()===zone;
+
+    const hay=[
+      x.id, x.zone, x.captain, x.guests,
+      x.rawStatus, x.type
+    ].join(' ').toLowerCase();
+
+    return statusOk && zoneOk && (!q || hay.includes(q));
+  });
+
+  // Rebuild rich cards from the live master, then retain only matched IDs.
+  const rich=bnxBuildRichTblsFromMaster();
+  const ids=new Set(matches.map(x=>x.id.toLowerCase()));
+  const cards=rich.filter(t=>ids.has(String(t.id).toLowerCase()));
+
   renderRTC(g,cards);
 
-  // Highlight the matching table in the complete floor map without changing
-  // its data. Only the text search drives this highlight.
-  document.querySelectorAll('#floorMap .fc').forEach(el=>el.classList.remove('search-hit'));
-  if(q && typeof tableData!=='undefined'){
-    const norm=q.replace(/[^0-9a-z]/g,'');
-    const match=tableData.find(t=>{
-      const tno=String(t.n).toLowerCase().replace(/[^0-9a-z]/g,'');
-      return norm===tno || norm===('t'+tno) || String(t.c||'').toLowerCase().includes(q);
-    });
-    if(match){
-      const el=Array.from(document.querySelectorAll('#floorMap .fc')).find(x=>String(x.title||'').toLowerCase().includes(String(match.n).toLowerCase()));
-      if(el){ el.classList.add('search-hit'); el.scrollIntoView({behavior:'smooth',block:'center'}); }
-    }
+  // Accurate result counter without changing the master statistics.
+  const resultEl=document.getElementById('tableFilterResultCount');
+  if(resultEl){
+    resultEl.textContent = (q||status||zone)
+      ? `${cards.length} table${cards.length===1?'':'s'} shown`
+      : '';
   }
+
+  // Search highlight on the floor map only; filtering itself remains in the card grid.
+  document.querySelectorAll('#floorMap .fc').forEach(el=>el.classList.remove('search-hit'));
+  if(q && matches.length){
+    const first=matches[0];
+    const el=Array.from(document.querySelectorAll('#floorMap .fc')).find(x=>{
+      const title=String(x.title||'').toLowerCase();
+      return title.includes(first.id.toLowerCase());
+    });
+    if(el) el.classList.add('search-hit');
+  }
+
+  bnxSyncTableFilterButtons_();
 }
+
+function bnxSyncTableFilterButtons_(){
+  const st=window._rtcFilterState||{search:'',status:'',zone:''};
+
+  document.querySelectorAll('#tableStatusFilters .fcat').forEach(b=>{
+    const v=String(b.getAttribute('data-table-filter')||'').toLowerCase();
+    b.classList.toggle('active',v===String(st.status||'').toLowerCase());
+  });
+
+  document.querySelectorAll('#tableZoneFilters .fcat').forEach(b=>{
+    const v=String(b.getAttribute('data-table-zone')||'').toLowerCase();
+    b.classList.toggle('active',v===String(st.zone||'').toLowerCase());
+  });
+}
+
 function filterRTC(val, btn){
-  const text=String(val||'');
-  const isStatus=['','available','running','occupied','reserved','cleaning'].includes(text.toLowerCase());
-  const isZone=btn && btn.dataset && btn.dataset.tableZone!==undefined;
-  if(isZone){
-    document.querySelectorAll('#tableZoneFilters .fcat').forEach(b=>b.classList.remove('active'));
-    if(btn) btn.classList.add('active');
+  const text=String(val??'').trim();
+
+  // Zone button: NEVER treat zone text as a search/status value.
+  if(btn && btn.dataset && btn.dataset.tableZone!==undefined){
     window._rtcFilterState.zone=text;
-  }else if(isStatus){
-    document.querySelectorAll('#tableStatusFilters .fcat').forEach(b=>b.classList.remove('active'));
-    if(btn) btn.classList.add('active');
+  }
+  // Status button: identified by its container, not by the button text.
+  else if(btn && btn.closest && btn.closest('#tableStatusFilters')){
     window._rtcFilterState.status=text.toLowerCase();
-  }else{
+  }
+  // Search input / programmatic search.
+  else{
     window._rtcFilterState.search=text;
   }
+
   bnxApplyTableFilters_();
 }
+
 function bnxClearTableFilters_(){
   window._rtcFilterState={search:'',status:'',zone:''};
-  document.querySelectorAll('#page-tables .fcat').forEach(b=>b.classList.remove('active'));
-  const allBtn=document.querySelector('#tableStatusFilters [data-table-filter=""]');
-  if(allBtn) allBtn.classList.add('active');
-  const inp=document.getElementById('tableMgmtSearch'); if(inp) inp.value='';
+
+  const inp=document.getElementById('tableMgmtSearch');
+  if(inp) inp.value='';
+
   bnxApplyTableFilters_();
 }
+
+window.bnxRefreshLiveTableFilters=function(){
+  const sf=document.getElementById('tableStatusFilters');
+  const zf=document.getElementById('tableZoneFilters');
+  if(!sf||!zf) return;
+
+  const rows=(typeof tableData!=='undefined' && Array.isArray(tableData)) ? tableData : [];
+
+  const zones=[...new Set(
+    rows.map(t=>String(bnxZoneForTable(t)||'').trim()).filter(Boolean)
+  )].sort((a,b)=>a.localeCompare(b));
+
+  const status=[
+    ['', 'All'],
+    ['available','🟢 Available'],
+    ['running','🟡 Running'],
+    ['occupied','🔴 Occupied'],
+    ['reserved','🟠 Reserved'],
+    ['cleaning','🔵 Cleaning']
+  ];
+
+  sf.innerHTML=status.map(([v,l])=>
+    `<button type="button" class="fcat" data-table-filter="${esc(v)}"
+      onclick="filterRTC(${JSON.stringify(v)},this)">${l}</button>`
+  ).join('');
+
+  zf.innerHTML=zones.map(z=>
+    `<button type="button" class="fcat" data-table-zone="${esc(z)}"
+      onclick="filterRTC(${JSON.stringify(z)},this)">📍 ${esc(z)}</button>`
+  ).join('');
+
+  // Result indicator.
+  if(!document.getElementById('tableFilterResultCount')){
+    const bar=document.getElementById('tableFilterBar');
+    if(bar){
+      const el=document.createElement('span');
+      el.id='tableFilterResultCount';
+      el.style.cssText='font-size:11px;font-weight:700;color:var(--text3);margin-left:auto;white-space:nowrap;';
+      bar.appendChild(el);
+    }
+  }
+
+  bnxSyncTableFilterButtons_();
+};
+
+(function(){
+  const oldBuild=window.buildRichTbls;
+  window.buildRichTbls=function(){
+    if(typeof oldBuild==='function') oldBuild.apply(this,arguments);
+    if(typeof window.bnxRefreshLiveTableFilters==='function'){
+      window.bnxRefreshLiveTableFilters();
+    }
+    // Reapply active filters after live rebuild.
+    const st=window._rtcFilterState||{};
+    if(st.search||st.status||st.zone) bnxApplyTableFilters_();
+  };
+
+  const oldSync=window.bnxSyncTableMasterFromBackend;
+  if(typeof oldSync==='function'){
+    window.bnxSyncTableMasterFromBackend=async function(silent){
+      const ok=await oldSync.apply(this,arguments);
+      window.bnxRefreshLiveTableFilters();
+      const st=window._rtcFilterState||{};
+      if(st.search||st.status||st.zone) bnxApplyTableFilters_();
+      return ok;
+    };
+  }
+
+  document.addEventListener('DOMContentLoaded',function(){
+    setTimeout(function(){
+      window.bnxRefreshLiveTableFilters();
+      const st=window._rtcFilterState||{};
+      if(st.search||st.status||st.zone) bnxApplyTableFilters_();
+    },300);
+  });
+})();
+
+
 /* ── SINGLE-TABLE GALLERY ("give single table wise gallery show all
    table one by one full architucture map and bill and details") ──
    Opens one table at a time in a big modal with everything about it:
@@ -22562,14 +22710,14 @@ async function loadClientBadge(){
     if (res && res.success && res.data && (res.data.companyName || res.data.name)){
       dot.style.background = 'var(--green)';
       text.textContent = `${cid} · ${res.data.companyName || res.data.name} (Live)`;
-      text.title = 'Connected to live client database';
+      text.title = 'Client identity loaded from live CLIENT_MASTER; tenant DB routing is checked separately.';
       return;
     }
     throw new Error((res && res.error) || 'No live client data');
   } catch(e){
     dot.style.background = 'var(--gold, #c2590a)';
-    text.textContent = `${cid} · Offline / DB unavailable`;
-    text.title = 'Live database could not be reached. No demo client data is shown.';
+    text.textContent = `${cid} · Client identity unavailable`;
+    text.title = 'Live CLIENT_MASTER identity could not be reached. No demo client data is shown.';
   }
 }
 loadClientBadge();
@@ -24368,50 +24516,7 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
 })();
 </script>
 
-<script>
-/* FINAL LIVE TABLE + CATEGORY MASTER PATCH */
-(function(){
-  function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
-  function categoryClean(v){
-    const x=String(v??'').trim();
-    if(!x) return 'Uncategorised';
-    if(/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(x)) return 'Uncategorised';
-    return x;
-  }
-  window.bnxRefreshLiveCategoryMaster=function(){
-    const cats=[...new Set((typeof menuData!=='undefined'?menuData:[]).map(x=>categoryClean(x.c)).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
-    const sel=document.getElementById('ni-cat');
-    if(sel){ const cur=sel.value; sel.innerHTML=cats.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('')+'<option value="__NEW__">+ New category…</option>'; if(cats.includes(cur)) sel.value=cur; }
-    if(typeof bnxRebuildCategoryPills==='function') bnxRebuildCategoryPills();
-  };
-  window.bnxRefreshLiveTableFilters=function(){
-    const sf=document.getElementById('tableStatusFilters'), zf=document.getElementById('tableZoneFilters');
-    if(!sf||!zf) return;
-    const rows=(typeof tableData!=='undefined'?tableData:[]);
-    const zones=[...new Set(rows.map(t=>String(t.zone||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
-    const status=[['','All'],['available','🟢 Available'],['running','🟡 Running'],['occupied','🔴 Occupied'],['reserved','🟠 Reserved'],['cleaning','🔵 Cleaning']];
-    sf.innerHTML=status.map(([v,l],i)=>`<button type="button" class="fcat${i===0?' active':''}" data-table-filter="${v}" onclick="filterRTC('${v}',this)">${l}</button>`).join('');
-    zf.innerHTML=zones.map(z=>{ const safe=String(z).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); return `<button type="button" class="fcat" data-table-zone="${esc(z)}" onclick="filterRTC(${JSON.stringify(String(z))},this)">📍 ${esc(z)}</button>`; }).join('');
-  };
-  const oldBuild=window.buildRichTbls;
-  window.buildRichTbls=function(){ if(typeof oldBuild==='function') oldBuild(); window.bnxRefreshLiveTableFilters(); };
-  const oldSync=window.bnxSyncTableMasterFromBackend;
-  window.bnxSyncTableMasterFromBackend=async function(silent){
-    const ok=await oldSync(silent);
-    window.bnxRefreshLiveTableFilters();
-    return ok;
-  };
-  const oldLoad=window.loadMenuData;
-  window.loadMenuData=function(){
-    const r=oldLoad.apply(this,arguments);
-    Promise.resolve(r).finally(()=>{setTimeout(window.bnxRefreshLiveCategoryMaster,50);});
-    return r;
-  };
-  document.addEventListener('DOMContentLoaded',()=>{
-    setTimeout(()=>{window.bnxRefreshLiveCategoryMaster();window.bnxRefreshLiveTableFilters();},250);
-  });
-})();
-</script>
+
 
 <script>
 /* =====================================================================
