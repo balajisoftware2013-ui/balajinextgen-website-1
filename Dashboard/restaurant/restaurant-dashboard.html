@@ -7672,7 +7672,11 @@ function showPage(id, el){
   // is their real bill list. Pull real bills from the server first, then
   // render — same "real data or honest empty state, never a fake stand-
   // in that behaves like real" rule already applied everywhere else.
-  if(id==='bills-list'){ blRenderTable(); bnxPullBillsFromServer().then(()=>blRenderTable()); }
+  if(id==='bills-list'){
+    const bd = (typeof getBusinessDate==='function') ? getBusinessDate() : new Date().toISOString().slice(0,10);
+    blRenderTable();
+    bnxPullBillsFromServer(bd, bd).then(()=>blRenderTable());
+  }
   if(id==='due-collection' || id==='customer-credit'){ bnxLoadDueCollection(); }
   if(id==='aggregator-settlement' && typeof bnxLoadAggregatorSettlement==='function'){ bnxLoadAggregatorSettlement(); }
   if(id==='online-orders' && typeof loadOnlineOrders==='function'){ loadOnlineOrders(); }
@@ -7702,11 +7706,19 @@ function showPage(id, el){
    shapes since listBills_'s exact return shape isn't visible from this
    frontend file alone. */
 let _bnxBillsSyncPromise=null;
-async function bnxPullBillsFromServer(){
-  if(_bnxBillsSyncPromise) return _bnxBillsSyncPromise;
+async function bnxPullBillsFromServer(from, to){
+  // Range-aware server sync: at 3,000 bills/day, pulling the default 60-day
+  // history on every screen is unnecessarily heavy. Reports/Bills List now
+  // request exactly the selected business-date window, while the no-arg
+  // call remains a safe compatibility fallback.
+  const syncKey = String(from||'')+'|'+String(to||'');
+  if(_bnxBillsSyncPromise && window._bnxBillsSyncKey===syncKey) return _bnxBillsSyncPromise;
+  window._bnxBillsSyncKey=syncKey;
   _bnxBillsSyncPromise=(async()=>{
   try{
-    const res = await gasApi('LIST_BILLS', { clientId: (typeof CLIENT_ID!=='undefined'?CLIENT_ID:undefined) });
+    const params = { clientId: (typeof CLIENT_ID!=='undefined'?CLIENT_ID:undefined) };
+    if (from || to){ params.FROM_DATE = from || to; params.TO_DATE = to || from; }
+    const res = await gasApi('LIST_BILLS', params);
     const serverBills = res && (res.bills || res.data || (Array.isArray(res) ? res : null));
     if(!Array.isArray(serverBills) || !serverBills.length) return;
     const local = bnxGetBillRegister();
@@ -16289,14 +16301,34 @@ function blRenderTable(data){
 // still one click away and now hard-capped in blRenderTable() below so
 // they can never render an unbounded number of rows at once either.
 let blActiveRange = 'today';
-function blSetRange(range, btn){
+async function blSetRange(range, btn){
   blActiveRange = range;
   document.querySelectorAll('#blRangeBtns .pcat').forEach(b=>b.classList.remove('active'));
   if (btn) btn.classList.add('active');
-  document.getElementById('blCustomRange').style.display = range === 'custom' ? 'flex' : 'none';
-  document.getElementById('blMonthRange').style.display = range === 'month-pick' ? 'flex' : 'none';
+  const customEl=document.getElementById('blCustomRange');
+  const monthEl=document.getElementById('blMonthRange');
+  if(customEl) customEl.style.display = range==='custom' ? 'flex' : 'none';
+  if(monthEl) monthEl.style.display = range==='month-pick' ? 'flex' : 'none';
+
+  const businessKey=(typeof getBusinessDate==='function')?getBusinessDate():new Date().toISOString().slice(0,10);
+  const bp=businessKey.split('-').map(Number), bd=new Date(bp[0],bp[1]-1,bp[2]);
+  const fmt=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  let from='',to='';
+  if(range==='today'){from=to=businessKey;}
+  else if(range==='yesterday'){const d=new Date(bd);d.setDate(d.getDate()-1);from=to=fmt(d);}
+  else if(range==='week'){const d=new Date(bd),dow=(d.getDay()+6)%7;d.setDate(d.getDate()-dow);from=fmt(d);to=businessKey;}
+  else if(range==='month'){from=fmt(new Date(bd.getFullYear(),bd.getMonth(),1));to=businessKey;}
+  else if(range==='year'){from=fmt(new Date(bd.getFullYear(),0,1));to=businessKey;}
+  else if(range==='month-pick'){const picked=document.getElementById('blMonth')?.value||'';if(picked){from=picked+'-01';const [y,m]=picked.split('-').map(Number);to=fmt(new Date(y,m,0));}}
+  else if(range==='custom'){from=document.getElementById('blFrom')?.value||'';to=document.getElementById('blTo')?.value||from;}
+  else if(range==='all'){from='ALL';to='ALL';}
+
+  if(range==='custom' && (!from || !to)){ blFilterBills(document.getElementById('blSearch')?.value||''); return; }
+  const list=document.getElementById('blCount'); if(list) list.textContent='Syncing live bills…';
+  try{ await bnxPullBillsFromServer(from,to); }catch(e){ console.warn('[Bills List range sync]',e.message); }
   blFilterBills(document.getElementById('blSearch')?.value || '');
 }
+
 /* PASS #15 FIX ("bill list search and filter workable"): same root cause
    as Order Register's ordRegParseDt (see that comment) — bill.dt for a
    REAL bill comes from bnxListBills -> b.BILL_DATE, which is
@@ -21025,6 +21057,15 @@ function rptRenderOne(anchor,shouldScroll){
     'gstr1':()=>bnxRenderGstrReports(from,to), 'gstr3b':()=>bnxRenderGstrReports(from,to)
   };
   const meta=REPORTS_META.find(x=>x.anchor===anchor);
+  const LOCAL_REPORT_SYNC_ANCHORS = new Set(['cancelled-bills','timewise','customer','user-table','parcel']);
+  if (LOCAL_REPORT_SYNC_ANCHORS.has(anchor) && typeof bnxPullBillsFromServer==='function' && from) {
+    rptSetLoadState('⟳ Syncing selected period…');
+    const localMapFn = map[anchor];
+    return bnxPullBillsFromServer(from,to).then(()=>{
+      try { return localMapFn ? localMapFn() : undefined; }
+      finally { rptSetLoadState('Loaded · '+(meta?.title||anchor)); }
+    }).catch(e=>{ console.error('[Reports Hub sync]',anchor,e); rptSetLoadState('⚠️ Failed · '+(meta?.title||anchor)); });
+  }
   if(meta?.unavailable){rptSetLoadState('🔴 Source not connected · '+meta.title);return;}
   if(!map[anchor]){rptSetLoadState('⚠️ No renderer wired · '+(meta?.title||anchor));return;}
   rptSetLoadState('Loading · '+(meta?.title||anchor));
@@ -21212,7 +21253,11 @@ async function rhInit(){
 async function runReportWithSync(){
   if(!rptActiveAnchor){showNotif('📊 Choose a report first','error');return;}
   rptSetLoadState('⟳ Syncing bills from server…');
-  try{ await Promise.all([bnxPullBillsFromServer(), bnxPullKotsFromServer()]); }
+  try{
+    const from=document.getElementById('rptFrom')?.value||'';
+    const to=document.getElementById('rptTo')?.value||from;
+    await Promise.all([bnxPullBillsFromServer(from,to), bnxPullKotsFromServer()]);
+  }
   catch(e){ console.warn('[runReportWithSync] server sync failed:', e.message); }
   rptPopulateFilterSelects();
   rptRefreshSalesKpis_();
@@ -23985,7 +24030,7 @@ function renderOrderRegExcelTable(data){
     </table>
   </div>`;
 }
-let orderRegActiveRange = 'all';
+let orderRegActiveRange = 'today';
 function setOrderRegRange(range, btn){
   orderRegActiveRange = range;
   document.querySelectorAll('#ordRegRangeBtns .pcat').forEach(b=>b.classList.remove('active'));
@@ -24017,33 +24062,36 @@ function setOrderRegStatus(status, btn){
 function ordRegDateInRange(dt){
   if (orderRegActiveRange === 'all') return true;
   const d = ordRegParseDt(dt);
-  if (!d) return true; // don't hide rows we can't parse
-  const now = new Date();
+  if (!d) return true;
+  const businessKey = (typeof getBusinessDate==='function') ? getBusinessDate() : new Date().toISOString().slice(0,10);
+  const bp = businessKey.split('-').map(Number);
+  const today = new Date(bp[0], bp[1]-1, bp[2]);
   const startOfDay = x => new Date(x.getFullYear(), x.getMonth(), x.getDate());
-  const today = startOfDay(now);
-  if (orderRegActiveRange === 'today') return startOfDay(d).getTime() === today.getTime();
+  const dd = startOfDay(d);
+  if (orderRegActiveRange === 'today') return dd.getTime() === today.getTime();
   if (orderRegActiveRange === 'week'){
-    const dow = (today.getDay()+6)%7;
-    const weekStart = new Date(today); weekStart.setDate(today.getDate()-dow);
-    return startOfDay(d) >= weekStart && startOfDay(d) <= today;
+    const dow=(today.getDay()+6)%7;
+    const weekStart=new Date(today); weekStart.setDate(today.getDate()-dow);
+    return dd>=weekStart && dd<=today;
   }
-  if (orderRegActiveRange === 'month') return d.getFullYear()===now.getFullYear() && d.getMonth()===now.getMonth();
+  if (orderRegActiveRange === 'month') return dd.getFullYear()===today.getFullYear() && dd.getMonth()===today.getMonth();
   if (orderRegActiveRange === 'month-pick'){
-    const picked = document.getElementById('ordRegMonth')?.value; // 'YYYY-MM'
-    if (!picked) return true; // no month chosen yet — don't hide everything
-    const [y,m] = picked.split('-').map(Number);
-    return d.getFullYear()===y && (d.getMonth()+1)===m;
+    const picked=document.getElementById('ordRegMonth')?.value;
+    if(!picked) return true;
+    const [y,m]=picked.split('-').map(Number);
+    return dd.getFullYear()===y && dd.getMonth()+1===m;
   }
-  if (orderRegActiveRange === 'year') return d.getFullYear()===now.getFullYear();
+  if (orderRegActiveRange === 'year') return dd.getFullYear()===today.getFullYear();
   if (orderRegActiveRange === 'custom'){
-    const from = document.getElementById('ordRegFrom')?.value ? new Date(document.getElementById('ordRegFrom').value) : null;
-    const to = document.getElementById('ordRegTo')?.value ? new Date(document.getElementById('ordRegTo').value) : null;
-    if (from && startOfDay(d) < startOfDay(from)) return false;
-    if (to && startOfDay(d) > startOfDay(to)) return false;
+    const from=document.getElementById('ordRegFrom')?.value ? new Date(document.getElementById('ordRegFrom').value) : null;
+    const to=document.getElementById('ordRegTo')?.value ? new Date(document.getElementById('ordRegTo').value) : null;
+    if(from && dd<startOfDay(from)) return false;
+    if(to && dd>startOfDay(to)) return false;
     return true;
   }
   return true;
 }
+
 function renderOrderRegList(){
   const el = document.getElementById('orderRegList');
   const filtered = orderRegData.filter(o=>ordRegDateInRange(o.ORDER_DATE) && (!orderRegActiveStatus || o.ORDER_STATUS===orderRegActiveStatus));
