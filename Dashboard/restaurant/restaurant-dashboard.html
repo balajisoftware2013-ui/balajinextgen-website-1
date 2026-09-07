@@ -102,50 +102,11 @@
    Connected to Admin Setup | erp-config.js
    Admin Setup: admin-setup.html
 ══════════════════════════════════════════════════════ */
-const GAS_APIS_DASH = {
-  // V2_AUTH kept SEPARATE and REAL — its dedicated login/session/role
-  // logic (01_LoginEngine.gs/03_SessionEngine.gs/08_RolePermissionEngine.gs)
-  // does something V2_CORE's simpler embedded LOGIN case doesn't; login
-  // broke when this was pointed at V2_CORE. V2_CORE stays consolidated —
-  // only that part of the earlier change is reverted. V2_FRONTEND key
-  // removed entirely — confirmed unused, was a leftover legacy deployment.
-  //
-  // FIX (P0 — "V2_AUTH fallback identical to V2_CORE, unverified"):
-  // was AKfycbz39...3310_n2izF_gAjofaIHgSJ, byte-identical to V2_CORE's
-  // fallback — meaning if GET_CONFIG ever fails and this app falls back
-  // to hardcoded IDs, login would silently be routed through V2_CORE's
-  // simpler embedded LOGIN case instead of the real, dedicated
-  // 01_LoginEngine.gs/03_SessionEngine.gs/08_RolePermissionEngine.gs
-  // stack — exactly the bug already found and fixed in
-  // steward-mobile.html. Not guessed: this is that same sibling app's
-  // CONFIRMED-correct, already-verified V2_AUTH deployment ID, reused
-  // here rather than left duplicated.
-  V2_CORE:     'https://script.google.com/macros/s/' + (function(){try{return localStorage.getItem('bnx_api_core');}catch(e){}}()||'AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ') + '/exec',
-  V2_AUTH:     'https://script.google.com/macros/s/' + (function(){try{return localStorage.getItem('bnx_api_auth');}catch(e){}}()||'AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx') + '/exec',
-};
-
-/* ═══ GOOGLE APPS SCRIPT ONLY TRANSPORT ═══
-   This dashboard is designed to be served by the same Google Apps Script
-   project as Code.gs. Browser API calls therefore use google.script.run and
-   never depend on Google Apps Script, Cloudflare, Vercel, or another external server bridge.
-   A direct /exec fetch is retained only for local file:// development.
-*/
-const BNX_SAME_ORIGIN_API = null;
-
-function bnxApiUrl_(endpoint){
-  endpoint = endpoint || 'V2_CORE';
-  return GAS_APIS_DASH[endpoint] || '';
-}
-
-function bnxDeploymentId_(endpoint){
-  try{
-    const u = String(GAS_APIS_DASH[endpoint] || '');
-    const m = u.match(/\/macros\/s\/([^/]+)\/exec(?:$|[?#])/);
-    return m ? m[1] : '';
-  }catch(e){ return ''; }
-}
-
-/* Centralized config — deployment IDs may be refreshed from the server. */
+/* ═══ GOOGLE APPS SCRIPT ONLY CONFIG ═══
+   Deployment IDs are server-side only. The browser never receives or
+   contacts V2_CORE/V2_AUTH URLs directly; google.script.run calls the
+   current Code.gs project's bnxApiCall() bridge. ═══ */
+const GAS_APIS_DASH = Object.freeze({V2_CORE:'APPS_SCRIPT',V2_AUTH:'APPS_SCRIPT'});
 
 /* ═══ REQUEST COALESCING / CIRCUIT PROTECTION ═══ */
 const BNX_API_FLIGHT = new Map();
@@ -192,89 +153,42 @@ function bnxRunAppsScript_(endpoint, body, timeoutMs){
 async function bnxFetchJson_(endpoint, options){
   options = options || {};
   endpoint = endpoint || 'V2_CORE';
-
-  const isAppsScriptRuntime = !!(window.google && google.script && google.script.run);
-  const isLocalFile = !!(window.location && window.location.protocol === 'file:');
-  const primary = bnxApiUrl_(endpoint);
-  const urls = [];
-  if (isAppsScriptRuntime) urls.push('__APPS_SCRIPT_RUN__');
-  else if (isLocalFile && primary) urls.push(primary);
-  else if (primary) urls.push(primary);
-
-  if (!urls.length) throw new Error('No Apps Script API runtime available for ' + endpoint);
-
+  const body = String(options.body || '');
+  const timeoutMs = Number(options.timeoutMs) || 30000;
+  if (!(window.google && google.script && google.script.run)) {
+    const err = new Error('Google Apps Script runtime is unavailable. Open this dashboard from the Apps Script Web App URL.');
+    err.status = 503;
+    throw err;
+  }
   const flightKey = bnxApiFlightKey_(endpoint, options);
   if (BNX_API_FLIGHT.has(flightKey)) return BNX_API_FLIGHT.get(flightKey);
-
-  const work = (async()=>{
-    if (bnxApiCircuitOpen_(endpoint)) {
-      const err = new Error('API circuit open for ' + endpoint);
-      err.status = 503; err.circuitOpen = true; throw err;
-    }
-
-    const body = String(options.body || '');
-    const parsedAction = (()=>{ try{return JSON.parse(body||'{}').action||'';}catch(e){return '';} })();
-    const timeoutMs = Number(options.timeoutMs) ||
-      (/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? BNX_WRITE_TIMEOUT_MS : BNX_READ_TIMEOUT_MS);
-
-    if (urls[0] === '__APPS_SCRIPT_RUN__') {
-      try {
-        const data = await bnxRunAppsScript_(endpoint, body, timeoutMs);
-        if (!data || typeof data !== 'object') throw new Error('Apps Script returned an invalid response');
-        BNX_API_CIRCUIT.delete(endpoint);
-        return data;
-      } catch(e) {
-        const err = e instanceof Error ? e : new Error(String(e));
-        err.status = err.status || 503;
-        BNX_API_CIRCUIT.set(endpoint, Date.now()+15000);
-        throw err;
-      }
-    }
-
-    /* Local file development only. Production must use google.script.run. */
-    let r;
-    const ctrl = new AbortController();
-    const timer = setTimeout(()=>ctrl.abort(), timeoutMs);
-    try {
-      r = await fetch(primary, Object.assign({
-        method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'},
-        credentials:'omit', redirect:'follow', signal:ctrl.signal
-      }, options));
-    } finally { clearTimeout(timer); }
-    const text = await r.text();
-    if (!r.ok) {
-      const err = new Error('API HTTP '+r.status+' at '+primary);
-      err.status=r.status; err.responseText=text.slice(0,300); throw err;
-    }
-    let data;
-    try { data=JSON.parse(text); }
-    catch(e){ throw new Error('API returned non-JSON: '+text.slice(0,180)); }
-    return data;
-  })();
-
+  const work = bnxRunAppsScript_(endpoint, body, timeoutMs);
   BNX_API_FLIGHT.set(flightKey, work);
-  try { return await work; }
-  finally { BNX_API_FLIGHT.delete(flightKey); }
+  work.finally(()=>BNX_API_FLIGHT.delete(flightKey)).catch(()=>{});
+  return work;
 }
+
 
 async function bnxRefreshConfig(){
   try{
-    const res = await bnxFetchJson_('V2_CORE', {body: JSON.stringify({action:'GET_CONFIG'}), timeoutMs:5000});
-    if(res && res.success && res.data){
-      if(res.data.v2CoreId) localStorage.setItem('bnx_api_core', res.data.v2CoreId);
-      if(res.data.v2AuthId) localStorage.setItem('bnx_api_auth', res.data.v2AuthId);
-      if(res.data.v2CoreId) GAS_APIS_DASH.V2_CORE = 'https://script.google.com/macros/s/' + res.data.v2CoreId + '/exec';
-      if(res.data.v2AuthId) GAS_APIS_DASH.V2_AUTH = 'https://script.google.com/macros/s/' + res.data.v2AuthId + '/exec';
-      console.log('[CONFIG] Apps Script deployment configuration loaded');
+    const res = await bnxFetchJson_('V2_CORE', {
+      body: JSON.stringify({action:'GET_CONFIG'}),
+      timeoutMs: 10000
+    });
+    if(res && res.success){
+      console.log('[CONFIG] Apps Script server configuration loaded');
     } else {
-      console.warn('[CONFIG] GET_CONFIG returned no usable deployment data; continuing with configured IDs');
+      console.warn('[CONFIG] GET_CONFIG returned no usable server configuration:', res && (res.error || res.message));
     }
+    return res;
   }catch(e){
-    console.warn('[CONFIG] GET_CONFIG unavailable; continuing with configured Apps Script project:', e.message);
+    console.warn('[CONFIG] Apps Script configuration unavailable:', e && e.message ? e.message : e);
+    return {success:false,error:e && e.message ? e.message : String(e)};
   }
 }
 window.__bnxConfigReady = bnxRefreshConfig();
-const GAS_URL = GAS_APIS_DASH.V2_CORE;
+
+
 function bnxShowApiTransportError_(err, endpoint){
   try{
     const id='_bnxApiTransportError';
@@ -4409,11 +4323,11 @@ document.addEventListener('DOMContentLoaded', function(){
         <div style="font-size:12px;font-weight:700;margin-bottom:8px;">🔑 API Endpoints (Read-only)</div>
         <div style="margin-bottom:7px;"><div style="font-size:10px;color:var(--text3);margin-bottom:3px;">V2_AUTH (separate — dedicated login/session project)</div><input class="fi" id="settings-v2auth-display" value="" readonly style="font-size:10px;font-family:'DM Mono',monospace;"></div>
         <div><div style="font-size:10px;color:var(--text3);margin-bottom:3px;">V2_CORE</div><input class="fi" id="settings-v2core-display" value="" readonly style="font-size:10px;font-family:'DM Mono',monospace;"></div>
-        <div style="font-size:9px;color:var(--text3);margin-top:4px;">⚠️ V2_AUTH shown above may not be verified as this app's actual working login deployment — see code comment near GAS_APIS_DASH.</div>
+        <div style="font-size:9px;color:var(--text3);margin-top:4px;">ℹ️ API connections are server-managed by this Google Apps Script project.</div>
         <script>(function(){ try{
           var a=document.getElementById('settings-v2auth-display'), c=document.getElementById('settings-v2core-display');
-          if(a) a.value = (typeof GAS_APIS_DASH!=='undefined' && GAS_APIS_DASH.V2_AUTH) ? GAS_APIS_DASH.V2_AUTH.replace('https://script.google.com/macros/s/','').replace('/exec','') : '(unavailable)';
-          if(c) c.value = (typeof GAS_APIS_DASH!=='undefined' && GAS_APIS_DASH.V2_CORE) ? GAS_APIS_DASH.V2_CORE.replace('https://script.google.com/macros/s/','').replace('/exec','') : '(unavailable)';
+          if(a) a.value = 'SERVER MANAGED (Apps Script)';
+          if(c) c.value = 'THIS APPS SCRIPT PROJECT';
         }catch(e){} })();</script>
       </div>
       <div style="font-size:11px;color:var(--text3);">Master Sheet ID: <span class="mono">1FuNJ_XejE2ekYTnk71wXVZ79hRJgu7pmIA6fuE-Iu7I</span></div>
@@ -6692,10 +6606,8 @@ Call us: {phone}</div>
 // only reaches this if GAS_APIS_DASH is somehow undefined, but if that
 // ever happens, this should be consistent with the real fix, not carry
 // its own separate copy of the same unverified-duplicate mistake.
-const ERP_APIS = {
-  V2_AUTH:     'https://script.google.com/macros/s/AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx/exec',
-  V2_CORE:     'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec',
-};
+const ERP_APIS = Object.freeze({V2_AUTH:'APPS_SCRIPT',V2_CORE:'APPS_SCRIPT'});
+const ERP_KEYS = Object.freeze({USER:'ERP_USER',ROLE:'ERP_ROLE',CLIENT:'ERP_CLIENT',SESSION:'ERP_SESSION',EXPIRY:'ERP_EXPIRY'});
 // FIX: ERP_KEYS was declared here AND in erp-config.js (loaded earlier on
 // the page via <script src="../erp-config.js">). Both are plain scripts
 // sharing one global scope, so two `const ERP_KEYS` declarations collide
