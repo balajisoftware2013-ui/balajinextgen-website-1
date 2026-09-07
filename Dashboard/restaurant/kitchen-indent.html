@@ -23,45 +23,61 @@
    a WhatsApp message, nothing was ever actually saved. Added the same
    API bridge pattern used elsewhere (import-hub.html, master-hub.html)
    so indents now really reach Store via SAVE_KITCHEN_INDENT. ── */
-const CLIENT_ID = (function(){
-  /* FIX: matches restaurant-dashboard.html's real, safe CLIENT_ID
-     resolution exactly — checks the actual logged-in session first
-     (ERP_USER), never falls back to a hardcoded real client ID like
-     'CL00010' (which risked silently writing test/wrong data into
-     VANN'S real sheets if opened without a proper session). Returns
-     empty string if truly nothing is found — callers must check for
-     this and refuse to save rather than guessing a client. */
+function getKitchenIndentClientId(){
   try{
-    var u=JSON.parse(sessionStorage.getItem('ERP_USER')||localStorage.getItem('ERP_USER')||sessionStorage.getItem('erpUser')||localStorage.getItem('erpUser')||'{}');
-    var fromSession = u.CLIENT_ID||u.clientId||u.client_id||'';
-    var fromFlatKey = localStorage.getItem('ERP_CLIENT')||'';
-    var fromUrl = new URLSearchParams(location.search).get('client')||'';
-    var id = fromSession || fromFlatKey || fromUrl || localStorage.getItem('bnx_client_id') || '';
+    const stores = [
+      sessionStorage.getItem('ERP_USER'),
+      localStorage.getItem('ERP_USER'),
+      sessionStorage.getItem('erpUser'),
+      localStorage.getItem('erpUser')
+    ];
+    for (const raw of stores){
+      if(!raw) continue;
+      try{
+        const u = JSON.parse(raw);
+        const id = String(u.CLIENT_ID||u.clientId||u.client_id||'').trim();
+        if(id){ localStorage.setItem('bnx_client_id', id); return id; }
+      }catch(e){}
+    }
+    const flat = String(localStorage.getItem('ERP_CLIENT')||'').trim();
+    const urlId = String(new URLSearchParams(location.search).get('client')||'').trim();
+    const cached = String(localStorage.getItem('bnx_client_id')||'').trim();
+    const id = flat || urlId || cached;
     if(id) localStorage.setItem('bnx_client_id', id);
     return id;
-  }catch(e){return '';}
-})();
+  }catch(e){ return ''; }
+}
 const KITCHEN_INDENT_API_URL = 'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec';
 async function erpApi(action, payload){
-  if(!CLIENT_ID){
-    // FIX: refuse to save with no real client resolved, rather than
-    // silently sending an empty/wrong clientId to the backend.
+  const clientId = getKitchenIndentClientId();
+  if(!clientId){
     return { success:false, message:'No client session found — please log in again before saving.' };
   }
+  const body = Object.assign({ action: action, clientId: clientId }, payload || {});
   try{
-    const body = Object.assign({ action: action, clientId: CLIENT_ID }, payload || {});
-    // DIAGNOSTIC: log the exact outgoing payload and incoming response.
-    // Added to find the persistent blank ITEM_NAME/UNIT/REQUIRED_QTY bug
-    // in SAVE_KITCHEN_INDENT without needing the Network tab — this
-    // prints directly in Console. Safe to remove once that bug is found.
-    console.log('[erpApi] → ' + action + ' ' + JSON.stringify(body));
-    const resp = await fetch(KITCHEN_INDENT_API_URL, { method:'POST', body: JSON.stringify(body) });
-    const json = await resp.json();
-    console.log('[erpApi] ← ' + action + ' ' + JSON.stringify(json));
+    console.log('[erpApi] → ' + action, body);
+    const controller = ('AbortController' in window) ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 30000) : null;
+    const resp = await fetch(KITCHEN_INDENT_API_URL, {
+      method:'POST',
+      body: JSON.stringify(body),
+      cache:'no-store',
+      signal: controller ? controller.signal : undefined
+    });
+    if(timer) clearTimeout(timer);
+    const text = await resp.text();
+    let json;
+    try { json = text ? JSON.parse(text) : {}; }
+    catch(parseErr){
+      console.error('[erpApi] NON-JSON RESPONSE', action, text.slice(0,500));
+      return { success:false, message:'Server returned an invalid response (' + resp.status + ').' };
+    }
+    console.log('[erpApi] ← ' + action, json);
+    if(!resp.ok) return { success:false, message:(json && json.message) || ('HTTP ' + resp.status) };
     return json;
   }catch(e){
-    console.error('[erpApi] ERROR', action, e.message);
-    return { success:false, message: e.message };
+    console.error('[erpApi] ERROR', action, e);
+    return { success:false, message:e.name === 'AbortError' ? 'Server timeout — please retry.' : (e.message || 'Network error') };
   }
 }
 
@@ -328,6 +344,7 @@ td.num{font-family:'JetBrains Mono',monospace;font-weight:600;text-align:right;}
       <div class="summary-item"><div class="summary-val" id="sumCats">0</div><div class="summary-lbl">Categories</div></div>
       <div class="summary-item"><div class="summary-val" id="sumPending">3</div><div class="summary-lbl">Pending Approval</div></div>
       <div class="summary-item"><div class="summary-val" id="sumToday">2</div><div class="summary-lbl">Received Today</div></div>
+      <button class="tb-btn" onclick="retryKitchenIndentQueue()" title="Retry any indent that could not reach Store">🔄 Retry Unsaved</button>
       <button class="tb-btn success" onclick="submitIndent()" style="margin-left:auto;">📤 Submit Indent</button>
     </div>
 
@@ -821,7 +838,7 @@ function renderTable(items) {
       const val = qtyMap[item.id] || '';
       const lowStock = item.stock <= item.min;
       const safeName = item.name || 'Unnamed item';
-      html += `<tr data-cat="${cat}" data-name="${safeName.toLowerCase()}">
+      html += `<tr data-cat="${cat}" data-name="${safeName.toLowerCase()}" data-id="${String(item.id).replace(/"/g, '&quot;')}">
         <td style="color:var(--muted);font-size:11px;font-family:'JetBrains Mono',monospace;">${rowNum++}</td>
         <td><strong>${safeName}</strong>${lowStock ? ' <span class="status-badge urgent" style="font-size:9px;padding:1px 5px;">Low</span>' : ''}</td>
         <td><span style="font-size:11px;color:var(--muted);background:var(--bg2);padding:2px 6px;border-radius:4px;">${cat}</span></td>
@@ -937,11 +954,26 @@ function clearAllQty() {
 // and the actual SAVE_KITCHEN_INDENT call, so custom items are never
 // silently dropped or sent as a separate/duplicate indent.
 function getAllIndentItems() {
-  const fromMaster = INDENT_ITEMS.filter(i => qtyMap[i.id]).map(i => ({
-    id: i.id, name: i.name, uom: i.uom, qty: qtyMap[i.id], remarks: '', category: i.cat || 'Other',
-  }));
-  const fromCustom = customItems.map(c => ({
-    id: c.id, name: c.name, category: c.category, uom: c.unit, qty: c.qty, remarks: c.remarks,
+  const fromMaster = INDENT_ITEMS.filter(i => Number(qtyMap[i.id]) > 0).map(i => {
+    const rows = [...document.querySelectorAll('#indentTbody tr[data-id]')];
+    const row = rows.find(r => String(r.dataset.id) === String(i.id));
+    const remEl = row ? row.querySelector('[data-remarks]') : null;
+    return {
+      id: i.id,
+      name: i.name,
+      uom: i.uom || '',
+      qty: Number(qtyMap[i.id]) || 0,
+      remarks: remEl ? String(remEl.value || '').trim() : '',
+      category: i.cat || 'Other'
+    };
+  });
+  const fromCustom = customItems.filter(c => Number(c.qty) > 0).map(c => ({
+    id: c.id,
+    name: c.name,
+    category: c.category || 'Other',
+    uom: c.unit || '',
+    qty: Number(c.qty) || 0,
+    remarks: c.remarks || ''
   }));
   return fromMaster.concat(fromCustom);
 }
@@ -966,57 +998,141 @@ function submitIndent() {
     </div>`;
   indentOpenModal('confirmModal');
 }
-function finalSubmit() {
-  var allItems = getAllIndentItems();
+async function finalSubmit() {
+  const allItems = getAllIndentItems();
   if(!allItems.length){ showToast('Please enter at least one quantity','warn'); return; }
-  var num = 'IND-' + Date.now().toString().slice(-6);
-  var dept = document.getElementById('indentDept').value;
-  var shift = document.getElementById('indentShift').value;
-  var priority = document.getElementById('indentPriority').value;
-  var by = document.getElementById('indentBy').value || 'Chef';
-  indentCloseModal('confirmModal');
 
-  // FIX: actually save to Store now, not just WhatsApp — same items
-  // (master-list + custom "not in list" items combined), sent through
-  // SAVE_KITCHEN_INDENT (46_LiveInventoryBridge.gs). Custom items send
-  // itemId as their generated CUSTOM-xxxx id (not a real ITEM_ID) so
-  // Store can still see them clearly in Remarks/ITEM_NAME.
-  erpApi('SAVE_KITCHEN_INDENT', {
+  const num = 'IND-' + Date.now().toString().slice(-8);
+  const date = document.getElementById('indentDate').value || new Date().toISOString().slice(0,10);
+  const dept = document.getElementById('indentDept').value || 'Main Kitchen';
+  const shift = document.getElementById('indentShift').value || 'All Day';
+  const priority = document.getElementById('indentPriority').value || 'Normal';
+  const by = document.getElementById('indentBy').value.trim() || 'Chef';
+  const notes = document.getElementById('indentNotes').value.trim();
+
+  const payload = {
+    indId: num,
+    indentId: num,
+    indentNo: num,
+    date: date,
+    indentDate: date,
+    dept: dept,
+    department: dept,
+    shift: shift,
+    priority: priority,
+    issuedBy: by,
+    requestedBy: by,
+    notes: notes,
+    remarks: notes,
+    indentType: 'KITCHEN',
     items: allItems.map(function(i){
-      const isCustom = i.id.startsWith('CUSTOM-');
-      const remarksWithCat = isCustom && i.category ? ('Category:' + i.category + (i.remarks ? ' — ' + i.remarks : '')) : i.remarks;
-      return { itemId: isCustom ? '' : i.id, itemName: isCustom ? i.name + ' (NOT IN LIST)' : i.name, unit: i.uom, requiredQty: i.qty, remarks: remarksWithCat };
-    }),
-    dept: dept, shift: shift, priority: priority, issuedBy: by,
-  }).then(function(res){
-    if(!res || !res.success){ showToast('⚠ Indent saved locally but Store was not reachable — retry later','warn'); }
-    else { loadIndentHistory(); loadPendingIndents(); }
+      const isCustom = String(i.id || '').indexOf('CUSTOM-') === 0;
+      let remarks = i.remarks || '';
+      if(isCustom && i.category){
+        remarks = 'Category:' + i.category + (remarks ? ' — ' + remarks : '');
+      }
+      return {
+        itemId: isCustom ? '' : i.id,
+        itemID: isCustom ? '' : i.id,
+        ITEM_ID: isCustom ? '' : i.id,
+        itemName: isCustom ? i.name + ' (NOT IN LIST)' : i.name,
+        ITEM_NAME: isCustom ? i.name + ' (NOT IN LIST)' : i.name,
+        unit: i.uom || '',
+        UNIT: i.uom || '',
+        requiredQty: Number(i.qty) || 0,
+        REQUIRED_QTY: Number(i.qty) || 0,
+        remarks: remarks
+      };
+    })
+  };
+
+  // Keep an exact retryable copy until the server confirms success.
+  const queueKey = 'BNJ_KITCHEN_INDENT_RETRY_QUEUE';
+  const saveQueue = (entry) => {
+    try{
+      const q = JSON.parse(localStorage.getItem(queueKey) || '[]');
+      const idx = q.findIndex(x => x.indId === entry.indId);
+      if(idx >= 0) q[idx] = entry; else q.push(entry);
+      localStorage.setItem(queueKey, JSON.stringify(q.slice(-20)));
+    }catch(e){}
+  };
+  const removeQueue = (indId) => {
+    try{
+      const q = JSON.parse(localStorage.getItem(queueKey) || '[]').filter(x => x.indId !== indId);
+      localStorage.setItem(queueKey, JSON.stringify(q));
+    }catch(e){}
+  };
+
+  indentCloseModal('confirmModal');
+  showToast('Saving indent ' + num + ' to Store…','warn');
+
+  const res = await erpApi('SAVE_KITCHEN_INDENT', payload);
+
+  if(!res || !res.success){
+    saveQueue(payload);
+    showToast('⚠ Indent NOT saved to Store. It is safely queued for Retry. ' + (res && res.message ? res.message : ''),'warn');
+    return; // IMPORTANT: do not clear the entered quantities on failure
+  }
+
+  removeQueue(num);
+  qtyMap = {};
+  customItems = [];
+  renderTable(INDENT_ITEMS);
+  renderCustomItems();
+  updateSummary();
+
+  showToast('✓ Indent ' + num + ' saved to Store successfully','success');
+  await Promise.allSettled([loadIndentHistory(), loadPendingIndents()]);
+
+  const lines = ['📦 *KITCHEN INDENT REQUEST*','━━━━━━━━━━━━━━━━',
+    '🏷️ Indent No : *'+num+'*',
+    '📅 Date      : '+date,
+    '🍽️ Dept      : '+dept,
+    '⏰ Shift     : '+shift,
+    '👤 By        : '+by,
+    '⚠️ Priority  : '+priority,
+    '━━━━━━━━━━━━━━━━'];
+  allItems.forEach(function(i){
+    lines.push('🔸 '+i.name+' — *'+i.qty+' '+i.uom+'*'+(String(i.id||'').indexOf('CUSTOM-')===0?' (not in list)':''));
   });
+  if(notes) lines.push('📝 Notes : '+notes);
+  lines.push('━━━━━━━━━━━━━━━━','✅ Saved to Store','_Balaji NextGen ERP Kitchen_');
+  const waMsg = lines.join('\n');
 
-  var lines = ['\u{1F4E6} *KITCHEN INDENT REQUEST*','\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501',
-    '\uD83C\uDFF7\uFE0F Indent No : *'+num+'*',
-    '\uD83D\uDCC5 Date      : '+new Date().toLocaleDateString('en-IN'),
-    '\uD83C\uDF7D\uFE0F Dept      : '+dept,
-    '\u23F0 Shift     : '+shift,'\uD83D\uDC64 By        : '+by,
-    '\u26A0\uFE0F Priority  : '+priority,'\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501'];
-  allItems.forEach(function(i){ lines.push('\uD83D\uDD38 '+i.name+' \u2014 *'+i.qty+' '+i.uom+'*'+(i.id.startsWith('CUSTOM-')?' (not in list)':'')); });
-  lines.push('\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501','\u2705 Please arrange ASAP','_Balaji NextGen ERP Kitchen_');
-  var waMsg = lines.join('\n');
+  // Printing/WhatsApp is secondary to the database save.
+  setTimeout(function(){ try{ openIndentPDFWindow(allItems); }catch(e){} }, 250);
 
-  qtyMap = {}; customItems = []; renderTable(INDENT_ITEMS); renderCustomItems();
-  showToast('\u2713 Indent '+num+' submitted!','success');
-
-  // FIX ("proper pdf also send after submit with text"): auto-opens
-  // the paper-format PDF alongside the existing auto-WhatsApp text
-  // send below, instead of requiring a separate manual PDF button
-  // click after every submission.
-  setTimeout(function(){ openIndentPDFWindow(allItems); }, 200);
-
-  var waNum = localStorage.getItem('BNJ_FACTORY_WA') || '';
-  if(!waNum){ waNum = prompt('Factory/Store WhatsApp number (with country code):','919832014403'); if(waNum) localStorage.setItem('BNJ_FACTORY_WA', waNum.replace(/[^0-9]/g,'')); }
-  if(waNum){ setTimeout(function(){ window.open('https://wa.me/'+waNum.replace(/[^0-9]/g,'')+'?text='+encodeURIComponent(waMsg),'_blank'); }, 500); }
-  else if(navigator.clipboard){ navigator.clipboard.writeText(waMsg); showToast('Indent copied \u2014 paste in WhatsApp','success'); }
+  let waNum = localStorage.getItem('BNJ_FACTORY_WA') || '';
+  if(waNum){
+    setTimeout(function(){
+      window.open('https://wa.me/'+waNum.replace(/[^0-9]/g,'')+'?text='+encodeURIComponent(waMsg),'_blank');
+    }, 500);
+  }else if(navigator.clipboard){
+    try{ await navigator.clipboard.writeText(waMsg); showToast('Indent saved — WhatsApp text copied','success'); }catch(e){}
+  }
 }
+
+async function retryKitchenIndentQueue(){
+  const key = 'BNJ_KITCHEN_INDENT_RETRY_QUEUE';
+  let q = [];
+  try{ q = JSON.parse(localStorage.getItem(key) || '[]'); }catch(e){}
+  if(!q.length){ showToast('No unsaved kitchen indents to retry','success'); return; }
+
+  showToast('Retrying ' + q.length + ' kitchen indent(s)…','warn');
+  const remaining = [];
+  for(const entry of q){
+    const res = await erpApi('SAVE_KITCHEN_INDENT', entry);
+    if(!res || !res.success) remaining.push(entry);
+  }
+  localStorage.setItem(key, JSON.stringify(remaining.slice(-20)));
+  if(remaining.length){
+    showToast(remaining.length + ' indent(s) still not saved — check connection and retry again','warn');
+  }else{
+    showToast('✓ All queued kitchen indents saved to Store','success');
+    await Promise.allSettled([loadIndentHistory(), loadPendingIndents()]);
+  }
+}
+
 function addHistoryRow(num) {
   const tbody = document.getElementById('historyTbody');
   const row = `<tr>
