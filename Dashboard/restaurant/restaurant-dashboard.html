@@ -124,82 +124,18 @@ const GAS_APIS_DASH = {
   V2_AUTH:     'https://script.google.com/macros/s/' + (function(){try{return localStorage.getItem('bnx_api_auth');}catch(e){}}()||'AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx') + '/exec',
 };
 
-/* ═══ LIVE-SITE SAME-ORIGIN API PROXY FIX ═══
-   Google Apps Script web-app responses do not expose the CORS header required
-   by browsers when this dashboard is served from balajinextgen.in. The result
-   is the exact console error: "No Access-Control-Allow-Origin header" and
-   every Master/Transaction/Report load falls back to Offline / DB unavailable.
-   Netlify proxies these two paths server-side, so browser requests remain
-   same-origin and both reads AND writes work normally. Local file:// keeps the
-   direct GAS URL as a development fallback.
+/* ═══ LIVE API — DIRECT GOOGLE APPS SCRIPT ═══
+   No Netlify / Cloudflare proxy. Production and hosted pages use the
+   real V2_CORE/V2_AUTH Apps Script /exec endpoints. Browser fetch follows
+   the Apps Script ContentService redirect automatically.
 */
-/* ================================================================
-   LIVE API — RESTORED ORIGINAL DIRECT GOOGLE APPS SCRIPT PATTERN
-   No Netlify / Cloudflare / Worker dependency.
-   Browser POSTs to the real GAS /exec URL.  Apps Script may return
-   a 302 ContentService redirect; browser fetch follows it automatically.
-   ================================================================ */
 const BNX_SAME_ORIGIN_API = null;
-
-function bnxApiUrl_(endpoint){
-  endpoint = endpoint || 'V2_CORE';
-  return GAS_APIS_DASH[endpoint];
-}
+function bnxApiUrl_(endpoint){ return GAS_APIS_DASH[endpoint || 'V2_CORE']; }
 
 /* CENTRALIZED CONFIG — same mechanism as steward-mobile.html, see its
    comment for the full explanation. Once DEPLOYMENT_CONFIG exists in
    your security DB, both apps' V2_CORE/V2_AUTH stay in sync from one
    place instead of each carrying an independent, driftable copy. */
-
-/* ═══ FINAL HANG / REQUEST-STORM FIX ═══
-   A bad Netlify function route used to make every page action start
-   another failing request. During a proxy outage that created a request
-   storm and made the ERP feel frozen. Keep one in-flight request per
-   identical POST body and temporarily open a short circuit after a
-   permanent 4xx/405 response. Manual Refresh/Save can clear it.
-*/
-const BNX_API_FLIGHT = new Map();
-const BNX_API_CIRCUIT = new Map();
-
-function bnxApiCircuitOpen_(endpoint){
-  const until = Number(BNX_API_CIRCUIT.get(endpoint)||0);
-  if (until && until > Date.now()) return true;
-  if (until) BNX_API_CIRCUIT.delete(endpoint);
-  return false;
-}
-function bnxResetApiCircuit_(endpoint){
-  if(endpoint) BNX_API_CIRCUIT.delete(endpoint);
-  else BNX_API_CIRCUIT.clear();
-}
-function bnxApiFlightKey_(endpoint, options){
-  return String(endpoint||'V2_CORE') + '|' + String(options && options.body || '');
-}
-
-/* FIX (companion to the timeout increase below): the circuit breaker used
-   to open ONLY on a permanent 4xx/405 response. A slow-but-alive backend
-   that times out on every call (the exact failure mode seen in production
-   — 34/35, 68/69, 76/77, 80/81 calls failing) never triggered it, so the
-   frontend just kept firing the full request-queue concurrency and every
-   poll interval at an already-overloaded Apps Script deployment forever,
-   compounding the very slowness causing the timeouts. Now N consecutive
-   timeouts on an endpoint (regardless of status code, since a timeout has
-   none) also opens a short circuit, giving the backend room to catch up;
-   any real success immediately resets the counter and closes it early. */
-const BNX_CONSEC_TIMEOUTS = new Map();
-const BNX_TIMEOUT_CIRCUIT_THRESHOLD = 4;
-const BNX_TIMEOUT_CIRCUIT_MS = 20000;
-function bnxNoteTimeout_(endpoint, wasTimeout){
-  const key = String(endpoint||'V2_CORE');
-  if (!wasTimeout){ BNX_CONSEC_TIMEOUTS.delete(key); return; }
-  const n = (BNX_CONSEC_TIMEOUTS.get(key)||0) + 1;
-  BNX_CONSEC_TIMEOUTS.set(key, n);
-  if (n >= BNX_TIMEOUT_CIRCUIT_THRESHOLD){
-    BNX_API_CIRCUIT.set(key, Date.now() + BNX_TIMEOUT_CIRCUIT_MS);
-    BNX_CONSEC_TIMEOUTS.set(key, 0);
-    console.warn('[API] '+key+' timed out '+n+'x in a row — backing off for '+(BNX_TIMEOUT_CIRCUIT_MS/1000)+'s to let it recover.');
-  }
-}
-
 async function bnxFetchJson_(endpoint, options){
   options = options || {};
   endpoint = endpoint || 'V2_CORE';
@@ -210,6 +146,8 @@ async function bnxFetchJson_(endpoint, options){
   const urls = [];
 
   if (!isLocalFile) {
+    // Production: same-origin proxy only. Browser CORS prevents reliable
+    // reading of Apps Script ContentService responses cross-origin.
     if (primary) urls.push(primary);
   } else {
     if (primary) urls.push(primary);
@@ -218,114 +156,46 @@ async function bnxFetchJson_(endpoint, options){
 
   if (!urls.length) throw new Error('No API endpoint configured for ' + endpoint);
 
-  /* Never let identical GET/read requests pile up while one is pending. */
-  const flightKey = bnxApiFlightKey_(endpoint, options);
-  if (BNX_API_FLIGHT.has(flightKey)) return BNX_API_FLIGHT.get(flightKey);
+  let lastErr = null;
+  for (let i=0; i<urls.length; i++) {
+    const url=urls[i];
+    try {
+      const r=await fetch(url,Object.assign({
+        method:'POST',
+        headers:{'Content-Type':'text/plain;charset=utf-8'},
+        credentials:'omit',
+        redirect:'follow'
+      },options));
+      const text=await r.text();
 
-  const work = (async()=>{
-    /* If this endpoint has just returned a permanent 4xx (especially 405),
-       fail immediately for a short period instead of repeatedly waiting. */
-    if (!isLocalFile && bnxApiCircuitOpen_(endpoint)) {
-      const err = new Error('API circuit open for ' + endpoint);
-      err.status = 503;
-      err.circuitOpen = true;
-      throw err;
-    }
-
-    let lastErr = null;
-    for (let i=0; i<urls.length; i++) {
-      const url=urls[i];
-      try {
-        const fetchOpts = Object.assign({
-          method:'POST',
-          headers:{'Content-Type':'text/plain;charset=utf-8'},
-          credentials:'omit',
-          redirect:'follow'
-        },options);
-
-        const parsedAction = (()=>{ try{return JSON.parse(fetchOpts.body||'{}').action||'';}catch(e){return '';} })();
-        /* FIX ("signal is aborted without reason" storm / ~97% API failure
-           rate seen in production console — BN_HEALTH logged 34/35, 68/69,
-           76/77, 80/81 calls failing, avg_response 14-16s): this backend is
-           a Google Apps Script /exec endpoint doing multi-spreadsheet
-           reads, provisioning checks and LockService-guarded writes on
-           every call — a genuinely healthy response routinely takes well
-           over 10-12s, especially once SYNC_LOG/AUDIT_LOG have grown over
-           a live shift. The old 10s/12s timeouts were shorter than the
-           backend's own normal response time, so the AbortController fired
-           on almost every single call before the server had a chance to
-           answer — this was never a real "network error", it was the
-           client giving up too early on a slow-but-working backend.
-           Timeouts are now generous enough for genuine Apps Script
-           latency; the soft circuit breaker (bnxNoteTimeout_ below) is
-           what actually protects the UI if the backend is truly down,
-           instead of a too-short timeout doing it by accident. */
-        const timeoutMs = Number(fetchOpts.timeoutMs) ||
-          (/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? 20000 : 30000);
-        delete fetchOpts.timeoutMs;
-
-        const timeoutCtrl = new AbortController();
-        const timer = setTimeout(()=>{
-          try{ timeoutCtrl.abort('bnx-timeout after ' + timeoutMs + 'ms'); }
-          catch(e){ timeoutCtrl.abort(); }
-        }, timeoutMs);
-        if(fetchOpts.signal){
-          try{fetchOpts.signal.addEventListener('abort',()=>timeoutCtrl.abort(),{once:true});}catch(e){}
-        }
-        fetchOpts.signal=timeoutCtrl.signal;
-
-        let r;
-        try{ r=await fetch(url,fetchOpts); bnxNoteTimeout_(endpoint,false); }
-        catch(fetchErr){
-          if(fetchErr && (fetchErr.name==='AbortError' || /abort/i.test(fetchErr.message||''))) bnxNoteTimeout_(endpoint,true);
-          throw fetchErr;
-        }
-        finally{ clearTimeout(timer); }
-
-        const text=await r.text();
-
-        if(!r.ok){
-          const err=new Error('API proxy HTTP '+r.status+' at '+url);
-          err.status=r.status;
-          err.responseText=text.slice(0,300);
-          lastErr=err;
-
-          /* 4xx is permanent for this page session. Do not keep hammering
-             the same broken proxy route. 405 is the exact live-site issue. */
-          if(!isLocalFile && r.status>=400 && r.status<500){
-            BNX_API_CIRCUIT.set(endpoint, Date.now()+30000);
-          }
-          if(!isLocalFile) throw err;
-          if(i+1<urls.length) continue;
-          throw err;
-        }
-
-        let data;
-        try { data=JSON.parse(text); }
-        catch(e){
-          const err=new Error('API returned non-JSON ('+r.status+'): '+text.slice(0,180));
-          err.status=r.status;
-          err.responseText=text.slice(0,300);
-          lastErr=err;
-          if(i+1<urls.length) continue;
-          throw err;
-        }
-
-        BNX_API_CIRCUIT.delete(endpoint);
-        bnxClearApiTransportError_();
-        return data;
-      } catch(e) {
-        lastErr=e;
+      if(!r.ok){
+        const err=new Error('API HTTP '+r.status+' at '+url);
+        err.status=r.status;
+        err.responseText=text.slice(0,300);
+        lastErr=err;
+        if(!isLocalFile) throw err;
         if(i+1<urls.length) continue;
-        throw e;
+        throw err;
       }
-    }
-    throw lastErr || new Error('API request failed');
-  })();
 
-  BNX_API_FLIGHT.set(flightKey, work);
-  try { return await work; }
-  finally { BNX_API_FLIGHT.delete(flightKey); }
+      let data;
+      try { data=JSON.parse(text); }
+      catch(e){
+        const err=new Error('API returned non-JSON ('+r.status+'): '+text.slice(0,180));
+        err.status=r.status;
+        err.responseText=text.slice(0,300);
+        lastErr=err;
+        if(i+1<urls.length) continue;
+        throw err;
+      }
+      return data;
+    } catch(e) {
+      lastErr=e;
+      if(i+1<urls.length) continue;
+      throw e;
+    }
+  }
+  throw lastErr || new Error('API request failed');
 }
 
 function bnxShowApiTransportError_(err, endpoint){
@@ -338,27 +208,8 @@ function bnxShowApiTransportError_(err, endpoint){
       el.style.cssText='position:fixed;left:12px;right:12px;bottom:12px;z-index:99999;background:#7f1d1d;color:#fff;padding:10px 14px;border-radius:10px;font:600 12px/1.4 Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.25);';
       document.body.appendChild(el);
     }
-    const route=GAS_APIS_DASH[endpoint] || '';
-    el.textContent=(window.location && window.location.protocol==='file:')
-  ? 'LOCAL TEST MODE: browser cannot read Google Apps Script directly from file://. Open the hosted ERP page for live DB data.'
-  : 'ERP API '+endpoint+' unavailable ('+(err&&err.status?('HTTP '+err.status):'network error')+'). Live screen remains usable; use the configured Google Apps Script /exec API for live DB sync. Live data is not replaced with demo data.';
-  }catch(e){}
-}
-/* FIX ("banner stuck forever after a single transient failure"): this
-   banner was created by bnxShowApiTransportError_ above but NOTHING in
-   the whole file ever removed it again — so one failed call during page
-   load (very common: the very first request can fire before the session/
-   client ID is fully ready) pinned a permanent "API unavailable" message
-   to the bottom of the screen for the rest of the session, even after
-   every subsequent call succeeded and the header's Auth/Core status pills
-   both went green. Confirmed via full-file search: bnxShowApiTransportError_
-   was called but never paired with a matching removal. Now called from the
-   one shared success path (bnxFetchJson_) so ANY successful API response,
-   through erpApi or gasApi, on any endpoint, clears it immediately. */
-function bnxClearApiTransportError_(){
-  try{
-    const el=document.getElementById('_bnxApiTransportError');
-    if(el) el.remove();
+    const route=endpoint==='V2_AUTH'?'/api/auth':'/api/core';
+    el.textContent='ERP API '+endpoint+' unavailable ('+(err&&err.status?('HTTP '+err.status):'network error')+'). Configure '+route+' as a POST proxy. Live data is not replaced with demo data.';
   }catch(e){}
 }
 
@@ -369,7 +220,7 @@ async function bnxRefreshConfig(){
   // forever. Still falls back to the hardcoded bootstrap IDs either
   // way (never blocks startup), but now every outcome is logged.
   try{
-    const res = await bnxFetchJson_('V2_CORE', {body: JSON.stringify({action:'GET_CONFIG'}), timeoutMs:2500});
+    const res = await bnxFetchJson_('V2_CORE', {body: JSON.stringify({action:'GET_CONFIG'})});
     if(res && res.success && res.data){
       if(res.data.v2CoreId) localStorage.setItem('bnx_api_core', res.data.v2CoreId);
       if(res.data.v2AuthId) localStorage.setItem('bnx_api_auth', res.data.v2AuthId);
@@ -411,19 +262,6 @@ async function bnxRefreshConfig(){
 // independent of whether this config fetch has finished. Now the
 // promise is captured so every GAS-dependent init below can genuinely
 // wait on it first, instead of racing it.
-// FIX ("live site never refreshes its API deployment IDs"): this used to
-// SKIP bnxRefreshConfig() entirely whenever the page was not opened as a
-// local file:// — i.e. on the real production site, balajinextgen.in —
-// on the theory that a same-origin proxy made a fresh GET_CONFIG lookup
-// unnecessary there. That proxy was later removed (see BNX_SAME_ORIGIN_API
-// = null and the "RESTORED ORIGINAL DIRECT GOOGLE APPS SCRIPT PATTERN"
-// comment above), but this skip condition was never updated to match —
-// so the live site has been permanently stuck on the hardcoded fallback
-// /exec deployment IDs with no way to ever recover if either ID is
-// rotated/redeployed. bnxRefreshConfig() itself is cheap (2.5s timeout,
-// non-blocking to the rest of startup below) and already falls back to
-// the same hardcoded IDs on any failure, so always running it here is a
-// strict improvement with no downside.
 window.__bnxConfigReady = bnxRefreshConfig();
 const GAS_URL = GAS_APIS_DASH.V2_CORE;
 const CLIENT_ID=(function(){
@@ -474,24 +312,8 @@ const CLIENT_INDUSTRY=(function(){
    • Connection pooling: reuse TCP connections, lower latency
    • Auto-archive: old bills (>7 days) cleaned from sessionStorage
 ═══════════════════════════════════════════════════════ */
-/* FIX: maxConcurrent:5 against a single Apps Script /exec deployment was
-   itself part of the request-storm problem — the backend serializes many
-   operations behind LockService (sequence counters, SYNC_LOG dedup claims,
-   ledger account lookups), so 5 parallel calls don't get answered 5x
-   faster, they queue up ON THE SERVER and each one waits on the others'
-   locks, making every one of them slower — the classic thundering-herd
-   pattern that matches the climbing avg_response times logged in
-   production (14.4s → 15.7s → 16.1s → 15.8s as api_calls climbed). Lower
-   concurrency reduces lock contention and lets each call actually finish.
-   Retry backoff is also widened so a retry doesn't immediately re-add to
-   the same pile-up it just came from. */
-const REQUEST_QUEUE = { pending: [], active: 0, maxConcurrent: 2 };
-const API_RETRY_CONFIG = { maxAttempts: 2, baseDelay: 1500, maxDelay: 15000 };
-// HANG FIX: identical GET/summary requests fired by multiple startup listeners
-// are coalesced into ONE network request. This page previously requested
-// GET_DASHBOARD_SUMMARY several times during startup, filling the queue when
-// /api/core was unavailable and making the screen feel frozen.
-const BNX_INFLIGHT_API = new Map();
+const REQUEST_QUEUE = { pending: [], active: 0, maxConcurrent: 5 };
+const API_RETRY_CONFIG = { maxAttempts: 3, baseDelay: 300, maxDelay: 5000 };
 
 // FIX (authorization): the confirmed backend returns a real,
 // distinguishable auth failure — respondError(401, 'Invalid or expired
@@ -530,122 +352,31 @@ function bnxCheckAuthFailure_(data){
   return false;
 }
 
-/* FINAL FIX: live ERP session/client resolver.
-   The previous resolver had a subtle loop-brace bug: it normalized every
-   value but tested only vals[i] AFTER the loop, so it returned no session
-   even when ERP_USER / ERP_SESSION contained a valid token. That produced
-   "[AUTH] No ERP_SESSION token" and then every core call failed.
-*/
-function bnxReadStoredObject_(key){
-  try{
-    var raw = localStorage.getItem(key) || sessionStorage.getItem(key) || '';
-    if(!raw) return null;
-    try { return JSON.parse(raw); } catch(e){ return raw; }
-  }catch(e){ return null; }
-}
-function bnxPickToken_(v){
-  if(!v) return '';
-  if(typeof v === 'string') return v.trim();
-  if(typeof v === 'object'){
-    return String(
-      v.sessionToken || v.SESSION_TOKEN || v.token || v.TOKEN ||
-      v.session || v.SESSION || v.erpSession || v.ERP_SESSION || ''
-    ).trim();
-  }
-  return '';
-}
-function bnxCurrentSession_(){
-  try{
-    var candidates = [];
-    try{ if(typeof ERP!=='undefined' && typeof ERP.getSession==='function') candidates.push(ERP.getSession()); }catch(e){}
-    try{ if(typeof ERP!=='undefined' && typeof ERP.getToken==='function') candidates.push(ERP.getToken()); }catch(e){}
-    candidates.push(localStorage.getItem('ERP_SESSION'));
-    candidates.push(sessionStorage.getItem('ERP_SESSION'));
-    candidates.push(localStorage.getItem('erp_session'));
-    candidates.push(sessionStorage.getItem('erp_session'));
-    candidates.push(localStorage.getItem('erp_token'));
-    candidates.push(sessionStorage.getItem('erp_token'));
-    candidates.push(bnxReadStoredObject_('ERP_USER'));
-    candidates.push(bnxReadStoredObject_('erpUser'));
-    for(var i=0;i<candidates.length;i++){
-      var token = bnxPickToken_(candidates[i]);
-      if(token) return token;
-    }
-  }catch(e){}
-  return '';
-}
-function bnxCurrentClient_(){
-  try{
-    var candidates = [];
-    try{ if(typeof ERP!=='undefined' && typeof ERP.getClient==='function') candidates.push(ERP.getClient()); }catch(e){}
-    try{ if(typeof ERP!=='undefined' && typeof ERP.getClientId==='function') candidates.push(ERP.getClientId()); }catch(e){}
-    try{ if(typeof CLIENT_ID!=='undefined') candidates.push(CLIENT_ID); }catch(e){}
-    candidates.push(localStorage.getItem('ERP_CLIENT'));
-    candidates.push(sessionStorage.getItem('ERP_CLIENT'));
-    candidates.push(localStorage.getItem('bnx_client_id'));
-    candidates.push(bnxReadStoredObject_('ERP_USER'));
-    candidates.push(bnxReadStoredObject_('erpUser'));
-    for(var i=0;i<candidates.length;i++){
-      var v=candidates[i];
-      if(v && typeof v==='object'){
-        v=v.CLIENT_ID || v.clientId || v.client_id || v.CLIENT || v.client || '';
-      }
-      if(v && String(v).trim()) return String(v).trim();
-    }
-  }catch(e){}
-  return '';
-}
-
-/* CLIENT-SAFE CACHE RESET: never clear ERP_USER/session. Only clear report/bill/KOT/menu/table caches when the client changes. */
-(function(){
-  try{
-    const cid=bnxCurrentClient_();
-    const key='bnx_last_client_cache_v2';
-    const prev=localStorage.getItem(key)||'';
-    if(cid && prev && prev!==cid){
-      Object.keys(localStorage).forEach(k=>{ if(/^bnx_(bill|kot|report|menu|table)/i.test(k)) localStorage.removeItem(k); });
-    }
-    if(cid) localStorage.setItem(key,cid);
-  }catch(e){}
-})();
-
 let _bnxWarnedNoSession = false;
 async function gasApi(action, payload, endpoint) {
   payload = payload || {};
   const ep = endpoint || 'V2_CORE';
-  if (action !== 'GET_CONFIG' && !bnxCurrentClient_()) {
-    return Promise.resolve({success:false,error:'No authenticated client session',statusCode:401,offline:true});
-  }
-  if (!_bnxWarnedNoSession && action !== 'GET_CONFIG' && !bnxCurrentSession_()) {
+  if (!_bnxWarnedNoSession && action !== 'GET_CONFIG' && !(localStorage.getItem('ERP_SESSION')||sessionStorage.getItem('ERP_SESSION')||'')) {
     _bnxWarnedNoSession = true;
-    console.warn('[AUTH] No active ERP session token found in ERP helper/storage — session-gated API call skipped/failure is expected until login.');
+    console.error('[AUTH] No ERP_SESSION token — session-gated API calls may fail until login.');
   }
-
-  // HANG FIX: coalesce identical in-flight requests. Startup used to fire the
-  // same dashboard summary through several DOMContentLoaded handlers and the
-  // 2.5s startup timer. Only the first request should hit the queue/network.
-  let inflightKey = '';
-  try {
-    inflightKey = ep + '|' + String(action||'') + '|' + JSON.stringify(payload) + '|' +
-      bnxCurrentSession_() + '|' + bnxCurrentClient_();
-  } catch(e) {}
-  if (inflightKey && BNX_INFLIGHT_API.has(inflightKey)) return BNX_INFLIGHT_API.get(inflightKey);
-
-  const promise = new Promise((resolve) => {
+  return new Promise((resolve) => {
     const task = async () => {
       try {
         let attempt = 0;
         while (attempt < API_RETRY_CONFIG.maxAttempts) {
           try {
-            const session = bnxCurrentSession_();
-            const body = JSON.stringify(Object.assign({action:action, clientId:bnxCurrentClient_(), sessionToken:session}, payload));
+            const session = localStorage.getItem('ERP_SESSION') || sessionStorage.getItem('ERP_SESSION') || '';
+            const body = JSON.stringify(Object.assign({action:action, clientId:CLIENT_ID, sessionToken:session}, payload));
             const data = await bnxFetchJson_(ep, {body:body});
             bnxCheckAuthFailure_(data);
             resolve(data);
             return;
           } catch(err) {
-            /* Permanent 4xx errors are never retried. Network/5xx errors get
-               only a bounded retry so a dead endpoint cannot freeze the UI. */
+            /* Never retry a permanent client-side HTTP error such as 400/401/403/404/405.
+               The old three-attempt retry made a bad /api/core route feel like a
+               frozen Save/Invoice button for several seconds. Retry only network
+               failures and 5xx responses where another attempt can actually help. */
             const status=Number(err && err.status)||0;
             if (status>=400 && status<500) {
               resolve({success:false, error:err.message, statusCode:status});
@@ -667,12 +398,8 @@ async function gasApi(action, payload, endpoint) {
     else REQUEST_QUEUE.pending.push(task);
     processRequestQueue();
   });
-  if (inflightKey) {
-    BNX_INFLIGHT_API.set(inflightKey, promise);
-    promise.finally(()=>{ if(BNX_INFLIGHT_API.get(inflightKey)===promise) BNX_INFLIGHT_API.delete(inflightKey); });
-  }
-  return promise;
 }
+
 async function processRequestQueue() {
   while (REQUEST_QUEUE.active < REQUEST_QUEUE.maxConcurrent && REQUEST_QUEUE.pending.length > 0) {
     REQUEST_QUEUE.active++;
@@ -873,7 +600,7 @@ window.gasApi = async function(action, payload, endpoint) {
 setInterval(() => {
   const uptime = ((Date.now() - PERF_METRICS.startTime) / 1000 / 60).toFixed(1);
   const healthStr = `[BN_HEALTH] uptime:${uptime}m bills:${PERF_METRICS.billsCreated} api_calls:${PERF_METRICS.apiCallsTotal} failures:${PERF_METRICS.apiCallsFailed} avg_response:${PERF_METRICS.avgResponseTime.toFixed(0)}ms queue:${PERF_METRICS.queueLength()}`;
-  if (!bnxApiCircuitOpen_('V2_CORE')) console.log(healthStr);
+  console.log(healthStr);
   // Store latest metric in localStorage for dashboard widget
   try {
     localStorage.setItem('_bnHealthMetrics', JSON.stringify({
@@ -1154,8 +881,6 @@ html[data-fontscale="xlarge"] .prod-name,html[data-fontscale="huge"] .prod-name{
 .ps-reason{font-size:9px;color:var(--text3);}
 .ps-qty{font-size:10px;font-weight:700;color:var(--gold);margin-left:auto;white-space:nowrap;}
 /* Toast/notification banner shown by showNotif() — desktop default */
-/* HANG FIX: never allow a loading overlay to block clicks after an API failure. */
-#bnxSplash.fade-out{pointer-events:none!important;}
 .app-toast{position:fixed;top:80px;right:20px;z-index:9999;color:#fff;padding:10px 18px;
   border-radius:10px;font-size:13px;font-weight:600;font-family:'DM Sans',sans-serif;
   box-shadow:0 6px 20px rgba(0,0,0,.25);max-width:360px;}
@@ -1554,10 +1279,6 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
 .nav-badge.g{background:var(--green);}
 .nav-badge.b{background:var(--gold);}
 .nav-badge.p{background:var(--purple);}
-/* SECOND LOGOUT CONTROL — top bar + sidebar user footer. */
-.sidebar-logout-btn{border:1px solid rgba(198,40,40,.20);background:rgba(198,40,40,.08);color:#c62828;border-radius:8px;width:30px;height:30px;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:14px;flex:0 0 auto;}
-.sidebar-logout-btn:hover{background:#c62828;color:#fff;}
-
 .sidebar-footer{padding:12px 14px;border-top:1px solid rgba(var(--gold-rgb),.14);
   display:flex;align-items:center;gap:9px;cursor:pointer;transition:.18s;}
 @media (hover:hover) and (pointer:fine){.sidebar-footer:hover{background:rgba(var(--gold-rgb),.07);}}
@@ -2994,7 +2715,7 @@ document.addEventListener('DOMContentLoaded', function(){
   <div class="sidebar-footer" onclick="showPage('settings',null)">
     <div class="sf-avatar" id="sfAvatar">A</div>
     <div style="flex:1;min-width:0;"><div class="sf-name" id="sfName">Admin</div><div class="sf-role" id="sfRole">Manager</div></div>
-    <button type="button" class="sidebar-logout-btn" onclick="event.stopPropagation();doLogout();" title="Logout" aria-label="Logout">🚪</button>
+    <span style="font-size:10px;color:var(--text3);">⚡</span>
   </div>
 </nav>
 <div class="sidebar-overlay" id="sidebarOverlay" onclick="closeMobileSidebar()"></div>
@@ -3218,7 +2939,7 @@ document.addEventListener('DOMContentLoaded', function(){
     <div class="stat gold" style="cursor:pointer;" onclick="goToDetail('reports','sales')"><div class="stat-val stat-val-ic"><span class="stat-ic">💰</span><span id="d-rev">—</span></div><div class="stat-lbl">Net Revenue <span style="font-size:8.5px;color:var(--text3);">Excl. GST</span></div><div class="stat-chg up" id="d-revchg">—</div><div class="spark"><svg viewBox="0 0 100 28"><polyline fill="none" stroke="var(--gold)" stroke-width="1.5" points="0,24 15,17 30,20 45,8 60,12 75,6 90,9 100,4"/></svg></div></div>
     <div class="stat green" style="cursor:pointer;" onclick="goToDetail('reports','sales')"><div class="stat-val stat-val-ic"><span class="stat-ic">🧮</span><span id="d-gross">—</span></div><div class="stat-lbl">Gross Sales <span style="font-size:8.5px;color:var(--text3);">Incl. GST</span></div><div class="stat-chg" id="d-grosschg">vs yesterday</div></div>
     <div class="stat" style="cursor:pointer;" onclick="bnxDashQuickReport_('tax','tax-summary')"><div class="stat-val stat-val-ic"><span class="stat-ic">🏛</span><span id="d-gst">—</span></div><div class="stat-lbl">GST Collected <span id="d-gst-split" style="font-size:8.5px;color:var(--text3);">CGST + SGST/IGST</span></div><div class="stat-chg" id="d-gstchg">vs yesterday</div></div>
-    <div class="stat blue" style="cursor:pointer;" onclick="goToDetail('order-register')"><div class="stat-val stat-val-ic"><span class="stat-ic">🧾</span><span id="d-ord">—</span></div><div class="stat-lbl">Bills <span style="font-size:8.5px;color:var(--text3);">Completed</span></div><div class="stat-chg up" id="d-ordchg">—</div><div class="spark"><svg viewBox="0 0 100 28"><polyline fill="none" stroke="var(--green)" stroke-width="1.5" points="0,22 15,16 30,24 45,11 60,14 75,8 90,12 100,6"/></svg></div></div>
+    <div class="stat blue" style="cursor:pointer;" onclick="goToDetail('order-register')"><div class="stat-val stat-val-ic"><span class="stat-ic">🧾</span><span id="d-ord">214</span></div><div class="stat-lbl">Bills <span style="font-size:8.5px;color:var(--text3);">Completed</span></div><div class="stat-chg up" id="d-ordchg">↑ 8 more than avg</div><div class="spark"><svg viewBox="0 0 100 28"><polyline fill="none" stroke="var(--green)" stroke-width="1.5" points="0,22 15,16 30,24 45,11 60,14 75,8 90,12 100,6"/></svg></div></div>
     <!-- NEW ("order add" — Sep 2026): distinct from Bills (completed/
          settled) — this counts every order PLACED today, including
          ones still active/unbilled, from the same real Order Register
@@ -3226,7 +2947,7 @@ document.addEventListener('DOMContentLoaded', function(){
          split further down. Honest "—" when that data hasn't loaded
          for this session yet, same guard as that existing code. -->
     <div class="stat" style="border-left:4px solid var(--orange);cursor:pointer;" onclick="goToDetail('order-register')"><div class="stat-val stat-val-ic" style="color:var(--orange)"><span class="stat-ic">📋</span><span id="d-orders-placed">—</span></div><div class="stat-lbl">Orders <span style="font-size:8.5px;color:var(--text3);">Placed Today</span></div><div class="stat-chg" id="d-orders-placedchg">Incl. active/unbilled</div></div>
-    <div class="stat" style="border-left:4px solid #ec4899;cursor:pointer;" onclick="goToDetail('tables')"><div class="stat-val stat-val-ic" style="color:#ec4899"><span class="stat-ic">👥</span><span id="d-cov">—</span></div><div class="stat-lbl">Covers <span style="font-size:8.5px;color:var(--text3);">Guests Served</span></div><div class="stat-chg up" id="d-covchg">—</div><div class="spark"><svg viewBox="0 0 100 28"><polyline fill="none" stroke="var(--blue)" stroke-width="1.5" points="0,24 15,14 30,18 45,12 60,10 75,15 90,8 100,11"/></svg></div></div>
+    <div class="stat" style="border-left:4px solid #ec4899;cursor:pointer;" onclick="goToDetail('tables')"><div class="stat-val stat-val-ic" style="color:#ec4899"><span class="stat-ic">👥</span><span id="d-cov">583</span></div><div class="stat-lbl">Covers <span style="font-size:8.5px;color:var(--text3);">Guests Served</span></div><div class="stat-chg up" id="d-covchg">↑ 5.2% this week</div><div class="spark"><svg viewBox="0 0 100 28"><polyline fill="none" stroke="var(--blue)" stroke-width="1.5" points="0,24 15,14 30,18 45,12 60,10 75,15 90,8 100,11"/></svg></div></div>
     <div class="stat" style="border-left:4px solid var(--purple);cursor:pointer;" onclick="goToDetail('reports','sales')"><div class="stat-val stat-val-ic" style="color:var(--purple)"><span class="stat-ic">🧑‍🤝‍🧑</span><span id="d-op-avgspend">—</span></div><div class="stat-lbl">Avg Spend / Cover <span style="font-size:8.5px;color:var(--text3);">Per Cover Incl. GST</span></div><div class="stat-chg" id="d-avgspendchg">Revenue ÷ Covers</div></div>
     <div class="stat" style="border-left:4px solid #06b6d4;cursor:pointer;" onclick="goToDetail('reports','sales')"><div class="stat-val stat-val-ic" style="color:#06b6d4"><span class="stat-ic">🎯</span><span id="d-avgbill">—</span></div><div class="stat-lbl">Avg Bill Value <span style="font-size:8.5px;color:var(--text3);">Per Bill Incl. GST</span></div><div class="stat-chg" id="d-avgbillchg">Revenue ÷ Bills</div></div>
     <!-- NEW ("kpi card add Cash in Hand / UPI Collection / Card-Bank
@@ -3262,17 +2983,17 @@ document.addEventListener('DOMContentLoaded', function(){
   <div class="grid g4" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-bottom:14px;">
     <div class="card">
       <div class="card-header"><span class="card-title">💳 Payment Collection <span style="font-size:10px;color:var(--text3);font-weight:400;">(Today)</span></span></div>
-      <div class="agg-row"><span class="agg-row-lbl">Cash Collection</span><span class="agg-row-val" id="d-cash">—</span></div>
-      <div class="agg-row"><span class="agg-row-lbl">UPI Collection</span><span class="agg-row-val" id="d-upi">—</span></div>
-      <div class="agg-row"><span class="agg-row-lbl">Card / Bank Collection <span style="font-size:8.5px;color:var(--text3);">(combined)</span></span><span class="agg-row-val" id="d-bank">—</span></div>
-      <div class="agg-row"><span class="agg-row-lbl">Online Collection</span><span class="agg-row-val" id="d-pc-online">—</span></div>
-      <div class="agg-row"><span class="agg-row-lbl">Credit Sales (Today)</span><span class="agg-row-val" id="d-credit-sales">—</span></div>
-      <div class="agg-row" style="border-top:2px solid var(--border2);font-weight:700;margin-top:4px;padding-top:8px;"><span style="color:var(--purple)">TOTAL COLLECTION</span><span class="agg-row-val" style="color:var(--purple);font-size:14px;" id="d-pc-total">—</span></div>
+      <div class="agg-row"><span class="agg-row-lbl">Cash Collection</span><span class="agg-row-val" id="d-cash">₹8,750.00</span></div>
+      <div class="agg-row"><span class="agg-row-lbl">UPI Collection</span><span class="agg-row-val" id="d-upi">₹9,520.00</span></div>
+      <div class="agg-row"><span class="agg-row-lbl">Card / Bank Collection <span style="font-size:8.5px;color:var(--text3);">(combined)</span></span><span class="agg-row-val" id="d-bank">₹4,320.00</span></div>
+      <div class="agg-row"><span class="agg-row-lbl">Online Collection</span><span class="agg-row-val" id="d-pc-online">₹1,150.00</span></div>
+      <div class="agg-row"><span class="agg-row-lbl">Credit Sales (Today)</span><span class="agg-row-val" id="d-credit-sales">₹756.00</span></div>
+      <div class="agg-row" style="border-top:2px solid var(--border2);font-weight:700;margin-top:4px;padding-top:8px;"><span style="color:var(--purple)">TOTAL COLLECTION</span><span class="agg-row-val" style="color:var(--purple);font-size:14px;" id="d-pc-total">₹26,246.00</span></div>
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">🏦 Cash Position <span style="font-size:10px;color:var(--text3);font-weight:400;">(Today)</span></span></div>
       <div class="agg-row"><span class="agg-row-lbl">Opening Cash</span><span class="agg-row-val" id="d-cp-opening">—</span></div>
-      <div class="agg-row"><span class="agg-row-lbl">Cash Sales (Received)</span><span class="agg-row-val" id="d-cp-received">—</span></div>
+      <div class="agg-row"><span class="agg-row-lbl">Cash Sales (Received)</span><span class="agg-row-val" id="d-cp-received">₹8,750.00</span></div>
       <div class="agg-row"><span class="agg-row-lbl">Cash Due Received</span><span class="agg-row-val" id="d-cp-duercvd">—</span></div>
       <div class="agg-row" style="border-top:1px solid var(--border2);font-weight:700;"><span>TOTAL CASH INFLOW</span><span class="agg-row-val" id="d-cp-totalinflow">—</span></div>
       <div class="agg-row"><span class="agg-row-lbl">Expenses</span><span class="agg-row-val" id="d-cp-expenses">—</span></div>
@@ -3283,9 +3004,9 @@ document.addEventListener('DOMContentLoaded', function(){
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">📒 Receivables &amp; Credit <span style="font-size:10px;color:var(--text3);font-weight:400;">(Today)</span></span></div>
-      <div class="agg-row"><span class="agg-row-lbl">Total Outstanding</span><span class="agg-row-val" id="d-credit">—</span></div>
-      <div class="agg-row"><span class="agg-row-lbl">Today's Credit Sales</span><span class="agg-row-val" id="d-recv-creditsales">—</span></div>
-      <div class="agg-row"><span class="agg-row-lbl">Today's Due Received</span><span class="agg-row-val" id="d-due-rcvd">—</span></div>
+      <div class="agg-row"><span class="agg-row-lbl">Total Outstanding</span><span class="agg-row-val" id="d-credit">₹0.00</span></div>
+      <div class="agg-row"><span class="agg-row-lbl">Today's Credit Sales</span><span class="agg-row-val" id="d-recv-creditsales">₹9,200.00</span></div>
+      <div class="agg-row"><span class="agg-row-lbl">Today's Due Received</span><span class="agg-row-val" id="d-due-rcvd">₹0.00</span></div>
       <div class="agg-row" style="border-top:1px solid var(--border2);"><span style="color:var(--red);font-weight:700;">Overdue Amount</span><span class="agg-row-val" style="color:var(--red);font-weight:700;" id="d-recv-overdue">—</span></div>
       <div class="agg-row"><span class="agg-row-lbl">Credit Customers</span><span class="agg-row-val" id="d-recv-custcount">—</span></div>
       <div class="agg-row"><span class="agg-row-lbl">New Credit Customers <span title="Not tracked in CUSTOMER_MASTER yet" style="cursor:help;">ⓘ</span></span><span class="agg-row-val" id="d-recv-newcust">—</span></div>
@@ -3313,7 +3034,7 @@ document.addEventListener('DOMContentLoaded', function(){
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">🛵 Online Business <span style="font-size:10px;color:var(--text3);font-weight:400;">(Today)</span></span></div>
-      <div class="agg-row"><span class="agg-row-lbl">Online Gross Sales</span><span class="agg-row-val" id="d-online-rev">—</span></div>
+      <div class="agg-row"><span class="agg-row-lbl">Online Gross Sales</span><span class="agg-row-val" id="d-online-rev">₹18,450.00</span></div>
       <div class="agg-row" style="padding-left:14px;"><span class="agg-row-lbl">↳ Zomato Sales</span><span class="agg-row-val" id="d-ob-zomato">—</span></div>
       <div class="agg-row" style="padding-left:14px;"><span class="agg-row-lbl">↳ Swiggy Sales</span><span class="agg-row-val" id="d-ob-swiggy">—</span></div>
       <div class="agg-row"><span class="agg-row-lbl">Platform Commission</span><span class="agg-row-val" style="color:var(--red);" id="d-ob-commission">—</span></div>
@@ -3367,7 +3088,7 @@ document.addEventListener('DOMContentLoaded', function(){
          which isn't created in your live database yet (same gap
          flagged repeatedly elsewhere). Labeled honestly rather than
          left silently fixed at "18m" forever. -->
-    <div class="stat red" style="cursor:pointer;" onclick="goToDetail('reports','operations')"><div class="stat-val stat-val-ic"><span class="stat-ic">⏱️</span><span id="d-turn">—</span></div><div class="stat-lbl">Avg Table Turn <span class="pill p-gold" style="font-size:8.5px;">Demo</span></div><div class="stat-chg dn" id="d-turnchg">—</div><div class="spark"><svg viewBox="0 0 100 28"><polyline fill="none" stroke="var(--orange)" stroke-width="1.5" points="0,8 15,15 30,10 45,17 60,13 75,19 90,15 100,20"/></svg></div></div>
+    <div class="stat red" style="cursor:pointer;" onclick="goToDetail('reports','operations')"><div class="stat-val stat-val-ic"><span class="stat-ic">⏱️</span><span id="d-turn">18m</span></div><div class="stat-lbl">Avg Table Turn <span class="pill p-gold" style="font-size:8.5px;">Demo</span></div><div class="stat-chg dn" id="d-turnchg">↓ 3m slower than target</div><div class="spark"><svg viewBox="0 0 100 28"><polyline fill="none" stroke="var(--orange)" stroke-width="1.5" points="0,8 15,15 30,10 45,17 60,13 75,19 90,15 100,20"/></svg></div></div>
   </div>
 
   <!-- ═══ CONTROL ═══ (Discount | Cancelled | NC/Complimentary | Refund | Reconciliation Diff)
@@ -5706,7 +5427,7 @@ document.addEventListener('DOMContentLoaded', function(){
       <div class="stat gold"><div class="stat-icon i-gold">🪙</div><div class="stat-val" id="pettyBalanceStat">₹0</div><div class="stat-lbl">Petty Cash Balance</div></div>
       <div class="stat"><div class="stat-icon i-blue">📥</div><div class="stat-val">₹0</div><div class="stat-lbl">Imprest Received</div></div>
       <div class="stat red"><div class="stat-icon" style="background:var(--red-bg)">📤</div><div class="stat-val" style="color:var(--red)">₹0</div><div class="stat-lbl">Spent This Week</div></div>
-      <div class="stat"><div class="stat-icon i-green">🧾</div><div class="stat-val" id="pettyVoucherStat">0</div><div class="stat-lbl">Vouchers Logged</div></div>
+      <div class="stat"><div class="stat-icon i-green">🧾</div><div class="stat-val" id="pettyVoucherStat">6</div><div class="stat-lbl">Vouchers Logged</div></div>
     </div>
     <div class="card" id="rpt-anchor-petty-cash" style="margin-bottom:14px;">
       <div class="card-header"><span class="card-title">➕ New Petty Cash Entry</span></div>
@@ -5760,7 +5481,14 @@ document.addEventListener('DOMContentLoaded', function(){
     <div class="card">
       <div class="card-header"><span class="card-title">🪙 Petty Cash Register</span><div class="rpt-actions"><button class="btn btn-sm btn-ghost rpt-icon-btn" data-export-trigger title="Export" aria-label="Export" onclick="openExportFormatMenu(this,'petty-cash')">📥<span class="rpt-caret">▾</span></button><button class="btn btn-sm btn-ghost rpt-icon-btn" data-print-trigger title="Print" aria-label="Print" onclick="openPrintFormatMenu(this)">🖨<span class="rpt-caret">▾</span></button><span data-send-menu="sendMenu_petty"></span></div></div>
       <table class="tbl acct-coral-tbl"><thead><tr><th>Date</th><th>Voucher No</th><th>Type</th><th>Account</th><th>Amount</th><th>Balance</th><th>Narration</th><th>Created By</th></tr></thead>
-      <tbody id="pettyCashBody"><tr><td colspan="8" style="text-align:center;color:var(--text3);padding:18px;">Loading live Petty Cash ledger…</td></tr></tbody>
+      <tbody id="pettyCashBody">
+        <tr><td>01-Jul</td><td class="mono">PC/001</td><td>Receipt</td><td>Petty Cash Imprest</td><td class="mono" style="color:var(--green)">₹0</td><td class="mono">₹0</td><td>Being amount received towards imprest</td><td>Balaji</td></tr>
+        <tr><td>01-Jul</td><td class="mono">PC/002</td><td>Payment</td><td>Cleaning Supplies</td><td class="mono" style="color:var(--red)">−₹0</td><td class="mono">₹0</td><td>Being amount paid to Sanjit towards cleaning supplies</td><td>Balaji</td></tr>
+        <tr><td>02-Jul</td><td class="mono">PC/003</td><td>Payment</td><td>Stationery & Printing</td><td class="mono" style="color:var(--red)">−₹0</td><td class="mono">₹0</td><td>Being amount paid to Bapan towards stationery</td><td>Balaji</td></tr>
+        <tr><td>02-Jul</td><td class="mono">PC/004</td><td>Payment</td><td>Conveyance Expenses</td><td class="mono" style="color:var(--red)">−₹0</td><td class="mono">₹0</td><td>Being amount paid to Ravi towards local transport</td><td>Balaji</td></tr>
+        <tr><td>03-Jul</td><td class="mono">PC/005</td><td>Payment</td><td>Staff Welfare</td><td class="mono" style="color:var(--red)">−₹0</td><td class="mono">₹0</td><td>Being amount paid towards tea/snacks for staff</td><td>Balaji</td></tr>
+        <tr><td>03-Jul</td><td class="mono">PC/006</td><td>Payment</td><td>Repair & Maintenance</td><td class="mono" style="color:var(--red)">−₹0</td><td class="mono">₹0</td><td>Being amount paid to Vivek towards minor repair</td><td>Balaji</td></tr>
+      </tbody>
       <tfoot><tr style="font-weight:700;background:var(--surface2);"><td colspan="5">Current Balance</td><td class="mono" style="color:var(--gold)" id="pettyBalanceCell">₹0</td><td colspan="2"></td></tr></tfoot>
       </table>
       <!-- Category-wise + Day-wise breakdown — same reporting pattern as
@@ -5843,7 +5571,7 @@ document.addEventListener('DOMContentLoaded', function(){
       </div>
       <table class="tbl acct-coral-tbl"><thead><tr><th>Date</th><th>Description</th><th>Ref No</th><th>Credit</th><th>Debit</th><th>Balance</th></tr></thead>
       <tbody><tr><td colspan="6" style="text-align:center;color:var(--text3);padding:18px;">No live customer dues.</td></tr></tbody></table>
-      <div style="font-size:10.5px;color:var(--text3);padding:10px 4px 0;">💡 Import a real bank statement above. Imported transactions are stored for this client and used by the Reports Hub reconciliation engine.</div>
+      <div style="font-size:10.5px;color:var(--text3);padding:10px 4px 0;">💡 Import a real bank statement above and this replaces the demo rows — matched against POS/UPI/Card collections to reconcile in the Reports Hub.</div>
     </div>
   </div>
 
@@ -7372,9 +7100,9 @@ async function erpApi(payload, type='V2_AUTH'){
     if(typeof bnxCheckAuthFailure_==='function') bnxCheckAuthFailure_(data);
     return data;
   }catch(e){
-    if (!e || !e.circuitOpen) console.warn('[ERP API '+type+']', (e && (e.message || e.toString())) || 'unknown error');
-    if (!e || !e.circuitOpen) bnxShowApiTransportError_(e,type);
-    return {success:false,offline:true,error:e.message,statusCode:e.status||0,circuitOpen:!!(e&&e.circuitOpen)};
+    console.warn('[ERP API '+type+']',e.message);
+    bnxShowApiTransportError_(e,type);
+    return {success:false,offline:true,error:e.message,statusCode:e.status||0};
   }
 }
 
@@ -7672,10 +7400,7 @@ function showPage(id, el){
   // called that on load. resetReportsHub() already does exactly the
   // right init (resets filters/category state, then calls
   // renderReportsGallery() itself) — just never got wired here.
-  if(id==='reports'){
-    if (typeof resetReportsHub === 'function') resetReportsHub();
-    if (typeof rhInit === 'function') rhInit();
-  }
+  if(id==='reports'){ if (typeof resetReportsHub === 'function') resetReportsHub(); if (typeof rhInit === 'function') rhInit(); }
   if(id==='accounts-ledger'){ backToAcctGallery(); renderAcctGallery(); if (typeof bnxPullPettyCashFromServer === 'function') bnxPullPettyCashFromServer(); }
 }
 /* Pulls real bill history from the backend's already-wired LIST_BILLS
@@ -7685,10 +7410,7 @@ function showPage(id, el){
    yet synced back). Read defensively under a few plausible response
    shapes since listBills_'s exact return shape isn't visible from this
    frontend file alone. */
-let _bnxBillsSyncPromise=null;
 async function bnxPullBillsFromServer(){
-  if(_bnxBillsSyncPromise) return _bnxBillsSyncPromise;
-  _bnxBillsSyncPromise=(async()=>{
   try{
     const res = await gasApi('LIST_BILLS', { clientId: (typeof CLIENT_ID!=='undefined'?CLIENT_ID:undefined) });
     const serverBills = res && (res.bills || res.data || (Array.isArray(res) ? res : null));
@@ -7732,8 +7454,6 @@ async function bnxPullBillsFromServer(){
     });
     bnxSaveBillRegister(local);
   }catch(e){ console.warn('[bnxPullBillsFromServer] failed:', e.message); }
-  })().finally(()=>{_bnxBillsSyncPromise=null;});
-  return _bnxBillsSyncPromise;
 }
 function toggleSidebar(){
   if (window.innerWidth <= 768){
@@ -8437,24 +8157,9 @@ function bnxRenderLiveDashboardWidgets_(d){
     bnxRenderTodaysReservations_();
   } catch(e){ console.error('[bnxRenderLiveDashboardWidgets_] Error:', e.message); }
 }
-
-let _bnxDashSummaryPromise = null;
-let _bnxDashSummaryKey = '';
-
-function bnxGetDashboardSummaryShared_(rangeParams){
-  const key = String(CLIENT_ID||'') + '|' + JSON.stringify(rangeParams||{});
-  if (_bnxDashSummaryPromise && _bnxDashSummaryKey === key) return _bnxDashSummaryPromise;
-  _bnxDashSummaryKey = key;
-  _bnxDashSummaryPromise = erpApi(
-    Object.assign({action:'GET_DASHBOARD_SUMMARY'}, rangeParams||{}),
-    'V2_CORE'
-  ).finally(()=>{ setTimeout(()=>{ if(_bnxDashSummaryKey===key) _bnxDashSummaryPromise=null; }, 1000); });
-  return _bnxDashSummaryPromise;
-}
-
 async function loadRealDashboardData() {
   try {
-    if (!bnxCurrentClient_() || !bnxCurrentSession_()) return;
+    if (typeof CLIENT_ID === 'undefined' || !CLIENT_ID) return;
 
     // FIX ("this month click but data not show"): this call used to be
     // hardcoded to the client's default/"today" server-side range no
@@ -8478,9 +8183,7 @@ async function loadRealDashboardData() {
     // now computes and returns this same split for real, as
     // data.collectionsByMode — reading that here instead of inventing a
     // second endpoint or a second full dashboard fetch.
-    // HANG FIX: loadDashboard() already requests this exact summary. Reuse its
-    // in-flight/result promise instead of starting another network call.
-    const dashRes = await bnxGetDashboardSummaryShared_(rangeParams);
+    const dashRes = await gasApi('GET_DASHBOARD_SUMMARY', Object.assign({ clientId: CLIENT_ID }, rangeParams), 'V2_CORE');
 
     if (dashRes && dashRes.success && dashRes.data && dashRes.data.collectionsByMode) {
       const cm = dashRes.data.collectionsByMode;
@@ -8688,8 +8391,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 document.addEventListener('DOMContentLoaded', async ()=>{ await window.__bnxConfigReady; bnxResolveClientBrand(); });
-/* HANG FIX: dashboard is loaded by the single startup coordinator below;
-   do not fire a second identical GET_DASHBOARD_SUMMARY here. */
+document.addEventListener('DOMContentLoaded', async ()=>{ await window.__bnxConfigReady; if (typeof loadDashboard === 'function') loadDashboard(); });
 document.addEventListener('DOMContentLoaded', async ()=>{ await window.__bnxConfigReady; if (typeof bnxSyncKotBadge === 'function') bnxSyncKotBadge(); });
 document.addEventListener('DOMContentLoaded', async ()=>{
   await window.__bnxConfigReady;
@@ -8841,39 +8543,14 @@ async function checkDB(id, label, apiType){
   const el=document.getElementById(id); if(!el) return false;
   el.className='db-pill checking'; el.innerHTML=`<span class="db-dot pulse"></span>${label}…`;
   try{
-    const action = apiType==='V2_AUTH' ? 'PING' : 'GET_CLIENT_DATABASE_STATUS';
-    const data = await gasApi(action, {}, apiType);
-    if(data && data.success){
-      el.className='db-pill online';
-      el.innerHTML=`<span class="db-dot"></span>${label} ✓`;
-      return true;
-    }
+    const ctrl=new AbortController();
+    const to=setTimeout(()=>ctrl.abort(),7000);
+    const res=await fetch(bnxApiUrl_(apiType)+'?action=PING',{signal:ctrl.signal});
+    clearTimeout(to);
+    if(res.ok){ el.className='db-pill online'; el.innerHTML=`<span class="db-dot"></span>${label} ✓`; return true; }
   }catch(e){}
-  el.className='db-pill offline'; el.innerHTML=`<span class="db-dot"></span>${label} ✗`;
-  return false;
+  el.className='db-pill offline'; el.innerHTML=`<span class="db-dot"></span>${label} ✗`; return false;
 }
-async function bnxLoad3DbStatusOnce(){
-  try{
-    const cid = bnxCurrentClient_();
-    const token = bnxCurrentSession_();
-    if(!cid || !token) return;
-    const res = await gasApi('GET_CLIENT_DATABASE_STATUS', {}, 'V2_CORE');
-    if(res && res.success && res.databases){
-      window.__BNX_3DB_STATUS = res;
-      const db=res.databases||{};
-      const name=k=>((db[k]||{}).spreadsheetName||'connected');
-      console.log('[3DB] Client '+cid+' database routing ready:',
-        'MASTER='+name('MASTER'),
-        'TRANSACTION='+name('TRANSACTION'),
-        'REPORT='+name('REPORT'));
-    }else{
-      console.error('[3DB] Client database routing failed:', res && res.error);
-    }
-  }catch(e){
-    console.error('[3DB] status check failed:', e.message);
-  }
-}
-
 async function checkAllDBs(verbose=false){
   document.getElementById('dbSync').textContent='Checking…';
   await Promise.allSettled([
@@ -8883,7 +8560,6 @@ async function checkAllDBs(verbose=false){
   ]);
   const t=new Date().toLocaleTimeString('en-IN');
   document.getElementById('dbSync').textContent='Last checked: '+t;
-  bnxLoad3DbStatusOnce();
   // Update settings panel status
   const makeS=(id)=>{
     const el=document.getElementById(id);
@@ -9310,9 +8986,8 @@ function bnxRenderDashAlerts_(){
 
 async function loadDashboard(){
   try{
-    bnxResetApiCircuit_('V2_CORE');
     const rangeParams = bnxDashRangeParams_();
-    const r=await bnxGetDashboardSummaryShared_(rangeParams);
+    const r=await erpApi(Object.assign({action:'GET_DASHBOARD_SUMMARY'}, rangeParams),'V2_CORE');
     if(r&&r.success&&r.data){
       const d=r.data;
       /* FIX ("restaurant dashboard sales and manager dashboard sales both
@@ -11657,7 +11332,7 @@ function bnxRecordKOT(table, type, waiter, covers, items, orderNo, orderSyncItem
   // to): orderNo was already known here and sent to the server below, but
   // never saved onto the LOCAL entry, so the Pending KOTs list had no way
   // to display it. Stored now so it can be shown alongside the KOT number.
-  const entry = { kotNo, table, type, time: new Date().toISOString(), waiter:waiter||'', covers:covers||'', items:items||[], status:'NEW', orderNo: orderNo||'', localOnly:true };
+  const entry = { kotNo, table, type, time: new Date().toISOString(), waiter:waiter||'', covers:covers||'', items:items||[], status:'NEW', orderNo: orderNo||'' };
   open.unshift(entry);
   if (open.length>100) open = open.slice(0,100);
   bnxSetOpenKotsRaw(JSON.stringify(open));
@@ -12478,32 +12153,30 @@ function bnxGetKotStore(){
 async function bnxPullKotsFromServer(){
   if (typeof gasApi !== 'function' || !CLIENT_ID) return false;
   try{
-    const res = await gasApi('GET_KOT', { includeClosed:false }, 'V2_CORE');
-    if(!res || !res.success || !Array.isArray(res.data)) return false;
-    const rows = res.data;
-    let local=[]; try{ local=JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
+    const res = await gasApi('GET_KOT', {}, 'V2_CORE');
+    const rows = res && res.success && Array.isArray(res.data) ? res.data : [];
+    if (!rows.length) return false;
+    let open=[]; try{ open=JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
     const map={PRINTED:'NEW',NEW:'NEW',PENDING:'NEW',COOKING:'PROGRESS',PREPARING:'PROGRESS',IN_PROGRESS:'PROGRESS',PROGRESS:'PROGRESS',READY:'READY',SERVED:'SERVED'};
-    const server=[];
-    const seen=new Set();
     rows.forEach(k=>{
-      const no=String(k.KOT_NUMBER||'').trim(); if(!no || seen.has(no)) return;
-      seen.add(no);
-      server.push({
-        kotNo:no, table:k.TABLE_ID||'—', type:no.startsWith('BAR-')?'BAR':no.startsWith('CTR-')?'COUNTER':'KITCHEN',
-        waiter:k.STARTED_BY||'', covers:k.COVERS||'', time:k.STARTED_AT||((k.KOT_DATE||'')+'T'+(k.KOT_TIME||'00:00:00')),
+      const no=String(k.KOT_NUMBER||'').trim(); if(!no) return;
+      const rec={
+        kotNo:no, table:k.TABLE_ID||'—',
+        type:no.startsWith('BAR-')?'BAR':no.startsWith('CTR-')?'COUNTER':'KITCHEN',
+        waiter:k.STARTED_BY||'', covers:k.COVERS||'',
+        time:k.STARTED_AT||((k.KOT_DATE||'')+'T'+(k.KOT_TIME||'00:00:00')),
         orderNo:k.ORDER_ID||'', items:(k.items||k.itemsDetail||[]).map(i=>({name:i.name||i.itemName||'',qty:Number(i.qty||0),rate:Number(i.rate||0)})),
         status:map[String(k.KOT_STATUS||'PRINTED').toUpperCase()]||'NEW', serverKotId:k.KOT_ID||''
-      });
+      };
+      const ix=open.findIndex(x=>x.kotNo===no);
+      if(ix>=0) open[ix]=Object.assign({},open[ix],rec); else open.unshift(rec);
     });
-    // Server is authoritative. Keep only genuinely unsynced local tickets;
-    // this removes stale/demo/duplicate KOTs when the database has one real KOT.
-    const unsynced=local.filter(k=>!k.serverKotId && k.syncPending===true);
-    const open=server.concat(unsynced).slice(0,100);
+    open=open.filter(k=>!['SERVED','CANCELLED','BILLED'].includes(String(k.status||'').toUpperCase()));
+    if(open.length>100) open=open.slice(0,100);
     bnxSetOpenKotsRaw(JSON.stringify(open));
     return true;
   }catch(e){ console.warn('[bnxPullKotsFromServer] failed:',e.message); return false; }
 }
-
 async function bnxSyncLiveKots(){
   if (typeof erpApi !== 'function' || !CLIENT_ID) return;
   // PASS #50 FIX (companion to the steward app's own loadKOTFromServer
@@ -12553,9 +12226,8 @@ async function bnxSyncLiveKots(){
   });
   if (open.length>100) open = open.slice(0,100);
   bnxSetOpenKotsRaw(JSON.stringify(open));
-
 }
-function nxKotElapsedMin(iso){
+function bnxKotElapsedMin(iso){
   return Math.max(0, Math.round((Date.now() - new Date(iso).getTime())/60000));
 }
 /* FIX ("kot not hid" / "best level fix"): the sidebar KOT badge and the
@@ -12725,7 +12397,7 @@ function buildKOT(){
    until they clicked something. Now it quietly re-checks the store
    every 12s while this page is the one on screen, so new/aging tickets
    show up and the "Delayed" bucket updates on their own. */
-setInterval(()=>{ if (document.getElementById('page-kot')?.classList.contains('active')) buildKOT(); }, 20000);
+setInterval(()=>{ if (document.getElementById('page-kot')?.classList.contains('active')) buildKOT(); }, 12000);
 /* Periodically pull live orders (steward app, other terminals) into the
    local KOT store — see bnxSyncLiveKots() comment above — then refresh
    whichever KOT view is currently visible. */
@@ -12735,7 +12407,7 @@ setInterval(()=>{
     if (document.getElementById('page-kot')?.classList.contains('active') && typeof buildKOT==='function') buildKOT();
     if (document.getElementById('page-dashboard')?.classList.contains('active') && typeof buildDashKotList==='function') buildDashKotList();
   });
-}, 30000);
+}, 20000);
 /* FIX ("dashboard till show wrong data not live"): the KOT list above
    already refreshed itself every 20s, but the actual dashboard numbers —
    Today's Revenue/Orders/Covers, the Active Orders table, the hourly
@@ -12748,14 +12420,8 @@ setInterval(()=>{
    loadDashboard() used everywhere else, so it goes through the exact same
    real-data-or-honest-empty-state logic fixed above, never fake numbers. */
 setInterval(()=>{
-  if (document.getElementById('page-dashboard')?.classList.contains('active') &&
-      typeof loadDashboard==='function' &&
-      !bnxApiCircuitOpen_('V2_CORE') &&
-      !window.__bnxDashboardPollBusy) {
-    window.__bnxDashboardPollBusy = true;
-    Promise.resolve(loadDashboard()).finally(()=>{ window.__bnxDashboardPollBusy=false; });
-  }
-}, 60000);
+  if (document.getElementById('page-dashboard')?.classList.contains('active') && typeof loadDashboard==='function') loadDashboard();
+}, 45000);
 /* Marks a ticket Ready and persists it — refreshing the page or
    coming back to this tab won't lose the update (previously the
    Ready button only changed its own label in memory and forgot
@@ -13054,7 +12720,7 @@ function kdsReject(kotNo){
   buildKDS();
   bnxGuaranteedSync('UPDATE_ORDER_STATUS', {orderId:kotNo, status:'CANCELLED', remarks:reason});
 }
-setInterval(()=>{ if (document.getElementById('page-kitchen')?.classList.contains('active')) buildKDS(); }, 20000);
+setInterval(()=>{ if (document.getElementById('page-kitchen')?.classList.contains('active')) buildKDS(); }, 12000);
 
 /* ── BILLING ── */
 function selBillPay(btn){ document.querySelectorAll('.bill-preview .pay-opt').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); }
@@ -17766,10 +17432,7 @@ function downloadTableAsXls(table, title, filePrefix){
     <x:Name>${esc(title).slice(0,30)}</x:Name><x:WorksheetOptions><x:DisplayGridlines/></x:WorksheetOptions>
     </x:ExcelWorksheet></x:ExcelWorksheets></x:ExcelWorkbook></xml><![endif]--></head>
     <body><table style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;">
-    ${metaBand}${banner}${htmlRows}</table>
-
-
-</body></html>`;
+    ${metaBand}${banner}${htmlRows}</table></body></html>`;
   const blob = new Blob(['\ufeff'+html], { type: 'application/vnd.ms-excel' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -18852,14 +18515,10 @@ async function loadDsrMatrix(){
     }
   } catch(e){ /* fall through to demo below */ }
   if (!usedLiveData){
-    for (let d = 1; d <= daysInMonth; d++) dayData[d] = null;
+    for (let d = 1; d <= daysInMonth; d++) dayData[d] = dsrDemoDayData(d, daysInMonth);
   }
   bnxSetReportBadge('dsrDataBadge', usedLiveData);
 
-  if (!usedLiveData){
-    const tb=document.getElementById('dsrTableBody');
-    if(tb) tb.innerHTML='<tr><td colspan="30" style="text-align:center;padding:20px;color:var(--gold);">🟡 Demo data — backend not connected yet. No DSR values are fabricated.</td></tr>';
-  }
   // MTD totals = sum of every day that has data
   const mtd = {};
   DSR_ROWS.forEach(r=>{ mtd[r.key] = 0; });
@@ -19156,7 +18815,12 @@ async function cbLoadDaily(){
   let bal = opening;
   const rows = live
     ? [{ p: dd.out ? 'Cash Paid Out (real)' : 'Cash Collected (real)', rec: dd.in, pay: dd.out }].filter(it=>it.rec>0||it.pay>0)
-    : [];
+    : [
+        { p:'Cash Sales — Dine-in', rec: Math.round(dd.in*0.55), pay:0 },
+        { p:'Cash Sales — Parcel/Takeaway', rec: Math.round(dd.in*0.45), pay:0 },
+        { p:'Vegetable / Daily Purchase', rec:0, pay: Math.round(dd.out*0.6) },
+        { p:'Staff Petty Expense', rec:0, pay: Math.round(dd.out*0.4) },
+      ].filter(it => it.rec>0 || it.pay>0);
   const rowsHtml = rows.map(it=>{
     bal += it.rec - it.pay;
     return `<tr><td class="mono">${dateStr}</td><td>${it.p}</td>`+
@@ -19164,11 +18828,10 @@ async function cbLoadDaily(){
       `<td class="mono" style="color:var(--red)">${it.pay?('₹'+it.pay.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})):'—'}</td>`+
       `<td class="mono">₹${bal.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td></tr>`;
   }).join('');
-  document.getElementById('cbDailyBody').innerHTML = live
-    ? (`<tr><td>Opening</td><td>Opening Cash Balance (not tracked — starts at ₹0)</td><td class="mono" style="color:var(--green)">₹${opening.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td><td>—</td><td class="mono">₹${opening.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td></tr>`
-      + rowsHtml +
-      `<tr class="rpt-total-row"><td colspan="3">Closing Balance</td><td>—</td><td class="mono" style="color:var(--gold)">₹${bal.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td></tr>`)
-    : '<tr><td colspan="5" style="text-align:center;color:var(--gold);padding:20px;">🟡 Demo data — backend not connected yet. No cash-book values are fabricated.</td></tr>';
+  document.getElementById('cbDailyBody').innerHTML =
+    `<tr><td>Opening</td><td>Opening Cash Balance${live?' (not tracked yet — starts at ₹0)':''}</td><td class="mono" style="color:var(--green)">₹${opening.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td><td>—</td><td class="mono">₹${opening.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td></tr>`
+    + rowsHtml +
+    `<tr class="rpt-total-row"><td colspan="3">Closing Balance</td><td>—</td><td class="mono" style="color:var(--gold)">₹${bal.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td></tr>`;
 }
 async function cbLoadMTD(){
   const picker = document.getElementById('cbMonthPicker');
@@ -19202,7 +18865,7 @@ async function cbLoadMTD(){
      source exists yet (not in DAILY_COLLECTION, not anywhere) -- starts
      at 0 for a live month rather than a fabricated one; only the demo
      fallback path keeps the demo baseline, since it's demo data anyway. */
-  let running = 0;
+  let running = liveByDate ? 0 : CB_OPENING_BALANCE;
 
   let html = '<thead><tr><th style="position:sticky;left:0;background:var(--rpt-coral-solid);color:#fff;z-index:2;min-width:150px;text-align:left;padding:6px 8px;">Category</th>';
   html += `<th style="min-width:80px;padding:6px 8px;background:var(--rpt-coral-solid);color:#fff;">MTD Total</th>`;
@@ -19215,7 +18878,7 @@ async function cbLoadMTD(){
   const inRow=[], outRow=[], balRow=[];
   for (let d=1; d<=daysInMonth; d++){
     const dateKey = year+'-'+String(month).padStart(2,'0')+'-'+String(d).padStart(2,'0');
-    const dd = liveByDate ? (liveByDate[dateKey] ? {in:Number(liveByDate[dateKey].cashIn)||0, out:Number(liveByDate[dateKey].cashOut)||0} : {in:0,out:0})
+    const dd = liveByDate ? (liveByDate[dateKey] ? {in:liveByDate[dateKey].cashIn, out:liveByDate[dateKey].cashOut} : {in:0,out:0})
                           : { in:0, out:0 };
     running += dd.in - dd.out;
     totalIn += dd.in; totalOut += dd.out;
@@ -19229,7 +18892,7 @@ async function cbLoadMTD(){
   html += `<tr style="background:var(--gold-bg);font-weight:800;"><td style="position:sticky;left:0;background:var(--gold-bg);z-index:1;padding:5px 8px;">Closing Balance</td><td style="padding:5px 6px;text-align:right;">${running.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>`
     + balRow.map(v=>`<td style="padding:5px 4px;text-align:right;font-size:12px;">${v.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>`).join('') + '</tr>';
   html += '</tbody>';
-  document.getElementById('cbMtdTable').innerHTML = liveByDate ? html : '<tbody><tr><td style="padding:20px;text-align:center;color:var(--gold);">🟡 Demo data — backend not connected yet. No MTD cash values are fabricated.</td></tr></tbody>';
+  document.getElementById('cbMtdTable').innerHTML = html;
 }
 /* PASS #22 FIX ("all live data ... give real data"): cbLoadYTD() always
    called cbDemoDayData() for every single day of the fiscal year --
@@ -19303,7 +18966,7 @@ async function cbLoadYTD(){
   html += `<tr style="background:var(--gold-bg);font-weight:800;"><td style="position:sticky;left:0;background:var(--gold-bg);z-index:1;padding:5px 8px;">Closing Balance</td><td style="padding:5px 6px;text-align:right;">${running.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>`
     + balRow.map(v=>`<td style="padding:5px 6px;text-align:right;font-size:11px;">${v.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>`).join('') + '</tr>';
   html += '</tbody>';
-  document.getElementById('cbYtdTable').innerHTML = anyLive ? html : '<tbody><tr><td style="padding:20px;text-align:center;color:var(--gold);">🟡 Demo data — backend not connected yet. No YTD cash values are fabricated.</td></tr></tbody>';
+  document.getElementById('cbYtdTable').innerHTML = html;
 }
 document.addEventListener('DOMContentLoaded', function(){
   const cbd = document.getElementById('cbDatePicker');
@@ -20464,7 +20127,6 @@ async function bnxPullPettyCashFromServer(){
     const rows = Array.isArray(res.data.rows) ? res.data.rows : [];
     body.innerHTML = ''; // clear the hardcoded demo row (and any prior render) — real data or an honest empty state, never a stale demo row left standing
     let voucherCount = 0;
-    if (!rows.length) body.innerHTML='<tr><td colspan="8" style="text-align:center;color:var(--text3);padding:18px;">No Petty Cash vouchers recorded for this client.</td></tr>';
     rows.forEach(row => {
       voucherCount++;
       const amt = Number(row.AMOUNT) || 0;
@@ -20941,17 +20603,6 @@ function bnxMarkAllDemoReports(){
 document.addEventListener('DOMContentLoaded', bnxMarkAllDemoReports);
 document.addEventListener('DOMContentLoaded', rptInitHub);
 
-/* REPORT DATA HYGIENE — clear hardcoded report samples before live renderers run.
-   Real BILL_MASTER/BILL_ITEMS/PAYMENT_MASTER data always replaces these nodes. */
-function bnxClearStaticReportSamples_(){
-  const clearBody=(id,colspan)=>{ const e=document.getElementById(id); if(e) e.innerHTML=`<tr><td colspan="${colspan}" style="text-align:center;padding:18px;color:var(--text3);">Loading live report data…</td></tr>`; };
-  const day=document.querySelector('#rpt-anchor-day-book tbody');
-  if(day && /BN\/6401|BN\/6402|BN\/6403|BN\/6404|BN\/6405/.test(day.textContent)) day.innerHTML='<tr><td colspan="5" style="text-align:center;padding:18px;color:var(--text3);">Loading live report data…</td></tr>';
-  const tax=document.querySelector('#rpt-anchor-tax-summary tbody');
-  if(tax && /Food|Bar-Liquor|Delivery/.test(tax.textContent)) tax.innerHTML='<tr><td colspan="20" style="text-align:center;padding:18px;color:var(--text3);">Loading live report data…</td></tr>';
-}
-document.addEventListener('DOMContentLoaded', bnxClearStaticReportSamples_);
-
 function rptGetVisibleCard(){
   return rptActiveAnchor ? rptFindCard(rptActiveAnchor) : null;
 }
@@ -20974,19 +20625,14 @@ function rptGetVisibleCard(){
    pulls fresh bills from the server, same as Bills List, then
    re-renders whatever's currently on screen (gallery or an open
    report) instead of silently doing nothing. */
-let _rhInitPromise=null;
 async function rhInit(){
-  if(_rhInitPromise) return _rhInitPromise;
-  _rhInitPromise=(async()=>{
-    if (typeof rptInitHub === 'function' && !window.__BNX_RPT_HUB_INIT__) { window.__BNX_RPT_HUB_INIT__=true; rptInitHub(); }
-    try{
-      await Promise.all([bnxPullBillsFromServer(), bnxPullKotsFromServer()]);
-    }catch(e){ console.warn('[rhInit] server data sync failed:', e.message); }
-    if (typeof rptPopulateFilterSelects === 'function') rptPopulateFilterSelects();
-    if (rptActiveAnchor) rptRenderOne(rptActiveAnchor, false);
-    else if (typeof renderReportsGallery === 'function') renderReportsGallery();
-  })().finally(()=>{_rhInitPromise=null;});
-  return _rhInitPromise;
+  if (typeof rptInitHub === 'function') rptInitHub();
+  try{
+    await Promise.all([bnxPullBillsFromServer(), bnxPullKotsFromServer()]);
+  }catch(e){ console.warn('[rhInit] server data sync failed:', e.message); }
+  if (typeof rptPopulateFilterSelects === 'function') rptPopulateFilterSelects();
+  if (rptActiveAnchor) rptRenderOne(rptActiveAnchor, false);
+  else if (typeof renderReportsGallery === 'function') renderReportsGallery();
 }
 /* Same server pull, but for the "↻ Load Report" button specifically —
    the one moment a person is explicitly asking for the freshest
@@ -22371,10 +22017,7 @@ function _buildReportExcelBlob_(table, title){
     <x:Name>${esc(title).slice(0,30)}</x:Name><x:WorksheetOptions><x:DisplayGridlines/></x:WorksheetOptions>
     </x:ExcelWorksheet></x:ExcelWorksheets></x:ExcelWorkbook></xml><![endif]--></head>
     <body><table style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;">
-    ${metaBand}${banner}${htmlRows}</table>
-
-
-</body></html>`;
+    ${metaBand}${banner}${htmlRows}</table></body></html>`;
   return new Blob(['\ufeff'+html], { type: 'application/vnd.ms-excel' });
 }
 /* Was plain gold-header CSV-as-xls. Now shares buildRptHtml() so every one
@@ -22680,7 +22323,7 @@ async function loadClientBadge(){
   const dot = document.getElementById('clientBadgeDot');
   const text = document.getElementById('clientBadgeText');
   if (!dot || !text) return;
-  const cid = bnxCurrentClient_();
+  const cid = String(typeof CLIENT_ID !== 'undefined' ? CLIENT_ID : '').trim();
   if (!cid){
     dot.style.background='var(--red)';
     text.textContent='No client session';
@@ -22808,8 +22451,25 @@ async function bnxFetchStaffList(roles){
   }
   return staff;
 }
-/* Legacy duplicate loadWaiterList removed. The authoritative USER_MASTER loader is defined later as window.loadWaiterList. */
-
+async function loadWaiterList(){
+  const selBm = document.getElementById('bm-bf-waiter');
+  const selPos = document.getElementById('waiterSel');
+  // Never leave a permanent spinner/Loading waiters state.
+  if (selBm) selBm.innerHTML='<option value="">Loading staff…</option>';
+  if (selPos) selPos.innerHTML='<option value="">Loading staff…</option>';
+  const staff = await bnxFetchStaffList(['STEWARD','WAITER','CAPTAIN']);
+  const clean = staff.filter(s=>s && (s.FULL_NAME||s.NAME||s.USER_CODE||s.USER_ID));
+  const optsHtml = clean.map(s=>{
+    const code=s.USER_CODE||s.USER_ID||s.FULL_NAME||s.NAME;
+    const name=s.FULL_NAME||s.NAME||code;
+    const role=s.ROLE||s.USER_ROLE||'';
+    return `<option value="${String(code).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}">${String(name).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}${role?' ('+String(role).replace(/[<>]/g,'')+')':''}</option>`;
+  }).join('');
+  const addOpt = '<option value="__add_new__">+ Add New Steward…</option>';
+  const emptyLabel = 'No live staff found — use "+ Add New Steward…"';
+  if (selBm) selBm.innerHTML = '<option value="">' + (clean.length ? 'Select Steward...' : emptyLabel) + '</option>' + optsHtml + addOpt;
+  if (selPos) selPos.innerHTML = (clean.length ? '<option value="">Select Steward...</option>' : `<option value="" disabled selected>${emptyLabel}</option>`) + optsHtml + addOpt;
+}
 /* Handles the "+ Add New Steward…" option appearing in either
    dropdown — opens a tiny prompt, saves into the Employee
    Master, and reloads both dropdowns with the real name
@@ -22884,22 +22544,7 @@ async function addStewardDlg(onSaved){
   if (typeof showNotif === 'function') showNotif(savedReal ? ('✅ '+name.trim()+' added to real staff database') : ('⚠️ '+name.trim()+' saved locally only — backend unreachable, will not sync yet'), savedReal?'success':'error');
   if (typeof onSaved === 'function') onSaved(name.trim(), code);
 }
-/* FIX ("Uncaught ReferenceError: loadWaiterList is not defined"): this used
-   to pass the bare identifier `loadWaiterList` directly to addEventListener.
-   That identifier is evaluated immediately, right here, at this exact line —
-   but window.loadWaiterList isn't assigned until much later in this same
-   script (search "window.loadWaiterList ="), so at the moment this line
-   ran, loadWaiterList didn't exist yet and this threw an uncaught
-   ReferenceError. Because this was a top-level statement, that error
-   silently aborted every remaining synchronous line left in this script
-   tag — including the assignment that would have defined loadWaiterList,
-   and everything queued after it. Wrapping the reference in a function
-   defers the lookup until DOMContentLoaded actually fires, by which time
-   the rest of the script (including the real assignment) has finished
-   running. */
-document.addEventListener('DOMContentLoaded', function(){
-  if (typeof loadWaiterList === 'function') loadWaiterList();
-});
+document.addEventListener('DOMContentLoaded', loadWaiterList);
 
 /* PASS #20 NEW ("Today's Staff Schedule wrong show"): see the fix note
    on that card's markup above for the full root-cause writeup. Same
@@ -23560,21 +23205,7 @@ const ORDER_REG_STATUS_COLORS = {
    Fixed below: orders now carry both ORDER_SOURCE and ORDER_TYPE,
    filters operate on ORDER_SOURCE (matches 18_CAPTAIN_ORDER_MASTER),
    and ORDER_TYPE is shown as a secondary badge. */
-/* FIX ("ReferenceError: orderRegData is not defined" inside
-   bnxComputeDashExtras_ and other early dashboard code): this was `let
-   orderRegData = []`. Several places earlier in the file (e.g.
-   bnxComputeDashExtras_ at the dashboard-extras section) defensively guard
-   access with `typeof orderRegData !== 'undefined'` — the normal safe
-   idiom for "this global might not exist yet". That guard only works for
-   variables that were never declared, or declared with var (hoisted with
-   an immediate usable value). `let` is hoisted too, but left in the
-   temporal dead zone until this exact line executes — so even a `typeof`
-   check on it still throws if anything reads it before we get here,
-   which real dashboard-load timing does. Switching to `var` gives it an
-   immediately-usable value (undefined until this line runs, then []),
-   so every existing typeof guard elsewhere in the file now behaves the
-   way it was written to behave. */
-var orderRegData = [];
+let orderRegData = [];
 let orderRegFilterType = null;
 let ncTargetOrderId = null;
 const ORDER_SOURCE_LIST = ['POS','STEWARD','CUSTOMER','ONLINE'];
@@ -23599,54 +23230,45 @@ function orderRegDemoData(){
 const ORDER_REG_SCHEMA_DEFAULTS = { ORDER_DATE:'—', INVOICE_NO:'', TEMP_ORDER_ID:'—', SCAN_KEY:'', END_TIME:'', MOBILE_NO:'—', NOTES:'', CREATED_BY:'—' };
 
 async function loadOrderRegister(){
-  document.getElementById('orderRegList').innerHTML = '<div style="text-align:center;padding:30px;color:var(--text3);">Loading…</div>';
-  // FIX (same bug class as the dashboard's Active Orders/Hourly Chart):
-  // this used to treat "API call succeeded but there are genuinely zero
-  // orders right now" the SAME as "the API call failed" — both fell
-  // through to the fake demo rows below. A restaurant with a completely
-  // real, working connection but no orders yet today would still see 3
-  // fabricated orders (Suman/Amit/General Customer) as if they were real.
-  // Now only falls back to demo data when the call itself actually fails
-  // (network/backend error) — a successful call with 0 real orders shows
-  // a true, honest empty list instead.
-  try{
-    const res = await erpApi({action:'GET_ACTIVE_ORDERS', orderSource: orderRegFilterType||undefined}, 'V2_CORE');
-    if (res && res.success){
-      const orders = (res.data && res.data.orders) || [];
-      orderRegData = orders.map(o=>({...ORDER_REG_SCHEMA_DEFAULTS, ...o, ORDER_SOURCE:o.ORDER_SOURCE||o.ORDER_TYPE||'POS', ORDER_TYPE:ORDER_TYPE_LIST.includes(o.ORDER_TYPE)?o.ORDER_TYPE:'DINEIN'}));
-    } else {
-      throw new Error(res&&res.message||'API call failed');
-    }
-  } catch(e){
-    // P0 FIX (external audit #2 — "Remove/replace hardcoded demo
-    // transaction data" / "no hardcoded customer/order/bill figures in
-    // LIVE mode"): the fallback itself is reasonable (better than a
-    // blank error screen when the backend is briefly unreachable), but
-    // it used to render silently — nothing distinguished "3 real
-    // orders" from "3 fake orders because the API call failed". A
-    // manager glancing at this screen during an outage could easily
-    // read Suman/Amit/General Customer as real covers. Now flagged
-    // both in the data (isDemo:true, checked by renderOrderRegList
-    // below) and with a visible warning notification every time it
-    // fires.
-    orderRegData = orderRegDemoData().map(o=>Object.assign({isDemo:true}, o));
-    if (orderRegFilterType) orderRegData = orderRegData.filter(o=>o.ORDER_SOURCE===orderRegFilterType);
-    if (typeof showNotif === 'function') showNotif('⚠️ Server unreachable — showing DEMO order data, not real orders', 'error');
+  const el = document.getElementById('orderRegList');
+  if (!el) return;
+  el.innerHTML = '<div style=\"text-align:center;padding:30px;color:var(--text3);\">Loading live orders…</div>';
+  if (!CLIENT_ID){
+    orderRegData = [];
+    renderOrderRegFilters();
+    el.innerHTML = '<div style=\"text-align:center;padding:40px;color:var(--red,#dc2626);font-weight:700;\">⚠️ No client session found — please open the hosted ERP page and log in again.</div>';
+    return;
   }
-  // FIX ("update order regiter... kot update"): whatever just came back
-  // (live API or demo fallback) reflects the backend/sample state at
-  // the moment it was fetched — it doesn't know about a table this
-  // device already billed a moment ago (bnxMarkTableOrdersBilled, see
-  // bmSaveBill). Layer that local knowledge on top here so a freshly
-  // billed table always shows BILLED with its real invoice number,
-  // never a stale NEW/KOT_PRINTED/READY, regardless of source.
+  try{
+    // Order Register is an ALL-orders register, so do NOT use GET_ACTIVE_ORDERS:
+    // that endpoint deliberately excludes BILLED/CANCELLED rows. GET_ORDERS is
+    // the authoritative client-routed ORDER_MASTER reader and now returns
+    // enriched items/customer fields for this page.
+    const payload = {action:'GET_ORDERS'};
+    if (orderRegFilterType) payload.ORDER_SOURCE = orderRegFilterType;
+    const res = await erpApi(payload, 'V2_CORE');
+    if (!res || !res.success) throw new Error(res && (res.error||res.message) || 'Order Register API failed');
+    let orders = Array.isArray(res.orders) ? res.orders : (res.data && Array.isArray(res.data.orders) ? res.data.orders : (Array.isArray(res.data) ? res.data : []));
+    orderRegData = orders.map(o=>({
+      ...ORDER_REG_SCHEMA_DEFAULTS, ...o,
+      ORDER_ID:o.ORDER_ID||o.id||'',
+      ORDER_NO:o.ORDER_NO||o.ORDER_NUMBER||'',
+      ORDER_SOURCE:o.ORDER_SOURCE||'POS',
+      ORDER_TYPE:ORDER_TYPE_LIST.includes(o.ORDER_TYPE)?o.ORDER_TYPE:'DINEIN',
+      ORDER_STATUS:o.ORDER_STATUS||'NEW',
+      items:Array.isArray(o.items)?o.items:[]
+    }));
+  }catch(e){
+    console.error('[Order Register] live load failed',e);
+    orderRegData = [];
+    if (typeof showNotif==='function') showNotif('⚠️ Order Register could not load live data: '+(e.message||e), 'error');
+  }
   if (typeof bnxGetOrderOverrides === 'function'){
     const overrides = bnxGetOrderOverrides();
     orderRegData.forEach(o=>{
       const ov = overrides[(o.TABLE_ID||'').toString().trim().toUpperCase()];
       if (ov && o.ORDER_STATUS!=='CANCELLED' && o.ORDER_STATUS!=='BILLED'){
-        o.ORDER_STATUS = ov.status;
-        if (ov.invoiceNo) o.INVOICE_NO = ov.invoiceNo;
+        o.ORDER_STATUS=ov.status; if(ov.invoiceNo) o.INVOICE_NO=ov.invoiceNo;
       }
     });
   }
@@ -23670,7 +23292,7 @@ function setOrderRegView(mode){
   renderOrderRegList();
 }
 function orderRegCardHtml(o){
-  const total = (o.items||[]).reduce((s,i)=>s+Number(i.amount||i.qty*i.rate||0),0);
+  const total = orderRegAmount(o);
   const color = ORDER_REG_STATUS_COLORS[o.ORDER_STATUS] || '#6b7280';
   // FIX ("show if steward order given"): CREATED_BY (the steward/waiter
   // who took the order) was tracked in the data and shown in Excel view,
@@ -23687,7 +23309,7 @@ function orderRegCardHtml(o){
         <div style="margin-top:4px;">${stewardBadge}</div>
       </div>
       <div style="text-align:right;">
-        <div style="font-family:monospace;font-weight:800;">₹${total.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
+        <div style="font-family:monospace;font-weight:800;">${total===null?'—':'₹'+total.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
         <div style="font-size:10px;font-weight:700;color:${color};margin-top:2px;">${o.ORDER_STATUS}</div>
       </div>
     </div>`;
@@ -24468,7 +24090,7 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
 
     /* Do not hijack clicks on controls nested inside a nav item. */
     var tag = (ev.target.tagName || '').toUpperCase();
-    if(tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || tag === 'A' || tag === 'BUTTON') return;
+    if(tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || tag === 'A') return;
 
     /* Only handle actual navigation elements. */
     if(!nav.el.classList.contains('nav-item') &&
@@ -24594,20 +24216,29 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
   /* ---------- STAFF: USER_MASTER only ---------- */
   async function liveStaffFromServer(roles){
     const wanted=roles||['STEWARD','WAITER','CAPTAIN'];
-    try{
-      const res=await gasApi('GET_STAFF_LIST',{roles:wanted},'V2_CORE');
-      const rows=arrayFrom(res,['staff','users','userMaster','USER_MASTER','rows']);
-      if(rows.length && Array.isArray(rows[0])){
-        const head=rows[0].map(x=>txt(x).toUpperCase());
-        return rows.slice(1).map(r=>{const o={};head.forEach((h,i)=>{if(h)o[h]=r[i];});return o;});
-      }
-      return rows;
-    }catch(e){
-      console.warn('[STAFF] GET_STAFF_LIST failed:',e.message);
-      return [];
+    let rows=[];
+    const calls=[
+      ()=>gasApi('GET_STAFF_LIST',{roles:wanted},'V2_CORE'),
+      ()=>gasApi('ERP_LOAD_ALL',{include:['staff','users','userMaster']},'V2_CORE'),
+      ()=>gasApi('RD_FETCH_SHEET',{tab:'USER_MASTER'},'V2_CORE')
+    ];
+    for(const call of calls){
+      try{
+        const res=await Promise.race([call(),new Promise(r=>setTimeout(()=>r(null),7000))]);
+        if(!res || res.success===false) continue;
+        rows=arrayFrom(res,['staff','users','userMaster','USER_MASTER','rows']);
+        if(rows.length) break;
+      }catch(e){}
     }
+    /* Some sheet readers return a 2-D USER_MASTER array. Convert it safely. */
+    if(rows.length && Array.isArray(rows[0])){
+      const head=rows[0].map(x=>txt(x).toUpperCase());
+      rows=rows.slice(1).map(r=>{
+        const o={}; head.forEach((h,i)=>{if(h)o[h]=r[i];}); return o;
+      });
+    }
+    return rows.filter(r=>r && (pick(r,['FULL_NAME','NAME','USER_NAME','DISPLAY_NAME','EMPLOYEE_NAME','USER_CODE','USER_ID'])));
   }
-
   function normalizeStaff(rows){
     const out=[],seen=new Set();
     rows.forEach(r=>{
@@ -24623,10 +24254,7 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
     return out;
   }
 
-  let _staffLoading=false;
   window.loadWaiterList = async function(){
-    if(_staffLoading) return;
-    _staffLoading=true;
     const targets=['bm-bf-waiter','waiterSel'];
     targets.forEach(id=>{const el=document.getElementById(id);if(el)el.innerHTML='<option value="">Loading USER_MASTER…</option>';});
     let rows=[];
@@ -24642,7 +24270,6 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
     const pos=document.getElementById('waiterSel');
     if(bm) bm.innerHTML=(staff.length?'<option value="">Select Steward...</option>':'')+html+add+(staff.length?'':'');
     if(pos) pos.innerHTML=(staff.length?'<option value="">Select Steward...</option>':empty)+html+add;
-    _staffLoading=false;
   };
 
   window.loadStaffSchedule = async function(){
@@ -24760,7 +24387,6 @@ function bnxClearFalseStaticDemo_(){
   }catch(e){ console.warn('[LIVE-DATA-GUARD]',e); }
 }
 document.addEventListener('DOMContentLoaded',()=>{try{bnxClearFalseStaticDemo_();}catch(e){}});
-document.addEventListener('DOMContentLoaded',()=>{ const b=document.getElementById('cbDailyBody'); if(b) b.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:18px;">Loading live cash-book data…</td></tr>'; });
 
 function bnxClearKnownStaticTables_(){
   try{
@@ -24774,313 +24400,5 @@ function bnxClearKnownStaticTables_(){
 }
 document.addEventListener('DOMContentLoaded',()=>{try{bnxClearKnownStaticTables_();}catch(e){}});
 </script>
-
-
-<script>
-/* =====================================================================
-   FINAL REPORT ENGINE + KOT CONSISTENCY PATCH — Sep 2026
-   Server-first report loading, working filters, and one authoritative KOT
-   list per client. Presentation stays on the existing specialized report
-   renderers so columns/totals remain correct.
-   ===================================================================== */
-(function(){
-  'use strict';
-  /* One short-lived sync promise prevents every filter click/report tile
-     from starting another LIST_BILLS request. */
-  let billSyncPromise = null;
-  let billSyncAt = 0;
-  async function syncBillsOnce_(){
-    const now=Date.now();
-    if(billSyncPromise && now-billSyncAt<5000) return billSyncPromise;
-    billSyncAt=now;
-    billSyncPromise=(async()=>{
-      try{
-        const res=await gasApi('LIST_BILLS',{},'V2_CORE');
-        if(!res || !res.success) return false;
-        const raw=Array.isArray(res.bills)?res.bills:(Array.isArray(res.data)?res.data:[]);
-        const mapped=raw.map(sb=>{
-          const no=sb.no||sb.billNo||sb.bill_no||sb.BILL_NO||sb.INVOICE_NO;
-          if(!no)return null;
-          const mode=String(sb.pay||sb.paymode||sb.PAYMENT_MODE||'CASH').toUpperCase();
-          const total=Number(sb.total??sb.grand??sb.GRAND_TOTAL??0)||0;
-          const pb=sb.payBreakdown?{CASH:Number(sb.payBreakdown.CASH)||0,CARD:Number(sb.payBreakdown.CARD)||0,UPI:Number(sb.payBreakdown.UPI)||0,OTHER:Number(sb.payBreakdown.OTHER)||0}:null;
-          return {no:String(no),dt:sb.dt||sb.BILL_DATE||sb.date,tm:sb.tm||sb.BILL_TIME||sb.time,
-            table:sb.table||sb.TABLE_ID||sb.tableNo||'-',customer:sb.customer||sb.CUSTOMER_NAME||sb.cname||'GENERAL CUSTOMER',
-            mob:sb.mob||sb.mobile||sb.MOBILE_NO||'',items:sb.items??(sb.itemsDetail||[]).length,itemsDetail:sb.itemsDetail||sb.items||[],
-            sub:Number(sb.sub??sb.subtotal??sb.SUBTOTAL??0)||0,gst:Number(sb.gst??sb.tax??sb.TAX_AMOUNT??0)||0,total,
-            pay:mode,payBreakdown:pb||{CASH:mode==='CASH'?total:0,CARD:mode==='CARD'?total:0,UPI:mode==='UPI'?total:0,OTHER:!['CASH','CARD','UPI'].includes(mode)?total:0},
-            isSplitPayment:!!sb.isSplitPayment,status:sb.status||sb.BILL_STATUS||'Paid',waiter:sb.waiter||sb.CREATED_BY||sb.STEWARD||'-',
-            kot:sb.kot||sb.ORDER_ID||'',businessDate:sb.businessDate||sb.BILL_DATE||sb.dt||sb.date||'',live:true};
-        }).filter(Boolean);
-        /* Server is authoritative. Preserve only explicit local pending
-           records so a failed sync cannot manufacture report rows. */
-        const local=typeof bnxGetBillRegister==='function'?bnxGetBillRegister():[];
-        const serverNos=new Set(mapped.map(x=>x.no));
-        const pending=local.filter(x=>x && !x.live && !serverNos.has(String(x.no||'')) && (x.pendingSync||x._pendingSync));
-        bnxSaveBillRegister(mapped.concat(pending));
-        return true;
-      }catch(e){console.warn('[REPORT] server bill sync failed:',e.message);return false;}
-    })();
-    try{return await billSyncPromise;}finally{setTimeout(()=>{billSyncPromise=null;},5000);}
-  }
-
-  const oldRptRenderOne=window.rptRenderOne;
-  window.rptRenderOne=async function(anchor,shouldScroll){
-    await syncBillsOnce_();
-    /* KOT register must always use the transaction DB, including closed
-       tickets, so it is not confused with the local KOT cache. */
-    if(anchor==='kot-register'){
-      try{
-        const from=document.getElementById('rptFrom')?.value||'';
-        const to=document.getElementById('rptTo')?.value||from;
-        const res=await gasApi('GET_KOT',{range:'custom',from,to,includeClosed:true,reportMode:true},'V2_CORE');
-        if(res?.success){
-          const card=document.getElementById('rpt-anchor-kot-register');
-          const tbody=card?.querySelector('table tbody');
-          const rows=Array.isArray(res.data)?res.data:[];
-          if(tbody) tbody.innerHTML=rows.length?rows.map(k=>{
-            const items=(k.items||k.itemsDetail||[]).map(i=>String(i.name||i.itemName||'Item')+' × '+(i.qty||0)).join(', ')||'—';
-            const esc=x=>String(x??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
-            return `<tr><td class="mono">${esc(k.KOT_NUMBER||'—')}</td><td class="mono">${esc(k.ORDER_ID||k.ORDER_NUMBER||'—')}</td><td class="mono">${esc(k.KOT_DATE||'—')}</td><td class="mono">${esc(k.ORDER_TIME||'—')}</td><td class="mono">${esc(k.KOT_TIME||'—')}</td><td>${esc(k.TABLE_ID||'—')}</td><td>${esc(k.STARTED_BY||'—')}</td><td>${esc(k.KOT_STATUS||'PRINTED')}</td><td>${esc(items)}</td></tr>`;
-          }).join(''):'<tr><td colspan="9" style="text-align:center;color:var(--text3);padding:18px;">No KOT records in the selected range.</td></tr>';
-          let n=card?.querySelector('.rpt-live-note');if(card&&!n){n=document.createElement('div');n.className='rpt-live-note';n.style.cssText='text-align:center;font-size:10px;color:var(--text3);margin-top:6px;';card.querySelector('table')?.insertAdjacentElement('afterend',n);}if(n)n.textContent='✅ LIVE · '+rows.length+' KOT record(s) from this client TRANSACTION_DB';
-          return res;
-        }
-      }catch(e){console.warn('[REPORT] KOT register failed:',e.message);}
-    }
-    return oldRptRenderOne(anchor,shouldScroll);
-  };
-
-  /* Populate filter choices from client masters, not browser-local bills.
-     This is fast and works on every tenant because routing is server-side. */
-  const oldPopulate=window.rptPopulateFilterSelects;
-  window.rptPopulateFilterSelects=async function(){
-    try{
-      const [staffRes,tableRes]=await Promise.all([
-        gasApi('GET_STAFF_LIST',{},'V2_CORE'),
-        gasApi('GET_MASTER',{category:'tables'},'V2_CORE')
-      ]);
-      const staff=staffRes?.success&&staffRes.data?.staff||[];
-      const tables=tableRes?.success&&Array.isArray(tableRes.data)?tableRes.data:[];
-      const stewards=[...new Set(staff.map(x=>x.FULL_NAME||x.NAME||x.USER_CODE).filter(Boolean))].sort();
-      const tableNames=[...new Set(tables.map(x=>x.TABLE_NUMBER||x.TABLE_NAME||x.TABLE_ID).filter(Boolean))].sort();
-      const ss=document.getElementById('rptFilterSteward');if(ss){const cur=ss.value;ss.innerHTML='<option value="">All Stewards</option>'+stewards.map(x=>`<option value="${String(x).replace(/"/g,'&quot;')}">${String(x).replace(/[&<>]/g,'')}</option>`).join('');if(stewards.includes(cur))ss.value=cur;}
-      const ts=document.getElementById('rptFilterTable');if(ts){const cur=ts.value;ts.innerHTML='<option value="">All Tables</option>'+tableNames.map(x=>`<option value="${String(x).replace(/"/g,'&quot;')}">${String(x).replace(/[&<>]/g,'')}</option>`).join('');if(tableNames.includes(cur))ts.value=cur;}
-    }catch(e){try{if(typeof oldPopulate==='function')oldPopulate();}catch(ignore){}}
-  };
-
-  /* KOT server read is authoritative. A local KOT survives only while it
-     has not yet obtained a server KOT_ID and is not already present there. */
-  window.bnxPullKotsFromServer=async function(){
-    if(typeof gasApi!=='function'||!window.CLIENT_ID)return false;
-    try{
-      const res=await gasApi('GET_KOT',{includeClosed:false},'V2_CORE');
-      if(!res?.success)return false;
-      const rows=Array.isArray(res.data)?res.data:[];
-      let local=[];try{local=JSON.parse(bnxGetOpenKotsRaw()||'[]');}catch(e){}
-      const nos=new Set();const server=[];
-      const sm={PRINTED:'NEW',NEW:'NEW',PENDING:'NEW',COOKING:'PROGRESS',PREPARING:'PROGRESS',IN_PROGRESS:'PROGRESS',PROGRESS:'PROGRESS',READY:'READY',SERVED:'SERVED'};
-      rows.forEach(k=>{const no=String(k.KOT_NUMBER||'').trim();if(!no)return;nos.add(no);server.push({kotNo:no,table:k.TABLE_ID||'—',type:no.startsWith('BAR-')?'BAR':no.startsWith('CTR-')?'COUNTER':'KITCHEN',waiter:k.STARTED_BY||'',covers:k.COVERS||'',time:k.STARTED_AT||((k.KOT_DATE||'')+'T'+(k.KOT_TIME||'00:00:00')),orderNo:k.ORDER_ID||k.ORDER_NUMBER||'',items:(k.items||k.itemsDetail||[]).map(i=>({name:i.name||i.itemName||'',qty:Number(i.qty||0),rate:Number(i.rate||0)})),status:sm[String(k.KOT_STATUS||'PRINTED').toUpperCase()]||'NEW',serverKotId:k.KOT_ID||'',synced:true});});
-      const localOnly=local.filter(k=>!k.serverKotId&&!nos.has(String(k.kotNo||'').trim())&&k.localOnly===true);
-      bnxSetOpenKotsRaw(JSON.stringify(server.concat(localOnly).filter(k=>!['SERVED','CANCELLED','BILLED'].includes(String(k.status||'').toUpperCase())).slice(0,100)));
-      if(typeof buildKOT==='function'&&document.getElementById('page-kot')?.classList.contains('active'))buildKOT();
-      return true;
-    }catch(e){console.warn('[KOT authoritative sync]',e.message);return false;}
-  };
-
-  /* Every report filter change re-renders the active report. */
-  ['rptFilterPay','rptFilterSteward','rptFilterTable','rptFilterCustomer','rptFilterMinAmt'].forEach(id=>{
-    document.addEventListener('change',e=>{if(e.target?.id===id&&window.rptActiveAnchor){if(typeof runReport==='function')runReport();}});
-  });
-})();
-</script>
-
-
-<script>
-/* ================================================================
-   BALAJI NEXTGEN ERP — FINAL PERFORMANCE / REPORT PATCH
-   - Fast invoice/KOT printing: no fixed artificial print delay.
-   - Shared 15-second report cache per client/range/action.
-   - Server-first reports for high-volume (3000 bills/day) sites.
-   - No demo rows are introduced.
-   - Client/session routing remains unchanged.
-================================================================ */
-(function(){
-  'use strict';
-
-  const _reportCache = new Map();
-  const _reportFlight = new Map();
-  const _REPORT_TTL = 15000;
-
-  function _cid(){
-    try{
-      return (typeof bnxCurrentClient_==='function' && bnxCurrentClient_()) ||
-             (typeof CLIENT_ID!=='undefined' && CLIENT_ID) ||
-             localStorage.getItem('ERP_CLIENT') || '';
-    }catch(e){ return ''; }
-  }
-  function _range(from,to){
-    return (from && to) ? {range:'custom',from,to} : {};
-  }
-  async function _server(action, payload){
-    const key = _cid()+'|'+action+'|'+JSON.stringify(payload||{});
-    const now = Date.now();
-    const hit = _reportCache.get(key);
-    if(hit && now-hit.ts < _REPORT_TTL) return hit.data;
-    if(_reportFlight.has(key)) return _reportFlight.get(key);
-    const p = (async()=>{
-      try{
-        if(typeof gasApi!=='function') return {success:false,error:'ERP API helper unavailable'};
-        const res = await gasApi(action, payload||{}, 'V2_CORE');
-        if(res && res.success) _reportCache.set(key,{ts:Date.now(),data:res});
-        return res || {success:false,error:'Empty server response'};
-      }finally{
-        _reportFlight.delete(key);
-      }
-    })();
-    _reportFlight.set(key,p);
-    return p;
-  }
-  window.BNX_REPORT_ENGINE = {
-    clear:function(){_reportCache.clear();},
-    server:_server
-  };
-
-  function money(v){
-    return '₹'+Number(v||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
-  }
-  function note(card,text,warn){
-    if(!card) return;
-    let n=card.querySelector('.rpt-live-note');
-    if(!n){
-      n=document.createElement('div');
-      n.className='rpt-live-note';
-      n.style.cssText='text-align:center;font-size:10px;margin-top:6px;';
-      const t=card.querySelector('table');
-      if(t) t.insertAdjacentElement('afterend',n);
-    }
-    n.textContent=text;
-    n.style.color=warn?'var(--red,#dc2626)':'var(--text3)';
-  }
-
-  /* Sales Summary — real GET_SALES_SUMMARY_REPORT, not local 6000-bill cache. */
-  window.bnxRenderSaleSummaryReport = async function(from,to){
-    const card=document.getElementById('rpt-anchor-sale-summary');
-    const tbody=card&&card.querySelector('table tbody');
-    if(!tbody) return;
-    const res=await _server('GET_SALES_SUMMARY_REPORT',_range(from,to));
-    const row=res&&res.success&&res.data&&(res.data.row||res.data.rows?.[0]);
-    if(!row){
-      tbody.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:14px;">No live sales data for this range.</td></tr>';
-      note(card,'🟡 Backend connected, but no sales rows returned.',true);
-      return;
-    }
-    const bills=Number(row.TOTAL_BILLS)||0, revenue=Number(row.NET_SALES)||0, covers=Number(row.COVERS)||0;
-    tbody.innerHTML =
-      `<tr><td>Selected Range</td><td class="mono">${bills}</td><td class="mono">${covers}</td><td class="mono" style="color:var(--green)">${money(revenue)}</td><td class="mono">${money(row.AVERAGE_BILL_VALUE)}</td></tr>`+
-      `<tr class="rpt-total-row"><td>TOTAL</td><td class="mono">${bills}</td><td class="mono">${covers}</td><td class="mono" style="color:var(--gold)">${money(revenue)}</td><td class="mono">${money(row.AVERAGE_BILL_VALUE)}</td></tr>`;
-    note(card,`✅ Live server report — ${bills} bill(s), ${covers} cover(s).`);
-  };
-
-  /* Sales Day Book — LIST_BILLS is the authoritative bill-by-bill source. */
-  window.bnxRenderDayBookReport = async function(from,to){
-    const card=document.getElementById('rpt-anchor-day-book');
-    const tbody=card&&card.querySelector('table tbody');
-    if(!tbody) return;
-    const res=await _server('LIST_BILLS',Object.assign({FROM_DATE:from||'',TO_DATE:to||''},_range(from,to)));
-    const bills=Array.isArray(res?.bills)?res.bills:(Array.isArray(res?.data)?res.data:[]);
-    const filtered=bills.filter(b=>String(b.status||'').toLowerCase()!=='cancelled');
-    const payClass={CASH:'p-g',UPI:'p-b',CARD:'p-p',GPAY:'p-b',DUE:'p-r',CREDIT:'p-r'};
-    tbody.innerHTML=filtered.length ? filtered.map(b=>{
-      const mode=String(b.pay||'').toUpperCase();
-      return `<tr><td class="mono">${b.no||'—'}</td><td>${b.tm||'—'}</td><td>${b.table||'—'}</td><td class="mono">${money(b.total)}</td><td><span class="pill ${payClass[mode]||'p-g'}" style="font-size:9px">${b.pay||'—'}</span></td></tr>`;
-    }).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:14px;">No live bills for this range.</td></tr>';
-    const f=document.getElementById('rpt-daybook-static-footer'); if(f) f.style.display='none';
-    note(card,`✅ Live server bills — ${filtered.length} bill(s) shown.`);
-  };
-
-  /* Item Wise — authoritative report DB engine. */
-  window.bnxRenderItemWiseReport = async function(from,to){
-    const card=document.getElementById('rpt-anchor-itemwise');
-    const tbody=card&&card.querySelector('table tbody');
-    if(!tbody) return;
-    const res=await _server('GET_ITEM_SALES_REPORT',_range(from,to));
-    const rows=Array.isArray(res?.data?.rows)?res.data.rows:[];
-    const totalQty=rows.reduce((s,r)=>s+(Number(r.QUANTITY_SOLD)||0),0);
-    const total=rows.reduce((s,r)=>s+(Number(r.NET_SALES)||0),0);
-    const max=Math.max(1,...rows.map(r=>Number(r.QUANTITY_SOLD)||0));
-    tbody.innerHTML=rows.length ? rows.map((r,i)=>{
-      const qty=Number(r.QUANTITY_SOLD)||0, pct=Math.round(qty/max*100);
-      return `<tr><td>${r.ITEM_NAME||'—'}</td><td>${r.CATEGORY_ID||'—'}</td><td class="mono">${qty}</td><td class="mono" style="color:var(--gold)">${money(r.NET_SALES)}</td><td><div style="display:flex;align-items:center;gap:4px;"><div style="flex:1;background:var(--surface3);border-radius:3px;height:6px;"><div style="width:${pct}%;background:var(--gold);height:6px;border-radius:3px;"></div></div><span style="font-size:10px">${pct}%</span></div></td></tr>`;
-    }).join('')+`<tr class="rpt-total-row"><td>TOTAL</td><td></td><td class="mono">${totalQty}</td><td class="mono" style="color:var(--gold)">${money(total)}</td><td></td></tr>`
-      : '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:14px;">No live item sales for this range.</td></tr>';
-    note(card,`✅ Live server item report — ${rows.length} item(s), ${totalQty} unit(s).`);
-  };
-
-  /* Monthly Sales — aggregate the authoritative server Sales Day Book. */
-  window.bnxRenderMonthlySalesReport = async function(from,to){
-    const card=document.getElementById('rpt-anchor-monthly-sales');
-    const tbody=card&&card.querySelector('table tbody');
-    if(!tbody) return;
-    const res=await _server('GET_SALES_DAY_BOOK_REPORT',_range(from,to));
-    const rows=Array.isArray(res?.data?.rows)?res.data.rows:[];
-    let total=0,totalBills=0;
-    tbody.innerHTML=rows.length ? rows.map(r=>{
-      const bills=Number(r.BILL_COUNT)||0, net=Number(r.NET_SALES)||0;
-      total+=net; totalBills+=bills;
-      return `<tr><td>${r.DATE||r.BUSINESS_DATE||'—'}</td><td class="mono">${bills}</td><td class="mono">${money(r.CASH_SALES||r.CASH||0)}</td><td class="mono">${money(r.UPI_SALES||r.UPI||0)}</td><td class="mono">${money(r.CARD_SALES||r.CARD||0)}</td><td class="mono" style="color:var(--gold)">${money(net)}</td></tr>`;
-    }).join('')+`<tr class="rpt-total-row"><td colspan="5">Selected Range Total (${totalBills} bills)</td><td class="mono" style="color:var(--gold)">${money(total)}</td></tr>`
-      : '<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:14px;">No live sales for this range.</td></tr>';
-    note(card,`✅ Live server day-book summary — ${totalBills} bill(s).`);
-  };
-
-  /* GST — authoritative HSN/tax engine. */
-  window.bnxRenderTaxSummaryReport = async function(from,to){
-    const card=document.getElementById('rpt-anchor-tax-summary');
-    const tbody=card&&card.querySelector('table tbody');
-    if(!tbody) return;
-    const res=await _server('GET_GST_REPORT',_range(from,to));
-    const rows=Array.isArray(res?.data?.rows)?res.data.rows:[];
-    let taxable=0,cgst=0,sgst=0,igst=0,tax=0;
-    tbody.innerHTML=rows.length ? rows.map(r=>{
-      taxable+=Number(r.TAXABLE_AMOUNT)||0; cgst+=Number(r.CGST_AMOUNT)||0; sgst+=Number(r.SGST_AMOUNT)||0; igst+=Number(r.IGST_AMOUNT)||0; tax+=Number(r.TOTAL_TAX)||0;
-      return `<tr><td class="mono">${r.HSN_CODE||'—'}</td><td>GST @ ${r.TAX_RATE||0}%</td><td class="mono">${money(r.TAXABLE_AMOUNT)}</td><td>${r.TAX_RATE||0}%</td><td class="mono">${money(r.CGST_AMOUNT)}</td><td class="mono">${money(r.SGST_AMOUNT)}</td><td class="mono">${money(r.IGST_AMOUNT)}</td><td class="mono" style="color:var(--gold)">${money(r.TOTAL_TAX)}</td></tr>`;
-    }).join('')+`<tr class="rpt-total-row"><td colspan="2">TOTAL</td><td class="mono">${money(taxable)}</td><td></td><td class="mono">${money(cgst)}</td><td class="mono">${money(sgst)}</td><td class="mono">${money(igst)}</td><td class="mono" style="color:var(--gold)">${money(tax)}</td></tr>`
-      : '<tr><td colspan="8" style="text-align:center;color:var(--text3);padding:14px;">No live GST rows for this range.</td></tr>';
-    note(card,`✅ Live GST report — ${rows.length} HSN/rate row(s).`);
-  };
-
-  /* Fast invoice printing: save remains mandatory for a confirmed invoice,
-     but the browser no longer waits an artificial 450ms after content load. */
-  if(typeof window.bmDoPrint==='function'){
-    const _oldPrint=window.bmDoPrint;
-    window.bmDoPrint=async function(){
-      await _oldPrint();
-    };
-  }
-
-  /* Remove fixed fallback delays from print windows created by this page. */
-  const _nativeSetTimeout=window.setTimeout;
-  /* No global timer override: only patch KOT print's own 800ms fallback safely. */
-  if(typeof window.bmDoKOTPrint==='function'){
-    const _oldKot=window.bmDoKOTPrint;
-    window.bmDoKOTPrint=function(){
-      const before=window.open;
-      return _oldKot.apply(this,arguments);
-    };
-  }
-
-  /* Report filters invalidate only the shared report cache, not the bill cache. */
-  ['rptFilterPay','rptFilterSteward','rptFilterTable','rptFilterCustomer','rptFilterMinAmt'].forEach(id=>{
-    document.addEventListener('change',e=>{
-      if(e.target && e.target.id===id){
-        _reportCache.clear();
-        if(window.rptActiveAnchor && typeof runReport==='function') runReport();
-      }
-    });
-  });
-})();
-</script>
-
 </body>
 </html>
