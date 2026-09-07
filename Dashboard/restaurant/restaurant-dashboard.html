@@ -124,40 +124,30 @@ const GAS_APIS_DASH = {
   V2_AUTH:     'https://script.google.com/macros/s/' + (function(){try{return localStorage.getItem('bnx_api_auth');}catch(e){}}()||'AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx') + '/exec',
 };
 
-/* ═══ LIVE-SITE SAME-ORIGIN API PROXY FIX ═══
-   Google Apps Script web-app responses do not expose the CORS header required
-   by browsers when this dashboard is served from balajinextgen.in. The result
-   is the exact console error: "No Access-Control-Allow-Origin header" and
-   every Master/Transaction/Report load falls back to Offline / DB unavailable.
-   Netlify proxies these two paths server-side, so browser requests remain
-   same-origin and both reads AND writes work normally. Local file:// keeps the
-   direct GAS URL as a development fallback.
+/* ═══ GOOGLE APPS SCRIPT ONLY TRANSPORT ═══
+   This dashboard is designed to be served by the same Google Apps Script
+   project as Code.gs. Browser API calls therefore use google.script.run and
+   never depend on Google Apps Script, Cloudflare, Vercel, or another external server bridge.
+   A direct /exec fetch is retained only for local file:// development.
 */
-/* ================================================================
-   LIVE API — RESTORED ORIGINAL DIRECT GOOGLE APPS SCRIPT PATTERN
-   No Netlify / Cloudflare / Worker dependency.
-   Browser POSTs to the real GAS /exec URL.  Apps Script may return
-   a 302 ContentService redirect; browser fetch follows it automatically.
-   ================================================================ */
 const BNX_SAME_ORIGIN_API = null;
 
 function bnxApiUrl_(endpoint){
   endpoint = endpoint || 'V2_CORE';
-  return GAS_APIS_DASH[endpoint];
+  return GAS_APIS_DASH[endpoint] || '';
 }
 
-/* CENTRALIZED CONFIG — same mechanism as steward-mobile.html, see its
-   comment for the full explanation. Once DEPLOYMENT_CONFIG exists in
-   your security DB, both apps' V2_CORE/V2_AUTH stay in sync from one
-   place instead of each carrying an independent, driftable copy. */
+function bnxDeploymentId_(endpoint){
+  try{
+    const u = String(GAS_APIS_DASH[endpoint] || '');
+    const m = u.match(/\/macros\/s\/([^/]+)\/exec(?:$|[?#])/);
+    return m ? m[1] : '';
+  }catch(e){ return ''; }
+}
 
-/* ═══ FINAL HANG / REQUEST-STORM FIX ═══
-   A bad API route used to make every page action start
-   another failing request. During a proxy outage that created a request
-   storm and made the ERP feel frozen. Keep one in-flight request per
-   identical POST body and temporarily open a short circuit after a
-   permanent 4xx/405 response. Manual Refresh/Save can clear it.
-*/
+/* Centralized config — deployment IDs may be refreshed from the server. */
+
+/* ═══ REQUEST COALESCING / CIRCUIT PROTECTION ═══ */
 const BNX_API_FLIGHT = new Map();
 const BNX_API_CIRCUIT = new Map();
 
@@ -175,108 +165,91 @@ function bnxApiFlightKey_(endpoint, options){
   return String(endpoint||'V2_CORE') + '|' + String(options && options.body || '');
 }
 
+function bnxRunAppsScript_(endpoint, body, timeoutMs){
+  return new Promise((resolve, reject)=>{
+    if (!(window.google && google.script && google.script.run)) {
+      reject(new Error('Google Apps Script runtime is unavailable. Open this dashboard from the Apps Script web app.'));
+      return;
+    }
+    let settled = false;
+    const timer = setTimeout(()=>{
+      if (!settled) { settled = true; reject(new Error('Apps Script request timed out')); }
+    }, Number(timeoutMs)||30000);
+    google.script.run
+      .withSuccessHandler((data)=>{
+        if (settled) return;
+        settled = true; clearTimeout(timer); resolve(data);
+      })
+      .withFailureHandler((err)=>{
+        if (settled) return;
+        settled = true; clearTimeout(timer);
+        reject(new Error((err && (err.message || err.toString())) || 'Apps Script request failed'));
+      })
+      .bnxApiCall(String(endpoint||'V2_CORE'), String(body||''));
+  });
+}
+
 async function bnxFetchJson_(endpoint, options){
   options = options || {};
   endpoint = endpoint || 'V2_CORE';
 
+  const isAppsScriptRuntime = !!(window.google && google.script && google.script.run);
   const isLocalFile = !!(window.location && window.location.protocol === 'file:');
   const primary = bnxApiUrl_(endpoint);
-  const direct = GAS_APIS_DASH[endpoint];
   const urls = [];
+  if (isAppsScriptRuntime) urls.push('__APPS_SCRIPT_RUN__');
+  else if (isLocalFile && primary) urls.push(primary);
+  else if (primary) urls.push(primary);
 
-  if (!isLocalFile) {
-    if (primary) urls.push(primary);
-  } else {
-    if (primary) urls.push(primary);
-    if (direct && direct !== primary) urls.push(direct);
-  }
+  if (!urls.length) throw new Error('No Apps Script API runtime available for ' + endpoint);
 
-  if (!urls.length) throw new Error('No API endpoint configured for ' + endpoint);
-
-  /* Never let identical GET/read requests pile up while one is pending. */
   const flightKey = bnxApiFlightKey_(endpoint, options);
   if (BNX_API_FLIGHT.has(flightKey)) return BNX_API_FLIGHT.get(flightKey);
 
   const work = (async()=>{
-    /* If this endpoint has just returned a permanent 4xx (especially 405),
-       fail immediately for a short period instead of repeatedly waiting. */
-    if (!isLocalFile && bnxApiCircuitOpen_(endpoint)) {
+    if (bnxApiCircuitOpen_(endpoint)) {
       const err = new Error('API circuit open for ' + endpoint);
-      err.status = 503;
-      err.circuitOpen = true;
-      throw err;
+      err.status = 503; err.circuitOpen = true; throw err;
     }
 
-    let lastErr = null;
-    for (let i=0; i<urls.length; i++) {
-      const url=urls[i];
+    const body = String(options.body || '');
+    const parsedAction = (()=>{ try{return JSON.parse(body||'{}').action||'';}catch(e){return '';} })();
+    const timeoutMs = Number(options.timeoutMs) ||
+      (/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? BNX_WRITE_TIMEOUT_MS : BNX_READ_TIMEOUT_MS);
+
+    if (urls[0] === '__APPS_SCRIPT_RUN__') {
       try {
-        const fetchOpts = Object.assign({
-          method:'POST',
-          headers:{'Content-Type':'text/plain;charset=utf-8'},
-          credentials:'omit',
-          redirect:'follow'
-        },options);
-
-        const parsedAction = (()=>{ try{return JSON.parse(fetchOpts.body||'{}').action||'';}catch(e){return '';} })();
-        const timeoutMs = Number(fetchOpts.timeoutMs) ||
-          (/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? BNX_WRITE_TIMEOUT_MS : BNX_READ_TIMEOUT_MS);
-        delete fetchOpts.timeoutMs;
-
-        const timeoutCtrl = new AbortController();
-        // Cosmetic only (not a functional bug): naming the abort reason
-        // turns the generic, unhelpful "signal is aborted without reason"
-        // console message into one that says what actually happened —
-        // this is the app's own timeout correctly firing, matching the
-        // "ERP API unavailable (network error)" banner already shown.
-        const timer = setTimeout(()=>timeoutCtrl.abort(`ERP API timeout after ${timeoutMs}ms`), timeoutMs);
-        if(fetchOpts.signal){
-          try{fetchOpts.signal.addEventListener('abort',()=>timeoutCtrl.abort('Upstream signal aborted'),{once:true});}catch(e){}
-        }
-        fetchOpts.signal=timeoutCtrl.signal;
-
-        let r;
-        try{ r=await fetch(url,fetchOpts); }
-        finally{ clearTimeout(timer); }
-
-        const text=await r.text();
-
-        if(!r.ok){
-          const err=new Error('API HTTP '+r.status+' at '+url);
-          err.status=r.status;
-          err.responseText=text.slice(0,300);
-          lastErr=err;
-
-          /* 4xx is permanent for this page session. Do not keep hammering
-             the same broken proxy route. 405 is the exact live-site issue. */
-          if(!isLocalFile && r.status>=400 && r.status<500){
-            BNX_API_CIRCUIT.set(endpoint, Date.now()+30000);
-          }
-          if(!isLocalFile) throw err;
-          if(i+1<urls.length) continue;
-          throw err;
-        }
-
-        let data;
-        try { data=JSON.parse(text); }
-        catch(e){
-          const err=new Error('API returned non-JSON ('+r.status+'): '+text.slice(0,180));
-          err.status=r.status;
-          err.responseText=text.slice(0,300);
-          lastErr=err;
-          if(i+1<urls.length) continue;
-          throw err;
-        }
-
+        const data = await bnxRunAppsScript_(endpoint, body, timeoutMs);
+        if (!data || typeof data !== 'object') throw new Error('Apps Script returned an invalid response');
         BNX_API_CIRCUIT.delete(endpoint);
         return data;
       } catch(e) {
-        lastErr=e;
-        if(i+1<urls.length) continue;
-        throw e;
+        const err = e instanceof Error ? e : new Error(String(e));
+        err.status = err.status || 503;
+        BNX_API_CIRCUIT.set(endpoint, Date.now()+15000);
+        throw err;
       }
     }
-    throw lastErr || new Error('API request failed');
+
+    /* Local file development only. Production must use google.script.run. */
+    let r;
+    const ctrl = new AbortController();
+    const timer = setTimeout(()=>ctrl.abort(), timeoutMs);
+    try {
+      r = await fetch(primary, Object.assign({
+        method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'},
+        credentials:'omit', redirect:'follow', signal:ctrl.signal
+      }, options));
+    } finally { clearTimeout(timer); }
+    const text = await r.text();
+    if (!r.ok) {
+      const err = new Error('API HTTP '+r.status+' at '+primary);
+      err.status=r.status; err.responseText=text.slice(0,300); throw err;
+    }
+    let data;
+    try { data=JSON.parse(text); }
+    catch(e){ throw new Error('API returned non-JSON: '+text.slice(0,180)); }
+    return data;
   })();
 
   BNX_API_FLIGHT.set(flightKey, work);
@@ -284,6 +257,24 @@ async function bnxFetchJson_(endpoint, options){
   finally { BNX_API_FLIGHT.delete(flightKey); }
 }
 
+async function bnxRefreshConfig(){
+  try{
+    const res = await bnxFetchJson_('V2_CORE', {body: JSON.stringify({action:'GET_CONFIG'}), timeoutMs:5000});
+    if(res && res.success && res.data){
+      if(res.data.v2CoreId) localStorage.setItem('bnx_api_core', res.data.v2CoreId);
+      if(res.data.v2AuthId) localStorage.setItem('bnx_api_auth', res.data.v2AuthId);
+      if(res.data.v2CoreId) GAS_APIS_DASH.V2_CORE = 'https://script.google.com/macros/s/' + res.data.v2CoreId + '/exec';
+      if(res.data.v2AuthId) GAS_APIS_DASH.V2_AUTH = 'https://script.google.com/macros/s/' + res.data.v2AuthId + '/exec';
+      console.log('[CONFIG] Apps Script deployment configuration loaded');
+    } else {
+      console.warn('[CONFIG] GET_CONFIG returned no usable deployment data; continuing with configured IDs');
+    }
+  }catch(e){
+    console.warn('[CONFIG] GET_CONFIG unavailable; continuing with configured Apps Script project:', e.message);
+  }
+}
+window.__bnxConfigReady = bnxRefreshConfig();
+const GAS_URL = GAS_APIS_DASH.V2_CORE;
 function bnxShowApiTransportError_(err, endpoint){
   try{
     const id='_bnxApiTransportError';
@@ -294,66 +285,12 @@ function bnxShowApiTransportError_(err, endpoint){
       el.style.cssText='position:fixed;left:12px;right:12px;bottom:12px;z-index:99999;background:#7f1d1d;color:#fff;padding:10px 14px;border-radius:10px;font:600 12px/1.4 Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.25);';
       document.body.appendChild(el);
     }
-    const route=GAS_APIS_DASH[endpoint] || '';
     el.textContent=(window.location && window.location.protocol==='file:')
-  ? 'LOCAL TEST MODE: browser cannot read Google Apps Script directly from file://. Open the hosted ERP page for live DB data.'
-  : 'ERP API '+endpoint+' unavailable ('+(err&&err.status?('HTTP '+err.status):'network error')+'). Live screen remains usable; use the configured Google Apps Script /exec API for live DB sync. Live data is not replaced with demo data.';
+  ? 'LOCAL TEST MODE: open the dashboard from the Google Apps Script web app for live ERP data.'
+  : 'ERP Apps Script '+endpoint+' unavailable ('+(err&&err.status?('HTTP '+err.status):'runtime error')+'). Live data is not replaced with demo data.';
   }catch(e){}
 }
 
-async function bnxRefreshConfig(){
-  // FIX (audit #6, P1 — "bnxRefreshConfig fails silently"): a failed
-  // or unsuccessful GET_CONFIG used to vanish with zero trace, so an
-  // outdated/wrong deployment ID could silently keep being used
-  // forever. Still falls back to the hardcoded bootstrap IDs either
-  // way (never blocks startup), but now every outcome is logged.
-  try{
-    const res = await bnxFetchJson_('V2_CORE', {body: JSON.stringify({action:'GET_CONFIG'}), timeoutMs:2500});
-    if(res && res.success && res.data){
-      if(res.data.v2CoreId) localStorage.setItem('bnx_api_core', res.data.v2CoreId);
-      if(res.data.v2AuthId) localStorage.setItem('bnx_api_auth', res.data.v2AuthId);
-      // FIX (P1 — "GAS_URL can become stale"): writing to localStorage
-      // alone did nothing for THIS page load. GAS_APIS_DASH.V2_CORE/
-      // V2_AUTH are plain strings computed ONCE when this object
-      // literal was first evaluated (from whatever localStorage held
-      // at that exact moment) — they are not live getters, so updating
-      // localStorage here never changed them again. gasApi()/erpApi()
-      // both re-read GAS_APIS_DASH[endpoint] fresh on every single
-      // call, so mutating the object in place (not just localStorage)
-      // is enough: any call that fires AFTER this line runs gets the
-      // corrected URL immediately, without needing a full sequential-
-      // boot rewrite. Calls already in flight before this resolves
-      // still used the bootstrap fallback — same as before, and still
-      // safe, since the fallback is a real working deployment too.
-      if(!BNX_SAME_ORIGIN_API){
-        if(res.data.v2CoreId) GAS_APIS_DASH.V2_CORE = 'https://script.google.com/macros/s/' + res.data.v2CoreId + '/exec';
-        if(res.data.v2AuthId) GAS_APIS_DASH.V2_AUTH = 'https://script.google.com/macros/s/' + res.data.v2AuthId + '/exec';
-      }
-      console.log('[CONFIG] GET_CONFIG loaded OK — using', res.data.v2CoreId ? 'server-supplied' : 'hardcoded fallback', 'deployment IDs');
-    } else {
-      // FIX: was logging the raw response object collapsed as
-      // "▶ Object" — in production devtools no one expands that, so
-      // the actual reason ("Unknown action" from an unwired router
-      // case vs a real backend error vs a malformed shape) was
-      // invisible. Print the fields that matter directly.
-      console.error('[CONFIG] GET_CONFIG returned no usable data — still on hardcoded fallback deployment IDs.',
-        'success=' + (res && res.success), 'error=' + (res && res.error), 'hasData=' + !!(res && res.data),
-        '(if success is undefined and error is undefined, the backend most likely never hit bnxGetConfig() at all —',
-        'check that case \'GET_CONFIG\': return bnxGetConfig(req); is actually wired into your live doPost() router)');
-    }
-  }catch(e){ console.error('[CONFIG] GET_CONFIG request failed — still on hardcoded fallback deployment IDs:', e.message); }
-}
-// FIX (P0 — "make config load blocking"): was fire-and-forget
-// (bnxRefreshConfig() called with no one ever awaiting it) — every one
-// of the DOMContentLoaded listeners below fires independently and in
-// parallel the instant the DOM finishes parsing, completely
-// independent of whether this config fetch has finished. Now the
-// promise is captured so every GAS-dependent init below can genuinely
-// wait on it first, instead of racing it.
-window.__bnxConfigReady = (window.location && window.location.protocol !== 'file:')
-  ? Promise.resolve({success:true, skipped:true, reason:'same-origin proxy uses bootstrap deployment config'})
-  : bnxRefreshConfig();
-const GAS_URL = GAS_APIS_DASH.V2_CORE;
 const CLIENT_ID=(function(){
   try{
     /* welcome.html's login flow stores the session under 'ERP_USER'
@@ -908,7 +845,7 @@ setInterval(() => {
    BALAJI NEXTGEN ERP — RESTAURANT POS v2.0
    Powered by Balaji NextGen Solutions
    Contact: 9614300272 | 
-   Website: https://balajinextgensolution.netlify.app/
+   Website: https://balajinextgensolution.Google Apps Script.app/
    Multi-client: 10,000+ clients | Demo→Trial→Subscription
    Roles: SUPER_ADMIN > DEVELOPER > OWNER > ADMIN > MANAGER > CASHIER/CHEF/WAITER
 ═══════════════════════════════════════════════ */
@@ -2885,27 +2822,27 @@ document.addEventListener('DOMContentLoaded', function(){
     <div class="s-section">Core</div>
     <div class="nav-item active" onclick="showPage('dashboard',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg></span><span class="nav-label">Dashboard</span></div>
     <div class="nav-item" onclick="showPage('pos',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.5 3h2l2.6 12.4a2 2 0 0 0 2 1.6h8.8a2 2 0 0 0 2-1.6L22.5 7H6"/></svg></span><span class="nav-label">Point of Sale</span></div>
-    <div class="nav-item" onclick="showPage('kot',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9a2 2 0 1 0 0 6"/><path d="M21 9a2 2 0 1 1 0 6"/><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M9 6v12" stroke-dasharray="2 2"/></svg></span><span class="nav-label">KOT</span><span class="nav-badge" id="kotBadge">7</span></div>
+    <div class="nav-item" onclick="showPage('kot',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9a2 2 0 1 0 0 6"/><path d="M21 9a2 2 0 1 1 0 6"/><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M9 6v12" stroke-dasharray="2 2"/></svg></span><span class="nav-label">KOT</span><span class="nav-badge" id="kotBadge" style="display:none">0</span></div>
     <div class="nav-item" onclick="showPage('tables',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10h16M4 10v9M20 10v9M7 10V6a1 1 0 0 1 1-1h8a1 1 0 0 1 1 1v4"/></svg></span><span class="nav-label">Table Management</span></div>
     <div class="s-section">Finance</div>
     <div class="nav-item" onclick="showPage('billing',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/></svg></span><span class="nav-label">New Bill</span></div>
     <div class="nav-item" onclick="showPage('order-register',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2h-4"/><rect x="9" y="2" width="6" height="4" rx="1"/><path d="M9 12h6M9 16h6"/></svg></span><span class="nav-label">Order Register</span></div>
     <div class="nav-item" onclick="showPage('bills-list',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2h12v18l-3-2-3 2-3-2-3 2V2z"/><path d="M9 7h6M9 11h6"/></svg></span><span class="nav-label">Bills List</span></div>
-    <div class="nav-item" onclick="showPage('settlement',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18M3 10h18M5 6l7-4 7 4M4 10v11M20 10v11M9 14v3M15 14v3"/></svg></span><span class="nav-label">Settlement</span><span class="nav-badge g">3</span></div>
+    <div class="nav-item" onclick="showPage('settlement',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18M3 10h18M5 6l7-4 7 4M4 10v11M20 10v11M9 14v3M15 14v3"/></svg></span><span class="nav-label">Settlement</span><span class="nav-badge g" id="settlementBadge" style="display:none">0</span></div>
     <div class="s-section">Operations</div>
-    <div class="nav-item" onclick="showPage('reservation',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg></span><span class="nav-label">Reservations</span><span class="nav-badge b">5</span></div>
-    <div class="nav-item" onclick="showPage('bar',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16l-7 9v7h4M9 20h4M9 13 4 4"/></svg></span><span class="nav-label">Bar Management</span><span class="nav-badge p">12</span></div>
+    <div class="nav-item" onclick="showPage('reservation',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg></span><span class="nav-label">Reservations</span><span class="nav-badge b" id="reservationBadge" style="display:none">0</span></div>
+    <div class="nav-item" onclick="showPage('bar',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16l-7 9v7h4M9 20h4M9 13 4 4"/></svg></span><span class="nav-label">Bar Management</span><span class="nav-badge p" id="barBadge" style="display:none">0</span></div>
     <div class="nav-item" onclick="showPage('kitchen',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 13a4 4 0 0 1 0-8 3 3 0 0 1 5-2 3 3 0 0 1 5 2 4 4 0 0 1 0 8"/><path d="M6 13v6a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-6"/></svg></span><span class="nav-label">Kitchen Display</span></div>
     <div class="nav-item" onclick="showPage('analytics',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-4 4"/></svg></span><span class="nav-label">Analytics</span></div>
     <div class="s-section">Online Orders</div>
-    <div class="nav-item" onclick="showPage('online-orders',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="19" r="2"/><circle cx="18" cy="19" r="2"/><path d="M4 19h2l1-9h9l3 5v4h-2M7 10V6h4"/></svg></span><span class="nav-label">Online Orders</span><span class="nav-badge" id="onlineBadge" style="background:#ef4444">12</span></div>
+    <div class="nav-item" onclick="showPage('online-orders',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="19" r="2"/><circle cx="18" cy="19" r="2"/><path d="M4 19h2l1-9h9l3 5v4h-2M7 10V6h4"/></svg></span><span class="nav-label">Online Orders</span><span class="nav-badge" id="onlineBadge" style="display:none;background:#ef4444">0</span></div>
     <div class="nav-item" onclick="showPage('aggregator-settlement',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9 9h.01M15 15h.01M15 9 9 15"/></svg></span><span class="nav-label">Aggregator Settlement</span></div>
     <div class="s-section">Credit & Accounts</div>
     <div class="nav-item" onclick="showPage('customer-credit',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V4a1 1 0 0 0-1-1H6.5A2.5 2.5 0 0 0 4 5.5v14z"/><path d="M8 7h8M8 11h5"/></svg></span><span class="nav-label">Customer Credit</span><span class="nav-badge" id="dueBadge" style="background:var(--orange)">₹</span></div>
     <div class="nav-item" onclick="showPage('due-collection',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="13" rx="2"/><path d="M16 3.5 12 7 8 3.5"/><circle cx="12" cy="13.5" r="3"/></svg></span><span class="nav-label">Due Collection</span></div>
     <div class="nav-item" onclick="showPage('accounts-ledger',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><rect x="7" y="12" width="3" height="6"/><rect x="12" y="8" width="3" height="10"/><rect x="17" y="5" width="3" height="13"/></svg></span><span class="nav-label">Accounts Ledger</span></div>
     <div class="s-section">Reports</div>
-    <div class="nav-item" onclick="showPage('reports',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.2 15a9 9 0 1 1-9.9-13.9"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg></span><span class="nav-label">Reports Hub</span><span class="nav-badge b">25+</span></div>
+    <div class="nav-item" onclick="showPage('reports',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.2 15a9 9 0 1 1-9.9-13.9"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg></span><span class="nav-label">Reports Hub</span><span class="nav-badge b" style="display:none">0</span></div>
     <div class="s-section">Communication</div>
     <div class="nav-item" onclick="showPage('whatsapp',this)"><span class="nav-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4A8.5 8.5 0 0 1 3 12a8.4 8.4 0 0 1 14.3-6 8.4 8.4 0 0 1 2.5 5.9z"/><path d="M8.5 9.5c.3 2 2.7 4.3 4.7 4.6l1-1c.4-.4 1-.5 1.5-.2l1.6 1c.5.4.6 1.1.2 1.6-.6.8-1.6 1.3-2.6 1.2-3-.3-6.3-3.6-6.6-6.6-.1-1 .4-2 1.2-2.6.5-.4 1.2-.3 1.6.2l1 1.6c.3.5.2 1.1-.2 1.5z"/></svg></span><span class="nav-label">WhatsApp Automation</span><span class="nav-badge g" style="background:var(--green)">WA</span></div>
     <div class="s-section">System</div>
@@ -3036,7 +2973,7 @@ document.addEventListener('DOMContentLoaded', function(){
       <div class="hero-stats-row" id="heroStatsRow">
         <div class="hero-stat"><div class="hero-stat-val" id="h-rev">—</div><div class="hero-stat-lbl">Today Revenue</div></div>
         <div class="hero-stat"><div class="hero-stat-val" id="h-ord">214</div><div class="hero-stat-lbl">Orders</div></div>
-        <div class="hero-stat"><div class="hero-stat-val" id="h-cov">583</div><div class="hero-stat-lbl">Covers</div></div>
+        <div class="hero-stat"><div class="hero-stat-val" id="h-cov">—</div><div class="hero-stat-lbl">Covers</div></div>
       </div>
     </div>
   </div>
@@ -3418,7 +3355,7 @@ document.addEventListener('DOMContentLoaded', function(){
         <span style="font-size:10px;color:var(--text3);">Hourly trend · tap for details</span>
       </div>
       <div style="margin-bottom:8px;">
-        <div style="font-family:'Playfair Display',serif;font-size:20px;font-weight:700;">₹1,96,540</div>
+        <div style="font-family:'Playfair Display',serif;font-size:20px;font-weight:700;" id="dashSalesOverviewValue">—</div>
         <div style="font-size:10px;color:var(--green);">▲ 12.5% vs Yesterday</div>
       </div>
       <div class="chart-area" style="height:110px;">
@@ -3438,8 +3375,8 @@ document.addEventListener('DOMContentLoaded', function(){
         </div>
         <div class="ai-pred-card">
           <div class="ai-tag">🤖 AI POWERED · BALAJI NEXTGEN</div>
-          <div class="ai-val">₹2,45,000</div>
-          <div class="ai-chg">Predicted Tomorrow · ▲ 14.6% vs Today</div>
+          <div class="ai-val">—</div>
+          <div class="ai-chg">Live forecast unavailable until a real forecasting source is connected.</div>
           <div class="ai-bars" id="aiPredBars"></div>
           <div style="display:flex;justify-content:space-between;font-size:8px;color:rgba(255,255,255,.5);margin-top:3px;">
             <span>12AM</span><span>6AM</span><span>12PM</span><span>6PM</span><span>12AM</span>
@@ -3533,12 +3470,12 @@ document.addEventListener('DOMContentLoaded', function(){
        OCCUPIED, RESERVATIONS, TOTAL TABLES, TOTAL PAX) into a single grid
        container with responsive CSS to display all 6 in one line on desktop. -->
   <div class="grid kpi-row-6col" style="margin-bottom:14px;">
-    <div class="stat" style="background:#e9f9f3;color:#0f9d6a;border:1px solid #d3f0e4;"><div style="font-size:10.5px;font-weight:800;opacity:.85;margin-bottom:6px;letter-spacing:.4px;">AVAILABLE</div><div style="font-family:'Playfair Display',serif;font-size:26px;font-weight:800;line-height:1;" id="tm-a">18</div></div>
-    <div class="stat" style="background:#fdf3e2;color:#c98a1f;border:1px solid #f6e6c4;"><div style="font-size:10.5px;font-weight:800;opacity:.85;margin-bottom:6px;letter-spacing:.4px;">RUNNING</div><div style="font-family:'Playfair Display',serif;font-size:26px;font-weight:800;line-height:1;" id="tm-r">12</div></div>
-    <div class="stat" style="background:#fbeceb;color:#cf4640;border:1px solid #f4d8d6;"><div style="font-size:10.5px;font-weight:800;opacity:.85;margin-bottom:6px;letter-spacing:.4px;">OCCUPIED</div><div style="font-family:'Playfair Display',serif;font-size:26px;font-weight:800;line-height:1;" id="tm-o">09</div></div>
-    <div class="stat" style="background:#eaf1fb;color:#3568b8;border:1px solid #d6e3f5;"><div style="font-size:10.5px;font-weight:800;opacity:.85;margin-bottom:6px;letter-spacing:.4px;">RESERVATIONS</div><div style="font-family:'Playfair Display',serif;font-size:26px;font-weight:800;line-height:1;" id="tm-rv">06</div></div>
-    <div class="stat" style="background:#f3eefb;color:#6b3fa0;border:1px solid #e3d6f4;"><div style="font-size:10.5px;font-weight:800;opacity:.85;margin-bottom:6px;letter-spacing:.4px;">TOTAL TABLES</div><div style="font-family:'Playfair Display',serif;font-size:26px;font-weight:800;line-height:1;" id="tm-total">00</div></div>
-    <div class="stat" style="background:#eef6fb;color:#1f6f96;border:1px solid #d3e9f2;"><div style="font-size:10.5px;font-weight:800;opacity:.85;margin-bottom:6px;letter-spacing:.4px;">TOTAL PAX (SEATING CAPACITY)</div><div style="font-family:'Playfair Display',serif;font-size:26px;font-weight:800;line-height:1;" id="tm-pax">00</div></div>
+    <div class="stat" style="background:#e9f9f3;color:#0f9d6a;border:1px solid #d3f0e4;"><div style="font-size:10.5px;font-weight:800;opacity:.85;margin-bottom:6px;letter-spacing:.4px;">AVAILABLE</div><div style="font-family:'Playfair Display',serif;font-size:26px;font-weight:800;line-height:1;" id="tm-a">—</div></div>
+    <div class="stat" style="background:#fdf3e2;color:#c98a1f;border:1px solid #f6e6c4;"><div style="font-size:10.5px;font-weight:800;opacity:.85;margin-bottom:6px;letter-spacing:.4px;">RUNNING</div><div style="font-family:'Playfair Display',serif;font-size:26px;font-weight:800;line-height:1;" id="tm-r">—</div></div>
+    <div class="stat" style="background:#fbeceb;color:#cf4640;border:1px solid #f4d8d6;"><div style="font-size:10.5px;font-weight:800;opacity:.85;margin-bottom:6px;letter-spacing:.4px;">OCCUPIED</div><div style="font-family:'Playfair Display',serif;font-size:26px;font-weight:800;line-height:1;" id="tm-o">—</div></div>
+    <div class="stat" style="background:#eaf1fb;color:#3568b8;border:1px solid #d6e3f5;"><div style="font-size:10.5px;font-weight:800;opacity:.85;margin-bottom:6px;letter-spacing:.4px;">RESERVATIONS</div><div style="font-family:'Playfair Display',serif;font-size:26px;font-weight:800;line-height:1;" id="tm-rv">—</div></div>
+    <div class="stat" style="background:#f3eefb;color:#6b3fa0;border:1px solid #e3d6f4;"><div style="font-size:10.5px;font-weight:800;opacity:.85;margin-bottom:6px;letter-spacing:.4px;">TOTAL TABLES</div><div style="font-family:'Playfair Display',serif;font-size:26px;font-weight:800;line-height:1;" id="tm-total">—</div></div>
+    <div class="stat" style="background:#eef6fb;color:#1f6f96;border:1px solid #d3e9f2;"><div style="font-size:10.5px;font-weight:800;opacity:.85;margin-bottom:6px;letter-spacing:.4px;">TOTAL PAX (SEATING CAPACITY)</div><div style="font-family:'Playfair Display',serif;font-size:26px;font-weight:800;line-height:1;" id="tm-pax">—</div></div>
   </div>
   <div class="fbar" id="tableFilterBar">
     <div class="search"><span>🔍</span><input id="tableMgmtSearch" placeholder="Search Table / Steward / Zone…" oninput="filterRTC(this.value)"></div>
@@ -3691,7 +3628,7 @@ document.addEventListener('DOMContentLoaded', function(){
 ═══════════════════════════════════════════════════════ -->
 <div class="page" id="page-kot">
   <div class="section-h">
-    <div><h2>Kitchen Order Tickets</h2><p id="kotPageSub">7 active · 3 urgent · Real-time sync</p></div>
+    <div><h2>Kitchen Order Tickets</h2><p id="kotPageSub">Loading live KOTs…</p></div>
     <div style="display:flex;gap:7px;">
       <button class="btn btn-sm" style="background:var(--gold);color:#fff;" onclick="kotOpenManualAdd()">➕ New KOT</button>
       <button class="btn btn-sm btn-primary" onclick="printAllKOT()">🖨 Print All</button>
@@ -3699,10 +3636,10 @@ document.addEventListener('DOMContentLoaded', function(){
     </div>
   </div>
   <div class="grid g4" style="margin-bottom:13px;">
-    <div class="stat"><div class="stat-icon i-blue">🆕</div><div class="stat-val" id="kot-stat-new">3</div><div class="stat-lbl">New Orders</div></div>
-    <div class="stat"><div class="stat-icon i-orange">🔥</div><div class="stat-val" id="kot-stat-progress">3</div><div class="stat-lbl">In Progress</div></div>
-    <div class="stat"><div class="stat-icon i-green">✅</div><div class="stat-val" id="kot-stat-ready">1</div><div class="stat-lbl">Ready to Serve</div></div>
-    <div class="stat"><div class="stat-icon i-red">⏰</div><div class="stat-val" id="kot-stat-delayed">2</div><div class="stat-lbl">Delayed (20m+)</div></div>
+    <div class="stat"><div class="stat-icon i-blue">🆕</div><div class="stat-val" id="kot-stat-new">—</div><div class="stat-lbl">New Orders</div></div>
+    <div class="stat"><div class="stat-icon i-orange">🔥</div><div class="stat-val" id="kot-stat-progress">—</div><div class="stat-lbl">In Progress</div></div>
+    <div class="stat"><div class="stat-icon i-green">✅</div><div class="stat-val" id="kot-stat-ready">—</div><div class="stat-lbl">Ready to Serve</div></div>
+    <div class="stat"><div class="stat-icon i-red">⏰</div><div class="stat-val" id="kot-stat-delayed">—</div><div class="stat-lbl">Delayed (20m+)</div></div>
   </div>
   <!-- FIX ("KOT Kanban layout"): Create 3-column status-based layout
        instead of flat grid. Groups orders by status: New → In Progress → Ready
@@ -4480,7 +4417,7 @@ document.addEventListener('DOMContentLoaded', function(){
         }catch(e){} })();</script>
       </div>
       <div style="font-size:11px;color:var(--text3);">Master Sheet ID: <span class="mono">1FuNJ_XejE2ekYTnk71wXVZ79hRJgu7pmIA6fuE-Iu7I</span></div>
-      <div style="font-size:11px;color:var(--text3);margin-top:3px;">Website: https://balajinextgensolution.netlify.app/ · AppSheet: Connected</div>
+      <div style="font-size:11px;color:var(--text3);margin-top:3px;">Website: https://balajinextgensolution.Google Apps Script.app/ · AppSheet: Connected</div>
     </div>
     <!-- Integrations -->
     <div class="stg-panel" id="s-integrations" style="display:none;">
@@ -9635,26 +9572,6 @@ function bnxElapsedFromAnyTime(raw){
   if (diff < 0) diff += 24*60;
   return diff+'m';
 }
-// FIX (console: "ReferenceError: bnxKotElapsedMin is not defined") —
-// called from 9 places across the file (KOT delay badges, the delayed-
-// KOT count used to flag orders running >=20 minutes, "Xm ago" labels
-// on KOT tickets) but never actually defined anywhere. Every one of
-// those calls threw, so the delayed-KOT alert and every "Xm ago" label
-// silently failed and never rendered. Takes a raw timestamp (whatever
-// format `new Date()` accepts — this file's KOT records store full
-// ISO/date-time strings, not bare clock times, so this is deliberately
-// simpler than bnxElapsedFromAnyTime() above, which parses "HH:MM"
-// clock-only strings and returns a string, not a number) and returns
-// whole elapsed minutes as a number, matching every call site's use
-// (compared with >=20, concatenated with 'm').
-function bnxKotElapsedMin(time){
-  try{
-    if(!time) return 0;
-    const d = new Date(time);
-    if(isNaN(d.getTime())) return 0;
-    return Math.max(0, Math.floor((Date.now()-d.getTime())/60000));
-  }catch(e){ return 0; }
-}
 function buildActiveOrders(data){
   const t=document.getElementById('activeOrdersTbl'); if(!t) return;
   // FIX (THE MAIN BUG — "dashboard till show wrong data"): this used to
@@ -12447,7 +12364,7 @@ async function bnxPullKotsFromServer(){
 }
 
 async function bnxSyncLiveKots(){
-  if (typeof erpApi !== 'function' || !CLIENT_ID) return;
+  if (typeof erpApi !== 'function' || !CLIENT_ID) return false;
   // PASS #50 FIX (companion to the steward app's own loadKOTFromServer
   // fix — "KOT CHECK FALSE" / "In Progress always 0"): COOKING/
   // PREPARING/IN_PROGRESS all used to collapse to 'NEW', so a ticket
@@ -12460,9 +12377,18 @@ async function bnxSyncLiveKots(){
     COOKING:'PROGRESS', PREPARING:'PROGRESS', IN_PROGRESS:'PROGRESS', PROGRESS:'PROGRESS',
     READY:'READY', SERVED:'SERVED' };
   let res;
-  try{ res = await erpApi({action:'GET_ACTIVE_ORDERS'}, 'V2_CORE'); }catch(e){ return; }
+  try{ res = await erpApi({action:'GET_ACTIVE_ORDERS'}, 'V2_CORE'); }catch(e){ return false; }
   const orders = res && res.success && res.data && Array.isArray(res.data.orders) ? res.data.orders : null;
-  if (!orders || !orders.length) return; // no live data — leave local store as-is
+  /* A successful live response with zero active orders is authoritative.
+     Never keep yesterday's browser-local KOTs on screen and call them live. */
+  if (!orders) return false;
+  if (!orders.length){
+    let local=[]; try{ local=JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
+    const unsynced=local.filter(k=>!k.serverKotId && k.syncPending===true);
+    bnxSetOpenKotsRaw(JSON.stringify(unsynced));
+    bnxSyncKotBadge();
+    return true;
+  }
 
   const STATUS_RANK = { NEW:0, PROGRESS:1, READY:2, SERVED:3 };
   let open = [];
@@ -12495,7 +12421,8 @@ async function bnxSyncLiveKots(){
   });
   if (open.length>100) open = open.slice(0,100);
   bnxSetOpenKotsRaw(JSON.stringify(open));
-
+  bnxSyncKotBadge();
+  return true;
 }
 function nxKotElapsedMin(iso){
   return Math.max(0, Math.round((Date.now() - new Date(iso).getTime())/60000));
@@ -14854,15 +14781,7 @@ function bmSearchQuick(term){
    FOOD" or a custom line) — it no longer needs to be flipped when you
    add a catalogued item, so there's nothing to auto-switch here anymore. */
 function bmAddProductToQuickBill(id,gridId){
-  // FIX (product tile tap doing nothing): bnxGetBillMenu()'s id comes from
-  // menuData's "code" field, which is the server's raw numeric row id for
-  // any live-server item (only locally-added ad-hoc items get a generated
-  // "ITM..." string). The onclick handlers below always pass id as a
-  // string, so x.id===id (strict, no type coercion) silently failed to
-  // match every live-server item with a numeric id — tapping its tile did
-  // nothing at all. String() both sides, same fix already applied to the
-  // Steward app's addItem()/placeOrder().
-  const m=bnxGetBillMenu().find(x=>String(x.id)===String(id));if(!m)return;
+  const m=bnxGetBillMenu().find(x=>x.id===id);if(!m)return;
   let found=false;
   document.querySelectorAll('[id^="bm-irow-"]').forEach(row=>{
     const rowId=row.id.replace('bm-irow-','');
@@ -22849,15 +22768,7 @@ async function addStewardDlg(onSaved){
   if (typeof showNotif === 'function') showNotif(savedReal ? ('✅ '+name.trim()+' added to real staff database') : ('⚠️ '+name.trim()+' saved locally only — backend unreachable, will not sync yet'), savedReal?'success':'error');
   if (typeof onSaved === 'function') onSaved(name.trim(), code);
 }
-// FIX (console: "ReferenceError: loadWaiterList is not defined"): the
-// real definition (window.loadWaiterList = async function(){...}) lives
-// in a LATER, separate <script> block further down the page. Referencing
-// the bare name here evaluates it immediately (to get the function
-// reference for addEventListener), which ran before that later block
-// had executed — deferring the lookup into a small wrapper means it
-// only runs once DOMContentLoaded actually fires, by which point every
-// script block on the page has already run.
-document.addEventListener('DOMContentLoaded', function(){ if (typeof loadWaiterList === 'function') loadWaiterList(); });
+document.addEventListener('DOMContentLoaded', loadWaiterList);
 
 /* PASS #20 NEW ("Today's Staff Schedule wrong show"): see the fix note
    on that card's markup above for the full root-cause writeup. Same
@@ -23518,20 +23429,7 @@ const ORDER_REG_STATUS_COLORS = {
    Fixed below: orders now carry both ORDER_SOURCE and ORDER_TYPE,
    filters operate on ORDER_SOURCE (matches 18_CAPTAIN_ORDER_MASTER),
    and ORDER_TYPE is shown as a secondary badge. */
-// FIX (console: "ReferenceError: orderRegData is not defined" at
-// bnxComputeDashExtras_, block 7): this file has several separate
-// top-level <script> tags. `let`/`const` declarations are scoped to
-// their OWN script tag only — they never become a shared global the
-// way `var` or a plain assignment does. orderRegData was declared with
-// `let` inside a LATER script block (Order Register), so code in this
-// EARLIER block could never see it at all — not a timing issue, a
-// scope issue: even after the Order Register block finished loading
-// real data, this block still couldn't read it, so Dine-in/Parcel/
-// Online here stayed stuck on "—" permanently. Declaring it on
-// `window` instead makes it one real shared global every block (and
-// every later plain `orderRegData = ...` reassignment already in this
-// file) reads and writes the same value.
-window.orderRegData = [];
+let orderRegData = [];
 let orderRegFilterType = null;
 let ncTargetOrderId = null;
 const ORDER_SOURCE_LIST = ['POS','STEWARD','CUSTOMER','ONLINE'];
