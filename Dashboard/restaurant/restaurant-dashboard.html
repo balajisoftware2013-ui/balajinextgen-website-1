@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<!-- WORLD-CLASS-ALL-PROBLEMS-FINAL-V2-2026-09-07 -->
+<!-- WORLD-CLASS-PROFESSIONAL-LIVE-REPORT-FIX-V3-2026-09-07 -->
 <!-- BALAJI NEXTGEN ERP · PROFESSIONAL FINAL · LIVE DATA ONLY · 2026-09-07 -->
 <!-- FIX ("rupee sign / ₹ not showing properly everywhere"): meta
      charset MUST be one of the very first things in <head> (within the
@@ -215,7 +215,8 @@ async function bnxFetchJson_(endpoint, options){
 
         const parsedAction = (()=>{ try{return JSON.parse(fetchOpts.body||'{}').action||'';}catch(e){return '';} })();
         const timeoutMs = Number(fetchOpts.timeoutMs) ||
-          (/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? BNX_WRITE_TIMEOUT_MS : BNX_READ_TIMEOUT_MS);
+          (/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? BNX_WRITE_TIMEOUT_MS :
+           /^(GET_|LIST_|RD_)/i.test(parsedAction) ? BNX_REPORT_TIMEOUT_MS : BNX_READ_TIMEOUT_MS);
         delete fetchOpts.timeoutMs;
 
         const timeoutCtrl = new AbortController();
@@ -414,6 +415,10 @@ const REQUEST_QUEUE = { pending: [], active: 0, maxConcurrent: 5 };
 const API_RETRY_CONFIG = { maxAttempts: 3, baseDelay: 250, maxDelay: 2500 };
 const BNX_READ_TIMEOUT_MS = 8000;
 const BNX_WRITE_TIMEOUT_MS = 12000;
+// Heavy Tally-style reports may scan BILL/PAYMENT/BILL_ITEMS/MASTER sheets.
+// Give report reads enough time to complete instead of falsely presenting
+// a timeout as an empty/demo report.
+const BNX_REPORT_TIMEOUT_MS = 30000;
 // HANG FIX: identical GET/summary requests fired by multiple startup listeners
 // are coalesced into ONE network request. This page previously requested
 // GET_DASHBOARD_SUMMARY several times during startup, filling the queue when
@@ -2688,7 +2693,7 @@ body.pos-machine .pos-wrap{grid-template-columns:1fr 380px;}
 }
 </style>
 
-<!-- REPORTS-KOT-TALLY-EXPORT-ALL-END-TO-END-FIXED-V2-2026-09-07 -->
+<!-- WORLD-CLASS-PROFESSIONAL-LIVE-REPORT-FIX-V3-2026-09-07 -->
 </head>
 <body>
 
@@ -5309,7 +5314,7 @@ document.addEventListener('DOMContentLoaded', function(){
        this codebase. "Mark Settled" only does local arithmetic on
        whatever's already on screen — it doesn't reach a real backend.
        Marked honestly as demo, same as the other two pages. -->
-  <div id="asDemoBanner" style="font-size:10.5px;color:var(--gold);font-weight:700;background:var(--gold-bg);border:1px solid var(--gold);border-radius:8px;padding:8px 12px;margin-bottom:12px;">🟡 Demo data — not connected to live aggregator (Zomato/Swiggy/etc.) settlement data yet. "Mark Settled" only updates what's on screen, it doesn't record anything real.</div>
+  <div id="asDemoBanner" style="font-size:10.5px;color:var(--gold);font-weight:700;background:var(--gold-bg);border:1px solid var(--gold);border-radius:8px;padding:8px 12px;margin-bottom:12px;">⚠️ Live aggregator settlement is not connected. No settlement values are fabricated.</div>
   <div class="grid g4" style="margin-bottom:16px;">
     <div class="stat gold"><div class="stat-icon i-gold">💸</div><div class="stat-val" id="asTotalBilled">₹0.00</div><div class="stat-lbl">Total Billed (Month) <span class="pill p-gold" style="font-size:8.5px;">Demo</span></div></div>
     <div class="stat green"><div class="stat-icon i-green">✅</div><div class="stat-val" id="asSettled">₹0.00</div><div class="stat-lbl">Settled / Received <span class="pill p-gold" style="font-size:8.5px;">Demo</span></div></div>
@@ -6156,7 +6161,7 @@ document.addEventListener('DOMContentLoaded', function(){
           <!-- populated by loadDsrMatrix() -->
         </table>
       </div>
-      <div style="font-size:10.5px;color:var(--text3);padding:10px 4px 0;">💡 Auto-generated from POS sales as bills are settled, or from an uploaded DSR sheet via Import Hub — whichever is present for each date. Format matches your existing Tally-style monthly DSR exactly.</div>
+      <div style="font-size:10.5px;color:var(--text3);padding:10px 4px 0;">💡 Generated from live POS/report data or an uploaded DSR source in Import Hub; no sample values are inserted. Format matches your existing Tally-style monthly DSR exactly.</div>
     </div>
   </div>
 
@@ -18778,6 +18783,9 @@ function gdSaveEntry(){
 }
 
 async function loadDsrMatrix(){
+  // Always wait for the live deployment configuration before the first
+  // report call. This prevents a report request from racing GET_CONFIG.
+  try { if (window.__bnxConfigReady) await window.__bnxConfigReady; } catch(e) {}
   const picker = document.getElementById('dsrMonthPicker');
   if (!picker.value){
     const now = new Date();
@@ -18799,24 +18807,36 @@ async function loadDsrMatrix(){
   // placeholder numbers for real ones during testing.
   let dayData = {};
   let usedLiveData = false;
-  try{
-    const resp = await erpApi({action:'GET_DSR_MATRIX', year, month}, 'V2_CORE');
-    if (resp && resp.success && resp.data && resp.data.byDay && Object.keys(resp.data.byDay).length){
-      for (let d = 1; d <= daysInMonth; d++){
-        const key = String(d).padStart(2,'0');
-        dayData[d] = resp.data.byDay[key] || null;
+  let reportError = '';
+  const reportPayload = {action:'GET_DSR_MATRIX', year, month};
+  // First request uses the normal report timeout. A transient transport
+  // failure is retried once after clearing the short API circuit.
+  for (let attempt = 0; attempt < 2 && !usedLiveData; attempt++) {
+    try {
+      if (attempt) {
+        try { bnxResetApiCircuit_('V2_CORE'); } catch(e) {}
+        await new Promise(r=>setTimeout(r, 350));
       }
-      usedLiveData = true;
-    }
-  } catch(e){ /* fall through to demo below */ }
-  if (!usedLiveData){
+      const resp = await erpApi(reportPayload, 'V2_CORE');
+      if (resp && resp.success && resp.data && resp.data.byDay) {
+        for (let d = 1; d <= daysInMonth; d++){
+          const key = String(d).padStart(2,'0');
+          dayData[d] = resp.data.byDay[key] || null;
+        }
+        usedLiveData = true;
+      } else {
+        reportError = (resp && resp.error) || 'Live report returned no data';
+      }
+    } catch(e) { reportError = e && e.message ? e.message : 'Live report request failed'; }
+  }
+  if (!usedLiveData) {
     for (let d = 1; d <= daysInMonth; d++) dayData[d] = null;
   }
   bnxSetReportBadge('dsrDataBadge', usedLiveData);
 
   if (!usedLiveData){
     const tb=document.getElementById('dsrTableBody');
-    if(tb) tb.innerHTML='<tr><td colspan="30" style="text-align:center;padding:20px;color:var(--gold);">🟡 Demo data — backend not connected yet. No DSR values are fabricated.</td></tr>';
+    if(tb) tb.innerHTML='<tr><td colspan="30" style="text-align:center;padding:20px;color:var(--red);">⚠️ Live DSR data is unavailable. '+String(reportError||'The report backend returned no data.').replace(/</g,'&lt;')+'</td></tr>';
   }
   // MTD totals = sum of every day that has data
   const mtd = {};
@@ -19126,7 +19146,7 @@ async function cbLoadDaily(){
     ? (`<tr><td>Opening</td><td>Opening Cash Balance (not tracked — starts at ₹0)</td><td class="mono" style="color:var(--green)">₹${opening.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td><td>—</td><td class="mono">₹${opening.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td></tr>`
       + rowsHtml +
       `<tr class="rpt-total-row"><td colspan="3">Closing Balance</td><td>—</td><td class="mono" style="color:var(--gold)">₹${bal.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td></tr>`)
-    : '<tr><td colspan="5" style="text-align:center;color:var(--gold);padding:20px;">🟡 Demo data — backend not connected yet. No cash-book values are fabricated.</td></tr>';
+    : '<tr><td colspan="5" style="text-align:center;color:var(--gold);padding:20px;">⚠️ Live data unavailable — backend did not return this report. No cash-book values are fabricated.</td></tr>';
 }
 async function cbLoadMTD(){
   const picker = document.getElementById('cbMonthPicker');
@@ -19187,7 +19207,7 @@ async function cbLoadMTD(){
   html += `<tr style="background:var(--gold-bg);font-weight:800;"><td style="position:sticky;left:0;background:var(--gold-bg);z-index:1;padding:5px 8px;">Closing Balance</td><td style="padding:5px 6px;text-align:right;">${running.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>`
     + balRow.map(v=>`<td style="padding:5px 4px;text-align:right;font-size:12px;">${v.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>`).join('') + '</tr>';
   html += '</tbody>';
-  document.getElementById('cbMtdTable').innerHTML = liveByDate ? html : '<tbody><tr><td style="padding:20px;text-align:center;color:var(--gold);">🟡 Demo data — backend not connected yet. No MTD cash values are fabricated.</td></tr></tbody>';
+  document.getElementById('cbMtdTable').innerHTML = liveByDate ? html : '<tbody><tr><td style="padding:20px;text-align:center;color:var(--gold);">⚠️ Live data unavailable — backend did not return this report. No MTD cash values are fabricated.</td></tr></tbody>';
 }
 /* PASS #22 FIX ("all live data ... give real data"): cbLoadYTD() always
    called cbDemoDayData() for every single day of the fiscal year --
@@ -19261,7 +19281,7 @@ async function cbLoadYTD(){
   html += `<tr style="background:var(--gold-bg);font-weight:800;"><td style="position:sticky;left:0;background:var(--gold-bg);z-index:1;padding:5px 8px;">Closing Balance</td><td style="padding:5px 6px;text-align:right;">${running.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>`
     + balRow.map(v=>`<td style="padding:5px 6px;text-align:right;font-size:11px;">${v.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>`).join('') + '</tr>';
   html += '</tbody>';
-  document.getElementById('cbYtdTable').innerHTML = anyLive ? html : '<tbody><tr><td style="padding:20px;text-align:center;color:var(--gold);">🟡 Demo data — backend not connected yet. No YTD cash values are fabricated.</td></tr></tbody>';
+  document.getElementById('cbYtdTable').innerHTML = anyLive ? html : '<tbody><tr><td style="padding:20px;text-align:center;color:var(--gold);">⚠️ Live data unavailable — backend did not return this report. No YTD cash values are fabricated.</td></tr></tbody>';
 }
 document.addEventListener('DOMContentLoaded', function(){
   const cbd = document.getElementById('cbDatePicker');
@@ -23317,8 +23337,8 @@ function bnxTogglePosIntegrationMode(){
 function bnxSetReportBadge(elId, isLive){
   const el = document.getElementById(elId);
   if (!el) return;
-  el.textContent = isLive ? '🟢 Live from database' : '🟡 Demo data — backend not connected yet';
-  el.className = 'pill ' + (isLive ? 'p-g' : 'p-gold');
+  el.textContent = isLive ? '🟢 Live from database' : '⚠️ Live data unavailable';
+  el.className = 'pill ' + (isLive ? 'p-g' : 'p-red');
 }
 
 /* PASS #25 NEW ("Reports Hub ... check till demo data shows ... give
