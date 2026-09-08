@@ -16143,14 +16143,43 @@ function bnxPurgeKnownInvalidFailed_(){
     if(cleanPending.length!==pending.length) localStorage.setItem(bnxOutboxKey(),JSON.stringify(cleanPending));
   }catch(e){ console.warn('[OUTBOX CLEANUP]',e); }
 }
+// FIX ("8 sync issues — tap to retry" never actually clearing — Sep
+// 2026): "Order not found for this client" means the referenced
+// order/KOT/bill no longer exists server-side at all (already
+// deleted, settled, or test data that was cleared) — no amount of
+// retrying can ever create a record that isn't there. "Unknown
+// action: X" means the live backend router has no handler for that
+// action (a deployment/routing gap, e.g. VOID_BILL not wired into
+// doPost() yet) — retrying the same unroutable action just gets the
+// same "unknown action" reply every time. Both used to be treated
+// exactly like a transient network hiccup: burn through 10 attempts
+// with exponential backoff (up to five minutes between the later
+// ones — nearly an hour total before giving up), then land in the
+// failed store. Tapping "tap to retry" then re-queued them AGAIN for
+// the same doomed 10-attempt cycle, so the badge always came back
+// with the same count and made retry look broken.
+function bnxIsNonRetryableOutboxError_(msg){
+  const m=String(msg||'');
+  return /order not found for this client/i.test(m) || /^unknown action:/i.test(m);
+}
 function bnxRetryFailedOutbox(){
   const failed = bnxGetFailedOutbox();
   if(!failed.length) return;
+  // Only genuinely retryable entries (transient network/session/etc.
+  // errors) get requeued. Non-retryable ones stay in the failed store
+  // untouched, with their real reason intact, so they get reported to
+  // the backend team instead of silently re-attempted forever.
+  const retryable = failed.filter(e=>!bnxIsNonRetryableOutboxError_(e.lastError));
+  const stuck = failed.filter(e=>bnxIsNonRetryableOutboxError_(e.lastError));
+  bnxSetFailedOutbox(stuck);
+  if(!retryable.length){
+    if (typeof showNotif === 'function') showNotif('⚠️ '+stuck.length+' sync issue'+(stuck.length>1?'s':'')+' need a backend fix, not a retry — see console for details','error');
+    return;
+  }
   const live = bnxGetOutbox();
-  failed.forEach(e=>{ e.attempts=0; e.lastAttemptAt=0; live.push(e); });
-  bnxSetFailedOutbox([]);
+  retryable.forEach(e=>{ e.attempts=0; e.lastAttemptAt=0; live.push(e); });
   bnxSetOutbox(live);
-  if (typeof showNotif === 'function') showNotif('Retrying '+failed.length+' failed sync item(s)…', 'info');
+  if (typeof showNotif === 'function') showNotif('Retrying '+retryable.length+' failed sync item(s)…'+(stuck.length?(' ('+stuck.length+' need a backend fix, left as-is)'):''), 'info');
   flushOutbox();
 }
 let bnxLiveStatus = 'checking';
@@ -16206,11 +16235,12 @@ async function flushOutbox(){
       // no way to tell a session/auth failure apart from a scope
       // violation or a missing tab. Stash it on the entry every attempt.
       entry.lastError = (res && res.error) || (res && res.errorCode) || 'No response from server';
-      if(entry.attempts < 10){
+      const nonRetryable = bnxIsNonRetryableOutboxError_(entry.lastError);
+      if(entry.attempts < 10 && !nonRetryable){
         remaining.push(entry);
         anyFailed = true;
       } else {
-        console.error('[OUTBOX] gave up after 10 attempts, moved to failed store. Reason:', entry.lastError, entry);
+        console.error('[OUTBOX] '+(nonRetryable?'non-retryable error — moved to failed store immediately.':'gave up after 10 attempts, moved to failed store.')+' Reason:', entry.lastError, entry);
         const failed = bnxGetFailedOutbox();
         failed.push(entry);
         bnxSetFailedOutbox(failed);
