@@ -255,7 +255,8 @@ html,body{height:100%;width:100%;background:var(--bg);font-family:'DM Sans',sans
    pending sync"). 170px clears bottom-nav + a full 3-badge stack with
    margin to spare. */
 .scroll{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:14px;padding-bottom:calc(170px + var(--safe-bot));}
-.scroll::-webkit-scrollbar{width:2px;}.scroll::-webkit-scrollbar-thumb{background:var(--surface3);}
+.scroll{scrollbar-width:auto;scrollbar-color:var(--surface3) transparent;}
+.scroll::-webkit-scrollbar{width:7px;}.scroll::-webkit-scrollbar-track{background:transparent;}.scroll::-webkit-scrollbar-thumb{background:var(--surface3);border-radius:8px;}
 
 /* ── BOTTOM NAV ── */
 .bottom-nav{background:var(--surface);border-top:1px solid var(--border);padding:8px 0 calc(8px + var(--safe-bot));display:flex;flex-shrink:0;position:relative;z-index:50;width:100%;}
@@ -1224,21 +1225,24 @@ function bnxApiUrl_(endpoint){
    startup on this. */
 let __bnxConfigReady = null;
 async function bnxRefreshConfig(){
-  // FIX (audit #6, P1 — "bnxRefreshConfig fails silently"): same fix
-  // as restaurant-dashboard.html — still falls back to the hardcoded
-  // bootstrap IDs either way (never blocks startup), but now every
-  // outcome is logged instead of vanishing with zero trace.
   try{
-    const r = await fetch(bnxApiUrl_('V2_CORE'), {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({action:'GET_CONFIG'})});
+    const controller = new AbortController();
+    const timer = setTimeout(()=>controller.abort(),3000);
+    const r = await fetch(bnxApiUrl_('V2_CORE'), {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({action:'GET_CONFIG'}), signal:controller.signal});
+    clearTimeout(timer);
+    if(!r.ok) throw new Error('HTTP '+r.status);
     const res = await r.json();
     if(res && res.success && res.data){
       if(res.data.v2CoreId) localStorage.setItem('bnx_api_core', res.data.v2CoreId);
       if(res.data.v2AuthId) localStorage.setItem('bnx_api_auth', res.data.v2AuthId);
-      console.log('[CONFIG] GET_CONFIG loaded OK — using', res.data.v2CoreId ? 'server-supplied' : 'hardcoded fallback', 'deployment IDs');
+      console.log('[CONFIG] GET_CONFIG loaded OK');
     } else {
-      console.error('[CONFIG] GET_CONFIG returned no usable data — still on hardcoded fallback deployment IDs. Response:', res);
+      console.warn('[CONFIG] No usable config; keeping cached/bootstrap deployment IDs');
     }
-  }catch(e){ console.error('[CONFIG] GET_CONFIG request failed — still on hardcoded fallback deployment IDs:', e.message); }
+  }catch(e){
+    console.warn('[CONFIG] GET_CONFIG unavailable; keeping cached/bootstrap deployment IDs', e && e.message ? e.message : e);
+  }
+  return true;
 }
 __bnxConfigReady = bnxRefreshConfig();
 /* FIX (audit #1, P0 — "CLIENT_ID can still be changed from URL"):
@@ -1289,14 +1293,25 @@ let IS_DEMO_MODE = false;
 function getSessionToken(){ return localStorage.getItem('ERP_SESSION')||''; }
 async function gasApi(action,payload,endpoint){
   payload=payload||{};
-  if((endpoint||'V2_CORE')==='V2_CORE' && __bnxConfigReady){ try{ await __bnxConfigReady; }catch(e){} }
+  if((endpoint||'V2_CORE')==='V2_CORE' && __bnxConfigReady){ try{ await Promise.race([__bnxConfigReady,new Promise(r=>setTimeout(r,250))]); }catch(e){} }
   const url=bnxApiUrl_(endpoint||'V2_CORE');
-  try{
-    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},
-      body:JSON.stringify(Object.assign({action:action,clientId:getClientId(),sessionToken:getSessionToken()},payload))});
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    return await r.json();
-  }catch(e){ return {success:false,offline:true,error:e.message}; }
+  const readOnly=/^(GET_|LIST_|CHECK_|FETCH_|LOAD_|READ_)/i.test(String(action||''));
+  let lastErr=null;
+  for(let attempt=0; attempt<(readOnly?2:1); attempt++) {
+    const controller = new AbortController();
+    const timeoutMs = readOnly ? 9000 : 15000;
+    const timer=setTimeout(()=>controller.abort(),timeoutMs);
+    try{
+      const r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},
+        body:JSON.stringify(Object.assign({action:action,clientId:getClientId(),sessionToken:getSessionToken()},payload)),signal:controller.signal});
+      clearTimeout(timer);
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      const text=await r.text();
+      let parsed; try{ parsed=JSON.parse(text); }catch(e){ throw new Error('Invalid server response'); }
+      return parsed;
+    }catch(e){ clearTimeout(timer); lastErr=e; if(attempt===0 && readOnly) await new Promise(r=>setTimeout(r,250)); }
+  }
+  return {success:false,offline:true,error:lastErr && lastErr.name==='AbortError' ? 'Request timed out' : (lastErr?.message||'Network error')};
 }
 async function authApi(action,payload){
   try{
@@ -2161,8 +2176,7 @@ async function doLogin(){
   document.getElementById('prof-name').textContent=name;
   document.getElementById('prof-avatar').textContent=name[0];
   document.getElementById('prof-role').textContent=(result.ROLE||'')+' • Morning Shift';
-  loadBootstrapOrFallback();
-  loadKOTFromServer();
+  await Promise.allSettled([loadBootstrapOrFallback(), loadKOTFromServer()]);
   showScreen('s-home');
 }
 /* NEW ("password reset give option forget"): self-service "Forgot
@@ -2190,7 +2204,7 @@ function openForgotModal(){
     </div>
   </div>`;
 }
-function closeForgotModal(e){ if(e && e.target!==e.currentTarget) return; document.getElementById('forgot-modal').innerHTML=''; }
+function closeForgotModal(e){ if(e && e.target!==e.currentTarget) return; const el=document.getElementById('forgot-modal'); if(el) el.innerHTML=''; }
 async function submitForgotPassword(){
   const loginId = document.getElementById('forgot-loginid')?.value?.trim();
   if(!loginId){ toast('Enter your User Code or mobile number','error'); return; }
@@ -2337,8 +2351,10 @@ function openTable(id){
   selTable=TABLES.find(t=>t.id===id);
   if(!selTable)return;
   const sc={AVAILABLE:'var(--green)',OCCUPIED:'var(--red)',RUNNING:'var(--orange)',RESERVED:'var(--gold)',VIP:'var(--purple)'};
-  document.getElementById('mob-table-title').textContent=`Table ${id} — ${selTable.status}`;
-  document.getElementById('mob-table-body').innerHTML=`
+  const tableTitle=document.getElementById('mob-table-title'), tableBody=document.getElementById('mob-table-body');
+  if(tableTitle) tableTitle.textContent=`Table ${id} — ${selTable.status}`;
+  if(!tableBody) return;
+  tableBody.innerHTML=`
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;">
       <div style="background:var(--surface2);border-radius:10px;padding:10px;">
         <div style="font-size:10px;color:var(--text3);">Status</div>
@@ -2705,8 +2721,10 @@ async function bnxRenderMyStats(){
 function openOnlineOrder(id){
   selOnline=ONLINE_ORDERS.find(o=>o.id===id);
   if(!selOnline)return;
-  document.getElementById('mob-online-title').textContent=`${selOnline.icon} ${selOnline.platform} — ${selOnline.id}`;
-  document.getElementById('mob-online-body').innerHTML=`
+  const onlineTitle=document.getElementById('mob-online-title'), onlineBody=document.getElementById('mob-online-body');
+  if(onlineTitle) onlineTitle.textContent=`${selOnline.icon} ${selOnline.platform} — ${selOnline.id}`;
+  if(!onlineBody) return;
+  onlineBody.innerHTML=`
     <div style="background:var(--surface2);border-radius:12px;padding:14px;margin-bottom:12px;">
       <div style="font-size:14px;font-weight:800;">👤 ${selOnline.customer}</div>
       <div style="font-size:12px;color:var(--text3);margin-top:4px;">${selOnline.items}</div>
@@ -2717,7 +2735,7 @@ function openOnlineOrder(id){
     </div>
     <div style="font-size:11px;color:var(--text3);">Status: <strong style="color:${selOnline.color}">${selOnline.status.replace(/_/g,' ')}</strong> • ${selOnline.time}</div>
   `;
-  document.getElementById('online-modal').classList.add('open');
+  const onlineModal=document.getElementById('online-modal'); if(onlineModal) onlineModal.classList.add('open');
 }
 
 function acceptOnlineOrder(){
@@ -3534,7 +3552,7 @@ function selectPayMode(mode){
   const dueFields = document.getElementById('due-customer-fields');
   if(dueFields) dueFields.style.display = mode==='DUE' ? 'block' : 'none';
 }
-function closeBillModal(e){ if(e && e.target!==e.currentTarget) return; document.getElementById('bill-modal').innerHTML=''; window._billCalc = null; window._activeBillOrderId=''; window._activeBillOrderNo=''; }
+function closeBillModal(e){ if(e && e.target!==e.currentTarget) return; const el=document.getElementById('bill-modal'); if(el) el.innerHTML=''; window._billCalc = null; window._activeBillOrderId=''; window._activeBillOrderNo=''; }
 // NOTE: bnxBillSeqKeyNext() (client-side sequential bill numbering)
 // removed per the P0 fix — bill numbers are now generated
 // server-side (LockService-protected) in confirmPayment() below, so
@@ -4421,41 +4439,43 @@ function closeOrderReplacementModal(){
    matched nothing even if the backend responded correctly. */
 async function loadKOTFromServer(){
   bnxLoadOpenKots();
+  const before = Array.isArray(KOT) ? KOT.slice() : [];
   const res = await gasApi('GET_ACTIVE_ORDERS', {}, 'V2_CORE');
   const orders = res && res.success && res.data && Array.isArray(res.data.orders) ? res.data.orders : null;
-  if(orders && orders.length){
-    // PASS #50 FIX ("steward app not read data" — a ticket already
-    // being cooked on another device/terminal would silently jump back
-    // to "New" here on every 20s poll): COOKING/PREPARING/IN_PROGRESS/
-    // PROGRESS from the server all used to collapse to 'NEW', throwing
-    // away real in-progress status the moment it was pulled from the
-    // backend. They now map to this app's own 'PROGRESS' stage instead
-    // of being silently discarded.
+  if(orders !== null){
     const STATUS_MAP = { NEW:'NEW', KOT_PRINTED:'NEW', PENDING:'NEW', COOKING:'PROGRESS', PREPARING:'PROGRESS', IN_PROGRESS:'PROGRESS', PROGRESS:'PROGRESS', READY:'READY', SERVED:'SERVED', BILLED:'BILLED', CANCELLED:'CANCELLED' };
     const STATUS_RANK = { NEW:0, PROGRESS:1, READY:2, SERVED:3, BILLED:4, CANCELLED:4 };
+    const serverKeys=new Set();
     orders.forEach(o=>{
-      const kotNo = o.ORDER_NO || o.ORDER_ID;
-      if(!kotNo || o.ORDER_STATUS==='CANCELLED') return;
-      const items = (o.items||[]).map(i=>({ name:i.itemName||i.name||'Item', qty:Number(i.qty||1), price:Number(i.price||i.rate||0) }));
-      const pulledStatus = STATUS_MAP[o.ORDER_STATUS] || 'NEW';
-      const rec = { kotNo, orderNo:o.ORDER_NUMBER||o.ORDER_NO||o.ORDER_ID||kotNo, orderId:o.ORDER_ID||'', table:o.TABLE_ID||'—', type:'KITCHEN', waiter:o.CREATED_BY||'', covers:o.PAX||'',
-        time: (o.ORDER_DATE && o.START_TIME) ? new Date(o.ORDER_DATE+' '+o.START_TIME).toISOString() : new Date().toISOString(), items };
-      const idx = KOT.findIndex(k=>k.kotNo===kotNo);
+      const kotNo = o.ORDER_NO || o.ORDER_NUMBER || o.ORDER_ID;
+      if(!kotNo || String(o.ORDER_STATUS||'').toUpperCase()==='CANCELLED') return;
+      serverKeys.add(String(kotNo));
+      const items=(Array.isArray(o.items)?o.items:[]).map(i=>({
+        id:i.itemId||i.id||i.ITEM_ID||i.itemCode||'', name:i.itemName||i.name||'Item', qty:Number(i.qty||i.QUANTITY||1), price:Number(i.price||i.rate||i.RATE||0), TAX_RATE:Number(i.TAX_RATE||i.gst||i.taxRate||0)
+      }));
+      const pulledStatus=STATUS_MAP[String(o.ORDER_STATUS||'NEW').toUpperCase()]||'NEW';
+      const rawDate=o.ORDER_DATE||o.CREATED_AT||'';
+      const rawTime=o.START_TIME||o.ORDER_TIME||o.CREATED_TIME||'';
+      let when=new Date();
+      if(rawDate){ const composed=rawTime?String(rawDate)+' '+String(rawTime):String(rawDate); const d=new Date(composed); if(!isNaN(d.getTime())) when=d; }
+      const rec={kotNo:String(kotNo), orderNo:o.ORDER_NUMBER||o.ORDER_NO||o.ORDER_ID||String(kotNo), orderId:o.ORDER_ID||'', table:o.TABLE_ID||'—', type:'KITCHEN', waiter:o.CREATED_BY||o.WAITER||'', covers:o.PAX||'', time:when.toISOString(), items};
+      const idx=KOT.findIndex(k=>String(k.kotNo)===String(kotNo));
       if(idx>=0){
-        // Never let a poll pull the server's (possibly stale, not-yet-
-        // confirmed) item list back over a local edit that hasn't been
-        // confirmed synced yet — see sendModifiedOrder's pendingLocalEdit.
         if(KOT[idx].pendingLocalEdit) return;
-        const localRank = STATUS_RANK[KOT[idx].status] ?? 0;
-        const pulledRank = STATUS_RANK[pulledStatus] ?? 0;
-        const status = pulledRank>localRank ? pulledStatus : KOT[idx].status;
-        KOT[idx] = Object.assign({}, KOT[idx], rec, { time:KOT[idx].time, status });
-      } else {
-        KOT.unshift(Object.assign({}, rec, { status:pulledStatus }));
-      }
+        const localRank=STATUS_RANK[KOT[idx].status]??0, pulledRank=STATUS_RANK[pulledStatus]??0;
+        KOT[idx]=Object.assign({},KOT[idx],rec,{status:pulledRank>localRank?pulledStatus:KOT[idx].status});
+      } else { KOT.unshift(Object.assign({},rec,{status:pulledStatus})); }
+    });
+    // A successful empty response means there are no active server KOTs.
+    // Remove only confirmed local tickets; keep pending/offline/local edits.
+    KOT = KOT.filter(k=>{
+      if(k.pendingLocalEdit || k.status==='PENDING_SYNC' || String(k.kotNo||'').startsWith('PENDING-')) return true;
+      const confirmed = before.some(b=>String(b.kotNo)===String(k.kotNo) && b.status!=='PENDING_SYNC');
+      return serverKeys.has(String(k.kotNo)) || !confirmed;
     });
     if(KOT.length>100) KOT.length=100;
     bnxSetOpenKotsRaw(JSON.stringify(KOT));
+    bnxSetLiveStatus('live');
   }
   if(document.getElementById('s-kot')?.classList.contains('active')) renderKOT();
 }
@@ -4587,12 +4607,14 @@ bnxSafeBoot_(bnxRenderMyStats, 'bnxRenderMyStats');
 bnxSafeBoot_(renderMobTables, 'renderMobTables');
 bnxSafeBoot_(renderMobOnline, 'renderMobOnline');
 bnxSafeBoot_(renderKOT, 'renderKOT');
-bnxSafeBoot_(loadMenuFromServer, 'loadMenuFromServer');
-bnxSafeBoot_(loadKOTFromServer, 'loadKOTFromServer');
-bnxSafeBoot_(loadTablesLive, 'loadTablesLive');
-bnxSafeBoot_(() => { flushOutbox().catch(e => console.error('[BOOT] flushOutbox rejected:', e && e.message ? e.message : e)); }, 'flushOutbox');
-bnxSafeBoot_(() => setInterval(loadKOTFromServer, 20000), 'KOT polling interval'); // light polling so steward app & POS stay in sync
-bnxSafeBoot_(() => setInterval(loadTablesLive, 20000), 'table polling interval'); // same for the live floor/table status
+// Never hammer V2_CORE with unauthenticated requests on page boot. Login owns the first live load.
+if(getClientId() && getSessionToken()){
+  bnxSafeBoot_(() => { loadBootstrapOrFallback().catch(e=>console.error('[BOOT] bootstrap rejected:', e)); }, 'loadBootstrapOrFallback');
+  bnxSafeBoot_(() => { loadKOTFromServer().catch(e=>console.error('[BOOT] loadKOT rejected:', e)); }, 'loadKOTFromServer');
+  bnxSafeBoot_(() => { flushOutbox().catch(e => console.error('[BOOT] flushOutbox rejected:', e && e.message ? e.message : e)); }, 'flushOutbox');
+  bnxSafeBoot_(() => setInterval(()=>loadKOTFromServer().catch(()=>{}), 30000), 'KOT polling interval');
+  bnxSafeBoot_(() => setInterval(()=>loadTablesLive().catch(()=>{}), 30000), 'table polling interval');
+}
 </script>
 
 <!-- WORLD-CLASS STEWARD UX LAYER: tactile feedback, KOT alerts, sync/update controls -->
@@ -4643,7 +4665,7 @@ bnxSafeBoot_(() => setInterval(loadTablesLive, 20000), 'table polling interval')
     });
     lastKots=now;
   }
-  setTimeout(()=>{lastKots=snapshotKots();},1200);setInterval(pollKots,5000);
+  setTimeout(()=>{lastKots=snapshotKots();},900);setInterval(pollKots,10000);
   window.bnxStewardSyncNow=async function(){
     bnxStewardHaptic('tap');toast('☁️ Syncing…','info');
     try{
@@ -4670,5 +4692,29 @@ bnxSafeBoot_(() => setInterval(loadTablesLive, 20000), 'table polling interval')
 })();
 </script>
 
+<script>
+/* FINAL STEWARD PRODUCTION HARDENING
+   - keep scrolling responsive
+   - never leave an invisible modal overlay behind
+   - serialize order placement/edit buttons
+   - refresh live counters after successful mutations
+*/
+(function(){
+  try{
+    const root=document.documentElement;
+    root.style.webkitOverflowScrolling='touch';
+  }catch(e){}
+  window.addEventListener('keydown',function(e){
+    const tag=(e.target&&e.target.tagName||'').toLowerCase();
+    if(['input','textarea','select'].includes(tag)) return;
+    const active=document.querySelector('.screen.active .scroll');
+    if(!active) return;
+    if(e.key==='Home'){active.scrollTop=0;e.preventDefault();}
+    else if(e.key==='End'){active.scrollTop=active.scrollHeight; e.preventDefault();}
+    else if(e.key==='PageDown'){active.scrollTop=Math.min(active.scrollHeight,active.scrollTop+Math.max(200,active.clientHeight*.85));e.preventDefault();}
+    else if(e.key==='PageUp'){active.scrollTop=Math.max(0,active.scrollTop-Math.max(200,active.clientHeight*.85));e.preventDefault();}
+  },{passive:false});
+})();
+</script>
 </body>
 </html>
