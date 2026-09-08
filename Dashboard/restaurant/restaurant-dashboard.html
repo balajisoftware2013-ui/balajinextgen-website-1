@@ -11359,7 +11359,7 @@ function bnxGetRecentItems(){
 //    grid used to render nothing with no explanation. Now shows a clear
 //    "no menu uploaded yet" empty state with a direct link to upload it.
 // ══════════════════════════════════════════════════════
-function bnxMenuKey(){ return 'bnx_menu_data_' + (CLIENT_ID || 'default'); }
+function bnxMenuKey(){ return 'bnx_menu_data_v3_' + (CLIENT_ID || 'default'); }
 // Default icon shown for any item that has no emoji/photo of its own —
 // picked from its category so a bar item still gets a bottle glass, a
 // dessert still gets something dessert-shaped, etc., instead of every
@@ -11422,6 +11422,9 @@ let usingDemoMenu = true; // true until EITHER a locally-cached real menu OR a s
 // the moment the page reloaded, since menuData started life as a
 // hardcoded const with nothing written back to it.
 function bnxLoadSavedMenu(){
+  // v3 intentionally ignores older local caches so stale Food-only menus cannot
+  // masquerade as the current live Food + Bar Menu Card. The first successful
+  // server sync creates the new client-scoped cache.
   try{
     const saved = JSON.parse(localStorage.getItem(bnxMenuKey())||'null');
     if (Array.isArray(saved)){
@@ -11473,7 +11476,14 @@ function bnxMenuKind_(item){
   try{const set=window.__BNX_LIVE_BAR_ITEM_IDS;if(set&&set.size&&ids.some(x=>set.has(String(x).toUpperCase())))return 'bar';}catch(e){}
   const mt=String(item.menuType||item.MENU_TYPE||'').trim().toLowerCase().replace(/[ _-]+/g,'');
   const ms=String(item.menuSection||item.MENU_SECTION||'').trim().toLowerCase().replace(/[ _-]+/g,'');
-  if(['bar','liquor','beveragebar','barmenu'].includes(mt)||['bar','liquor','barmenu'].includes(ms))return 'bar';
+  if(['bar','liquor','beveragebar','barmenu','barcard'].includes(mt)||['bar','liquor','barmenu','barcard'].includes(ms))return 'bar';
+  try{
+    const names=window.__BNX_LIVE_BAR_ITEM_NAMES;
+    if(names && names.has(String(item.n||item.ITEM_NAME||'').trim().toUpperCase())) return 'bar';
+  }catch(e){}
+  // Conservative fallback for unmistakable bar products only.
+  const txt=(String(item.n||item.ITEM_NAME||'')+' '+String(item.category||item.c||'')).toLowerCase();
+  if(/\b(beer|whisky|whiskey|vodka|rum|gin|tequila|brandy|cognac|liqueur|liquor|wine|champagne|cocktail|aperitif|spirits|scotch|draught|draft|peg|bar)\b/.test(txt))return 'bar';
   return 'food';
 }
 
@@ -17444,21 +17454,38 @@ async function loadMenuData(){
     return {success:false,food:0,bar:0,total:menuData.length,error:detail};
   }
 
-  const barItems=barRows.map(barNorm).filter(Boolean), barIds=new Set(barItems.map(x=>String(x.code||x.itemCode||'').trim().toUpperCase()).filter(Boolean));
-  // Keep the Bar identity set globally so filters and any late-rendered/cache rows
-  // can classify a real BAR_ITEM_MASTER item as Bar even when its source endpoint
-  // row has a generic RESTAURANT menu type.
+  const barItems=barRows.map(barNorm).filter(Boolean);
+  const barIds=new Set(barItems.flatMap(x=>[x.code,x.itemCode,x.id,x.itemId].map(v=>String(v??'').trim().toUpperCase())).filter(Boolean));
+  const barNames=new Set(barItems.map(x=>String(x.n||'').trim().toUpperCase()).filter(Boolean));
+  // Keep both identity and name sets globally. This handles older master rows where
+  // BAR_ITEM_MASTER and MENU_CARD_ITEMS used different ITEM_ID values but the same
+  // real menu name.
   window.__BNX_LIVE_BAR_ITEM_IDS = new Set(barIds);
-  const foodItems=foodRows.map(x=>foodNorm(x,barIds)).filter(Boolean);
+  window.__BNX_LIVE_BAR_ITEM_NAMES = new Set(barNames);
+  const foodItems=foodRows.map(x=>foodNorm(x,barIds)).filter(Boolean).map(x=>{
+    const ids=['code','id','itemCode','ITEM_ID','itemId','ITEM_CODE'].map(k=>String(x[k]??'').trim().toUpperCase()).filter(Boolean);
+    const name=String(x.n||'').trim().toUpperCase();
+    if(ids.some(id=>barIds.has(id)) || barNames.has(name)){
+      x.isBar=true; x.menuType='BAR'; x.menuSection=x.menuSection||x.c||'BAR'; x.v='';
+    }
+    return x;
+  });
   const dedup=new Map();
-  foodItems.forEach(x=>{const k='F|'+String(x.menuCardKey||x.code||x.n).toUpperCase(); if(!dedup.has(k))dedup.set(k,x);});
-  barItems.forEach(x=>{const k='B|'+String(x.menuCardKey||x.code||x.n).toUpperCase(); if(!dedup.has(k))dedup.set(k,x);});
-  menuData.length=0; Array.from(dedup.values()).forEach(x=>menuData.push(x)); usingDemoMenu=false;
+  foodItems.forEach(x=>{const k=(x.isBar?'B|':'F|')+String(x.menuCardKey||x.code||x.n).toUpperCase(); if(!dedup.has(k)||x.isBar)dedup.set(k,x);});
+  barItems.forEach(x=>{const k='B|'+String(x.menuCardKey||x.code||x.n).toUpperCase(); dedup.set(k,x);});
+  // Put Bar first in the unfiltered All view so the real Bar menu is visible
+  // immediately rather than after the first 141 food-card rows.
+  const liveItems=Array.from(dedup.values()).sort((a,b)=>{
+    if(!!a.isBar!==!!b.isBar)return a.isBar?-1:1;
+    return String(a.c||'').localeCompare(String(b.c||''))||String(a.n||'').localeCompare(String(b.n||''));
+  });
+  menuData.length=0; liveItems.forEach(x=>menuData.push(x)); usingDemoMenu=false;
   // LAST-MILE GUARANTEE: Bar identity always wins for POS filtering, including
   // rows from an older backend/cache that still says MENU_TYPE=RESTAURANT.
   menuData.forEach(x=>{
     const ids=['code','id','itemCode','ITEM_ID','itemId','ITEM_CODE'].map(k=>String(x[k]??'').trim().toUpperCase()).filter(Boolean);
-    if(ids.some(id=>window.__BNX_LIVE_BAR_ITEM_IDS.has(id))){ x.isBar=true; x.menuType='BAR'; x.v=''; }
+    const name=String(x.n||'').trim().toUpperCase();
+    if(ids.some(id=>barIds.has(id)) || barNames.has(name)){ x.isBar=true; x.menuType='BAR'; x.v=''; }
   });
   bnxNormalizeMenuVeg_(); bnxSaveMenuData(); bnxRebuildCategoryPills(); bnxRebuildItemGroupPills_(); buildMenu(); if(typeof renderMenuItemsTable==='function')renderMenuItemsTable();
   const total=menuData.length; showNotif('✅ Menu Card synced — Food: '+foodItems.length+' · Bar: '+barItems.length+' · Total: '+total,'success');
