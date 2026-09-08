@@ -10337,8 +10337,22 @@ function bnxElapsedMinFromStart(startTime){
     return diff+'m';
   }catch(e){ return ''; }
 }
+let bnxTableMasterLastSync = 0;
 async function bnxSyncTableMasterFromBackend(silent){
   if (typeof gasApi !== 'function' || typeof CLIENT_ID === 'undefined' || !CLIENT_ID) return false;
+  // FIX ("table move slow" — Sep 2026): this hit RD_FETCH_SHEET (a real
+  // network round trip) on EVERY call — once on page load, again every
+  // time the POS/Billing page is opened, AND again every single time
+  // Change Table is opened. In normal use those stack back-to-back
+  // within a couple seconds of each other (open POS -> auto-sync, then
+  // immediately tap Change Table -> a second full sync before the
+  // picker would trust its own data), so Change Table felt stuck
+  // waiting on a sync that, in most cases, had already finished
+  // moments earlier. Silent/background calls now skip the network and
+  // reuse the already-current tableData if a sync completed in the
+  // last 8s; an explicit user-initiated refresh (silent=false) always
+  // still hits the network for a guaranteed up-to-date pull.
+  if (silent && (Date.now() - bnxTableMasterLastSync) < 8000) return true;
   try{
     // FIX (this session, full audit): was 'fetchSheet' — silently
     // collided with the Bar Module's unrelated same-named action after
@@ -10378,6 +10392,7 @@ async function bnxSyncTableMasterFromBackend(silent){
     const known = new Set(fromSheet.map(t=>t.n));
     extra = extra.filter(t=>!known.has(t.n));
     tableData = fromSheet.concat(extra);
+    bnxTableMasterLastSync = Date.now();
     if (typeof buildFloor==='function'){ buildFloor('floorMap'); buildFloor('dashMap'); }
     if (typeof buildRichTbls==='function') buildRichTbls();
     if (!silent && typeof showNotif==='function') showNotif('✅ '+fromSheet.length+' tables synced live from 04_TABLE_MASTER','success');
@@ -18928,13 +18943,39 @@ function dcrRenderTable(rows, firstColLabel){
   document.getElementById('dcrTable').innerHTML = head + body + foot;
 }
 
+// FIX ("Cannot read properties of null (reading 'netClosing')" —
+// Sep 2026): dcrDemoDayData() deliberately returns null for any date
+// with no saved Daily Collection (DCR_MANUAL) entry — that's correct,
+// it's what stops the Cash Position dashboard card from showing a
+// fake number for a day nobody has filled in (see the comment on that
+// card). But every report loader below (Day/Week/Month/YTD/Custom)
+// assumed dcrDemoDayData() always returns an object and immediately
+// read .netClosing off it — both for the day just before the range
+// (to seed Opening Cash) and for every single day inside the range.
+// The very first time ANY day in view had no manual entry (which is
+// most days, since this is manually typed in daily), the whole report
+// crashed instead of rendering. dcrSafeDayData() keeps the same "no
+// fake numbers" rule intact — it still carries forward a real null
+// check for the dashboard's own use of dcrDemoDayData() directly —
+// but for these reports it now fills a missing day with an all-zero
+// row that simply carries the running Opening/Closing Cash balance
+// forward unchanged, so the report renders instead of breaking.
+function dcrSafeDayData(y,m,d,prevClosing){
+  const real = dcrDemoDayData(y,m,d,prevClosing);
+  if (real) return real;
+  const opening = prevClosing!=null ? prevClosing : DCR_OPENING_FLOAT;
+  const zero = {}; DCR_COLS.forEach(c=>zero[c.key]=0);
+  zero.openingCash = opening; zero.netClosing = opening;
+  return zero;
+}
+
 function dcrLoadDay(){
   const el = document.getElementById('dcrDayPicker');
   if (!el.value) el.value = (typeof bnxReportBusinessDate_ === 'function' ? bnxReportBusinessDate_() : new Date().toISOString().slice(0,10));
   const [y,m,d] = el.value.split('-').map(Number);
   const prevDate = new Date(y,m-1,d-1);
-  const prev = dcrDemoDayData(prevDate.getFullYear(), prevDate.getMonth()+1, prevDate.getDate());
-  const data = dcrDemoDayData(y,m,d, prev.netClosing);
+  const prev = dcrSafeDayData(prevDate.getFullYear(), prevDate.getMonth()+1, prevDate.getDate());
+  const data = dcrSafeDayData(y,m,d, prev.netClosing);
   const label = String(d).padStart(2,'0')+'-'+String(m).padStart(2,'0')+'-'+y;
   dcrRenderTable([{label, data}], 'Date');
 }
@@ -18957,9 +18998,9 @@ function dcrLoadWeek(){
     const dt = new Date(monday); dt.setDate(monday.getDate()+i);
     if (prevClosing === null){
       const p = new Date(dt); p.setDate(dt.getDate()-1);
-      prevClosing = dcrDemoDayData(p.getFullYear(), p.getMonth()+1, p.getDate()).netClosing;
+      prevClosing = dcrSafeDayData(p.getFullYear(), p.getMonth()+1, p.getDate()).netClosing;
     }
-    const data = dcrDemoDayData(dt.getFullYear(), dt.getMonth()+1, dt.getDate(), prevClosing);
+    const data = dcrSafeDayData(dt.getFullYear(), dt.getMonth()+1, dt.getDate(), prevClosing);
     prevClosing = data.netClosing;
     rows.push({ label: String(dt.getDate()).padStart(2,'0')+'-'+String(dt.getMonth()+1).padStart(2,'0')+' ('+['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][dt.getDay()]+')', data });
   }
@@ -18976,9 +19017,9 @@ function dcrLoadMonth(){
   const daysInMonth = new Date(y,m,0).getDate();
   const rows = [];
   const prevDate = new Date(y,m-1,0);
-  let prevClosing = dcrDemoDayData(prevDate.getFullYear(), prevDate.getMonth()+1, prevDate.getDate()).netClosing;
+  let prevClosing = dcrSafeDayData(prevDate.getFullYear(), prevDate.getMonth()+1, prevDate.getDate()).netClosing;
   for (let d=1; d<=daysInMonth; d++){
-    const data = dcrDemoDayData(y,m,d, prevClosing);
+    const data = dcrSafeDayData(y,m,d, prevClosing);
     prevClosing = data.netClosing;
     rows.push({ label: String(d).padStart(2,'0')+'-'+String(m).padStart(2,'0')+'-'+y, data });
   }
@@ -19009,9 +19050,9 @@ function dcrLoadYTD(){
     for (let d=1; d<=daysInMonth; d++){
       if (prevClosing === null){
         const p = new Date(y,m-1,0);
-        prevClosing = dcrDemoDayData(p.getFullYear(), p.getMonth()+1, p.getDate()).netClosing;
+        prevClosing = dcrSafeDayData(p.getFullYear(), p.getMonth()+1, p.getDate()).netClosing;
       }
-      const data = dcrDemoDayData(y,m,d,prevClosing);
+      const data = dcrSafeDayData(y,m,d,prevClosing);
       prevClosing = data.netClosing;
       DCR_COLS.forEach(c=>{
         if (c.key==='openingCash') { if (d===1) monthTotals.openingCash = data.openingCash; }
@@ -19032,11 +19073,11 @@ function dcrLoadCustom(){
   if (to < from){ showNotif('⚠️ "To" date must be on or after "From" date.', 'error'); return; }
   const rows = [];
   const prevDate = new Date(from); prevDate.setDate(from.getDate()-1);
-  let prevClosing = dcrDemoDayData(prevDate.getFullYear(), prevDate.getMonth()+1, prevDate.getDate()).netClosing;
+  let prevClosing = dcrSafeDayData(prevDate.getFullYear(), prevDate.getMonth()+1, prevDate.getDate()).netClosing;
   const cur = new Date(from);
   let guard = 0;
   while (cur <= to && guard < 400){
-    const data = dcrDemoDayData(cur.getFullYear(), cur.getMonth()+1, cur.getDate(), prevClosing);
+    const data = dcrSafeDayData(cur.getFullYear(), cur.getMonth()+1, cur.getDate(), prevClosing);
     prevClosing = data.netClosing;
     rows.push({ label: String(cur.getDate()).padStart(2,'0')+'-'+String(cur.getMonth()+1).padStart(2,'0')+'-'+cur.getFullYear(), data });
     cur.setDate(cur.getDate()+1);
