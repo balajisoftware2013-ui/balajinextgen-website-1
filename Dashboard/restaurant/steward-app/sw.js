@@ -1,4 +1,4 @@
-const CACHE = 'bnx-steward-v1-2026-09-09';
+const CACHE = 'bnx-steward-v3-2026-09-09';
 const APP_SHELL = [
   './steward-mobile.html',
   './manifest.json',

@@ -1,10 +1,11 @@
-STEWARD MOBILE FINAL DEPLOYMENT PACKAGE
+FINAL Balaji NextGen Restaurant + Steward package
 
-Deploy steward-mobile.html, manifest.json, sw.js and icons/ together in the same web directory.
-Use Code.gs as the paired V2_CORE backend source.
+Files:
+- restaurant-dashboard.html
+- steward-mobile.html
+- Code.gs
+- manifest.json
+- sw.js
+- icons/
 
-Allowed Steward Mobile login roles:
-CAPTAIN, STEWARD, CHEF, SUPER_ADMIN
-
-CAPTAIN/STEWARD see their own active KOTs. CHEF/SUPER_ADMIN can see all active KOTs.
-Online Orders reads the client's ONLINE_ORDER_MASTER; external Zomato/Swiggy/EasyDiner/ONDC feeds must write/import into that sheet for live orders to appear.
+Deploy Code.gs and the HTML files together. Keep manifest.json, sw.js and icons/ in the same web directory as steward-mobile.html for PWA installation.
