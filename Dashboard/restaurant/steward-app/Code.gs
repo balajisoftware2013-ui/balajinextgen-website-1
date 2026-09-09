@@ -1859,7 +1859,7 @@ function bnxSaveKOT(session, payload) {
       KOT_SOURCE: payload.kotSource || payload.KOT_SOURCE || 'POS',
       KOT_DATE: now.businessDate, KOT_TIME: now.time, COVERS: payload.covers || payload.COVERS || 0,
       KOT_STATUS: 'PRINTED', PRIORITY: payload.priority || payload.PRIORITY || 'NORMAL',
-      STARTED_BY: payload.waiter || payload.steward || payload.captain || payload.createdByName || userId, KITCHEN_NOTES: payload.remarks || '',
+      STARTED_BY: payload.waiter || userId, KITCHEN_NOTES: payload.remarks || '',
       STARTED_AT: now.iso, CREATED_AT: now.iso
     };
     // HARD GUARANTEE: write to the client's TRANSACTION_DB KOT_MASTER.
@@ -2084,7 +2084,9 @@ function bnxGetActiveOrders(session, payload) {
         ORDER_TYPE: o.ORDER_TYPE || 'DINEIN', ORDER_STATUS: o.ORDER_STATUS || 'NEW', PAX: o.PAX || 0,
         TEMP_ORDER_ID: '', SCAN_KEY: '', CUSTOMER_NAME: cust ? cust.name : '\u2014',
         MOBILE_NO: cust ? cust.phone : '\u2014', START_TIME: o.ORDER_TIME || '', END_TIME: '',
-        NOTES: o.SPECIAL_INSTRUCTIONS || '', CREATED_BY: o.STARTED_BY || '\u2014',
+        NOTES: o.SPECIAL_INSTRUCTIONS || '', CREATED_BY: o.CREATED_BY_NAME || o.STARTED_BY || o.CREATED_BY || '\u2014',
+        CREATED_BY_ID: o.CREATED_BY_ID || '', CREATED_BY_LOGIN: o.CREATED_BY_LOGIN || '', CREATED_BY_NAME: o.CREATED_BY_NAME || '',
+        USER_ID: o.CREATED_BY_ID || '', LOGIN_ID: o.CREATED_BY_LOGIN || '',
         items: itemsByOrderId[o.ORDER_ID] || []
       };
     });
@@ -2148,17 +2150,6 @@ function bnxGetKOT(session, payload) {
       k.ORDER_TIME = k.ORDER_TIME || (linkedOrder ? (linkedOrder.ORDER_TIME || '') : '');
       k.orderTime = k.ORDER_TIME || '';
       k.ORDER_NUMBER = linkedOrder ? (linkedOrder.ORDER_NUMBER || '') : (k.ORDER_NUMBER || '');
-      // Steward/captain ownership: KOT_MASTER may not have a dedicated steward
-      // column in older tenant schemas, so recover it from the linked ORDER_MASTER
-      // record when available. Never invent a name.
-      const linkedOwner = linkedOrder ? (linkedOrder.CREATED_BY_NAME || linkedOrder.CREATED_BY || linkedOrder.STARTED_BY || linkedOrder.STEWARD || linkedOrder.WAITER || '') : '';
-      const linkedOwnerId = linkedOrder ? (linkedOrder.CREATED_BY_ID || linkedOrder.USER_ID || '') : '';
-      const linkedOwnerLogin = linkedOrder ? (linkedOrder.CREATED_BY_LOGIN || linkedOrder.LOGIN_ID || '') : '';
-      k.STEWARD_NAME = k.STEWARD_NAME || k.STEWARD || k.WAITER || k.CAPTAIN || linkedOwner || '';
-      k.STEWARD_ID = k.STEWARD_ID || k.WAITER_ID || k.CAPTAIN_ID || linkedOwnerId || '';
-      k.STEWARD_LOGIN = k.STEWARD_LOGIN || k.WAITER_LOGIN || k.CAPTAIN_LOGIN || linkedOwnerLogin || '';
-      k.CREATED_BY_NAME = k.CREATED_BY_NAME || linkedOwner || '';
-      k.STARTED_BY = k.STARTED_BY || (linkedOrder ? (linkedOrder.STARTED_BY || '') : '');
       kots.push(k);
     });
     return { success: true, data: kots, count: kots.length };
@@ -4994,7 +4985,7 @@ function bnxSaveTableStatusHandler(session, payload) {
     const nowTime = new Date().toISOString().split('T')[1].slice(0, 5);
     const status = payload.status !== undefined ? String(payload.status).toUpperCase() : undefined;
     for (let r = 1; r < values.length; r++) {
-      if (values[r][tnCol] === tableNo && (ciCol === -1 || values[r][ciCol] === clientId)) {
+      if (String(values[r][tnCol] || '').trim() === String(tableNo).trim() && (ciCol === -1 || String(values[r][ciCol]) === String(clientId))) {
         if (status !== undefined && statusCol !== -1) sheet.getRange(r + 1, statusCol + 1).setValue(status);
         if (payload.covers !== undefined && coversCol !== -1) sheet.getRange(r + 1, coversCol + 1).setValue(payload.covers);
         if (payload.bill !== undefined && billCol !== -1) sheet.getRange(r + 1, billCol + 1).setValue(payload.bill);
