@@ -2035,7 +2035,25 @@ function bnxDedupeKOTs_(rows){
   return out;
 }
 function bnxLoadOpenKots(){
-  try{ const raw=bnxGetOpenKotsRaw(); KOT = bnxDedupeKOTs_(raw ? JSON.parse(raw) : []); }catch(e){ KOT=[]; }
+  try{
+    const raw=bnxGetOpenKotsRaw();
+    const all=bnxDedupeKOTs_(raw ? JSON.parse(raw) : []);
+    // LIVE staff data must never leak another steward's local KOT.
+    // Keep only tickets owned by the authenticated user; pending local
+    // tickets are retained only when their waiter/owner matches.
+    const i=typeof getCurrentStaffIdentity==='function' ? getCurrentStaffIdentity() : {};
+    const norm=v=>String(v==null?'':v).trim().toLowerCase();
+    const own=k=>{
+      if(!i.userId && !i.loginId && !i.fullName) return false;
+      const ids=[k.userId,k.createdById,k.CREATED_BY_ID,k.staffId,k.stewardId,k.waiterId];
+      const logins=[k.loginId,k.createdByLogin,k.CREATED_BY_LOGIN,k.stewardLogin,k.waiterLogin,k.USER_CODE];
+      const names=[k.waiter,k.steward,k.captain,k.createdBy,k.CREATED_BY,k.CREATED_BY_NAME,k.staffName];
+      return (i.userId && ids.some(v=>v&&norm(v)===norm(i.userId))) ||
+             (i.loginId && logins.some(v=>v&&norm(v)===norm(i.loginId))) ||
+             (i.fullName && names.some(v=>v&&norm(v)===norm(i.fullName)));
+    };
+    KOT = all.filter(own);
+  }catch(e){ KOT=[]; }
   try{ bnxSetOpenKotsRaw(JSON.stringify(KOT)); }catch(e){}
 }
 bnxLoadOpenKots();
@@ -2556,7 +2574,7 @@ function renderMobTables(){
 }
 
 function openTable(id){
-  selTable=TABLES.find(t=>t.id===id);
+  selTable=TABLES.find(t=>t.id===id) || {id:String(id),no:String(id),status:'RUNNING',covers:0,bill:0};
   if(!selTable)return;
   const sc={AVAILABLE:'var(--green)',OCCUPIED:'var(--red)',RUNNING:'var(--orange)',RESERVED:'var(--gold)',VIP:'var(--purple)'};
   const tableTitle=document.getElementById('mob-table-title'), tableBody=document.getElementById('mob-table-body');
@@ -2576,6 +2594,29 @@ function openTable(id){
     ${selTable.bill?`<div style="background:var(--gold-bg);border:1px solid rgba(212,160,23,.25);border-radius:12px;padding:12px 16px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"><span style="font-size:13px;color:var(--gold);font-weight:700;">Running Bill</span><span style="font-size:22px;font-weight:900;font-family:'DM Mono',monospace;color:var(--gold);">₹${selTable.bill.toLocaleString('en-IN')}</span></div>`:''}
     ${selTable.steward?`<div style="font-size:12px;color:var(--text3);">👤 Steward: ${selTable.steward}</div>`:''}
   `;
+  // If this table already has an order, load the authenticated steward's
+  // order so "My Running Table" opens the SAME order that will later bill.
+  const currentOrderBoxId='mob-current-order-box';
+  let currentBox=document.getElementById(currentOrderBoxId);
+  if(!currentBox){
+    currentBox=document.createElement('div'); currentBox.id=currentOrderBoxId;
+    tableBody.appendChild(currentBox);
+  }
+  currentBox.innerHTML='<div style="padding:10px;color:var(--text3);font-size:11px;">Loading current order…</div>';
+  (async()=>{
+    try{
+      const i=getCurrentStaffIdentity();
+      const r=await gasApi('GET_ORDERS',{LOCATION_ID:i.locationId||''},'V2_CORE');
+      const rows=(r&&r.success&&Array.isArray(r.data))?r.data:[];
+      const mine=rows.filter(o=>String(o.TABLE_ID||'').trim()===String(selTable.id).trim());
+      if(mine.length){
+        const o=mine[0];
+        const total=Number(o.amt??o.ORDER_AMOUNT??o.ORDER_TOTAL??o.GRAND_TOTAL??0)||0;
+        currentBox.innerHTML='<div style="background:var(--gold-bg);border:1px solid rgba(212,160,23,.25);border-radius:12px;padding:12px 14px;margin:8px 0 10px;"><div style="font-size:12px;font-weight:800;color:var(--gold);">🧾 Current Order '+String(o.ORDER_NUMBER||o.ORDER_NO||o.ORDER_ID||'').replace(/</g,'&lt;')+'</div><div style="font-size:10.5px;color:var(--text3);margin-top:4px;">Status: '+String(o.ORDER_STATUS||'NEW')+' · '+(o.items?.length||0)+' items</div><div style="font-size:18px;font-weight:900;margin-top:5px;">₹'+total.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})+'</div></div>';
+      }else currentBox.innerHTML='<div style="padding:8px 2px;color:var(--text3);font-size:11px;">No current order found for this table.</div>';
+    }catch(e){ currentBox.innerHTML='<div style="padding:8px 2px;color:var(--red);font-size:11px;">Could not load current order. Tap Refresh/Sync and try again.</div>'; }
+  })();
+
   const settleBtn = document.getElementById('mob-settle-btn');
   if(settleBtn) settleBtn.style.display = (selTable.status==='OCCUPIED'||selTable.status==='RUNNING') ? '' : 'none';
   document.getElementById('table-modal').classList.add('open');
@@ -2840,41 +2881,51 @@ function bnxStartOfMonth(){ const t=new Date(); return new Date(t.getFullYear(),
 
 function renderMyTables(){
   const el=document.getElementById('my-running-tables');
-  const identity = getCurrentStaffIdentity();
-  const myT=TABLES.filter(t=>isMyTable(t, identity) && (t.status==='OCCUPIED'||t.status==='RUNNING'));
+  const identity=getCurrentStaffIdentity();
   const sc={OCCUPIED:'var(--red)',RUNNING:'var(--orange)'};
-  /* PASS #37 FIX ("My Orders / My Tables / My Sales ... actual his
-     reports show only his performance"): confirmed these 3 home-screen
-     stat cards had NO update function anywhere in the file — pure
-     static HTML (12 / 4 / ₹9.8K), same for every steward, every day,
-     forever. Unlike the "My Tables" LIST just below them on this same
-     screen (which already correctly filters TABLES by the real
-     logged-in steward via bnxGetStewardName() — see above), nothing
-     ever fed real numbers into these three specific cards. "My
-     Tables" stat now reuses the same myT this function already
-     computes; Orders/Sales come from bnxRenderMyStats() below, using
-     the same real bill register + per-user match already built for
-     Order History in PASS #36. */
-  const myTablesEl = document.getElementById('my-tables');
-  if (myTablesEl) myTablesEl.textContent = String(myT.length);
-  if(!TABLES.length && bnxTablesSource !== 'demo'){
-    el.innerHTML = bnxTablesSource === 'none'
-      ? `<div style="text-align:center;padding:20px;color:var(--text3);font-size:12px;">⏳ Loading Tables…</div>`
-      : `<div style="text-align:center;padding:20px;color:var(--red);font-size:12px;">🔴 OFFLINE — could not load tables <button onclick="loadTablesLive()" style="margin-left:4px;background:var(--red,#c0392b);color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:10.5px;font-weight:700;cursor:pointer;">Retry</button></div>`;
-    return;
+  const localMine=()=>TABLES.filter(t=>isMyTable(t,identity)&&(t.status==='OCCUPIED'||t.status==='RUNNING'));
+  const paint=(rows)=>{
+    const myT=Array.isArray(rows)?rows:[];
+    const myTablesEl=document.getElementById('my-tables');
+    if(myTablesEl) myTablesEl.textContent=String(myT.length);
+    if(!myT.length){el.innerHTML='<div style="text-align:center;padding:20px;color:var(--text3);font-size:12px;">No running tables assigned to you</div>';return;}
+    el.innerHTML=myT.map(t=>`
+      <div style="background:var(--surface2);border:1px solid var(--border);border-radius:14px;padding:14px;margin-bottom:8px;display:flex;align-items:center;gap:12px;" onclick="openTable('${String(t.id||t.TABLE_NO||'').replace(/'/g,"\\'")}')">
+        <div style="width:44px;height:44px;background:${sc[t.status]||'var(--orange)'}22;border:2px solid ${sc[t.status]||'var(--orange)'}44;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:900;color:${sc[t.status]||'var(--orange)'};">${t.no||t.id||t.TABLE_NO}</div>
+        <div style="flex:1;">
+          <div style="font-size:13px;font-weight:700;">Table ${t.id||t.TABLE_NO}</div>
+          <div style="font-size:11px;color:var(--text3);margin-top:2px;">${Number(t.covers||t.COVERS)||0} guests · ${t.status||t.STATUS||'RUNNING'}</div>
+        </div>
+        ${Number(t.bill||t.BILL_AMOUNT)?`<div style="font-size:16px;font-weight:900;font-family:'DM Mono',monospace;color:var(--gold);">₹${Number(t.bill||t.BILL_AMOUNT).toLocaleString('en-IN')}</div>`:''}
+      </div>`).join('');
+  };
+  if(!TABLES.length && bnxTablesSource !== 'demo' && bnxTablesSource !== 'live'){
+    el.innerHTML='<div style="text-align:center;padding:20px;color:var(--text3);font-size:12px;">⏳ Loading Tables…</div>';
   }
-  if(!myT.length){el.innerHTML=`<div style="text-align:center;padding:20px;color:var(--text3);font-size:12px;">No running tables</div>`;return;}
-  el.innerHTML=myT.map(t=>`
-    <div style="background:var(--surface2);border:1px solid var(--border);border-radius:14px;padding:14px;margin-bottom:8px;display:flex;align-items:center;gap:12px;" onclick="openTable('${t.id}')">
-      <div style="width:44px;height:44px;background:${sc[t.status]}22;border:2px solid ${sc[t.status]}44;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:900;color:${sc[t.status]};">${t.no}</div>
-      <div style="flex:1;">
-        <div style="font-size:13px;font-weight:700;">Table ${t.id}</div>
-        <div style="font-size:11px;color:var(--text3);margin-top:2px;">${t.covers} guests</div>
-      </div>
-      ${t.bill?`<div style="font-size:16px;font-weight:900;font-family:'DM Mono',monospace;color:var(--gold);">₹${t.bill.toLocaleString('en-IN')}</div>`:''}
-    </div>`).join('');
+  // Server is authoritative for My Running Tables; this prevents the old
+  // client-side all-table projection from hiding a table whose ownership
+  // is known only through TABLE_LIVE_STATE / ORDER_MASTER.
+  (async()=>{
+    try{
+      const res=await gasApi('GET_MY_RUNNING_TABLES',{LOCATION_ID:identity.locationId||''},'V2_CORE');
+      if(res&&res.success&&Array.isArray(res.data)){
+        const rows=res.data.map(r=>({
+          id:r.TABLE_NO||r.TABLE_ID||r.id||'',
+          no:r.TABLE_NO||r.TABLE_ID||r.id||'',
+          status:bnxMapSheetStatusToTcard(r.STATUS||r.status||'RUNNING'),
+          covers:Number(r.COVERS||r.covers||r.PAX||0),
+          bill:Number(r.BILL_AMOUNT||r.bill||0),
+          steward:r.CAPTAIN||r.STEWARD||r.WAITER||'',
+          stewardId:r.CAPTAIN_ID||r.STEWARD_ID||r.WAITER_ID||'',
+          stewardLogin:r.CAPTAIN_LOGIN||r.STEWARD_LOGIN||r.WAITER_LOGIN||''
+        })).filter(t=>t.id);
+        paint(rows);
+        return;
+      }
+    }catch(e){ console.warn('[MY_RUNNING_TABLES]',e); }
+    paint(localMine());
+  })();
 }
-
 /* PASS #37 NEW: "My Orders" and "My Sales" home stat cards — real
    count/sum of TODAY's bills created by the logged-in steward/captain,
    same source (LIST_BILLS-backed bill register) and same per-user name
