@@ -424,6 +424,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // first, since FETCHSHEET needs a real client to know which sheet
   // to open.
   setTimeout(() => loadRealBarItemMaster(), 900);
+  setTimeout(() => startBarAutoCapture(), 1800);
 });
 
 // Expects BAR_B1_ITEM_MASTER rows to have at minimum an item name and
@@ -1343,7 +1344,7 @@ table thead th{position:sticky;top:0;background:#e2726b;color:#ffffff;z-index:1;
             <div class="ph-right">
               <button class="btn btn-primary btn-sm" onclick="openAddSaleModal()">+ Add Sale</button>
               <button class="btn btn-ghost btn-sm" onclick="exportTableCSV('tblSales','sales_export')">⬇ CSV</button>
-              <button class="btn btn-ghost btn-sm" data-pos-only style="display:none;" onclick="const rows=window._pendingInventoryConvert&&window._pendingInventoryConvert.length?window._pendingInventoryConvert:loadData('sales');const r=autoCaptureInventory(rows);toast('Converted '+r.converted+' item(s) to inventory ✓','ok');window._pendingInventoryConvert=null;">📦 Convert to Inventory</button>
+              <button class="btn btn-ghost btn-sm" data-pos-only style="display:none;" onclick="convertPendingInventory()">📦 Convert to Inventory</button>
             </div>
           </div>
         </div>
@@ -2080,7 +2081,7 @@ function getModuleSettings(clientId){
   clientId = clientId || currentClient;
   let stored = null;
   try{ stored = JSON.parse(localStorage.getItem(_settingsKey(clientId))); }catch(e){ stored = null; }
-  const defaults = { posEnabled:false, posAutoCapture:false, posEndpoint:'', manualUploadAlways:true };
+  const defaults = { posEnabled:true, posAutoCapture:true, posEndpoint:'', manualUploadAlways:true };
   return Object.assign({}, defaults, stored||{});
 }
 
@@ -2106,15 +2107,37 @@ function applyModuleVisibility(){
   }
 }
 
-/** Converts newly captured POS sales rows into an Inventory/Store consumption
- *  entry (Stock Adjustment table) using Code Master ML mapping — this is the
- *  "auto capture → convert inventory" step. Runs automatically when a client's
- *  Auto-Capture setting is ON, or manually via the "Convert to Inventory" button. */
-function autoCaptureInventory(salesRows){
-  if(!salesRows||!salesRows.length)return{converted:0,skipped:0,details:[]};
-  var converted=0,skipped=0,details=[];
-  salesRows.forEach(function(r){var c=getSaleInventoryConsumption_(r);if(c.length){converted+=c.length;details=details.concat(c);}else skipped++;});
-  return{converted:converted,skipped:skipped,details:details};
+/**
+ * REAL POS → INVENTORY CONVERSION ENGINE
+ * --------------------------------------
+ * Sales are converted through Code Master / cocktail recipe into base-stock
+ * consumption in ML.  The sales ledger itself remains the single source of
+ * truth for revenue.  We intentionally do NOT write the same sale again as a
+ * stock adjustment because that would subtract stock twice.
+ */
+async function autoCaptureInventory(salesRows){
+  if(!Array.isArray(salesRows)||!salesRows.length) return {converted:0,skipped:0,details:[]};
+  const ledgerKey='bnx_bar_conversion_ledger_'+(currentClient||'default');
+  let ledger={};
+  try{ ledger=JSON.parse(localStorage.getItem(ledgerKey)||'{}')||{}; }catch(e){ ledger={}; }
+  let converted=0, skipped=0, details=[];
+  salesRows.forEach(function(r,idx){
+    const saleKey=String(r.id||r.billNo||r.billId||'')+'|'+String(r.date||'')+'|'+normBarText_(r.product||r.item||'')+'|'+Number(r.qty||0)+'|'+Number(r.amount||0);
+    if(ledger[saleKey]) return;
+    const consumption=getSaleInventoryConsumption_(r);
+    if(!consumption.length){ skipped++; return; }
+    const itemDetails=consumption.map(function(x){
+      return {saleKey:saleKey,itemName:x.itemName,itemCode:x.itemCode||'',group:x.group||'',totalML:Number(x.totalML)||0};
+    }).filter(x=>x.totalML>0);
+    if(!itemDetails.length){ skipped++; return; }
+    ledger[saleKey]={at:new Date().toISOString(),date:r.date||'',product:r.product||r.reportName||'',qty:Number(r.qty)||0,amount:Number(r.amount)||0,details:itemDetails};
+    details.push.apply(details,itemDetails);
+    converted += itemDetails.length;
+  });
+  try{ localStorage.setItem(ledgerKey,JSON.stringify(ledger)); }catch(e){}
+  window._lastInventoryConversion={converted,skipped,details,at:new Date().toISOString()};
+  try{ renderBarStockBalance(); renderStoreMov(); }catch(e){}
+  return {converted,skipped,details};
 }
 
 /** Renders the Settings page: per-client POS connect toggle, auto-capture
@@ -2269,6 +2292,50 @@ async function gasLoad(tbl, silent){
   _cache[ck] = parsed;
   try{ localStorage.setItem(getKey(tbl), JSON.stringify(parsed)); }catch(e){}
   if(!silent) setGasBadge('✓ Synced '+rows.length+' rows', 'ok');
+
+/* ═══════════ LIVE AUTO CAPTURE ENGINE ═══════════
+ * Pulls the authoritative Bar Sales + Stock Receipt feeds periodically.
+ * The engine is client-scoped and idempotent: a sale/receipt already present
+ * locally is not appended again. Sales are converted to base-stock ML using
+ * Code Master/recipes, and the running stock view recalculates immediately.
+ */
+let _barAutoCaptureBusy=false;
+let _barAutoCaptureTimer=null;
+async function barAutoCaptureNow(silent){
+  if(_barAutoCaptureBusy || !currentClient) return;
+  const st=getModuleSettings(currentClient);
+  if(st.posEnabled===false) return;
+  _barAutoCaptureBusy=true;
+  try{
+    await Promise.all([
+      gasLoad('codemaster',true),
+      gasLoad('menu',true),
+      gasLoad('sales',true),
+      gasLoad('store',true),
+      gasLoad('adj',true)
+    ]);
+    const sales=loadData('sales');
+    const conv=await autoCaptureInventory(sales);
+    try{ renderSalesTable(); renderStoreTable(); renderStoreMov(); renderDashboard(); }catch(e){}
+    if(!silent){
+      const el=document.getElementById('posModeBadge');
+      if(el) el.textContent='🟢 LIVE · Sales '+sales.length+' · Converted '+conv.converted+' · Stock receipts '+loadData('store').length;
+    }
+    return conv;
+  }catch(e){
+    console.warn('[barAutoCaptureNow]',e);
+    if(!silent) setGasBadge('⚠ Auto capture retry pending','err');
+    return {converted:0,skipped:0,details:[],error:e.message};
+  }finally{
+    _barAutoCaptureBusy=false;
+  }
+}
+function startBarAutoCapture(){
+  if(_barAutoCaptureTimer) clearInterval(_barAutoCaptureTimer);
+  _barAutoCaptureTimer=setInterval(function(){ barAutoCaptureNow(true); },60000);
+  setTimeout(function(){barAutoCaptureNow(true);},1500);
+}
+window.barAutoCaptureNow=barAutoCaptureNow;
 }
 
 // ── GAS push: append new rows to Google Sheets ──────────────────────────────
@@ -3225,7 +3292,7 @@ function handleExcelUpload(event,preferSheet,callback){
   reader.readAsBinaryString(file);
 }
 
-function importSalesFromRows(rows){
+async function importSalesFromRows(rows){
   // find header row
   let hdrIdx = 0;
   for(let i=0;i<Math.min(5,rows.length);i++){ const keys=Object.keys(rows[i]||{}); if(keys.some(k=>String(k).includes('Date')||String(k).includes('date'))) { hdrIdx=i; break; } }
@@ -3259,44 +3326,23 @@ function importSalesFromRows(rows){
       toast(`Auto-captured ${res.converted} item(s) into Inventory/Store ✓`,'ok');
     } else if(prev){
       window._pendingInventoryConvert = mapped;
-      prev.innerHTML += `<div class="conv-row" style="margin-top:6px;"><button class="btn btn-primary btn-sm" onclick="const r=autoCaptureInventory(window._pendingInventoryConvert||[]);toast('Converted '+r.converted+' item(s) to inventory ✓','ok');window._pendingInventoryConvert=null;">📦 Convert to Inventory</button></div>`;
+      prev.innerHTML += `<div class="conv-row" style="margin-top:6px;"><button class="btn btn-primary btn-sm" onclick="convertPendingInventory()">📦 Convert to Inventory</button></div>`;
     }
   }
 }
 
-function importStoreFromRows(rows){
-  // handle both formats
-  let hdrIdx=0;
-  for(let i=0;i<Math.min(5,rows.length);i++){const keys=Object.keys(rows[i]||{});if(keys.some(k=>String(k).includes('DATE')||String(k).includes('Date')||String(k).includes('date'))){hdrIdx=i;break;}}
-  const data=rows.slice(hdrIdx);
-  const mapped=data.filter(r=>{
-    const d=r['DATE']||r['Date']||r['date']||r['Unnamed: 0'];
-    return d&&String(d).length>4;
-  }).map(r=>({
-    id:Date.now()+Math.random(),
-    date:fmtDate(r['DATE']||r['Date']||r['date']||r['Unnamed: 0']),
-    item:r['ITEM NAME']||r['ItemName']||r['Item Name']||r['Unnamed: 1']||'',
-    uom:r['UOM']||'',
-    issqty:Number(r['IssQtr']||r['IssQty']||r['RecQty']||r['Unnamed: 2']||0),
-    rate:Number(r['IssRate']||r['Rate']||r['Old Rate']||r['Unnamed: 9']||0),
-    issval:Number(r['IssVal']||0),
-    mlEquiv:Number(r['Bar Receivd IN ML']||r['Bar Receivd']||0),
-    barName:r['BAR REPORT NAME']||r['ITEM NAME']||r['Unnamed: 4']||'',
-    group:r['REPORTGROUP']||r['Group']||r['Unnamed: 6']||'',
-    month:r['Month']||monthOf(r['DATE']||r['Date']||'')
-  })).filter(r=>r.item&&r.date);
-  // compute issval and mlEquiv if missing
-  const codemaster=loadData('codemaster');
-  mapped.forEach(r=>{
-    if(!r.issval) r.issval=r.issqty*r.rate;
-    if(!r.mlEquiv||r.mlEquiv===0){
-      const cm=codemaster.find(c=>c.store&&(c.store.toLowerCase().includes(r.item.toLowerCase().slice(0,8))||c.report===r.barName));
-      if(cm) r.mlEquiv=r.issqty*Number(cm.issue||750);
-    }
-  });
-  const arr=loadData('store'); arr.push(...mapped); saveData('store',arr); if(mapped.length) gasPush('store',mapped);
-  renderStoreTable(); toast(`Imported ${mapped.length} store records ✓ — pushing to Sheets…`,'ok');
-  const prev=document.getElementById('storeUploadPreview');if(prev) prev.innerHTML=`<div class="conv-row"><strong>${mapped.length}</strong> store records imported.</div>`;
+async function importStoreFromRows(rows){
+  const mapped=parseStoreRows(rows);
+  if(!mapped.length){toast('No valid stock receipt rows found','warn');return;}
+  const existing=loadData('store');
+  const keys=new Set(existing.map(r=>String(r.id)+'|'+r.date+'|'+normBarText_(r.barName||r.item)+'|'+Number(r.qtyML||r.mlEquiv||0)));
+  const newOnes=mapped.filter(r=>!keys.has(String(r.id)+'|'+r.date+'|'+normBarText_(r.barName||r.item)+'|'+Number(r.qtyML||r.mlEquiv||0)));
+  saveData('store',[...existing,...newOnes]);
+  for(const r of newOnes) await gasPush('store',[r]);
+  renderStoreTable(); renderStoreMov(); renderBarStockBalance();
+  toast(`✓ ${newOnes.length} stock receipts imported and synced!`,'ok');
+  const prev=document.getElementById('storeUploadPreview');
+  if(prev) prev.innerHTML=`<div class="conv-row"><strong>${newOnes.length}</strong> receipts imported · <strong>${formatML(newOnes.reduce((a,r)=>a+Number(r.qtyML||0),0))}</strong> base stock ML.</div>`;
 }
 
 function importPhyFromRows(rows){
@@ -3324,56 +3370,100 @@ function importCMFromRows(rows){
 //  STORE TABLE
 // ═══════════════════════════════════════════════════
 function openAddStoreModal(){ openModal('modalAddStore'); document.getElementById('mst_date').value=todayStr(); }
-function addStoreRecord(){
-  const d={id:Date.now(),date:document.getElementById('ste_date').value,item:document.getElementById('ste_item').value,uom:document.getElementById('ste_uom').value,issqty:Number(document.getElementById('ste_issqty').value||0),rate:Number(document.getElementById('ste_rate').value||0),issval:0,mlEquiv:0,barName:document.getElementById('ste_barname').value,month:monthOf(document.getElementById('ste_date').value)};
-  d.issval=d.issqty*d.rate;
-  const cm=loadData('codemaster').find(c=>c.report&&c.report.toLowerCase()===d.barName.toLowerCase());
-  if(cm) d.mlEquiv=d.issqty*Number(cm.issue||750);
-  if(!d.date||!d.item){ toast('Fill required fields','warn'); return; }
-  const arr=loadData('store'); arr.push(d); saveData('store',arr); gasPush('store',[d]);
-  renderStoreTable(); toast('Store record saved ✓','ok');
+function _makeStoreReceipt_(date,item,uom,qty,rate,barName,vendor,invoice){
+  const cleanUom=String(uom||'BT').trim().toUpperCase();
+  const q=Number(qty)||0, rt=Number(rate)||0;
+  const cm=findCodeMap_(barName||item);
+  const bottleML=Number((cm&&cm.issue)||0)>0?Number(cm.issue):750;
+  const qtyML=cleanUom==='ML'?q:cleanUom==='LTR'?q*1000:cleanUom==='CL'?q*10:q*bottleML;
+  return {
+    id:barUuid(), date:date||todayStr(), item:item||barName||'', uom:cleanUom,
+    qtyBtl:cleanUom==='BT'||cleanUom==='BOTTLE'||cleanUom==='BTL'?q:0,
+    bottleML:bottleML, qtyML:+qtyML.toFixed(3), rate:rt, amount:+(q*rt).toFixed(2),
+    barName:barName||((cm&&cm.report)||item||''), vendor:vendor||'', invoice:invoice||'',
+    godown:'', excise:0, remarks:'Manual stock receipt', month:monthOf(date||todayStr())
+  };
 }
-function addStoreFromModal(){
-  const d={id:Date.now(),date:document.getElementById('mst_date').value,item:document.getElementById('mst_item').value,uom:document.getElementById('mst_uom').value,issqty:Number(document.getElementById('mst_qty').value||0),rate:Number(document.getElementById('mst_rate').value||0),issval:0,mlEquiv:0,barName:document.getElementById('mst_barname').value,month:monthOf(document.getElementById('mst_date').value)};
-  d.issval=d.issqty*d.rate;
-  const cm=loadData('codemaster').find(c=>c.report&&c.report.toLowerCase()===d.barName.toLowerCase());
-  if(cm) d.mlEquiv=d.issqty*Number(cm.issue||750);
-  const arr=loadData('store'); arr.push(d); saveData('store',arr); gasPush('store',[d]);
-  closeModal('modalAddStore'); renderStoreTable(); toast('Added ✓','ok');
+async function addStoreRecord(){
+  const d=_makeStoreReceipt_(
+    document.getElementById('ste_date')?.value,
+    document.getElementById('ste_item')?.value.trim(),
+    document.getElementById('ste_uom')?.value,
+    document.getElementById('ste_issqty')?.value,
+    document.getElementById('ste_rate')?.value,
+    document.getElementById('ste_barname')?.value.trim(),
+    document.getElementById('ste_vendor')?.value?.trim()||'',
+    document.getElementById('ste_invoice')?.value?.trim()||''
+  );
+  if(!d.date||!d.item||d.qtyML<=0){toast('Fill date, item and a positive receipt quantity','warn');return;}
+  const arr=loadData('store'); arr.push(d); saveData('store',arr);
+  const res=await gasPush('store',[d]);
+  renderStoreTable(); renderBarStockBalance();
+  toast(res&&res.success?'Stock receipt saved ✓':'Receipt saved locally and queued for Sheets ✓',res&&res.success?'ok':'warn');
+}
+async function addStoreFromModal(){
+  const d=_makeStoreReceipt_(
+    document.getElementById('mst_date')?.value,
+    document.getElementById('mst_item')?.value.trim(),
+    document.getElementById('mst_uom')?.value,
+    document.getElementById('mst_qty')?.value,
+    document.getElementById('mst_rate')?.value,
+    document.getElementById('mst_barname')?.value.trim(),
+    document.getElementById('mst_vendor')?.value?.trim()||'',
+    document.getElementById('mst_invoice')?.value?.trim()||''
+  );
+  if(!d.date||!d.item||d.qtyML<=0){toast('Fill date, item and a positive receipt quantity','warn');return;}
+  const arr=loadData('store'); arr.push(d); saveData('store',arr);
+  const res=await gasPush('store',[d]);
+  closeModal('modalAddStore'); renderStoreTable(); renderBarStockBalance();
+  toast(res&&res.success?'Receipt added ✓':'Receipt added locally and queued ✓',res&&res.success?'ok':'warn');
 }
 function renderStoreTable(filter){
   let arr=loadData('store');
   if(filter){ if(filter.from) arr=arr.filter(r=>r.date>=filter.from); if(filter.to) arr=arr.filter(r=>r.date<=filter.to); }
   arr.sort((a,b)=>(a.date||'')>(b.date||'')?-1:1);
   const tbody=document.getElementById('tbodyStore'); if(!tbody) return;
-  const total=arr.reduce((s,r)=>s+Number(r.issval||0),0);
-  const totalML=arr.reduce((s,r)=>s+Number(r.mlEquiv||0),0);
-  tbody.innerHTML=arr.length?arr.map((r,i)=>`<tr>
-    <td>${r.date||'—'}</td><td class="td-bold">${r.item||'—'}</td><td>${r.uom||'—'}</td>
-    <td class="td-num">${r.issqty}</td><td class="td-num">₹${formatNum(r.rate)}</td>
-    <td class="td-num td-bold">₹${formatNum(r.issval)}</td>
-    <td class="td-num td-green">${formatML(r.mlEquiv)}</td>
-    <td>${r.barName||'—'}</td><td>${r.month||monthOf(r.date)||'—'}</td>
-    <td><button class="btn btn-ghost btn-sm" onclick="delStore(${r.id})">🗑</button></td>
-  </tr>`).join(''):'<tr><td colspan="10" style="text-align:center;padding:24px;color:var(--text3);">No store data. Upload Data_Store Excel.</td></tr>';
+  const total=arr.reduce((s,r)=>s+Number(r.amount!=null?r.amount:r.issval||0),0);
+  const totalML=arr.reduce((s,r)=>s+Number(r.qtyML!=null?r.qtyML:r.mlEquiv||0),0);
+  tbody.innerHTML=arr.length?arr.map((r,i)=>{
+    const qty=Number(r.qtyBtl!=null?r.qtyBtl:r.issqty)||0, ml=Number(r.qtyML!=null?r.qtyML:r.mlEquiv)||0, amount=Number(r.amount!=null?r.amount:r.issval)||0;
+    return `<tr>
+    <td>${r.date||'—'}</td><td class="td-bold">${r.item||r.barName||'—'}</td><td>${r.uom||'BT'}</td>
+    <td class="td-num">${formatNum(qty)}</td><td class="td-num">₹${formatNum(Number(r.rate)||0)}</td>
+    <td class="td-num td-bold">₹${formatNum(amount)}</td>
+    <td class="td-num td-green">${formatML(ml)}</td>
+    <td>${r.barName||r.item||'—'}</td><td>${r.month||monthOf(r.date)||'—'}</td>
+    <td><button class="btn btn-ghost btn-sm" onclick="delStore('${String(r.id).replace(/'/g,"\\'")}')">🗑</button></td>
+  </tr>`;}).join(''):'<tr><td colspan="10" style="text-align:center;padding:24px;color:var(--text3);">No store data. Upload Data_Store Excel.</td></tr>';
   const f=document.getElementById('storeFooter'); if(f) f.textContent=`${arr.length} records · Value: ₹${formatNum(total)} · ML: ${formatML(totalML)}`;
 }
 function filterStore(){ renderStoreTable({from:document.getElementById('storeFrom')?.value,to:document.getElementById('storeTo')?.value}); }
 function clearStoreFilter(){ ['storeFrom','storeTo'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';}); renderStoreTable(); }
-function delStore(id){ if(!confirm('Delete?'))return; saveData('store',loadData('store').filter(r=>r.id!==id)); renderStoreTable(); toast('Deleted','warn'); }
+function delStore(id){ if(!confirm('Delete?'))return; saveData('store',loadData('store').filter(r=>String(r.id)!==String(id))); renderStoreTable(); renderBarStockBalance(); toast('Deleted','warn'); }
 
 // ═══════════════════════════════════════════════════
 //  PHY STOCK
 // ═══════════════════════════════════════════════════
-function addPhyRecord(){
-  const d={id:Date.now(),group:'',item:document.getElementById('phy_item').value.trim(),unit:document.getElementById('phy_unit').value||'ML',sysQty:0,phyQty:Number(document.getElementById('phy_qty').value||0),variance:0,phyDate:document.getElementById('phy_date').value,remarks:document.getElementById('phy_remarks').value};
-  if(!d.phyDate||!d.item){ toast('Fill required fields','warn'); return; }
-  const sales=loadData('sales'); const rec=loadData('store');
-  const salesML=sales.filter(s=>s.reportName===d.item||s.product===d.item).reduce((s,r)=>s+Number(r.totalML||0),0);
-  const recML=rec.filter(r=>r.barName===d.item).reduce((s,r)=>s+Number(r.mlEquiv||0),0);
-  d.sysQty=recML-salesML; d.variance=d.phyQty-d.sysQty;
-  const arr=loadData('phy'); arr.push(d); saveData('phy',arr); gasPush('phy',[d]);
-  renderPhyTable(); toast('Physical count saved ✓','ok');
+async function addPhyRecord(){
+  const d={id:'PHY-'+Date.now(),group:'',item:document.getElementById('phy_item').value.trim(),
+    unit:document.getElementById('phy_unit').value||'ML',sysQty:0,
+    phyQty:Number(document.getElementById('phy_qty').value||0),variance:0,
+    phyDate:document.getElementById('phy_date').value,remarks:document.getElementById('phy_remarks').value};
+  if(!d.phyDate||!d.item||d.phyQty<0){toast('Fill date, item and physical quantity','warn');return;}
+  const sales=loadData('sales').filter(r=>String(r.date||'')<=String(d.phyDate));
+  const rec=loadData('store').filter(r=>String(r.date||'')<=String(d.phyDate));
+  const itemKey=normBarText_(d.item);
+  const salesML=sales.reduce((sum,r)=>sum+getSaleInventoryConsumption_(r).filter(x=>normBarText_(x.itemName)===itemKey).reduce((a,x)=>a+Number(x.totalML||0),0),0);
+  const recML=rec.reduce((sum,r)=>sum+(normBarText_(r.barName||r.item)===itemKey?Number(r.qtyML!=null?r.qtyML:r.mlEquiv||0):0),0);
+  const openingMap=typeof _loadOpeningBalanceMap==='function'?_loadOpeningBalanceMap():{};
+  const openingKey=Object.keys(openingMap).find(k=>normBarText_(k)===itemKey);
+  const opening=openingKey!=null?Number(openingMap[openingKey])||0:0;
+  d.sysQty=+(opening+recML-salesML).toFixed(3);
+  d.variance=+(d.phyQty-d.sysQty).toFixed(3);
+  const arr=loadData('phy'); arr.push(d); saveData('phy',arr);
+  const res=await gasPush('phy',[d]);
+  renderPhyTable(); renderBarStockBalance();
+  toast(res&&res.success?'Physical stock saved ✓':'Physical stock saved locally and queued ✓',res&&res.success?'ok':'warn');
 }
 function renderPhyTable(){
   const arr=loadData('phy'); const tbody=document.getElementById('tbodyPhy'); if(!tbody) return;
@@ -3679,24 +3769,31 @@ function renderStoreReportFull(){
 // ═══════════════════════════════════════════════════
 function renderDaywise(){var sales=loadData('sales'),store=loadData('store'),phy=loadData('phy'),itemF=document.getElementById('dwItem')?.value||'',monthF=document.getElementById('dwMonth')?.value||'',dayMap={},key=function(d,i){return d+'|'+normBarText_(i);};store.forEach(function(r){var item=r.barName||r.item;if(!item)return;var k=key(r.date,item);if(!dayMap[k])dayMap[k]={date:r.date,item:item,received:0,sale:0,phyStock:null};dayMap[k].received+=Number(r.mlEquiv||0);});sales.forEach(function(r){getSaleInventoryConsumption_(r).forEach(function(x){var k=key(r.date,x.itemName);if(!dayMap[k])dayMap[k]={date:r.date,item:x.itemName,received:0,sale:0,phyStock:null};dayMap[k].sale+=x.totalML;});});phy.forEach(function(r){var d=r.date||r.phyDate||'',i=r.itemName||r.item;if(!d||!i)return;var k=key(d,i);if(dayMap[k])dayMap[k].phyStock=Number(r.phyQtyML!=null?r.phyQtyML:r.phyQty)||0;});var rows=Object.values(dayMap);if(itemF)rows=rows.filter(function(r){return normBarText_(r.item)===normBarText_(itemF);});if(monthF)rows=rows.filter(function(r){return monthOf(r.date)===monthF;});rows.sort(function(a,b){return(a.date||'').localeCompare(b.date||'')||a.item.localeCompare(b.item);});var manual=_loadOpeningBalanceMap(),run={};rows.forEach(function(r){var k=normBarText_(r.item);if(run[k]==null){var mk=Object.keys(manual).find(function(x){return normBarText_(x)===k;});run[k]=mk!=null?Number(manual[mk])||0:0;}r.opening=run[k];r.closing=r.opening+r.received-r.sale;r.variance=r.phyStock!=null?r.phyStock-r.closing:null;run[k]=r.closing;});var tbody=document.getElementById('tbodyDaywise');if(!tbody)return;tbody.innerHTML=rows.length?rows.map(function(r){return'<tr><td>'+ (r.date||'—')+'</td><td class="td-bold">'+r.item+'</td><td class="td-num day-open">'+formatML(r.opening)+'</td><td class="td-num day-recd">'+formatML(r.received)+'</td><td class="td-num day-sale">'+formatML(r.sale)+'</td><td class="td-num day-close">'+formatML(r.closing)+'</td><td class="td-num day-phy">'+(r.phyStock!=null?formatML(r.phyStock):'—')+'</td><td class="td-num '+(r.variance>0?'day-var-pos':r.variance<0?'day-var-neg':'')+'">'+(r.variance!=null?(r.variance>=0?'+':'')+r.variance.toFixed(2):'—')+'</td></tr>';}).join(''):'<tr><td colspan="8" style="text-align:center;padding:24px;color:var(--text3);">No daywise inventory data.</td></tr>';var dw=document.getElementById('dwItem');if(dw){var all=[...new Set(Object.values(dayMap).map(function(r){return r.item;}))].sort();dw.innerHTML='<option value="">All Items</option>'+all.map(function(i){return'<option>'+i+'</option>';}).join('');if(itemF)dw.value=itemF;}}
 function renderStoreMov(){
-  const store=loadData('store'); // IN: purchase/transfer receipts (qtyML)
-  const sales=loadData('sales'); // OUT: POS pours (mlQty)
+  const store=loadData('store'), sales=loadData('sales');
   const tbody=document.getElementById('tbodyStoreMov'); if(!tbody) return;
   const rows=[];
   store.forEach(r=>{
-    rows.push({date:r.date, item:r.barName||r.item||'—', uom:'ML', received:r.qtyML||0, issued:0, value:r.amount||0, month:monthOf(r.date)});
+    rows.push({date:r.date,item:r.barName||r.item||'—',uom:'ML',
+      received:Number(r.qtyML!=null?r.qtyML:r.mlEquiv)||0,issued:0,
+      value:Number(r.amount!=null?r.amount:r.issval)||0,month:monthOf(r.date),type:'RECEIPT'});
   });
   sales.forEach(r=>{
-    rows.push({date:r.date, item:r.product||r.item||'—', uom:'ML', received:0, issued:r.mlQty||0, value:r.amount||0, month:monthOf(r.date)});
+    const cons=getSaleInventoryConsumption_(r);
+    if(cons.length){
+      cons.forEach(x=>rows.push({date:r.date,item:x.itemName||r.product||'—',uom:'ML',
+        received:0,issued:Number(x.totalML)||0,value:Number(r.amount)||0,month:monthOf(r.date),type:'SALE'}));
+    } else {
+      rows.push({date:r.date,item:r.product||r.item||'—',uom:'ML',received:0,
+        issued:Number(r.mlQty)||0,value:Number(r.amount)||0,month:monthOf(r.date),type:'SALE'});
+    }
   });
   rows.sort((a,b)=>(a.date||'')<(b.date||'')?1:(a.date||'')>(b.date||'')?-1:0);
   tbody.innerHTML=rows.length?rows.map(r=>`<tr>
     <td>${r.date||'—'}</td><td class="td-bold">${r.item}</td><td>${r.uom}</td>
     <td class="td-num td-green">${r.received?formatNum(r.received):'—'}</td>
     <td class="td-num td-red">${r.issued?formatNum(r.issued):'—'}</td>
-    <td class="td-num td-bold">₹${formatNum(r.value)}</td>
-    <td>${r.month||'—'}</td>
-  </tr>`).join(''):'<tr><td colspan="7" style="text-align:center;padding:24px;color:var(--text3);">No store movement data.</td></tr>';
+    <td class="td-num td-bold">₹${formatNum(r.value)}</td><td>${r.month||'—'}</td>
+  </tr>`).join(''):'<tr><td colspan="7" style="text-align:center;padding:24px;color:var(--text3);">No stock movement data.</td></tr>';
   renderBarStockBalance();
 }
 // ── Real running stock balance per item, in ML — the calculation this whole
@@ -3704,20 +3801,35 @@ function renderStoreMov(){
 // (adj.recQtyML) + reissue-back (adj.reIssueML). Bottle-size comes from the
 // most recent store receipt for that item, so "≈ Bottles" is a genuine
 // estimate even though the real unit of truth stays ML throughout. ──
-function getBarStockBalance(){var store=loadData('store'),sales=loadData('sales'),adj=loadData('adj'),items={};store.forEach(function(r){var key=r.barName||r.item;if(!key)return;var k=normBarText_(key);items[k]=items[k]||{name:key,received:0,sold:0,adjOut:0,bottleML:Number(r.bottleML)||750,lastDate:r.date||''};items[k].received+=Number(r.mlEquiv)||0;if(!items[k].lastDate||r.date>items[k].lastDate){items[k].bottleML=Number(r.bottleML)||items[k].bottleML;items[k].lastDate=r.date||'';}});Object.values(getInventoryConsumptionMap_(sales)).forEach(function(c){var k=normBarText_(c.name);items[k]=items[k]||{name:c.name,received:0,sold:0,adjOut:0,bottleML:750,lastDate:''};items[k].sold+=c.soldML;});adj.forEach(function(r){var key=r.itemName;if(!key)return;var k=normBarText_(key);items[k]=items[k]||{name:key,received:0,sold:0,adjOut:0,bottleML:750,lastDate:''};items[k].adjOut+=Number(r.recQtyML||0)-Number(r.reIssueML||0);});var manual=typeof _loadOpeningBalanceMap==='function'?_loadOpeningBalanceMap():{};return Object.values(items).map(function(d){var base=Object.keys(manual).find(function(k){return normBarText_(k)===normBarText_(d.name);}),opening=base!=null?Number(manual[base])||0:0;return{name:d.name,bottleML:d.bottleML,opening:opening,received:d.received,sold:d.sold,adjOut:d.adjOut,closing:opening+d.received-d.sold-d.adjOut};}).sort(function(a,b){return a.name.localeCompare(b.name);});}
-function renderBarStockBalance(){
-  const tbody=document.getElementById('tbodyBarStock');if(!tbody)return;
-  const rows=getBarStockBalance();
-  tbody.innerHTML=rows.length?rows.map(r=>`<tr>
-    <td class="td-bold">${r.name}</td>
-    <td class="td-num">${r.bottleML} ml</td>
-    <td class="td-num">${formatNum(r.opening)}</td>
-    <td class="td-num td-green">${formatNum(r.received)}</td>
-    <td class="td-num td-red">${formatNum(r.sold)}</td>
-    <td class="td-num" style="color:var(--warn,#d97706)">${formatNum(r.adjOut)}</td>
-    <td class="td-num td-bold" style="color:${r.closing<0?'var(--red)':'var(--brand)'}">${formatNum(r.closing)}</td>
-    <td class="td-num">${r.bottleML?(r.closing/r.bottleML).toFixed(1):'—'}</td>
-  </tr>`).join(''):'<tr><td colspan="8" style="text-align:center;padding:24px;color:var(--text3);">No stock data yet — receive stock or record a sale first.</td></tr>';
+function getBarStockBalance(){
+  const store=loadData('store'), sales=loadData('sales'), adj=loadData('adj'), items={};
+  store.forEach(function(r){
+    const key=r.barName||r.item;if(!key)return;const k=normBarText_(key);
+    if(!items[k])items[k]={name:key,received:0,sold:0,adjOut:0,bottleML:Number(r.bottleML)||750,lastDate:r.date||''};
+    items[k].received+=Number(r.qtyML!=null?r.qtyML:r.mlEquiv)||0;
+    if(!items[k].lastDate||String(r.date||'')>String(items[k].lastDate)){
+      items[k].bottleML=Number(r.bottleML)||items[k].bottleML;items[k].lastDate=r.date||'';
+    }
+  });
+  Object.values(getInventoryConsumptionMap_(sales)).forEach(function(c){
+    const k=normBarText_(c.name);if(!items[k])items[k]={name:c.name,received:0,sold:0,adjOut:0,bottleML:750,lastDate:''};
+    items[k].sold+=Number(c.soldML)||0;
+  });
+  adj.forEach(function(r){
+    // POS_CONSUMPTION is only an audit/conversion marker; sales already reduce
+    // stock above, so never subtract it a second time.
+    if(String(r.adjType||'').toUpperCase()==='POS_CONSUMPTION')return;
+    const key=r.itemName;if(!key)return;const k=normBarText_(key);
+    if(!items[k])items[k]={name:key,received:0,sold:0,adjOut:0,bottleML:750,lastDate:''};
+    items[k].adjOut+=Number(r.recQtyML||0)-Number(r.reIssueML||0);
+  });
+  const manual=typeof _loadOpeningBalanceMap==='function'?_loadOpeningBalanceMap():{};
+  return Object.values(items).map(function(d){
+    const base=Object.keys(manual).find(function(k){return normBarText_(k)===normBarText_(d.name);});
+    const opening=base!=null?Number(manual[base])||0:0;
+    return {name:d.name,bottleML:d.bottleML,opening,received:d.received,sold:d.sold,adjOut:d.adjOut,
+      closing:+(opening+d.received-d.sold-d.adjOut).toFixed(3)};
+  }).sort(function(a,b){return a.name.localeCompare(b.name);});
 }
 
 // ═══════════════════════════════════════════════════
@@ -4341,30 +4453,30 @@ function parseCMRows(rows) {
 
 /* ═══════════ SMART STORE PARSER ═══════════ */
 function parseStoreRows(rows) {
-  if(!rows.length) return [];
-  const headers=Object.keys(rows[0]);
-  const cols=detectCols(headers);
-  const cm=loadData('codemaster');
+  if(!Array.isArray(rows)||!rows.length) return [];
+  const headers=Object.keys(rows[0]||{}), cols=detectCols(headers), cm=loadData('codemaster');
   return rows.map((r,i)=>{
-    const vals=Object.values(r);
-    const g=(idx)=>idx!==-1?vals[idx]:'';
+    const vals=Object.values(r), g=idx=>idx!==-1?vals[idx]:'';
     const item=String(g(cols.storeItem)||g(cols.product)||vals[1]||'').trim();
-    const qty=parseFloat(g(cols.qty))||0;
-    if(!item||!qty) return null;
-    const rate=parseFloat(g(cols.rate))||0;
-    const uom=String(g(cols.uom)||'BT').trim();
-    const cmMatch=cm.find(c=>c.store===item||c.barname===item||c.report===item);
-    const mlPB=cmMatch?.issue||750;
-    const mlEquiv=uom==='ML'?qty:uom==='LTR'?qty*1000:qty*mlPB;
+    const qty=Number(g(cols.qty))||0;
+    if(!item||qty<=0)return null;
+    const rate=Number(g(cols.rate))||0;
+    const uom=String(g(cols.uom)||'BT').trim().toUpperCase();
+    const cmMatch=cm.find(c=>[c.store,c.barname,c.report,c.posName].some(v=>normBarText_(v)===normBarText_(item)))||null;
+    const bottleML=Number(cmMatch&&cmMatch.issue)||750;
+    const qtyML=uom==='ML'?qty:uom==='LTR'?qty*1000:uom==='CL'?qty*10:qty*bottleML;
+    const date=fmtDate(g(cols.date)||'')||todayStr();
     return {
-      id:Date.now()+i,
-      date:fmtDate(g(cols.date)||''),
-      item, uom, issqty:qty, rate,
-      issval:qty*rate,
-      mlEquiv, barName:cmMatch?.report||item,
+      id:'ST-'+Date.now()+'-'+i+'-'+Math.random().toString(36).slice(2,7),
+      date,item,uom,
+      qtyBtl:/^(BT|BTL|BOTTLE|BOTTLES)$/.test(uom)?qty:0,
+      bottleML,qtyML:+qtyML.toFixed(3),rate,
+      amount:+(qty*rate).toFixed(2),
+      barName:(cmMatch&&cmMatch.report)||item,
       vendor:String(g(cols.vendor)||''),
       invoice:String(g(cols.invoice)||''),
-      month:String(g(cols.month)||monthOf(fmtDate(g(cols.date)||'')||'')),
+      godown:'',excise:0,remarks:'Imported stock receipt',
+      month:String(g(cols.month)||monthOf(date))
     };
   }).filter(Boolean);
 }
@@ -4413,7 +4525,7 @@ window.handleMocktailUpload = function(event) {
 };
 
 window.handleSalesFileUpload = function(event) {
-  handleExcelUpload(event,'Sales',rows=>{
+  handleExcelUpload(event,'Sales',async rows=>{
     const parsed=parsePosRows(rows);
     if(!parsed.length){toast('No sales data found','warn');return;}
     const existing=loadData('sales');
@@ -4439,14 +4551,15 @@ window.handleSalesFileUpload = function(event) {
 };
 
 window.handleStoreFileUpload = function(event) {
-  handleExcelUpload(event,'Store',rows=>{
+  handleExcelUpload(event,'Store',async rows=>{
     const parsed=parseStoreRows(rows);
     if(!parsed.length){toast('No store data found','warn');return;}
     const existing=loadData('store');
     saveData('store',[...existing,...parsed]);
-    renderStoreTable();
-    addImportLog('Store Upload',parsed.length,'ok','Stock receipts imported');
-    toast(`✓ ${parsed.length} store records imported!`,'ok');
+    const res=await Promise.all(parsed.map(r=>gasPush('store',[r])));
+    renderStoreTable(); renderStoreMov(); renderBarStockBalance();
+    addImportLog('Store Upload',parsed.length,'ok','Stock receipts imported and synced');
+    toast(`✓ ${parsed.length} stock receipts imported!`,'ok');
   });
 };
 
@@ -4463,6 +4576,16 @@ window.handleCMUpload = function(event) {
     toast(`✓ ${newOnes.length} Code Master items imported!`,'ok');
   });
 };
+
+async function convertPendingInventory(){
+  const rows=(window._pendingInventoryConvert&&window._pendingInventoryConvert.length)
+    ? window._pendingInventoryConvert : loadData('sales');
+  const r=await autoCaptureInventory(rows);
+  window._pendingInventoryConvert=null;
+  toast(`Converted ${r.converted} item(s) to inventory ✓${r.skipped?' · '+r.skipped+' unmapped':''}`,r.skipped?'warn':'ok');
+  renderStoreMov(); renderBarStockBalance();
+  return r;
+}
 
 /* ═══════════ GAS LIVE SYNC ALL MODULES ═══════════ */
 let _gasSyncing=false;
@@ -4494,8 +4617,8 @@ async function gasSyncAll(){
         source:'GAS',
       })).filter(r=>r.product);
       const ex=loadData('sales');
-      const keys=new Set(ex.map(r=>r.date+'|'+r.product));
-      const merged=[...ex,...rows.filter(r=>!keys.has(r.date+'|'+r.product))];
+      const keys=new Set(ex.map(r=>String(r.id||'')+'|'+r.date+'|'+r.product+'|'+Number(r.qty||0)+'|'+Number(r.amount||0)));
+      const merged=[...ex,...rows.filter(r=>!keys.has(String(r.id||'')+'|'+r.date+'|'+r.product+'|'+Number(r.qty||0)+'|'+Number(r.amount||0)))];
       saveData('sales',merged);
       log(`Sales: ${rows.length} rows fetched`);
     }
