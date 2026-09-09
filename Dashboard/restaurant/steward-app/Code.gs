@@ -866,6 +866,29 @@ const TRANSACTION_TYPES = {
   PURCHASE: 'PURCHASE', STOCK_MOVEMENT: 'STOCK_MOVEMENT', STOCK_ADJUSTMENT: 'STOCK_ADJUSTMENT'
 };
 
+// ---------------------------------------------------------------------
+// STEWARD MOBILE APP AUTHORIZATION
+// This is an app-specific gate; generic Restaurant Dashboard actions are
+// unaffected. The Steward Mobile app may be used only by CAPTAIN, STEWARD,
+// CHEF or SUPER_ADMIN.
+const STEWARD_APP_ALLOWED_ROLES_ = ['CAPTAIN','STEWARD','CHEF','SUPER_ADMIN'];
+function bnxNormalizeStewardRole_(role){
+  const r=String(role||'').trim().toUpperCase();
+  if(r.indexOf('SUPER_ADMIN')>=0) return 'SUPER_ADMIN';
+  if(r.indexOf('CAPTAIN')>=0) return 'CAPTAIN';
+  if(r.indexOf('CHEF')>=0) return 'CHEF';
+  if(r.indexOf('STEWARD')>=0) return 'STEWARD';
+  return r;
+}
+function bnxAuthorizeStewardApp_(session, payload){
+  if(String(payload && payload.appId || '').trim().toUpperCase()!=='STEWARD_MOBILE') return null;
+  const role=bnxNormalizeStewardRole_(session && session.ROLE);
+  if(STEWARD_APP_ALLOWED_ROLES_.indexOf(role)===-1){
+    return respondError(403,'Steward Mobile access denied. Allowed roles: CAPTAIN, STEWARD, CHEF, SUPER_ADMIN',payload && payload.requestId || '');
+  }
+  return null;
+}
+
 function doPost(e) {
   try {
     const requestBody = e.postData.contents;
@@ -887,6 +910,8 @@ function doPost(e) {
       bnxLogError(session.CLIENT_ID, `Unauthorized access attempt: client ${clientId}`, payload);
       return respondJson(respondError(403, 'Unauthorized access', requestId));
     }
+    const stewardAuthError = bnxAuthorizeStewardApp_(session, payload);
+    if (stewardAuthError) return respondJson(stewardAuthError);
 
     let result;
     switch (action) {
@@ -1577,34 +1602,6 @@ function bnxSaveOrder(session, payload) {
       };
       bnxAppendRow(clientId, SHEETS.ORDER_ITEMS, orderItem);
     });
-    // SINGLE SOURCE OF TRUTH: every successful DINE-IN table order moves
-    // the real TABLE_LIVE_STATE row to RUNNING immediately. This is what makes
-    // the same running table appear on Restaurant Dashboard, Steward Maps,
-    // My Running Tables and other devices without waiting for a stale local
-    // cache. Counter/Delivery/Quick-Bill pseudo tables are excluded.
-    const orderTableId = String(payload.tableId || payload.TABLE_ID || '').trim();
-    if (orderTableId && !/^(COUNTER|DELIVERY|#QB)/i.test(orderTableId)) {
-      const orderAmount = (payload.items || []).reduce((sum, item) => {
-        const q = Number(item.qty != null ? item.qty : item.QUANTITY) || 0;
-        const rate = Number(item.price != null ? item.price : (item.rate != null ? item.rate : item.RATE)) || 0;
-        return sum + q * rate;
-      }, 0);
-      try {
-        bnxSaveTableStatusHandler(session, {
-          requestId: requestId ? String(requestId) + ':TABLE_LIVE' : generateShortId_(clientId,'TABLE_SYNC'),
-          tableNo: orderTableId,
-          status: 'RUNNING',
-          covers: Number(payload.covers || payload.PAX || 0) || 0,
-          bill: orderAmount,
-          steward: payload.steward || payload.waiter || payload.captain || payload.createdByName || '',
-          stewardId: payload.stewardId || payload.waiterId || payload.captainId || payload.createdById || userId,
-          stewardLogin: payload.stewardLogin || payload.waiterLogin || payload.captainLogin || payload.createdByLogin || ''
-        });
-      } catch (tableErr) {
-        console.warn('[SAVE_ORDER] table live projection deferred:', tableErr.message);
-      }
-    }
-
     bnxCreateAuditLog(clientId, {
       CLIENT_ID: clientId, LOCATION_ID: locationId, USER_ID: userId, ACTION: isAddOn ? 'ADD_ITEMS' : 'CREATE',
       MODULE: payload.orderSource || 'POS', RECORD_TYPE: 'ORDER', RECORD_ID: orderId, OLD_VALUE: '{}',
@@ -2054,6 +2051,19 @@ function bnxGetActiveOrders(session, payload) {
         if (locationId && o.LOCATION_ID !== locationId) return false;
         if (orderSource && o.ORDER_SOURCE !== orderSource) return false;
         if (o.ORDER_STATUS === 'CANCELLED' || o.ORDER_STATUS === 'BILLED') return false;
+        if (String(payload.appId||'').toUpperCase()==='STEWARD_MOBILE') {
+          const rr=bnxNormalizeStewardRole_(session && session.ROLE);
+          if (rr==='CHEF' || rr==='SUPER_ADMIN') return true;
+          const targetId=String(session.USER_ID||'').trim().toLowerCase();
+          const targetLogin=String(payload.loginId||session.LOGIN_ID||'').trim().toLowerCase();
+          const targetName=String(session.FULL_NAME||'').trim().toLowerCase();
+          const fields=[o.STARTED_BY,o.CREATED_BY,o.USER_ID,o.CREATED_BY_ID,o.CREATED_BY_NAME,o.WAITER,o.STEWARD,o.CAPTAIN,o.WAITER_LOGIN,o.STEWARD_LOGIN,o.CAPTAIN_LOGIN];
+          const vals=fields.map(v=>String(v||'').trim().toLowerCase()).filter(Boolean);
+          if(targetId && vals.indexOf(targetId)>=0) return true;
+          if(targetLogin && vals.indexOf(targetLogin)>=0) return true;
+          if(targetName && vals.indexOf(targetName)>=0) return true;
+          return false;
+        }
         return true;
       });
     const itemSheet = bnxClientSheet(clientId, SHEETS.ORDER_ITEMS);
@@ -2869,6 +2879,7 @@ const MASTER_CATEGORY_MAP = {
   employee: { table: 'USER_MASTER', idField: 'USER_ID', fieldMap: { EMP_NAME: 'FULL_NAME', MOBILE: 'PHONE' } },
   user:     { table: 'USER_MASTER', idField: 'USER_ID', fieldMap: {} },
   item:     { table: 'ITEM_MASTER', idField: 'ITEM_ID', fieldMap: { ITEM_NAME: 'ITEM_NAME', HSN_CODE: 'HSN_CODE', REORDER_LEVEL: 'REORDER_LEVEL' } },
+  item_master: { table: 'ITEM_MASTER', idField: 'ITEM_ID', fieldMap: {} },
   // LIVE POS category/group masters. Keep aliases because older frontend builds
   // use menucat while newer report code uses category/item_groups.
   category: { table: 'CATEGORY_MASTER', idField: 'CATEGORY_ID', fieldMap: { CATEGORY_NAME: 'CATEGORY_NAME', NAME: 'CATEGORY_NAME', IS_ACTIVE: 'IS_ACTIVE' } },
@@ -4455,6 +4466,22 @@ function bnxTaxRateMap_(clientId) {
  * FAST POS MENU ENDPOINT — one request for Food + Bar.
  * Published Menu Card sheets remain authoritative.
  */
+
+function bnxGetPosMenuHierarchy(session, payload) {
+  const clientId = session.CLIENT_ID;
+  try {
+    const food = bnxGetMenuItems(session, payload || {});
+    const bar = bnxGetBarMenu(session, payload || {});
+    const f = food && Array.isArray(food.data) ? food.data : [];
+    const b = bar && Array.isArray(bar.data) ? bar.data : [];
+    const cats = rows => [...new Set(rows.map(r => String(r.category || r.barCategory || r.menuSection || 'Uncategorised').trim()).filter(Boolean))].sort();
+    return { success:true, clientId, data:{food:{categories:cats(f),count:f.length},bar:{categories:cats(b),count:b.length}}, source:'MENU_CARD_ITEMS+BAR_MENU_CARD' };
+  } catch (e) {
+    bnxLogError(clientId, `bnxGetPosMenuHierarchy failed: ${e.message}`, payload);
+    return { success:false, error:e.message, data:{food:{categories:[],count:0},bar:{categories:[],count:0}} };
+  }
+}
+
 function bnxGetPosMenu(session, payload) {
   const clientId = session.CLIENT_ID;
   try {
@@ -4940,24 +4967,7 @@ function bnxRdFetchSheet(session, payload) {
       const owner = findFirst(live,['CAPTAIN','STEWARD','WAITER','ASSIGNED_STEWARD','ASSIGNED_CAPTAIN']) || findFirst(t,['CAPTAIN','STEWARD','WAITER','ASSIGNED_STEWARD','ASSIGNED_CAPTAIN']);
       const ownerId = findFirst(live,['CAPTAIN_ID','STEWARD_ID','WAITER_ID','ASSIGNED_STEWARD_ID','ASSIGNED_CAPTAIN_ID']) || findFirst(t,['CAPTAIN_ID','STEWARD_ID','WAITER_ID']);
       const ownerLogin = findFirst(live,['CAPTAIN_LOGIN','STEWARD_LOGIN','WAITER_LOGIN']) || findFirst(t,['CAPTAIN_LOGIN','STEWARD_LOGIN','WAITER_LOGIN']);
-      // Canonical live projection shared by Restaurant Dashboard, Steward map,
-      // My Running Tables and reports. Keep the first 12 columns stable with
-      // the dashboard's existing mapper, then append owner id/login so the
-      // steward can match a table by identity across devices.
-      let kotCount = 0;
-      try {
-        const omSheet = bnxClientSheet(clientId, SHEETS.ORDER_MASTER);
-        const omVals = omSheet.getDataRange().getValues();
-        const omHdr = omVals[0] || [];
-        const omOrders = omVals.slice(1).map(r => bnxRowToObject(r, omHdr));
-        const closed = new Set(['BILLED','CANCELLED']);
-        kotCount = omOrders.filter(o => String(o.CLIENT_ID || '') === String(clientId) && String(o.TABLE_ID || '').trim() === tableNo && !closed.has(String(o.ORDER_STATUS || '').toUpperCase())).length;
-      } catch (e) { kotCount = 0; }
-      const kitchenStatus = findFirst(live,['KITCHEN_STATUS','KDS_STATUS']) || findFirst(t,['KITCHEN_STATUS','KDS_STATUS']) || '';
-      const barStatus = findFirst(live,['BAR_STATUS','BAR_KDS_STATUS']) || findFirst(t,['BAR_STATUS','BAR_KDS_STATUS']) || '';
-      const covers = Number(live.COVERS || 0) || 0;
-      const billAmount = Number(live.BILL_AMOUNT || 0) || 0;
-      rows.push([ tableNo, t.SECTION || t.ZONE || '', findFirst(t,['TABLE_NAME','NAME']) || '', live.STATUS || t.STATUS || 'AVAILABLE', Number(t.CAPACITY || t.PAX) || 4, owner, covers, live.START_TIME || '', kitchenStatus, barStatus, kotCount, billAmount, ownerId, ownerLogin ]);
+      rows.push([ tableNo, t.SECTION || t.ZONE || '', '', live.STATUS || t.STATUS || 'AVAILABLE', Number(t.CAPACITY || t.PAX) || 4, owner, Number(live.COVERS) || 0, live.START_TIME || '', ownerId, ownerLogin, Number(live.BILL_AMOUNT) || 0 ]);
     }
     return { success: true, data: rows };
   } catch (error) {
@@ -8886,36 +8896,50 @@ function bnxGetOnlineOrdersList(session, payload) {
   try {
     const sheet = bnxClientSheet(clientId, SHEETS.ONLINE_ORDER_MASTER);
     const values = sheet.getDataRange().getValues();
+    if (!values.length) return {success:true,data:{rows:[],totalsByAgg:{},date,note:'ONLINE_ORDER_MASTER has no rows.'}};
     const headers = values[0];
-    const rows = [];
-    for (let r = 1; r < values.length; r++) {
-      const o = bnxRowToObject(values[r], headers);
-      if (o.CLIENT_ID !== clientId) continue;
-      let d = o.CREATED_AT, t = '';
-      try {
-        const dt = new Date(o.CREATED_AT);
-        if (!isNaN(dt.getTime())) { d = Utilities.formatDate(dt, tz, 'yyyy-MM-dd'); t = Utilities.formatDate(dt, tz, 'HH:mm'); }
-      } catch (e) {}
-      if (d !== date) continue;
+
+    // Optional item join so the Steward app shows the actual online items.
+    const itemsByOrder={};
+    try{
+      const itemSheet=bnxClientSheet(clientId, SHEETS.ONLINE_ORDER_ITEMS);
+      const iv=itemSheet.getDataRange().getValues(); const ih=iv[0]||[];
+      for(let r=1;r<iv.length;r++){
+        const it=bnxRowToObject(iv[r],ih);
+        const oid=String(it.ONLINE_ORDER_ID||it.AGGREGATOR_ORDER_ID||it.ORDER_ID||it.ORDER_REF||'').trim();
+        if(!oid) continue;
+        const nm=String(it.ITEM_NAME||it.PRODUCT_NAME||it.NAME||'').trim();
+        const qty=Number(it.QUANTITY||it.QTY||1)||1;
+        if(nm) (itemsByOrder[oid]||(itemsByOrder[oid]=[])).push((qty>1?qty+' × ':'')+nm);
+      }
+    }catch(e){ console.warn('[Online Orders] item join unavailable:',e.message); }
+
+    const rows=[];
+    for(let r=1;r<values.length;r++){
+      const o=bnxRowToObject(values[r],headers);
+      if(String(o.CLIENT_ID||'')!==String(clientId)) continue;
+      const created=o.CREATED_AT||o.CREATED_ON||o.ORDER_DATE||o.DATE||'';
+      let d='',t='';
+      try{
+        const dt=new Date(created);
+        if(!isNaN(dt.getTime())){d=Utilities.formatDate(dt,tz,'yyyy-MM-dd');t=Utilities.formatDate(dt,tz,'HH:mm');}
+      }catch(e){}
+      if(!d) d=String(o.ORDER_DATE||o.DATE||'').slice(0,10);
+      if(d!==date) continue;
+      const ref=String(o.AGGREGATOR_ORDER_ID||o.ONLINE_ORDER_ID||o.ORDER_REF||o.ORDER_ID||'').trim();
+      const items=itemsByOrder[ref]&&itemsByOrder[ref].length?itemsByOrder[ref].join(', '):String(o.ITEMS||o.ITEM_NAMES||o.ORDER_ITEMS||'Online Order');
       rows.push({
-        aggregator: o.AGGREGATOR || '', orderRef: o.AGGREGATOR_ORDER_ID || o.ONLINE_ORDER_ID, time: t,
-        billAmount: Number(o.ORDER_AMOUNT) || 0, platformFee: Number(o.PLATFORM_FEE) || 0,
-        deliveryFee: Number(o.DELIVERY_FEE) || 0, discountByPlatform: Number(o.DISCOUNT_BY_PLATFORM) || 0,
-        netAmount: Number(o.NET_AMOUNT_TO_RESTAURANT) || 0, orderStatus: o.ORDER_STATUS || '',
-        customerName: o.CUSTOMER_NAME || ''
+        aggregator:String(o.AGGREGATOR||o.PLATFORM||'').trim(), orderRef:ref, time:t||String(o.ORDER_TIME||o.TIME||''),
+        billAmount:Number(o.ORDER_AMOUNT||o.BILL_AMOUNT||o.GRAND_TOTAL||0)||0,
+        platformFee:Number(o.PLATFORM_FEE||0)||0, deliveryFee:Number(o.DELIVERY_FEE||0)||0,
+        discountByPlatform:Number(o.DISCOUNT_BY_PLATFORM||0)||0, netAmount:Number(o.NET_AMOUNT_TO_RESTAURANT||o.NET_AMOUNT||0)||0,
+        orderStatus:String(o.ORDER_STATUS||o.STATUS||'NEW').trim(), customerName:String(o.CUSTOMER_NAME||o.CUSTOMER||'').trim(), items
       });
     }
-    rows.sort((a, b) => a.time.localeCompare(b.time));
-    const totalsByAgg = {};
-    rows.forEach(r => {
-      if (!totalsByAgg[r.aggregator]) totalsByAgg[r.aggregator] = { orders: 0, revenue: 0 };
-      totalsByAgg[r.aggregator].orders += 1;
-      totalsByAgg[r.aggregator].revenue += r.billAmount;
-    });
-    return {
-      success: true, data: { rows, totalsByAgg, date,
-        note: 'Settlement status and a separate GST/packing split are not tracked per-order in ONLINE_ORDER_MASTER yet (only PLATFORM_FEE/DELIVERY_FEE/DISCOUNT_BY_PLATFORM exist) -- those columns are left blank rather than guessed. This only shows orders logged via "Log Online Order" (SAVE_ONLINE_ORDER); there is no live Zomato/Swiggy/etc. API connection.' }
-    };
+    rows.sort((a,b)=>String(a.time).localeCompare(String(b.time)));
+    const totalsByAgg={};
+    rows.forEach(r=>{const k=r.aggregator||'OTHER';if(!totalsByAgg[k])totalsByAgg[k]={orders:0,revenue:0};totalsByAgg[k].orders++;totalsByAgg[k].revenue+=Number(r.billAmount)||0;});
+    return {success:true,data:{rows,totalsByAgg,date,note:'Reads ONLINE_ORDER_MASTER for this client. External Zomato/Swiggy/EasyDiner/ONDC orders appear only after their connector/import/webhook writes them to ONLINE_ORDER_MASTER.'}};
   } catch (error) {
     bnxLogError(clientId, `bnxGetOnlineOrdersList failed: ${error.message}`, payload);
     return { success: false, error: error.message };
