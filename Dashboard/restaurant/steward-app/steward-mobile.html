@@ -82,18 +82,6 @@ function bnxKotElapsedMin_(order){
 
 </script>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-<!-- Storage API fallback for private browsing mode -->
-<script>
-window._safeStorage = {};
-window.safeStore = function(key, value) {
-  try { localStorage.setItem(key, JSON.stringify(value)); }
-  catch(e) { window._safeStorage[key] = value; }
-};
-window.safeGet = function(key) {
-  try { return JSON.parse(localStorage.getItem(key) || 'null'); }
-  catch(e) { return window._safeStorage[key] || null; }
-};
-</script>
 <title>Steward — Restaurant Service App</title>
 
 <!-- ── PWA: install to home screen ── -->
@@ -4940,13 +4928,8 @@ if(getClientId() && getSessionToken()){
   function mapRow(m, isBarFlag){
     const id=S(m.id||m.ITEM_ID||m.itemId||m.code||m.ITEM_CODE||m.name||m.ITEM_NAME);
     const name=S(m.name||m.ITEM_NAME||m.n||m.itemName);
-    let category=normCat(m.category||m.CATEGORY||m.cat||m.c);
-    const grp0=S(m.group||m.itemGroup||m.ITEM_GROUP||m.GROUP_NAME||m.ITEM_GROUP_NAME);
-    const addonHay=[category, m.menuSection, m.menu_section, grp0, m.name, m.ITEM_NAME, m.n]
-      .map(v=>S(v).toUpperCase()).join(' ');
-    const isAddonFood = !isBarItem && /\bADD[\s_-]*ONS?\b|\bADD[\s_-]*ON\b|\bADDONS?\b|\bEXTRA\b|\bPAID\s+EXTRA\b/.test(addonHay);
-    if(isAddonFood) category='ADD-ONS';
-    const grp=grp0;
+    const category=normCat(m.category||m.CATEGORY||m.cat||m.c);
+    const grp=S(m.group||m.itemGroup||m.ITEM_GROUP||m.GROUP_NAME||m.ITEM_GROUP_NAME);
     const isBarItem = isBarFlag || barish(m);
     return {
       id, name, cat:category, group:grp,
@@ -5099,6 +5082,7 @@ if(getClientId() && getSessionToken()){
       </div>`;
 
     let html=control;
+    html += `<div style="font-size:10px;font-weight:800;letter-spacing:.06em;color:var(--text3);margin:0 2px 8px;text-transform:uppercase;">${scope==='ALL'?'All Menu':scope==='FOOD'?'Food Menu':scope==='BAR'?'Bar Menu':scope==='OTHER'?'Other':scope==='FAV'?'Favourites':scope==='POPULAR'?'Popular':'Recent'} → ${cat==='ALL'?'Category':esc(cat)}${cat!=='ALL'?' → '+(group==='ALL'?'Item Group':esc(group)):' → Item Group → Items'}</div>`;
     if(!current.length){
       const msg=!all.length
         ? 'No live menu is loaded yet. Tap Refresh Menu to retry.'
@@ -5132,11 +5116,11 @@ if(getClientId() && getSessionToken()){
   };
 
   window.__swMenuScope=function(v){
-    scope=S(v)||'ALL'; cat='ALL'; group='ALL'; quick='ALL';
+    scope=S(v)||'ALL'; cat='ALL'; group='ALL';
     if(scope==='BAR' || scope==='ALL' || scope==='FAV' || scope==='POPULAR' || scope==='RECENT') vf='ALL';
     renderMenu();
   };
-  window.__swMenuCat=function(v){ cat=S(v)||'ALL'; if(/^ADD[\s_-]*ONS?$/i.test(cat)||/^ADD[\s_-]*ON$/i.test(cat)) cat='ADD-ONS'; group='ALL'; renderMenu(); };
+  window.__swMenuCat=function(v){ cat=S(v)||'ALL'; group='ALL'; renderMenu(); };
   window.__swMenuGroup=function(v){ group=S(v)||'ALL'; renderMenu(); };
   window.__swMenuVeg=function(v){ vf=S(v)||'ALL'; renderMenu(); };
   window.__swMenuSearch=function(v){ q=S(v); renderMenu(); };
@@ -5175,5 +5159,177 @@ if(getClientId() && getSessionToken()){
 
 })();
 </script>
+
+<script>
+/* ================================================================
+   BNX STEWARD FINAL HARDENING PASS
+   - Menu: Scope -> Category -> Item Group -> Items
+   - Navigation back always clears transient menu filters when leaving order screen.
+   - KOT: de-duplicate server/local copies and prefer authoritative server record.
+   - KOT: steward sees own tickets by default; supervisors can use All KOT.
+   - Tables: preserve live TABLE_MASTER + TABLE_LIVE_STATE projection.
+   - Attendance: backend-independent guard and clear error reporting.
+   ================================================================ */
+(function(){
+  'use strict';
+  const S=v=>String(v==null?'':v).trim();
+  const N=v=>S(v).toLowerCase();
+  const esc=v=>S(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  /* -------- MENU state reset / deterministic hierarchy -------- */
+  function resetTransientMenuFilters(){
+    try{
+      if(typeof window.__swMenuScope==='function'){
+        // Scope handler clears category/group itself.
+        window.__swMenuScope('ALL');
+      } else if(typeof window.renderMenu==='function'){
+        window.renderMenu();
+      }
+    }catch(e){ console.warn('[STEWARD_MENU] reset failed',e); }
+  }
+  window.bnxResetMenuFilters=function(){
+    try{
+      if(typeof window.__swMenuScope==='function') window.__swMenuScope('ALL');
+      if(typeof window.__swMenuCat==='function') window.__swMenuCat('ALL');
+      if(typeof window.__swMenuGroup==='function') window.__swMenuGroup('ALL');
+      if(typeof window.__swMenuVeg==='function') window.__swMenuVeg('ALL');
+      if(typeof window.__swMenuSearch==='function') window.__swMenuSearch('');
+      if(typeof window.bnxSetMenuQuickFilter==='function') window.bnxSetMenuQuickFilter('ALL');
+    }catch(e){}
+  };
+
+  /* -------- Back navigation: clear menu/category/group/search residue -------- */
+  const originalShowScreen=window.showScreen;
+  if(typeof originalShowScreen==='function' && !window.__bnxFinalShowScreenWrapped){
+    window.__bnxFinalShowScreenWrapped=true;
+    window.showScreen=function(id,navEl){
+      const leavingNew = id!=='s-new-order' && document.getElementById('s-new-order')?.classList.contains('active');
+      if(leavingNew && typeof window.bnxResetMenuFilters==='function') window.bnxResetMenuFilters();
+      const leavingTables = id!=='s-tables' && document.getElementById('s-tables')?.classList.contains('active');
+      if(leavingTables){ try{ mobTableSearchQuery=''; mobTableStatusFilter='ALL'; mobTableSectionFilter='ALL'; }catch(e){} }
+      const leavingHistory = id!=='s-history' && document.getElementById('s-history')?.classList.contains('active');
+      if(leavingHistory){ try{ histCustomFrom=''; histCustomTo=''; histPickedMonth=''; if(typeof histRange!=='undefined') histRange='TODAY'; if(typeof histStatus!=='undefined') histStatus='ALL'; }catch(e){} }
+      return originalShowScreen.apply(this,arguments);
+    };
+  }
+
+  /* -------- KOT identity / ownership helpers -------- */
+  function currentIdentity(){
+    try{return typeof getCurrentStaffIdentity==='function'?getCurrentStaffIdentity():{userId:'',loginId:'',fullName:'',role:''};}
+    catch(e){return {userId:'',loginId:'',fullName:'',role:''};}
+  }
+  function isSupervisor(){
+    const r=N(currentIdentity().role);
+    return /admin|manager|owner|super/.test(r);
+  }
+  function kotOwner(k){
+    return S(k.waiter||k.steward||k.captain||k.createdBy||k.CREATED_BY||k.CREATED_BY_NAME||'');
+  }
+  function isMine(k){
+    const i=currentIdentity();
+    const vals=[k.waiterId,k.stewardId,k.captainId,k.CREATED_BY_ID,k.createdById,k.waiterLogin,k.stewardLogin,k.captainLogin,k.CREATED_BY_LOGIN,k.waiter,k.steward,k.captain,k.CREATED_BY_NAME,k.createdBy];
+    return (i.userId && vals.some(v=>S(v)===S(i.userId))) ||
+           (i.loginId && vals.some(v=>N(v)===N(i.loginId))) ||
+           (i.fullName && vals.some(v=>N(v)===N(i.fullName)));
+  }
+
+  function dedupeKots(list){
+    const out=[]; const idx=new Map();
+    (Array.isArray(list)?list:[]).forEach(k=>{
+      const key= S(k.kotNo||k.KOT_NO||k.orderId||k.ORDER_ID||k.id||k.ORDER_NUMBER);
+      if(!key){out.push(k);return;}
+      const pos=idx.get(key);
+      if(pos==null){idx.set(key,out.length);out.push(k);return;}
+      const prev=out[pos];
+      // Prefer confirmed/server record over pending local shadow.
+      const prevPending=/PENDING_SYNC|PENDING|OFFLINE/i.test(S(prev.status));
+      const curPending=/PENDING_SYNC|PENDING|OFFLINE/i.test(S(k.status));
+      if(prevPending && !curPending) out[pos]=k;
+    });
+    return out;
+  }
+  window.bnxDedupStewardKots=function(){
+    try{
+      if(Array.isArray(window.KOT)){
+        window.KOT=dedupeKots(window.KOT);
+        if(typeof bnxSetOpenKotsRaw==='function') bnxSetOpenKotsRaw(JSON.stringify(window.KOT));
+      }
+    }catch(e){}
+  };
+
+  /* Wrap renderKOT once: keep current functionality but prevent duplicates and
+     default a normal steward to their own KOTs. */
+  const originalRenderKOT=window.renderKOT;
+  if(typeof originalRenderKOT==='function' && !window.__bnxFinalRenderKOTWrapped){
+    window.__bnxFinalRenderKOTWrapped=true;
+    window.renderKOT=function(){
+      try{
+        bnxDedupStewardKots();
+        const originalK=window.KOT;
+        if(!isSupervisor() && Array.isArray(originalK)){
+          // Temporarily narrow only during rendering; restore immediately after.
+          const mine=originalK.filter(k=>isMine(k));
+          window.KOT=mine;
+          try{return originalRenderKOT.apply(this,arguments);}finally{window.KOT=originalK;}
+        }
+      }catch(e){console.warn('[KOT_RENDER]',e);}
+      return originalRenderKOT.apply(this,arguments);
+    };
+  }
+
+  /* After every server KOT load, dedupe and re-render once. */
+  const originalLoadKOT=window.loadKOTFromServer;
+  if(typeof originalLoadKOT==='function' && !window.__bnxFinalLoadKOTWrapped){
+    window.__bnxFinalLoadKOTWrapped=true;
+    window.loadKOTFromServer=async function(){
+      const r=await originalLoadKOT.apply(this,arguments);
+      try{ bnxDedupStewardKots(); }catch(e){}
+      return r;
+    };
+  }
+
+  /* -------- KOT elapsed time: always derive from the ticket timestamp -------- */
+  window.bnxKotElapsedLabel=function(k){
+    try{
+      const raw=k?.time||k?.TIME||k?.START_TIME||k?.CREATED_AT||k?.CREATED_ON||k?.ORDER_DATE||'';
+      if(!raw) return '—';
+      const d=new Date(raw); if(isNaN(d.getTime())) return S(raw);
+      const mins=Math.max(0,Math.floor((Date.now()-d.getTime())/60000));
+      if(mins<60)return mins+' min';
+      const h=Math.floor(mins/60),m=mins%60;
+      return h+'h '+String(m).padStart(2,'0')+'m';
+    }catch(e){return '—';}
+  };
+
+  /* -------- Attendance: useful client-side guard before server call -------- */
+  const oldMarkAttendance=window.bnxMarkAttendance;
+  if(typeof oldMarkAttendance==='function' && !window.__bnxAttendanceWrapped){
+    window.__bnxAttendanceWrapped=true;
+    window.bnxMarkAttendance=async function(kind,btn){
+      const i=currentIdentity();
+      if(!i.userId && !i.loginId && !i.fullName){
+        if(typeof toast==='function') toast('Staff identity unavailable. Please login again.','error');
+        return;
+      }
+      try{return await oldMarkAttendance.apply(this,arguments);}
+      catch(e){
+        if(typeof toast==='function') toast('Attendance could not be saved: '+(e?.message||'server error'),'error');
+      }
+    };
+  }
+
+  /* -------- Safe menu load after auth/client context becomes ready -------- */
+  function safeMenuLoad(){
+    try{
+      if(typeof CLIENT_ID!=='undefined' && CLIENT_ID && typeof IS_DEMO_MODE!=='undefined' && !IS_DEMO_MODE && typeof window.loadMenuFromServer==='function'){
+        window.loadMenuFromServer(false);
+      }
+    }catch(e){}
+  }
+  setTimeout(safeMenuLoad,350);
+  window.addEventListener('online',safeMenuLoad);
+})();
+</script>
+
 </body>
 </html>
