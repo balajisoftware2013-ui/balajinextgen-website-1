@@ -866,29 +866,6 @@ const TRANSACTION_TYPES = {
   PURCHASE: 'PURCHASE', STOCK_MOVEMENT: 'STOCK_MOVEMENT', STOCK_ADJUSTMENT: 'STOCK_ADJUSTMENT'
 };
 
-// ---------------------------------------------------------------------
-// STEWARD MOBILE APP AUTHORIZATION
-// This is an app-specific gate; generic Restaurant Dashboard actions are
-// unaffected. The Steward Mobile app may be used only by CAPTAIN, STEWARD,
-// CHEF or SUPER_ADMIN.
-const STEWARD_APP_ALLOWED_ROLES_ = ['CAPTAIN','STEWARD','CHEF','SUPER_ADMIN'];
-function bnxNormalizeStewardRole_(role){
-  const r=String(role||'').trim().toUpperCase();
-  if(r.indexOf('SUPER_ADMIN')>=0) return 'SUPER_ADMIN';
-  if(r.indexOf('CAPTAIN')>=0) return 'CAPTAIN';
-  if(r.indexOf('CHEF')>=0) return 'CHEF';
-  if(r.indexOf('STEWARD')>=0) return 'STEWARD';
-  return r;
-}
-function bnxAuthorizeStewardApp_(session, payload){
-  if(String(payload && payload.appId || '').trim().toUpperCase()!=='STEWARD_MOBILE') return null;
-  const role=bnxNormalizeStewardRole_(session && session.ROLE);
-  if(STEWARD_APP_ALLOWED_ROLES_.indexOf(role)===-1){
-    return respondError(403,'Steward Mobile access denied. Allowed roles: CAPTAIN, STEWARD, CHEF, SUPER_ADMIN',payload && payload.requestId || '');
-  }
-  return null;
-}
-
 function doPost(e) {
   try {
     const requestBody = e.postData.contents;
@@ -910,8 +887,6 @@ function doPost(e) {
       bnxLogError(session.CLIENT_ID, `Unauthorized access attempt: client ${clientId}`, payload);
       return respondJson(respondError(403, 'Unauthorized access', requestId));
     }
-    const stewardAuthError = bnxAuthorizeStewardApp_(session, payload);
-    if (stewardAuthError) return respondJson(stewardAuthError);
 
     let result;
     switch (action) {
@@ -1551,22 +1526,29 @@ function bnxSaveOrder(session, payload) {
     if (friendlyOrderNo) {
       try {
         const omSheet = bnxClientSheet(clientId, SHEETS.ORDER_MASTER);
-        const omValues = omSheet.getDataRange().getValues();
-        const omHeaders = omValues[0];
-        const ciCol = omHeaders.indexOf('CLIENT_ID');
-        const noCol = omHeaders.indexOf('ORDER_NUMBER');
-        const idCol = omHeaders.indexOf('ORDER_ID');
-        const statusCol = omHeaders.indexOf('ORDER_STATUS');
-        const updatedCol = omHeaders.indexOf('UPDATED_AT');
-        for (let r = omValues.length - 1; r >= 1; r--) {
-          if (ciCol !== -1 && omValues[r][ciCol] !== clientId) continue;
-          if (noCol === -1 || String(omValues[r][noCol] || '').trim() !== String(friendlyOrderNo).trim()) continue;
-          const status = statusCol !== -1 ? String(omValues[r][statusCol] || '').toUpperCase() : '';
-          if (status === 'BILLED' || status === 'CANCELLED') continue; // that order is closed -- a new SAVE_ORDER under the same old number is a fresh order, not an add-on
-          orderId = idCol !== -1 ? omValues[r][idCol] : '';
-          if (updatedCol !== -1) omSheet.getRange(r + 1, updatedCol + 1).setValue(wallClockNow.iso);
-          isAddOn = true;
-          break;
+        const omLastRow = omSheet.getLastRow(), omLastCol = omSheet.getLastColumn();
+        if (omLastRow > 1 && omLastCol > 0) {
+          const omHeaders = omSheet.getRange(1, 1, 1, omLastCol).getValues()[0].map(String);
+          const noCol = omHeaders.indexOf('ORDER_NUMBER');
+          const ciCol = omHeaders.indexOf('CLIENT_ID');
+          const idCol = omHeaders.indexOf('ORDER_ID');
+          const statusCol = omHeaders.indexOf('ORDER_STATUS');
+          const updatedCol = omHeaders.indexOf('UPDATED_AT');
+          if (noCol >= 0) {
+            const matches = omSheet.getRange(2, noCol + 1, omLastRow - 1, 1)
+              .createTextFinder(String(friendlyOrderNo)).matchEntireCell(true).findAll();
+            for (let mi = matches.length - 1; mi >= 0; mi--) {
+              const rr = matches[mi].getRow();
+              const row = omSheet.getRange(rr, 1, 1, omLastCol).getValues()[0];
+              if (ciCol >= 0 && String(row[ciCol] || '') !== String(clientId)) continue;
+              const status = statusCol >= 0 ? String(row[statusCol] || '').toUpperCase() : '';
+              if (status === 'BILLED' || status === 'CANCELLED') continue;
+              orderId = idCol >= 0 ? row[idCol] : '';
+              if (updatedCol >= 0) omSheet.getRange(rr, updatedCol + 1).setValue(wallClockNow.iso);
+              isAddOn = !!orderId;
+              if (isAddOn) break;
+            }
+          }
         }
       } catch (e) { /* lookup best-effort -- falls through to normal insert below on any error */ }
     }
@@ -1940,11 +1922,17 @@ function bnxFindBillById_(clientId, billId) {
   if (!billId) return null;
   try {
     const sheet = bnxClientSheet(clientId, SHEETS.BILL_MASTER);
-    const values = sheet.getDataRange().getValues();
-    if (!values.length) return null;
-    const headers = values[0];
-    for (let r = values.length - 1; r >= 1; r--) {
-      const b = bnxRowToObject(values[r], headers);
+    const lastRow = sheet.getLastRow();
+    const lastCol = sheet.getLastColumn();
+    if (lastRow < 2 || lastCol < 1) return null;
+    const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(String);
+    const idCol = headers.indexOf('BILL_ID');
+    if (idCol < 0) return null;
+    const matches = sheet.getRange(2, idCol + 1, lastRow - 1, 1)
+      .createTextFinder(String(billId)).matchEntireCell(true).findAll();
+    for (let i = matches.length - 1; i >= 0; i--) {
+      const rowNo = matches[i].getRow();
+      const b = bnxRowToObject(sheet.getRange(rowNo, 1, 1, lastCol).getValues()[0], headers);
       if (String(b.CLIENT_ID || '') === String(clientId) && String(b.BILL_ID || '') === String(billId)) return b;
     }
   } catch (e) {}
@@ -2051,19 +2039,6 @@ function bnxGetActiveOrders(session, payload) {
         if (locationId && o.LOCATION_ID !== locationId) return false;
         if (orderSource && o.ORDER_SOURCE !== orderSource) return false;
         if (o.ORDER_STATUS === 'CANCELLED' || o.ORDER_STATUS === 'BILLED') return false;
-        if (String(payload.appId||'').toUpperCase()==='STEWARD_MOBILE') {
-          const rr=bnxNormalizeStewardRole_(session && session.ROLE);
-          if (rr==='CHEF' || rr==='SUPER_ADMIN') return true;
-          const targetId=String(session.USER_ID||'').trim().toLowerCase();
-          const targetLogin=String(payload.loginId||session.LOGIN_ID||'').trim().toLowerCase();
-          const targetName=String(session.FULL_NAME||'').trim().toLowerCase();
-          const fields=[o.STARTED_BY,o.CREATED_BY,o.USER_ID,o.CREATED_BY_ID,o.CREATED_BY_NAME,o.WAITER,o.STEWARD,o.CAPTAIN,o.WAITER_LOGIN,o.STEWARD_LOGIN,o.CAPTAIN_LOGIN];
-          const vals=fields.map(v=>String(v||'').trim().toLowerCase()).filter(Boolean);
-          if(targetId && vals.indexOf(targetId)>=0) return true;
-          if(targetLogin && vals.indexOf(targetLogin)>=0) return true;
-          if(targetName && vals.indexOf(targetName)>=0) return true;
-          return false;
-        }
         return true;
       });
     const itemSheet = bnxClientSheet(clientId, SHEETS.ORDER_ITEMS);
@@ -3253,7 +3228,14 @@ function bnxGetDashboardSummary_impl_(session, payload) {
   const { from, to } = bnxResolveDateRange_(payload);
   try {
     const sheet = bnxClientSheet(clientId, SHEETS.BILL_MASTER);
-    const values = sheet.getDataRange().getValues();
+    const billHeaderRow = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(String);
+    const isTodayOnly = (from === to && from === bnxBusinessDateKey_());
+    // High-volume path: a 3,000-bill day must not read the entire lifetime
+    // BILL_MASTER just to draw today's dashboard. Use a bounded tail window.
+    // Older/range reports intentionally retain the complete-range path.
+    const values = isTodayOnly
+      ? [billHeaderRow].concat(bnxRecentDataWindow_(sheet, billHeaderRow, 5000))
+      : sheet.getDataRange().getValues();
     const headers = values[0];
     let revenue = 0, totalSales = 0, orders = 0, covers = 0, creditToday = 0;
     const hourlyMap = {};
@@ -3315,7 +3297,10 @@ function bnxGetDashboardSummary_impl_(session, payload) {
     let cash = 0, upi = 0, bank = 0;
     try {
       const paySheet = bnxClientSheet(clientId, SHEETS.PAYMENT_MASTER);
-      const payValues = paySheet.getDataRange().getValues();
+      const payHeaderRow = paySheet.getRange(1, 1, 1, paySheet.getLastColumn()).getValues()[0].map(String);
+      const payValues = isTodayOnly
+        ? [payHeaderRow].concat(bnxRecentDataWindow_(paySheet, payHeaderRow, 10000))
+        : paySheet.getDataRange().getValues();
       const payHeaders = payValues[0];
       for (let r = 1; r < payValues.length; r++) {
         const p = bnxRowToObject(payValues[r], payHeaders);
@@ -3334,7 +3319,10 @@ function bnxGetDashboardSummary_impl_(session, payload) {
     let topItems = [];
     try {
       const biSheet = bnxClientSheet(clientId, SHEETS.BILL_ITEMS);
-      const biValues = biSheet.getDataRange().getValues();
+      const biHeaderRow = biSheet.getRange(1, 1, 1, biSheet.getLastColumn()).getValues()[0].map(String);
+      const biValues = isTodayOnly
+        ? [biHeaderRow].concat(bnxRecentDataWindow_(biSheet, biHeaderRow, 100000))
+        : biSheet.getDataRange().getValues();
       const biHeaders = biValues[0];
       const itemMap = {};
       for (let r = 1; r < biValues.length; r++) {
@@ -3383,8 +3371,12 @@ function bnxGetDashboardSummary_impl_(session, payload) {
       const dayTotals = {};
       const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - lookbackDays);
       const cutoffStr = Utilities.formatDate(cutoff, Session.getScriptTimeZone() || 'Asia/Kolkata', 'yyyy-MM-dd');
-      for (let r = 1; r < values.length; r++) {
-        const b = bnxRowToObject(values[r], headers);
+      const forecastValues = isTodayOnly
+        ? [billHeaderRow].concat(bnxRecentDataWindow_(sheet, billHeaderRow, 30000))
+        : values;
+      const forecastHeaders = forecastValues[0];
+      for (let r = 1; r < forecastValues.length; r++) {
+        const b = bnxRowToObject(forecastValues[r], forecastHeaders);
         if (b.CLIENT_ID !== clientId) continue;
         const st = String(b.BILL_STATUS || '').trim().toUpperCase();
         if (st === 'CANCELLED' || st === 'VOID') continue;
@@ -3401,7 +3393,10 @@ function bnxGetDashboardSummary_impl_(session, payload) {
     let avgTableTurn = null;
     try {
       const orderSheet = bnxClientSheet(clientId, SHEETS.ORDER_MASTER);
-      const orderValues = orderSheet.getDataRange().getValues();
+      const orderHeaderRow = orderSheet.getRange(1, 1, 1, orderSheet.getLastColumn()).getValues()[0].map(String);
+      const orderValues = isTodayOnly
+        ? [orderHeaderRow].concat(bnxRecentDataWindow_(orderSheet, orderHeaderRow, 10000))
+        : orderSheet.getDataRange().getValues();
       const orderHeaders = orderValues[0];
       const orderTimeByNumber = {};
       for (let r = 1; r < orderValues.length; r++) {
@@ -3438,7 +3433,10 @@ function bnxGetDashboardSummary_impl_(session, payload) {
     let ordersPlaced = 0;
     try {
       const orderSheet = bnxClientSheet(clientId, SHEETS.ORDER_MASTER);
-      const orderValues = orderSheet.getDataRange().getValues();
+      const orderHeaderRow = orderSheet.getRange(1, 1, 1, orderSheet.getLastColumn()).getValues()[0].map(String);
+      const orderValues = isTodayOnly
+        ? [orderHeaderRow].concat(bnxRecentDataWindow_(orderSheet, orderHeaderRow, 10000))
+        : orderSheet.getDataRange().getValues();
       const orderHeaders = orderValues[0];
       for (let r = 1; r < orderValues.length; r++) {
         const o = bnxRowToObject(orderValues[r], orderHeaders);
@@ -3698,7 +3696,10 @@ function bnxGetDsrMatrix_impl_(session, payload) {
           bnxClassifyDsrItem_(catName, it.ITEM_NAME);
       }
       const biSheet = bnxClientSheet(clientId, SHEETS.BILL_ITEMS);
-      const biValues = biSheet.getDataRange().getValues();
+      const biHeaderRow = biSheet.getRange(1, 1, 1, biSheet.getLastColumn()).getValues()[0].map(String);
+      const biValues = isTodayOnly
+        ? [biHeaderRow].concat(bnxRecentDataWindow_(biSheet, biHeaderRow, 100000))
+        : biSheet.getDataRange().getValues();
       const biHeaders = biValues[0];
       for (let r = 1; r < biValues.length; r++) {
         const it = bnxRowToObject(biValues[r], biHeaders);
@@ -3795,7 +3796,10 @@ function bnxGetDsrYtd_impl_(session, payload) {
           bnxClassifyDsrItem_(catName, it.ITEM_NAME);
       }
       const biSheet = bnxClientSheet(clientId, SHEETS.BILL_ITEMS);
-      const biValues = biSheet.getDataRange().getValues();
+      const biHeaderRow = biSheet.getRange(1, 1, 1, biSheet.getLastColumn()).getValues()[0].map(String);
+      const biValues = isTodayOnly
+        ? [biHeaderRow].concat(bnxRecentDataWindow_(biSheet, biHeaderRow, 100000))
+        : biSheet.getDataRange().getValues();
       const biHeaders = biValues[0];
       for (let r = 1; r < biValues.length; r++) {
         const it = bnxRowToObject(biValues[r], biHeaders);
@@ -4466,22 +4470,6 @@ function bnxTaxRateMap_(clientId) {
  * FAST POS MENU ENDPOINT — one request for Food + Bar.
  * Published Menu Card sheets remain authoritative.
  */
-
-function bnxGetPosMenuHierarchy(session, payload) {
-  const clientId = session.CLIENT_ID;
-  try {
-    const food = bnxGetMenuItems(session, payload || {});
-    const bar = bnxGetBarMenu(session, payload || {});
-    const f = food && Array.isArray(food.data) ? food.data : [];
-    const b = bar && Array.isArray(bar.data) ? bar.data : [];
-    const cats = rows => [...new Set(rows.map(r => String(r.category || r.barCategory || r.menuSection || 'Uncategorised').trim()).filter(Boolean))].sort();
-    return { success:true, clientId, data:{food:{categories:cats(f),count:f.length},bar:{categories:cats(b),count:b.length}}, source:'MENU_CARD_ITEMS+BAR_MENU_CARD' };
-  } catch (e) {
-    bnxLogError(clientId, `bnxGetPosMenuHierarchy failed: ${e.message}`, payload);
-    return { success:false, error:e.message, data:{food:{categories:[],count:0},bar:{categories:[],count:0}} };
-  }
-}
-
 function bnxGetPosMenu(session, payload) {
   const clientId = session.CLIENT_ID;
   try {
@@ -4509,7 +4497,7 @@ function bnxGetPosMenu(session, payload) {
       errors: { food: foodRes && foodRes.success ? '' : String(foodRes && foodRes.error || ''), bar: barRes && barRes.success ? '' : String(barRes && barRes.error || '') },
       source: 'MENU_CARD_ITEMS+BAR_MENU_CARD'
     };
-    try { CacheService.getScriptCache().put(cacheKey, JSON.stringify(result), 5); } catch (e) {}
+    try { CacheService.getScriptCache().put(cacheKey, JSON.stringify(result), 30); } catch (e) {}
     return result;
   } catch (error) {
     bnxLogError(clientId, `bnxGetPosMenu failed: ${error.message}`, payload);
@@ -4711,13 +4699,56 @@ function bnxListBills(session, payload) {
     // BILL_MASTER into Apps Script. BILL_MASTER is append-only in this POS,
     // so a generous 5,000-row tail covers the stated daily volume while
     // preserving the exact explicit-range path for older/history reports.
+    const pageSize = Math.min(1000, Math.max(50, Number(payload.pageSize || 500)));
+    const page = Math.max(1, Number(payload.page || 1));
+    const usePagination = payload.page !== undefined || payload.pageSize !== undefined;
+
+    // For the normal/full response keep the existing compatibility path.
+    // For paged callers, scan newest rows first and stop after one page +
+    // one extra match. This keeps the response fast even when the tenant has
+    // hundreds of thousands of historical bills.
     const billValues = singleBusinessDay
-      ? [billHeaderRow].concat(bnxRecentDataWindow_(billSheet,billHeaderRow,5000))
-      : billSheet.getDataRange().getValues();
-    const billHeaders = billValues[0];
+      ? [billHeaderRow].concat(bnxRecentDataWindow_(billSheet,billHeaderRow,10000))
+      : (usePagination ? null : billSheet.getDataRange().getValues());
+    const billHeaders = billHeaderRow;
     const inRangeBillIds = {};
     const billsInRange = [];
-    for (let r = 1; r < billValues.length; r++) {
+
+    let hasMore = false;
+    if (usePagination) {
+      const lastRow = billSheet.getLastRow();
+      const chunkRows = 5000;
+      const skip = (page - 1) * pageSize;
+      let matchedSkipped = 0;
+      let foundCount = 0;
+      if (lastRow >= 2) {
+        for (let endRow = lastRow; endRow >= 2 && !hasMore; ) {
+          const startRow = Math.max(2, endRow - chunkRows + 1);
+          const countRows = endRow - startRow + 1;
+          const chunk = billSheet.getRange(startRow, 1, countRows, billSheet.getLastColumn()).getValues();
+          for (let i = chunk.length - 1; i >= 0; i--) {
+            const b = bnxRowToObject(chunk[i], billHeaders);
+            if (String(b.CLIENT_ID || '') !== String(clientId)) continue;
+            const billDateKey = bnxNormalizeDateKey_(b.BILL_DATE);
+            if (fromDate && billDateKey < fromDate) continue;
+            if (toDate && billDateKey > toDate) continue;
+            if (matchedSkipped < skip) { matchedSkipped++; continue; }
+            if (foundCount < pageSize) {
+              inRangeBillIds[b.BILL_ID] = true;
+              billsInRange.push(b);
+              foundCount++;
+            } else {
+              hasMore = true;
+              break;
+            }
+          }
+          endRow = startRow - 1;
+        }
+      }
+      // Attach paging metadata for fast clients; existing callers can still
+      // consume bills/data exactly as before.
+    } else {
+      for (let r = 1; r < billValues.length; r++) {
       const b = bnxRowToObject(billValues[r], billHeaders);
       if (b.CLIENT_ID !== clientId) continue;
       const billDateKey = bnxNormalizeDateKey_(b.BILL_DATE);
@@ -4725,6 +4756,7 @@ function bnxListBills(session, payload) {
       if (toDate && billDateKey > toDate) continue;
       inRangeBillIds[b.BILL_ID] = true;
       billsInRange.push(b);
+      }
     }
 
     const itemSheet = bnxClientSheet(clientId, SHEETS.BILL_ITEMS);
@@ -4796,6 +4828,10 @@ function bnxListBills(session, payload) {
 
     return {
       success: true, bills, data: bills, filteredRange: { from: fromDate || null, to: toDate || null },
+      page: usePagination ? page : undefined,
+      pageSize: usePagination ? pageSize : undefined,
+      hasMore: usePagination ? hasMore : false,
+      nextPage: usePagination && hasMore ? page + 1 : null,
       note: (!wantsAll && !payload.FROM_DATE && !payload.TO_DATE)
         ? 'Defaulted to the current business date for high-volume speed -- pass an explicit FROM_DATE/TO_DATE (or ALL) for older history.'
         : undefined
@@ -8896,50 +8932,36 @@ function bnxGetOnlineOrdersList(session, payload) {
   try {
     const sheet = bnxClientSheet(clientId, SHEETS.ONLINE_ORDER_MASTER);
     const values = sheet.getDataRange().getValues();
-    if (!values.length) return {success:true,data:{rows:[],totalsByAgg:{},date,note:'ONLINE_ORDER_MASTER has no rows.'}};
     const headers = values[0];
-
-    // Optional item join so the Steward app shows the actual online items.
-    const itemsByOrder={};
-    try{
-      const itemSheet=bnxClientSheet(clientId, SHEETS.ONLINE_ORDER_ITEMS);
-      const iv=itemSheet.getDataRange().getValues(); const ih=iv[0]||[];
-      for(let r=1;r<iv.length;r++){
-        const it=bnxRowToObject(iv[r],ih);
-        const oid=String(it.ONLINE_ORDER_ID||it.AGGREGATOR_ORDER_ID||it.ORDER_ID||it.ORDER_REF||'').trim();
-        if(!oid) continue;
-        const nm=String(it.ITEM_NAME||it.PRODUCT_NAME||it.NAME||'').trim();
-        const qty=Number(it.QUANTITY||it.QTY||1)||1;
-        if(nm) (itemsByOrder[oid]||(itemsByOrder[oid]=[])).push((qty>1?qty+' × ':'')+nm);
-      }
-    }catch(e){ console.warn('[Online Orders] item join unavailable:',e.message); }
-
-    const rows=[];
-    for(let r=1;r<values.length;r++){
-      const o=bnxRowToObject(values[r],headers);
-      if(String(o.CLIENT_ID||'')!==String(clientId)) continue;
-      const created=o.CREATED_AT||o.CREATED_ON||o.ORDER_DATE||o.DATE||'';
-      let d='',t='';
-      try{
-        const dt=new Date(created);
-        if(!isNaN(dt.getTime())){d=Utilities.formatDate(dt,tz,'yyyy-MM-dd');t=Utilities.formatDate(dt,tz,'HH:mm');}
-      }catch(e){}
-      if(!d) d=String(o.ORDER_DATE||o.DATE||'').slice(0,10);
-      if(d!==date) continue;
-      const ref=String(o.AGGREGATOR_ORDER_ID||o.ONLINE_ORDER_ID||o.ORDER_REF||o.ORDER_ID||'').trim();
-      const items=itemsByOrder[ref]&&itemsByOrder[ref].length?itemsByOrder[ref].join(', '):String(o.ITEMS||o.ITEM_NAMES||o.ORDER_ITEMS||'Online Order');
+    const rows = [];
+    for (let r = 1; r < values.length; r++) {
+      const o = bnxRowToObject(values[r], headers);
+      if (o.CLIENT_ID !== clientId) continue;
+      let d = o.CREATED_AT, t = '';
+      try {
+        const dt = new Date(o.CREATED_AT);
+        if (!isNaN(dt.getTime())) { d = Utilities.formatDate(dt, tz, 'yyyy-MM-dd'); t = Utilities.formatDate(dt, tz, 'HH:mm'); }
+      } catch (e) {}
+      if (d !== date) continue;
       rows.push({
-        aggregator:String(o.AGGREGATOR||o.PLATFORM||'').trim(), orderRef:ref, time:t||String(o.ORDER_TIME||o.TIME||''),
-        billAmount:Number(o.ORDER_AMOUNT||o.BILL_AMOUNT||o.GRAND_TOTAL||0)||0,
-        platformFee:Number(o.PLATFORM_FEE||0)||0, deliveryFee:Number(o.DELIVERY_FEE||0)||0,
-        discountByPlatform:Number(o.DISCOUNT_BY_PLATFORM||0)||0, netAmount:Number(o.NET_AMOUNT_TO_RESTAURANT||o.NET_AMOUNT||0)||0,
-        orderStatus:String(o.ORDER_STATUS||o.STATUS||'NEW').trim(), customerName:String(o.CUSTOMER_NAME||o.CUSTOMER||'').trim(), items
+        aggregator: o.AGGREGATOR || '', orderRef: o.AGGREGATOR_ORDER_ID || o.ONLINE_ORDER_ID, time: t,
+        billAmount: Number(o.ORDER_AMOUNT) || 0, platformFee: Number(o.PLATFORM_FEE) || 0,
+        deliveryFee: Number(o.DELIVERY_FEE) || 0, discountByPlatform: Number(o.DISCOUNT_BY_PLATFORM) || 0,
+        netAmount: Number(o.NET_AMOUNT_TO_RESTAURANT) || 0, orderStatus: o.ORDER_STATUS || '',
+        customerName: o.CUSTOMER_NAME || ''
       });
     }
-    rows.sort((a,b)=>String(a.time).localeCompare(String(b.time)));
-    const totalsByAgg={};
-    rows.forEach(r=>{const k=r.aggregator||'OTHER';if(!totalsByAgg[k])totalsByAgg[k]={orders:0,revenue:0};totalsByAgg[k].orders++;totalsByAgg[k].revenue+=Number(r.billAmount)||0;});
-    return {success:true,data:{rows,totalsByAgg,date,note:'Reads ONLINE_ORDER_MASTER for this client. External Zomato/Swiggy/EasyDiner/ONDC orders appear only after their connector/import/webhook writes them to ONLINE_ORDER_MASTER.'}};
+    rows.sort((a, b) => a.time.localeCompare(b.time));
+    const totalsByAgg = {};
+    rows.forEach(r => {
+      if (!totalsByAgg[r.aggregator]) totalsByAgg[r.aggregator] = { orders: 0, revenue: 0 };
+      totalsByAgg[r.aggregator].orders += 1;
+      totalsByAgg[r.aggregator].revenue += r.billAmount;
+    });
+    return {
+      success: true, data: { rows, totalsByAgg, date,
+        note: 'Settlement status and a separate GST/packing split are not tracked per-order in ONLINE_ORDER_MASTER yet (only PLATFORM_FEE/DELIVERY_FEE/DISCOUNT_BY_PLATFORM exist) -- those columns are left blank rather than guessed. This only shows orders logged via "Log Online Order" (SAVE_ONLINE_ORDER); there is no live Zomato/Swiggy/etc. API connection.' }
+    };
   } catch (error) {
     bnxLogError(clientId, `bnxGetOnlineOrdersList failed: ${error.message}`, payload);
     return { success: false, error: error.message };
