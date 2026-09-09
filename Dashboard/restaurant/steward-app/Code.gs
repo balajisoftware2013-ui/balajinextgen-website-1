@@ -1483,18 +1483,6 @@ function bnxSyncLogCachePut_(clientId, requestId, info) {
   try { CacheService.getScriptCache().put(bnxSyncLogCacheKey_(clientId, requestId), JSON.stringify(info), 21600); } catch (e) {}
 }
 
-/* FINAL SHARED STEWARD AUTO-ASSIGNMENT + RUNNING TABLE SYNC */
-function bnxResolveStewardAssignment_(clientId,tableNo,payload){
-  payload=payload||{}; const explicitId=String(payload.createdById||payload.stewardId||payload.captainId||payload.waiterId||'').trim(); const explicitLogin=String(payload.createdByLogin||payload.stewardLogin||payload.captainLogin||payload.waiterLogin||'').trim(); const explicitName=String(payload.createdByName||payload.steward||payload.waiter||payload.captain||'').trim();
-  if(explicitId||explicitLogin||explicitName) return {id:explicitId,login:explicitLogin,name:explicitName,source:'EXPLICIT'};
-  const tno=String(tableNo||'').trim();
-  const owner=(sheetName)=>{try{const sh=bnxClientSheet(clientId,sheetName),v=sh.getDataRange().getValues(),h=v[0]||[];for(let r=1;r<v.length;r++){const o=bnxRowToObject(v[r],h);const no=String(o.TABLE_NO||o.TABLE_NUMBER||o.TABLE_ID||o.TABLE_CODE||'').trim();if(no!==tno)continue;const id=o.CAPTAIN_ID||o.STEWARD_ID||o.WAITER_ID||o.ASSIGNED_STEWARD_ID||o.ASSIGNED_CAPTAIN_ID||'';const login=o.CAPTAIN_LOGIN||o.STEWARD_LOGIN||o.WAITER_LOGIN||'';const name=o.CAPTAIN||o.STEWARD||o.WAITER||o.ASSIGNED_STEWARD||o.ASSIGNED_CAPTAIN||'';if(id||login||name)return {id:String(id||''),login:String(login||''),name:String(name||''),source:sheetName};}}catch(e){}return null;};
-  const mapped=owner('TABLE_LIVE_STATE')||owner('TABLE_MASTER'); if(mapped)return mapped;
-  try{const sh=bnxClientSheet(clientId,SHEETS.USER_MASTER),v=sh.getDataRange().getValues(),h=v[0]||[],staff=[];for(let r=1;r<v.length;r++){const u=bnxRowToObject(v[r],h);if(u.CLIENT_ID&&String(u.CLIENT_ID)!==String(clientId))continue;if(u.IS_ACTIVE===false||String(u.IS_ACTIVE).toUpperCase()==='FALSE')continue;const role=String(u.ROLE||u.ROLE_NAME||u.ROLE_ID||u.STAFF_TYPE||'').toUpperCase();if(!['CAPTAIN','STEWARD','WAITER'].includes(role))continue;const id=u.USER_ID||u.USER_CODE||u.EMP_ID||'',login=u.USERNAME||u.LOGIN_ID||u.USER_CODE||'',name=u.FULL_NAME||u.NAME||'';if(id&&name)staff.push({id:String(id),login:String(login),name:String(name),role});}if(staff.length){const p=PropertiesService.getScriptProperties(),k='BNX_STEWARD_RR_'+clientId,n=(Number(p.getProperty(k)||0)||0)%staff.length;p.setProperty(k,String(n+1));return Object.assign({source:'ROUND_ROBIN'},staff[n]);}}catch(e){}
-  return {id:'',login:'',name:'',source:'NONE'};
-}
-function bnxApplyRunningTableFromOrder_(clientId,tableNo,covers,billAmount,steward){const no=String(tableNo||'').trim();if(!no)return;try{const sh=bnxClientSheet(clientId,SHEETS.TABLE_LIVE_STATE),v=sh.getDataRange().getValues(),h=v[0]||[],tn=h.indexOf('TABLE_NO'),ci=h.indexOf('CLIENT_ID'),st=h.indexOf('STATUS'),cv=h.indexOf('COVERS'),ba=h.indexOf('BILL_AMOUNT'),bt=h.indexOf('START_TIME'),up=h.indexOf('UPDATED_AT'),cap=h.indexOf('CAPTAIN'),cid=h.indexOf('CAPTAIN_ID'),cl=h.indexOf('CAPTAIN_LOGIN');for(let r=1;r<v.length;r++){if(tn>=0&&String(v[r][tn]).trim()!==no)continue;if(ci>=0&&String(v[r][ci])!==String(clientId))continue;if(st>=0)sh.getRange(r+1,st+1).setValue('RUNNING');if(cv>=0)sh.getRange(r+1,cv+1).setValue(Number(covers)||0);if(ba>=0)sh.getRange(r+1,ba+1).setValue(Number(billAmount)||0);if(bt>=0&&!v[r][bt])sh.getRange(r+1,bt+1).setValue(new Date().toISOString());if(cap>=0&&steward?.name)sh.getRange(r+1,cap+1).setValue(steward.name);if(cid>=0&&steward?.id)sh.getRange(r+1,cid+1).setValue(steward.id);if(cl>=0&&steward?.login)sh.getRange(r+1,cl+1).setValue(steward.login);if(up>=0)sh.getRange(r+1,up+1).setValue(new Date().toISOString());return;}bnxAppendRow(clientId,SHEETS.TABLE_LIVE_STATE,{CLIENT_ID:clientId,TABLE_NO:no,STATUS:'RUNNING',COVERS:Number(covers)||0,BILL_AMOUNT:Number(billAmount)||0,START_TIME:new Date().toISOString(),CAPTAIN:steward?.name||'',CAPTAIN_ID:steward?.id||'',CAPTAIN_LOGIN:steward?.login||'',CREATED_AT:new Date().toISOString(),UPDATED_AT:new Date().toISOString()});}catch(e){bnxLogError(clientId,'bnxApplyRunningTableFromOrder_ failed: '+e.message,{tableNo:no});}}
-
 function bnxSaveOrder(session, payload) {
   const requestId = payload.requestId;
   const clientId = session.CLIENT_ID;
@@ -1507,11 +1495,6 @@ function bnxSaveOrder(session, payload) {
   if (!validation.valid) return respondError(400, validation.errors.join('; '), requestId);
   try {
     const locationId = payload.locationId || payload.LOCATION_ID || '';
-    const tableNo = payload.tableId || payload.TABLE_ID || '';
-    const assignedSteward = bnxResolveStewardAssignment_(clientId, tableNo, payload);
-    if(assignedSteward.name){ payload.waiter=assignedSteward.name; payload.steward=assignedSteward.name; payload.captain=assignedSteward.name; payload.createdByName=assignedSteward.name; }
-    if(assignedSteward.id){ payload.createdById=assignedSteward.id; payload.stewardId=assignedSteward.id; payload.captainId=assignedSteward.id; }
-    if(assignedSteward.login){ payload.createdByLogin=assignedSteward.login; payload.stewardLogin=assignedSteward.login; payload.captainLogin=assignedSteward.login; }
     const clientDt = bnxResolveClientDateTime_(payload.orderDate, payload.orderTime);
     const now = clientDt || bnxNowParts_();
     const wallClockNow = bnxNowParts_();
@@ -1573,7 +1556,6 @@ function bnxSaveOrder(session, payload) {
         CUSTOMER_ID: payload.customerId || '', PAX: payload.covers || payload.PAX || 0,
         ORDER_DATE: now.businessDate, ORDER_TIME: now.time, STARTED_BY: payload.waiter || payload.steward || payload.captain || userId,
         CREATED_BY: payload.waiter || payload.steward || payload.captain || payload.createdByName || userId, CREATED_BY_ID: payload.createdById || userId, CREATED_BY_LOGIN: payload.waiterLogin || payload.stewardLogin || payload.captainLogin || payload.createdByLogin || '', CREATED_BY_NAME: payload.waiterName || payload.stewardName || payload.captainName || payload.createdByName || payload.waiter || payload.steward || payload.captain || '',
-        ASSIGNED_STEWARD_ID: assignedSteward.id || '', ASSIGNED_STEWARD_LOGIN: assignedSteward.login || '', ASSIGNED_STEWARD: assignedSteward.name || '', ASSIGNMENT_SOURCE: assignedSteward.source || '',
         ORDER_STATUS: 'NEW', SPECIAL_INSTRUCTIONS: payload.remarks || '',
         CREATED_AT: wallClockNow.iso, UPDATED_AT: wallClockNow.iso
       };
@@ -1591,12 +1573,38 @@ function bnxSaveOrder(session, payload) {
         ITEM_TAX_RATE: item.TAX_RATE != null ? Number(item.TAX_RATE) : (item.gst != null ? Number(item.gst) : 0),
         ITEM_TAX: qty * rate * (item.TAX_RATE != null ? Number(item.TAX_RATE) : (item.gst != null ? Number(item.gst) : 0)),
         LINE_TOTAL: (qty * rate) + (qty * rate * (item.TAX_RATE != null ? Number(item.TAX_RATE) : (item.gst != null ? Number(item.gst) : 0))),
-        KOT_STATION: item.station || item.STATION || item.KOT_STATION || '', STATION: item.station || item.STATION || item.KOT_STATION || '', SPECIAL_INSTRUCTIONS: item.SPECIAL_INSTRUCTIONS || '', ITEM_STATUS: 'PENDING', CREATED_AT: wallClockNow.iso
+        SPECIAL_INSTRUCTIONS: item.SPECIAL_INSTRUCTIONS || '', ITEM_STATUS: 'PENDING', CREATED_AT: wallClockNow.iso
       };
       bnxAppendRow(clientId, SHEETS.ORDER_ITEMS, orderItem);
     });
-    const runningAmount=(payload.items||[]).reduce((s,it)=>s+(Number(it.qty||it.QUANTITY||0)*Number(it.price!=null?it.price:(it.rate||it.RATE||0))),0);
-    bnxApplyRunningTableFromOrder_(clientId, tableNo, payload.covers || payload.PAX || 0, runningAmount, assignedSteward);
+    // SINGLE SOURCE OF TRUTH: every successful DINE-IN table order moves
+    // the real TABLE_LIVE_STATE row to RUNNING immediately. This is what makes
+    // the same running table appear on Restaurant Dashboard, Steward Maps,
+    // My Running Tables and other devices without waiting for a stale local
+    // cache. Counter/Delivery/Quick-Bill pseudo tables are excluded.
+    const orderTableId = String(payload.tableId || payload.TABLE_ID || '').trim();
+    if (orderTableId && !/^(COUNTER|DELIVERY|#QB)/i.test(orderTableId)) {
+      const orderAmount = (payload.items || []).reduce((sum, item) => {
+        const q = Number(item.qty != null ? item.qty : item.QUANTITY) || 0;
+        const rate = Number(item.price != null ? item.price : (item.rate != null ? item.rate : item.RATE)) || 0;
+        return sum + q * rate;
+      }, 0);
+      try {
+        bnxSaveTableStatusHandler(session, {
+          requestId: requestId ? String(requestId) + ':TABLE_LIVE' : generateShortId_(clientId,'TABLE_SYNC'),
+          tableNo: orderTableId,
+          status: 'RUNNING',
+          covers: Number(payload.covers || payload.PAX || 0) || 0,
+          bill: orderAmount,
+          steward: payload.steward || payload.waiter || payload.captain || payload.createdByName || '',
+          stewardId: payload.stewardId || payload.waiterId || payload.captainId || payload.createdById || userId,
+          stewardLogin: payload.stewardLogin || payload.waiterLogin || payload.captainLogin || payload.createdByLogin || ''
+        });
+      } catch (tableErr) {
+        console.warn('[SAVE_ORDER] table live projection deferred:', tableErr.message);
+      }
+    }
+
     bnxCreateAuditLog(clientId, {
       CLIENT_ID: clientId, LOCATION_ID: locationId, USER_ID: userId, ACTION: isAddOn ? 'ADD_ITEMS' : 'CREATE',
       MODULE: payload.orderSource || 'POS', RECORD_TYPE: 'ORDER', RECORD_ID: orderId, OLD_VALUE: '{}',
@@ -1606,7 +1614,7 @@ function bnxSaveOrder(session, payload) {
     // Invalidate today's dashboard cache immediately so Orders Placed KPI
     // reflects a newly saved order without waiting for the 30s report TTL.
     try { bnxInvalidateTodayReportCaches_(clientId); } catch (e) {}
-    return { success: true, transactionId: orderId, data: Object.assign({}, orderMaster || { ORDER_ID: orderId, addOn: true }, { ASSIGNED_STEWARD_ID:assignedSteward.id||'', ASSIGNED_STEWARD_LOGIN:assignedSteward.login||'', ASSIGNED_STEWARD:assignedSteward.name||'', ASSIGNMENT_SOURCE:assignedSteward.source||'' }), addOn: isAddOn };
+    return { success: true, transactionId: orderId, data: orderMaster || { ORDER_ID: orderId, addOn: true }, addOn: isAddOn };
   } catch (error) {
     bnxLogError(clientId, `bnxSaveOrder failed: ${error.message}`, { requestId, payload });
     return respondError(500, error.message, requestId);
@@ -1849,8 +1857,6 @@ function bnxSaveKOT(session, payload) {
       ORDER_ID: linkedOrderId, KOT_NUMBER: kotNumber,
       TABLE_ID: payload.table || payload.TABLE_ID || '', CUSTOMER_NAME: payload.customerName || '',
       KOT_SOURCE: payload.kotSource || payload.KOT_SOURCE || 'POS',
-      KOT_STATION: payload.station || payload.STATION || payload.kotStation || '', STATION: payload.station || payload.STATION || payload.kotStation || '',
-      ASSIGNED_STEWARD: payload.steward || payload.waiter || payload.captain || '',
       KOT_DATE: now.businessDate, KOT_TIME: now.time, COVERS: payload.covers || payload.COVERS || 0,
       KOT_STATUS: 'PRINTED', PRIORITY: payload.priority || payload.PRIORITY || 'NORMAL',
       STARTED_BY: payload.waiter || userId, KITCHEN_NOTES: payload.remarks || '',
@@ -1870,7 +1876,7 @@ function bnxSaveKOT(session, payload) {
         KOT_ITEM_ID: generateShortId_(clientId, 'KOT_ITEM_ID'), KOT_ID: kotId, ORDER_ITEM_ID: item.ORDER_ITEM_ID || '',
         ITEM_ID: item.ITEM_ID || '', SEQUENCE: idx + 1, ITEM_NAME: item.name || item.ITEM_NAME || '',
         QUANTITY: qty, UNIT_ID: item.UNIT_ID || 'PIECE', RATE: rate, AMOUNT: qty * rate,
-        ITEM_STATUS: 'NEW', KOT_STATION: item.station || item.STATION || item.KOT_STATION || '', STATION: item.station || item.STATION || item.KOT_STATION || '', SPECIAL_INSTRUCTIONS: item.SPECIAL_INSTRUCTIONS || '', CREATED_AT: now.iso
+        ITEM_STATUS: 'NEW', SPECIAL_INSTRUCTIONS: item.SPECIAL_INSTRUCTIONS || '', CREATED_AT: now.iso
       };
       bnxAppendRow(clientId, SHEETS.KOT_ITEMS, kotItem);
     });
@@ -2057,7 +2063,7 @@ function bnxGetActiveOrders(session, payload) {
     itemData.slice(1).forEach(row => {
       const item = bnxRowToObject(row, itemHeaders);
       if (!itemsByOrderId[item.ORDER_ID]) itemsByOrderId[item.ORDER_ID] = [];
-      itemsByOrderId[item.ORDER_ID].push({ itemName: item.ITEM_NAME || '', qty: item.QUANTITY || 0, rate: item.RATE || 0, amount: item.LINE_TOTAL || 0, ITEM_ID:item.ITEM_ID||'', station:item.KOT_STATION||item.STATION||'', KOT_STATION:item.KOT_STATION||item.STATION||'' });
+      itemsByOrderId[item.ORDER_ID].push({ itemName: item.ITEM_NAME || '', qty: item.QUANTITY || 0, rate: item.RATE || 0, amount: item.LINE_TOTAL || 0 });
     });
     const neededCustomerIds = new Set(activeOrders.map(o => o.CUSTOMER_ID).filter(Boolean));
     const customerLookup = {};
@@ -2079,8 +2085,6 @@ function bnxGetActiveOrders(session, payload) {
         TEMP_ORDER_ID: '', SCAN_KEY: '', CUSTOMER_NAME: cust ? cust.name : '\u2014',
         MOBILE_NO: cust ? cust.phone : '\u2014', START_TIME: o.ORDER_TIME || '', END_TIME: '',
         NOTES: o.SPECIAL_INSTRUCTIONS || '', CREATED_BY: o.STARTED_BY || '\u2014',
-        CREATED_BY_ID: o.CREATED_BY_ID || '', CREATED_BY_LOGIN: o.CREATED_BY_LOGIN || '', CREATED_BY_NAME: o.CREATED_BY_NAME || '',
-        ASSIGNED_STEWARD_ID: o.ASSIGNED_STEWARD_ID || '', ASSIGNED_STEWARD_LOGIN: o.ASSIGNED_STEWARD_LOGIN || '', ASSIGNED_STEWARD: o.ASSIGNED_STEWARD || '', ASSIGNMENT_SOURCE: o.ASSIGNMENT_SOURCE || '',
         items: itemsByOrderId[o.ORDER_ID] || []
       };
     });
@@ -2865,7 +2869,6 @@ const MASTER_CATEGORY_MAP = {
   employee: { table: 'USER_MASTER', idField: 'USER_ID', fieldMap: { EMP_NAME: 'FULL_NAME', MOBILE: 'PHONE' } },
   user:     { table: 'USER_MASTER', idField: 'USER_ID', fieldMap: {} },
   item:     { table: 'ITEM_MASTER', idField: 'ITEM_ID', fieldMap: { ITEM_NAME: 'ITEM_NAME', HSN_CODE: 'HSN_CODE', REORDER_LEVEL: 'REORDER_LEVEL' } },
-  item_master: { table: 'ITEM_MASTER', idField: 'ITEM_ID', fieldMap: {} },
   // LIVE POS category/group masters. Keep aliases because older frontend builds
   // use menucat while newer report code uses category/item_groups.
   category: { table: 'CATEGORY_MASTER', idField: 'CATEGORY_ID', fieldMap: { CATEGORY_NAME: 'CATEGORY_NAME', NAME: 'CATEGORY_NAME', IS_ACTIVE: 'IS_ACTIVE' } },
@@ -4452,22 +4455,6 @@ function bnxTaxRateMap_(clientId) {
  * FAST POS MENU ENDPOINT — one request for Food + Bar.
  * Published Menu Card sheets remain authoritative.
  */
-
-function bnxGetPosMenuHierarchy(session, payload) {
-  const clientId = session.CLIENT_ID;
-  try {
-    const food = bnxGetMenuItems(session, payload || {});
-    const bar = bnxGetBarMenu(session, payload || {});
-    const f = food && Array.isArray(food.data) ? food.data : [];
-    const b = bar && Array.isArray(bar.data) ? bar.data : [];
-    const cats = rows => [...new Set(rows.map(r => String(r.category || r.barCategory || r.menuSection || 'Uncategorised').trim()).filter(Boolean))].sort();
-    return { success:true, clientId, data:{food:{categories:cats(f),count:f.length},bar:{categories:cats(b),count:b.length}}, source:'MENU_CARD_ITEMS+BAR_MENU_CARD' };
-  } catch (e) {
-    bnxLogError(clientId, `bnxGetPosMenuHierarchy failed: ${e.message}`, payload);
-    return { success:false, error:e.message, data:{food:{categories:[],count:0},bar:{categories:[],count:0}} };
-  }
-}
-
 function bnxGetPosMenu(session, payload) {
   const clientId = session.CLIENT_ID;
   try {
@@ -4953,7 +4940,24 @@ function bnxRdFetchSheet(session, payload) {
       const owner = findFirst(live,['CAPTAIN','STEWARD','WAITER','ASSIGNED_STEWARD','ASSIGNED_CAPTAIN']) || findFirst(t,['CAPTAIN','STEWARD','WAITER','ASSIGNED_STEWARD','ASSIGNED_CAPTAIN']);
       const ownerId = findFirst(live,['CAPTAIN_ID','STEWARD_ID','WAITER_ID','ASSIGNED_STEWARD_ID','ASSIGNED_CAPTAIN_ID']) || findFirst(t,['CAPTAIN_ID','STEWARD_ID','WAITER_ID']);
       const ownerLogin = findFirst(live,['CAPTAIN_LOGIN','STEWARD_LOGIN','WAITER_LOGIN']) || findFirst(t,['CAPTAIN_LOGIN','STEWARD_LOGIN','WAITER_LOGIN']);
-      rows.push([ tableNo, t.SECTION || t.ZONE || '', '', live.STATUS || t.STATUS || 'AVAILABLE', Number(t.CAPACITY || t.PAX) || 4, owner, Number(live.COVERS) || 0, live.START_TIME || '', ownerId, ownerLogin, Number(live.BILL_AMOUNT) || 0 ]);
+      // Canonical live projection shared by Restaurant Dashboard, Steward map,
+      // My Running Tables and reports. Keep the first 12 columns stable with
+      // the dashboard's existing mapper, then append owner id/login so the
+      // steward can match a table by identity across devices.
+      let kotCount = 0;
+      try {
+        const omSheet = bnxClientSheet(clientId, SHEETS.ORDER_MASTER);
+        const omVals = omSheet.getDataRange().getValues();
+        const omHdr = omVals[0] || [];
+        const omOrders = omVals.slice(1).map(r => bnxRowToObject(r, omHdr));
+        const closed = new Set(['BILLED','CANCELLED']);
+        kotCount = omOrders.filter(o => String(o.CLIENT_ID || '') === String(clientId) && String(o.TABLE_ID || '').trim() === tableNo && !closed.has(String(o.ORDER_STATUS || '').toUpperCase())).length;
+      } catch (e) { kotCount = 0; }
+      const kitchenStatus = findFirst(live,['KITCHEN_STATUS','KDS_STATUS']) || findFirst(t,['KITCHEN_STATUS','KDS_STATUS']) || '';
+      const barStatus = findFirst(live,['BAR_STATUS','BAR_KDS_STATUS']) || findFirst(t,['BAR_STATUS','BAR_KDS_STATUS']) || '';
+      const covers = Number(live.COVERS || 0) || 0;
+      const billAmount = Number(live.BILL_AMOUNT || 0) || 0;
+      rows.push([ tableNo, t.SECTION || t.ZONE || '', findFirst(t,['TABLE_NAME','NAME']) || '', live.STATUS || t.STATUS || 'AVAILABLE', Number(t.CAPACITY || t.PAX) || 4, owner, covers, live.START_TIME || '', kitchenStatus, barStatus, kotCount, billAmount, ownerId, ownerLogin ]);
     }
     return { success: true, data: rows };
   } catch (error) {
