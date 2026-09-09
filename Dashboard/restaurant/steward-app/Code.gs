@@ -858,9 +858,7 @@ const SHEETS = {
   MENU_CARD_ITEMS: 'MENU_CARD_ITEMS',
   BAR_MENU_CARD: 'BAR_MENU_CARD',
   // PETTY CASH PATCH
-  PETTY_CASH_MASTER: 'PETTY_CASH_MASTER',
-  ATTENDANCE_MASTER: 'ATTENDANCE_MASTER',
-  INCENTIVE_TRANSACTION: 'INCENTIVE_TRANSACTION'
+  PETTY_CASH_MASTER: 'PETTY_CASH_MASTER'
 };
 
 const TRANSACTION_TYPES = {
@@ -1861,7 +1859,7 @@ function bnxSaveKOT(session, payload) {
       KOT_SOURCE: payload.kotSource || payload.KOT_SOURCE || 'POS',
       KOT_DATE: now.businessDate, KOT_TIME: now.time, COVERS: payload.covers || payload.COVERS || 0,
       KOT_STATUS: 'PRINTED', PRIORITY: payload.priority || payload.PRIORITY || 'NORMAL',
-      STARTED_BY: payload.waiter || userId, KITCHEN_NOTES: payload.remarks || '',
+      STARTED_BY: payload.waiter || payload.steward || payload.captain || payload.createdByName || userId, KITCHEN_NOTES: payload.remarks || '',
       STARTED_AT: now.iso, CREATED_AT: now.iso
     };
     // HARD GUARANTEE: write to the client's TRANSACTION_DB KOT_MASTER.
@@ -2150,6 +2148,17 @@ function bnxGetKOT(session, payload) {
       k.ORDER_TIME = k.ORDER_TIME || (linkedOrder ? (linkedOrder.ORDER_TIME || '') : '');
       k.orderTime = k.ORDER_TIME || '';
       k.ORDER_NUMBER = linkedOrder ? (linkedOrder.ORDER_NUMBER || '') : (k.ORDER_NUMBER || '');
+      // Steward/captain ownership: KOT_MASTER may not have a dedicated steward
+      // column in older tenant schemas, so recover it from the linked ORDER_MASTER
+      // record when available. Never invent a name.
+      const linkedOwner = linkedOrder ? (linkedOrder.CREATED_BY_NAME || linkedOrder.CREATED_BY || linkedOrder.STARTED_BY || linkedOrder.STEWARD || linkedOrder.WAITER || '') : '';
+      const linkedOwnerId = linkedOrder ? (linkedOrder.CREATED_BY_ID || linkedOrder.USER_ID || '') : '';
+      const linkedOwnerLogin = linkedOrder ? (linkedOrder.CREATED_BY_LOGIN || linkedOrder.LOGIN_ID || '') : '';
+      k.STEWARD_NAME = k.STEWARD_NAME || k.STEWARD || k.WAITER || k.CAPTAIN || linkedOwner || '';
+      k.STEWARD_ID = k.STEWARD_ID || k.WAITER_ID || k.CAPTAIN_ID || linkedOwnerId || '';
+      k.STEWARD_LOGIN = k.STEWARD_LOGIN || k.WAITER_LOGIN || k.CAPTAIN_LOGIN || linkedOwnerLogin || '';
+      k.CREATED_BY_NAME = k.CREATED_BY_NAME || linkedOwner || '';
+      k.STARTED_BY = k.STARTED_BY || (linkedOrder ? (linkedOrder.STARTED_BY || '') : '');
       kots.push(k);
     });
     return { success: true, data: kots, count: kots.length };
