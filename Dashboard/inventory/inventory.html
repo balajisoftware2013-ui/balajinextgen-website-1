@@ -7585,7 +7585,7 @@ function showPhyVar(id,sys){const counted=parseFloat(document.getElementById('ph
 function savePhyCount(){
   const wh = document.getElementById('phy-wh')?.value || 'WH001';
   const items = DB.all('items');
-  let posted = 0;
+  let posted = 0; const pendingPhy = [];
   items.forEach(i=>{
     const input = document.getElementById('phy-'+i._id);
     if(!input) return;
@@ -7594,18 +7594,17 @@ function savePhyCount(){
     const diff = counted - sys;
     if(diff === 0) return; // counted exactly right — nothing to post
     const remark = document.getElementById('phy-rem-'+i._id)?.value || '';
-    DB.insert('stock_ledger',{
-      _id:uid('SL'), item_id:i._id, wh_id:wh, date:today(),
-      txn_type:'physical_count', ref_id:'', ref_type:'physical_count',
-      qty_in: diff>0?diff:0, qty_out: diff<0?-diff:0, balance:counted,
-      rate:i.purchase_price||0, value:diff*(i.purchase_price||0),
-      remarks: remark
-    });
+    // Backend is authoritative. Queue the exact counted quantity; only
+    // mirror the local ledger after server acceptance.
+    pendingPhy.push({item_id:i._id,item_name:i.name,countedQty:counted,remark});
     posted++;
   });
-  loadDashboard();
-  if(document.getElementById('p-stock')?.classList.contains('active') && typeof loadStockView==='function') loadStockView();
-  toast(posted ? `Physical count posted — ${posted} item(s) adjusted ✓` : 'No variance found — nothing to post', posted?'s':'w');
+  if(!pendingPhy.length){ loadDashboard(); toast('No variance found — nothing to post','w'); return; }
+  erpApi('SAVE_PHYSICAL_ADJUSTMENT',{date:today(),wh_id:wh,items:pendingPhy,countId:uid('COUNT')}).then(r=>{
+    if(!r||!r.success){toast('Physical adjustment server posting failed: '+(r&&r.message||'unknown error'),'e');return;}
+    loadDashboard(); if(document.getElementById('p-stock')?.classList.contains('active')&&typeof loadStockView==='function')loadStockView();
+    toast(`Physical count posted — ${posted} item(s) adjusted ✓`,'s');
+  }).catch(e=>toast('Physical adjustment failed: '+e.message,'e'));
 }
 
 // ── Transfer ────────────────────────────────────
@@ -7671,20 +7670,16 @@ function saveTransfer(){
     unit: items_rows.length===1 ? items_rows[0].unit : '',
     status: 'approved', _ts: now(),
   };
-  DB.insert('stock_transfers', transfer);
-
-  // Two ledger entries per item: stock OUT at source, stock IN at destination
-  items_rows.forEach(ir=>{
-    const prevFrom = getStockBalance(ir.item_id, fromWh);
-    DB.insert('stock_ledger',{_id:uid('SL'),item_id:ir.item_id,wh_id:fromWh,date:trDate,txn_type:'transfer_out',ref_id:transfer._id,ref_type:'transfer',qty_in:0,qty_out:ir.qty,balance:prevFrom-ir.qty,rate:0,value:0});
-    const prevTo = getStockBalance(ir.item_id, toWh);
-    DB.insert('stock_ledger',{_id:uid('SL'),item_id:ir.item_id,wh_id:toWh,date:trDate,txn_type:'transfer_in',ref_id:transfer._id,ref_type:'transfer',qty_in:ir.qty,qty_out:0,balance:prevTo+ir.qty,rate:0,value:0});
-  });
-
-  document.getElementById('tr-items-body').innerHTML = '';
-  loadDashboard();
-  if(typeof loadTransferRegister==='function') loadTransferRegister();
-  toast('Transfer '+transfer._id+' saved & stock updated ✓','s');
+  erpApi('SAVE_STOCK_TRANSFER', transfer).then(r=>{
+    if(!r || !r.success){ toast('Transfer not posted to server: '+(r&&r.message||'unknown error'),'e'); return; }
+    DB.insert('stock_transfers', transfer);
+    items_rows.forEach(ir=>{
+      const prevFrom=getStockBalance(ir.item_id,fromWh), prevTo=getStockBalance(ir.item_id,toWh);
+      DB.insert('stock_ledger',{_id:uid('SL'),item_id:ir.item_id,wh_id:fromWh,date:trDate,txn_type:'transfer_out',ref_id:transfer._id,ref_type:'transfer',qty_in:0,qty_out:ir.qty,balance:prevFrom-ir.qty,rate:ir.rate||0,value:ir.qty*(ir.rate||0)});
+      DB.insert('stock_ledger',{_id:uid('SL'),item_id:ir.item_id,wh_id:toWh,date:trDate,txn_type:'transfer_in',ref_id:transfer._id,ref_type:'transfer',qty_in:ir.qty,qty_out:0,balance:prevTo+ir.qty,rate:ir.rate||0,value:ir.qty*(ir.rate||0)});
+    });
+    document.getElementById('tr-items-body').innerHTML=''; loadDashboard(); if(typeof loadTransferRegister==='function')loadTransferRegister(); toast('Transfer '+transfer._id+' saved & stock updated ✓','s');
+  }).catch(e=>toast('Transfer server posting failed: '+e.message,'e'));
 }
 
 // ── GRN ─────────────────────────────────────────
@@ -7812,12 +7807,18 @@ function saveGRN(qcStatus){
     _ts: now()
   };
   DB.insert('grn_records', grn);
-  // Post stock in if approved
+  // Stock is posted ONLY after server acceptance. The backend is the
+  // authoritative ledger; the browser copy is refreshed afterward.
   if(qcStatus === 'approved') {
-    items_rows.forEach(ir => {
-      const prev = getStockBalance(ir.item_id, wh);
-      DB.insert('stock_ledger',{_id:uid('SL'),item_id:ir.item_id,wh_id:wh,date:grnDate,txn_type:'grn',ref_id:grn._id,ref_type:'grn',qty_in:ir.received,qty_out:0,balance:prev+ir.received,rate:ir.rate,value:ir.received*ir.rate});
-    });
+    erpApi('SAVE_GRN', grn).then(r=>{
+      if(!r || !r.success){ toast('GRN saved locally but server stock posting failed — do not rely on this stock until retry: '+(r&&r.message||'unknown error'),'e'); return; }
+      items_rows.forEach(ir => {
+        const prev=getStockBalance(ir.item_id,wh);
+        DB.insert('stock_ledger',{_id:uid('SL'),item_id:ir.item_id,wh_id:wh,date:grnDate,txn_type:'grn',ref_id:grn._id,ref_type:'grn',qty_in:ir.received,qty_out:0,balance:prev+ir.received,rate:ir.rate,value:ir.received*ir.rate});
+      });
+      loadDashboard(); if(typeof loadGRNRegister==='function') loadGRNRegister();
+      toast('GRN '+grn._id+' approved — stock IN posted ✓','s');
+    }).catch(e=>toast('GRN server posting failed: '+e.message,'e'));
   }
   window._grnAttachments = [];
   document.getElementById('grn-files-list').innerHTML = '';
