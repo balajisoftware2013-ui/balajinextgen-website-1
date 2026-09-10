@@ -8122,8 +8122,12 @@ function showPage(id, el){
   if(id==='reservation'){ bnxInitReservationForm(); bnxRenderReservations(); bnxPullReservationsFromServer(); }
   if(id==='bar') loadBarManagementData();
   if(id==='settings') setTimeout(()=>checkAllDBs(false),400);
-  if(id==='bm-products') setTimeout(()=>bmBuildProductGrid('bmProductGrid','All'),50);
-  if(id==='billing'){ bmInitClientBranch(); bnxApplyTaxModeToBillForm(); bmRefreshTableList(); bnxUpdateHoldBadge(); setTimeout(()=>bmRenderBillPreview(),50);
+  if(id==='bm-products'){
+    setTimeout(()=>{
+      bnxEnsureBillingMenuLive_().then(()=>bmBuildProductGrid('bmProductGrid',bmProdListActiveCat||'All')).catch(()=>bmBuildProductGrid('bmProductGrid','All'));
+    },50);
+  }
+  if(id==='billing'){ bnxEnsureBillingMenuLive_(); bmInitClientBranch(); bnxApplyTaxModeToBillForm(); bmRefreshTableList(); bnxUpdateHoldBadge(); setTimeout(()=>bmRenderBillPreview(),50);
     /* FIX ("grand total not visible" — pad measured too early): a single
        sync 100ms after switching to this page ran before the receipt
        preview (queued 50ms later) and web fonts had actually finished
@@ -14880,10 +14884,133 @@ function resetVoucherNumbering(){
    called, so a price change, a menu sync, or an Excel import is
    instantly reflected in New Bill too — one Item Master, one price,
    everywhere, with zero separate state that can go stale. */
+
+/* ═══════════════════════════════════════════════════════════════════════
+   FINAL BILLING MENU SOURCE — ONE LIVE CATALOG
+   Billing must be able to sell every published Food/Bakery/Other menu item
+   plus every published Bar item. POS publication remains:
+     - MENU_CARD_ITEMS  = restaurant/food/bakery/other published menu
+     - BAR_MENU_CARD     = bar published menu
+     - ITEM_MASTER       = shared item identity/price/GST enrichment
+   The master verification contains 141 restaurant rows + 242 bar rows.
+   Do not fabricate or copy demo products.
+═══════════════════════════════════════════════════════════════════════ */
+let __BNX_BILLING_BAR_REFRESHING = false;
+let __BNX_BILLING_MENU_READY = null;
+
+function bnxBillingBarNormalize_(row){
+  const name=String(row?.name||row?.ITEM_NAME||row?.MENU_ITEM_NAME||'').trim();
+  const id=String(row?.itemId||row?.ITEM_ID||row?.id||row?.itemCode||row?.ITEM_CODE||'').trim();
+  if(!name || !id) return null;
+  const category=String(row?.category||row?.barCategory||row?.CATEGORY_NAME||row?.menuSection||row?.MENU_SECTION||'BAR').trim()||'BAR';
+  const price=Number(row?.price??row?.sellingPrice??row?.SERVING_PRICE??0);
+  const bool=v=>v===true || ['true','1','yes','y'].includes(String(v??'').trim().toLowerCase());
+  return {
+    n:name, p:Number.isFinite(price)?price:0, c:category, v:'', e:row?.icon||'🍸',
+    fav:bool(row?.favorite??row?.favourite??row?.FAVOURITE),
+    pop:bool(row?.popular??row?.POPULAR),
+    code:id, itemCode:row?.itemCode||row?.ITEM_CODE||id, id, itemId:id,
+    isBar:true, menuType:row?.menuType||'BAR',
+    menuSection:row?.menuSection||row?.MENU_SECTION||category,
+    menuActive:true, gst:Number(row?.gst??row?.GST)||0,
+    itemGroupId:row?.itemGroupId||row?.ITEM_GROUP_ID||'',
+    itemGroupName:row?.itemGroupName||row?.ITEM_GROUP_NAME||'',
+    hsn:row?.hsn||row?.HSN_CODE||'', printTo:row?.printTo||row?.PRINT_TO||'BAR',
+    avail:row?.availability||row?.AVAILABILITY_STATUS||'available',
+    aliases:Array.isArray(row?.aliases)?row.aliases:[],
+    menuCardKey:row?.menuCardKey||('BAR|'+id+'|'+category+'|'+String(price))
+  };
+}
+
+async function bnxForceFullBarRefresh_(){
+  if(__BNX_BILLING_BAR_REFRESHING) return false;
+  if(typeof gasApi!=='function') return false;
+  __BNX_BILLING_BAR_REFRESHING=true;
+  try{
+    const r=await gasApi('GET_BAR_MENU',{},'V2_CORE');
+    const raw=Array.isArray(r?.data)?r.data:
+      (Array.isArray(r?.data?.items)?r.data.items:
+      (Array.isArray(r?.data?.bar)?r.data.bar:
+      (Array.isArray(r?.items)?r.items:[])));
+    if(!r?.success || !raw.length){
+      console.warn('[BILLING MENU] GET_BAR_MENU returned no live rows',r?.error||'empty');
+      return false;
+    }
+    const fresh=raw.map(bnxBillingBarNormalize_).filter(Boolean);
+    if(!fresh.length) return false;
+
+    const ids=new Set(fresh.flatMap(x=>[x.id,x.itemId,x.code,x.itemCode].map(v=>String(v||'').trim().toUpperCase())).filter(Boolean));
+    const names=new Set(fresh.map(x=>String(x.n||'').trim().toUpperCase()).filter(Boolean));
+    window.__BNX_LIVE_BAR_ITEM_IDS=ids;
+    window.__BNX_LIVE_BAR_ITEM_NAMES=names;
+
+    const keep=Array.isArray(menuData)?menuData.filter(x=>{
+      const xids=['id','itemId','code','itemCode','ITEM_ID','ITEM_CODE']
+        .map(k=>String(x?.[k]??'').trim().toUpperCase()).filter(Boolean);
+      return !(x?.isBar===true || xids.some(id=>ids.has(id)) || names.has(String(x?.n||x?.name||'').trim().toUpperCase()));
+    }):[];
+
+    menuData.length=0;
+    keep.forEach(x=>menuData.push(x));
+    fresh.forEach(x=>menuData.push(x));
+    usingDemoMenu=false;
+    try{ bnxSaveMenuData(); }catch(e){}
+    try{ bnxRebuildCategoryPills(); }catch(e){}
+    try{ bnxRebuildItemGroupPills_(); }catch(e){}
+    try{ buildMenu(); }catch(e){}
+    console.info('[BILLING MENU] Live Bar refreshed:',fresh.length);
+    return true;
+  }catch(e){
+    console.warn('[BILLING MENU] Bar refresh failed:',e);
+    return false;
+  }finally{
+    __BNX_BILLING_BAR_REFRESHING=false;
+  }
+}
+
+/* Always make Billing use the same live menu catalog. If the page opened before
+   the background menu sync completed, load the menu first, then force the Bar
+   source once so stale/partial GET_POS_MENU cache cannot hide Bar items. */
+async function bnxEnsureBillingMenuLive_(){
+  if(__BNX_BILLING_MENU_READY) return __BNX_BILLING_MENU_READY;
+  __BNX_BILLING_MENU_READY=(async()=>{
+    try{
+      if(!Array.isArray(menuData) || !menuData.length){
+        await loadMenuData();
+      }else{
+        // Refresh the complete Food/Restaurant side when the catalog is empty or
+        // clearly incomplete; otherwise preserve the already-visible menu.
+        const hasBar=menuData.some(x=>x?.isBar===true);
+        if(!hasBar && typeof loadMenuData==='function') await loadMenuData();
+      }
+    }catch(e){ console.warn('[BILLING MENU] base menu sync failed:',e); }
+    await bnxForceFullBarRefresh_();
+    try{
+      if(typeof bnxNormalizeMenuVeg_==='function') bnxNormalizeMenuVeg_();
+      if(typeof bnxRebuildCategoryPills==='function') bnxRebuildCategoryPills();
+      if(typeof bnxRebuildItemGroupPills_==='function') bnxRebuildItemGroupPills_();
+      if(typeof buildMenu==='function') buildMenu();
+    }catch(e){}
+    return true;
+  })().finally(()=>{ __BNX_BILLING_MENU_READY=null; });
+  return __BNX_BILLING_MENU_READY;
+}
+
 function bnxGetBillMenu(){
-  return menuData.map(m=>({
-    id: m.code, em: m.e || bnxDefaultIcon(m.c), name: m.n, cat: m.c, price: Number(m.p)||0
-  }));
+  const arr=Array.isArray(menuData)?menuData:[];
+  return arr.map(m=>({
+    id: m.code||m.id||m.itemCode||m.itemId,
+    em: m.e || bnxDefaultIcon(m.c),
+    name: m.n||m.name||m.ITEM_NAME||'',
+    cat: m.c||m.category||m.CATEGORY_NAME||m.menuSection||'Uncategorised',
+    price: Number(m.p??m.price??m.sellingPrice??m.SELLING_RATE??0)||0,
+    isBar: m.isBar===true || String(m.menuType||m.MENU_TYPE||'').toUpperCase()==='BAR',
+    itemGroupId:m.itemGroupId||m.ITEM_GROUP_ID||'',
+    itemGroupName:m.itemGroupName||m.ITEM_GROUP_NAME||'',
+    gst:Number(m.gst??m.GST??0)||0,
+    hsn:m.hsn||m.HSN_CODE||'',
+    source:m.isBar===true?'BAR_MENU_CARD':'MENU_CARD_ITEMS'
+  })).filter(m=>m.name);
 }
 let bmItemRowCount=0;
 
@@ -15860,9 +15987,16 @@ function bmOpenQuickAdd(){
   const si=document.getElementById('bmQuickSearchInput'); if(si) si.value='';
   document.querySelectorAll('#bmQuickAddModal .pcat').forEach(b=>b.classList.remove('active'));
   const allBtn=document.querySelector('#bmQuickAddModal .pcat'); if(allBtn) allBtn.classList.add('active');
-  bmBuildProductGrid('bmQuickProdGrid','All');
+  const grid=document.getElementById('bmQuickProdGrid');
+  if(grid && (!Array.isArray(menuData)||!menuData.length)) grid.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:26px;color:var(--text3);">⏳ Loading live Menu Master…</div>';
+  else bmBuildProductGrid('bmQuickProdGrid','All');
   document.getElementById('bmQuickAddModal').classList.add('open');
   setTimeout(()=>{ if(si) si.focus(); },50);
+  bnxEnsureBillingMenuLive_().then(()=>{
+    if(document.getElementById('bmQuickAddModal')?.classList.contains('open')){
+      bmBuildProductGrid('bmQuickProdGrid',bmQuickActiveCat||'All');
+    }
+  }).catch(e=>console.warn('[BILLING QUICK ADD]',e));
 }
 /* Looks up KOTs actually sent from POS for this bill's Table No
    (localStorage-recorded by bnxRecordKOT). If an order split into
@@ -24971,152 +25105,68 @@ function orderRegDemoData(){
 }
 const ORDER_REG_SCHEMA_DEFAULTS = { ORDER_DATE:'—', INVOICE_NO:'', TEMP_ORDER_ID:'—', SCAN_KEY:'', END_TIME:'', MOBILE_NO:'—', NOTES:'', CREATED_BY:'—' };
 
-function bnxOrderRegSession_(){
-  try{
-    const u = JSON.parse(sessionStorage.getItem('ERP_USER') || localStorage.getItem('ERP_USER') || '{}');
-    return {
-      clientId: String(u.CLIENT_ID||u.clientId||u.client_id||CLIENT_ID||'').trim(),
-      role: String(u.ROLE||u.role||u.ROLE_NAME||u.roleName||'').trim().toUpperCase(),
-      locationId: String(u.LOCATION_ID||u.locationId||'').trim()
-    };
-  }catch(e){ return {clientId:'',role:'',locationId:''}; }
-}
-
-function bnxOrderRegIsAdmin_(){
-  const s=bnxOrderRegSession_();
-  return /^(ADMIN|SUPER_ADMIN|SUPERADMIN|OWNER|DEVELOPER)$/.test(s.role);
-}
-
-function bnxOrderRegNormalize_(o){
-  o = o || {};
-  const itemsRaw = o.items || o.ITEMS || o.orderItems || o.ORDER_ITEMS || [];
-  const items = Array.isArray(itemsRaw) ? itemsRaw.map(it=>({
-    ITEM_ID: it.ITEM_ID||it.itemId||it.id||'',
-    itemName: it.itemName||it.ITEM_NAME||it.name||it.item||'',
-    qty: Number(it.qty??it.QUANTITY??it.quantity??it.QTY??0)||0,
-    rate: Number(it.rate??it.RATE??it.price??it.PRICE??0)||0,
-    amount: Number(it.amount??it.LINE_TOTAL??it.lineTotal??0) ||
-      ((Number(it.qty??it.QUANTITY??it.quantity??it.QTY??0)||0) * (Number(it.rate??it.RATE??it.price??it.PRICE??0)||0))
-  })) : [];
-
-  const amountRaw = o.amt ?? o.amount ?? o.total ?? o.ORDER_AMOUNT ?? o.ORDER_TOTAL ??
-                    o.BILL_AMOUNT ?? o.GRAND_TOTAL;
-  const amount = (amountRaw!==undefined && amountRaw!==null && amountRaw!=='')
-    ? Number(amountRaw)
-    : items.reduce((s,it)=>s+(Number(it.amount)||Number(it.qty)*Number(it.rate)||0),0);
-
-  return {
-    ...ORDER_REG_SCHEMA_DEFAULTS, ...o,
-    ORDER_ID: o.ORDER_ID||o.orderId||o.id||'',
-    ORDER_NO: o.ORDER_NO||o.ORDER_NUMBER||o.orderNo||o.orderNumber||'',
-    ORDER_DATE: o.ORDER_DATE||o.orderDate||o.date||o.BILL_DATE||'',
-    INVOICE_NO: o.INVOICE_NO||o.BILL_NUMBER||o.invoiceNo||o.invoiceNumber||'',
-    TABLE_ID: o.TABLE_ID||o.TABLE_NO||o.tableId||o.table||'',
-    ORDER_SOURCE: String(o.ORDER_SOURCE||o.ORDER_SOURCE_TYPE||o.orderSource||o.source||'POS').toUpperCase(),
-    ORDER_TYPE: String(o.ORDER_TYPE||o.orderType||'DINEIN').toUpperCase(),
-    ORDER_STATUS: String(o.ORDER_STATUS||o.status||o.STATUS||'NEW').toUpperCase(),
-    PAX: Number(o.PAX??o.pax??o.COVERS??o.covers??1)||1,
-    CUSTOMER_NAME: o.CUSTOMER_NAME||o.customerName||o.CUSTOMER||o.GUEST_NAME||o.guestName||'',
-    MOBILE_NO: o.MOBILE_NO||o.CUSTOMER_PHONE||o.customerPhone||o.PHONE||o.mobile||o.mobileNo||'',
-    CREATED_BY: o.CREATED_BY||o.STARTED_BY||o.createdBy||o.stewardName||o.steward||o.waiterName||o.waiter||'',
-    START_TIME: o.START_TIME||o.ORDER_TIME||o.orderTime||o.time||'',
-    END_TIME: o.END_TIME||o.endTime||'',
-    NOTES: o.NOTES||o.SPECIAL_INSTRUCTIONS||o.remarks||'',
-    items,
-    amt: Number.isFinite(amount) ? amount : 0
-  };
-}
-
 async function loadOrderRegister(){
-  const el=document.getElementById('orderRegList');
-  if(el) el.innerHTML='<div style="text-align:center;padding:30px;color:var(--text3);">Loading live orders…</div>';
-
-  const session=bnxOrderRegSession_();
-  if(!session.clientId){
-    window.orderRegData=[];
-    renderOrderRegFilters();
-    renderOrderRegList();
-    if(typeof showNotif==='function') showNotif('⚠️ No authenticated client session. Please log in again.','error');
-    return;
-  }
-
+  document.getElementById('orderRegList').innerHTML = '<div style="text-align:center;padding:30px;color:var(--text3);">Loading…</div>';
+  // FIX (same bug class as the dashboard's Active Orders/Hourly Chart):
+  // this used to treat "API call succeeded but there are genuinely zero
+  // orders right now" the SAME as "the API call failed" — both fell
+  // through to the fake demo rows below. A restaurant with a completely
+  // real, working connection but no orders yet today would still see 3
+  // fabricated orders (Suman/Amit/General Customer) as if they were real.
+  // Now only falls back to demo data when the call itself actually fails
+  // (network/backend error) — a successful call with 0 real orders shows
+  // a true, honest empty list instead.
   try{
-    /*
-      IMPORTANT:
-      Order Register is client-wide for Admin/Owner. The previous code always
-      sent window.BNX_LOCATION_ID / window.LOCATION_ID. If that value was stale
-      or blank in the dashboard, the backend correctly applied the location
-      filter and returned zero rows even though CL00010 had real orders.
-      Admin/Owner therefore loads the complete CLIENT_ID history.
-      Non-admin users keep their authenticated location when available.
-    */
-    let locationId = '';
-    if(!bnxOrderRegIsAdmin_()){
-      locationId = session.locationId || String(window.BNX_LOCATION_ID||window.LOCATION_ID||'').trim();
+    // COMPLETE history for Order Register. GET_ACTIVE_ORDERS intentionally
+    // hides BILLED/CANCELLED rows, so using it here made the page look blank
+    // after an order was billed. GET_ORDERS is the authoritative history and
+    // the backend now attaches its ORDER_ITEMS for the detail view.
+    const res = await erpApi({action:'GET_ORDERS', LOCATION_ID:(window.BNX_LOCATION_ID||window.LOCATION_ID||undefined)}, 'V2_CORE');
+    if (res && res.success){
+      const orders = Array.isArray(res.data) ? res.data : ((res.data && res.data.orders) || []);
+      orderRegData = orders.map(o=>({...ORDER_REG_SCHEMA_DEFAULTS, ...o,
+        ORDER_NO:o.ORDER_NO||o.ORDER_NUMBER||'',
+        TABLE_ID:o.TABLE_ID||'',
+        ORDER_SOURCE:o.ORDER_SOURCE||'POS',
+        ORDER_TYPE:ORDER_TYPE_LIST.includes(String(o.ORDER_TYPE||'').toUpperCase()) ? String(o.ORDER_TYPE).toUpperCase() : 'DINEIN'
+      }));
+      if (orderRegFilterType) orderRegData = orderRegData.filter(o=>String(o.ORDER_SOURCE||'').toUpperCase()===String(orderRegFilterType).toUpperCase());
+    } else {
+      throw new Error(res&&res.message||'API call failed');
     }
-
-    let res = await erpApi({
-      action:'GET_ORDERS',
-      ...(locationId ? {LOCATION_ID:locationId} : {})
-    }, 'V2_CORE');
-
-    if(!res || !res.success){
-      throw new Error(res && (res.message||res.error) || 'GET_ORDERS failed');
-    }
-
-    let rawOrders = Array.isArray(res.data) ? res.data :
-      (Array.isArray(res.orders) ? res.orders :
-      (res.data && Array.isArray(res.data.orders) ? res.data.orders : []));
-
-    /*
-      If a non-admin location filter returns zero, do NOT silently switch to
-      all-client data. For Admin/Owner we already requested all locations.
-    */
-    window.orderRegData = rawOrders.map(bnxOrderRegNormalize_);
-
-    if(orderRegFilterType){
-      const wanted=String(orderRegFilterType).toUpperCase();
-      window.orderRegData=window.orderRegData.filter(o=>String(o.ORDER_SOURCE||'').toUpperCase()===wanted);
-    }
-
-    if(!window.orderRegData.length && bnxOrderRegIsAdmin_()){
-      /*
-        One clean retry without any client-side location value. This handles
-        legacy deployments where an old location value is still present in
-        session/local storage. Tenant isolation remains server-side through
-        session.CLIENT_ID.
-      */
-      const retry = await erpApi({action:'GET_ORDERS'}, 'V2_CORE');
-      if(retry && retry.success){
-        const retryRows = Array.isArray(retry.data) ? retry.data :
-          (Array.isArray(retry.orders) ? retry.orders :
-          (retry.data && Array.isArray(retry.data.orders) ? retry.data.orders : []));
-        window.orderRegData=retryRows.map(bnxOrderRegNormalize_);
-        if(orderRegFilterType){
-          const wanted=String(orderRegFilterType).toUpperCase();
-          window.orderRegData=window.orderRegData.filter(o=>String(o.ORDER_SOURCE||'').toUpperCase()===wanted);
-        }
-      }
-    }
-  }catch(e){
-    window.orderRegData=[];
-    console.error('[ORDER REGISTER] Live GET_ORDERS failed:',e);
-    if(typeof showNotif==='function'){
-      showNotif('⚠️ Live Order Register could not load: '+(e.message||'server error'),'error');
-    }
+  } catch(e){
+    // P0 FIX (external audit #2 — "Remove/replace hardcoded demo
+    // transaction data" / "no hardcoded customer/order/bill figures in
+    // LIVE mode"): the fallback itself is reasonable (better than a
+    // blank error screen when the backend is briefly unreachable), but
+    // it used to render silently — nothing distinguished "3 real
+    // orders" from "3 fake orders because the API call failed". A
+    // manager glancing at this screen during an outage could easily
+    // read Suman/Amit/General Customer as real covers. Now flagged
+    // both in the data (isDemo:true, checked by renderOrderRegList
+    // below) and with a visible warning notification every time it
+    // fires.
+    orderRegData = [];
+    if (orderRegFilterType) orderRegData = [];
+    if (typeof showNotif === 'function') showNotif('⚠️ Live order history is temporarily unavailable. No sample orders are shown.', 'error');
   }
-
-  if(typeof bnxGetOrderOverrides==='function'){
-    const overrides=bnxGetOrderOverrides();
-    window.orderRegData.forEach(o=>{
-      const ov=overrides[String(o.TABLE_ID||'').trim().toUpperCase()];
-      if(ov && o.ORDER_STATUS!=='CANCELLED' && o.ORDER_STATUS!=='BILLED'){
-        o.ORDER_STATUS=ov.status;
-        if(ov.invoiceNo) o.INVOICE_NO=ov.invoiceNo;
+  // FIX ("update order regiter... kot update"): whatever just came back
+  // (live API or demo fallback) reflects the backend/sample state at
+  // the moment it was fetched — it doesn't know about a table this
+  // device already billed a moment ago (bnxMarkTableOrdersBilled, see
+  // bmSaveBill). Layer that local knowledge on top here so a freshly
+  // billed table always shows BILLED with its real invoice number,
+  // never a stale NEW/KOT_PRINTED/READY, regardless of source.
+  if (typeof bnxGetOrderOverrides === 'function'){
+    const overrides = bnxGetOrderOverrides();
+    orderRegData.forEach(o=>{
+      const ov = overrides[(o.TABLE_ID||'').toString().trim().toUpperCase()];
+      if (ov && o.ORDER_STATUS!=='CANCELLED' && o.ORDER_STATUS!=='BILLED'){
+        o.ORDER_STATUS = ov.status;
+        if (ov.invoiceNo) o.INVOICE_NO = ov.invoiceNo;
       }
     });
   }
-
   renderOrderRegFilters();
   renderOrderRegList();
 }
@@ -25160,23 +25210,20 @@ function setOrderRegView(mode){
   }
 }
 function orderRegCardHtml(o){
-  const total = orderRegAmount(o);
+  const total = (o.items||[]).reduce((s,i)=>s+Number(i.amount||i.qty*i.rate||0),0);
   const color = ORDER_REG_STATUS_COLORS[o.ORDER_STATUS] || '#6b7280';
-  const customer = o.CUSTOMER_NAME || o.customerName || o.CUSTOMER || o.GUEST_NAME || '—';
-  const mobile = o.MOBILE_NO || o.CUSTOMER_PHONE || o.customerPhone || o.PHONE || o.mobile || '';
-  const createdBy = o.CREATED_BY || o.createdBy || o.STARTED_BY || o.stewardName || o.steward || o.waiterName || o.waiter || '';
   // FIX ("show if steward order given"): CREATED_BY (the steward/waiter
   // who took the order) was tracked in the data and shown in Excel view,
   // but never appeared on the default card list — there was no way to
   // see at a glance who took an order, or spot one nobody's claimed yet.
-  const steward = (createdBy && createdBy !== '—') ? createdBy : null;
+  const steward = (o.CREATED_BY && o.CREATED_BY !== '—') ? o.CREATED_BY : null;
   const stewardBadge = steward
     ? `<span style="font-size:10px;font-weight:600;color:var(--text2);">👤 ${steward}</span>`
     : `<span style="font-size:10px;font-weight:700;color:var(--red,#dc2626);">⚠ No steward assigned</span>`;
   return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px;display:flex;justify-content:space-between;align-items:center;gap:12px;cursor:pointer;" onclick="openOrderRegDetail('${o.ORDER_ID}')">
       <div>
         <div style="font-weight:700;font-size:13.5px;">${o.ORDER_NO} · Table ${o.TABLE_ID} <span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;background:${color}18;color:${color};margin-left:6px;">${o.ORDER_SOURCE}</span> <span style="font-size:9.5px;font-weight:600;padding:2px 7px;border-radius:10px;background:#00000010;color:var(--text3);margin-left:3px;">${o.ORDER_TYPE}</span></div>
-        <div style="font-size:11.5px;color:var(--text3);margin-top:2px;">${customer}${mobile ? ' · '+mobile : ''} · Pax ${o.PAX||1} · ${(o.items||[]).length} items · ${o.START_TIME||''}</div>
+        <div style="font-size:11.5px;color:var(--text3);margin-top:2px;">${o.CUSTOMER_NAME||'—'} · Pax ${o.PAX||1} · ${(o.items||[]).length} items · ${o.START_TIME||''}</div>
         <div style="margin-top:4px;">${stewardBadge}</div>
       </div>
       <div style="text-align:right;">
@@ -25210,7 +25257,7 @@ function orderRegCardHtml(o){
 const ORDER_REG_EXCEL_COLS = [
   ['ORDER_ID','Order_ID'], ['ORDER_NO','Order_No'], ['ORDER_DATE','Order_Date'],
   ['INVOICE_NO','Invoice_No'], ['TABLE_ID','Table_ID'], ['ORDER_TYPE','Order_Type'],
-  ['PAX','Pax'], ['END_TIME','End Time'],
+  ['PAX','Pax'], ['START_TIME','Start Time'], ['END_TIME','End Time'],
   ['CUSTOMER_NAME','Customer_Name'], ['MOBILE_NO','Mobile No'], ['NOTES','Notes'],
   ['CREATED_BY','Created_By'],
 ];
@@ -25328,15 +25375,7 @@ function ordRegDateInRange(dt){
 
 function renderOrderRegList(){
   const el = document.getElementById('orderRegList');
-  if(!el) return;
-  const sourceData = Array.isArray(window.orderRegData) ? window.orderRegData : [];
-  const filtered = sourceData.filter(o=>ordRegDateInRange(o.ORDER_DATE) && (!orderRegActiveStatus || String(o.ORDER_STATUS||'').toUpperCase()===String(orderRegActiveStatus||'').toUpperCase()));
-  const filteredTotal = filtered.reduce((s,o)=>s+(Number(orderRegAmount(o))||0),0);
-  const summaryHtml = `<div style="display:flex;gap:24px;align-items:center;flex-wrap:wrap;margin:4px 0 12px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface);">
-    <div><div style="font-size:20px;font-weight:800;">${filtered.length}</div><div style="font-size:11px;color:var(--text3);">Orders</div></div>
-    <div><div style="font-size:20px;font-weight:800;">₹${filteredTotal.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</div><div style="font-size:11px;color:var(--text3);">Filtered Total</div></div>
-  </div>`;
-
+  const filtered = orderRegData.filter(o=>ordRegDateInRange(o.ORDER_DATE) && (!orderRegActiveStatus || o.ORDER_STATUS===orderRegActiveStatus));
   // P0 FIX (audit #2): unmissable banner whenever ANY row currently on
   // screen is demo fallback data (isDemo:true, set only in
   // loadOrderRegister's catch block above) — not just a one-time
@@ -25345,9 +25384,9 @@ function renderOrderRegList(){
   const demoBanner = filtered.some(o=>o.isDemo)
     ? '<div style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;border-radius:8px;padding:8px 12px;margin-bottom:10px;font-size:12px;font-weight:700;text-align:center;">⚠️ DEMO DATA — server unreachable, these are NOT real orders</div>'
     : '';
-  if (!filtered.length){ el.innerHTML = summaryHtml + demoBanner + '<div style="text-align:center;padding:40px;color:var(--text3);">No orders in this range</div>'; return; }
-  if (orderRegViewMode === 'excel'){ el.innerHTML = summaryHtml + demoBanner + renderOrderRegExcelTable(filtered); return; }
-  if (orderRegViewMode !== 'table'){ el.innerHTML = summaryHtml + demoBanner + filtered.map(orderRegCardHtml).join(''); return; }
+  if (!filtered.length){ el.innerHTML = demoBanner + '<div style="text-align:center;padding:40px;color:var(--text3);">No orders in this range</div>'; return; }
+  if (orderRegViewMode === 'excel'){ el.innerHTML = demoBanner + renderOrderRegExcelTable(filtered); return; }
+  if (orderRegViewMode !== 'table'){ el.innerHTML = demoBanner + filtered.map(orderRegCardHtml).join(''); return; }
 
   const byTable = {};
   filtered.forEach(o=>{
@@ -25378,10 +25417,10 @@ function renderOrderRegList(){
 function openOrderRegDetail(orderId){
   const o = orderRegData.find(x=>x.ORDER_ID===orderId);
   if (!o) return;
-  const total = Number(orderRegAmount(o))||0;
+  const total = (o.items||[]).reduce((s,i)=>s+Number(i.amount||i.qty*i.rate||0),0);
   document.getElementById('orderRegModalBody').innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:14px;">
-      <div><div style="font-weight:800;font-size:16px;">${o.ORDER_NO}</div><div style="font-size:12px;color:#888;">Table ${o.TABLE_ID||'—'} · ${o.ORDER_SOURCE||'—'} · ${o.ORDER_TYPE||'—'} · ${o.CUSTOMER_NAME||o.customerName||o.CUSTOMER||o.GUEST_NAME||'—'}</div>
+      <div><div style="font-weight:800;font-size:16px;">${o.ORDER_NO}</div><div style="font-size:12px;color:#888;">Table ${o.TABLE_ID} · ${o.ORDER_SOURCE} · ${o.ORDER_TYPE} · ${o.CUSTOMER_NAME||'—'}</div>
       <div style="font-size:12px;margin-top:3px;${(o.CREATED_BY&&o.CREATED_BY!=='—')?'color:#555;':'color:var(--red,#dc2626);font-weight:700;'}">${(o.CREATED_BY&&o.CREATED_BY!=='—')?'👤 Steward: '+o.CREATED_BY:'⚠ No steward assigned'}</div></div>
       <button onclick="closeOrderRegModal()" style="border:none;background:#f2ede5;width:28px;height:28px;border-radius:8px;font-size:14px;cursor:pointer;">✕</button>
     </div>
