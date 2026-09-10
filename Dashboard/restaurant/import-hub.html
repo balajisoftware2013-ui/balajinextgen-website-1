@@ -220,8 +220,13 @@
     let sheetData = null;
 
     document.addEventListener('DOMContentLoaded', () => {
-      document.getElementById('clientDisplay').textContent = CLIENT_ID ? `Client: ${CLIENT_ID}` : '⚠️ No client session — please log in again';
+      document.getElementById('clientDisplay').textContent = CLIENT_ID ? `Client: ${bnxEsc(CLIENT_ID)}` : '⚠️ No client session — please log in again';
       setupDragDrop();
+      if (!CLIENT_ID) {
+        const area = document.getElementById('uploadArea');
+        area.style.opacity = '0.55';
+        area.title = 'Please log in again before importing data.';
+      }
     });
 
     // FIX — CRITICAL (P0 client security): this used to be URL-only
@@ -234,14 +239,27 @@
     // from the authenticated session first, same as the rest of the
     // suite, and never defaults to a real client code.
     function getClientIdFromURL() {
-      try{
-        var u=JSON.parse(sessionStorage.getItem('ERP_USER')||localStorage.getItem('ERP_USER')||'{}');
-        var fromSession = u.CLIENT_ID||u.clientId||u.client_id||'';
-        var fromFlatKey = localStorage.getItem('ERP_CLIENT')||'';
-        var id = fromSession || fromFlatKey || localStorage.getItem('bnx_client_id') || '';
-        if(id) localStorage.setItem('bnx_client_id', id);
-        return id;
-      }catch(e){ return ''; }
+      try {
+        const raw = sessionStorage.getItem('ERP_USER') || localStorage.getItem('ERP_USER') || '{}';
+        const u = JSON.parse(raw);
+        const sessionId = String(u.CLIENT_ID || u.clientId || u.client_id || '').trim();
+        const storedId = String(localStorage.getItem('bnx_client_id') || '').trim();
+        const flatId = String(localStorage.getItem('ERP_CLIENT') || '').trim();
+
+        // Authenticated session is authoritative. A conflicting stored client is unsafe.
+        if (sessionId) {
+          if (storedId && storedId !== sessionId) console.warn('Ignoring stale bnx_client_id:', storedId);
+          if (flatId && flatId !== sessionId) console.warn('Ignoring stale ERP_CLIENT:', flatId);
+          localStorage.setItem('bnx_client_id', sessionId);
+          return sessionId;
+        }
+
+        // No authenticated user => no live-client fallback.
+        return '';
+      } catch (e) {
+        console.error('Client session resolution failed:', e);
+        return '';
+      }
     }
 
     function setupDragDrop() {
@@ -265,18 +283,74 @@
       if (files.length) handleFile(files[0]);
     }
 
+    // Safety/robustness helpers.
+    function bnxEsc(value) {
+      return String(value == null ? '' : value).replace(/[&<>"']/g, function(ch) {
+        return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]);
+      });
+    }
+
+    // RFC4180-style CSV parser: supports quoted commas, quotes and newlines.
+    function bnxParseCSV(csv) {
+      const rows = [];
+      let row = [], field = '', quoted = false;
+      for (let i = 0; i < csv.length; i++) {
+        const ch = csv[i];
+        const next = csv[i + 1];
+        if (quoted) {
+          if (ch === '"' && next === '"') { field += '"'; i++; }
+          else if (ch === '"') quoted = false;
+          else field += ch;
+        } else {
+          if (ch === '"') quoted = true;
+          else if (ch === ',') { row.push(field); field = ''; }
+          else if (ch === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+          else if (ch === '\r') { if (next !== '\n') { row.push(field); rows.push(row); row = []; field = ''; } }
+          else field += ch;
+        }
+      }
+      if (quoted) throw new Error('CSV contains an unclosed quoted field.');
+      if (field.length || row.length) { row.push(field); rows.push(row); }
+      return rows.filter(r => r.some(v => String(v).trim() !== ''));
+    }
+
+    function bnxNormalizeHeaders(headers) {
+      return (headers || []).map(h => String(h == null ? '' : h).trim());
+    }
+
+    function bnxDuplicateHeaders(headers) {
+      const seen = Object.create(null), dup = [];
+      headers.forEach(h => {
+        if (!h) return;
+        const k = h.toLowerCase();
+        if (seen[k]) { if (!dup.includes(h)) dup.push(h); }
+        else seen[k] = true;
+      });
+      return dup;
+    }
+
     function handleFile(file) {
+      if (!file) return;
+      const allowed = /\.(csv|xlsx|xls)$/i.test(file.name);
+      if (!allowed) {
+        showMessage('uploadMessage', '❌ Unsupported file type. Please select CSV, XLSX or XLS.', 'error');
+        return;
+      }
+      const maxBytes = 25 * 1024 * 1024;
+      if (file.size > maxBytes) {
+        showMessage('uploadMessage', '❌ File is larger than 25 MB. Split it into smaller files before importing.', 'error');
+        return;
+      }
       const reader = new FileReader();
       reader.onload = function(evt) {
         try {
           let sheets = {};
-          if (file.name.endsWith('.csv')) {
+          if (/\.csv$/i.test(file.name)) {
             const csv = evt.target.result;
-            const lines = csv.split('\n');
-            const headers = lines[0].split(',').map(h => h.trim());
-            const rows = lines.slice(1)
-              .filter(l => l.trim())
-              .map(l => l.split(',').map(v => v.trim()));
+            const parsed = bnxParseCSV(csv);
+            if (parsed.length < 2) throw new Error('CSV must contain a header row and at least one data row.');
+            const headers = bnxNormalizeHeaders(parsed[0]);
+            const rows = parsed.slice(1);
             sheets[file.name] = { headers, rows };
           } else {
             const workbook = XLSX.read(evt.target.result, { type: 'array' });
@@ -317,8 +391,8 @@
         const rows = fileData.sheets[sheetName].rows.length;
         const btn = document.createElement('div');
         btn.className = 'sheet-option';
-        btn.innerHTML = `<strong>${sheetName}</strong><br><small>${rows} rows</small>`;
-        btn.onclick = () => selectSheet(sheetName);
+        btn.innerHTML = `<strong>${bnxEsc(sheetName)}</strong><br><small>${rows} rows</small>`;
+        btn.onclick = () => selectSheet(sheetName, btn);
         selector.appendChild(btn);
       });
     }
@@ -401,17 +475,33 @@
       const cols = detected.length;
       const rows = sheetData.rows.length;
       const chunks = Math.ceil(rows / CHUNK_SIZE);
+      const blankHeaders = detected.map((h,i) => h ? null : (i + 1)).filter(Boolean);
+      const duplicateHeaders = bnxDuplicateHeaders(detected);
       const expected = DB_SCHEMA[selectedSheet];
       const importFormat = IMPORT_FORMAT_SCHEMA[selectedSheet];
 
       const headerListHtml = `<div style="font-family:'DM Mono',monospace,monospace;font-size:11px;background:#fafafa;border:1px solid #e0e0e0;border-radius:6px;padding:10px;margin-top:10px;max-height:140px;overflow:auto;">
-        ${detected.map(h => `<span style="display:inline-block;background:#fff;border:1px solid #ddd;border-radius:4px;padding:2px 6px;margin:2px;">${h || '<em style="color:#c62828">(blank)</em>'}</span>`).join('')}
+        ${detected.map(h => `<span style="display:inline-block;background:#fff;border:1px solid #ddd;border-radius:4px;padding:2px 6px;margin:2px;">${h ? bnxEsc(h) : '<em style="color:#c62828">(blank)</em>'}</span>`).join('')}
       </div>`;
 
       let statusHtml, statusClass, statusMsg;
       headerMismatch = false;
 
-      if (importFormat) {
+      if (!rows) {
+        headerMismatch = true;
+        statusClass = 'error';
+        statusHtml = '<div class="status-box error"><strong>❌ No data rows found.</strong></div>';
+        statusMsg = '❌ No data rows found — import blocked.';
+      } else if (blankHeaders.length || duplicateHeaders.length) {
+        headerMismatch = true;
+        statusClass = 'error';
+        statusHtml = `<div class="status-box error">
+          <strong>⚠️ Invalid header row — import blocked.</strong><br>
+          ${blankHeaders.length ? `Blank header position(s): ${blankHeaders.join(', ')}<br>` : ''}
+          ${duplicateHeaders.length ? `Duplicate header(s): ${duplicateHeaders.map(bnxEsc).join(', ')}` : ''}
+        </div>`;
+        statusMsg = '⚠️ Blank or duplicate headers detected — fix the file before importing.';
+      } else if (importFormat) {
         // POSHEAD / ITEMWISE — the real historical-import format. Only
         // the columns the backend actually reads are required; extra
         // columns beyond that are normal for a raw POS export and are
@@ -497,7 +587,20 @@
       // mismatch before allowing that write through, rather than
       // treating it the same as a normal clean import.
       if (headerMismatch){
-        const proceedAnyway = confirm('⚠️ HEADER MISMATCH — this file\'s column names do not match "' + selectedSheet + '"\'s real columns in the live database.\n\nImporting it will very likely write wrong/garbage data into ' + selectedSheet + ' and break reports that read from it, the same way this happened before.\n\nOnly continue if you are certain this file\'s headers are correct.\n\nOK = Import anyway despite mismatched headers\nCancel = Stop and fix the file first');
+        const isKnownTable = !!DB_SCHEMA[selectedSheet];
+        const isKnownImportFormat = !!IMPORT_FORMAT_SCHEMA[selectedSheet];
+        if (!isKnownTable && !isKnownImportFormat) {
+          showMessage('validateMessage', '❌ Import blocked: "' + bnxEsc(selectedSheet) + '" is not an accepted import target.', 'error');
+          return;
+        }
+        // Missing required fields are never safely overridable.
+        const detected = bnxNormalizeHeaders(sheetData.headers);
+        const fmt = IMPORT_FORMAT_SCHEMA[selectedSheet];
+        if (fmt && fmt.required.some(h => !detected.includes(h))) {
+          showMessage('validateMessage', '❌ Import blocked: required import columns are missing. Fix the file first.', 'error');
+          return;
+        }
+        const proceedAnyway = confirm('⚠️ HEADER MISMATCH — the uploaded headers do not exactly match "' + selectedSheet + '"\'s live schema.\n\nOnly continue if this is an intentional schema-compatible import.\n\nOK = Import anyway\nCancel = Stop and fix the file first');
         if (!proceedAnyway) return;
       }
       // P0 FIX: duplicate-file detection — warn (not block outright;
@@ -576,6 +679,15 @@
         return;
       }
       const totalRows = sheetData.rows.length;
+      if (!selectedSheet || !sheetData || !Array.isArray(sheetData.headers) || !sheetData.headers.length) {
+        document.getElementById('importStatus').textContent = '❌ Import stopped: invalid sheet selection.';
+        return;
+      }
+      if (bnxDuplicateHeaders(bnxNormalizeHeaders(sheetData.headers)).length ||
+          bnxNormalizeHeaders(sheetData.headers).some(h => !h)) {
+        document.getElementById('importStatus').textContent = '❌ Import stopped: blank or duplicate headers.';
+        return;
+      }
       const chunks = [];
       
       for (let i = 0; i < totalRows; i += CHUNK_SIZE) {
@@ -646,8 +758,10 @@
       const failedNote = (failedBatches && failedBatches.length)
         ? `<br><span style="color:var(--red,#c0392b);">⚠️ Batch(es) ${failedBatches.map(b=>b.batchNum).join(', ')} failed after retries — those rows were NOT imported. Re-run this file to retry just those rows, or check the server logs.</span>`
         : '';
-      const html = `<div class="status-box success">
-        <strong>✅ Import Complete!</strong> (Batch ${currentBatchId})<br>
+      const finalClass = failCount === 0 ? 'success' : (successCount > 0 ? 'loading' : 'error');
+      const finalTitle = failCount === 0 ? '✅ Import Complete!' : (successCount > 0 ? '⚠️ Import Partially Complete' : '❌ Import Failed');
+      const html = `<div class="status-box ${finalClass}">
+        <strong>${finalTitle}</strong> (Batch ${bnxEsc(currentBatchId || '')})<br>
         Imported: ${successCount} rows | Failed: ${failCount}${failedNote}
       </div>`;
       
@@ -670,6 +784,8 @@
 
     function resetImport() {
       fileData = null;
+      currentBatchId = null;
+      headerMismatch = false;
       selectedSheet = null;
       sheetData = null;
       
