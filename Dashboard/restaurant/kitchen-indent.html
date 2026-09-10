@@ -753,6 +753,45 @@ let INDENT_ITEMS = INDENT_ITEMS_FALLBACK.slice();
 let qtyMap = {};
 let fullItemList = [...INDENT_ITEMS];
 
+// FIX: Kitchen Indent must consider quantities already pending from earlier
+// indents. Production already received into inventory is represented by the
+// live STOCK value returned by GET_ITEMS, so it must NOT be requested again.
+// Only the remaining quantity below minimum, after existing pending indents,
+// becomes a new indent requirement.
+let pendingIndentQtyMap = {};
+let indentCalcLoaded = false;
+
+function normItemKey(v) {
+  return String(v == null ? '' : v).trim().toUpperCase();
+}
+function calculateIndentQty(item) {
+  const stock = Number(item.stock) || 0;
+  const min = Number(item.min) || 0;
+  const pending = Number(pendingIndentQtyMap[normItemKey(item.id)]) || 0;
+  // Current stock already includes posted production/receipts. Therefore:
+  // new indent = minimum target - stock - already pending.
+  return Math.max(0, min - stock - pending);
+}
+async function loadPendingIndentBalances() {
+  pendingIndentQtyMap = {};
+  try {
+    const res = await erpApi('GET_PENDING_INDENTS', { indentType: 'KITCHEN' });
+    const rows = res && res.success && res.data && Array.isArray(res.data.indents)
+      ? res.data.indents : [];
+    rows.forEach(function(r) {
+      const status = String(r.STATUS || 'PENDING').toUpperCase();
+      if (['REJECTED','CANCELLED','CLOSED','COMPLETED','ISSUED','PROCESSED'].includes(status)) return;
+      const key = normItemKey(r.ITEM_ID || r.itemId || r.ITEM_CODE || r.itemCode);
+      if (!key) return;
+      const qty = Math.max(0, Number(r.REQUIRED_QTY || r.requiredQty || 0) - Number(r.ISSUED_QTY || r.issuedQty || 0));
+      pendingIndentQtyMap[key] = (pendingIndentQtyMap[key] || 0) + qty;
+    });
+  } catch (e) {
+    console.warn('[loadPendingIndentBalances] Pending indent check failed; using stock only', e);
+  }
+  indentCalcLoaded = true;
+}
+
 // Fetches the real item list (GET_ITEMS, from ITEM_MASTER) and re-renders
 // the New Indent table with it. Falls back to the static list above if
 // the server can't be reached, so the screen still works either way.
@@ -768,6 +807,7 @@ async function loadRealItems() {
     stock: Number(i.STOCK) || 0, min: Number(i.MIN_STOCK) || 0, rate: Number(i.RATE) || 0,
   }));
   fullItemList = [...INDENT_ITEMS];
+  await loadPendingIndentBalances();
   renderCategoryFilter();
   renderTable(INDENT_ITEMS);
 }
@@ -799,8 +839,16 @@ function renderTable(items) {
   Object.entries(groups).forEach(([cat, catItems]) => {
     html += `<tr><td colspan="8" class="section-row">📂 ${cat}</td></tr>`;
     catItems.forEach(item => {
-      const val = qtyMap[item.id] || '';
-      const lowStock = item.stock <= item.min;
+      const calculated = calculateIndentQty(item);
+      // Auto-suggest only the remaining balance. Existing user-entered qty
+      // remains editable and is never overwritten on re-render.
+      const val = Object.prototype.hasOwnProperty.call(qtyMap, item.id)
+        ? qtyMap[item.id]
+        : (calculated > 0 ? calculated : '');
+      if (calculated > 0 && !Object.prototype.hasOwnProperty.call(qtyMap, item.id)) {
+        qtyMap[item.id] = calculated;
+      }
+      const lowStock = item.stock < item.min;
       const safeName = item.name || 'Unnamed item';
       html += `<tr data-cat="${cat}" data-name="${safeName.toLowerCase()}">
         <td style="color:var(--muted);font-size:11px;font-family:'JetBrains Mono',monospace;">${rowNum++}</td>
@@ -808,8 +856,8 @@ function renderTable(items) {
         <td><span style="font-size:11px;color:var(--muted);background:var(--bg2);padding:2px 6px;border-radius:4px;">${cat}</span></td>
         <td style="font-family:'JetBrains Mono',monospace;font-weight:600;font-size:11px;">${item.uom}</td>
         <td class="num" style="color:var(--muted);font-family:'JetBrains Mono',monospace;">${item.rate ? '₹'+item.rate.toFixed(2) : '—'}</td>
-        <td class="num" style="color:${lowStock?'var(--red)':'var(--green)'};">${item.stock} ${item.uom}</td>
-        <td class="num" style="color:var(--muted);">${item.min} ${item.uom}</td>
+        <td class="num" title="Posted production/receipts are already included in current stock" style="color:${lowStock?'var(--red)':'var(--green)'};">${item.stock} ${item.uom}</td>
+        <td class="num" title="Target minimum level">${item.min} ${item.uom}</td>
         <td><input type="number" class="qty-input${val?' filled':''}" min="0" step="0.1" value="${val}" placeholder="0" data-id="${item.id}" oninput="onQtyChange('${item.id}',this)" onkeydown="handleQtyArrowKey(event,this)"></td>
         <td><input type="text" style="width:120px;padding:5px 8px;border:1.5px solid var(--border);border-radius:6px;font-size:11px;background:var(--bg);color:var(--text);font-family:inherit;" placeholder="Remarks…" data-remarks="${item.id}"></td>
       </tr>`;
