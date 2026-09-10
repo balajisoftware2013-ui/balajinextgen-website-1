@@ -8302,6 +8302,23 @@ async function bnxPullBillsFromServer(from, to){
         const payBreakdown = sb.payBreakdown
           ? { CASH:Number(sb.payBreakdown.CASH)||0, CARD:Number(sb.payBreakdown.CARD)||0, UPI:Number(sb.payBreakdown.UPI)||0, OTHER:Number(sb.payBreakdown.OTHER)||0 }
           : { CASH:0, CARD:0, UPI:0, OTHER:0, [bucket]:fallbackTotal };
+        // FIX ("category filter breaks every register report" — confirmed
+        // real bug): LIST_BILLS' itemsDetail line items carry only
+        // name/qty/rate/amt — no category — because a bill's items can span
+        // many categories and the backend never attaches one. Every report
+        // filter that tried to match a category against a bill (or its line
+        // items) therefore always failed silently, returning zero rows the
+        // moment a category was selected. Enrich each line item here, once,
+        // against the item master already loaded into menuData for the POS
+        // (name → category), so category filtering has something real to
+        // match against everywhere bills are used.
+        const rawItemsDetail = sb.itemsDetail || (Array.isArray(sb.items)?sb.items:[]);
+        const itemsDetail = Array.isArray(rawItemsDetail) ? rawItemsDetail.map(it=>{
+          if (!it || it.cat || it.category) return it;
+          const nm = String(it.name||it.n||'').trim().toLowerCase();
+          const found = nm && Array.isArray(menuData) ? menuData.find(m=>String(m.n||'').trim().toLowerCase()===nm) : null;
+          return found && found.c ? Object.assign({}, it, {cat: found.c, category: found.c}) : it;
+        }) : rawItemsDetail;
         local.push({
           no,
           dt: sb.dt || sb.BILL_DATE || sb.date,
@@ -8309,8 +8326,8 @@ async function bnxPullBillsFromServer(from, to){
           table: sb.table || sb.TABLE_ID || sb.tableNo || '-',
           customer: sb.customer || sb.CUSTOMER_NAME || sb.cname || 'GENERAL CUSTOMER',
           mob: sb.mob || sb.mobile || '',
-          items: sb.items ?? (Array.isArray(sb.itemsDetail)?sb.itemsDetail.length:0),
-          itemsDetail: sb.itemsDetail || (Array.isArray(sb.items)?sb.items:[]),
+          items: sb.items ?? (Array.isArray(itemsDetail)?itemsDetail.length:0),
+          itemsDetail,
           sub: sb.sub ?? sb.subtotal ?? sb.SUBTOTAL ?? 0,
           gst: sb.gst ?? sb.tax ?? sb.TAX_AMOUNT ?? 0,
           total: sb.total ?? sb.grand ?? sb.GRAND_TOTAL ?? 0,
@@ -11591,9 +11608,20 @@ function bnxRebuildCategoryPills(){
              : mode==='Bar' ? bnxCategoryItems_('Bar')
              : mode==='All' ? bnxCategoryItems_('All')
              : [];
+  // FIX ("no mixing of Food and Bar categories" — confirmed real bug, not
+  // just a claim): window.bnxLiveCategories is a GLOBAL union built from
+  // every item in menuData regardless of Food/Bar kind (see
+  // refreshCategories()/bnxRefreshLiveCategoryMaster below — both compute it
+  // the same unfiltered way). Concatenating it here unconditionally meant
+  // Bar Menu's category strip always showed Food-only categories mixed in
+  // (ADD-ONS, DESSERTS…) alongside real bar categories (VODKA, WHISKY…),
+  // and vice versa for Food Menu. Only pull in that global "every category
+  // that exists anywhere" list for the true All-Items view; Food/Bar modes
+  // now use ONLY categories that actually belong to an item of that kind
+  // (`base`, already correctly filtered by bnxCategoryItems_ above).
   const cats = Array.from(new Set(
     base.map(i=>String(i.c||'').trim()).filter(Boolean)
-      .concat((Array.isArray(window.bnxLiveCategories)?window.bnxLiveCategories:[]).map(x=>String(x||'').trim()).filter(Boolean))
+      .concat(mode==='All' ? (Array.isArray(window.bnxLiveCategories)?window.bnxLiveCategories:[]).map(x=>String(x||'').trim()).filter(Boolean) : [])
   )).sort((a,b)=>a.localeCompare(b));
 
   // Favourites/Popular/Recent do not need a second category level unless
@@ -16794,9 +16822,21 @@ function bnxRecordBill(d){
   // BILLS), so every bill in the register carries payBreakdown either
   // way, regardless of which of the two paths created it.
   const bnxBucket = payMode === 'CASH' ? 'CASH' : payMode === 'UPI' ? 'UPI' : payMode === 'CARD' ? 'CARD' : 'OTHER';
+  // Same category enrichment as bnxPullBillsFromServer's fix above, applied
+  // here too since this is the OTHER path a bill's itemsDetail reaches the
+  // register through (bnxRecordBill fires for bills created on this device,
+  // before any LIST_BILLS round trip) — without it, a bill billed locally
+  // would still fail the same category-filter match the server path just
+  // got fixed for.
+  const rdItemsDetail = Array.isArray(d.items) ? d.items.map(it=>{
+    if (!it || it.cat || it.category) return it;
+    const nm = String(it.name||it.n||'').trim().toLowerCase();
+    const found = nm && Array.isArray(menuData) ? menuData.find(m=>String(m.n||'').trim().toLowerCase()===nm) : null;
+    return found && found.c ? Object.assign({}, it, {cat: found.c, category: found.c}) : it;
+  }) : [];
   const entry = {
     no: d.no, dt: d.dt, tm: d.tm, table: d.table||'-', customer: d.customer||'GENERAL CUSTOMER',
-    mob: d.mob||'', items: (d.items||[]).length, itemsDetail: d.items||[], sub: d.sub||0, gst: d.gst||0,
+    mob: d.mob||'', items: rdItemsDetail.length, itemsDetail: rdItemsDetail, sub: d.sub||0, gst: d.gst||0,
     total: d.total||0, pay: payMode, payBreakdown: { CASH:0, CARD:0, UPI:0, OTHER:0, [bnxBucket]: Number(d.total)||0 }, isSplitPayment: false,
     status: payMode==='DUE'||payMode==='CREDIT' ? 'Pending' : (payMode==='COMPLIMENTARY'?'Complimentary':'Paid'),
     waiter: d.waiter||'-', kot: d.kot||'', live:true,
@@ -22750,7 +22790,14 @@ function bnxResolveReportRange(from, to){
   // mode filter whenever that mode has a positive amount on it, split
   // or not.
   if(payVal) filtered=filtered.filter(b=>Number((b.payBreakdown||{})[payVal]||0) > 0 || (!b.payBreakdown && String(b.pay||'').toUpperCase()===payVal));
-  if(categoryVal) filtered=filtered.filter(b=>String(b.category||b.categoryName||'').trim().toLowerCase()===categoryVal);
+  // FIX ("category filter breaks every register report" — confirmed real
+  // bug, not a guess): a bill has no single `.category` — it can contain
+  // items from several categories — so `b.category` was always undefined
+  // and this filter silently zeroed out every bill-register report the
+  // instant a category was selected. A bill now matches a category filter
+  // when at least one of its line items belongs to that category (see the
+  // itemsDetail category enrichment in bnxPullBillsFromServer above).
+  if(categoryVal) filtered=filtered.filter(b=>Array.isArray(b.itemsDetail) && b.itemsDetail.some(it=>String((it&&(it.cat||it.category))||'').trim().toLowerCase()===categoryVal));
   if(stewardVal) filtered=filtered.filter(b=>String(b.waiter||'')===stewardVal);
   if(tableVal) filtered=filtered.filter(b=>String(b.table||'')===tableVal);
   if(custVal) filtered=filtered.filter(b=>String(b.customer||'').toLowerCase().includes(custVal)||String(b.mob||'').includes(custVal));
@@ -23940,108 +23987,6 @@ function printAllReportsHub(){
     .rp-title{background:#31719B;color:#fff;font-size:15px;font-weight:800;text-align:center;padding:10px 12px;border-radius:6px 6px 0 0;-webkit-print-color-adjust:exact;print-color-adjust:exact;}
     .rp-meta{font-size:9px;color:#475569;padding:7px 2px;border-bottom:2px solid #c25a0a;margin-bottom:8px;} .rp-footer{font-size:8px;color:#64748b;border-top:1px solid #d9d9d9;padding-top:5px;margin-top:8px;display:flex;justify-content:space-between;}
   </style>
-<style id="reports-hub-full-view-final-fix">
-/* FINAL REPORTS HUB VIEWPORT FIX
-   Reports Hub is a full-page workspace, not a vertically centred card.
-   Always anchor it to the top of the actual content viewport and remove
-   animation/legacy spacing that can create a large blank band. */
-#page-reports{
-  position:relative!important;
-  top:0!important;
-  margin:0!important;
-  padding:0!important;
-  min-height:0!important;
-  height:auto!important;
-  transform:none!important;
-  animation:none!important;
-  box-sizing:border-box!important;
-  width:100%!important;
-  max-width:100%!important;
-}
-#page-reports>.section-h{margin:0 0 10px!important;padding:0!important;position:relative!important;top:0!important;transform:none!important;}
-#page-reports>.rpt-step-label{margin:8px 0 5px!important;}
-#page-reports #rptGallery,#page-reports #rptDropdownView{margin-top:0!important;}
-#page-reports #rptGallerySearch{margin-top:0!important;}
-/* The real vertical scroll belongs to content-area. */
-.content-area{min-width:0!important;max-width:100%!important;}
-@media screen{
-  .content-area{overflow-y:auto!important;overflow-x:hidden!important;scroll-behavior:auto!important;}
-}
-/* Never let a report card itself create a page-level vertical spacer. */
-#page-reports .rpt-gallery-grid,#page-reports .rpt-category-tabs,#page-reports .rpt-command-bar,#page-reports .rpt-pro-card{box-sizing:border-box;max-width:100%;}
-#page-reports{display:block!important;align-self:stretch!important;justify-self:stretch!important;overflow:visible!important;}
-#page-reports > *{max-width:100%;min-width:0;box-sizing:border-box;}
-#page-reports .rpt-command-bar,#page-reports #rptGallery,#page-reports #rptDropdownView,#page-reports #rptDetailBackBar{overflow:visible;}
-#page-reports table{min-width:0;}
-#page-reports .table-wrap,#page-reports .table-responsive{max-width:100%;overflow-x:auto;overflow-y:visible;-webkit-overflow-scrolling:touch;}
-</style>
-<script>
-
-<style id="dashboard-layout-final-fix">
-  #page-dashboard{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;}
-  #page-dashboard .grid,#page-dashboard .dash-grid2{width:100%;max-width:100%;min-width:0;}
-  #page-dashboard table{max-width:100%;}
-</style>
-/* FINAL deterministic Reports Hub viewport anchor. */
-(function(){
-  function anchorReportsTop(){
-    try{
-      var page=document.getElementById('page-reports');
-      var ca=document.querySelector('.content-area');
-      if(!page||!ca||!page.classList.contains('active')) return;
-      /* Hidden sibling .page elements must never influence the starting
-         scroll position. Reports is the first visible page in content-area. */
-      ca.scrollTop=0;
-      ca.scrollLeft=0;
-      if(ca.parentElement && ca.parentElement.scrollTop!=null) ca.parentElement.scrollTop=0;
-      window.scrollTo(0,0);
-      /* Re-assert after browser hash/scroll restoration and after the page
-         paint; no hard-coded vertical offset is used. */
-      requestAnimationFrame(function(){
-        if(page.classList.contains('active')){
-          ca.scrollTop=0; ca.scrollLeft=0; window.scrollTo(0,0);
-        }
-      });
-      setTimeout(function(){
-        if(page.classList.contains('active')){
-          ca.scrollTop=0; ca.scrollLeft=0; window.scrollTo(0,0);
-        }
-      },120);
-      setTimeout(function(){
-        if(page.classList.contains('active')){
-          ca.scrollTop=0; ca.scrollLeft=0; window.scrollTo(0,0);
-        }
-      },350);
-    }catch(e){console.warn('[Reports top anchor]',e.message);}
-  }
-  window.bnxAnchorReportsTopFinal=anchorReportsTop;
-  document.addEventListener('DOMContentLoaded',anchorReportsTop);
-  window.addEventListener('hashchange',function(){if(location.hash==='#reports') setTimeout(anchorReportsTop,0);});
-  window.addEventListener('pageshow',function(){if(location.hash==='#reports') setTimeout(anchorReportsTop,0);});
-  document.addEventListener('click',function(e){
-    var el=e.target && e.target.closest ? e.target.closest('[onclick*="showPage(\'reports\'"]') : null;
-    if(el) setTimeout(anchorReportsTop,30);
-  },true);
-})();
-<\/script>
-<style id="bnx-final-viewport-blank-screen-fix">
-html,body{width:100%;height:100%;min-height:100%;overflow:hidden!important;}
-body{visibility:visible!important;background:var(--bg,#f4f3ee)!important;}
-.shell{height:100vh!important;min-height:0!important;overflow:hidden!important;}
-.shell-body{display:flex!important;flex:1 1 auto!important;min-height:0!important;min-width:0!important;overflow:hidden!important;}
-.main{display:flex!important;flex:1 1 auto!important;flex-direction:column!important;min-width:0!important;min-height:0!important;overflow:hidden!important;}
-.content-area{display:block!important;flex:1 1 auto!important;min-width:0!important;min-height:0!important;height:auto!important;overflow-y:scroll!important;overflow-x:hidden!important;scrollbar-width:auto!important;scrollbar-color:#b8690e #eee9df!important;}
-.content-area::-webkit-scrollbar{width:12px!important;height:12px!important;}
-.content-area::-webkit-scrollbar-track{background:#eee9df!important;}
-.content-area::-webkit-scrollbar-thumb{background:#b8690e!important;border-radius:8px!important;border:2px solid #eee9df!important;}
-.content-area::-webkit-scrollbar-thumb:hover{background:#934f08!important;}
-.sidebar{min-height:0!important;overflow-y:auto!important;overflow-x:hidden!important;scrollbar-width:auto!important;scrollbar-color:#b8690e #f5e8d8!important;}
-.sidebar::-webkit-scrollbar{width:10px!important;}
-.sidebar::-webkit-scrollbar-track{background:#f5e8d8!important;}
-.sidebar::-webkit-scrollbar-thumb{background:#b8690e!important;border-radius:8px!important;border:2px solid #f5e8d8!important;}
-#page-settings .settings-sidebar,#page-settings .stg-nav,#page-settings .settings-nav{max-height:calc(100vh - var(--topbar-h,64px) - var(--dbbar-h,28px) - 36px)!important;overflow-y:auto!important;overflow-x:hidden!important;min-height:0!important;scrollbar-width:auto!important;}
-@media(max-width:768px){.content-area{overflow-y:scroll!important;-webkit-overflow-scrolling:touch!important;}.sidebar{overflow-y:auto!important;}}
-</style>
 </head><body>${pages}</body></html>`);
   w.document.close();
   setTimeout(()=>{w.focus();w.print();},500);
