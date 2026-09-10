@@ -566,34 +566,6 @@ html,body{width:100%;max-width:100%;overflow:hidden;}
 }
 </style>
 
-
-<style id="steward-live-fast-order-ui-v2">
-/* FINAL LIVE ORDER UI: compact, fast-tap, no clipped horizontal controls. */
-#s-new-order .scroll{padding:8px 10px 14px;overflow-x:hidden;}
-#s-new-order #cat-tabs{width:100%;max-width:100%;overflow:hidden;margin:0 0 7px;padding:0;}
-#s-new-order #cat-tabs .menu-view-controls{width:100%;max-width:100%;overflow:hidden;}
-#s-new-order #cat-tabs .menu-view-controls>div,
-#s-new-order #cat-tabs .cat-tabs-wrapper{width:100%;max-width:100%;box-sizing:border-box;overflow-x:auto;overflow-y:hidden;padding-left:2px;padding-right:2px;scrollbar-width:none;}
-#s-new-order #cat-tabs .menu-view-controls>div::-webkit-scrollbar,
-#s-new-order #cat-tabs .cat-tabs-wrapper::-webkit-scrollbar{display:none;height:0;}
-#s-new-order #cat-tabs button{flex:0 0 auto;white-space:nowrap;}
-#s-new-order .cat-tab{padding:6px 11px;font-size:10px;line-height:1.15;max-width:210px;overflow:hidden;text-overflow:ellipsis;}
-#s-new-order .menu-view-toggle{padding:6px 10px;font-size:10px;}
-#s-new-order .menu-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:start;}
-#s-new-order .menu-card{height:164px;min-height:164px;box-sizing:border-box;padding:9px;border-radius:12px;overflow:hidden;}
-#s-new-order .mc-icon{font-size:22px;line-height:1;margin:0 0 5px;}
-#s-new-order .mc-name{font-size:11.5px;line-height:1.2;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;padding-right:3px;}
-#s-new-order .mc-cat{font-size:9px;line-height:1.2;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-top:3px;padding-right:2px;}
-#s-new-order .mc-price{font-size:13px;margin-top:4px;}
-#s-new-order .mc-add{width:30px;height:30px;right:8px;bottom:8px;border-radius:9px;z-index:2;}
-#s-new-order .sec-title{font-size:10px;}
-@media(max-width:360px){
-  #s-new-order .scroll{padding-left:8px;padding-right:8px;}
-  #s-new-order .menu-grid{gap:7px;}
-  #s-new-order .menu-card{height:154px;min-height:154px;padding:8px;}
-  #s-new-order .mc-name{font-size:11px;}
-}
-</style>
 </head>
 <body>
 <script>
@@ -3155,7 +3127,7 @@ function swKotStation_(item){
   if(['IMPORTED LIQUOR','SALES LIQUOR','JUICES/MOCKTAILS'].includes(c)) return 'BAR';
   if(['CIGARETTE','FLAVOURED BEVERAGES','SALES BEVERAGES'].includes(c)) return 'COUNTER';
   const n=String(item.name||item.itemName||item.ITEM_NAME||'').toLowerCase();
-  if(/beer|whisky|whiskey|wine|vodka|rum|gin|tequila|cocktail|liquor|liqueur|spirit|aperitif|martini|brunch|spritz/.test(n)) return 'BAR';
+  if(/beer|whisky|whiskey|wine|vodka|rum|gin|tequila|cocktail|liquor|liqueur|spirit|aperitif|martini|spritz/.test(n)) return 'BAR';
   return 'KITCHEN';
 }
 
@@ -4300,9 +4272,35 @@ async function placeOrder(){
     return;
   }
   lastOrderId = orderId;
+
+  // STEWARD SPLIT-KOT: one real ORDER_MASTER for the table/order, then one
+  // KOT_MASTER ticket per station. Food -> KITCHEN, drinks/bar -> BAR.
+  // This keeps the restaurant Order Register as ONE order while KOT/KDS has
+  // the two operational tickets. Each KOT references the same order number.
+  const orderNo = String((res.data && (res.data.ORDER_NUMBER || res.data.ORDER_NO)) || orderId);
+  const stationGroups = {};
+  items.forEach(it => { const stn=String(it.station||it.STATION||swKotStation_(MENU.find(m=>String(m.id)===String(it.ITEM_ID))||{})||'KITCHEN').toUpperCase(); (stationGroups[stn]||(stationGroups[stn]=[])).push(it); });
+  const kotResults = await Promise.all(Object.keys(stationGroups).filter(k=>stationGroups[k].length).map(async stn=>{
+    const kotRequestId=bnxUuid();
+    const kotPayload={requestId:kotRequestId,kotNumber:'',orderNo,table:selTable.id,locationId:identity.locationId||'',waiter:stewardName,covers:'',customerName:document.getElementById('custNameInput')?.value||'',kotSource:'STEWARD-'+stn,station:stn,printTo:stn==='BAR'?'BAR':'Kitchen',items:stationGroups[stn],remarks:''};
+    try{
+      const kr=await gasApi('SAVE_KOT',kotPayload,'V2_CORE');
+      if(!kr||!kr.success){ bnxQueuePending('SAVE_KOT',kotPayload,kotRequestId,'kot-'+orderNo+'-'+stn); return {station:stn,ok:false}; }
+      return {station:stn,ok:true,number:kr.kotNumber||kr.transactionId||''};
+    }catch(e){ bnxQueuePending('SAVE_KOT',kotPayload,kotRequestId,'kot-'+orderNo+'-'+stn); return {station:stn,ok:false}; }
+  }));
+  const failedKots=kotResults.filter(x=>!x.ok);
+
   bnxLoadOpenKots();
-  const entry = { kotNo:orderId, orderNo:(res.data&&res.data.ORDER_NUMBER)||orderId, orderId:(res.data&&res.data.ORDER_ID)||res.transactionId||orderId, table:selTable.id, type:'KITCHEN', time:res.serverTimestamp||new Date().toISOString(), waiter:stewardName, covers:'', items, amount, occasion:selectedOccasion, status:'NEW' };
-  KOT.unshift(entry);
+  // Mirror the same split locally so the Steward KOT screen immediately shows
+  // separate Kitchen/Bar tickets, while both still carry the SAME orderNo.
+  const localKots=kotResults.filter(x=>x.ok).map(x=>{
+    const stationItems=stationGroups[x.station]||[];
+    return {kotNo:String(x.number||('PENDING-'+orderId+'-'+x.station)),orderNo,orderId:(res.data&&res.data.ORDER_ID)||res.transactionId||orderId,table:selTable.id,type:x.station,time:new Date().toISOString(),waiter:stewardName,covers:'',items:stationItems,amount:stationItems.reduce((a,i)=>a+Number(i.price||0)*Number(i.qty||0),0),occasion:selectedOccasion,status:'NEW'};
+  });
+  // If a ticket was queued offline, show a pending ticket for that station too.
+  kotResults.filter(x=>!x.ok).forEach(x=>{const stationItems=stationGroups[x.station]||[];localKots.push({kotNo:'PENDING-'+orderId+'-'+x.station,orderNo,orderId,table:selTable.id,type:x.station,time:new Date().toISOString(),waiter:stewardName,covers:'',items:stationItems,amount:stationItems.reduce((a,i)=>a+Number(i.price||0)*Number(i.qty||0),0),occasion:selectedOccasion,status:'PENDING_SYNC'});});
+  localKots.reverse().forEach(entry=>KOT.unshift(entry));
   if(KOT.length>100) KOT.length=100;
   bnxSetOpenKotsRaw(JSON.stringify(KOT));
 
@@ -4311,7 +4309,7 @@ async function placeOrder(){
     status: 'PLACED', timestamp: Date.now(), originalItems: JSON.parse(JSON.stringify(items)), hasServerId: true
   };
 
-  toast('✅ KOT sent to kitchen — confirmed on server','success');
+  toast(failedKots.length ? '⚠️ Order saved; some KOT tickets are queued for sync' : (Object.keys(stationGroups).length>1 ? '✅ Order saved — Kitchen + Bar KOTs confirmed' : '✅ KOT sent — confirmed on server'),'success');
   order={};
   selectOccasion('None');
 

@@ -290,7 +290,7 @@ async function bnxFetchJson_(endpoint, options){
         const parsedAction = (()=>{ try{return JSON.parse(fetchOpts.body||'{}').action||'';}catch(e){return '';} })();
         const timeoutMs = Number(fetchOpts.timeoutMs) ||
           (/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? BNX_WRITE_TIMEOUT_MS :
-           /^(GET_|LIST_|RD_)/i.test(parsedAction) ? BNX_REPORT_TIMEOUT_MS : BNX_READ_TIMEOUT_MS);
+           /^(GET_(GST_REPORT|SALES_DAY_BOOK_REPORT|PAYMENT_REPORT_V2|CASH_BANK_REPORT|CUSTOMER_DUES_REPORT_V2|SUPPLIER_DUES_REPORT_V2|PROFIT_LOSS_REPORT|RECONCILIATION_REPORT|STOCK_REPORT|REPORT_HUB_ALL)|LIST_BILLS|RD_)/i.test(parsedAction) ? BNX_REPORT_TIMEOUT_MS : BNX_READ_TIMEOUT_MS);
         delete fetchOpts.timeoutMs;
 
         const timeoutCtrl = new AbortController();
@@ -511,10 +511,10 @@ const CLIENT_INDUSTRY=(function(){
    • Connection pooling: reuse TCP connections, lower latency
    • Auto-archive: old bills (>7 days) cleaned from sessionStorage
 ═══════════════════════════════════════════════════════ */
-const REQUEST_QUEUE = { pending: [], active: 0, maxConcurrent: 2 };
-const API_RETRY_CONFIG = { maxAttempts: 3, baseDelay: 700, maxDelay: 5000 };
-const BNX_READ_TIMEOUT_MS = 20000;
-const BNX_WRITE_TIMEOUT_MS = 20000;
+const REQUEST_QUEUE = { pending: [], active: 0, maxConcurrent: 4 };
+const API_RETRY_CONFIG = { maxAttempts: 2, baseDelay: 450, maxDelay: 3000 };
+const BNX_READ_TIMEOUT_MS = 12000;
+const BNX_WRITE_TIMEOUT_MS = 15000;
 // Heavy Tally-style reports may scan BILL/PAYMENT/BILL_ITEMS/MASTER sheets.
 // Give report reads enough time to complete instead of falsely presenting
 // a timeout as an empty/demo report.
@@ -9912,7 +9912,7 @@ function bnxComputeDashExtras_(){
 // cache (bnxResolveReportRange) and other already-real signals on
 // this page -- same convention as bnxComputeDashExtras_ above. No new
 // backend calls, no invented numbers.
-async function bnxRenderDashChartsRow_(){
+function bnxRenderDashChartsRow_(){
   try{
     // ── Sales Trend (this week: last 7 calendar days, Mon-anchored not
     // required here -- just the trailing 7 days like the Reports Hub's
@@ -9958,41 +9958,40 @@ async function bnxRenderDashChartsRow_(){
     // bnxRenderTopSellingItems_ directly, the same real backend call
     // this file already makes on every load -- see those two functions.
 
-    // ── Category Wise Sales — LIVE backend source ──
-    // Never derive this dashboard table from this browser's local bill cache:
-    // another POS/steward/device may have created today's bills. Use the same
-    // tenant-scoped GET_ITEM_SALES_REPORT used by the Reports Hub, aggregate
-    // authoritative NET_SALES by CATEGORY_NAME, and render zero honestly.
+    // ── Category Wise Sales — LIVE tenant backend source.
+    // Never derive this report from this device's local bill cache: bills may
+    // be created by another POS/steward/device. The backend report is already
+    // tenant-scoped and returns NET_SALES by category. Cache the last successful
+    // snapshot locally only as a short-lived display fallback.
     const catBody = document.getElementById('dashCategorySalesBody');
     const catFoot = document.getElementById('dashCategorySalesFoot');
     const catFootAmt = document.getElementById('dashCatSalesFootAmt');
-    if (catBody){
-      catBody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--text3);padding:14px;">Loading live category sales…</td></tr>';
-      try{
-        const catRes = await (typeof _server === 'function'
-          ? _server('GET_ITEM_SALES_REPORT',{})
-          : gasApi('GET_ITEM_SALES_REPORT',{},'V2_CORE'));
-        const itemRows = Array.isArray(catRes?.data?.rows) ? catRes.data.rows : [];
-        const byCat = {};
-        itemRows.forEach(r=>{
-          const cat = String(r.CATEGORY_NAME || r.CATEGORY || r.categoryName || 'Other').trim() || 'Other';
-          const net = Number(r.NET_SALES ?? r.netSales ?? 0) || 0;
-          if (!byCat[cat]) byCat[cat] = {cat,revenue:0};
-          byCat[cat].revenue += net;
-        });
-        const catRows = Object.values(byCat).filter(r=>r.revenue!==0).sort((a,b)=>b.revenue-a.revenue);
-        const catTotal = catRows.reduce((sum,r)=>sum+r.revenue,0);
-        catBody.innerHTML = catRows.length ? catRows.map(r=>{
-          const pct = catTotal ? (r.revenue/catTotal*100).toFixed(1) : '0.0';
-          return '<tr><td>'+bnxEscapeHtml_(r.cat)+'</td><td class="mono">'+r.revenue.toLocaleString('en-IN',{maximumFractionDigits:2})+'</td><td class="mono">'+pct+'%</td></tr>';
-        }).join('') : '<tr><td colspan="3" style="text-align:center;color:var(--text3);padding:14px;">No items sold today yet.</td></tr>';
-        if(catFoot && catFootAmt){catFoot.style.display=catRows.length?'':'none';catFootAmt.textContent=catTotal.toLocaleString('en-IN',{maximumFractionDigits:2});}
-      }catch(e){
-        console.error('[Dashboard] live category sales failed',e);
-        catBody.innerHTML='<tr><td colspan="3" style="text-align:center;color:var(--red,#dc2626);padding:14px;">Live category sales unavailable — retrying…</td></tr>';
-        if(catFoot) catFoot.style.display='none';
-      }
-    }
+    const catRange = (typeof bnxDashRangeParams_==='function') ? bnxDashRangeParams_() : {range:'today'};
+    const catKey = 'bnx_live_category_sales_' + String(bnxCurrentClient_()||'') + '|' + JSON.stringify(catRange);
+    const renderCatRows = (rows, liveSource) => {
+      rows = Array.isArray(rows) ? rows : [];
+      const clean = rows.map(r=>({
+        cat: String(r.CATEGORY_NAME || r.categoryName || r.CATEGORY_ID || 'Other'),
+        revenue: Number(r.NET_SALES ?? r.net ?? 0) || 0
+      })).filter(r=>r.revenue!==0 || r.cat);
+      clean.sort((a,b)=>b.revenue-a.revenue);
+      const total = clean.reduce((a,r)=>a+r.revenue,0);
+      if(catBody) catBody.innerHTML = clean.length ? clean.map(r=>{
+        const pct = total>0 ? (r.revenue/total*100).toFixed(1) : '0.0';
+        return '<tr><td>'+bnxEscapeHtml_(r.cat)+'</td><td class=\"mono\">'+r.revenue.toLocaleString('en-IN',{maximumFractionDigits:2})+'</td><td class=\"mono\">'+pct+'%</td></tr>';
+      }).join('') : '<tr><td colspan=\"3\" style=\"text-align:center;color:var(--text3);padding:14px;\">No items sold today yet.</td></tr>';
+      if(catFoot && catFootAmt){ catFoot.style.display=clean.length?'':'none'; catFootAmt.textContent=total.toLocaleString('en-IN',{maximumFractionDigits:2}); }
+      if(liveSource){ try{localStorage.setItem(catKey,JSON.stringify({ts:Date.now(),rows:clean,total}));}catch(e){} }
+    };
+    let catRendered=false;
+    try{
+      const cached=JSON.parse(localStorage.getItem(catKey)||'null');
+      if(cached && (Date.now()-Number(cached.ts||0))<60000){ renderCatRows(cached.rows||[],false); catRendered=true; }
+    }catch(e){}
+    gasApi('GET_CATEGORY_SALES_REPORT',catRange,'V2_CORE').then(res=>{
+      if(res && res.success && res.data){ renderCatRows(res.data.rows||[],true); }
+      else if(!catRendered && catBody) catBody.innerHTML='<tr><td colspan=\"3\" style=\"text-align:center;color:var(--text3);padding:14px;\">No live category sales available.</td></tr>';
+    }).catch(()=>{ if(!catRendered && catBody) catBody.innerHTML='<tr><td colspan=\"3\" style=\"text-align:center;color:var(--text3);padding:14px;\">No live category sales available.</td></tr>'; });
   }catch(e){ console.error('[Dashboard] bnxRenderDashChartsRow_ error:', e); }
 }
 
@@ -10031,7 +10030,6 @@ async function loadDashboard(){
     if(r&&r.success&&r.data){
       const d=r.data;
       window.__bnxLastDashboardSummary = d;
-      bnxRenderDashChartsRow_().catch(e=>console.error('[Dashboard] chart row render',e));
       /* FIX ("restaurant dashboard sales and manager dashboard sales both
          same need"): the two dashboard pages were calling the backend with
          different field names (this page read d.revenue/d.orders/d.covers,
@@ -13678,7 +13676,7 @@ setInterval(()=>{
     window.__bnxDashboardPollBusy = true;
     Promise.resolve(loadDashboard()).finally(()=>{ window.__bnxDashboardPollBusy=false; });
   }
-}, 45000);
+}, 60000);
 /* Marks a ticket Ready and persists it — refreshing the page or
    coming back to this tab won't lose the update (previously the
    Ready button only changed its own label in memory and forgot
