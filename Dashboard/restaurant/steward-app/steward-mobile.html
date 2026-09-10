@@ -344,6 +344,12 @@ html,body{height:100%;width:100%;background:var(--bg);font-family:'DM Sans',sans
 .bt-label{font-size:13px;font-weight:700;color:var(--gold);}
 .bt-val{font-size:22px;font-weight:900;font-family:'DM Mono',monospace;color:var(--gold);}
 
+
+.menu-scope-row button,.menu-veg-btn{padding:7px 12px;border:1px solid var(--border2);background:var(--surface2);border-radius:18px;color:var(--text2);font-size:11px;font-weight:800;white-space:nowrap;cursor:pointer;}
+.menu-scope-row button.active,.menu-veg-btn.active{background:var(--gold);color:#fff;border-color:var(--gold);}
+.menu-hierarchy-row{display:flex;align-items:center;gap:7px;margin-bottom:7px;min-width:0;}
+.menu-hierarchy-row>div:last-child{min-width:0;flex:1;}
+.menu-hierarchy-row .cat-tabs-wrapper{margin-bottom:0;padding-bottom:2px;}
 /* ── MENU VIEW CONTROLS ── */
 .menu-view-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;
   position:sticky;top:0;z-index:5;background:var(--bg);padding-top:4px;}
@@ -1300,23 +1306,11 @@ async function gasApi(action,payload,endpoint){
   let lastErr=null;
   for(let attempt=0; attempt<(readOnly?2:1); attempt++) {
     const controller = new AbortController();
-    // FIX ("CATEGORIES (0)" under Bar Menu — confirmed real root cause):
-    // read-only calls (GET_BAR_MENU, GET_MENU_ITEMS, …) only got 9000ms per
-    // attempt before this. The dashboard's own live console health log
-    // (checked earlier this session) shows this backend's confirmed real
-    // average response time running 14.5–19.3 SECONDS, with failure counts
-    // climbing over the session — not an occasional blip. A 9s timeout,
-    // even with the retry, sits right at or below that observed worst case,
-    // so GET_BAR_MENU frequently lost the race and silently returned
-    // success:false — which is exactly what an empty bar item set with
-    // "Categories (0)" looks like: not zero bar items on the server, zero
-    // bar items that ever finished loading in time. Raised to budgets that
-    // sit comfortably above the confirmed real latency instead of below it.
-    const timeoutMs = readOnly ? 30000 : 25000;
+    const timeoutMs = readOnly ? 9000 : 15000;
     const timer=setTimeout(()=>controller.abort(),timeoutMs);
     try{
       const r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},
-        body:JSON.stringify(Object.assign({action:action,appId:'STEWARD_MOBILE',clientId:getClientId(),sessionToken:getSessionToken()},payload)),signal:controller.signal});
+        body:JSON.stringify(Object.assign({action:action,clientId:getClientId(),sessionToken:getSessionToken()},payload)),signal:controller.signal});
       clearTimeout(timer);
       if(!r.ok) throw new Error('HTTP '+r.status);
       const text=await r.text();
@@ -1762,19 +1756,23 @@ async function loadMenuFromServer(force){
   if(bnxMenuLoadingPromise) return bnxMenuLoadingPromise;
 
   bnxMenuLoadingPromise = (async function(){
-    // Real client-scoped cache is displayed immediately while the live read
-    // is in flight. Never introduce MENU_FALLBACK in live mode.
+    // Display the last real client-scoped cache while live reads run.
     try{
       const saved = JSON.parse(localStorage.getItem(bnxMenuKey())||'null');
       if(Array.isArray(saved) && saved.length && (!MENU.length || bnxMenuSource==='none')){
         MENU = saved.map(m=>({
           id: m.code || m.id || m.n,
           name: m.n || m.name,
-          cat: m.c || m.cat || 'Other',
+          cat: bnxNormCat_(m.c || m.cat || 'Other'),
+          group: String(m.group || m.itemGroup || m.ITEM_GROUP || m.GROUP_NAME || 'Other').trim() || 'Other',
           price: Number(m.p ?? m.price) || 0,
           icon: m.e || m.icon || bnxDefaultIcon(m.c||m.cat),
           avail: m.avail!==false,
-          gst: Number(m.gst)||0, group: m.group || m.itemGroup || m.ITEM_GROUP || m.GROUP_NAME || '', veg: m.veg || m.VEG || m.VEG_NONVEG || m.foodType || ''
+          gst: Number(m.gst)||0,
+          veg: m.veg || m.VEG || m.VEG_NONVEG || m.foodType || '',
+          isBar: m.isBar===true || m.menuType==='BAR' || m.menuSection==='BAR',
+          menuType: String(m.menuType || (m.isBar ? 'BAR' : 'FOOD')).toUpperCase(),
+          favorite: m.favorite, popular: m.popular, itemCode:m.itemCode, menuActive:m.menuActive
         })).filter(m=>m.id && m.name && m.menuActive !== false);
         bnxMenuSource = 'cache';
         bnxMenuLastUpdated = new Date();
@@ -1782,44 +1780,74 @@ async function loadMenuFromServer(force){
       }
     }catch(e){}
 
-    const res = await gasApi('GET_MENU_ITEMS', {}, 'V2_CORE');
-    bnxMenuLastFetchAt = Date.now();
+    try{
+      const results = await Promise.all([
+        gasApi('GET_MENU_ITEMS', {}, 'V2_CORE'),
+        gasApi('GET_BAR_MENU', {}, 'V2_CORE')
+      ]);
+      bnxMenuLastFetchAt = Date.now();
 
-    if(res && res.success && Array.isArray(res.data)){
-      const mapped = res.data.map(m=>({
+      const foodRes = results[0], barRes = results[1];
+      const food = (foodRes && foodRes.success && Array.isArray(foodRes.data)) ? foodRes.data.map(m=>({
         id: m.id || m.ITEM_ID || m.code || m.name,
         name: m.name || m.ITEM_NAME || m.n,
-        cat: m.category || m.CATEGORY || m.c || 'Other',
-        price: parseFloat(m.price ?? m.PRICE ?? m.p) || 0,
+        cat: bnxNormCat_(m.category || m.CATEGORY || m.c || 'Other'),
+        group: String(m.group || m.itemGroup || m.ITEM_GROUP || m.GROUP_NAME || 'Other').trim() || 'Other',
+        price: Number(m.price ?? m.PRICE ?? m.p)||0,
         icon: m.icon || m.e || bnxDefaultIcon(m.category||m.CATEGORY||m.c),
         avail: m.avail !== false,
-        gst: Number(m.gst ?? m.GST)||0, group: m.group || m.itemGroup || m.ITEM_GROUP || m.GROUP_NAME || '', veg: m.veg || m.VEG || m.VEG_NONVEG || m.foodType || ''
-      })).filter(m=>m.id && m.name && m.menuActive !== false);
+        gst: Number(m.gst ?? m.GST)||0,
+        veg: m.veg || m.VEG || m.VEG_NONVEG || m.foodType || '',
+        isBar: m.isBar===true || m.IS_BAR===true || m.menuType==='BAR',
+        menuType: String(m.menuType || (m.isBar ? 'BAR' : 'FOOD')).toUpperCase(),
+        menuSection:m.menuSection,
+        favorite:m.favorite, popular:m.popular, itemCode:m.itemCode, menuActive:m.menuActive,
+        barcode:m.barcode||m.BARCODE, hsn:m.hsn||m.HSN_CODE
+      })).filter(m=>m.id && m.name && m.menuActive !== false) : [];
 
-      // A successful empty menu is valid business data. Do not keep stale
-      // cached items in that case; the server is authoritative.
-      MENU = mapped;
-      bnxMenuSource = 'live';
+      const bar = (barRes && barRes.success && Array.isArray(barRes.data)) ? barRes.data.map(m=>({
+        id: m.id || m.ITEM_ID || m.code || m.name,
+        name: m.name || m.ITEM_NAME || m.n,
+        cat: bnxNormCat_(m.category || m.CATEGORY || m.c || 'Other'),
+        group: String(m.group || m.itemGroup || m.ITEM_GROUP || m.GROUP_NAME || 'Other').trim() || 'Other',
+        price: Number(m.price ?? m.PRICE ?? m.p)||0,
+        icon: m.icon || m.e || bnxDefaultIcon(m.category||m.CATEGORY||m.c),
+        avail: m.avail !== false,
+        gst: Number(m.gst ?? m.GST)||0,
+        veg: m.veg || m.VEG || m.VEG_NONVEG || m.foodType || '',
+        isBar:true,
+        menuType:'BAR',
+        menuSection:m.menuSection,
+        favorite:m.favorite, popular:m.popular, itemCode:m.itemCode, menuActive:m.menuActive,
+        barcode:m.barcode||m.BARCODE, hsn:m.hsn||m.HSN_CODE
+      })).filter(m=>m.id && m.name && m.menuActive !== false) : [];
+
+      // Deduplicate only exact menu-source duplicates; preserve legitimate bar variants.
+      const seen = new Set(), merged=[];
+      [...food, ...bar].forEach(m=>{
+        const key=[String(m.isBar?'BAR':'FOOD'),String(m.id),String(m.cat),String(m.group),String(m.price)].join('|');
+        if(seen.has(key)) return;
+        seen.add(key); merged.push(m);
+      });
+      MENU = merged;
+      bnxMenuSource = (foodRes?.success || barRes?.success) ? 'live' : (MENU.length ? bnxMenuSource : 'none');
       bnxMenuLastUpdated = new Date();
 
-      // Keep the same client-scoped cache in sync for fast next open.
       try{
         localStorage.setItem(bnxMenuKey(), JSON.stringify(MENU.map(m=>({
-          code:m.id,n:m.name,c:m.cat,p:m.price,e:m.icon,avail:m.avail,gst:m.gst,group:m.group,veg:m.veg,isBar:m.isBar,menuType:m.menuType,menuSection:m.menuSection,favorite:m.favorite,popular:m.popular,itemCode:m.itemCode,menuActive:m.menuActive
+          code:m.id,n:m.name,c:m.cat,p:m.price,e:m.icon,avail:m.avail,gst:m.gst,group:m.group,veg:m.veg,
+          isBar:m.isBar,menuType:m.menuType,menuSection:m.menuSection,favorite:m.favorite,popular:m.popular,
+          itemCode:m.itemCode,menuActive:m.menuActive,barcode:m.barcode,hsn:m.hsn
         }))));
       }catch(e){}
-    } else if(!MENU.length && !IS_DEMO_MODE){
-      bnxMenuSource = 'none';
+    }catch(e){
+      console.error('[MENU_LOAD] Failed to load menu:',e&&e.message?e.message:e);
+      if(!MENU.length && !IS_DEMO_MODE) bnxMenuSource='none';
     }
 
     if(document.getElementById('s-new-order')?.classList.contains('active')) renderMenu();
-    return !!(res && res.success);
-  })().catch(e=>{
-    console.error('[MENU_LOAD] Failed to load menu:',e && e.message?e.message:e);
-    if(!MENU.length && !IS_DEMO_MODE) bnxMenuSource='none';
-    if(document.getElementById('s-new-order')?.classList.contains('active')) renderMenu();
-    return false;
-  }).finally(()=>{ bnxMenuLoadingPromise=null; });
+    return bnxMenuSource==='live' || bnxMenuSource==='cache';
+  })().finally(()=>{ bnxMenuLoadingPromise=null; });
 
   return bnxMenuLoadingPromise;
 }
@@ -1943,8 +1971,21 @@ let ONLINE_ORDERS = [];
    dashboard's exact shape: {kotNo, table, type, time, waiter, covers,
    items, status}. */
 let KOT=[];
+function bnxKOTDisplayKey_(k){
+  const order=String(k.orderNo||k.orderId||'').trim().toUpperCase();
+  const station=String(k.type||'KITCHEN').trim().toUpperCase();
+  const table=String(k.table||'').trim().toUpperCase();
+  const items=(k.items||[]).map(i=>String(i.name||i.n||'').trim().toUpperCase()+'x'+Number(i.qty||1)).sort().join('|');
+  return (order||'KOT:'+String(k.kotNo||'').trim().toUpperCase())+'|'+station+'|'+table+'|'+items;
+}
+function bnxDedupeKOTs_(rows){
+  const out=[]; const seen=new Set();
+  (Array.isArray(rows)?rows:[]).forEach(k=>{ const key=bnxKOTDisplayKey_(k); if(seen.has(key)) return; seen.add(key); out.push(k); });
+  return out;
+}
 function bnxLoadOpenKots(){
-  try{ const raw=bnxGetOpenKotsRaw(); KOT = raw ? JSON.parse(raw) : []; }catch(e){ KOT=[]; }
+  try{ const raw=bnxGetOpenKotsRaw(); KOT = bnxDedupeKOTs_(raw ? JSON.parse(raw) : []); }catch(e){ KOT=[]; }
+  try{ bnxSetOpenKotsRaw(JSON.stringify(KOT)); }catch(e){}
 }
 bnxLoadOpenKots();
 
@@ -1988,14 +2029,6 @@ function selectOccasion(o){
 
 /* ── SCREEN NAV ── */
 function showScreen(id,navEl){
-  try{
-    if(id==='s-new-order'){
-      document.querySelectorAll('#s-new-order .scroll').forEach(sc=>sc.scrollTop=0);
-      if(typeof activeCat!=='undefined') activeCat='All';
-      if(typeof menuSearchQuery!=='undefined') menuSearchQuery='';
-      if(typeof menuVegFilter!=='undefined') menuVegFilter='ALL';
-    }
-  }catch(e){}
   document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
   if(navEl){
@@ -2160,7 +2193,7 @@ async function doLogin(){
     return;
   }
   // Restrict this app to floor staff roles
-  const allowedRoles=['CAPTAIN','STEWARD','CHEF','SUPER_ADMIN'];
+  const allowedRoles=['STEWARD','WAITER','CAPTAIN','MANAGER','SUPER_ADMIN','OWNER','ADMIN'];
   if(!allowedRoles.includes((result.ROLE||'').toUpperCase())){
     toast('This account does not have steward floor access','error');
     return;
@@ -2813,15 +2846,15 @@ async function rejectOnlineOrder(){
 let bnxOnlineLoadPromise = null;
 async function loadOnlineOrdersLive(force){
   if(bnxOnlineLoadPromise && !force) return bnxOnlineLoadPromise;
-  bnxOnlineLoadPromise=(async function(){
+  bnxOnlineLoadPromise = (async function(){
     try{
-      const res=await gasApi('GET_ONLINE_ORDERS_LIST',{date:businessDate()},'V2_CORE');
-      if(res&&res.success&&res.data&&Array.isArray(res.data.rows)){
-        const colors={ZOMATO:'#e23744',SWIGGY:'#fc8019',EASYDINER:'#e8b318',ONDC:'#2874f0',MAGICPIN:'#8a2be2',OTHER:'#2874f0'};
+      const res = await gasApi('GET_ONLINE_ORDERS_LIST',{date:businessDate()},'V2_CORE');
+      if(res && res.success && res.data && Array.isArray(res.data.rows)){
+        const colors={ZOMATO:'#e23744',SWIGGY:'#fc8019',EASYDINER:'#e8b318',ONDC:'#2874f0',MAGICPIN:'#8a2be2'};
         ONLINE_ORDERS=res.data.rows.map((r,idx)=>{
           const platform=String(r.aggregator||'OTHER').toUpperCase();
           const id=String(r.orderRef||('ONLINE-'+(idx+1)));
-          return {id,onlineOrderId:id,platform,customer:r.customerName||'Online Customer',items:r.items||r.itemNames||'Online Order',amount:Number(r.billAmount)||0,status:String(r.orderStatus||'NEW').toUpperCase(),time:r.time||'',color:colors[platform]||colors.OTHER};
+          return {id,onlineOrderId:id,platform,customer:r.customerName||'Online Customer',items:'Online Order',amount:Number(r.billAmount)||0,status:String(r.orderStatus||'DELIVERED').toUpperCase(),time:r.time||'',color:colors[platform]||'#2874f0'};
         });
         if(document.getElementById('s-online')?.classList.contains('active')) renderMobOnline();
         if(document.getElementById('s-home')?.classList.contains('active')) renderHomeOnline();
@@ -3216,20 +3249,12 @@ function cancelKot(kotNo){
    the browser's native share/print sheet. */
 function printKOTTicket(kotNo){
   bnxLoadOpenKots();
-  const k = KOT.find(x=>x.kotNo===kotNo);
-  if(!k){ toast('KOT not found','error'); return; }
-  const rows=(k.items||[]).map(i=>`<tr><td style="padding:4px 0;">${i.qty} × ${i.name}</td></tr>`).join('');
-  const html=`<html><head><title>KOT ${k.kotNo}</title><style>
-    body{font-family:monospace;width:280px;margin:0 auto;padding:10px;}
-    h2{text-align:center;margin:0 0 6px;} .meta{font-size:12px;margin-bottom:8px;}
-    table{width:100%;border-collapse:collapse;font-size:13px;} hr{border:none;border-top:1px dashed #000;margin:8px 0;}
-  </style></head><body>
-    <h2>KOT — ${k.kotNo}</h2>
-    <div class="meta">Table: ${k.table}<br>Waiter: ${k.waiter||'-'} &nbsp; Covers: ${k.covers||'-'}<br>Time: ${bnxKotTimeLabel(k.time)}${k.occasion && k.occasion!=='None' ? ` &nbsp; <span style="color:var(--gold);font-weight:700;">🎉 ${k.occasion}</span>` : ''}</div>
-    <hr><table>${rows}</table><hr>
-    <div style="text-align:center;font-size:11px;">Balaji NextGen ERP</div>
-  
-</body></html>`;
+  const k=KOT.find(x=>String(x.kotNo)===String(kotNo));
+  if(!k){toast('KOT not found','error');return;}
+  const esc=v=>String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');
+  const rows=(k.items||[]).map(i=>`<tr><td style=\"padding:4px 0;\">${Number(i.qty||1)} × ${esc(i.name||i.n||'Item')}</td></tr>`).join('');
+  const shownTime=k.time?bnxKotTimeLabel(k.time):new Date().toLocaleString('en-IN');
+  const html=`<html><head><title>KOT ${esc(k.kotNo)}</title><style>@page{margin:4mm;}body{font-family:monospace;width:280px;margin:0 auto;padding:10px;color:#000;}h2{text-align:center;margin:0 0 6px;}.meta{font-size:12px;margin-bottom:8px;}table{width:100%;border-collapse:collapse;font-size:13px;}hr{border:none;border-top:1px dashed #000;margin:8px 0;}</style></head><body><h2>KOT — ${esc(k.kotNo)}</h2><div class=\"meta\">Table: ${esc(k.table)}<br>Waiter: ${esc(k.waiter||'-')} &nbsp; Covers: ${esc(k.covers||'-')}<br>Time: ${esc(shownTime)}${k.occasion&&k.occasion!=='None'?` &nbsp; 🎉 ${esc(k.occasion)}`:''}</div><hr><table>${rows}</table><hr><div style=\"text-align:center;font-size:11px;\">Balaji NextGen ERP</div></body></html>`;
   bnxPrintHtml(html);
 }
 
@@ -3334,25 +3359,8 @@ function printKOTTicket(kotNo){
     // instead of saving with a blank location every time.
     try{
       const r=await api('MARK_ATTENDANCE',{attendanceType:kind,attendanceDate:businessDate(),userId:i.userId,loginId:i.loginId,fullName:i.fullName,role:i.role,locationId:i.locationId});
-      if(r&&r.success){
-        // FAST UI: do not wait for a second GET round-trip before showing the
-        // result. The server response already contains the saved date/time.
-        // Update the current attendance row locally, render immediately, then
-        // refresh from server in the background for authoritative state.
-        const saved=(HUB.attendance&&HUB.attendance[0])?Object.assign({},HUB.attendance[0]):{};
-        const d=r.data||{};
-        if(kind==='IN') saved.IN_TIME=d.time||saved.IN_TIME||saved.CHECK_IN||'';
-        if(kind==='OUT') saved.OUT_TIME=d.time||saved.OUT_TIME||saved.CHECK_OUT||'';
-        saved.ATTENDANCE_DATE=d.date||saved.ATTENDANCE_DATE||businessDate();
-        HUB.attendance=[saved].concat((HUB.attendance||[]).slice(1));
-        toast(kind==='IN'?'✅ Attendance marked IN':'✅ Attendance marked OUT','success');
-        renderHub();
-        // Background refresh; never block the button/result on a slow GET.
-        loadAttendance().then(()=>{ if(HUB.tab==='attendance') renderHub(); }).catch(()=>{});
-      } else {
-        toast('Attendance not saved: '+(r?.error||'server unavailable'),'error');
-        if(btn){btn.disabled=false;btn.textContent=originalLabel;}
-      }
+      if(r&&r.success){toast(kind==='IN'?'✅ Attendance marked IN':'✅ Attendance marked OUT','success');await loadAttendance();renderHub();}
+      else{toast('Attendance not saved: '+(r?.error||'server unavailable'),'error');if(btn){btn.disabled=false;btn.textContent=originalLabel;}}
     }catch(e){
       toast('Attendance not saved: '+(e?.message||'server unavailable'),'error');
       if(btn){btn.disabled=false;btn.textContent=originalLabel;}
@@ -3888,6 +3896,7 @@ function bnxNormalizeVeg_(v){
 let menuVegFilter='ALL';
 let menuTypeFilter='ALL';
 let menuQuickFilter='ALL';
+let menuGroupFilter='All';
 function bnxBool_(v){
   if(v===true || v===1) return true;
   const x=String(v==null?'':v).trim().toLowerCase();
@@ -3899,7 +3908,13 @@ function bnxMenuIsBar_(m){
   const type=String(m.menuType||m.menu_type||m.type||'').trim().toLowerCase();
   const sec=String(m.menuSection||m.menu_section||m.section||'').trim().toLowerCase();
   const cat=String(m.cat||'').trim().toLowerCase();
-  return /bar|liquor|alcohol|beverage/.test(type+' '+sec+' '+cat);
+  return /\bbar\b|liquor|alcohol|spirit|whisky|whiskey|vodka|rum|gin|tequila|beer|wine|cocktail|shots?/.test(type+' '+sec+' '+cat);
+}
+function bnxMenuScope_(m){
+  if(bnxMenuIsBar_(m)) return 'BAR';
+  const t=String(m.menuType||m.menu_type||m.type||'').trim().toUpperCase();
+  if(t==='FOOD' || t==='RESTAURANT' || !t) return 'FOOD';
+  return 'OTHER';
 }
 function bnxMenuIsFav_(m){
   return bnxBool_(m.favorite??m.favourite??m.FAVORITE??m.FAVOURITE??m.isFavorite??m.is_favorite);
@@ -3924,38 +3939,55 @@ function bnxRecentMenuIds_(){
 function bnxSetMenuTypeFilter(v,el){
   menuTypeFilter=v||'ALL';
   menuQuickFilter='ALL';
+  activeCat='All';
+  menuGroupFilter='All';
+  if(menuTypeFilter!=='FOOD' && menuTypeFilter!=='OTHER' && menuTypeFilter!=='ALL') menuVegFilter='ALL';
   document.querySelectorAll('.menu-type-btn,.menu-quick-btn').forEach(x=>x.classList.remove('active'));
   if(el) el.classList.add('active');
-  renderMenuItems_();
+  renderMenu();
 }
 function bnxSetMenuQuickFilter(v,el){
   menuQuickFilter=v||'ALL';
   menuTypeFilter='ALL';
+  activeCat='All';
+  menuGroupFilter='All';
   document.querySelectorAll('.menu-type-btn,.menu-quick-btn').forEach(x=>x.classList.remove('active'));
   if(el) el.classList.add('active');
-  renderMenuItems_();
+  renderMenu();
 }
 function bnxSetMenuVegFilter(v,el){
   menuVegFilter=v||'ALL';
   document.querySelectorAll('.menu-veg-btn').forEach(x=>x.classList.remove('active'));
   if(el) el.classList.add('active');
-  renderMenuItems_();
+  renderMenu();
+}
+function bnxGetMenuScopeItems_(){
+  let items=Array.isArray(MENU)?MENU:[];
+  if(menuTypeFilter==='FOOD') items=items.filter(m=>bnxMenuScope_(m)==='FOOD');
+  else if(menuTypeFilter==='BAR') items=items.filter(m=>bnxMenuScope_(m)==='BAR');
+  else if(menuTypeFilter==='OTHER') items=items.filter(m=>bnxMenuScope_(m)==='OTHER');
+
+  if(menuQuickFilter==='FAV') items=items.filter(bnxMenuIsFav_);
+  if(menuQuickFilter==='POPULAR') items=items.filter(bnxMenuIsPopular_);
+  if(menuQuickFilter==='RECENT'){
+    const ids=new Set(bnxRecentMenuIds_()); items=items.filter(m=>ids.has(String(m.id)));
+  }
+  if(menuQuickFilter==='ADDONS') items=items.filter(bnxMenuIsAddOn_);
+  if(menuQuickFilter==='ALLTIME') items=items.filter(bnxMenuIsAllTimeFav_);
+  return items;
 }
 function bnxGetFilteredMenu_(){
   const q = String(menuSearchQuery||'').trim().toLowerCase();
-  let filtered = activeCat==='All'
-    ? MENU
-    : MENU.filter(m=>bnxNormCat_(m.cat).toLowerCase()===bnxNormCat_(activeCat).toLowerCase());
-  if(menuTypeFilter==='FOOD') filtered=filtered.filter(m=>!bnxMenuIsBar_(m));
-  if(menuTypeFilter==='BAR') filtered=filtered.filter(m=>bnxMenuIsBar_(m));
-  if(menuQuickFilter==='FAV') filtered=filtered.filter(bnxMenuIsFav_);
-  if(menuQuickFilter==='POPULAR') filtered=filtered.filter(bnxMenuIsPopular_);
-  if(menuQuickFilter==='RECENT'){
-    const ids=new Set(bnxRecentMenuIds_()); filtered=filtered.filter(m=>ids.has(String(m.id)));
+  let filtered = bnxGetMenuScopeItems_();
+
+  if(activeCat!=='All'){
+    filtered = filtered.filter(m=>bnxNormCat_(m.cat).toLowerCase()===bnxNormCat_(activeCat).toLowerCase());
   }
-  if(menuQuickFilter==='ADDONS') filtered=filtered.filter(bnxMenuIsAddOn_);
-  if(menuQuickFilter==='ALLTIME') filtered=filtered.filter(bnxMenuIsAllTimeFav_);
+  if(menuGroupFilter!=='All'){
+    filtered = filtered.filter(m=>String(m.group||'Other').trim().toLowerCase()===String(menuGroupFilter||'All').trim().toLowerCase());
+  }
   if(menuVegFilter!=='ALL') filtered=filtered.filter(m=>bnxNormalizeVeg_(m.veg)===menuVegFilter);
+
   if(q){
     filtered = filtered.filter(m=>{
       const hay=[m.name,m.cat,m.group,m.id,m.code,m.barcode,m.BARCODE,m.hsn,m.HSN_CODE].map(x=>String(x||'').toLowerCase());
@@ -3963,6 +3995,11 @@ function bnxGetFilteredMenu_(){
     });
   }
   return filtered;
+}
+
+function bnxFilterRows_(rows){
+  const scopeRows = Array.isArray(rows)?rows:[];
+  return scopeRows.filter(m=>m && m.id && m.name);
 }
 
 function renderMenuItems_(itemsList){
@@ -3978,17 +4015,31 @@ function renderMenuItems_(itemsList){
   grid.innerHTML = filtered.map(m=>`
     <div class="menu-card${!m.avail?' unavailable':''}" data-menu-id="${bnxEscapeHtml_(m.id)}"
          onclick="${m.avail?`addItem(${bnxAttrJson_(m.id)})`:'toast(&quot;Out of stock&quot;,&quot;error&quot;)'}">
-      <div class="mc-icon">${bnxEscapeHtml_(m.icon)}</div>
+      <div class="mc-icon">${bnxEscapeHtml_(m.icon || bnxDefaultIcon(m.cat))}</div>
       <div class="mc-name">${bnxEscapeHtml_(m.name)}</div>
-      <div class="mc-cat">${bnxEscapeHtml_(bnxNormCat_(m.cat))}${m.group&&String(m.group).toLowerCase()!==bnxNormCat_(m.cat).toLowerCase()?` · ${bnxEscapeHtml_(m.group)}`:''}${m.itemCode?` · ${bnxEscapeHtml_(m.itemCode)}`:''}</div>
+      <div class="mc-cat">${bnxEscapeHtml_(bnxNormCat_(m.cat))} · ${bnxEscapeHtml_(String(m.group||'Other'))}${m.itemCode?` · ${bnxEscapeHtml_(m.itemCode)}`:''}</div>
+      ${bnxMenuScope_(m)==='BAR'?'<div style="font-size:9px;color:#b06a00;font-weight:800;margin-top:2px;">🍸 BAR</div>':''}
       ${bnxNormalizeVeg_(m.veg)==='V'?'<div style="font-size:9px;color:#198754;font-weight:800;margin-top:2px;">● VEG</div>':bnxNormalizeVeg_(m.veg)==='NV'?'<div style="font-size:9px;color:#d33;font-weight:800;margin-top:2px;">● NON-VEG</div>':''}
       <div class="mc-price">₹${(Number(m.price)||0).toLocaleString('en-IN')}</div>
       ${m.avail?`<div class="mc-add" data-menu-qty="${bnxEscapeHtml_(m.id)}">${order[m.id]?`<span style="font-size:11px;">${order[m.id]}</span>`:'+'}</div>`:''}
     </div>`).join('');
+
+  if(!filtered.length){
+    grid.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:36px 14px;color:var(--text3);font-size:12px;">🔎 No items in this selection</div>';
+  }
 }
 
 function renderMenu(){
-  const cats=['All',...new Set(MENU.map(m=>bnxNormCat_(m.cat)))];
+  const base = bnxFilterRows_(bnxGetMenuScopeItems_());
+  const cats = ['All', ...Array.from(new Set(base.map(m=>bnxNormCat_(m.cat)))).sort((a,b)=>a.localeCompare(b))];
+
+  if(activeCat!=='All' && !cats.some(c=>c.toLowerCase()===String(activeCat).toLowerCase())) activeCat='All';
+
+  const categoryBase = activeCat==='All' ? base : base.filter(m=>bnxNormCat_(m.cat).toLowerCase()===bnxNormCat_(activeCat).toLowerCase());
+  const groups = ['All', ...Array.from(new Set(categoryBase.map(m=>String(m.group||'Other').trim()||'Other')))].sort((a,b)=>a==='All'?-1:b==='All'?1:a.localeCompare(b));
+
+  if(menuGroupFilter!=='All' && !groups.some(g=>g.toLowerCase()===String(menuGroupFilter).toLowerCase())) menuGroupFilter='All';
+
   const menuGridEl=document.getElementById('menu-grid');
   if(!menuGridEl) return;
 
@@ -4000,44 +4051,78 @@ function renderMenu(){
   }
   if(bnxMenuSource==='none'){
     bannerEl.style.cssText='background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;font-size:11.5px;font-weight:700;padding:10px 12px;border-radius:8px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:8px;';
-    bannerEl.innerHTML='<span>⚠️ Menu temporarily unavailable — could not reach the server and no cached menu exists on this device.</span><button onclick="loadMenuFromServer(true)" style="background:#991b1b;color:#fff;border:none;border-radius:6px;padding:5px 10px;font-size:10.5px;font-weight:700;cursor:pointer;white-space:nowrap;">Retry</button>';
+    bannerEl.innerHTML='<span>⚠️ Menu unavailable — no live/cached menu on this device.</span><button onclick="loadMenuFromServer(true)" style="background:#991b1b;color:#fff;border:none;border-radius:6px;padding:5px 10px;font-size:10.5px;font-weight:700;cursor:pointer;">Retry</button>';
   }else if(bnxMenuSource==='cache'){
-    const t=bnxMenuLastUpdated?bnxMenuLastUpdated.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}):'';
     bannerEl.style.cssText='background:#fef3c7;border:1px solid #fbbf24;color:#92400e;font-size:11.5px;font-weight:700;padding:8px 12px;border-radius:8px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:8px;';
-    bannerEl.innerHTML='<span>🟡 Cached Menu'+(t?' — last updated '+t:'')+'</span><button onclick="loadMenuFromServer(true)" style="background:#92400e;color:#fff;border:none;border-radius:6px;padding:5px 10px;font-size:10.5px;font-weight:700;cursor:pointer;white-space:nowrap;">Refresh</button>';
+    bannerEl.innerHTML='<span>🟡 Cached Menu</span><button onclick="loadMenuFromServer(true)" style="background:#92400e;color:#fff;border:none;border-radius:6px;padding:5px 10px;font-size:10.5px;font-weight:700;cursor:pointer;">Refresh</button>';
   }else{
-    bannerEl.style.cssText='display:none;';
-    bannerEl.innerHTML='';
+    bannerEl.style.cssText='display:none;'; bannerEl.innerHTML='';
   }
 
-  const viewToggle=`<div class="menu-view-controls">
-    <div class="menu-search-wrap">
-      <input type="search" id="menuSearchInput" class="menu-search-input" placeholder="🔍 Search item or category…" value="${String(menuSearchQuery||'').replace(/"/g,'&quot;')}" oninput="filterMenuSearch(this.value)">
-      <span id="menuSearchClear" onclick="document.getElementById('menuSearchInput').value='';filterMenuSearch('');" style="display:${menuSearchQuery?'':'none'};position:absolute;right:10px;top:50%;transform:translateY(-50%);cursor:pointer;color:var(--text3);font-size:13px;">✕</span>
-    </div>
-    <div style="display:flex;gap:6px;overflow-x:auto;padding:2px 0 6px;">
-      <button type="button" class="menu-veg-btn active" onclick="bnxSetMenuVegFilter('ALL',this)" style="padding:5px 10px;border-radius:16px;border:1px solid var(--border2);background:var(--surface2);font-size:10px;font-weight:800;white-space:nowrap;">All</button>
-      <button type="button" class="menu-veg-btn" onclick="bnxSetMenuVegFilter('V',this)" style="padding:5px 10px;border-radius:16px;border:1px solid var(--border2);background:var(--surface2);font-size:10px;font-weight:800;white-space:nowrap;">🟢 Veg</button>
-      <button type="button" class="menu-veg-btn" onclick="bnxSetMenuVegFilter('NV',this)" style="padding:5px 10px;border-radius:16px;border:1px solid var(--border2);background:var(--surface2);font-size:10px;font-weight:800;white-space:nowrap;">🔴 Non-Veg</button>
-    </div>
-    <div class="cat-tabs-wrapper">
-      ${cats.map(c=>`<button class="cat-tab${c===activeCat?' active':''}" onclick="filterCat(${bnxAttrJson_(c)},this)">${bnxEscapeHtml_(c)}</button>`).join('')}
-    </div>
-    <div class="view-toggle-btn">
-      <button class="menu-view-toggle${menuViewMode==='grid'?' active':''}" data-view="grid" onclick="toggleMenuView('grid')">⊞ Grid</button>
-      <button class="menu-view-toggle${menuViewMode==='table'?' active':''}" data-view="table" onclick="toggleMenuView('table')">≣ Table</button>
-    </div>
+  const button = (cls,val,label,active)=>`<button type="button" class="${cls}${active?' active':''}" onclick="${cls.includes('menu-type-btn')?`bnxSetMenuTypeFilter(${bnxAttrJson_(val)},this)`:`bnxSetMenuQuickFilter(${bnxAttrJson_(val)},this)`}">${label}</button>`;
+
+  const typeRow = `
+    <div class="menu-scope-row" style="display:flex;gap:6px;overflow-x:auto;padding:2px 0 7px;">
+      ${button('menu-type-btn','ALL','🍽 All',menuTypeFilter==='ALL'&&menuQuickFilter==='ALL')}
+      ${button('menu-type-btn','FOOD','🍴 Food',menuTypeFilter==='FOOD')}
+      ${button('menu-type-btn','BAR','🍸 Bar',menuTypeFilter==='BAR')}
+      ${button('menu-type-btn','OTHER','📦 Other',menuTypeFilter==='OTHER')}
+      ${button('menu-quick-btn','FAV','⭐ Favourites',menuQuickFilter==='FAV')}
+      ${button('menu-quick-btn','POPULAR','🔥 Popular',menuQuickFilter==='POPULAR')}
+      ${button('menu-quick-btn','RECENT','🕘 Recent',menuQuickFilter==='RECENT')}
+    </div>`;
+
+  const searchRow = `<div class="menu-search-wrap"><input type="search" id="menuSearchInput" class="menu-search-input" placeholder="🔍 Search item, category or group…" value="${String(menuSearchQuery||'').replace(/"/g,'&quot;')}" oninput="filterMenuSearch(this.value)"><span id="menuSearchClear" onclick="document.getElementById('menuSearchInput').value='';filterMenuSearch('');" style="display:${menuSearchQuery?'':'none'};position:absolute;right:10px;top:50%;transform:translateY(-50%);cursor:pointer;color:var(--text3);font-size:13px;">✕</span></div>`;
+
+  const vegRow = `<div style="display:flex;gap:6px;overflow-x:auto;padding:2px 0 7px;">
+    <button type="button" class="menu-veg-btn${menuVegFilter==='ALL'?' active':''}" onclick="bnxSetMenuVegFilter('ALL',this)">All</button>
+    <button type="button" class="menu-veg-btn${menuVegFilter==='V'?' active':''}" onclick="bnxSetMenuVegFilter('V',this)">🟢 Veg</button>
+    <button type="button" class="menu-veg-btn${menuVegFilter==='NV'?' active':''}" onclick="bnxSetMenuVegFilter('NV',this)">🔴 Non-Veg</button>
+  </div>`;
+
+  const catRow=`<div class="menu-hierarchy-row"><div style="font-size:10px;font-weight:800;color:var(--text3);min-width:72px;">CATEGORIES</div><div class="cat-tabs-wrapper">
+    ${cats.map(c=>`<button type="button" class="cat-tab${String(c).toLowerCase()===String(activeCat).toLowerCase()?' active':''}" onclick="filterCat(${bnxAttrJson_(c)},this)">${bnxEscapeHtml_(c)} <span style="opacity:.65;font-size:9px;">(${categoryBase.filter(m=>bnxNormCat_(m.cat).toLowerCase()===c.toLowerCase()).length})</span></button>`).join('')}
+  </div></div>`;
+
+  const groupRow=`<div class="menu-hierarchy-row"><div style="font-size:10px;font-weight:800;color:var(--text3);min-width:72px;">ITEM GROUP</div><div class="cat-tabs-wrapper">
+    ${groups.map(g=>`<button type="button" class="cat-tab${String(g).toLowerCase()===String(menuGroupFilter).toLowerCase()?' active':''}" onclick="filterMenuGroup(${bnxAttrJson_(g)},this)">${bnxEscapeHtml_(g)} <span style="opacity:.65;font-size:9px;">(${(activeCat==='All'?base:categoryBase).filter(m=>String(m.group||'Other').trim().toLowerCase()===g.toLowerCase()).length})</span></button>`).join('')}
+  </div></div>`;
+
+  const viewToggle=`<div class="menu-view-controls">${searchRow}${typeRow}${catRow}${groupRow}${vegRow}
+    <div class="view-toggle-btn"><button class="menu-view-toggle${menuViewMode==='grid'?' active':''}" onclick="toggleMenuView('grid')">⊞ Grid</button><button class="menu-view-toggle${menuViewMode==='table'?' active':''}" onclick="toggleMenuView('table')">≣ Table</button></div>
   </div>`;
 
   let catTabsContainer=document.getElementById('cat-tabs');
   if(!catTabsContainer){
-    catTabsContainer=document.createElement('div');
-    catTabsContainer.id='cat-tabs';
-    menuGridEl.parentElement.insertBefore(catTabsContainer,menuGridEl);
+    catTabsContainer=document.createElement('div'); catTabsContainer.id='cat-tabs'; menuGridEl.parentElement.insertBefore(catTabsContainer,menuGridEl);
   }
   catTabsContainer.innerHTML=viewToggle;
   renderMenuItems_();
   updateOrderBadge();
+}
+
+function filterMenuSearch(val){
+  menuSearchQuery = val || '';
+  renderMenuItems_();
+  const clearBtn=document.getElementById('menuSearchClear'); if(clearBtn) clearBtn.style.display=menuSearchQuery?'':'none';
+  const el=document.getElementById('menuSearchInput'); if(el && document.activeElement!==el) el.focus();
+}
+function filterCat(cat,el){
+  activeCat=cat;
+  menuGroupFilter='All';
+  document.querySelectorAll('.cat-tab').forEach(t=>{
+    if(t.closest('.menu-hierarchy-row')===el.closest('.menu-hierarchy-row')) t.classList.remove('active');
+  });
+  el.classList.add('active');
+  renderMenu();
+}
+function filterMenuGroup(group,el){
+  menuGroupFilter=group;
+  document.querySelectorAll('.cat-tab').forEach(t=>{
+    if(t.closest('.menu-hierarchy-row')===el.closest('.menu-hierarchy-row')) t.classList.remove('active');
+  });
+  el.classList.add('active');
+  renderMenu();
 }
 
 function toggleMenuView(view){
@@ -4913,490 +4998,5 @@ if(getClientId() && getSessionToken()){
   },{passive:false});
 })();
 </script>
-
-<script>
-/* ================================================================
-   BNX STEWARD FINAL MENU + PWA PATCH
-   - One consistent hierarchy:
-       Scope (All/Food/Bar/Other/Favourites/Popular/Recent)
-       -> Category -> Item Group -> Items
-   - Food and Bar loaded from their authoritative endpoints in parallel.
-   - Category and group lists are derived from the currently filtered set.
-   - No fake menu is ever generated in live mode.
-   - Existing order/KOT/table code remains intact.
-   ================================================================ */
-(function(){
-  'use strict';
-
-  function S(v){ return String(v==null?'':v).trim(); }
-  function N(v){ return S(v).toLowerCase(); }
-  function esc(v){
-    return S(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  }
-  function bool(v){
-    if(v===true || v===1) return true;
-    const x=N(v);
-    return ['true','1','yes','y','on','active','available'].includes(x);
-  }
-  // Availability is shared with Restaurant Dashboard / Kitchen Menu.
-  // Normalize every known backend field so a string like "unavailable"
-  // never becomes truthy merely because it is a non-empty string.
-  function availStatus(m){
-    const raw = m && (m.avail ?? m.availability ?? m.AVAILABILITY_STATUS ?? m.availabilityStatus ?? m.status ?? m.STATUS ?? m.IS_AVAILABLE ?? m.isAvailable);
-    if(raw===false || raw===0) return 'unavailable';
-    const x=N(raw);
-    if(['unavailable','not available','not_available','off','inactive','disabled','false','0','no','n'].includes(x)) return 'unavailable';
-    if(['limited','low stock','low_stock','partial'].includes(x)) return 'limited';
-    return 'available';
-  }
-  function barish(m){
-    if(!m) return false;
-    if(m.isBar===true || m.IS_BAR===true || m.is_bar===true || N(m.menuType)==='bar' || N(m.menu_type)==='bar') return true;
-    const type=N(m.menuType||m.menu_type||m.type||'');
-    const sec=N(m.menuSection||m.menu_section||m.section||'');
-    const cat=N(m.cat||m.category||'');
-    return /bar|liquor|alcohol|spirits|wine|beer|whisky|whiskey|vodka|rum|gin|cocktail|aperitif|scotch|single malt|shots?/.test(type+' '+sec+' '+cat);
-  }
-  function normCat(v){ return S(v)||'Other'; }
-  function veg(v){
-    if(v===true || v===1) return 'V';
-    if(v===false || v===0) return 'NV';
-    const x=S(v).toUpperCase().replace(/[\s_-]+/g,'');
-    if(['V','VEG','VEGETARIAN','YES','Y','TRUE','1','GREEN'].includes(x)) return 'V';
-    if(['NV','NONVEG','NONVEGETARIAN','NO','N','FALSE','0','RED'].includes(x)) return 'NV';
-    return '';
-  }
-  function attr(v){ return JSON.stringify(S(v)).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
-
-  let scope='ALL', cat='ALL', group='ALL', q='', vf='ALL', quick='ALL';
-  // FIX ("give two types of view + a setting to switch" — confirmed real
-  // complaint, not a guess): renderMenu() only ever offered one browsing
-  // style — Category, THEN a mandatory second tap on an Item Group, before
-  // a single item could be seen (see the "Select a category to view its
-  // item groups" / "Select an item group under X to view items" empty
-  // states below). For a steward trying to fire an order fast, that's two
-  // required taps before anything is even visible — exactly what shows up
-  // empty in the screenshot. 'grouped' keeps that exact original behaviour
-  // (matches the dashboard's Category → Group → Items structure) for
-  // clients that rely on it; 'simple' shows every item in the tapped
-  // category immediately, with Item Group turned into an optional filter
-  // chip row instead of a gate. Persisted per device so the steward only
-  // has to pick it once.
-  const BNX_BROWSE_MODE_KEY='bnx_steward_menu_browse_mode';
-  let browseMode='grouped';
-  try{ const saved=localStorage.getItem(BNX_BROWSE_MODE_KEY); if(saved==='simple'||saved==='grouped') browseMode=saved; }catch(e){}
-  window.__swMenuBrowseMode=function(v){
-    browseMode=(v==='simple')?'simple':'grouped';
-    try{ localStorage.setItem(BNX_BROWSE_MODE_KEY,browseMode); }catch(e){}
-    renderMenu();
-  };
-  let loadP=null, lastAt=0;
-  const FRESH=45000;
-  let barIds=new Set(), foodIds=new Set();
-
-  function mapRow(m, isBarFlag){
-    const id=S(m.id||m.ITEM_ID||m.itemId||m.code||m.ITEM_CODE||m.name||m.ITEM_NAME);
-    const name=S(m.name||m.ITEM_NAME||m.n||m.itemName);
-    const categoryId=S(m.categoryId||m.CATEGORY_ID||m.category_id);
-    const category=normCat(m.category||m.CATEGORY||m.cat||m.c||m.MENU_SECTION);
-    const groupId=S(m.itemGroupId||m.ITEM_GROUP_ID||m.groupId||m.GROUP_ID);
-    const grp=S(m.group||m.itemGroup||m.ITEM_GROUP||m.GROUP_NAME||m.ITEM_GROUP_NAME||m.groupName);
-    const isBarItem = isBarFlag || barish(m);
-    return {
-      id, name, cat:category, categoryId, group:grp, groupId,
-      price:Number(m.price??m.PRICE??m.p??m.rate??m.RATE)||0,
-      icon:S(m.icon||m.e)||((typeof bnxDefaultIcon==='function')?bnxDefaultIcon(category):'🍽️'),
-      avail:availStatus(m)!=='unavailable',
-      availStatus:availStatus(m),
-      gst:Number(m.gst??m.GST??m.TAX_RATE??m.taxRate)||0,
-      veg:S(m.veg||m.VEG||m.VEG_NONVEG||m.foodType||''),
-      isBar:isBarItem,
-      menuType:S(m.menuType||m.menu_type||(isBarItem?'BAR':'FOOD')),
-      menuSection:S(m.menuSection||m.menu_section||m.section),
-      favorite:bool(m.favorite??m.favourite??m.FAVORITE??m.FAVOURITE??m.isFavorite),
-      popular:bool(m.popular??m.POPULAR??m.isPopular),
-      itemCode:S(m.itemCode||m.ITEM_CODE||m.code||m.CODE),
-      barcode:S(m.barcode||m.BARCODE),
-      hsn:S(m.hsn||m.HSN_CODE||m.hsnCode)
-    };
-  }
-
-  async function call(action){
-    try{
-      return await gasApi(action,{},'V2_CORE');
-    }catch(e){
-      return {success:false,error:e&&e.message?e.message:String(e),data:[]};
-    }
-  }
-
-  window.loadMenuFromServer = function(force){
-    force=force===true;
-    const now=Date.now();
-    if(!force && MENU.length && lastAt && now-lastAt<FRESH){
-      if(document.getElementById('s-new-order')?.classList.contains('active')) window.renderMenu();
-      return Promise.resolve(true);
-    }
-    if(loadP) return loadP;
-    loadP=(async function(){
-      const old=Array.isArray(MENU)?MENU.slice():[];
-      const [fr,br]=await Promise.all([call('GET_MENU_ITEMS'),call('GET_BAR_MENU')]);
-      const food=fr&&fr.success&&Array.isArray(fr.data)?fr.data.map(x=>mapRow(x,false)):[];
-      const bar=br&&br.success&&Array.isArray(br.data)?br.data.map(x=>mapRow(x,true)):[];
-
-      barIds=new Set(bar.map(x=>S(x.id)).filter(Boolean));
-      foodIds=new Set(food.map(x=>S(x.id)).filter(Boolean));
-
-      // A published Bar row is never allowed to remain in Food.
-      const foodOnly=food.filter(x=>!barIds.has(S(x.id)) && !x.isBar);
-      const barOnly=bar.map(x=>Object.assign({},x,{isBar:true}));
-      const merged=[];
-      const seen=new Set();
-      foodOnly.concat(barOnly).forEach(x=>{
-        if(!x.id || !x.name) return;
-        // Bar serving/variant rows can legitimately repeat ID; retain them by using
-        // a composite key when the source supplies a distinct menu card variant.
-        const key=x.isBar ? ('B|'+x.id+'|'+x.cat+'|'+x.name+'|'+x.price) : ('F|'+x.id);
-        if(seen.has(key)) return;
-        seen.add(key); merged.push(x);
-      });
-
-      if(merged.length){
-        MENU=merged; bnxMenuSource='live';
-      }else if(old.length && !(fr&&fr.success) && !(br&&br.success)){
-        MENU=old; bnxMenuSource='cache';
-      }else{
-        MENU=[]; bnxMenuSource='none';
-      }
-      lastAt=Date.now(); bnxMenuLastFetchAt=lastAt; bnxMenuLastUpdated=new Date();
-
-      // New cache version prevents stale single-endpoint Food-only caches.
-      try{
-        const key='bnx_steward_menu_v6_'+(typeof CLIENT_ID!=='undefined'?(CLIENT_ID||'default'):'default');
-        localStorage.setItem(key,JSON.stringify(MENU));
-        localStorage.removeItem('bnx_menu_data_'+(typeof CLIENT_ID!=='undefined'?(CLIENT_ID||'default'):'default'));
-      }catch(e){}
-
-      if(document.getElementById('s-new-order')?.classList.contains('active')) window.renderMenu();
-      return MENU.length>0;
-    })().catch(e=>{
-      console.error('[STEWARD_MENU]',e);
-      if(document.getElementById('s-new-order')?.classList.contains('active')) window.renderMenu();
-      return false;
-    }).finally(()=>{loadP=null;});
-    return loadP;
-  };
-
-  function baseSet(){
-    let a=(Array.isArray(MENU)?MENU:[]).slice();
-    if(scope==='FOOD') a=a.filter(m=>!m.isBar && !barish(m));
-    if(scope==='BAR') a=a.filter(m=>m.isBar || barish(m));
-    if(scope==='OTHER') a=a.filter(m=>!m.isBar && !barish(m));
-    if(scope==='FAV') a=a.filter(m=>m.favorite);
-    if(scope==='POPULAR') a=a.filter(m=>m.popular);
-    if(scope==='RECENT'){
-      const ids=(typeof bnxRecentMenuIds_==='function')?bnxRecentMenuIds_():[];
-      const set=new Set((ids||[]).map(String));
-      a=a.filter(m=>set.has(S(m.id)));
-    }
-    if(quick==='ADDONS') a=a.filter(m=>/add.?on|addon|extra|paid extra/i.test(S(m.cat)+' '+S(m.group)+' '+S(m.menuSection)));
-    if(quick==='ALLTIME') a=a.filter(m=>m.favorite || /all.?time.?fav/i.test(S(m.cat)+' '+S(m.group)+' '+S(m.menuSection)));
-    if(cat!=='ALL') a=a.filter(m=>N(normCat(m.cat))===N(cat));
-    if(group!=='ALL') a=a.filter(m=>N(S(m.group)||'Other')===N(group));
-    if(vf!=='ALL') a=a.filter(m=>veg(m.veg)===vf);
-    if(q){
-      a=a.filter(m=>[m.name,m.id,m.itemCode,m.barcode,m.hsn,m.cat,m.group].some(v=>N(v).includes(N(q))));
-    }
-    return a;
-  }
-
-  window.renderMenu= function(){
-    const grid=document.getElementById('menu-grid');
-    if(!grid) return;
-    const all=Array.isArray(MENU)?MENU:[];
-    let scopeItems=all.slice();
-    if(scope==='FOOD') scopeItems=scopeItems.filter(m=>!m.isBar && !barish(m));
-    else if(scope==='BAR') scopeItems=scopeItems.filter(m=>m.isBar || barish(m));
-    else if(scope==='OTHER') scopeItems=scopeItems.filter(m=>!m.isBar && !barish(m));
-    else if(scope==='FAV') scopeItems=scopeItems.filter(m=>m.favorite);
-    else if(scope==='POPULAR') scopeItems=scopeItems.filter(m=>m.popular);
-    else if(scope==='RECENT'){
-      const ids=(typeof bnxRecentMenuIds_==='function')?bnxRecentMenuIds_():[];
-      const set=new Set((ids||[]).map(String)); scopeItems=scopeItems.filter(m=>set.has(S(m.id)));
-    }
-
-    // Quick filters are a refinement inside the selected scope; they never
-    // replace the authoritative Category -> Group -> Item hierarchy.
-    if(quick==='ADDONS') scopeItems=scopeItems.filter(m=>/add.?on|addon|extra|paid extra/i.test(S(m.cat)+' '+S(m.group)+' '+S(m.menuSection)));
-    if(quick==='ALLTIME') scopeItems=scopeItems.filter(m=>m.favorite || /all.?time.?fav/i.test(S(m.cat)+' '+S(m.group)+' '+S(m.menuSection)));
-
-    const cats=['ALL',...Array.from(new Set(scopeItems.map(m=>normCat(m.cat)).filter(Boolean))).sort((a,b)=>a.localeCompare(b))];
-    if(cat!=='ALL' && !cats.some(c=>N(c)===N(cat))) { cat='ALL'; group='ALL'; }
-
-    let categoryItems = cat==='ALL' ? [] : scopeItems.filter(m=>N(normCat(m.cat))===N(cat));
-    const groups = cat==='ALL' ? [] : ['ALL',...Array.from(new Set(categoryItems.map(m=>S(m.group)||'Other').filter(Boolean))).sort((a,b)=>a.localeCompare(b))];
-    if(group!=='ALL' && !groups.some(g=>N(g)===N(group))) group='ALL';
-
-    // FIX (part of the two-view fix above): 'simple' mode shows every item
-    // in the selected category as soon as it's tapped — Item Group narrows
-    // the list further if picked, but is never required to see anything.
-    // 'grouped' mode is the original behaviour: nothing shows until both a
-    // Category AND an Item Group are picked.
-    let current=[];
-    if(browseMode==='simple'){
-      if(cat!=='ALL'){
-        current = group!=='ALL' ? categoryItems.filter(m=>N(S(m.group)||'Other')===N(group)) : categoryItems.slice();
-        if(vf!=='ALL') current=current.filter(m=>veg(m.veg)===vf);
-        if(q) current=current.filter(m=>[m.name,m.id,m.itemCode,m.barcode,m.hsn,m.cat,m.group].some(v=>N(v).includes(N(q))));
-      }
-    } else if(cat!=='ALL' && group!=='ALL'){
-      current=categoryItems.filter(m=>N(S(m.group)||'Other')===N(group));
-      if(vf!=='ALL') current=current.filter(m=>veg(m.veg)===vf);
-      if(q) current=current.filter(m=>[m.name,m.id,m.itemCode,m.barcode,m.hsn,m.cat,m.group].some(v=>N(v).includes(N(q))));
-    }
-
-    const escAttr = v => S(v).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    const controls=`
-      <div class="menu-view-controls">
-        <div class="menu-search-wrap">
-          <input id="menuSearchInput" class="menu-search-input" type="search" value="${escAttr(q)}" placeholder="🔍 Search item / category / code" oninput="window.__swMenuSearch(this.value)">
-        </div>
-        <div class="sw-menu-breadcrumb" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:2px 0 6px;font-size:11px;font-weight:800;color:var(--text3);">
-          <span>${esc(scope==='FOOD'?'FOOD':scope==='BAR'?'BAR':scope==='OTHER'?'OTHER':scope==='FAV'?'FAVOURITES':scope==='POPULAR'?'POPULAR':scope==='RECENT'?'RECENT':'ALL ITEMS')}</span>
-          ${cat!=='ALL'?`<span>›</span><button type="button" class="menu-view-toggle active" onclick="window.__swMenuCat(${attr(cat)})">${esc(cat)}</button>`:''}
-          ${group!=='ALL'?`<span>›</span><button type="button" class="menu-view-toggle active" onclick="window.__swMenuGroup(${attr(group)})">${esc(group)}</button>`:''}
-        </div>
-        <div style="display:flex;gap:6px;overflow-x:auto;width:100%;padding:2px 0 6px;">
-          ${[['ALL','All Items'],['FOOD','🍽️ Food Menu'],['BAR','🍸 Bar Menu'],['OTHER','Other'],['FAV','⭐ Favourites'],['POPULAR','🔥 Popular'],['RECENT','🕘 Recent']].map(([v,l])=>`<button type="button" class="menu-view-toggle${scope===v?' active':''}" onclick="window.__swMenuScope(${attr(v)})">${l}</button>`).join('')}
-        </div>
-        <div style="display:flex;gap:6px;padding:1px 0 6px;align-items:center;">
-          <span style="font-size:10px;font-weight:800;color:var(--text3);text-transform:uppercase;margin-right:2px;">View</span>
-          <button type="button" class="menu-view-toggle${browseMode==='grouped'?' active':''}" onclick="window.__swMenuBrowseMode('grouped')" title="Category, then pick an Item Group, then items">📁 Grouped</button>
-          <button type="button" class="menu-view-toggle${browseMode==='simple'?' active':''}" onclick="window.__swMenuBrowseMode('simple')" title="Category shows all its items right away; Item Group becomes an optional filter">⚡ Simple</button>
-        </div>
-        ${cat==='ALL' ? `
-          <div style="font-size:10px;font-weight:800;color:var(--text3);text-transform:uppercase;margin:2px 0 4px;">Categories (${Math.max(0,cats.length-1)})</div>
-          <div style="display:flex;gap:6px;overflow-x:auto;width:100%;padding:1px 0 6px;">
-            ${cats.slice(1).map(c=>`<button type="button" class="menu-view-toggle" onclick="window.__swMenuCat(${attr(c)})">${esc(c)} <span style="opacity:.65">${scopeItems.filter(m=>N(normCat(m.cat))===N(c)).length}</span></button>`).join('')}
-          </div>` : `
-          <div style="font-size:10px;font-weight:800;color:var(--text3);text-transform:uppercase;margin:2px 0 4px;">Item Groups (${Math.max(0,groups.length-1)})</div>
-          <div style="display:flex;gap:6px;overflow-x:auto;width:100%;padding:1px 0 6px;">
-            ${groups.slice(1).map(g=>`<button type="button" class="menu-view-toggle" onclick="window.__swMenuGroup(${attr(g)})">${esc(g)} <span style="opacity:.65">${categoryItems.filter(m=>N(S(m.group)||'Other')===N(g)).length}</span></button>`).join('')}
-          </div>`}
-        ${(cat!=='ALL' && (group!=='ALL' || browseMode==='simple')) ? `
-          <div style="display:flex;gap:6px;overflow-x:auto;width:100%;padding:1px 0 6px;">
-            ${[['ALL','All'],['V','🟢 Veg'],['NV','🔴 Non-Veg']].map(([v,l])=>`<button type="button" class="menu-view-toggle${vf===v?' active':''}" onclick="window.__swMenuVeg(${attr(v)})">${l}</button>`).join('')}
-          </div>` : ''}
-      </div>`;
-
-    let html=controls;
-    if(!all.length){
-      html+=`<div style="text-align:center;padding:36px 12px;color:var(--text3);font-size:12px;">No live menu is loaded yet. Tap Refresh Menu to retry.</div>`;
-      grid.innerHTML=html; updateOrderBadge(); return;
-    }
-
-    if(cat==='ALL'){
-      html+=`<div style="text-align:center;padding:30px 12px;color:var(--text3);font-size:12px;">Select a category to view its ${browseMode==='simple'?'items':'item groups'}.</div>`;
-    }else if(browseMode==='grouped' && group==='ALL'){
-      html+=`<div style="text-align:center;padding:30px 12px;color:var(--text3);font-size:12px;">Select an item group under <b>${esc(cat)}</b> to view items.</div>`;
-    }else if(!current.length){
-      html+=`<div style="text-align:center;padding:30px 12px;color:var(--text3);font-size:12px;">No items match the selected filters.</div>`;
-    }else{
-      if(menuViewMode==='table' && typeof renderMenuTable==='function'){
-        grid.innerHTML=html;
-        renderMenuTable(current);
-        return;
-      }
-      html+=current.map(m=>`
-        <div class="menu-card${m.avail?'':' unavailable'}" data-menu-id="${esc(m.id)}" onclick="${m.avail?`addItem(${attr(m.id)})`:`toast('Not Available — selected by restaurant menu','error')`}">
-          <div class="mc-icon">${esc(m.icon||'🍽️')}</div>
-          <div class="mc-name">${esc(m.name)}</div>
-          <div class="mc-cat">${esc(normCat(m.cat))}${m.group?' · '+esc(m.group):''}</div>
-          ${veg(m.veg)==='V'?'<div style="font-size:9px;color:#198754;font-weight:800;">● VEG</div>':veg(m.veg)==='NV'?'<div style="font-size:9px;color:#d33;font-weight:800;">● NON-VEG</div>':''}
-          <div class="mc-price">₹${Number(m.price||0).toLocaleString('en-IN')}</div>
-          ${m.availStatus==='unavailable'?'<div style="margin-top:5px;font-size:10px;font-weight:900;color:#b91c1c;background:#fee2e2;border:1px solid #fecaca;border-radius:7px;padding:4px 6px;">🔴 NOT AVAILABLE</div>':m.availStatus==='limited'?'<div style="margin-top:5px;font-size:10px;font-weight:900;color:#a16207;background:#fef3c7;border:1px solid #fde68a;border-radius:7px;padding:4px 6px;">⚠ LIMITED</div>':''}
-          ${m.avail?`<div class="mc-add" data-menu-qty="${esc(m.id)}">${order[m.id]?`<span style="font-size:11px;">${order[m.id]}</span>`:'+'}</div>`:''}
-        </div>`).join('');
-    }
-    grid.innerHTML=html;
-    updateOrderBadge();
-    if(q){ const el=document.getElementById('menuSearchInput'); if(el){el.focus(); try{el.setSelectionRange(el.value.length,el.value.length);}catch(_){} } }
-  };
-
-  window.__swMenuScope=function(v){
-    scope=S(v)||'ALL'; cat='ALL'; group='ALL'; q='';
-    vf=(scope==='BAR'||scope==='ALL'||scope==='FAV'||scope==='POPULAR'||scope==='RECENT')?'ALL':vf;
-    renderMenu();
-  };
-  window.__swMenuCat=function(v){ cat=S(v)||'ALL'; group='ALL'; renderMenu(); };
-  window.__swMenuGroup=function(v){ group=S(v)||'ALL'; renderMenu(); };
-  window.__swMenuVeg=function(v){ vf=S(v)||'ALL'; renderMenu(); };
-  window.__swMenuSearch=function(v){ q=S(v); renderMenu(); };
-
-  // Keep legacy handlers working if other code calls them.
-  window.filterCat=function(v,el){ window.__swMenuCat(v); };
-  window.filterMenuSearch=function(v){ window.__swMenuSearch(v); };
-  window.bnxSetMenuTypeFilter=function(v,el){ window.__swMenuScope(v); };
-  window.bnxSetMenuQuickFilter=function(v,el){
-    quick=S(v)||'ALL';
-    cat='ALL'; group='ALL';
-    renderMenu();
-  };
-  window.bnxSetMenuVegFilter=function(v,el){ window.__swMenuVeg(v); };
-
-  // Make old addItem handler resolve IDs safely and record recent use.
-  const oldAdd=window.addItem;
-  window.addItem=function(id){
-    const m=(Array.isArray(MENU)?MENU:[]).find(x=>S(x.id)===S(id));
-    if(!m){ toast('Menu item not available','error'); return; }
-    if(m.avail===false){ toast('Out of stock','error'); return; }
-    if(oldAdd) return oldAdd(id);
-  };
-
-  // Install button: make it visible early and add a direct browser-safe fallback.
-  function ensureInstallButton(){
-    const b=document.getElementById('install-app-btn');
-    if(b && !(window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)) b.style.display='flex';
-  }
-  document.addEventListener('DOMContentLoaded', ensureInstallButton);
-  window.addEventListener('load', ensureInstallButton);
-
-  // Refresh after auth/client identity becomes ready.
-  window.addEventListener('online',()=>{ window.loadMenuFromServer(true); });
-  setTimeout(()=>{ try{ if(typeof CLIENT_ID!=='undefined' && !IS_DEMO_MODE) window.loadMenuFromServer(false); }catch(e){} },100);
-
-})();
-</script>
-<script>
-/* ================================================================
-   STEWARD MOBILE FINAL ACCESS / OWNERSHIP GUARD
-   Allowed login roles: CAPTAIN, STEWARD, CHEF, SUPER_ADMIN only.
-   Captain/Steward: own KOTs. Chef/Super Admin: all active KOTs.
-   Leaving New Order resets Menu -> Category -> Group -> Search state.
-   ================================================================ */
-(function(){
-  'use strict';
-  function S(v){return String(v==null?'':v).trim();}
-  function U(v){return S(v).toUpperCase();}
-  const ALLOWED=['CAPTAIN','STEWARD','CHEF','SUPER_ADMIN'];
-  function role(){
-    try{
-      const raw=(typeof getCurrentStaffIdentity==='function' ? getCurrentStaffIdentity().role : localStorage.getItem('ERP_ROLE'))||'';
-      const r=U(raw);
-      if(r.indexOf('SUPER_ADMIN')>=0) return 'SUPER_ADMIN';
-      if(r.indexOf('CAPTAIN')>=0) return 'CAPTAIN';
-      if(r.indexOf('CHEF')>=0) return 'CHEF';
-      if(r.indexOf('STEWARD')>=0) return 'STEWARD';
-      return r;
-    }catch(e){return '';}
-  }
-  function id(){
-    try{return typeof getCurrentStaffIdentity==='function'?getCurrentStaffIdentity():{userId:'',loginId:'',fullName:'',role:''};}
-    catch(e){return {userId:'',loginId:'',fullName:'',role:''};}
-  }
-  window.bnxStewardAppAllowed=function(){return ALLOWED.includes(role());};
-  window.bnxStewardCanOrder=function(){return ['CAPTAIN','STEWARD','SUPER_ADMIN'].includes(role());};
-  window.bnxStewardCanSeeAllKOT=function(){return ['CHEF','SUPER_ADMIN'].includes(role());};
-
-  // Protect the app UI even if a stale/unauthorized session is sitting in localStorage.
-  function forceLogin(){
-    try{['ERP_USER','ERP_SESSION','ERP_ROLE','ERP_CLIENT','ERP_EXPIRY','bnx_client_id'].forEach(k=>localStorage.removeItem(k));sessionStorage.removeItem('ERP_USER');}catch(e){}
-    const l=document.getElementById('s-login');
-    if(l){document.querySelectorAll('.screen').forEach(x=>x.classList.remove('active'));l.classList.add('active');}
-  }
-  window.addEventListener('load',function(){
-    if((localStorage.getItem('ERP_SESSION')||'') && !window.bnxStewardAppAllowed()) forceLogin();
-  });
-
-  const rawShow=window.showScreen;
-  window.showScreen=function(screenId,navEl){
-    if(screenId!=='s-login' && !window.bnxStewardAppAllowed()){
-      forceLogin();
-      toast('Steward App access: Captain, Steward, Chef or Super Admin only','error');
-      return;
-    }
-    // Whenever leaving New Order, clear all temporary filters/search.
-    if(screenId!=='s-new-order'){
-      try{
-        window.__swMenuScope && window.__swMenuScope('ALL');
-        if(typeof menuSearchQuery!=='undefined') menuSearchQuery='';
-      }catch(e){}
-    }
-    const r=rawShow.apply(this,arguments);
-    if(screenId==='s-new-order'){
-      setTimeout(function(){
-        try{document.querySelector('#s-new-order .scroll')?.scrollTo({top:0,behavior:'auto'});}catch(e){}
-        try{document.getElementById('menuSearchInput')?.focus();}catch(e){}
-      },0);
-    }
-    return r;
-  };
-
-  const rawPlace=window.placeOrder;
-  if(rawPlace) window.placeOrder=function(){
-    if(!window.bnxStewardCanOrder()){toast('Only Captain, Steward or Super Admin can place a table order','error');return;}
-    return rawPlace.apply(this,arguments);
-  };
-
-  // KOT ownership is enforced in the UI as well as on the backend response.
-  function norm(v){return S(v).toLowerCase();}
-  function owns(k){
-    const i=id(), uid=norm(i.userId), lid=norm(i.loginId), name=norm(i.fullName);
-    if(uid && [k.userId,k.USER_ID,k.createdById,k.CREATED_BY_ID,k.createdByUserId,k.waiterId,k.stewardId,k.captainId].some(v=>v&&norm(v)===uid)) return true;
-    if(lid && [k.loginId,k.LOGIN_ID,k.createdByLogin,k.CREATED_BY_LOGIN,k.waiterLogin,k.stewardLogin,k.captainLogin].some(v=>v&&norm(v)===lid)) return true;
-    if(name && [k.fullName,k.FULL_NAME,k.createdByName,k.CREATED_BY_NAME,k.waiter,k.steward,k.captain,k.WAITER,k.STEWARD,k.CAPTAIN].some(v=>v&&norm(v)===name)) return true;
-    return false;
-  }
-  const rawRenderKOT=window.renderKOT;
-  window.renderKOT=function(){
-    const list=document.getElementById('kot-list');
-    if(!list||!rawRenderKOT) return;
-    const all=(Array.isArray(window.KOT)?window.KOT:[]).filter(k=>!['CANCELLED','BILLED','SERVED'].includes(U(k.status)));
-    const visible=window.bnxStewardCanSeeAllKOT()?all:all.filter(owns);
-    const original=KOT.slice(); KOT.length=0; visible.forEach(k=>KOT.push(k));
-    try{rawRenderKOT();}finally{KOT.length=0; original.forEach(k=>KOT.push(k));}
-    const bar=document.createElement('div'); bar.style='font-size:10.5px;font-weight:800;color:var(--text3);padding:2px 0 8px;';
-    bar.textContent=window.bnxStewardCanSeeAllKOT()?'All active KOTs':'My active KOTs';
-    const old=document.getElementById('steward-kot-ownership-label'); if(old)old.remove(); bar.id='steward-kot-ownership-label';
-    list.parentElement.insertBefore(bar,list);
-  };
-})();
-</script>
 </body>
 </html>
-
-<script id="bnx-profession-incentive-display-fix">
-/* PROFESSION-WISE INCENTIVE DISPLAY: show the configured profession/rate and
-   the server-calculated own incentive. Never invent a rate when backend is absent. */
-(function(){
-  'use strict';
-  const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
-  function identity(){try{return typeof getCurrentStaffIdentity==='function'?getCurrentStaffIdentity():{};}catch(e){return {};}}
-  const oldLoad=window.loadIncentive;
-  window.loadIncentive=async function(){
-    if(oldLoad) await oldLoad.apply(this,arguments);
-    try{
-      const id=identity();
-      const r=await api('GET_MY_INCENTIVE',{fromDate:businessDate(),toDate:businessDate(),loginId:id.loginId||'',fullName:id.fullName||''});
-      const d=r&&r.success&&r.data?r.data:{};
-      window.__BNX_MY_INCENTIVE_SUMMARY=d.summary||null;
-    }catch(e){window.__BNX_MY_INCENTIVE_SUMMARY=null;}
-  };
-  const oldRender=window.bnxStaffHubTab;
-  // Refresh the incentive card after tab switching without replacing the existing hub logic.
-  const oldHubRefresh=window.bnxStaffHubRefresh;
-  window.bnxStaffHubRefresh=async function(){const r=oldHubRefresh?await oldHubRefresh.apply(this,arguments):null;return r;};
-  const oldOpen=window.bnxStaffHubOpen;
-  window.bnxStaffHubOpen=async function(){const r=oldOpen?await oldOpen.apply(this,arguments):null;try{renderSummary();}catch(e){}return r;};
-  function renderSummary(){
-    const host=document.getElementById('staff-hub-content'); if(!host)return;
-    const d=window.__BNX_MY_INCENTIVE_SUMMARY; if(!d)return;
-    const cards=host.querySelectorAll('.bill-total');
-    if(!cards.length && (d.profession||d.rate!=null)){
-      const box=document.createElement('div');box.className='bill-total';box.style.marginBottom='10px';
-      box.innerHTML=`<div><div class="bt-label">Profession · ${esc(d.profession||'—')}</div><div style="font-size:10px;color:var(--text3);margin-top:3px">Incentive rate: ${Number(d.rate||0).toFixed(2)}% · ${esc(d.basisLabel||'Sales')}</div></div><div class="bt-val">₹${Number(d.calculated||0).toLocaleString('en-IN')}</div>`;
-      host.prepend(box);
-    }
-  }
-  setTimeout(()=>{try{if(typeof bnxStaffHubOpen==='function')bnxStaffHubOpen();}catch(e){}},500);
-})();
-</script>
