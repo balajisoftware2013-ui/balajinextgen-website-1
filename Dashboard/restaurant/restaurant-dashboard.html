@@ -1732,6 +1732,19 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
   border:1px solid var(--border2);background:none;color:var(--text2);cursor:pointer;transition:.18s;}
 .fcat.active{background:var(--gold);color:var(--bg);border-color:var(--gold);}
 @media (hover:hover) and (pointer:fine){.fcat:hover{background:var(--gold);color:var(--bg);border-color:var(--gold);}}
+/* FIX ("2nd scroll bar give for move table bar to snug"): the zone chip
+   strip (Bar, Brew Pub, Family … Snug) used to be flex-wrap:wrap, so on a
+   client with 10+ real zones it just stacked into extra rows with no way to
+   jump quickly across them. A dedicated horizontally-scrolling strip (own
+   visible scrollbar, no wrap) lets you drag/scroll straight from Bar to
+   Snug in one row instead of hunting across wrapped lines. */
+.zone-scroll{flex-wrap:nowrap !important;overflow-x:auto;overflow-y:hidden;
+  -webkit-overflow-scrolling:touch;scrollbar-width:thin;scrollbar-color:var(--gold) var(--surface2);
+  padding-bottom:4px;}
+.zone-scroll .fcat{flex:0 0 auto;white-space:nowrap;}
+.zone-scroll::-webkit-scrollbar{height:7px;}
+.zone-scroll::-webkit-scrollbar-track{background:var(--surface2);border-radius:8px;}
+.zone-scroll::-webkit-scrollbar-thumb{background:var(--gold);border-radius:8px;}
 
 /* ═══ FLOOR MAP ═══ */
 .fmap{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;}
@@ -4219,7 +4232,7 @@ document.addEventListener('DOMContentLoaded', function(){
   <div class="fbar" id="tableFilterBar">
     <div class="search"><span>🔍</span><input id="tableMgmtSearch" placeholder="Search Table / Steward / Zone…" oninput="filterRTC(this.value)"></div>
     <div id="tableStatusFilters" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;"></div>
-    <div id="tableZoneFilters" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;"></div>
+    <div id="tableZoneFilters" class="zone-scroll" style="display:flex;gap:6px;align-items:center;max-width:100%;"></div>
   </div>
   <div class="rtg" id="richTblGrid"></div>
   <div class="card" style="margin-top:16px;">
@@ -15849,7 +15862,14 @@ function bmFilterQuick(cat,btn){
     return;
   }
   grid.innerHTML=items.map(m=>
-    '<div class="prod-item" id="bm-pi-'+String(m.id).replace(/[^a-zA-Z0-9_-]/g,'_')+'" onclick="bmAddProductToQuickBill('+JSON.stringify(String(m.id))+',\'bmQuickProdGrid\')">'+
+    // FIX (same root cause as the Table Management zone chips and the Quick
+    // Add category pills below): JSON.stringify(String(m.id)) inserts a
+    // DOUBLE-quoted string, which was landing inside an already
+    // double-quoted onclick="..." attribute and truncating it at the first
+    // embedded quote — so tapping any Quick Bill product tile silently did
+    // nothing. Switched to the same escaped-single-quote convention used
+    // everywhere else in this file.
+    '<div class="prod-item" id="bm-pi-'+String(m.id).replace(/[^a-zA-Z0-9_-]/g,'_')+'" onclick="bmAddProductToQuickBill(\''+String(m.id).replace(/'/g,"\\'")+'\',\'bmQuickProdGrid\')">'+
     '<div class="prod-em">'+m.em+'</div><div class="prod-name">'+m.name+'</div>'+
     '<div class="prod-price">₹'+Number(m.price||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})+'</div>'+
     '<div class="prod-cat">'+m.cat+'</div></div>'
@@ -17540,13 +17560,37 @@ function loadMenuData(){
   // fake displaces something real" convention this file uses
   // everywhere else. Falls back to the honest "couldn't reach server,
   // showing what you have" message if the call fails.
-  return Promise.race([
-    Promise.all([
-      gasApi('GET_MENU_ITEMS', {}, 'V2_CORE'),
-      gasApi('GET_BAR_MENU', {}, 'V2_CORE').catch(()=>({success:false,data:[],ids:[]}))
-    ]),
-    new Promise(resolve=>setTimeout(()=>resolve({success:false,error:'menu timeout'}),9000))
+  //
+  // FIX ("Food Menu showing Bar items / stale items never clear" — real,
+  // confirmed root cause, not a guess): this used to race the real
+  // GET_MENU_ITEMS/GET_BAR_MENU call against a bare 9000ms setTimeout via
+  // Promise.race, and whichever settled first WON — the loser's result was
+  // silently discarded, not merely delayed. gasApi() itself already grants
+  // GET_*/LIST_*/RD_* actions a real 45000ms timeout (BNX_REPORT_TIMEOUT_MS)
+  // specifically because this backend can be slow, and this client's own
+  // [BN_HEALTH] console log confirms avg_response running 14–19 SECONDS with
+  // climbing failure counts — so the inner 9s race almost always lost, and
+  // the real Promise.all(...) kept running in the background completely
+  // orphaned: nothing was ever listening for it, so even a slow-but-eventually
+  // -successful sync was thrown away every time. That is exactly why stale
+  // items (e.g. ones since deactivated or reclassified as IS_BAR in
+  // ITEM_MASTER) never got purged from the cached menuData/localStorage and
+  // kept showing under the wrong tab indefinitely — Sync Menu never actually
+  // got to run its "remove anything the server no longer returns" step
+  // (see serverIds/serverNames below) because its own result was discarded
+  // before that code ever ran. Fix: await the real call directly (no
+  // discard-on-timeout race) and use a separate, non-destructive timer only
+  // to tell the user it's still working — it never abandons the in-flight
+  // request or throws away a result that's about to arrive.
+  let __bnxMenuSlowNoticeTimer = setTimeout(()=>{
+    showNotif('⏳ Menu sync is taking longer than usual — still syncing, not giving up…','success');
+  }, 9000);
+  const __bnxClearSlowNotice = ()=>{ clearTimeout(__bnxMenuSlowNoticeTimer); };
+  return Promise.all([
+    gasApi('GET_MENU_ITEMS', {}, 'V2_CORE'),
+    gasApi('GET_BAR_MENU', {}, 'V2_CORE').catch(()=>({success:false,data:[],ids:[]}))
   ]).then(pair=>{
+    __bnxClearSlowNotice();
     const res=Array.isArray(pair) ? pair[0] : pair;
     const barRes=Array.isArray(pair) ? pair[1] : null;
     if(barRes && barRes.success && Array.isArray(barRes.ids)){
@@ -17696,6 +17740,7 @@ function loadMenuData(){
       showNotif('⚠️ Could not reach menu backend — showing last saved menu ('+menuData.length+' items)','error');
     }
   }).catch(()=>{
+    __bnxClearSlowNotice();
     buildMenu();
     showNotif('⚠️ Menu sync failed — showing last saved menu ('+menuData.length+' items)','error');
   });
@@ -26352,7 +26397,17 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
     const status=[['','All'],['available','🟢 Available'],['running','🟡 Running'],['occupied','🔴 Occupied'],['reserved','🟠 Reserved'],['cleaning','🔵 Cleaning']];
     const st=window._rtcFilterState||{search:'',status:'',zone:''};
     sf.innerHTML=status.map(([v,l])=>`<button type="button" class="fcat${String(st.status||'')===v?' active':''}" data-table-filter="${v}" onclick="window.filterRTC('${v}',this)">${l}</button>`).join('');
-    zf.innerHTML=zones.map(z=>`<button type="button" class="fcat${String(st.zone||'').toLowerCase()===String(z).toLowerCase()?' active':''}" data-table-zone="${esc(z)}" onclick="window.filterRTC(${JSON.stringify(String(z))},this)">📍 ${esc(z)}</button>`).join('');
+    // FIX ("all filter not works"): JSON.stringify() wraps the zone name in
+    // DOUBLE quotes (e.g. "Brew Pub (Round Table)"), and that was being
+    // dropped straight inside an already double-quoted onclick="..."
+    // attribute. The browser's HTML parser ends the attribute value at that
+    // first embedded double quote, truncating onclick to the literal broken
+    // text `window.filterRTC(` — so every single zone chip silently did
+    // nothing on click, for every client, not just this one. Switched to the
+    // same single-quote + escaped-apostrophe convention already used by
+    // filterMenu()/filterMenuCategory() elsewhere in this file, which never
+    // collides with the surrounding double-quoted attribute.
+    zf.innerHTML=zones.map(z=>`<button type="button" class="fcat${String(st.zone||'').toLowerCase()===String(z).toLowerCase()?' active':''}" data-table-zone="${esc(z)}" onclick="window.filterRTC('${String(z).replace(/'/g,"\\'")}',this)">📍 ${esc(z)}</button>`).join('');
   };
   const oldBuild=window.buildRichTbls;
   window.buildRichTbls=function(){ if(typeof oldBuild==='function') oldBuild(); window.bnxRefreshLiveTableFilters(); if(typeof bnxApplyTableFilters_==='function') bnxApplyTableFilters_(); };
@@ -26488,8 +26543,12 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
     const wrap=modal.querySelector('.modal-body > div[style*="flex-wrap"]');
     if(!wrap) return;
     const cats=getRealCategories();
+    // FIX (same quote-collision bug as Table Management zone chips above):
+    // JSON.stringify(c) inserts a DOUBLE-quoted string into an already
+    // double-quoted onclick="..." attribute, truncating it — every Quick Add
+    // category pill except the hardcoded "All" button silently did nothing.
     wrap.innerHTML='<button class="pcat active" data-live-cat="All" onclick="bmFilterQuick(\'All\',this)">All</button>'+
-      cats.map(c=>`<button class="pcat" data-live-cat="${esc(c)}" onclick="bmFilterQuick(${JSON.stringify(c)},this)">${esc(c)}</button>`).join('');
+      cats.map(c=>`<button class="pcat" data-live-cat="${esc(c)}" onclick="bmFilterQuick('${String(c).replace(/'/g,"\\'")}',this)">${esc(c)}</button>`).join('');
   }
   window.bnxRenderLiveQuickCategories=renderQuickCategories;
 
