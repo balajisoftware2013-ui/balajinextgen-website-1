@@ -814,7 +814,17 @@ const SHEETS = {
      resolves to a sheet that really exists. */
   SUPPLIER_MASTER: 'SUPPLIER_MASTER',
   USER_MASTER: 'USER_MASTER',
+  // Steward HR constants must exist in the routable SHEETS map.
+  // Their DB routing is already TRANSACTION; the missing constants were the
+  // direct cause of `bnxClientSheet: sheetName required` on attendance.
+  ATTENDANCE_MASTER: 'ATTENDANCE_MASTER',
+  INCENTIVE_TRANSACTION: 'INCENTIVE_TRANSACTION',
+  SHIFT_TRANSACTION: 'SHIFT_TRANSACTION',
+  LEAVE_TRANSACTION: 'LEAVE_TRANSACTION',
+  PAYROLL_MASTER: 'PAYROLL_MASTER',
   ORDER_MASTER: 'ORDER_MASTER',
+  // Explicit online-order item table used by steward details when available.
+  ONLINE_ORDER_ITEMS: 'ONLINE_ORDER_ITEMS',
   ORDER_ITEMS: 'ORDER_ITEMS',
   KOT_MASTER: 'KOT_MASTER',
   KOT_ITEMS: 'KOT_ITEMS',
@@ -862,9 +872,461 @@ const SHEETS = {
 };
 
 const TRANSACTION_TYPES = {
-  ORDER: 'ORDER', KOT: 'KOT', BILL: 'BILL', PAYMENT: 'PAYMENT',
+  ORDER: 'ORDER', KOT: 'KOT', BILL: 'BILL', PAYMENT: 'PAYMENT', VOID: 'VOID',
   PURCHASE: 'PURCHASE', STOCK_MOVEMENT: 'STOCK_MOVEMENT', STOCK_ADJUSTMENT: 'STOCK_ADJUSTMENT'
 };
+
+
+/* =========================================================================
+ * PASS #KITCHEN-INDENT-LIVE -- unified Kitchen -> Inventory workflow
+ *
+ * The Inventory/Kitchen HTML clients already call:
+ *   SAVE_KITCHEN_INDENT
+ *   GET_PENDING_INDENTS
+ *   APPROVE_ISSUE_INDENT
+ * but the production router must expose the same actions in the deployed
+ * multi-client Code.gs. These handlers are tenant-scoped through the
+ * authenticated session and the existing KITCHEN_INDENT / STOCK_* tabs.
+ * One KITCHEN_INDENT row is stored per requested item with its own IND_ID.
+ * ========================================================================= */
+function bnxKitchenIndentHeaders_(clientId) {
+  const sh = bnxClientSheet(clientId, SHEETS.KITCHEN_INDENT);
+  const lastCol = Math.max(1, sh.getLastColumn());
+  const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h){ return String(h || '').trim(); });
+  if (!headers.length || !headers.some(Boolean)) throw new Error('KITCHEN_INDENT sheet has no header row');
+  return { sheet: sh, headers: headers };
+}
+
+function bnxGetPendingIndents(session, payload) {
+  const clientId = session.CLIENT_ID;
+  try {
+    const ref = bnxKitchenIndentHeaders_(clientId);
+    const values = ref.sheet.getDataRange().getValues();
+    const headers = ref.headers;
+    const rows = [];
+    for (let r = 1; r < values.length; r++) {
+      const o = bnxRowToObject(values[r], headers);
+      if (String(o.CLIENT_ID || clientId) !== String(clientId)) continue;
+      if (!o.IND_ID && !o.ITEM_ID && !o.ITEM_NAME) continue;
+      if (payload && payload.pendingOnly && String(o.STATUS||'PENDING').toUpperCase() !== 'PENDING') continue;
+      rows.push(o);
+    }
+    return { success:true, data:{indents:rows}, indents:rows };
+  } catch (e) {
+    bnxLogError(clientId, 'bnxGetPendingIndents failed: ' + e.message, payload || {});
+    return { success:false, message:e.message, error:e.message };
+  }
+}
+
+function bnxSaveKitchenIndent(session, payload) {
+  const clientId = session.CLIENT_ID;
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  if (!items.length) return { success:false, message:'At least one kitchen indent item is required' };
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ref = bnxKitchenIndentHeaders_(clientId);
+    const now = new Date().toISOString();
+    const base = String(payload.indentId || payload.indId || payload.indentNo || '').trim() ||
+      ('IND-' + Date.now());
+    const saved = [];
+
+    items.forEach(function(item, idx) {
+      const qty = Number(item.requiredQty != null ? item.requiredQty : item.REQUIRED_QTY) || 0;
+      if (qty <= 0) return;
+
+      const itemId = String(item.itemId || item.itemID || item.ITEM_ID || '').trim();
+      const itemName = String(item.itemName || item.ITEM_NAME || '').trim();
+      const indId = generateShortId_(clientId, 'KITCHEN_INDENT_ID');
+
+      bnxAppendRow(clientId, SHEETS.KITCHEN_INDENT, {
+        IND_ID: indId,
+        CLIENT_ID: clientId,
+        DATE: payload.date || payload.indentDate || now,
+        ITEM_ID: itemId,
+        ITEM_NAME: itemName,
+        UNIT: String(item.unit || item.UNIT || '').trim(),
+        REQUIRED_QTY: qty,
+        ISSUED_QTY: 0,
+        ISSUED_BY: '',
+        STATUS: 'PENDING',
+        REMARKS: String(item.remarks || payload.remarks || payload.notes || '').trim(),
+        CATEGORY: String(item.category || item.CATEGORY || '').trim(),
+        DEPARTMENT: String(payload.department || payload.dept || 'Main Kitchen').trim(),
+        SHIFT: String(payload.shift || 'All Day').trim(),
+        PRIORITY: String(payload.priority || 'Normal').trim()
+      });
+      saved.push({IND_ID:indId, itemId:itemId, itemName:itemName, requiredQty:qty, batchId:base, line:idx+1});
+    });
+
+    if (!saved.length) return { success:false, message:'No positive required quantities were supplied' };
+    return { success:true, indentId:base, indents:saved, savedCount:saved.length };
+  } catch (e) {
+    bnxLogError(clientId, 'bnxSaveKitchenIndent failed: ' + e.message, payload || {});
+    return { success:false, message:e.message, error:e.message };
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+function bnxFindKitchenIndentRow_(clientId, indId) {
+  const ref = bnxKitchenIndentHeaders_(clientId);
+  const sh = ref.sheet, headers = ref.headers;
+  const idCol = headers.indexOf('IND_ID'), ciCol = headers.indexOf('CLIENT_ID');
+  if (idCol === -1) throw new Error('KITCHEN_INDENT is missing IND_ID column');
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return null;
+  const matches = sh.getRange(2, idCol + 1, lastRow - 1, 1)
+    .createTextFinder(String(indId).trim()).matchEntireCell(true).findAll();
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const rowNo = matches[i].getRow();
+    const vals = sh.getRange(rowNo, 1, 1, headers.length).getValues()[0];
+    const o = bnxRowToObject(vals, headers);
+    if (ciCol !== -1 && String(o.CLIENT_ID || '') !== String(clientId)) continue;
+    return {sheet:sh, headers:headers, rowNo:rowNo, values:vals, object:o};
+  }
+  return null;
+}
+
+function bnxGetItemPurchaseRate_(clientId, itemId) {
+  if (!itemId) return 0;
+  try {
+    const sh = bnxClientSheet(clientId, SHEETS.ITEM_MASTER);
+    const vals = sh.getDataRange().getValues();
+    const headers = vals[0] || [];
+    const idCol = headers.indexOf('ITEM_ID');
+    const rateNames = ['PURCHASE_RATE','PURCHASE_PRICE','COST_PRICE','LAST_PURCHASE_RATE'];
+    const rateCols = rateNames.map(function(n){return headers.indexOf(n);}).filter(function(i){return i !== -1;});
+    if (idCol === -1) return 0;
+    for (let r=1;r<vals.length;r++) {
+      if (String(vals[r][idCol]) !== String(itemId)) continue;
+      for (let k=0;k<rateCols.length;k++) {
+        const n=Number(vals[r][rateCols[k]]);
+        if (isFinite(n) && n >= 0) return n;
+      }
+      return 0;
+    }
+  } catch(e) {}
+  return 0;
+}
+
+function bnxGetAvailableStockQty_(clientId, itemId, locationId) {
+  try {
+    const sh = bnxClientSheet(clientId, SHEETS.STOCK_BALANCE);
+    const vals = sh.getDataRange().getValues();
+    const headers = vals[0] || [];
+    const idCol=headers.indexOf('ITEM_ID'), ciCol=headers.indexOf('CLIENT_ID');
+    const locCol=headers.indexOf('LOCATION_ID'), qtyCol=headers.indexOf('CURRENT_QUANTITY');
+    const availCol=headers.indexOf('AVAILABLE_QUANTITY');
+    if(idCol===-1) return null;
+    let total=0, found=false;
+    for(let r=1;r<vals.length;r++){
+      if(ciCol!==-1 && String(vals[r][ciCol])!==String(clientId)) continue;
+      if(String(vals[r][idCol])!==String(itemId)) continue;
+      if(locationId && locCol!==-1 && String(vals[r][locCol]||'')!==String(locationId)) continue;
+      const q=Number(availCol!==-1 ? vals[r][availCol] : vals[r][qtyCol]);
+      if(isFinite(q)){ total+=q; found=true; }
+    }
+    return found ? total : null;
+  } catch(e) {
+    return null;
+  }
+}
+
+function bnxUpdateStockBalanceAfterMovement_(clientId, itemId, locationId, qtyOut, qtyIn, movementAt) {
+  const sh=bnxClientSheet(clientId,SHEETS.STOCK_BALANCE);
+  const headers=sh.getRange(1,1,1,Math.max(1,sh.getLastColumn())).getValues()[0].map(String);
+  const idCol=headers.indexOf('ITEM_ID'), ciCol=headers.indexOf('CLIENT_ID'), locCol=headers.indexOf('LOCATION_ID');
+  const curCol=headers.indexOf('CURRENT_QUANTITY'), availCol=headers.indexOf('AVAILABLE_QUANTITY');
+  if(idCol<0 || curCol<0) return false;
+  const last=sh.getLastRow();
+  let rowNo=0;
+  if(last>=2){
+    const vals=sh.getRange(2,1,last-1,headers.length).getValues();
+    for(let i=0;i<vals.length;i++){
+      if(ciCol>=0 && String(vals[i][ciCol])!==String(clientId)) continue;
+      if(String(vals[i][idCol])!==String(itemId)) continue;
+      if(locCol>=0 && String(vals[i][locCol]||'')!==String(locationId||'')) continue;
+      rowNo=i+2; break;
+    }
+  }
+  const now=new Date().toISOString();
+  if(!rowNo){
+    const obj={STOCK_BALANCE_ID:generateShortId_(clientId,'STOCK_BALANCE_ID'),CLIENT_ID:clientId,LOCATION_ID:locationId||'',ITEM_ID:itemId,
+      CURRENT_QUANTITY:+(Number(qtyIn||0)-Number(qtyOut||0)).toFixed(4),RESERVED_QUANTITY:0,
+      AVAILABLE_QUANTITY:+(Number(qtyIn||0)-Number(qtyOut||0)).toFixed(4),REORDER_LEVEL:bnxGetItemReorderLevel_(clientId,itemId),LAST_MOVEMENT_AT:movementAt||now,UPDATED_AT:now};
+    bnxAppendRow(clientId,SHEETS.STOCK_BALANCE,obj); return true;
+  }
+  const current=Number(sh.getRange(rowNo,curCol+1).getValue())||0;
+  const next=+(current+Number(qtyIn||0)-Number(qtyOut||0)).toFixed(4);
+  sh.getRange(rowNo,curCol+1).setValue(next);
+  if(availCol>=0){
+    const resCol=headers.indexOf('RESERVED_QUANTITY');
+    const reserved=resCol>=0?(Number(sh.getRange(rowNo,resCol+1).getValue())||0):0;
+    sh.getRange(rowNo,availCol+1).setValue(+(next-reserved).toFixed(4));
+  }
+  const lm=headers.indexOf('LAST_MOVEMENT_AT'); if(lm>=0)sh.getRange(rowNo,lm+1).setValue(movementAt||now);
+  const up=headers.indexOf('UPDATED_AT'); if(up>=0)sh.getRange(rowNo,up+1).setValue(now);
+  return true;
+}
+function bnxGetItemReorderLevel_(clientId,itemId){
+  try{
+    const sh=bnxClientSheet(clientId,SHEETS.ITEM_MASTER), vals=sh.getDataRange().getValues(), h=vals[0]||[];
+    const ic=h.indexOf('ITEM_ID'), rc=h.indexOf('REORDER_LEVEL'); if(ic<0||rc<0)return 0;
+    for(let r=1;r<vals.length;r++) if(String(vals[r][ic])===String(itemId)) return Number(vals[r][rc])||0;
+  }catch(e){}
+  return 0;
+}
+
+function bnxApproveIssueIndent(session, payload) {
+  const clientId = session.CLIENT_ID;
+  const indId = String(payload.indId || payload.IND_ID || '').trim();
+  if (!indId) return { success:false, message:'indId is required' };
+  const requestedQty = Number(payload.issuedQty != null ? payload.issuedQty : payload.REQUIRED_QTY);
+  if (!(requestedQty > 0)) return { success:false, message:'issuedQty must be greater than zero' };
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const found = bnxFindKitchenIndentRow_(clientId, indId);
+    if (!found) return { success:false, message:'Kitchen indent not found: ' + indId };
+
+    const o=found.object;
+    const status=String(o.STATUS||'PENDING').toUpperCase();
+    if (status === 'ISSUED') return { success:true, alreadyIssued:true, indId:indId, issuedQty:Number(o.ISSUED_QTY)||0 };
+    if (status !== 'PENDING' && status !== 'PARTIALLY_ISSUED') {
+      return { success:false, message:'Indent is not issuable in status ' + status };
+    }
+
+    const required=Math.max(0,Number(o.REQUIRED_QTY)||0);
+    const already=Math.max(0,Number(o.ISSUED_QTY)||0);
+    const remaining=Math.max(0,required-already);
+    const qty=Math.min(requestedQty,remaining);
+    if (!(qty>0)) return { success:true, alreadyIssued:true, indId:indId, issuedQty:already };
+
+    const locationId=String(payload.locationId || payload.LOCATION_ID || '').trim();
+    const available=bnxGetAvailableStockQty_(clientId,String(o.ITEM_ID||''),locationId);
+    if (available !== null && available + 1e-9 < qty) {
+      return { success:false, message:'Insufficient available stock for ' + (o.ITEM_NAME || o.ITEM_ID) + '. Available: ' + available + ', requested: ' + qty };
+    }
+
+    const rate=bnxGetItemPurchaseRate_(clientId,String(o.ITEM_ID||''));
+    const now=new Date().toISOString();
+    const movementId=generateShortId_(clientId,'STOCK_MOVEMENT_ID');
+    bnxAppendRow(clientId,SHEETS.STOCK_MOVEMENT,{
+      STOCK_MOVEMENT_ID:movementId,
+      CLIENT_ID:clientId,
+      LOCATION_ID:locationId,
+      ITEM_ID:String(o.ITEM_ID||''),
+      MOVEMENT_TYPE:'ISSUE',
+      MOVEMENT_DATE:bnxBusinessDateKey_(new Date()),
+      QUANTITY_IN:0,
+      QUANTITY_OUT:qty,
+      RATE:rate,
+      SOURCE_TYPE:'KITCHEN_INDENT',
+      SOURCE_ID:indId,
+      CREATED_BY:String(payload.issuedBy || session.USER_ID || 'Store Manager'),
+      CREATED_AT:now,
+      REFERENCE_NUMBER:indId
+    });
+    // Keep STOCK_BALANCE in sync immediately. Previously the movement was
+    // appended but the balance stayed stale until a manual rebuild, allowing
+    // the next issue to see the old available quantity.
+    bnxUpdateStockBalanceAfterMovement_(clientId,String(o.ITEM_ID||''),locationId,qty,0,now);
+
+    const newIssued=+(already+qty).toFixed(4);
+    const newStatus=newIssued+1e-9>=required?'ISSUED':'PARTIALLY_ISSUED';
+    const h=found.headers;
+    const set=function(name,val){const c=h.indexOf(name);if(c!==-1)found.sheet.getRange(found.rowNo,c+1).setValue(val);};
+    set('ISSUED_QTY',newIssued);
+    set('STATUS',newStatus);
+    set('ISSUED_BY',String(payload.issuedBy || session.USER_ID || 'Store Manager'));
+    if(h.indexOf('REMARKS')!==-1){
+      const old=String(o.REMARKS||'');
+      const note='Issued '+qty+' '+String(o.UNIT||'')+' on '+now;
+      set('REMARKS',old ? old+' | '+note : note);
+    }
+    try { bnxInvalidateTodayReportCaches_(clientId); } catch(e) {}
+    return { success:true, indId:indId, issuedQty:newIssued, status:newStatus, stockMovementId:movementId, rate:rate };
+  } catch(e) {
+    bnxLogError(clientId,'bnxApproveIssueIndent failed: '+e.message,payload||{});
+    return { success:false, message:e.message, error:e.message };
+  } finally {
+    try { lock.releaseLock(); } catch(e) {}
+  }
+}
+
+
+
+// PASS #68 — LIVE KITCHEN CONSUMPTION / WASTAGE POSTING
+// These actions are intentionally transactional: every accepted entry writes
+// the source sheet AND one STOCK_MOVEMENT row, then updates STOCK_BALANCE.
+// No local-only consumption/wastage records are treated as stock.
+function bnxResolveInventoryItem_(clientId, itemId, itemName) {
+  const id=String(itemId||'').trim();
+  if(id) return {itemId:id, itemName:String(itemName||'').trim()};
+  const name=String(itemName||'').trim().toLowerCase();
+  if(!name) return null;
+  const sh=bnxClientSheet(clientId,SHEETS.ITEM_MASTER);
+  const v=sh.getDataRange().getValues(), h=v[0]||[];
+  const ic=h.indexOf('ITEM_ID'), nc=h.indexOf('ITEM_NAME');
+  if(ic<0||nc<0) return null;
+  const hits=[];
+  for(let r=1;r<v.length;r++){ if(String(v[r][nc]||'').trim().toLowerCase()===name) hits.push({itemId:String(v[r][ic]||'').trim(),itemName:String(v[r][nc]||'').trim()}); }
+  return hits.length===1 ? hits[0] : null;
+}
+function bnxSaveKitchenConsumption(session,payload){
+  const clientId=session.CLIENT_ID, p=payload||{};
+  const entries=Array.isArray(p.entries)?p.entries:[p];
+  if(!entries.length) return {success:false,message:'Consumption entries required'};
+  const results=[];
+  const lock=LockService.getScriptLock();
+  try{
+    lock.waitLock(10000);
+    for(const e of entries){
+      const item=bnxResolveInventoryItem_(clientId,e.itemId||e.ITEM_ID,e.itemName||e.ITEM_NAME);
+      if(!item) return {success:false,message:'Unique ITEM_ID is required; item name was not uniquely matched'};
+      const qty=Number(e.issued!=null?e.issued:(e.issuedQty!=null?e.issuedQty:e.QTY));
+      if(!(qty>0)) return {success:false,message:'Consumption quantity must be greater than zero'};
+      const locationId=String(e.locationId||e.LOCATION_ID||'').trim();
+      const available=bnxGetAvailableStockQty_(clientId,item.itemId,locationId);
+      if(available!==null && available+1e-9<qty) return {success:false,message:'Insufficient available stock for '+item.itemName+'. Available: '+available+', requested: '+qty};
+      const rate=bnxGetItemPurchaseRate_(clientId,item.itemId), now=new Date().toISOString(), date=bnxBusinessDateKey_(new Date());
+      const conId=generateShortId_(clientId,'CON_ID');
+      const opening=available===null?0:available;
+      bnxAppendRow(clientId,SHEETS.KITCHEN_CONSUMPTION,{CON_ID:conId,CLIENT_ID:clientId,DATE:date,ITEM_ID:item.itemId,ITEM_NAME:item.itemName,UNIT:String(e.unit||e.UNIT||''),OPENING:opening,RECEIVED:0,ISSUED:qty,CLOSING:+(opening-qty).toFixed(4),WASTAGE:0,ENTERED_BY:String(e.enteredBy||session.USER_ID||'Kitchen')});
+      const movementId=generateShortId_(clientId,'STOCK_MOVEMENT_ID');
+      bnxAppendRow(clientId,SHEETS.STOCK_MOVEMENT,{STOCK_MOVEMENT_ID:movementId,CLIENT_ID:clientId,LOCATION_ID:locationId,ITEM_ID:item.itemId,MOVEMENT_TYPE:'CONSUMPTION',MOVEMENT_DATE:date,MOVEMENT_TIME:new Date().toTimeString().slice(0,8),QUANTITY_IN:0,QUANTITY_OUT:qty,RATE:rate,SOURCE_TYPE:'KITCHEN_CONSUMPTION',SOURCE_ID:conId,REFERENCE_NUMBER:conId,NOTES:String(e.purpose||e.PURPOSE||''),CREATED_BY:String(e.enteredBy||session.USER_ID||'Kitchen'),CREATED_AT:now});
+      bnxUpdateStockBalanceAfterMovement_(clientId,item.itemId,locationId,qty,0,now);
+      results.push({conId,movementId,itemId:item.itemId,itemName:item.itemName,qty,rate});
+    }
+    try{bnxInvalidateTodayReportCaches_(clientId);}catch(e){}
+    return {success:true,entries:results};
+  }catch(err){ bnxLogError(clientId,'bnxSaveKitchenConsumption failed: '+err.message,payload||{}); return {success:false,message:err.message}; }
+  finally{try{lock.releaseLock();}catch(e){}}
+}
+function bnxGetConsumptionHistory(session,payload){
+  const clientId=session.CLIENT_ID, sh=bnxClientSheet(clientId,SHEETS.KITCHEN_CONSUMPTION);
+  const v=sh.getDataRange().getValues(), h=v[0]||[], rows=[];
+  const {from,to}=bnxResolveDateRange_(payload||{});
+  for(let r=1;r<v.length;r++){ const o=bnxRowToObject(v[r],h); if(o.CLIENT_ID&&String(o.CLIENT_ID)!==String(clientId))continue; const d=String(o.DATE||'').slice(0,10); if(d&& (d<from||d>to))continue; rows.push(o); }
+  rows.sort((a,b)=>String(b.DATE).localeCompare(String(a.DATE)));
+  return {success:true,history:rows};
+}
+function bnxSaveWastage(session,payload){
+  const clientId=session.CLIENT_ID, p=payload||{}, entries=Array.isArray(p.entries)?p.entries:[p];
+  if(!entries.length)return {success:false,message:'Wastage entries required'};
+  const results=[],lock=LockService.getScriptLock();
+  try{ lock.waitLock(10000);
+    for(const e of entries){
+      const item=bnxResolveInventoryItem_(clientId,e.itemId||e.ITEM_ID||e.itemCode||e.ITEM_CODE,e.itemName||e.ITEM_NAME||e.item);
+      if(!item)return {success:false,message:'Unique ITEM_ID is required for wastage'};
+      const qty=Number(e.qty!=null?e.qty:e.QTY); if(!(qty>0))return {success:false,message:'Wastage quantity must be greater than zero'};
+      const locationId=String(e.locationId||e.LOCATION_ID||'').trim(), available=bnxGetAvailableStockQty_(clientId,item.itemId,locationId);
+      if(available!==null&&available+1e-9<qty)return {success:false,message:'Insufficient available stock for wastage. Available: '+available+', requested: '+qty};
+      const rate=Number(e.rate)||bnxGetItemPurchaseRate_(clientId,item.itemId), value=+(qty*rate).toFixed(2), now=new Date().toISOString(), date=bnxBusinessDateKey_(new Date()), wid=generateShortId_(clientId,'WASTAGE_ID');
+      bnxAppendRow(clientId,SHEETS.WASTAGE_MASTER,{WASTAGE_ID:wid,CLIENT_ID:clientId,DATE:date,ITEM_CODE:item.itemId,ITEM_NAME:item.itemName,QTY:qty,UOM:String(e.unit||e.UOM||''),REASON:String(e.reason||e.REASON||'Wastage'),COST_VALUE:value,APPROVED_BY:String(e.approvedBy||''),DEPARTMENT:String(e.department||e.DEPARTMENT||'Kitchen'),ENTRY_BY:String(e.reportedBy||e.ENTRY_BY||session.USER_ID||'Kitchen')});
+      const mid=generateShortId_(clientId,'STOCK_MOVEMENT_ID');
+      bnxAppendRow(clientId,SHEETS.STOCK_MOVEMENT,{STOCK_MOVEMENT_ID:mid,CLIENT_ID:clientId,LOCATION_ID:locationId,ITEM_ID:item.itemId,MOVEMENT_TYPE:'WASTAGE',MOVEMENT_DATE:date,MOVEMENT_TIME:new Date().toTimeString().slice(0,8),QUANTITY_IN:0,QUANTITY_OUT:qty,RATE:rate,SOURCE_TYPE:'WASTAGE_MASTER',SOURCE_ID:wid,REFERENCE_NUMBER:wid,NOTES:String(e.notes||''),CREATED_BY:String(e.reportedBy||session.USER_ID||'Kitchen'),CREATED_AT:now});
+      bnxUpdateStockBalanceAfterMovement_(clientId,item.itemId,locationId,qty,0,now); results.push({wastageId:wid,movementId:mid,itemId:item.itemId,qty,rate,value});
+    }
+    try{bnxInvalidateTodayReportCaches_(clientId);}catch(e){}
+    return {success:true,entries:results};
+  }catch(err){bnxLogError(clientId,'bnxSaveWastage failed: '+err.message,payload||{});return {success:false,message:err.message};}finally{try{lock.releaseLock();}catch(e){}}
+}
+function bnxGetWastageLog(session,payload){
+  const clientId=session.CLIENT_ID, sh=bnxClientSheet(clientId,SHEETS.WASTAGE_MASTER),v=sh.getDataRange().getValues(),h=v[0]||[],rows=[],{from,to}=bnxResolveDateRange_(payload||{});
+  for(let r=1;r<v.length;r++){const o=bnxRowToObject(v[r],h);if(o.CLIENT_ID&&String(o.CLIENT_ID)!==String(clientId))continue;const d=String(o.DATE||'').slice(0,10);if(d&&(d<from||d>to))continue;rows.push(o);}
+  rows.sort((a,b)=>String(b.DATE).localeCompare(String(a.DATE))); return {success:true,data:{entries:rows}};
+}
+
+
+// PASS #69 — LIVE INVENTORY IN/OUT TRANSACTION BRIDGE
+// Purchase invoice, GRN, department issue, transfer and physical adjustment
+// must never remain browser-local. Each accepted transaction writes the
+// tenant transaction sheet(s), STOCK_MOVEMENT and STOCK_BALANCE atomically.
+function bnxInventoryItem_(clientId,itemId,itemName){ return bnxResolveInventoryItem_(clientId,itemId,itemName); }
+function bnxSavePurchaseInvoiceRow(session,payload){
+  const clientId=session.CLIENT_ID, p=payload||{}, row=p.row||{};
+  const id=String(row._id||row.PURCHASE_INVOICE_ID||row.PURCHASE_ID||'').trim();
+  if(!id) return {success:false,message:'Purchase invoice ID required'};
+  const lock=LockService.getScriptLock(); try{lock.waitLock(10000);
+    const sh=bnxClientSheet(clientId,SHEETS.PURCHASE_INVOICE), vals=sh.getDataRange().getValues(), h=vals[0]||[];
+    const idCol=h.indexOf('PURCHASE_INVOICE_ID')>=0?h.indexOf('PURCHASE_INVOICE_ID'):h.indexOf('_id');
+    let existing=-1; for(let r=1;r<vals.length;r++) if(idCol>=0&&String(vals[r][idCol])===id){existing=r;break;}
+    const base={PURCHASE_INVOICE_ID:id,CLIENT_ID:clientId,INVOICE_NO:row.inv_no||row.INVOICE_NO||'',INVOICE_DATE:row.inv_date||row.INVOICE_DATE||'',SUPPLIER_ID:row.party_id||row.SUPPLIER_ID||'',SUPPLIER_NAME:row.party_name||row.SUPPLIER_NAME||'',LOCATION_ID:row.wh_id||row.LOCATION_ID||'',TAXABLE_AMOUNT:Number(row.taxable)||0,CGST:Number(row.cgst)||0,SGST:Number(row.sgst)||0,IGST:Number(row.igst)||0,OTHER_CHARGES:Number(row.other_charges)||0,TOTAL_AMOUNT:Number(row.total)||0,STATUS:row.status||'unpaid',ITEMS_JSON:JSON.stringify(Array.isArray(row.items)?row.items:[]),UPDATED_AT:new Date().toISOString()};
+    if(existing>0){ const out=vals[existing].slice(); h.forEach((x,i)=>{if(base[x]!==undefined)out[i]=base[x];}); sh.getRange(existing+1,1,1,out.length).setValues([out]); }
+    else bnxAppendRow(clientId,SHEETS.PURCHASE_INVOICE,base);
+    // Rebuild purchase stock impact for this invoice id from source items.
+    const oldMoves=bnxGetRows_(clientId,SHEETS.STOCK_MOVEMENT).filter(m=>String(m.SOURCE_ID||'')===id&&String(m.SOURCE_TYPE||'').toUpperCase()==='PURCHASE_INVOICE');
+    // Remove the invoice's previous stock movements before rebuilding the
+    // edited invoice. This keeps REBUILD_STOCK_BALANCE mathematically
+    // consistent; a mere balance decrement would leave the old movement in
+    // the ledger and rebuild would double-count it.
+    if(oldMoves.length){
+      const sm=bnxClientSheet(clientId,SHEETS.STOCK_MOVEMENT), sv=sm.getDataRange().getValues(), sh=sv[0]||[], sidCol=sh.indexOf('SOURCE_ID'), stCol=sh.indexOf('SOURCE_TYPE');
+      if(sidCol>=0 && stCol>=0){
+        for(let r=sv.length-1;r>=1;r--){ if(String(sv[r][sidCol])===id && String(sv[r][stCol]).toUpperCase()==='PURCHASE_INVOICE') sm.deleteRow(r+1); }
+      }
+      for(const m of oldMoves){ if(Number(m.QUANTITY_IN)>0) bnxUpdateStockBalanceAfterMovement_(clientId,m.ITEM_ID,m.LOCATION_ID,Number(m.QUANTITY_IN),0,m.CREATED_AT||new Date().toISOString()); }
+    }
+    const items=Array.isArray(row.items)?row.items:[]; const date=String(row.inv_date||row.INVOICE_DATE||bnxBusinessDateKey_(new Date())).slice(0,10), wh=String(row.wh_id||row.LOCATION_ID||'');
+    for(const it of items){ const item=bnxInventoryItem_(clientId,it.item_id||it.ITEM_ID,it.item_name||it.ITEM_NAME); const qty=Number(it.qty||it.received||it.QUANTITY)||0; if(!item||qty<=0)continue; const rate=Number(it.rate||it.RATE)||bnxGetItemPurchaseRate_(clientId,item.itemId); bnxAppendRow(clientId,SHEETS.STOCK_MOVEMENT,{STOCK_MOVEMENT_ID:generateShortId_(clientId,'STOCK_MOVEMENT_ID'),CLIENT_ID:clientId,LOCATION_ID:wh,ITEM_ID:item.itemId,MOVEMENT_TYPE:'PURCHASE',MOVEMENT_DATE:date,QUANTITY_IN:qty,QUANTITY_OUT:0,RATE:rate,SOURCE_TYPE:'PURCHASE_INVOICE',SOURCE_ID:id,REFERENCE_NUMBER:String(row.inv_no||''),CREATED_BY:String(session.USER_ID||'Purchase'),CREATED_AT:new Date().toISOString()}); bnxUpdateStockBalanceAfterMovement_(clientId,item.itemId,wh,0,qty,new Date().toISOString()); }
+    try{bnxInvalidateTodayReportCaches_(clientId);}catch(e){} return {success:true,purchaseInvoiceId:id};
+  }catch(e){bnxLogError(clientId,'SYNC_PURCHASE_INVOICE_ROW failed: '+e.message,payload||{});return {success:false,message:e.message};}finally{try{lock.releaseLock();}catch(e){}}
+}
+function bnxDeletePurchaseInvoiceRow(session,payload){
+  const clientId=session.CLIENT_ID,id=String((payload||{}).id||'').trim(); if(!id)return {success:false,message:'Purchase invoice ID required'};
+  const lock=LockService.getScriptLock();try{lock.waitLock(10000);const sh=bnxClientSheet(clientId,SHEETS.PURCHASE_INVOICE),v=sh.getDataRange().getValues(),h=v[0]||[],ic=h.indexOf('PURCHASE_INVOICE_ID');for(let r=v.length-1;r>=1;r--)if(ic>=0&&String(v[r][ic])===id)sh.deleteRow(r+1);
+    const moves=bnxGetRows_(clientId,SHEETS.STOCK_MOVEMENT).filter(m=>String(m.SOURCE_ID||'')===id&&String(m.SOURCE_TYPE||'').toUpperCase()==='PURCHASE_INVOICE');
+    const sm=bnxClientSheet(clientId,SHEETS.STOCK_MOVEMENT),sv=sm.getDataRange().getValues(),smHeaders=sv[0]||[],sidCol=smHeaders.indexOf('SOURCE_ID'),stCol=smHeaders.indexOf('SOURCE_TYPE');
+    for(const m of moves)if(Number(m.QUANTITY_IN)>0)bnxUpdateStockBalanceAfterMovement_(clientId,m.ITEM_ID,m.LOCATION_ID,Number(m.QUANTITY_IN),0,m.CREATED_AT||new Date().toISOString());
+    if(sidCol>=0&&stCol>=0)for(let r=sv.length-1;r>=1;r--)if(String(sv[r][sidCol])===id&&String(sv[r][stCol]).toUpperCase()==='PURCHASE_INVOICE')sm.deleteRow(r+1);
+    return {success:true};
+  }catch(e){return {success:false,message:e.message};}finally{try{lock.releaseLock();}catch(e){}}
+}
+function bnxIssueStockToDept(session,payload){ return bnxSaveDeptIssueLive_(session,payload,'ISSUE_STOCK_TO_DEPT'); }
+function bnxSaveDeptIssueLive_(session,payload){
+  const clientId=session.CLIENT_ID,p=payload||{},issueId=String(p._id||p.issueId||generateShortId_(clientId,'ISSUE_ID')); const date=String(p.issue_date||p.date||bnxBusinessDateKey_(new Date())).slice(0,10),wh=String(p.wh_id||p.warehouseId||p.LOCATION_ID||''); const items=Array.isArray(p.items)?p.items:[]; if(!items.length)return {success:false,message:'Issue items required'};
+  const lock=LockService.getScriptLock();try{lock.waitLock(10000);const existing=bnxGetRows_(clientId,SHEETS.STOCK_MOVEMENT).some(m=>String(m.SOURCE_ID||'')===issueId&&String(m.SOURCE_TYPE||'').toUpperCase()==='DEPARTMENT_ISSUE');if(existing)return {success:true,issueId,duplicate:true};
+    const resolved=[];for(const x of items){const it=bnxInventoryItem_(clientId,x.item_id||x.ITEM_ID,x.item_name||x.name||x.ITEM_NAME);const qty=Number(x.qty||x.quantity)||0;if(!it||qty<=0)return {success:false,message:'Invalid issue item or quantity'};const av=bnxGetAvailableStockQty_(clientId,it.itemId,wh);if(av!==null&&av+1e-9<qty)return {success:false,message:'Insufficient stock for '+it.itemName};resolved.push({it,qty});}
+    for(const x of resolved){const rate=bnxGetItemPurchaseRate_(clientId,x.it.itemId),now=new Date().toISOString();bnxAppendRow(clientId,SHEETS.STOCK_MOVEMENT,{STOCK_MOVEMENT_ID:generateShortId_(clientId,'STOCK_MOVEMENT_ID'),CLIENT_ID:clientId,LOCATION_ID:wh,ITEM_ID:x.it.itemId,MOVEMENT_TYPE:'ISSUE',MOVEMENT_DATE:date,QUANTITY_IN:0,QUANTITY_OUT:x.qty,RATE:rate,SOURCE_TYPE:'DEPARTMENT_ISSUE',SOURCE_ID:issueId,REFERENCE_NUMBER:issueId,NOTES:String(p.purpose||''),CREATED_BY:String(p.issuedBy||session.USER_ID||'Store'),CREATED_AT:now});bnxUpdateStockBalanceAfterMovement_(clientId,x.it.itemId,wh,x.qty,0,now);}
+    return {success:true,issueId};
+  }catch(e){return {success:false,message:e.message};}finally{try{lock.releaseLock();}catch(e){}}
+}
+function bnxSaveDeptIssue(session,payload){return bnxSaveDeptIssueLive_(session,payload);}
+function bnxGetDeptIssues(session,payload){const clientId=session.CLIENT_ID,rows=bnxGetRows_(clientId,'DEPARTMENT_ISSUE');if(rows.length)return {success:true,issues:rows};const moves=bnxGetRows_(clientId,SHEETS.STOCK_MOVEMENT).filter(m=>String(m.SOURCE_TYPE||'').toUpperCase()==='DEPARTMENT_ISSUE');return {success:true,issues:moves};}
+function bnxAckDeptIssue(session,payload){return {success:true,issueId:(payload||{}).issueId||''};}
+function bnxSaveGRNLive(session,payload){
+  const clientId=session.CLIENT_ID,p=payload||{},id=String(p._id||p.grnId||generateShortId_(clientId,'GRN_ID')),date=String(p.grn_date||p.date||bnxBusinessDateKey_(new Date())).slice(0,10),wh=String(p.wh_id||p.locationId||''),items=Array.isArray(p.items)?p.items:[];if(!items.length)return {success:false,message:'GRN items required'};const lock=LockService.getScriptLock();try{lock.waitLock(10000);if(bnxGetRows_(clientId,SHEETS.STOCK_MOVEMENT).some(m=>String(m.SOURCE_ID||'')===id&&String(m.SOURCE_TYPE||'').toUpperCase()==='GRN'))return {success:true,grnId:id,duplicate:true};for(const x of items){const it=bnxInventoryItem_(clientId,x.item_id||x.ITEM_ID,x.item_name||x.ITEM_NAME);const qty=Number(x.received||x.qty||x.QUANTITY)||0;if(!it||qty<=0)continue;const rate=Number(x.rate||x.RATE)||bnxGetItemPurchaseRate_(clientId,it.itemId),now=new Date().toISOString();bnxAppendRow(clientId,SHEETS.STOCK_MOVEMENT,{STOCK_MOVEMENT_ID:generateShortId_(clientId,'STOCK_MOVEMENT_ID'),CLIENT_ID:clientId,LOCATION_ID:wh,ITEM_ID:it.itemId,MOVEMENT_TYPE:'PURCHASE',MOVEMENT_DATE:date,QUANTITY_IN:qty,QUANTITY_OUT:0,RATE:rate,SOURCE_TYPE:'GRN',SOURCE_ID:id,REFERENCE_NUMBER:String(p.inv_no||p.INVOICE_NO||id),CREATED_BY:String(p.received_by||session.USER_ID||'Store'),CREATED_AT:now});bnxUpdateStockBalanceAfterMovement_(clientId,it.itemId,wh,0,qty,now);}return {success:true,grnId:id};}catch(e){return {success:false,message:e.message};}finally{try{lock.releaseLock();}catch(e){}}
+}
+function bnxSaveTransferLive(session,payload){const clientId=session.CLIENT_ID,p=payload||{},id=String(p._id||p.transferId||generateShortId_(clientId,'TRANSFER_ID')),from=String(p.from_wh||p.fromWh||''),to=String(p.to_wh||p.toWh||''),items=Array.isArray(p.items)?p.items:[],date=String(p.date||bnxBusinessDateKey_(new Date())).slice(0,10);if(!from||!to||from===to||!items.length)return {success:false,message:'Valid source, destination and items required'};const lock=LockService.getScriptLock();try{lock.waitLock(10000);if(bnxGetRows_(clientId,SHEETS.STOCK_MOVEMENT).some(m=>String(m.SOURCE_ID||'')===id&&String(m.SOURCE_TYPE||'').toUpperCase()==='TRANSFER'))return {success:true,transferId:id,duplicate:true};for(const x of items){const it=bnxInventoryItem_(clientId,x.item_id||x.ITEM_ID,x.item_name||x.ITEM_NAME);const qty=Number(x.qty||x.quantity)||0;if(!it||qty<=0)return {success:false,message:'Invalid transfer item'};const av=bnxGetAvailableStockQty_(clientId,it.itemId,from);if(av!==null&&av+1e-9<qty)return {success:false,message:'Insufficient stock for '+it.itemName};}for(const x of items){const it=bnxInventoryItem_(clientId,x.item_id||x.ITEM_ID,x.item_name||x.ITEM_NAME),qty=Number(x.qty||x.quantity)||0,rate=bnxGetItemPurchaseRate_(clientId,it.itemId),now=new Date().toISOString();bnxAppendRow(clientId,SHEETS.STOCK_MOVEMENT,{STOCK_MOVEMENT_ID:generateShortId_(clientId,'STOCK_MOVEMENT_ID'),CLIENT_ID:clientId,LOCATION_ID:from,ITEM_ID:it.itemId,MOVEMENT_TYPE:'TRANSFER_OUT',MOVEMENT_DATE:date,QUANTITY_IN:0,QUANTITY_OUT:qty,RATE:rate,SOURCE_TYPE:'TRANSFER',SOURCE_ID:id,CREATED_BY:String(session.USER_ID||'Store'),CREATED_AT:now});bnxUpdateStockBalanceAfterMovement_(clientId,it.itemId,from,qty,0,now);bnxAppendRow(clientId,SHEETS.STOCK_MOVEMENT,{STOCK_MOVEMENT_ID:generateShortId_(clientId,'STOCK_MOVEMENT_ID'),CLIENT_ID:clientId,LOCATION_ID:to,ITEM_ID:it.itemId,MOVEMENT_TYPE:'TRANSFER_IN',MOVEMENT_DATE:date,QUANTITY_IN:qty,QUANTITY_OUT:0,RATE:rate,SOURCE_TYPE:'TRANSFER',SOURCE_ID:id,CREATED_BY:String(session.USER_ID||'Store'),CREATED_AT:now});bnxUpdateStockBalanceAfterMovement_(clientId,it.itemId,to,0,qty,now);}return {success:true,transferId:id};}catch(e){return {success:false,message:e.message};}finally{try{lock.releaseLock();}catch(e){}}
+}
+function bnxSavePhysicalAdjustment(session,payload){const clientId=session.CLIENT_ID,p=payload||{},date=String(p.date||bnxBusinessDateKey_(new Date())).slice(0,10),wh=String(p.wh_id||p.locationId||''),items=Array.isArray(p.items)?p.items:[],countId=String(p.countId||p.COUNT_ID||'').trim()||generateShortId_(clientId,'COUNT_ID');if(!items.length||!wh)return {success:false,message:'Physical adjustment requires warehouse and items'};const lock=LockService.getScriptLock();try{lock.waitLock(10000);const existing=bnxGetRows_(clientId,SHEETS.STOCK_MOVEMENT).some(r=>String(r.SOURCE_TYPE||'').toUpperCase()==='PHYSICAL_COUNT'&&String(r.SOURCE_ID||'')===countId);if(existing)return {success:true,alreadyPosted:true,countId,adjusted:[]};const results=[];for(const x of items){const it=bnxInventoryItem_(clientId,x.item_id||x.ITEM_ID,x.item_name||x.ITEM_NAME),counted=Number(x.countedQty);if(!it||!Number.isFinite(counted)||counted<0)continue;const current=bnxGetAvailableStockQty_(clientId,it.itemId,wh);if(current===null)continue;const diff=+(counted-current).toFixed(4);if(Math.abs(diff)<0.00001)continue;const now=new Date().toISOString();bnxAppendRow(clientId,SHEETS.STOCK_MOVEMENT,{STOCK_MOVEMENT_ID:generateShortId_(clientId,'STOCK_MOVEMENT_ID'),CLIENT_ID:clientId,LOCATION_ID:wh,ITEM_ID:it.itemId,MOVEMENT_TYPE:'ADJUSTMENT',MOVEMENT_DATE:date,QUANTITY_IN:diff>0?diff:0,QUANTITY_OUT:diff<0?-diff:0,RATE:bnxGetItemPurchaseRate_(clientId,it.itemId),SOURCE_TYPE:'PHYSICAL_COUNT',SOURCE_ID:countId,NOTES:String(x.remark||''),CREATED_BY:String(session.USER_ID||'Store'),CREATED_AT:now});bnxUpdateStockBalanceAfterMovement_(clientId,it.itemId,wh,diff<0?-diff:0,diff>0?diff:0,now);results.push({itemId:it.itemId,diff});}return {success:true,countId,adjusted:results};}catch(e){return {success:false,message:e.message};}finally{try{lock.releaseLock();}catch(e){}}}
+function bnxApplySupplierDueDelta_(clientId,locationId,supplierId,delta,date){
+  const sh=bnxClientSheet(clientId,'SUPPLIER_DUES'),v=sh.getDataRange().getValues(),h=v[0]||[],sid=h.indexOf('SUPPLIER_ID'),lid=h.indexOf('LOCATION_ID'),bal=h.indexOf('CURRENT_BALANCE'); let rr=-1;
+  for(let r=1;r<v.length;r++) if(String(v[r][sid]||'')===String(supplierId)&&(!locationId||String(v[r][lid]||'')===String(locationId))){rr=r;break;}
+  const now=new Date().toISOString();
+  if(rr<0){bnxAppendRow(clientId,'SUPPLIER_DUES',{SUPPLIER_DUES_ID:generateShortId_(clientId,'SUPPLIER_DUES_ID'),CLIENT_ID:clientId,LOCATION_ID:locationId,SUPPLIER_ID:supplierId,OPENING_BALANCE:0,CURRENT_BALANCE:+delta.toFixed(2),LAST_TRANSACTION_DATE:date,STATUS:delta>0?'OUTSTANDING':'SETTLED',UPDATED_AT:now});return;}
+  const nw=+((Number(v[rr][bal])||0)+delta).toFixed(2); if(bal>=0)sh.getRange(rr+1,bal+1).setValue(nw);
+  const ld=h.indexOf('LAST_TRANSACTION_DATE'),st=h.indexOf('STATUS'),up=h.indexOf('UPDATED_AT'); if(ld>=0)sh.getRange(rr+1,ld+1).setValue(date); if(st>=0)sh.getRange(rr+1,st+1).setValue(nw>0?'OUTSTANDING':'SETTLED'); if(up>=0)sh.getRange(rr+1,up+1).setValue(now);
+}
+function bnxSavePurchaseReturnLive(session,payload){
+  const clientId=session.CLIENT_ID,p=payload||{},id=String(p.returnId||p._id||generateShortId_(clientId,'PURCHASE_RETURN_ID')),date=String(p.returnDate||p.return_date||p.date||bnxBusinessDateKey_(new Date())).slice(0,10),wh=String(p.locationId||p.wh_id||p.LOCATION_ID||''),supplierId=String(p.supplierId||p.SUPPLIER_ID||''),items=Array.isArray(p.items)?p.items:[];
+  if(!wh||!items.length)return {success:false,message:'Purchase return requires location and items'};
+  const lock=LockService.getScriptLock();try{lock.waitLock(10000);if(bnxGetRows_(clientId,'PURCHASE_RETURN').some(x=>String(x.PURCHASE_RETURN_ID||'')===id))return {success:true,returnId:id,duplicate:true};
+    const resolved=[];let total=0;for(const x of items){const it=bnxInventoryItem_(clientId,x.itemId||x.ITEM_ID,x.itemName||x.ITEM_NAME);const qty=Number(x.qty||x.quantity||x.QUANTITY)||0;if(!it||qty<=0)return {success:false,message:'Invalid return item or quantity'};const av=bnxGetAvailableStockQty_(clientId,it.itemId,wh);if(av!==null&&av+1e-9<qty)return {success:false,message:'Insufficient stock for return: '+it.itemName};const rate=Number(x.rate||x.RATE)||bnxGetItemPurchaseRate_(clientId,it.itemId),line=+(qty*rate).toFixed(2);resolved.push({it,qty,rate,line,unitId:x.unitId||x.UNIT_ID||''});total+=line;}
+    const now=new Date().toISOString();bnxAppendRow(clientId,'PURCHASE_RETURN',{PURCHASE_RETURN_ID:id,CLIENT_ID:clientId,LOCATION_ID:wh,SUPPLIER_ID:supplierId,RETURN_NUMBER:String(p.returnNumber||p.RETURN_NUMBER||id),RETURN_DATE:date,REFERENCE_PURCHASE_ID:String(p.purchaseId||p.PURCHASE_ID||p.referencePurchaseId||''),TOTAL_AMOUNT:+total.toFixed(2),STATUS:String(p.status||'POSTED'),REASON:String(p.reason||p.REASON||''),CREATED_BY:String(session.USER_ID||p.createdBy||'Purchase'),CREATED_AT:now});
+    for(const x of resolved){bnxAppendRow(clientId,'PURCHASE_RETURN_ITEMS',{PURCHASE_RETURN_ITEM_ID:generateShortId_(clientId,'PURCHASE_RETURN_ITEM_ID'),PURCHASE_RETURN_ID:id,ITEM_ID:x.it.itemId,QUANTITY:x.qty,UNIT_ID:x.unitId,RATE:x.rate,TAX_RATE:Number(x.taxRate||x.TAX_RATE)||0,LINE_TOTAL:x.line,REASON:String(p.reason||x.reason||''),CREATED_AT:now});bnxAppendRow(clientId,SHEETS.STOCK_MOVEMENT,{STOCK_MOVEMENT_ID:generateShortId_(clientId,'STOCK_MOVEMENT_ID'),CLIENT_ID:clientId,LOCATION_ID:wh,ITEM_ID:x.it.itemId,MOVEMENT_TYPE:'PURCHASE_RETURN',MOVEMENT_DATE:date,QUANTITY_IN:0,QUANTITY_OUT:x.qty,RATE:x.rate,SOURCE_TYPE:'PURCHASE_RETURN',SOURCE_ID:id,REFERENCE_NUMBER:String(p.returnNumber||id),NOTES:String(p.reason||''),CREATED_BY:String(session.USER_ID||'Purchase'),CREATED_AT:now});bnxUpdateStockBalanceAfterMovement_(clientId,x.it.itemId,wh,x.qty,0,now);}
+    if(supplierId)bnxApplySupplierDueDelta_(clientId,wh,supplierId,-total,date);try{bnxInvalidateTodayReportCaches_(clientId);}catch(e){}return {success:true,returnId:id,total:+total.toFixed(2)};
+  }catch(e){bnxLogError(clientId,'SAVE_PURCHASE_RETURN failed: '+e.message,p);return {success:false,message:e.message};}finally{try{lock.releaseLock();}catch(e){}}
+}
+function bnxSavePurchasePaymentLive(session,payload){
+  const clientId=session.CLIENT_ID,p=payload||{},id=String(p.paymentId||p._id||generateShortId_(clientId,'PURCHASE_PAYMENT_ID')),amount=Number(p.amount||p.AMOUNT)||0,supplierId=String(p.supplierId||p.SUPPLIER_ID||''),wh=String(p.locationId||p.LOCATION_ID||p.wh_id||'');if(!(amount>0)||!supplierId)return {success:false,message:'Supplier and payment amount are required'};
+  const lock=LockService.getScriptLock();try{lock.waitLock(10000);if(bnxGetRows_(clientId,'PURCHASE_PAYMENT').some(x=>String(x.PURCHASE_PAYMENT_ID||'')===id))return {success:true,paymentId:id,duplicate:true};const date=String(p.paymentDate||p.PAYMENT_DATE||p.date||bnxBusinessDateKey_(new Date())).slice(0,10),now=new Date().toISOString();bnxAppendRow(clientId,'PURCHASE_PAYMENT',{PURCHASE_PAYMENT_ID:id,CLIENT_ID:clientId,LOCATION_ID:wh,SUPPLIER_ID:supplierId,PURCHASE_ID:String(p.purchaseId||p.PURCHASE_ID||''),AMOUNT:amount,PAYMENT_MODE:String(p.paymentMode||p.PAYMENT_MODE||'CASH'),PAYMENT_DATE:date,REFERENCE:String(p.reference||p.REFERENCE||''),STATUS:String(p.status||'POSTED'),CREATED_BY:String(session.USER_ID||p.createdBy||'Purchase'),CREATED_AT:now});bnxApplySupplierDueDelta_(clientId,wh,supplierId,-amount,date);try{bnxInvalidateTodayReportCaches_(clientId);}catch(e){}return {success:true,paymentId:id,amount};}catch(e){return {success:false,message:e.message};}finally{try{lock.releaseLock();}catch(e){}}
+}
+function bnxCloseBusinessDayLive(session,payload){const clientId=session.CLIENT_ID,p=payload||{},date=String(p.businessDate||p.date||bnxBusinessDateKey_(new Date())).slice(0,10),cashCounted=Number(p.cashCounted||p.CASH_COUNTED)||0;try{const rows=bnxGetRows_(clientId,SHEETS.DAY_STATUS),closed=rows.find(x=>String(x.BUSINESS_DATE||'')===date&&String(x.STATUS||'').toUpperCase()==='CLOSED');if(closed)return {success:true,businessDate:date,alreadyClosed:true};bnxUpsertDayStatus_(clientId,date,{STATUS:'CLOSED',CLOSED_AT:new Date().toISOString(),CASH_COUNTED:cashCounted});return {success:true,businessDate:date,status:'CLOSED'};}catch(e){return {success:false,message:e.message};}}
 
 function doPost(e) {
   try {
@@ -924,44 +1386,51 @@ function bnxVoidBill(session, payload) {
   const billNumber = String(payload.billNumber || payload.BILL_NUMBER || '').trim();
   const reason = String(payload.reason || '').trim();
   if (!billNumber) return { success: false, error: 'billNumber is required' };
+  const lock=LockService.getScriptLock();
   try {
+    lock.waitLock(10000);
     const found = bnxFindBillRowByNumber_(clientId, billNumber);
     if (!found) return { success: false, error: 'Bill not found for this client (billNumber: ' + billNumber + ')' };
     const sheet = found.sheet, headers = found.headers, rowNo = found.rowNo, values = found.values;
     const bill = bnxRowToObject(values, headers);
     const currentStatus = String(bill.BILL_STATUS || '').toUpperCase();
-    if (currentStatus === 'CANCELLED' || currentStatus === 'VOID') {
-      return { success: true, billNumber: billNumber, alreadyVoided: true };
-    }
+    if (currentStatus === 'CANCELLED' || currentStatus === 'VOID') return { success: true, billNumber: billNumber, alreadyVoided: true };
 
-    const statusCol = headers.indexOf('BILL_STATUS');
-    const reasonCol = headers.indexOf('VOID_REASON');
-    const byCol = headers.indexOf('VOIDED_BY');
-    const atCol = headers.indexOf('VOIDED_AT');
     const nowIso = new Date().toISOString();
+    // Reverse every financial/inventory side-effect BEFORE marking the bill
+    // cancelled. If a required reversal fails, the invoice stays FINALIZED so
+    // the operator cannot end up with a cancelled bill whose money/stock was
+    // never reversed.
+    const paymentRev = bnxReverseBillPayments_(clientId,bill,userId,nowIso,reason);
+    // CUSTOMER_DUES stores the outstanding balance, not cumulative payments.
+    // On void, remove exactly the balance that remained immediately before
+    // the void. For a fully-paid bill this is zero; for a credit bill it is
+    // the remaining due after any later payments.
+    const outstandingBeforeVoid = Math.max(0, Number(bill.DUE_AMOUNT)||0);
+    if(outstandingBeforeVoid>0 && bill.CUSTOMER_ID) bnxAdjustCustomerDue_(clientId,bill.CUSTOMER_ID,-outstandingBeforeVoid,bill.BILL_DATE||bnxNowParts_().businessDate,'VOID_BILL');
+    bnxReverseBillStock_(clientId,bill,userId,nowIso);
+    bnxReverseBillLedger_(clientId,bill,userId,nowIso,reason);
+
+    const statusCol = headers.indexOf('BILL_STATUS'), reasonCol = headers.indexOf('VOID_REASON'), byCol = headers.indexOf('VOIDED_BY'), atCol = headers.indexOf('VOIDED_AT'), dueCol=headers.indexOf('DUE_AMOUNT'), payStatusCol=headers.indexOf('PAYMENT_STATUS');
     if (statusCol !== -1) sheet.getRange(rowNo, statusCol + 1).setValue('CANCELLED');
     if (reasonCol !== -1) sheet.getRange(rowNo, reasonCol + 1).setValue(reason);
     if (byCol !== -1) sheet.getRange(rowNo, byCol + 1).setValue(userId);
     if (atCol !== -1) sheet.getRange(rowNo, atCol + 1).setValue(nowIso);
-
-    try {
-      bnxReverseBillLedger_(clientId, bill, userId, nowIso, reason);
-    } catch (ledgerErr) {
-      console.warn('[bnxVoidBill] ledger reversal failed: ' + ledgerErr.message);
-    }
+    if (dueCol !== -1) sheet.getRange(rowNo,dueCol+1).setValue(0);
+    if (payStatusCol !== -1) sheet.getRange(rowNo,payStatusCol+1).setValue('VOID');
 
     bnxCreateAuditLog(clientId, {
-      CLIENT_ID: clientId, USER_ID: userId, ACTION: 'VOID', MODULE: 'BILLING',
+      CLIENT_ID: clientId, LOCATION_ID: bill.LOCATION_ID || '', USER_ID: userId, ACTION: 'VOID', MODULE: 'BILLING',
       RECORD_TYPE: 'BILL', RECORD_ID: bill.BILL_ID || billNumber,
-      OLD_VALUE: JSON.stringify({ BILL_STATUS: bill.BILL_STATUS }),
-      NEW_VALUE: JSON.stringify({ BILL_STATUS: 'CANCELLED', reason: reason }), TIMESTAMP: nowIso
+      OLD_VALUE: JSON.stringify({ BILL_STATUS: bill.BILL_STATUS, PAYMENT_STATUS: bill.PAYMENT_STATUS }),
+      NEW_VALUE: JSON.stringify({ BILL_STATUS: 'CANCELLED', PAYMENT_STATUS: 'VOID', reversedPayments: paymentRev.count, reversedPaymentAmount: paymentRev.total, reason: reason }), TIMESTAMP: nowIso
     });
     try { bnxInvalidateTodayReportCaches_(clientId); } catch (e) {}
-    return { success: true, billNumber: billNumber, billId: bill.BILL_ID || '' };
+    return { success: true, billNumber: billNumber, billId: bill.BILL_ID || '', reversedPayments: paymentRev.count, reversedPaymentAmount: paymentRev.total };
   } catch (error) {
     bnxLogError(clientId, `bnxVoidBill failed: ${error.message}`, payload);
     return { success: false, error: error.message };
-  }
+  } finally { try{lock.releaseLock();}catch(e){} }
 }
 
 function bnxReverseBillLedger_(clientId, bill, userId, nowIso, reason) {
@@ -991,6 +1460,17 @@ function bnxReverseBillLedger_(clientId, bill, userId, nowIso, reason) {
   }
   if (!originalLines.length) return;
 
+  // Idempotency: a repeated VOID request must not append a second reversal journal.
+  try {
+    const jsh = bnxClientSheet(clientId, SHEETS.JOURNAL);
+    const jv = jsh.getDataRange().getValues(); const jh=jv[0]||[];
+    const stCol=jh.indexOf('SOURCE_TYPE'), sidCol=jh.indexOf('SOURCE_ID');
+    if(stCol!==-1&&sidCol!==-1){
+      for(let rr=1;rr<jv.length;rr++){
+        if(String(jv[rr][stCol])==='BILL_VOID' && String(jv[rr][sidCol])===String(billId)) return;
+      }
+    }
+  } catch(e) {}
   const reversalJournalId = generateShortId_(clientId, 'JOURNAL_ID');
   const totalDr = +originalLines.reduce((s, l) => s + (Number(l.CREDIT) || 0), 0).toFixed(2);
   const totalCr = +originalLines.reduce((s, l) => s + (Number(l.DEBIT) || 0), 0).toFixed(2);
@@ -1039,6 +1519,13 @@ function bnxReverseBillLedger_(clientId, bill, userId, nowIso, reason) {
       case 'GET_MENU_ITEMS': result = bnxGetMenuItems(session, payload); break;
       case 'GET_BAR_MENU': result = bnxGetBarMenu(session, payload); break;
       case 'GET_POS_MENU': result = bnxGetPosMenu(session, payload); break;
+      case 'SAVE_KITCHEN_INDENT': result = bnxSaveKitchenIndent(session, payload); break;
+      case 'GET_PENDING_INDENTS': result = bnxGetPendingIndents(session, payload); break;
+      case 'APPROVE_ISSUE_INDENT': result = bnxApproveIssueIndent(session, payload); break;
+      case 'SAVE_KITCHEN_CONSUMPTION': result = bnxSaveKitchenConsumption(session, payload); break;
+      case 'GET_CONSUMPTION_HISTORY': result = bnxGetConsumptionHistory(session, payload); break;
+      case 'SAVE_WASTAGE': result = bnxSaveWastage(session, payload); break;
+      case 'GET_WASTAGE_LOG': result = bnxGetWastageLog(session, payload); break;
       case 'GET_PAYMENT_MODES': result = bnxGetPaymentModes(session, payload); break;
       case 'GET_TAX_CONFIG': result = bnxGetTaxConfig(session, payload); break;
       case 'HEARTBEAT': result = { success: true, timestamp: new Date().toISOString() }; break;
@@ -1131,7 +1618,18 @@ function bnxReverseBillLedger_(clientId, bill, userId, nowIso, reason) {
       case 'GET_CLIENT_POS_PROFILE': result = bnxGetClientPosProfile_(session, payload); break;
       case 'AUTO_REPAIR_CLIENT': result = bnxAutoRepairClient_(session, payload); break;
       case 'GET_CLIENT_SCALE_STATUS': result = bnxGetClientScaleStatus_(session, payload); break;
-      default:
+      case 'SYNC_PURCHASE_INVOICE_ROW': result = bnxSavePurchaseInvoiceRow(session, payload); break;
+      case 'DELETE_PURCHASE_INVOICE_ROW': result = bnxDeletePurchaseInvoiceRow(session, payload); break;
+      case 'ISSUE_STOCK_TO_DEPT': result = bnxIssueStockToDept(session, payload); break;
+      case 'SAVE_DEPT_ISSUE': result = bnxSaveDeptIssue(session, payload); break;
+      case 'GET_DEPT_ISSUES': result = bnxGetDeptIssues(session, payload); break;
+      case 'ACK_DEPT_ISSUE': result = bnxAckDeptIssue(session, payload); break;
+      case 'SAVE_GRN': result = bnxSaveGRNLive(session, payload); break;
+      case 'SAVE_STOCK_TRANSFER': result = bnxSaveTransferLive(session, payload); break;
+      case 'SAVE_PHYSICAL_ADJUSTMENT': result = bnxSavePhysicalAdjustment(session, payload); break;
+      case 'SAVE_PURCHASE_RETURN': result = bnxSavePurchaseReturnLive(session, payload); break;
+      case 'SAVE_PURCHASE_PAYMENT': result = bnxSavePurchasePaymentLive(session, payload); break;
+      case 'CLOSE_BUSINESS_DAY': result = bnxCloseBusinessDayLive(session, payload); break;      default:
         return respondJson(respondError(400, `Unknown action: ${action}`, requestId));
     }
     return respondJson(result);
@@ -1526,22 +2024,29 @@ function bnxSaveOrder(session, payload) {
     if (friendlyOrderNo) {
       try {
         const omSheet = bnxClientSheet(clientId, SHEETS.ORDER_MASTER);
-        const omValues = omSheet.getDataRange().getValues();
-        const omHeaders = omValues[0];
-        const ciCol = omHeaders.indexOf('CLIENT_ID');
-        const noCol = omHeaders.indexOf('ORDER_NUMBER');
-        const idCol = omHeaders.indexOf('ORDER_ID');
-        const statusCol = omHeaders.indexOf('ORDER_STATUS');
-        const updatedCol = omHeaders.indexOf('UPDATED_AT');
-        for (let r = omValues.length - 1; r >= 1; r--) {
-          if (ciCol !== -1 && omValues[r][ciCol] !== clientId) continue;
-          if (noCol === -1 || String(omValues[r][noCol] || '').trim() !== String(friendlyOrderNo).trim()) continue;
-          const status = statusCol !== -1 ? String(omValues[r][statusCol] || '').toUpperCase() : '';
-          if (status === 'BILLED' || status === 'CANCELLED') continue; // that order is closed -- a new SAVE_ORDER under the same old number is a fresh order, not an add-on
-          orderId = idCol !== -1 ? omValues[r][idCol] : '';
-          if (updatedCol !== -1) omSheet.getRange(r + 1, updatedCol + 1).setValue(wallClockNow.iso);
-          isAddOn = true;
-          break;
+        const omLastCol = omSheet.getLastColumn(), omLastRow = omSheet.getLastRow();
+        if (omLastRow > 1 && omLastCol > 0) {
+          const omHeaders = omSheet.getRange(1, 1, 1, omLastCol).getValues()[0].map(String);
+          const noCol = omHeaders.indexOf('ORDER_NUMBER');
+          const idCol = omHeaders.indexOf('ORDER_ID');
+          const statusCol = omHeaders.indexOf('ORDER_STATUS');
+          const updatedCol = omHeaders.indexOf('UPDATED_AT');
+          const ciCol = omHeaders.indexOf('CLIENT_ID');
+          if (noCol !== -1) {
+            const matches = omSheet.getRange(2, noCol + 1, omLastRow - 1, 1)
+              .createTextFinder(String(friendlyOrderNo).trim()).matchEntireCell(true).findAll();
+            for (let mi = matches.length - 1; mi >= 0; mi--) {
+              const rowNo = matches[mi].getRow();
+              const vals = omSheet.getRange(rowNo, 1, 1, omLastCol).getValues()[0];
+              if (ciCol !== -1 && String(vals[ciCol] || '').trim() !== String(clientId).trim()) continue;
+              const status = statusCol !== -1 ? String(vals[statusCol] || '').toUpperCase() : '';
+              if (status === 'BILLED' || status === 'CANCELLED') continue;
+              orderId = idCol !== -1 ? vals[idCol] : '';
+              if (updatedCol !== -1) omSheet.getRange(rowNo, updatedCol + 1).setValue(wallClockNow.iso);
+              isAddOn = true;
+              break;
+            }
+          }
         }
       } catch (e) { /* lookup best-effort -- falls through to normal insert below on any error */ }
     }
@@ -1577,34 +2082,6 @@ function bnxSaveOrder(session, payload) {
       };
       bnxAppendRow(clientId, SHEETS.ORDER_ITEMS, orderItem);
     });
-    // SINGLE SOURCE OF TRUTH: every successful DINE-IN table order moves
-    // the real TABLE_LIVE_STATE row to RUNNING immediately. This is what makes
-    // the same running table appear on Restaurant Dashboard, Steward Maps,
-    // My Running Tables and other devices without waiting for a stale local
-    // cache. Counter/Delivery/Quick-Bill pseudo tables are excluded.
-    const orderTableId = String(payload.tableId || payload.TABLE_ID || '').trim();
-    if (orderTableId && !/^(COUNTER|DELIVERY|#QB)/i.test(orderTableId)) {
-      const orderAmount = (payload.items || []).reduce((sum, item) => {
-        const q = Number(item.qty != null ? item.qty : item.QUANTITY) || 0;
-        const rate = Number(item.price != null ? item.price : (item.rate != null ? item.rate : item.RATE)) || 0;
-        return sum + q * rate;
-      }, 0);
-      try {
-        bnxSaveTableStatusHandler(session, {
-          requestId: requestId ? String(requestId) + ':TABLE_LIVE' : generateShortId_(clientId,'TABLE_SYNC'),
-          tableNo: orderTableId,
-          status: 'RUNNING',
-          covers: Number(payload.covers || payload.PAX || 0) || 0,
-          bill: orderAmount,
-          steward: payload.steward || payload.waiter || payload.captain || payload.createdByName || '',
-          stewardId: payload.stewardId || payload.waiterId || payload.captainId || payload.createdById || userId,
-          stewardLogin: payload.stewardLogin || payload.waiterLogin || payload.captainLogin || payload.createdByLogin || ''
-        });
-      } catch (tableErr) {
-        console.warn('[SAVE_ORDER] table live projection deferred:', tableErr.message);
-      }
-    }
-
     bnxCreateAuditLog(clientId, {
       CLIENT_ID: clientId, LOCATION_ID: locationId, USER_ID: userId, ACTION: isAddOn ? 'ADD_ITEMS' : 'CREATE',
       MODULE: payload.orderSource || 'POS', RECORD_TYPE: 'ORDER', RECORD_ID: orderId, OLD_VALUE: '{}',
@@ -1735,7 +2212,8 @@ function bnxSaveBill(session, payload) {
       COUNTER_CODE: bnxNormalizeCounterCode_(bill.counterCode || payload.counterCode || 'C1'),
       BILL_NUMBER: bnxGenerateBillNumber(clientId, locationId, bill.counterCode || payload.counterCode || 'C1'), BILL_DATE: now.businessDate, BILL_TIME: now.time,
       TABLE_ID: bill.table || '', CUSTOMER_ID: customerId, CUSTOMER_NAME: bill.customer || 'Walk-in',
-      BILL_TYPE: 'DINEIN', COVERS: 1, SUBTOTAL: subtotal, ITEM_DISCOUNT: 0,
+      BILL_TYPE: String(bill.billType || bill.BILL_TYPE || bill.orderType || bill.ORDER_TYPE || (bill.table ? 'DINEIN' : 'TAKEAWAY')).toUpperCase(),
+      COVERS: Number(bill.covers || bill.COVERS || bill.pax || bill.PAX || 1) || 1, SUBTOTAL: subtotal, ITEM_DISCOUNT: 0,
       SUBTOTAL_AFTER_ITEM_DISCOUNT: taxableAfterDiscount, BILL_DISCOUNT: billDiscount, TAXABLE_AMOUNT: taxableAfterDiscount,
       TAX_RATE: taxableAfterDiscount > 0 ? +(tax / taxableAfterDiscount).toFixed(4) : 0, TAX_AMOUNT: tax,
       ROUND_OFF: +(total - (taxableAfterDiscount + tax)).toFixed(2), GRAND_TOTAL: total,
@@ -1747,6 +2225,7 @@ function bnxSaveBill(session, payload) {
     };
     bnxAppendRow(clientId, SHEETS.BILL_MASTER, billMaster);
     const itemNameMap_ = bnxCachedItemNameMap_(clientId);
+    const itemCostMap_ = bnxCachedItemCostMap_(clientId);
     /* PASS #66: build every BILL_ITEMS row first, write them ALL in one
        batch call instead of one bnxAppendRow per item. */
     const billItemRows = [];
@@ -1754,7 +2233,7 @@ function bnxSaveBill(session, payload) {
       const qty = item.qty || 0;
       const rate = item.rate || 0;
       const lineTotal = item.amt != null ? item.amt : qty * rate;
-      const resolvedItemId = itemNameMap_[String(item.name||'').toLowerCase().trim()] || '';
+      const resolvedItemId = String(item.ITEM_ID || item.itemId || '').trim() || itemNameMap_[String(item.name||'').toLowerCase().trim()] || '';
       // FIX ("liquor items non-GST 0"): prefer the real per-item rate the
       // frontend now sends (item.taxRate, e.g. 0 for liquor, 0.05 for
       // food) over the old one-rate-for-the-whole-bill fallback.
@@ -1762,7 +2241,7 @@ function bnxSaveBill(session, payload) {
       billItemRows.push({
         BILL_ITEM_ID: generateShortId_(clientId, 'BILL_ITEM_ID'), BILL_ID: billId, ORDER_ITEM_ID: '', ITEM_ID: resolvedItemId,
         SEQUENCE: idx + 1, ITEM_NAME: item.name || '', QUANTITY: qty, UNIT_ID: 'PIECE', RATE: rate,
-        LINE_DISCOUNT: 0, DISCOUNTED_RATE: rate, TAXABLE_PER_ITEM: lineTotal,
+        LINE_DISCOUNT: Number(item.discount || item.LINE_DISCOUNT || 0) || 0, DISCOUNTED_RATE: Number(item.discountedRate || item.DISCOUNTED_RATE || rate) || rate, TAXABLE_PER_ITEM: lineTotal,
         TAX_RATE: lineTaxRate, TAX_PER_ITEM: +(lineTotal * lineTaxRate).toFixed(2),
         LINE_TOTAL: lineTotal, CREATED_AT: wallClockNow.iso
       });
@@ -1789,11 +2268,16 @@ function bnxSaveBill(session, payload) {
     const stockMovementRows = [];
     (bill.itemsDetail || []).forEach(item => {
       const rate = item.rate || 0;
-      const resolvedItemId = itemNameMap_[String(item.name||'').toLowerCase().trim()] || '';
+      const resolvedItemId = String(item.ITEM_ID || item.itemId || '').trim() || itemNameMap_[String(item.name||'').toLowerCase().trim()] || '';
+      // P0 accounting fix: never invent cost as 50% of selling price.
+      // Use the real current ITEM_MASTER.PURCHASE_RATE. If no real cost is
+      // configured, record zero rather than fabricate COGS. Recipe costing
+      // remains available through the dedicated recipe/cost engine.
+      const actualCostRate = resolvedItemId ? Number(itemCostMap_[resolvedItemId] || 0) : 0;
       stockMovementRows.push({
         STOCK_MOVEMENT_ID: generateShortId_(clientId, 'STOCK_MOVEMENT_ID'), CLIENT_ID: clientId, LOCATION_ID: locationId, ITEM_ID: resolvedItemId,
         MOVEMENT_TYPE: 'SALE', MOVEMENT_DATE: now.businessDate, QUANTITY_IN: 0, QUANTITY_OUT: item.qty || 0,
-        RATE: rate * 0.5, SOURCE_TYPE: 'BILL', SOURCE_ID: billId, CREATED_BY: bill.waiter || userId,
+        RATE: actualCostRate, SOURCE_TYPE: 'BILL', SOURCE_ID: billId, CREATED_BY: bill.waiter || userId,
         CREATED_AT: wallClockNow.iso
       });
     });
@@ -1838,14 +2322,21 @@ function bnxSaveKOT(session, payload) {
     if (suppliedOrderRef) {
       try {
         const os = bnxClientSheet(clientId, SHEETS.ORDER_MASTER);
-        const ov = os.getDataRange().getValues();
-        const oh = ov[0] || [];
-        for (let r = 1; r < ov.length; r++) {
-          const o = bnxRowToObject(ov[r], oh);
-          if (o.CLIENT_ID !== clientId) continue;
-          if (String(o.ORDER_ID || '') === suppliedOrderRef || String(o.ORDER_NUMBER || '') === suppliedOrderRef) {
-            linkedOrderId = o.ORDER_ID || suppliedOrderRef;
-            break;
+        const olc=os.getLastColumn(), olr=os.getLastRow();
+        if (olr>1 && olc>0) {
+          const oh=os.getRange(1,1,1,olc).getValues()[0].map(String);
+          const ci=oh.indexOf('CLIENT_ID');
+          for (const field of ['ORDER_ID','ORDER_NUMBER']) {
+            const col=oh.indexOf(field); if(col===-1) continue;
+            const matches=os.getRange(2,col+1,olr-1,1).createTextFinder(suppliedOrderRef).matchEntireCell(true).findAll();
+            for(let mi=matches.length-1;mi>=0;mi--){
+              const rowNo=matches[mi].getRow();
+              const vals=os.getRange(rowNo,1,1,olc).getValues()[0];
+              if(ci!==-1 && String(vals[ci]||'').trim()!==String(clientId).trim()) continue;
+              const oid=oh.indexOf('ORDER_ID');
+              if(oid!==-1 && vals[oid]) { linkedOrderId=String(vals[oid]).trim(); break; }
+            }
+            if(linkedOrderId!==suppliedOrderRef || field==='ORDER_ID') break;
           }
         }
       } catch (linkErr) { console.warn('[bnxSaveKOT] order link lookup failed: ' + linkErr.message); }
@@ -1859,7 +2350,7 @@ function bnxSaveKOT(session, payload) {
       KOT_SOURCE: payload.kotSource || payload.KOT_SOURCE || 'POS',
       KOT_DATE: now.businessDate, KOT_TIME: now.time, COVERS: payload.covers || payload.COVERS || 0,
       KOT_STATUS: 'PRINTED', PRIORITY: payload.priority || payload.PRIORITY || 'NORMAL',
-      STARTED_BY: payload.waiter || payload.steward || payload.captain || payload.createdByName || userId, KITCHEN_NOTES: payload.remarks || '',
+      STARTED_BY: payload.waiter || userId, KITCHEN_NOTES: payload.remarks || '',
       STARTED_AT: now.iso, CREATED_AT: now.iso
     };
     // HARD GUARANTEE: write to the client's TRANSACTION_DB KOT_MASTER.
@@ -1904,6 +2395,164 @@ function bnxSaveKOT(session, payload) {
   }
 }
 
+
+/* ============================================================================
+ * PASS #67 — PAYMENT / VOID ACCOUNTING INTEGRITY
+ *
+ * A bill can be paid later through SAVE_PAYMENT. The old handler only wrote a
+ * PAYMENT_MASTER row; it did NOT reduce BILL_MASTER.DUE_AMOUNT/PAYMENT_STATUS,
+ * did not prevent over-collection, did not reduce CUSTOMER_DUES, and did not
+ * post the receipt into JOURNAL/LEDGER_ENTRIES. Likewise VOID_BILL changed the
+ * bill status and reversed the sales journal, but left successful payments and
+ * sale stock movements active. That made Bills vs Payments, cash/receivable,
+ * stock, and reconciliation reports disagree.
+ *
+ * This pass makes the lifecycle explicit and idempotent:
+ *   BILL -> PAYMENT -> BILL balance/status -> payment journal
+ *   BILL VOID -> reverse payments -> reverse sale ledger -> reverse stock
+ *            -> reverse customer due -> mark bill CANCELLED
+ * ============================================================================ */
+function bnxFindBillRowByIdFast_(clientId, billId) {
+  if (!billId) return null;
+  try {
+    const sheet = bnxClientSheet(clientId, SHEETS.BILL_MASTER);
+    const lastCol=sheet.getLastColumn(), lastRow=sheet.getLastRow();
+    if(lastRow<2||lastCol<1) return null;
+    const headers=sheet.getRange(1,1,1,lastCol).getValues()[0].map(String);
+    const idCol=headers.indexOf('BILL_ID'); if(idCol===-1) return null;
+    const matches=sheet.getRange(2,idCol+1,lastRow-1,1).createTextFinder(String(billId).trim()).matchEntireCell(true).findAll();
+    if(!matches.length) return null;
+    const rowNo=matches[matches.length-1].getRow();
+    const vals=sheet.getRange(rowNo,1,1,lastCol).getValues()[0];
+    const ci=headers.indexOf('CLIENT_ID');
+    if(ci!==-1 && String(vals[ci])!==String(clientId)) return null;
+    return {sheet,headers,rowNo,values:vals,bill:bnxRowToObject(vals,headers)};
+  } catch(e){ return null; }
+}
+
+function bnxBillOutstanding_(bill) {
+  const explicit=Number(bill&&bill.DUE_AMOUNT);
+  if(Number.isFinite(explicit) && explicit>=0) return +explicit.toFixed(2);
+  return Math.max(0,Number(bill&&bill.GRAND_TOTAL)||0);
+}
+
+function bnxUpdateBillPaymentState_(clientId, billId, totalPaid) {
+  const found=bnxFindBillRowByIdFast_(clientId,billId);
+  if(!found) throw new Error('Bill not found for payment update: '+billId);
+  const bill=found.bill;
+  const grand=Math.max(0,Number(bill.GRAND_TOTAL)||0);
+  const paid=Math.max(0,Number(totalPaid)||0);
+  const due=Math.max(0,+(grand-paid).toFixed(2));
+  const h=found.headers, row=found.rowNo, sh=found.sheet;
+  const dueCol=h.indexOf('DUE_AMOUNT'), statusCol=h.indexOf('PAYMENT_STATUS');
+  if(dueCol!==-1) sh.getRange(row,dueCol+1).setValue(due);
+  if(statusCol!==-1) sh.getRange(row,statusCol+1).setValue(due<=0.01?'PAID':paid>0?'PARTIAL':'DUE');
+  return Object.assign({},bill,{DUE_AMOUNT:due,PAYMENT_STATUS:due<=0.01?'PAID':paid>0?'PARTIAL':'DUE'});
+}
+
+function bnxGetSuccessfulPaymentsForBill_(clientId,billId) {
+  const out=[];
+  try{
+    const sh=bnxClientSheet(clientId,SHEETS.PAYMENT_MASTER), vals=sh.getDataRange().getValues();
+    const h=vals[0]||[];
+    for(let r=1;r<vals.length;r++){
+      const p=bnxRowToObject(vals[r],h);
+      if(String(p.CLIENT_ID||'')!==String(clientId)) continue;
+      if(String(p.BILL_ID||'')!==String(billId)) continue;
+      const st=String(p.PAYMENT_STATUS||'').toUpperCase();
+      if(st==='SUCCESS') out.push(p);
+    }
+  }catch(e){ throw new Error('Unable to read payments for bill '+billId+': '+e.message); }
+  return out;
+}
+
+function bnxPostPaymentToLedger_(clientId,payment,bill) {
+  const journalId=generateShortId_(clientId,'JOURNAL_ID');
+  const now=new Date().toISOString();
+  const cashAcct=bnxGetOrCreateLedgerAccount_(clientId,'CASH_'+String(payment.PAYMENT_MODE||'CASH').toUpperCase(),String(payment.PAYMENT_MODE||'CASH')+' Collections','ASSET');
+  const duesAcct=bnxGetOrCreateLedgerAccount_(clientId,'CUSTOMER_DUES','Customer Dues','ASSET');
+  const amount=+Number(payment.AMOUNT||0).toFixed(2);
+  if(amount<=0) return;
+  bnxAppendRow(clientId,SHEETS.JOURNAL,{
+    JOURNAL_ID:journalId,CLIENT_ID:clientId,LOCATION_ID:payment.LOCATION_ID||bill.LOCATION_ID||'',
+    JOURNAL_DATE:payment.PAYMENT_DATE,JOURNAL_TYPE:'RECEIPT',SOURCE_TYPE:'PAYMENT',SOURCE_ID:payment.PAYMENT_ID,
+    REFERENCE_NUMBER:bill.BILL_NUMBER||bill.BILL_ID,DESCRIPTION:'Payment - Bill '+(bill.BILL_NUMBER||bill.BILL_ID),
+    TOTAL_DEBIT:amount,TOTAL_CREDIT:amount,CREATED_BY:payment.CREATED_BY||'',CREATED_AT:now,
+    ENTRY_DATE:payment.PAYMENT_DATE,REFERENCE_TYPE:'PAYMENT',REFERENCE_ID:payment.PAYMENT_ID,
+    NARRATION:String(payment.PAYMENT_MODE||'CASH')+' receipt - Bill '+(bill.BILL_NUMBER||bill.BILL_ID)
+  });
+  bnxAppendRowsBatch_(clientId,SHEETS.LEDGER_ENTRIES,[
+    {LEDGER_ENTRY_ID:generateShortId_(clientId,'LEDGER_ENTRY_ID'),CLIENT_ID:clientId,JOURNAL_ID:journalId,LOCATION_ID:payment.LOCATION_ID||bill.LOCATION_ID||'',ACCOUNT:cashAcct,ENTRY_DATE:payment.PAYMENT_DATE,DEBIT:amount,CREDIT:0,REFERENCE_TYPE:'PAYMENT',REFERENCE_ID:payment.PAYMENT_ID,CREATED_AT:now},
+    {LEDGER_ENTRY_ID:generateShortId_(clientId,'LEDGER_ENTRY_ID'),CLIENT_ID:clientId,JOURNAL_ID:journalId,LOCATION_ID:payment.LOCATION_ID||bill.LOCATION_ID||'',ACCOUNT:duesAcct,ENTRY_DATE:payment.PAYMENT_DATE,DEBIT:0,CREDIT:amount,REFERENCE_TYPE:'PAYMENT',REFERENCE_ID:payment.PAYMENT_ID,CREATED_AT:now}
+  ]);
+  return journalId;
+}
+
+function bnxAdjustCustomerDue_(clientId,customerId,delta,dateStr,txnType){
+  if(!customerId||!delta) return;
+  const sh=bnxClientSheet(clientId,SHEETS.CUSTOMER_DUES), vals=sh.getDataRange().getValues(), h=vals[0]||[];
+  const ci=h.indexOf('CLIENT_ID'), cu=h.indexOf('CUSTOMER_ID'), bal=h.indexOf('CURRENT_BALANCE');
+  if(ci===-1||cu===-1||bal===-1) return;
+  for(let r=1;r<vals.length;r++){
+    if(String(vals[r][ci])!==String(clientId)||String(vals[r][cu])!==String(customerId)) continue;
+    const current=Number(vals[r][bal])||0;
+    const next=Math.max(0,+(current+Number(delta)).toFixed(2));
+    sh.getRange(r+1,bal+1).setValue(next);
+    const dc=h.indexOf('LAST_TRANSACTION_DATE'), tc=h.indexOf('LAST_TRANSACTION_TYPE'), uc=h.indexOf('UPDATED_AT');
+    if(dc!==-1) sh.getRange(r+1,dc+1).setValue(dateStr||'');
+    if(tc!==-1) sh.getRange(r+1,tc+1).setValue(txnType||'PAYMENT');
+    if(uc!==-1) sh.getRange(r+1,uc+1).setValue(new Date().toISOString());
+    return;
+  }
+}
+
+function bnxReverseBillPayments_(clientId,bill,userId,nowIso,reason){
+  const payments=bnxGetSuccessfulPaymentsForBill_(clientId,bill.BILL_ID);
+  if(!payments.length) return {count:0,total:0};
+  const sh=bnxClientSheet(clientId,SHEETS.PAYMENT_MASTER), h=sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+  const statusCol=h.indexOf('PAYMENT_STATUS'), refCol=h.indexOf('REFERENCE');
+  let total=0;
+  payments.forEach(p=>{
+    const found=bnxFindPaymentRowById_(clientId,p.PAYMENT_ID);
+    if(!found) return;
+    if(statusCol!==-1) sh.getRange(found.rowNo,statusCol+1).setValue('REVERSED');
+    if(refCol!==-1) sh.getRange(found.rowNo,refCol+1).setValue((p.REFERENCE||'')+' | VOID '+(reason||''));
+    total+=Number(p.AMOUNT)||0;
+    bnxCreateAuditLog(clientId,{CLIENT_ID:clientId,LOCATION_ID:bill.LOCATION_ID||'',USER_ID:userId,ACTION:'REVERSE',MODULE:'PAYMENT',RECORD_TYPE:'PAYMENT',RECORD_ID:p.PAYMENT_ID,OLD_VALUE:JSON.stringify({PAYMENT_STATUS:'SUCCESS'}),NEW_VALUE:JSON.stringify({PAYMENT_STATUS:'REVERSED',BILL_ID:bill.BILL_ID,reason:reason||''}),TIMESTAMP:nowIso});
+  });
+  return {count:payments.length,total:+total.toFixed(2)};
+}
+
+function bnxFindPaymentRowById_(clientId,paymentId){
+  const sh=bnxClientSheet(clientId,SHEETS.PAYMENT_MASTER), lastCol=sh.getLastColumn(), lastRow=sh.getLastRow();
+  if(lastRow<2||!paymentId) return null;
+  const h=sh.getRange(1,1,1,lastCol).getValues()[0].map(String), idCol=h.indexOf('PAYMENT_ID');
+  if(idCol===-1) return null;
+  const matches=sh.getRange(2,idCol+1,lastRow-1,1).createTextFinder(String(paymentId)).matchEntireCell(true).findAll();
+  if(!matches.length) return null;
+  const rowNo=matches[matches.length-1].getRow(), vals=sh.getRange(rowNo,1,1,lastCol).getValues()[0];
+  const ci=h.indexOf('CLIENT_ID'); if(ci!==-1&&String(vals[ci])!==String(clientId)) return null;
+  return {sheet:sh,headers:h,rowNo,values:vals,payment:bnxRowToObject(vals,h)};
+}
+
+function bnxReverseBillStock_(clientId,bill,userId,nowIso){
+  const sh=bnxClientSheet(clientId,SHEETS.STOCK_MOVEMENT), vals=sh.getDataRange().getValues(), h=vals[0]||[];
+  const rows=[];
+  const src=h.indexOf('SOURCE_ID'), type=h.indexOf('MOVEMENT_TYPE'), ci=h.indexOf('CLIENT_ID');
+  if(src===-1) return {count:0};
+  for(let r=1;r<vals.length;r++){
+    if(ci!==-1&&String(vals[r][ci])!==String(clientId)) continue;
+    if(String(vals[r][src])!==String(bill.BILL_ID)) continue;
+    if(type!==-1&&String(vals[r][type]).toUpperCase()!=='SALE') continue;
+    const o=bnxRowToObject(vals[r],h);
+    rows.push({
+      STOCK_MOVEMENT_ID:generateShortId_(clientId,'STOCK_MOVEMENT_ID'),CLIENT_ID:clientId,LOCATION_ID:o.LOCATION_ID||bill.LOCATION_ID||'',ITEM_ID:o.ITEM_ID||'',MOVEMENT_TYPE:'VOID_SALE',MOVEMENT_DATE:bill.BILL_DATE||bnxNowParts_().businessDate,QUANTITY_IN:Number(o.QUANTITY_OUT)||0,QUANTITY_OUT:0,RATE:Number(o.RATE)||0,SOURCE_TYPE:'BILL_VOID',SOURCE_ID:bill.BILL_ID,CREATED_BY:userId,CREATED_AT:nowIso
+    });
+  }
+  if(rows.length) bnxAppendRowsBatch_(clientId,SHEETS.STOCK_MOVEMENT,rows);
+  return {count:rows.length};
+}
+
 function bnxSavePayment(session, payload) {
   const requestId = payload.requestId;
   const data = payload.data || {};
@@ -1911,28 +2560,43 @@ function bnxSavePayment(session, payload) {
   const userId = session.USER_ID;
   const claim = bnxClaimRequest(clientId, requestId, TRANSACTION_TYPES.PAYMENT);
   if (!claim.claimed) return { success: true, transactionId: claim.existing.transactionId, cached: true };
-  if (!data.AMOUNT || data.AMOUNT <= 0) return respondError(400, 'AMOUNT must be > 0', requestId);
+  const amount = +Number(data.AMOUNT || 0).toFixed(2);
+  if (!(amount > 0)) return respondError(400, 'AMOUNT must be > 0', requestId);
+  if (!data.BILL_ID) return respondError(400, 'BILL_ID is required for a payment', requestId);
   try {
+    const found = bnxFindBillRowByIdFast_(clientId, data.BILL_ID);
+    if (!found) return respondError(404, 'Bill not found for this client', requestId);
+    const bill = found.bill;
+    const billStatus = String(bill.BILL_STATUS || '').toUpperCase();
+    if (billStatus === 'CANCELLED' || billStatus === 'VOID') return respondError(409, 'Cannot pay a cancelled/void bill', requestId);
+    const existing = bnxGetSuccessfulPaymentsForBill_(clientId, data.BILL_ID);
+    const alreadyPaid = existing.reduce((s,p)=>s+(Number(p.AMOUNT)||0),0);
+    const grand = +(Number(bill.GRAND_TOTAL)||0).toFixed(2);
+    const remaining = Math.max(0, +(grand-alreadyPaid).toFixed(2));
+    if (amount > remaining + 0.01) return respondError(409, 'Payment exceeds bill balance. Remaining ₹'+remaining.toFixed(2), requestId);
+
     const paymentId = generateShortId_(clientId, 'PAYMENT_ID');
     const now = bnxNowParts_();
     const payment = {
-      PAYMENT_ID: paymentId, CLIENT_ID: clientId, LOCATION_ID: data.LOCATION_ID,
-      BILL_ID: data.BILL_ID || '', CUSTOMER_ID: data.CUSTOMER_ID || '',
-      PAYMENT_MODE_ID: data.PAYMENT_MODE_ID || '', PAYMENT_MODE: data.PAYMENT_MODE || 'CASH',
-      AMOUNT: data.AMOUNT, PAYMENT_DATE: now.businessDate, PAYMENT_TIME: now.time,
-      REFERENCE: data.PAYMENT_REFERENCE || '', PAYMENT_STATUS: 'SUCCESS', CREATED_BY: userId,
-      CREATED_AT: now.iso,
-      TIPS_AMOUNT: Number(data.TIPS_AMOUNT) || 0
+      PAYMENT_ID: paymentId, CLIENT_ID: clientId, LOCATION_ID: data.LOCATION_ID || bill.LOCATION_ID || '',
+      BILL_ID: data.BILL_ID, CUSTOMER_ID: data.CUSTOMER_ID || bill.CUSTOMER_ID || '',
+      PAYMENT_MODE_ID: data.PAYMENT_MODE_ID || '', PAYMENT_MODE: data.PAYMENT_MODE || 'CASH', AMOUNT: amount,
+      PAYMENT_DATE: now.businessDate, PAYMENT_TIME: now.time, REFERENCE: data.PAYMENT_REFERENCE || '',
+      PAYMENT_STATUS: 'SUCCESS', CREATED_BY: userId, CREATED_AT: now.iso, TIPS_AMOUNT: Number(data.TIPS_AMOUNT) || 0
     };
     bnxAppendRow(clientId, SHEETS.PAYMENT_MASTER, payment);
+    const newPaid = +(alreadyPaid + amount).toFixed(2);
+    bnxUpdateBillPaymentState_(clientId, data.BILL_ID, newPaid);
+    if (bill.CUSTOMER_ID && bill.CUSTOMER_ID === payment.CUSTOMER_ID) bnxAdjustCustomerDue_(clientId, bill.CUSTOMER_ID, -amount, now.businessDate, 'PAYMENT');
+    bnxPostPaymentToLedger_(clientId, payment, bill);
     bnxCreateAuditLog(clientId, {
-      CLIENT_ID: clientId, LOCATION_ID: data.LOCATION_ID, USER_ID: userId, ACTION: 'CREATE',
+      CLIENT_ID: clientId, LOCATION_ID: payment.LOCATION_ID, USER_ID: userId, ACTION: 'CREATE',
       MODULE: 'PAYMENT', RECORD_TYPE: 'PAYMENT', RECORD_ID: paymentId, OLD_VALUE: '{}',
-      NEW_VALUE: JSON.stringify(payment), REQUEST_ID: requestId, TIMESTAMP: now.iso
+      NEW_VALUE: JSON.stringify(Object.assign({}, payment, { billPaidBefore: alreadyPaid, billPaidAfter: newPaid })), REQUEST_ID: requestId, TIMESTAMP: now.iso
     });
     bnxMarkSynced(clientId, requestId, paymentId, TRANSACTION_TYPES.PAYMENT);
     bnxInvalidateTodayReportCaches_(clientId);
-    return { success: true, transactionId: paymentId, data: payment };
+    return { success: true, transactionId: paymentId, data: payment, bill: bnxFindBillById_(clientId,data.BILL_ID), paidAmount: newPaid, dueAmount: Math.max(0,+(grand-newPaid).toFixed(2)) };
   } catch (error) {
     bnxLogError(clientId, `bnxSavePayment failed: ${error.message}`, { requestId, data });
     return respondError(500, error.message, requestId);
@@ -2148,17 +2812,6 @@ function bnxGetKOT(session, payload) {
       k.ORDER_TIME = k.ORDER_TIME || (linkedOrder ? (linkedOrder.ORDER_TIME || '') : '');
       k.orderTime = k.ORDER_TIME || '';
       k.ORDER_NUMBER = linkedOrder ? (linkedOrder.ORDER_NUMBER || '') : (k.ORDER_NUMBER || '');
-      // Steward/captain ownership: KOT_MASTER may not have a dedicated steward
-      // column in older tenant schemas, so recover it from the linked ORDER_MASTER
-      // record when available. Never invent a name.
-      const linkedOwner = linkedOrder ? (linkedOrder.CREATED_BY_NAME || linkedOrder.CREATED_BY || linkedOrder.STARTED_BY || linkedOrder.STEWARD || linkedOrder.WAITER || '') : '';
-      const linkedOwnerId = linkedOrder ? (linkedOrder.CREATED_BY_ID || linkedOrder.USER_ID || '') : '';
-      const linkedOwnerLogin = linkedOrder ? (linkedOrder.CREATED_BY_LOGIN || linkedOrder.LOGIN_ID || '') : '';
-      k.STEWARD_NAME = k.STEWARD_NAME || k.STEWARD || k.WAITER || k.CAPTAIN || linkedOwner || '';
-      k.STEWARD_ID = k.STEWARD_ID || k.WAITER_ID || k.CAPTAIN_ID || linkedOwnerId || '';
-      k.STEWARD_LOGIN = k.STEWARD_LOGIN || k.WAITER_LOGIN || k.CAPTAIN_LOGIN || linkedOwnerLogin || '';
-      k.CREATED_BY_NAME = k.CREATED_BY_NAME || linkedOwner || '';
-      k.STARTED_BY = k.STARTED_BY || (linkedOrder ? (linkedOrder.STARTED_BY || '') : '');
       kots.push(k);
     });
     return { success: true, data: kots, count: kots.length };
@@ -2880,6 +3533,7 @@ const MASTER_CATEGORY_MAP = {
   employee: { table: 'USER_MASTER', idField: 'USER_ID', fieldMap: { EMP_NAME: 'FULL_NAME', MOBILE: 'PHONE' } },
   user:     { table: 'USER_MASTER', idField: 'USER_ID', fieldMap: {} },
   item:     { table: 'ITEM_MASTER', idField: 'ITEM_ID', fieldMap: { ITEM_NAME: 'ITEM_NAME', HSN_CODE: 'HSN_CODE', REORDER_LEVEL: 'REORDER_LEVEL' } },
+  item_master: { table: 'ITEM_MASTER', idField: 'ITEM_ID', fieldMap: {} },
   // LIVE POS category/group masters. Keep aliases because older frontend builds
   // use menucat while newer report code uses category/item_groups.
   category: { table: 'CATEGORY_MASTER', idField: 'CATEGORY_ID', fieldMap: { CATEGORY_NAME: 'CATEGORY_NAME', NAME: 'CATEGORY_NAME', IS_ACTIVE: 'IS_ACTIVE' } },
@@ -3296,7 +3950,7 @@ function bnxGetDashboardSummary_impl_(session, payload) {
         ? taxableRaw
         : Math.max(0, +((amt - tax - roundOff)).toFixed(2));
       revenue += taxableAmt; totalSales += amt; orders += 1; covers += Number(b.COVERS) || 0;
-      if (String(b.PAYMENT_STATUS).toUpperCase() !== 'PAID') creditToday += amt;
+      if (String(b.PAYMENT_STATUS).toUpperCase() !== 'PAID') creditToday += bnxBillOutstanding_(b);
       const hour = (b.BILL_TIME || '00:00:00').split(':')[0];
       if (!hourlyMap[hour]) hourlyMap[hour] = { v: 0, sales: 0, bills: 0, discount: 0, tax: 0 };
       hourlyMap[hour].v += taxableAmt;
@@ -3520,6 +4174,26 @@ function bnxCachedUnitNameMap_(clientId) {
   try { CacheService.getScriptCache().put(key, JSON.stringify(map), 60); } catch (e) {}
   return map;
 }
+function bnxCachedItemCostMap_(clientId) {
+  const key = 'itemcostmap_' + clientId;
+  try { const cached = CacheService.getScriptCache().get(key); if (cached) return JSON.parse(cached); } catch (e) {}
+  const map = {};
+  try {
+    const sh = bnxClientSheet(clientId, SHEETS.ITEM_MASTER);
+    const values = sh.getDataRange().getValues();
+    const headers = values[0] || [];
+    for (let r = 1; r < values.length; r++) {
+      const it = bnxRowToObject(values[r], headers);
+      if (it.CLIENT_ID && String(it.CLIENT_ID) !== String(clientId)) continue;
+      const id = String(it.ITEM_ID || '').trim();
+      if (!id) continue;
+      const purchaseRate = Number(it.PURCHASE_RATE);
+      map[id] = Number.isFinite(purchaseRate) && purchaseRate > 0 ? purchaseRate : 0;
+    }
+  } catch (e) {}
+  try { CacheService.getScriptCache().put(key, JSON.stringify(map), 60); } catch (e) {}
+  return map;
+}
 function bnxCachedItemNameMap_(clientId) {
   const key = 'itemnamemap_' + clientId;
   try {
@@ -3543,7 +4217,7 @@ function bnxCachedItemNameMap_(clientId) {
 function bnxInvalidateMasterCache_(clientId) {
   try {
     const cache = CacheService.getScriptCache();
-    cache.removeAll(['catmap_' + clientId, 'taxmap_' + clientId, 'unitmap_' + clientId, 'itemnamemap_' + clientId, 'itemgroupmap_' + clientId, 'posmenu_' + clientId]);
+    cache.removeAll(['catmap_' + clientId, 'taxmap_' + clientId, 'unitmap_' + clientId, 'itemnamemap_' + clientId, 'itemcostmap_' + clientId, 'itemgroupmap_' + clientId, 'posmenu_' + clientId]);
   } catch (e) {}
 }
 
@@ -3665,7 +4339,7 @@ function bnxGetDsrMatrix_impl_(session, payload) {
       byDay[day].roundOff += Number(b.ROUND_OFF) || 0;
       byDay[day].grossSale += Number(b.GRAND_TOTAL) || 0;
       byDay[day].discount += (Number(b.BILL_DISCOUNT) || 0) + (Number(b.ITEM_DISCOUNT) || 0);
-      if (String(b.PAYMENT_STATUS).toUpperCase() !== 'PAID') byDay[day].guestDueSales += Number(b.GRAND_TOTAL) || 0;
+      if (String(b.PAYMENT_STATUS).toUpperCase() !== 'PAID') byDay[day].guestDueSales += bnxBillOutstanding_(b);
       if (b.BILL_ID) billDayByBillId[b.BILL_ID] = day;
     }
     const paySheet = bnxClientSheet(clientId, SHEETS.PAYMENT_MASTER);
@@ -3762,7 +4436,7 @@ function bnxGetDsrYtd_impl_(session, payload) {
       totals.roundOff += Number(b.ROUND_OFF) || 0;
       totals.grossSale += Number(b.GRAND_TOTAL) || 0;
       totals.discount += (Number(b.BILL_DISCOUNT) || 0) + (Number(b.ITEM_DISCOUNT) || 0);
-      if (String(b.PAYMENT_STATUS).toUpperCase() !== 'PAID') totals.guestDueSales += Number(b.GRAND_TOTAL) || 0;
+      if (String(b.PAYMENT_STATUS).toUpperCase() !== 'PAID') totals.guestDueSales += bnxBillOutstanding_(b);
       if (b.BILL_ID) billIdsInRange[b.BILL_ID] = true;
     }
 
@@ -4052,7 +4726,9 @@ function bnxUpsertDayStatus_(clientId, businessDate, patch) {
 function bnxGetBootstrap(session, payload) {
   const clientId = session.CLIENT_ID;
   try {
-    const menuRes = bnxGetMenuItems(session, {});
+    const pos = bnxGetPosMenu(session, {});
+    const food = pos && pos.data && Array.isArray(pos.data.food) ? pos.data.food : [];
+    const bar = pos && pos.data && Array.isArray(pos.data.bar) ? pos.data.bar : [];
     const tableSheet = bnxClientSheet(clientId, 'TABLE_MASTER');
     const tableValues = tableSheet.getDataRange().getValues();
     const tableHeaders = tableValues[0];
@@ -4062,7 +4738,7 @@ function bnxGetBootstrap(session, payload) {
       if (t.CLIENT_ID !== clientId) continue;
       tables.push({ id: t.TABLE_ID, name: t.TABLE_NUMBER, capacity: Number(t.CAPACITY) || 0, section: t.SECTION || '' });
     }
-    return { success: true, data: { menu: (menuRes.data || []), tables } };
+    return { success: true, data: { menu: food.concat(bar), food, bar, counts: {food:food.length, bar:bar.length, total:food.length+bar.length}, tables } };
   } catch (error) {
     bnxLogError(clientId, `bnxGetBootstrap failed: ${error.message}`, payload);
     return { success: false, error: error.message };
@@ -4466,6 +5142,22 @@ function bnxTaxRateMap_(clientId) {
  * FAST POS MENU ENDPOINT — one request for Food + Bar.
  * Published Menu Card sheets remain authoritative.
  */
+
+function bnxGetPosMenuHierarchy(session, payload) {
+  const clientId = session.CLIENT_ID;
+  try {
+    const food = bnxGetMenuItems(session, payload || {});
+    const bar = bnxGetBarMenu(session, payload || {});
+    const f = food && Array.isArray(food.data) ? food.data : [];
+    const b = bar && Array.isArray(bar.data) ? bar.data : [];
+    const cats = rows => [...new Set(rows.map(r => String(r.category || r.barCategory || r.menuSection || 'Uncategorised').trim()).filter(Boolean))].sort();
+    return { success:true, clientId, data:{food:{categories:cats(f),count:f.length},bar:{categories:cats(b),count:b.length}}, source:'MENU_CARD_ITEMS+BAR_MENU_CARD' };
+  } catch (e) {
+    bnxLogError(clientId, `bnxGetPosMenuHierarchy failed: ${e.message}`, payload);
+    return { success:false, error:e.message, data:{food:{categories:[],count:0},bar:{categories:[],count:0}} };
+  }
+}
+
 function bnxGetPosMenu(session, payload) {
   const clientId = session.CLIENT_ID;
   try {
@@ -4577,7 +5269,7 @@ function bnxGetBarMenu(session, payload) {
     const barById={},itemById={};
     for(let r=1;r<barValues.length;r++){const o=bnxRowToObject(barValues[r],barHeaders),id=String(o.ITEM_ID||'').trim();if(id)barById[id]=o;}
     for(let r=1;r<itemValues.length;r++){const o=bnxRowToObject(itemValues[r],itemHeaders);if(o.CLIENT_ID&&String(o.CLIENT_ID)!==String(clientId))continue;const id=String(o.ITEM_ID||'').trim();if(id)itemById[id]=o;}
-    const taxMap=bnxCachedTaxRateMap_(clientId), boolValue=v=>v===true||['true','1','yes','y'].includes(String(v??'').trim().toLowerCase());
+    const taxMap=bnxCachedTaxRateMap_(clientId), groupMap=bnxCachedItemGroupMap_(clientId), boolValue=v=>v===true||['true','1','yes','y'].includes(String(v??'').trim().toLowerCase());
     const rows=[],ids=[];
     for(let r=1;r<cardValues.length;r++){
       const card=bnxRowToObject(cardValues[r],cardHeaders);if(card.CLIENT_ID&&String(card.CLIENT_ID)!==String(clientId))continue;
@@ -4586,8 +5278,10 @@ function bnxGetBarMenu(session, payload) {
       const taxId=String(card.TAX_ID||bar.TAX_ID||master.TAX_ID||'').trim();
       const fav=card.FAVOURITE!==undefined&&card.FAVOURITE!==''?boolValue(card.FAVOURITE):boolValue(bar.FAVOURITE??master.FAVOURITE),pop=card.POPULAR!==undefined&&card.POPULAR!==''?boolValue(card.POPULAR):boolValue(bar.POPULAR??master.POPULAR);
       const section=String(card.MENU_SECTION||card.CATEGORY_NAME||card.BAR_CATEGORY||'BAR').trim()||'BAR',category=String(card.CATEGORY_NAME||card.BAR_CATEGORY||section).trim()||section;
+      const groupId=String(card.ITEM_GROUP_ID||bar.ITEM_GROUP_ID||master.ITEM_GROUP_ID||'').trim();
+      const groupName=String(card.ITEM_GROUP_NAME||bar.ITEM_GROUP_NAME||master.ITEM_GROUP_NAME||groupMap.byId[groupId]||'').trim();
       rows.push({itemId:id,id,ITEM_ID:id,name,ITEM_NAME:name,itemCode:card.ITEM_CODE||bar.ITEM_CODE||master.ITEM_CODE||id,price:Number.isFinite(price)?price:0,sellingPrice:Number.isFinite(price)?price:0,
-        category,barCategory:category,categoryId:String(card.CATEGORY_ID||master.CATEGORY_ID||'').trim(),menuType:card.MENU_TYPE||'BAR',menuSection:section,menuActive:true,isBar:true,veg:'',dietaryType:'',gst:taxId?(taxMap.rateById[taxId]||0):0,hsn:master.HSN_CODE||'',icon:master.ICON||'🍸',availability:card.AVAILABILITY_STATUS||'available',favorite:fav,popular:pop,aliases:[],menuCardKey:'BAR|'+r+'|'+id+'|'+section+'|'+String(price)});ids.push(id);
+        category,barCategory:category,categoryId:String(card.CATEGORY_ID||master.CATEGORY_ID||'').trim(),itemGroupId:groupId,itemGroupName:groupName,ITEM_GROUP_ID:groupId,ITEM_GROUP_NAME:groupName,menuType:card.MENU_TYPE||'BAR',menuSection:section,menuActive:true,isBar:true,veg:'',dietaryType:'',gst:taxId?(taxMap.rateById[taxId]||0):0,hsn:master.HSN_CODE||'',icon:master.ICON||'🍸',availability:card.AVAILABILITY_STATUS||'available',favorite:fav,popular:pop,aliases:[],menuCardKey:'BAR|'+r+'|'+id+'|'+section+'|'+String(price)});ids.push(id);
     }
     return {success:true,data:rows,ids,source:'BAR_MENU_CARD',count:rows.length};
   }catch(error){bnxLogError(clientId,`bnxGetBarMenu(BAR_MENU_CARD) failed: ${error.message}`,payload);return {success:false,error:error.message,data:[],ids:[],source:'BAR_MENU_CARD'};}
@@ -4951,24 +5645,7 @@ function bnxRdFetchSheet(session, payload) {
       const owner = findFirst(live,['CAPTAIN','STEWARD','WAITER','ASSIGNED_STEWARD','ASSIGNED_CAPTAIN']) || findFirst(t,['CAPTAIN','STEWARD','WAITER','ASSIGNED_STEWARD','ASSIGNED_CAPTAIN']);
       const ownerId = findFirst(live,['CAPTAIN_ID','STEWARD_ID','WAITER_ID','ASSIGNED_STEWARD_ID','ASSIGNED_CAPTAIN_ID']) || findFirst(t,['CAPTAIN_ID','STEWARD_ID','WAITER_ID']);
       const ownerLogin = findFirst(live,['CAPTAIN_LOGIN','STEWARD_LOGIN','WAITER_LOGIN']) || findFirst(t,['CAPTAIN_LOGIN','STEWARD_LOGIN','WAITER_LOGIN']);
-      // Canonical live projection shared by Restaurant Dashboard, Steward map,
-      // My Running Tables and reports. Keep the first 12 columns stable with
-      // the dashboard's existing mapper, then append owner id/login so the
-      // steward can match a table by identity across devices.
-      let kotCount = 0;
-      try {
-        const omSheet = bnxClientSheet(clientId, SHEETS.ORDER_MASTER);
-        const omVals = omSheet.getDataRange().getValues();
-        const omHdr = omVals[0] || [];
-        const omOrders = omVals.slice(1).map(r => bnxRowToObject(r, omHdr));
-        const closed = new Set(['BILLED','CANCELLED']);
-        kotCount = omOrders.filter(o => String(o.CLIENT_ID || '') === String(clientId) && String(o.TABLE_ID || '').trim() === tableNo && !closed.has(String(o.ORDER_STATUS || '').toUpperCase())).length;
-      } catch (e) { kotCount = 0; }
-      const kitchenStatus = findFirst(live,['KITCHEN_STATUS','KDS_STATUS']) || findFirst(t,['KITCHEN_STATUS','KDS_STATUS']) || '';
-      const barStatus = findFirst(live,['BAR_STATUS','BAR_KDS_STATUS']) || findFirst(t,['BAR_STATUS','BAR_KDS_STATUS']) || '';
-      const covers = Number(live.COVERS || 0) || 0;
-      const billAmount = Number(live.BILL_AMOUNT || 0) || 0;
-      rows.push([ tableNo, t.SECTION || t.ZONE || '', findFirst(t,['TABLE_NAME','NAME']) || '', live.STATUS || t.STATUS || 'AVAILABLE', Number(t.CAPACITY || t.PAX) || 4, owner, covers, live.START_TIME || '', kitchenStatus, barStatus, kotCount, billAmount, ownerId, ownerLogin ]);
+      rows.push([ tableNo, t.SECTION || t.ZONE || '', '', live.STATUS || t.STATUS || 'AVAILABLE', Number(t.CAPACITY || t.PAX) || 4, owner, Number(live.COVERS) || 0, live.START_TIME || '', ownerId, ownerLogin, Number(live.BILL_AMOUNT) || 0 ]);
     }
     return { success: true, data: rows };
   } catch (error) {
@@ -7020,9 +7697,15 @@ function bnxBuildStockLedgerDataset_(clientId, locationId, from, to) {
     };
   }
   const TYPE_BUCKET = {
-    PURCHASE: 'purchase', PURCHASE_RETURN: 'adjustment',
+    PURCHASE: 'purchase',
+    PURCHASE_RETURN: 'adjustment',
     TRANSFER_IN: 'transferIn', TRANSFER_OUT: 'transferOut', TRANSFER: 'transferOut',
-    CONSUMPTION: 'consumption', SALE: 'consumption', ISSUE: 'consumption',
+    // ISSUE is an internal stock movement, not consumption. Counting it as
+    // consumption made Kitchen Indent/Department Issue + later actual
+    // consumption double-count food cost. It reduces the issuing location
+    // only; actual consumption/wastage remains the cost event.
+    ISSUE: 'transferOut',
+    CONSUMPTION: 'consumption', SALE: 'consumption',
     WASTAGE: 'wastage', BREAKAGE: 'breakage', ADJUSTMENT: 'adjustment'
   };
   const smSheet = bnxClientSheet(clientId, 'STOCK_MOVEMENT');
@@ -7034,7 +7717,8 @@ function bnxBuildStockLedgerDataset_(clientId, locationId, from, to) {
     const m = bnxRowToObject(smValues[r], smHeaders);
     if (m.CLIENT_ID !== clientId) continue;
     if (locationId && m.LOCATION_ID !== locationId) continue;
-    if (m.MOVEMENT_DATE < from || m.MOVEMENT_DATE > to) continue;
+    const movementDateKey = bnxNormalizeDateKey_(m.MOVEMENT_DATE);
+    if (!movementDateKey || movementDateKey < from || movementDateKey > to) continue;
     const itemId = m.ITEM_ID;
     if (!byItem[itemId]) byItem[itemId] = { purchaseQty: 0, purchaseValue: 0, transferInQty: 0, transferInValue: 0, transferOutQty: 0, transferOutValue: 0, consumptionQty: 0, consumptionValue: 0, wastageQty: 0, wastageValue: 0, breakageQty: 0, breakageValue: 0, adjustmentQty: 0, adjustmentValue: 0, purchaseCostSum: 0, purchaseCostQty: 0 };
     const x = byItem[itemId];
@@ -7129,6 +7813,7 @@ function bnxGetPurchaseReport(session, payload) {
       supNameById[s.SUPPLIER_ID] = s.SUPPLIER_NAME;
     }
     const bySupplier = {};
+    try { bnxGetRows_(clientId,'PURCHASE_RETURN').forEach(x=>{const d=String(x.RETURN_DATE||'').slice(0,10);if(d<from||d>to)return;const sid=x.SUPPLIER_ID||'';if(!bySupplier[sid])bySupplier[sid]={count:0,amount:0,tax:0,returns:0};bySupplier[sid].returns+=(Number(x.TOTAL_AMOUNT)||0);}); } catch(e) {}
     for (let r = 1; r < pmValues.length; r++) {
       const p = bnxRowToObject(pmValues[r], pmHeaders);
       if (p.CLIENT_ID !== clientId) continue;
@@ -7137,7 +7822,7 @@ function bnxGetPurchaseReport(session, payload) {
       const status = String(p.PURCHASE_STATUS || '').toUpperCase();
       if (status === 'CANCELLED') continue;
       const supId = p.SUPPLIER_ID || '';
-      if (!bySupplier[supId]) bySupplier[supId] = { count: 0, amount: 0, tax: 0 };
+      if (!bySupplier[supId]) bySupplier[supId] = { count: 0, amount: 0, tax: 0, returns: 0 };
       bySupplier[supId].count += 1;
       bySupplier[supId].amount += Number(p.TAXABLE_AMOUNT) || 0;
       bySupplier[supId].tax += Number(p.TAX_AMOUNT) || 0;
@@ -7148,7 +7833,7 @@ function bnxGetPurchaseReport(session, payload) {
       return {
         CLIENT_ID: clientId, LOCATION_ID: locationId, FROM_DATE: from, TO_DATE: to, SUPPLIER_ID: supId,
         SUPPLIER_NAME: supNameById[supId] || 'Unknown', PURCHASE_COUNT: x.count, PURCHASE_AMOUNT: +x.amount.toFixed(2),
-        TAX_AMOUNT: +x.tax.toFixed(2), RETURN_AMOUNT: 0, NET_PURCHASE: netPurchase
+        TAX_AMOUNT: +x.tax.toFixed(2), RETURN_AMOUNT: +(x.returns||0).toFixed(2), NET_PURCHASE: +(netPurchase-(x.returns||0)).toFixed(2)
       };
     });
     rows.sort((a, b) => b.NET_PURCHASE - a.NET_PURCHASE);
@@ -7318,14 +8003,29 @@ function bnxGetFoodOrBarCostReport_(session, payload, wantBar) {
   const sheetName = wantBar ? 'BAR_COST_REPORT' : 'FOOD_COST_REPORT';
   try {
     const ds = bnxBuildStockLedgerDataset_(clientId, locationId, from, to);
-    let openingValue = 0, purchases = 0, transferIn = 0, transferOut = 0, consumption = 0, wastage = 0, breakage = 0, closingValue = 0;
+    let openingValue = 0, purchases = 0, transferIn = 0, transferOut = 0;
+    let consumption = 0, wastage = 0, breakage = 0, adjustmentValue = 0, closingValue = 0;
+    let openingQty = 0, purchaseQty = 0, transferInQty = 0, transferOutQty = 0;
+    let consumptionQty = 0, wastageQty = 0, breakageQty = 0, adjustmentQty = 0, closingQtyTotal = 0;
+
     Object.keys(ds.byItem).forEach(itemId => {
       const meta = ds.itemMeta[itemId] || {};
       if ((meta.isBar || false) !== wantBar) return;
       const x = ds.byItem[itemId];
       const openingInfo = bnxStockOpeningForItem_(clientId, locationId, itemId, from);
       const avgCost = x.purchaseCostQty > 0 ? (x.purchaseCostSum / x.purchaseCostQty) : (meta.purchaseRate || 0);
-      const closingQty = openingInfo.opening + x.purchaseQty + x.transferInQty - x.transferOutQty - x.consumptionQty - x.wastageQty - x.breakageQty + x.adjustmentQty;
+      const closeQty = openingInfo.opening + x.purchaseQty + x.transferInQty - x.transferOutQty - x.consumptionQty - x.wastageQty - x.breakageQty + x.adjustmentQty;
+
+      openingQty += openingInfo.opening;
+      purchaseQty += x.purchaseQty;
+      transferInQty += x.transferInQty;
+      transferOutQty += x.transferOutQty;
+      consumptionQty += x.consumptionQty;
+      wastageQty += x.wastageQty;
+      breakageQty += x.breakageQty;
+      adjustmentQty += x.adjustmentQty;
+      closingQtyTotal += closeQty;
+
       openingValue += openingInfo.opening * avgCost;
       purchases += x.purchaseValue;
       transferIn += x.transferInValue;
@@ -7333,10 +8033,20 @@ function bnxGetFoodOrBarCostReport_(session, payload, wantBar) {
       consumption += x.consumptionValue;
       wastage += x.wastageValue;
       breakage += x.breakageValue;
-      closingValue += closingQty * avgCost;
+      adjustmentValue += x.adjustmentValue;
+      closingValue += closeQty * avgCost;
     });
-    const cost = +(consumption + wastage + breakage).toFixed(2);
+
+    // Stock equation check. A non-zero variance means the selected ledger
+    // contains a movement type/quantity that is not represented by the cost
+    // buckets, or the persisted opening snapshot is inconsistent.
+    const movementClosingQty = +(openingQty + purchaseQty + transferInQty - transferOutQty - consumptionQty - wastageQty - breakageQty + adjustmentQty).toFixed(3);
+    const stockQtyVariance = +(closingQtyTotal - movementClosingQty).toFixed(3);
+
     let periodNetSales = 0;
+    let theoreticalRecipeCost = 0;
+    let recipeBackedSalesLines = 0;
+    let fallbackSalesLines = 0;
     try {
       const salesDs = bnxBuildSalesDataset_(clientId, locationId, from, to);
       const imSheet = bnxClientSheet(clientId, SHEETS.ITEM_MASTER);
@@ -7348,25 +8058,77 @@ function bnxGetFoodOrBarCostReport_(session, payload, wantBar) {
         if (it.CLIENT_ID !== clientId) continue;
         isBarByItem[it.ITEM_ID] = (it.IS_BAR === true || String(it.IS_BAR).toUpperCase() === 'TRUE');
       }
-      salesDs.itemRows.forEach(l => { if ((isBarByItem[l.itemId] || false) === wantBar) periodNetSales += l.net; });
+      salesDs.itemRows.forEach(l => {
+        if ((isBarByItem[l.itemId] || false) !== wantBar) return;
+        periodNetSales += Number(l.net) || 0;
+      });
     } catch (e) {}
-    const costPercent = periodNetSales > 0 ? +((cost / periodNetSales) * 100).toFixed(2) : 0;
+
+    // Cost percentages are deliberately based on real stock consumption,
+    // wastage and breakage. Sales are only the denominator; no selling-price
+    // percentage is ever fabricated as a cost.
+    const inventoryCost = +(consumption + wastage + breakage).toFixed(2);
+    const operationalCost = +consumption.toFixed(2);
+    const lossCost = +(wastage + breakage).toFixed(2);
+    const foodCostPercent = periodNetSales > 0 ? +(operationalCost / periodNetSales * 100).toFixed(2) : 0;
+    const lossPercent = periodNetSales > 0 ? +(lossCost / periodNetSales * 100).toFixed(2) : 0;
+
+    const stockValueEquation = +(openingValue + purchases + transferIn - transferOut - inventoryCost + adjustmentValue).toFixed(2);
+    const valueVariance = +(closingValue - stockValueEquation).toFixed(2);
 
     const row = wantBar
-      ? { CLIENT_ID: clientId, LOCATION_ID: locationId, FROM_DATE: from, TO_DATE: to, OPENING_STOCK: +openingValue.toFixed(2), PURCHASES: +purchases.toFixed(2), CONSUMPTION: +consumption.toFixed(2), WASTAGE: +wastage.toFixed(2), BREAKAGE: +breakage.toFixed(2), CLOSING_STOCK: +closingValue.toFixed(2), BAR_COST: cost, BAR_COST_PERCENT: costPercent }
-      : { CLIENT_ID: clientId, LOCATION_ID: locationId, FROM_DATE: from, TO_DATE: to, OPENING_STOCK: +openingValue.toFixed(2), PURCHASES: +purchases.toFixed(2), TRANSFER_IN: +transferIn.toFixed(2), TRANSFER_OUT: +transferOut.toFixed(2), CONSUMPTION: +consumption.toFixed(2), WASTAGE: +wastage.toFixed(2), CLOSING_STOCK: +closingValue.toFixed(2), FOOD_COST: cost, FOOD_COST_PERCENT: costPercent };
+      ? {
+          CLIENT_ID: clientId, LOCATION_ID: locationId, FROM_DATE: from, TO_DATE: to,
+          OPENING_STOCK: +openingValue.toFixed(2), PURCHASES: +purchases.toFixed(2),
+          TRANSFER_IN: +transferIn.toFixed(2), TRANSFER_OUT: +transferOut.toFixed(2),
+          CONSUMPTION: +consumption.toFixed(2), WASTAGE: +wastage.toFixed(2), BREAKAGE: +breakage.toFixed(2),
+          CLOSING_STOCK: +closingValue.toFixed(2), BAR_COST: operationalCost,
+          BAR_COST_PERCENT: foodCostPercent,
+          INVENTORY_COST: inventoryCost, LOSS_COST: lossCost, LOSS_PERCENT: lossPercent,
+          STOCK_VALUE_VARIANCE: valueVariance, RECONCILIATION_STATUS: Math.abs(valueVariance) < 0.01 ? 'BALANCED' : 'REVIEW'
+        }
+      : {
+          CLIENT_ID: clientId, LOCATION_ID: locationId, FROM_DATE: from, TO_DATE: to,
+          OPENING_STOCK: +openingValue.toFixed(2), PURCHASES: +purchases.toFixed(2),
+          TRANSFER_IN: +transferIn.toFixed(2), TRANSFER_OUT: +transferOut.toFixed(2),
+          CONSUMPTION: +consumption.toFixed(2), WASTAGE: +wastage.toFixed(2), BREAKAGE: +breakage.toFixed(2),
+          CLOSING_STOCK: +closingValue.toFixed(2), FOOD_COST: operationalCost,
+          FOOD_COST_PERCENT: foodCostPercent,
+          INVENTORY_COST: inventoryCost, LOSS_COST: lossCost, LOSS_PERCENT: lossPercent,
+          STOCK_VALUE_VARIANCE: valueVariance, RECONCILIATION_STATUS: Math.abs(valueVariance) < 0.01 ? 'BALANCED' : 'REVIEW'
+        };
 
+    bnxEnsureCostReportColumns_(clientId, sheetName);
     bnxReplaceReportByFields_(clientId, sheetName, { LOCATION_ID: locationId, FROM_DATE: from, TO_DATE: to }, [row]);
     bnxUpsertReportRegistry_(clientId, sheetName, 'COST', 'REPORT', 'STOCK_MOVEMENT,ITEM_MASTER,BILL_MASTER,BILL_ITEMS');
     return {
       success: true, available: true, isDemo: false,
-      data: { row, from, to,
-        note: 'Stock values use ITEM_MASTER.PURCHASE_RATE / period weighted purchase cost at query time, not a historical cost snapshot. ' + (wantBar ? 'BAR_COST' : 'FOOD_COST') + '_PERCENT is against ' + (wantBar ? 'bar' : 'food') + '-item NET_SALES for the same period from the shared sales dataset, so it cannot disagree with ITEM_SALES_REPORT.' }
+      data: {
+        row, from, to,
+        reconciliation: {
+          openingQty:+openingQty.toFixed(3), purchaseQty:+purchaseQty.toFixed(3),
+          transferInQty:+transferInQty.toFixed(3), transferOutQty:+transferOutQty.toFixed(3),
+          consumptionQty:+consumptionQty.toFixed(3), wastageQty:+wastageQty.toFixed(3),
+          breakageQty:+breakageQty.toFixed(3), adjustmentQty:+adjustmentQty.toFixed(3),
+          closingQty:+closingQtyTotal.toFixed(3), quantityVariance:stockQtyVariance,
+          openingValue:+openingValue.toFixed(2), purchaseValue:+purchases.toFixed(2),
+          transferInValue:+transferIn.toFixed(2), transferOutValue:+transferOut.toFixed(2),
+          consumptionValue:+consumption.toFixed(2), wastageValue:+wastage.toFixed(2),
+          breakageValue:+breakage.toFixed(2), adjustmentValue:+adjustmentValue.toFixed(2),
+          closingValue:+closingValue.toFixed(2), valueVariance:valueVariance,
+          status:(Math.abs(stockQtyVariance) < 0.001 && Math.abs(valueVariance) < 0.01) ? 'BALANCED' : 'REVIEW'
+        },
+        sales: { netSales:+periodNetSales.toFixed(2), costPercent:foodCostPercent },
+        note: 'Food/Bar cost uses real STOCK_MOVEMENT consumption as the operational cost. Wastage and breakage are reported separately as inventory loss. ISSUE is treated as internal transfer-out, preventing Kitchen Indent/Department Issue from being double-counted when actual consumption is later posted. No missing cost is fabricated.'
+      }
     };
   } catch (error) {
     bnxLogError(clientId, `bnxGetFoodOrBarCostReport_ failed: ${error.message}`, payload);
     return { success: false, error: error.message };
   }
+}
+function bnxEnsureCostReportColumns_(clientId, sheetName) {
+  try { bnxEnsureColumns_(bnxClientSheet(clientId, sheetName), ['INVENTORY_COST','LOSS_COST','LOSS_PERCENT','STOCK_VALUE_VARIANCE','RECONCILIATION_STATUS','TRANSFER_IN','TRANSFER_OUT','BREAKAGE']); } catch (e) {}
 }
 function bnxGetFoodCostReport(session, payload) { return bnxGetFoodOrBarCostReport_(session, payload, false); }
 function bnxGetBarCostReport(session, payload) { return bnxGetFoodOrBarCostReport_(session, payload, true); }
@@ -7814,7 +8576,7 @@ function bnxGetSalesDayBookReport_impl_(session, payload) {
       byDate[d].disc += (Number(b.BILL_DISCOUNT) || 0) + (Number(b.ITEM_DISCOUNT) || 0);
       byDate[d].taxable += Number(b.TAXABLE_AMOUNT) || 0;
       byDate[d].tax += Number(b.TAX_AMOUNT) || 0;
-      if (String(b.PAYMENT_STATUS).toUpperCase() !== 'PAID') byDate[d].due += Number(b.GRAND_TOTAL) || 0;
+      if (String(b.PAYMENT_STATUS).toUpperCase() !== 'PAID') byDate[d].due += bnxBillOutstanding_(b);
       dateByBillId[b.BILL_ID] = d;
     }
     const paySheet = bnxClientSheet(clientId, SHEETS.PAYMENT_MASTER);
@@ -8044,7 +8806,7 @@ function bnxGetCustomerDuesReportV2(session, payload) {
       if (b.CLIENT_ID !== clientId || !b.CUSTOMER_ID) continue;
       if (b.BILL_DATE !== asOfDate) continue;
       if (String(b.PAYMENT_STATUS).toUpperCase() === 'PAID') continue;
-      creditSalesByCust[b.CUSTOMER_ID] = (creditSalesByCust[b.CUSTOMER_ID] || 0) + (Number(b.GRAND_TOTAL) || 0);
+      creditSalesByCust[b.CUSTOMER_ID] = (creditSalesByCust[b.CUSTOMER_ID] || 0) + bnxBillOutstanding_(b);
     }
     try {
       const recSheet = bnxClientSheet(clientId, SHEETS.DUES_RECEIPT);
@@ -8390,6 +9152,13 @@ function bnxGetItemSalesReport(session, payload) {
 }
 
 function bnxGetCategorySalesReport(session, payload) {
+  const clientId = session.CLIENT_ID;
+  const p = payload || {};
+  const key = bnxReportCacheKey_('cat_sales', clientId, p);
+  return bnxCachedReport_(key, 20, () => bnxGetCategorySalesReport_impl_(session, p));
+}
+
+function bnxGetCategorySalesReport_impl_(session, payload) {
   const clientId = session.CLIENT_ID;
   const locationId = payload.locationId || payload.LOCATION_ID || '';
   const { from, to } = bnxResolveDateRange_(payload);
