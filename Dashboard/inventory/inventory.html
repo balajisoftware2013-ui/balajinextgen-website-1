@@ -5845,37 +5845,69 @@ function centralInvArea_(w){
   if(t==='kitchen'||/\bkitchen\b/.test(n)) return 'Kitchen Inventory';
   return 'Store Inventory';
 }
-function loadCentralInventory(){
+async function loadCentralInventory(){
   const body=document.getElementById('central-inv-body'), detail=document.getElementById('central-inv-detail-body'), kpi=document.getElementById('central-inv-kpis');
   if(!body||!detail) return;
+  const area={
+    'Store Inventory':{types:new Set(['STORE']),ws:new Set(),rows:[],qty:0,val:0,low:0},
+    'Bar Inventory':{types:new Set(['BAR']),ws:new Set(),rows:[],qty:0,val:0,low:0},
+    'Kitchen Inventory':{types:new Set(['KITCHEN']),ws:new Set(),rows:[],qty:0,val:0,low:0}
+  };
+  const firstDay=(typeof today==='function'?today():new Date().toISOString().slice(0,10)).slice(0,8)+'01';
+  const to=(typeof today==='function'?today():new Date().toISOString().slice(0,10));
+  body.innerHTML='<tr><td colspan="7" class="tbl-empty">⏳ Loading LIVE central/store/bar/kitchen inventory…</td></tr>';
+  detail.innerHTML='<tr><td colspan="8" class="tbl-empty">⏳ Loading live stock balances…</td></tr>';
   try{
-    const warehouses=DB.all('warehouses')||[], items=DB.all('items')||[], ledger=DB.all('stock_ledger')||[];
-    const itemMap=Object.fromEntries(items.map(i=>[String(i._id),i]));
-    const whMap=Object.fromEntries(warehouses.map(w=>[String(w._id),w]));
-    const area={
-      'Store Inventory':{ws:[],rows:[],qty:0,val:0,low:0},
-      'Bar Inventory':{ws:[],rows:[],qty:0,val:0,low:0},
-      'Kitchen Inventory':{ws:[],rows:[],qty:0,val:0,low:0}
-    };
-    warehouses.forEach(w=>{const a=centralInvArea_(w);area[a].ws.push(w);});
-    const latest={};
-    ledger.forEach(s=>{
-      const key=String(s.item_id)+'|'+String(s.wh_id);
-      if(!latest[key] || String(s._ts||'')>String(latest[key]._ts||'')) latest[key]=s;
+    // Use the production Core projection first. This is the same per-client
+    // STOCK_MOVEMENT/ITEM_MASTER calculation used by the inventory reports.
+    const res=await erpApi('GET_CENTRAL_INVENTORY',{from:firstDay,to});
+    const d=res?.data||{};
+    const rows=Array.isArray(d.rows)?d.rows:[];
+    if(!res?.success || !rows.length) throw new Error(res?.error || 'No live inventory rows returned');
+    rows.forEach(r=>{
+      const typ=String(r.INVENTORY_TYPE||'').toUpperCase();
+      const key=typ==='BAR'?'Bar Inventory':typ==='KITCHEN'?'Kitchen Inventory':typ==='STORE'?'Store Inventory':'';
+      if(!key) return;
+      const a=area[key];
+      a.ws.add(String(r.LOCATION_NAME||r.LOCATION_ID||'—'));
+      const q=Number(r.CLOSING_QTY)||0, val=Number(r.STOCK_VALUE)||0, min=Number(r.REORDER_LEVEL)||0;
+      a.rows.push({area:key,item:r.ITEM_NAME||r.ITEM_ID||'—',cat:'—',warehouse:r.LOCATION_NAME||r.LOCATION_ID||'—',unit:'',qty:q,rate:q?val/q:0,val,min});
+      a.qty+=q; a.val+=val; if(min>0&&q<=min)a.low++;
     });
-    Object.values(latest).forEach(s=>{
-      const w=whMap[String(s.wh_id)]; if(!w) return;
-      const i=itemMap[String(s.item_id)]||{}; const a=centralInvArea_(w); const q=Number(s.balance)||0; const rate=Number(i.purchase_price??i.cost_price??s.rate??s.price)||0;
-      const r={area:a,item:i.name||s.item_id,cat:i.cat||i.category||'—',warehouse:w.name||s.wh_id,unit:i.unit||s.unit||'',qty:q,rate,val:q*rate,min:Number(i.min_stock)||0};
-      area[a].rows.push(r); area[a].qty+=q; area[a].val+=r.val; if(q<=r.min) area[a].low++;
-    });
-    const total=Object.values(area).reduce((x,a)=>({qty:x.qty+a.qty,val:x.val+a.val,low:x.low+a.low}),{qty:0,val:0,low:0});
+    renderCentralInventory_();
+    return;
+  }catch(liveErr){
+    // Local cache is only a presentation fallback if Core is temporarily
+    // unavailable; it is never presented as the authoritative live source.
+    console.warn('[CENTRAL INVENTORY] live load failed, using local cache:',liveErr?.message||liveErr);
+    try{
+      const warehouses=DB.all('warehouses')||[], items=DB.all('items')||[], ledger=DB.all('stock_ledger')||[];
+      const itemMap=Object.fromEntries(items.map(i=>[String(i._id),i])), whMap=Object.fromEntries(warehouses.map(w=>[String(w._id),w]));
+      const latest={}; ledger.forEach(x=>{const k=String(x.item_id)+'|'+String(x.wh_id);if(!latest[k]||String(x._ts||'')>String(latest[k]._ts||''))latest[k]=x;});
+      Object.values(latest).forEach(r=>{
+        const w=whMap[String(r.wh_id)]; if(!w)return;
+        const t=String(w.type||'').toLowerCase(), n=String(w.name||'').toLowerCase();
+        const key=t==='bar'||/\bbar\b/.test(n)?'Bar Inventory':t==='kitchen'||/\bkitchen\b/.test(n)?'Kitchen Inventory':'Store Inventory';
+        const a=area[key], i=itemMap[String(r.item_id)]||{}, q=Number(r.balance)||0, rate=Number(i.purchase_price??i.cost_price??r.rate??r.price)||0;
+        a.ws.add(w.name||r.wh_id); a.rows.push({area:key,item:i.name||r.item_id,cat:i.cat||i.category||'—',warehouse:w.name||r.wh_id,unit:i.unit||r.unit||'',qty:q,rate,val:q*rate,min:Number(i.min_stock)||0}); a.qty+=q;a.val+=q*rate;if(Number(i.min_stock)>0&&q<=Number(i.min_stock))a.low++;
+      });
+      renderCentralInventory_();
+      const note=document.getElementById('central-inv-live-note'); if(note)note.textContent='⚠ Live Core inventory unavailable — showing local cache';
+    }catch(e){
+      console.error('[CENTRAL INVENTORY]',e);
+      body.innerHTML='<tr><td colspan="7" class="tbl-empty">Unable to load central inventory: '+escCentral_(e.message||e)+'</td></tr>';
+      detail.innerHTML='<tr><td colspan="8" class="tbl-empty">Unable to load details</td></tr>';
+    }
+  }
+  function renderCentralInventory_(){
+    const all=Object.values(area), total=all.reduce((x,a)=>({qty:x.qty+a.qty,val:x.val+a.val,low:x.low+a.low}),{qty:0,val:0,low:0});
     if(kpi) kpi.innerHTML=[['🏢','Total Stock Value',fmt(total.val),''],['📦','Total Quantity',fmt(total.qty),''],['⚠️','Low Stock Items',String(total.low),total.low?'color:var(--red)':'color:var(--green)']].map(x=>`<div class="stat-card"><div class="icon">${x[0]}</div><div class="val" style="${x[3]}">${x[2]}</div><div class="lbl">${x[1]}</div></div>`).join('');
-    body.innerHTML=Object.entries(area).map(([name,a])=>{const ws=a.ws.map(w=>w.name).join(', ')||'—'; const status=a.low?'Review low stock':'Healthy'; return `<tr><td><strong>${name}</strong></td><td>${escCentral_(ws)}</td><td class="r">${a.rows.length}</td><td class="r">${fmt(a.qty)}</td><td class="r">${fmt(a.val)}</td><td class="r" style="${a.low?'color:var(--red);font-weight:700;':''}">${a.low}</td><td><span class="badge ${a.low?'r':'g'}">${status}</span></td></tr>`;}).join('');
-    const rows=Object.values(area).flatMap(a=>a.rows).sort((x,y)=>x.area.localeCompare(y.area)||x.item.localeCompare(y.item));
-    detail.innerHTML=rows.length?rows.slice(0,300).map(r=>`<tr><td><strong>${escCentral_(r.area)}</strong></td><td>${escCentral_(r.item)}</td><td>${escCentral_(r.cat)}</td><td>${escCentral_(r.warehouse)}</td><td>${escCentral_(r.unit)}</td><td class="r">${fmt(r.qty)}</td><td class="r">${fmt(r.rate)}</td><td class="r">${fmt(r.val)}</td></tr>`).join(''):'<tr><td colspan="8" class="tbl-empty">No stock records found</td></tr>';
-  }catch(e){console.error('[CENTRAL INVENTORY]',e);body.innerHTML='<tr><td colspan="7" class="tbl-empty">Unable to load central inventory: '+escCentral_(e.message||e)+'</td></tr>';detail.innerHTML='<tr><td colspan="8" class="tbl-empty">Unable to load details</td></tr>';}
+    body.innerHTML=Object.entries(area).map(([name,a])=>{const ws=Array.from(a.ws).join(', ')||'—';const status=a.low?'Review low stock':'Healthy';return `<tr><td><strong>${name}</strong></td><td>${escCentral_(ws)}</td><td class="r">${a.rows.length}</td><td class="r">${fmt(a.qty)}</td><td class="r">${fmt(a.val)}</td><td class="r" style="${a.low?'color:var(--red);font-weight:700;':''}">${a.low}</td><td><span class="badge ${a.low?'r':'g'}">${status}</span></td></tr>`;}).join('');
+    const rows=all.flatMap(a=>a.rows).sort((x,y)=>x.area.localeCompare(y.area)||x.item.localeCompare(y.item));
+    detail.innerHTML=rows.length?rows.slice(0,500).map(r=>`<tr><td><strong>${escCentral_(r.area)}</strong></td><td>${escCentral_(r.item)}</td><td>${escCentral_(r.cat)}</td><td>${escCentral_(r.warehouse)}</td><td>${escCentral_(r.unit)}</td><td class="r">${fmt(r.qty)}</td><td class="r">${fmt(r.rate)}</td><td class="r">${fmt(r.val)}</td></tr>`).join(''):'<tr><td colspan="8" class="tbl-empty">No live stock records found</td></tr>';
+  }
 }
+
 function escCentral_(v){return String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function exportCentralInventoryExcel(){
   if(typeof XLSX==='undefined'){toast('Excel library not loaded','e');return;}
