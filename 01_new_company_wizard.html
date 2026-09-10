@@ -320,7 +320,7 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min
     <div class="wiz-header-icon">⚙️</div>
     <div>
       <h2>New Company / Client Setup Wizard</h2>
-      <p>7 steps · Auto client ID · Works online &amp; offline · Export to Excel/CSV · Auto-sends welcome email</p>
+      <p>7 steps · Auto client ID · Universal 3-DB setup · Auto business health check · Works online &amp; offline</p>
     </div>
   </div>
 
@@ -476,8 +476,8 @@ window.addEventListener('load',()=>{setTimeout(syncPending,3000);updateNetBadge(
 // ID SCHEME SWITCHED: BN0001, BN0002... (4-digit) — fresh sequence,
 // independent of the old CL##### numbers scattered across sheets/Drive.
 // No collision risk with any existing CL-prefixed client.
-const CLIENT_ID_PREFIX = 'BN';
-const CLIENT_ID_DIGITS = 4;
+const CLIENT_ID_PREFIX = 'CL';
+const CLIENT_ID_DIGITS = 5;
 const BASE_CLIENT_COUNT = 0; // BN sequence starts fresh at 0 → first ID is BN0001
 
 let autoClientId=CLIENT_ID_PREFIX+String(BASE_CLIENT_COUNT+1).padStart(CLIENT_ID_DIGITS,'0'), totalCount=0;
@@ -493,7 +493,7 @@ function _offlineFallback(badge){
   const localExtra=getLocalClientCount()+getPending();
   totalCount=BASE_CLIENT_COUNT+localExtra;
   autoClientId=_nextId(localExtra);
-  document.getElementById('nextClientId').textContent=autoClientId+' (offline)';
+  document.getElementById('nextClientId').textContent=autoClientId+' (offline estimate)';
   document.getElementById('totalClients').textContent=totalCount+' Clients';
   const lc=getLocalClients();
   document.getElementById('lastClient').textContent=lc.length?(lc[lc.length-1].CLIENT_ID||lc[lc.length-1].clientId||CLIENT_ID_PREFIX+String(BASE_CLIENT_COUNT).padStart(CLIENT_ID_DIGITS,'0')):CLIENT_ID_PREFIX+String(BASE_CLIENT_COUNT).padStart(CLIENT_ID_DIGITS,'0');
@@ -556,21 +556,13 @@ const SECTOR_GROUPS={
   'Finance & NBFC':["NBFC", "CHIT_FUND", "INSURANCE"],
   'NGO & Government':["NGO", "COOP"],
 };
-// 2026-08-08: which industries actually have a template in
-// TEMPLATE_REGISTRY today (checked directly against the sheet, not
-// guessed). WIZ_copyTemplateDatabases no longer falls back silently
-// to an unrelated industry's DB when one is missing — it fails with
-// a clear error instead — so an industry not in this list will save
-// the client fine (SAVE_CLIENT doesn't need a template) but the
-// COPY_TEMPLATE_DB step right after will fail. Flagging it here up
-// front instead of after a 5-minute form fill. Update this list
-// whenever a new template is added to TEMPLATE_REGISTRY.
-const TEMPLATE_COVERED_INDUSTRIES = new Set();
-
-// UNIVERSAL ERP TEMPLATE POLICY (2026-09-02)
-// Every industry uses the same three core database architecture.
-// Industry-specific behavior is configuration/modules, not a different DB schema.
+// UNIVERSAL ERP TEMPLATE POLICY
+// Every registered client uses the same three core databases.
+// Industry selection controls modules/configuration only; it must NEVER
+// block registration because an industry-specific database template is missing.
+const TEMPLATE_COVERED_INDUSTRIES = null;
 const UNIVERSAL_CORE_TEMPLATE_STATUS = 'UNIVERSAL ERP READY';
+const UNIVERSAL_TEMPLATE_IDS = {MASTER:'TEM_MAST', TRANSACTION:'TEM_TXN', REPORT:'TEM_RT'};
 
 
 const INDUSTRY_SECTORS=[
@@ -1365,119 +1357,85 @@ async function saveToSheets(sendAfter=false){
   pvSetStep(1,'success');
   pvSetStep(2,'running');
 
-  // ── STEP 2: COPY TEMPLATE DATABASES ──────────────────────
+  // ── STEP 2: AUTHORITATIVE UNIVERSAL DATABASE PROVISIONING ──────
+  // Do NOT select an industry-specific template here. Production routing uses
+  // the universal TEM_MAST / TEM_TXN / TEM_RT templates and fills the client's
+  // own CLIENT_DATABASE_REGISTRY row. Existing database IDs are preserved.
   try {
-    const industryCode = INDUSTRY_MAP[data.industry]||data.industry||'RESTAURANT';
-    const copyPayload  = { action:'COPY_TEMPLATE_DB', clientId:data.clientId, industry:industryCode, universalArchitecture:true };
-    const copyRes      = await gasPost(copyPayload);
-    if(copyRes.success||copyRes.status==='success'){
-      ss.textContent='✅ Saved & Databases Ready! Client ID: '+data.clientId;
-      toast('✅ Databases copied successfully! Template used: '+(copyRes.templateUsed||'—'),3000);
+    const provisionRes = await gasPost({
+      action:'PROVISION_CLIENT_DATABASES',
+      clientId:data.clientId
+    });
 
-      // 2026-08-08: WIZ_copyTemplateDatabases now reports separately if
-      // TRANSACTION_DB or REPORT_DB couldn't be found/copied even though
-      // MASTER_DB succeeded (previously this failed silently — the client
-      // looked fully provisioned but sales/KOT/orders/payments, or DSR/
-      // MTD/YTD/cashbook reports, had nowhere to write).
-      if(copyRes.transactionDbWarning || copyRes.reportDbWarning){
-        pvSetStep(2,'warning',[copyRes.transactionDbWarning&&'Transaction DB',copyRes.reportDbWarning&&'Report DB'].filter(Boolean).join(', ')+' missing');
-      } else {
-        pvSetStep(2,'success',copyRes.templateUsed||'');
-      }
-      if(copyRes.transactionDbWarning){
-        toast('⚠️ '+copyRes.transactionDbWarning,6000);
-      }
-      if(copyRes.reportDbWarning){
-        toast('⚠️ '+copyRes.reportDbWarning,6000);
-      }
-
+    if(provisionRes.success||provisionRes.status==='success'){
+      ss.textContent='✅ Client saved & 3 databases ready! Client ID: '+data.clientId;
+      toast('✅ MASTER + TRANSACTION + REPORT databases ready.',3000);
+      pvSetStep(2,'success','TEM_MAST · TEM_TXN · TEM_RT');
       pvSetStep(3,'running');
 
-      // ── STEP 2b: PROVISION MODULE DATABASES (Inventory/Purchase/Sales) ──
-      // Copies TEM033/036/037 into this client's own CLIENT_DATABASES
-      // folder and registers the 3 new spreadsheet IDs in
-      // CLIENT_DATABASE_REGISTRY (see client-module-provisioner.gs).
-      // Non-fatal — client is already fully saved even if this fails;
-      // the SYNC_PULL_ALL/SYNC_PUSH_TABLE backend falls back to the
-      // client's original spreadsheet until this succeeds.
+      // ── STEP 3: AUTOMATIC BUSINESS/SCHEMA HEALTH CHECK + REPAIR ──
+      // Repairs missing tenant sheets/schema and validates the selected
+      // industry profile. This is intentionally automatic for every client.
       try {
-        const modRes = await gasPost({ action:'PROVISION_CLIENT_MODULES', clientId:data.clientId, companyName:data.companyName });
-        if(modRes.success||modRes.status==='success'){
-          ss.textContent='✅ Saved, Databases & Module DBs Ready! Client ID: '+data.clientId;
-          pvSetStep(3,'success');
-        } else {
-          toast('⚠️ Module DB provisioning: '+(modRes.error||'Check GAS logs'),5000);
-          pvSetStep(3,'fail',modRes.error||'Check GAS logs');
-        }
-      } catch(modErr){
-        toast('⚠️ Module DB provisioning error: '+modErr.message,5000);
-        pvSetStep(3,'fail',modErr.message);
-      }
-      pvSetStep(4,'running');
-
-      // ── STEP 2c: PROVISION CONFIG FILES (Dashboard/Theme/Permissions) ──
-      // Creates <clientId>_DASHBOARD_CONFIG.json / _THEME_CONFIG.json /
-      // _PERMISSIONS_CONFIG.json in the client's folder (see
-      // client-json-config-store.gs) — settings-type data as JSON files
-      // instead of sheet rows. Non-fatal, same pattern as the steps above.
-      try {
-        const cfgJsonRes = await gasPost({
-          action:'PROVISION_CLIENT_CONFIG',
-          clientId:data.clientId,
-          industry:industryCode,
-          modules:data.modules,
-          adminRole:data.adminRole||'SUPER_ADMIN'
+        const repairRes = await gasPost({
+          action:'AUTO_REPAIR_CLIENT',
+          clientId:data.clientId
         });
-        if(cfgJsonRes.success||cfgJsonRes.status==='success'){
-          ss.textContent='✅ Saved, Databases, Module DBs & Config Ready! Client ID: '+data.clientId;
-        } else {
-          toast('⚠️ Config file provisioning: '+(cfgJsonRes.error||'Check GAS logs'),5000);
-        }
-      } catch(cfgJsonErr){
-        toast('⚠️ Config file provisioning error: '+cfgJsonErr.message,5000);
-      }
 
-      // ── STEP 3: GENERATE DASHBOARD CONFIG (module + report visibility) ──
-      // Non-fatal — client is already fully saved even if this fails
-      try {
-        const cfgRes = await gasPost({ action:'GENERATE_DASHBOARD_CONFIG', clientId:data.clientId });
-        if(cfgRes.success||cfgRes.status==='success'){
-          ss.textContent='✅ Saved, Databases & Dashboard Config Ready! Client ID: '+data.clientId;
-          pvSetStep(4,'success');
+        if(repairRes.success||repairRes.status==='success'){
+          const dbs=repairRes.provisioned?.databases||repairRes.databases||{};
+          const schema=repairRes.schema||{};
+          const dbCount=Object.keys(dbs).length;
+          const schemaMsg=schema?.success===false?'Schema check warning':'Schema ready';
+          ss.textContent='✅ Client + databases + business setup verified! Client ID: '+data.clientId;
+          toast('✅ Auto business check passed — '+schemaMsg+'.',3500);
+          pvSetStep(3,'success',(dbCount?dbCount+' databases verified · ':'')+schemaMsg);
+          pvSetStep(4,'running');
+
+          // ── STEP 4: CONFIG / PERMISSIONS ────────────────────────
+          const industryCode = INDUSTRY_MAP[data.industry]||data.industry||'RESTAURANT';
+          try {
+            const cfgJsonRes = await gasPost({
+              action:'PROVISION_CLIENT_CONFIG',
+              clientId:data.clientId,
+              industry:industryCode,
+              modules:data.modules,
+              adminRole:data.adminRole||'SUPER_ADMIN'
+            });
+            if(cfgJsonRes.success||cfgJsonRes.status==='success'){
+              ss.textContent='✅ Client, DBs, health check & config ready! Client ID: '+data.clientId;
+              pvSetStep(4,'success','Industry modules + permissions configured');
+            } else {
+              toast('⚠️ Config provisioning: '+(cfgJsonRes.error||'Check GAS logs'),5000);
+              pvSetStep(4,'warning',cfgJsonRes.error||'Config step needs review');
+            }
+          } catch(cfgErr){
+            toast('⚠️ Config provisioning error: '+cfgErr.message,5000);
+            pvSetStep(4,'warning',cfgErr.message);
+          }
         } else {
-          toast('⚠️ Dashboard config: '+(cfgRes.error||'Check GAS logs'),5000);
-          pvSetStep(4,'fail',cfgRes.error||'Check GAS logs');
+          toast('⚠️ Auto business check: '+(repairRes.error||'Check GAS logs'),6000);
+          pvSetStep(3,'fail',repairRes.error||'Auto repair failed');
+          pvSetStep(4,'warning','Config held until database health is fixed');
         }
-      } catch(cfgErr){
-        toast('⚠️ Dashboard config error: '+cfgErr.message,5000);
-        pvSetStep(4,'fail',cfgErr.message);
+      } catch(repairErr){
+        toast('⚠️ Auto business check error: '+repairErr.message,6000);
+        pvSetStep(3,'fail',repairErr.message);
+        pvSetStep(4,'warning','Config held until database health is fixed');
       }
     } else {
-      ss.textContent='✅ Saved. ⚠️ DB copy pending — run WIZ_testCopyTemplate in GAS.';
-      // 2026-08-08: the backend no longer silently falls back to an
-      // unrelated industry's template on a miss — it fails with either
-      // coveredIndustries (no template exists yet for this industry) or
-      // conflictingTemplateIds (TEMPLATE_REGISTRY has two ACTIVE rows
-      // for the same industry, unresolved). Surface whichever applies
-      // instead of the generic "Check GAS logs" — this is exactly the
-      // information needed to fix it without opening the spreadsheet.
-      if(copyRes.coveredIndustries && copyRes.coveredIndustries.length){
-        toast('⚠️ No template for "'+industryCode+'". Industries with a template today: '+copyRes.coveredIndustries.join(', '),8000);
-      } else if(copyRes.conflictingTemplateIds && copyRes.conflictingTemplateIds.length){
-        toast('⚠️ TEMPLATE_REGISTRY has '+copyRes.conflictingTemplateIds.length+' active templates for "'+industryCode+'" ('+copyRes.conflictingTemplateIds.join(', ')+') — mark all but one INACTIVE, then retry.',8000);
-      } else {
-        toast('⚠️ DB copy: '+(copyRes.error||'Check GAS logs'),5000);
-      }
-      pvSetStep(2,'fail',copyRes.error||'');
-      pvSetStep(3,'fail','skipped — databases not ready');
-      pvSetStep(4,'fail','skipped — databases not ready');
+      ss.textContent='⚠️ Client saved, but database provisioning needs attention.';
+      toast('⚠️ Database provisioning: '+(provisionRes.error||'Check GAS logs'),7000);
+      pvSetStep(2,'fail',provisionRes.error||'Provisioning failed');
+      pvSetStep(3,'fail','Skipped — databases not ready');
+      pvSetStep(4,'warning','Skipped — databases not ready');
     }
-  } catch(copyErr){
-    ss.textContent='✅ Saved. ⚠️ DB copy pending — run WIZ_testCopyTemplate in GAS.';
-    toast('⚠️ DB copy error: '+copyErr.message,5000);
-    pvSetStep(2,'fail',copyErr.message);
-    pvSetStep(3,'fail','skipped — databases not ready');
-    pvSetStep(4,'fail','skipped — databases not ready');
+  } catch(provisionErr){
+    ss.textContent='⚠️ Client saved, but database provisioning needs attention.';
+    toast('⚠️ Database provisioning error: '+provisionErr.message,7000);
+    pvSetStep(2,'fail',provisionErr.message);
+    pvSetStep(3,'fail','Skipped — databases not ready');
+    pvSetStep(4,'warning','Skipped — databases not ready');
   }
 
   if(sendAfter)sendCreds('WhatsApp');
