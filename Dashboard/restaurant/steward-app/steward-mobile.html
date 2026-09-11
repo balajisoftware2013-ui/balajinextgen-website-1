@@ -2603,7 +2603,7 @@ function bnxRenderQuickActionCounts(){
   }
   const kot = document.getElementById('qa-kot-count');
   if(kot){
-    const active = (typeof KOT!=='undefined'?KOT:[]).filter(k=>!['CANCELLED','BILLED','SERVED'].includes(k.status)).length;
+    const active = (typeof bnxVisibleActiveKOTs_==='function'?bnxVisibleActiveKOTs_():[]).length;
     kot.textContent = active+' in kitchen';
   }
 }
@@ -2692,6 +2692,27 @@ function renderMobTables(){
   bnxRenderQuickActionCounts();
 }
 
+
+/* OWNERSHIP LOCK — a running/occupied table belongs to the steward who
+   started it. Only that steward may add a new KOT or modify an existing
+   KOT on the table. Available tables may be claimed by the first steward
+   who places an order. */
+function bnxCanEditRunningTable_(table){
+  if(!table) return {ok:false,reason:'Table not found'};
+  const st=String(table.status||'').toUpperCase();
+  if(st!=='RUNNING' && st!=='OCCUPIED') return {ok:true};
+  if(isMyTable(table,getCurrentStaffIdentity()) || liveTableOwner(table)) return {ok:true};
+  const owner=table.steward||table.captain||table.waiter||table.STEWARD||table.CAPTAIN||table.WAITER||'';
+  return {ok:false,reason:owner
+    ? `🔒 Table ${table.id} is already running under ${owner}. Only that steward can change or add orders.`
+    : `🔒 Table ${table.id} is already running under another steward. You cannot change or add an order here.`};
+}
+function bnxRequireOwnRunningTable_(table){
+  const r=bnxCanEditRunningTable_(table);
+  if(!r.ok){ toast(r.reason,'error'); return false; }
+  return true;
+}
+
 function openTable(id){
   selTable=TABLES.find(t=>t.id===id);
   if(!selTable)return;
@@ -2720,8 +2741,10 @@ function openTable(id){
 
 function openOrderForTable(){
   const t=selTable;
-  closeModal();
   if(!t)return;
+  // Running/occupied tables are locked to their own steward.
+  if(!bnxRequireOwnRunningTable_(t)) return;
+  closeModal();
   document.getElementById('no-title').textContent=`Order — Table ${t.id}`;
   order={};
   showScreen('s-new-order');
@@ -3785,13 +3808,26 @@ function bnxOrderStatusLocked_(status){
   const s=String(status||'').trim().toUpperCase();
   return ['READY','SERVED','BILLED','SETTLED','CANCELLED'].includes(s);
 }
+function bnxKOTCanSeeAll_(){
+  const role=bnxNorm_(getCurrentStaffIdentity().role);
+  return ['admin','owner','manager','restaurant_admin','restaurant admin','restaurant-manager','restaurant_manager','super_admin','super admin'].includes(role);
+}
+function bnxIsVisibleKOT_(k){
+  if(bnxKOTCanSeeAll_()) return true;
+  return isMyOrder(k,getCurrentStaffIdentity());
+}
+function bnxVisibleActiveKOTs_(){
+  return (Array.isArray(KOT)?KOT:[]).filter(k=>!['CANCELLED','BILLED','SERVED'].includes(String(k.status||'').toUpperCase()) && bnxIsVisibleKOT_(k));
+}
 function renderKOT(){
+  // Steward privacy/ownership fix: a steward must see only KOTs created by
+  // the logged-in steward. Restaurant-level privileged roles may see all.
   // PASS #50 FIX (companion to the dashboard's "In Progress always 0"
   // fix): PROGRESS/IN_PROGRESS had no color mapping here at all, so a
   // ticket cooking-in-progress rendered with the default stat-prep style
   // by accident rather than intentionally — added explicitly.
   const sc={PREPARING:'stat-prep',PROGRESS:'stat-prep',IN_PROGRESS:'stat-prep',READY:'stat-ready',NEW:'stat-pending',PENDING:'stat-pending',DELAYED:'stat-delayed'};
-  const active = KOT.filter(k=>!['CANCELLED','BILLED','SERVED'].includes(k.status));
+  const active = bnxVisibleActiveKOTs_();
   const listEl = document.getElementById('kot-list');
   // FIX ("14 active orders" hardcoded forever): this subtitle had no id
   // and was never touched by any function — real kitchen activity never
@@ -4089,6 +4125,9 @@ function shareKOTWhatsApp(kotNo){
     const six=6*60*60*1000;
     return ms < six ? ms + 24*60*60*1000 : ms;
   }
+  // IN_TIME and OUT_TIME are always saved as matching HH:mm:ss values.
+  // The calculator also handles overnight shifts (for example 14:32:53 →
+  // 01:12:31) by rolling the OUT time into the next calendar day.
   function bnxAttendanceHours_(inTime,outTime){
     const a=bnxAttendanceTimeMs_(inTime), b=bnxAttendanceTimeMs_(outTime);
     if(!isFinite(a)||!isFinite(b)) return 0;
@@ -5282,6 +5321,7 @@ async function placeOrder(){
   const tot=Object.values(order).reduce((a,b)=>a+b,0);
   if(!tot){ toast('No items in order','error'); return; }
   if(!selTable){ toast('No table selected','error'); return; }
+  if(!bnxRequireOwnRunningTable_(selTable)) return;
   // FIX ("add to order" problem — the actual KOT sent to kitchen/billing
   // was corrupted): same string-vs-number id mismatch as updateOrderBadge
   // above, but here the consequence was worse than a wrong badge total —
@@ -5341,7 +5381,7 @@ async function placeOrder(){
   // orderDate's own auto-capture pattern above. No manual time entry.
   const orderTime = new Date().toTimeString().slice(0,5);
   const res = await gasApi('SAVE_ORDER', {
-    requestId, tableId:selTable.id, locationId:identity.locationId||'', orderSource:'POS', orderType:'DINEIN', waiter:stewardName, steward:stewardName, waiterName:stewardName, waiterLogin:identity.loginId, covers:'', items, occasion:'None', customerName:customerFields.customerName, customerMobile:customerFields.customerMobile, orderDate, orderTime,
+    requestId, stewardApp:true, tableId:selTable.id, locationId:identity.locationId||'', orderSource:'POS', orderType:'DINEIN', waiter:stewardName, steward:stewardName, waiterName:stewardName, waiterLogin:identity.loginId, covers:'', items, occasion:'None', customerName:customerFields.customerName, customerMobile:customerFields.customerMobile, orderDate, orderTime,
     ...orderIdentityFields
   }, 'V2_CORE');
 
@@ -5350,7 +5390,7 @@ async function placeOrder(){
   if(!res || !res.success){
     // Genuine failure or offline — queue it, tell the truth about the
     // state ("Pending Sync"), never pretend it's on the dashboard yet.
-    bnxQueuePending('SAVE_ORDER', { requestId, tableId:selTable.id, locationId:identity.locationId||'', orderSource:'POS', orderType:'DINEIN', waiter:stewardName, steward:stewardName, waiterName:stewardName, waiterLogin:identity.loginId, covers:'', items, occasion:'None', customerName:customerFields.customerName, customerMobile:customerFields.customerMobile, orderDate, orderTime, ...orderIdentityFields }, requestId, 'kot');
+    bnxQueuePending('SAVE_ORDER', { requestId, stewardApp:true, tableId:selTable.id, locationId:identity.locationId||'', orderSource:'POS', orderType:'DINEIN', waiter:stewardName, steward:stewardName, waiterName:stewardName, waiterLogin:identity.loginId, covers:'', items, occasion:'None', customerName:customerFields.customerName, customerMobile:customerFields.customerMobile, orderDate, orderTime, ...orderIdentityFields }, requestId, 'kot');
     toast('📴 Could not reach server — order queued, will send when back online','error');
     bnxSetLiveStatus('offline');
     // Still reflected locally so THIS device's own screens are usable
@@ -5394,7 +5434,14 @@ async function placeOrder(){
   }
   lastOrderId = orderId;
   bnxLoadOpenKots();
-  const entry = { kotNo:orderId, orderNo:(res.data&&res.data.ORDER_NUMBER)||orderId, orderId:(res.data&&res.data.ORDER_ID)||res.transactionId||orderId, table:selTable.id, type:'KITCHEN', time:res.serverTimestamp||new Date().toISOString(), waiter:stewardName, covers:'', items, amount, customerName:customerFields.customerName, customerMobile:customerFields.customerMobile, orderTime, status:'NEW' };
+  const serverKotNumbers = (res.kotNumbers || (res.data && res.data.KOT_NUMBERS) || []).filter(Boolean);
+  const primaryKotNumber = res.kotNumber || (res.data && res.data.KOT_NUMBER) || serverKotNumbers[0] || '';
+  const entry = { kotNo:primaryKotNumber, kotNumbers:serverKotNumbers, kotCount:serverKotNumbers.length,
+    orderNo:(res.data&&res.data.ORDER_NUMBER)||orderId, orderId:(res.data&&res.data.ORDER_ID)||res.transactionId||orderId,
+    table:selTable.id, type:'KITCHEN', time:res.serverTimestamp||new Date().toISOString(), waiter:stewardName,
+    userId:identity.userId, loginId:identity.loginId, createdById:identity.userId, createdByLogin:identity.loginId, createdByName:stewardName,
+    covers:'', items, amount, customerName:customerFields.customerName, customerMobile:customerFields.customerMobile,
+    orderTime, status:'NEW' };
   KOT.unshift(entry);
   if(KOT.length>100) KOT.length=100;
   bnxSetOpenKotsRaw(JSON.stringify(KOT));
@@ -5421,7 +5468,7 @@ async function placeOrder(){
     status: 'PLACED', timestamp: Date.now(), originalItems: JSON.parse(JSON.stringify(items)), hasServerId: true
   };
 
-  toast('✅ KOT sent to kitchen — confirmed on server','success');
+  toast('✅ KOT saved to kitchen — '+(serverKotNumbers.length>1 ? serverKotNumbers.length+' KOTs split by item group' : '1 KOT')+' confirmed on server','success');
   order={};
   selectOccasion('None');
   bnxClearOrderCustomerFields_();
@@ -5481,6 +5528,8 @@ function showOrderPlacedModal(orderId){
   
   const modal = document.getElementById('order-placed-modal');
   if(!modal) return;
+  const canModify = isMyOrder(placedOrder,getCurrentStaffIdentity()) ||
+    bnxCanEditRunningTable_(TABLES.find(t=>String(t.id)===String(placedOrder.table))).ok;
   
   const itemsList = placedOrder.items.map(i=>`<div class="opm-item">
     <span class="opm-qty">${i.qty}×</span>
@@ -5501,9 +5550,9 @@ function showOrderPlacedModal(orderId){
           <span>₹${placedOrder.amount.toLocaleString('en-IN')}</span>
         </div>
         <div class="opm-actions">
-          <button class="btn btn-secondary" onclick="openOrderReplacementModal('${orderId}')">
+          ${canModify ? `<button class="btn btn-secondary" onclick="openOrderReplacementModal('${orderId}')">
             🔄 Modify / Replace Items
-          </button>
+          </button>` : `<div style="padding:10px;border-radius:10px;background:var(--red-bg);color:var(--red);font-size:11px;font-weight:700;text-align:center;">🔒 This table is assigned to another steward.</div>`}
           <button class="btn btn-primary" onclick="closeModal()">
             ✓ Done
           </button>
@@ -5642,6 +5691,12 @@ async function sendModifiedOrder(orderId){
     return;
   }
   
+  const editTable=TABLES.find(t=>String(t.id)===String(order.table));
+  if(!isMyOrder(order,getCurrentStaffIdentity()) && !bnxCanEditRunningTable_(editTable).ok){
+    toast('🔒 This table/order belongs to another steward. Change not allowed.','error');
+    return;
+  }
+
   const newTotal = calculateOrderTotal(orderId);
   
   toast('Sending modified KOT…','info');
@@ -5672,7 +5727,7 @@ async function sendModifiedOrder(orderId){
   // create a duplicate server-side update. Now included in the
   // payload for both the live call and the queued retry payload.
   const requestId = bnxUuid();
-  const i = getCurrentStaffIdentity(); const editPayload = {requestId, orderId:order.id, tableId:order.table, locationId:i.locationId, orderType:'KITCHEN', waiter:order.steward, waiterName:order.steward, waiterLogin:i.loginId, createdById:i.userId, createdByLogin:i.loginId, createdByName:order.steward, items:order.items};
+  const i = getCurrentStaffIdentity(); const editPayload = {requestId, stewardApp:true, orderId:order.id, tableId:order.table, locationId:i.locationId, orderType:'KITCHEN', waiter:order.steward, waiterName:order.steward, waiterLogin:i.loginId, createdById:i.userId, createdByLogin:i.loginId, createdByName:order.steward, items:order.items};
   const res = await gasApi('SAVE_ORDER', editPayload, 'V2_CORE');
   if(!res || !res.success){
     bnxQueuePending('SAVE_ORDER', editPayload, requestId, 'kot-edit:'+order.id);
@@ -5706,6 +5761,13 @@ function editKotOrder(kotNo){
   const k = KOT.find(x=>x.kotNo===kotNo);
   if(!k){ toast('Order not found','error'); return; }
   if(bnxOrderStatusLocked_(k.status)){ toast('🔒 Ready/Served/Billed orders cannot be changed from Steward Mobile','error'); return; }
+  if(!isMyOrder(k,getCurrentStaffIdentity())){
+    const t=TABLES.find(x=>String(x.id)===String(k.table));
+    if(!t || !bnxCanEditRunningTable_(t).ok){
+      toast('🔒 This KOT belongs to another steward. You cannot modify it.','error');
+      return;
+    }
+  }
   if(!PLACED_ORDERS[kotNo]){
     PLACED_ORDERS[kotNo] = {
       id: kotNo, orderNo:k.orderNo||kotNo, orderId:k.orderId||'', table: k.table,
@@ -5760,7 +5822,7 @@ async function loadKOTFromServer(){
       const rawTime=o.START_TIME||o.ORDER_TIME||o.CREATED_TIME||'';
       let when=new Date();
       if(rawDate){ const composed=rawTime?String(rawDate)+' '+String(rawTime):String(rawDate); const d=new Date(composed); if(!isNaN(d.getTime())) when=d; }
-      const rec={kotNo:String(kotNo), orderNo:o.ORDER_NUMBER||o.ORDER_NO||o.ORDER_ID||String(kotNo), orderId:o.ORDER_ID||'', table:o.TABLE_ID||o.TABLE_NO||o.tableId||o.table||'—', type:'KITCHEN', waiter:o.CREATED_BY||o.WAITER||o.STEWARD||'', covers:o.PAX||o.COVERS||'', customerName:o.CUSTOMER_NAME||o.customerName||o.CUSTOMER||'', customerMobile:o.CUSTOMER_MOBILE||o.customerMobile||o.MOBILE||'', time:when.toISOString(), items};
+      const rec={kotNo:String(kotNo), orderNo:o.ORDER_NUMBER||o.ORDER_NO||o.ORDER_ID||String(kotNo), orderId:o.ORDER_ID||'', table:o.TABLE_ID||o.TABLE_NO||o.tableId||o.table||'—', type:'KITCHEN', waiter:o.CREATED_BY||o.WAITER||o.STEWARD||o.STARTED_BY||'', createdBy:o.CREATED_BY||o.CREATED_BY_NAME||o.STARTED_BY||'', createdById:o.CREATED_BY_ID||o.USER_ID||'', createdByLogin:o.CREATED_BY_LOGIN||o.LOGIN_ID||'', createdByName:o.CREATED_BY_NAME||o.CREATED_BY||o.STARTED_BY||'', userId:o.CREATED_BY_ID||o.USER_ID||'', loginId:o.CREATED_BY_LOGIN||o.LOGIN_ID||'', covers:o.PAX||o.COVERS||'', customerName:o.CUSTOMER_NAME||o.customerName||o.CUSTOMER||'', customerMobile:o.CUSTOMER_MOBILE||o.customerMobile||o.MOBILE||o.MOBILE_NO||'', time:when.toISOString(), items};
       const idx=KOT.findIndex(k=>String(k.kotNo)===String(kotNo));
       if(idx>=0){
         if(KOT[idx].pendingLocalEdit) return;
