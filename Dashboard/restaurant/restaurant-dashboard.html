@@ -11380,15 +11380,21 @@ function bnxLoadSavedMenu(){
       usingDemoMenu = false;
     }
   }catch(e){}
-  // Re-sanitize cached rows using the same authoritative Food/Bar classifier.
+  // Re-sanitize cached rows without discarding a previously confirmed BAR menu.
+  // IMPORTANT: a temporary BAR API failure must never turn a working POS into
+  // a Food-only POS. Cached BAR rows are a last-known-good fallback and are
+  // replaced only when a fresh authoritative BAR response succeeds.
   const sanitized=[]; const seen=new Set();
   menuData.forEach(it=>{
-    const kind=bnxMenuKind_(it);
-    if(kind==='bar') return; // cached Bar rows are reloaded from live BAR_MENU_CARD
+    if(!it) return;
     const key=String(it.code||it.itemCode||it.id||it.n||'').trim().toUpperCase();
-    if(key && seen.has(key)) return;
-    if(key) seen.add(key);
-    if(!it.e) it.e = bnxDefaultIcon(it.c); it.v=bnxMenuVegValue_(it); sanitized.push(it);
+    const kind=bnxMenuKind_(it);
+    const dedupKey=(kind==='bar'?'B|':'F|')+key;
+    if(key && seen.has(dedupKey)) return;
+    if(key) seen.add(dedupKey);
+    if(!it.e) it.e = bnxDefaultIcon(it.c);
+    it.v=bnxMenuVegValue_(it);
+    sanitized.push(it);
   });
   menuData.length=0; sanitized.forEach(it=>menuData.push(it));
 }
@@ -17522,7 +17528,18 @@ async function bnxLoadMenuDataCore(){
     return {success:false,food:0,bar:0,total:menuData.length,error:detail};
   }
 
-  const barItems=barRows.map(barNorm).filter(Boolean);
+  // Preserve the last known-good BAR rows whenever this refresh is partial.
+  // Google Apps Script can transiently return available.bar=true with an empty
+  // payload, or the legacy endpoint can fail while Food succeeds. In either case
+  // the POS must not erase the visible Bar Menu.
+  const existingBars=(Array.isArray(menuData)?menuData:[]).filter(x=>{
+    try{return typeof bnxMenuKind_==='function' ? bnxMenuKind_(x)==='bar' : !!x?.isBar;}catch(e){return !!x?.isBar;}
+  });
+  let barItems=barRows.map(barNorm).filter(Boolean);
+  if(!barItems.length && existingBars.length){
+    barItems=existingBars.map(x=>Object.assign({},x,{isBar:true,menuType:'BAR',v:''}));
+    console.warn('[POS MENU] BAR refresh empty/failed — preserving last known-good BAR rows:',barItems.length);
+  }
   const barIds=new Set(barItems.flatMap(x=>[x.code,x.itemCode,x.id,x.itemId].map(v=>String(v??'').trim().toUpperCase())).filter(Boolean));
   const barNames=new Set(barItems.map(x=>String(x.n||'').trim().toUpperCase()).filter(Boolean));
   // Keep both identity and name sets globally. This handles older master rows where
@@ -27683,7 +27700,7 @@ html,body{min-height:100%;}
     const mode=window.__BNX_POS_MODE||'All';
     const active=window.__BNX_POS_CATEGORY||'All';
     const base=modeItems(mode);
-    const cats=[...new Set(base.map(categoryOf).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+    const cats=[...new Set(base.map(bnxPosCategoryOf).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
     // In Food/Bar mode the row is the authoritative category level. Never show
     // categories belonging to the other menu. For All/Fav/etc it still reflects
     // only the currently visible item set.
@@ -28152,7 +28169,11 @@ document.addEventListener('DOMContentLoaded',()=>{setTimeout(()=>{try{bnxInitIte
 
   function barCount(){
     const rows=Array.isArray(window.menuData)?window.menuData:[];
-    return rows.filter(x=>x && (x.isBar===true || String(x.menuType||x.MENU_TYPE||'').toUpperCase()==='BAR')).length;
+    return rows.filter(x=>{
+      if(!x)return false;
+      try{if(typeof bnxMenuKind_==='function' && bnxMenuKind_(x)==='bar')return true;}catch(e){}
+      return x.isBar===true || String(x.menuType||x.MENU_TYPE||'').toUpperCase()==='BAR';
+    }).length;
   }
   async function loadBarFinal(){
     try{
@@ -28239,6 +28260,62 @@ document.addEventListener('DOMContentLoaded',()=>{setTimeout(()=>{try{bnxInitIte
     },250);
   }
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init,{once:true});else init();
+})();
+</script>
+<script id="bnx-pos-final-bar-persistence-v15">
+(function(){
+  'use strict';
+  // Final persistence guard: a Food-only/partial background refresh may not
+  // erase a Bar Menu that was already loaded successfully. This guard keeps a
+  // last-known-good BAR snapshot and restores it after any generic menu refresh
+  // that returns without usable Bar rows. It never invents Bar items.
+  function isBar(i){
+    if(!i)return false;
+    try{if(typeof bnxMenuKind_==='function'&&bnxMenuKind_(i)==='bar')return true;}catch(e){}
+    return i.isBar===true||String(i.menuType||i.MENU_TYPE||'').toUpperCase()==='BAR';
+  }
+  function snapshot(){
+    const rows=Array.isArray(window.menuData)?window.menuData:[];
+    const bars=rows.filter(isBar);
+    if(bars.length){
+      try{window.__BNX_LAST_GOOD_BAR_MENU=bars.map(x=>Object.assign({},x));}catch(e){}
+    }
+    return bars.length;
+  }
+  function restoreIfMissing(){
+    const rows=Array.isArray(window.menuData)?window.menuData:[];
+    if(rows.some(isBar)) { snapshot(); return false; }
+    const saved=Array.isArray(window.__BNX_LAST_GOOD_BAR_MENU)?window.__BNX_LAST_GOOD_BAR_MENU:[];
+    if(!saved.length)return false;
+    window.__BNX_LIVE_BAR_ITEM_IDS=new Set(saved.flatMap(x=>[x.code,x.itemCode,x.id,x.itemId]).filter(Boolean).map(v=>String(v).trim().toUpperCase()));
+    window.__BNX_LIVE_BAR_ITEM_NAMES=new Set(saved.map(x=>String(x.n||x.name||'').trim().toUpperCase()).filter(Boolean));
+    saved.forEach(x=>{x.isBar=true;x.menuType='BAR';x.v='';});
+    rows.push(...saved.map(x=>Object.assign({},x)));
+    console.warn('[POS BAR PERSISTENCE v15] restored last-known-good BAR menu:',saved.length);
+    try{if(typeof bnxRebuildCategoryPills==='function')bnxRebuildCategoryPills();}catch(e){}
+    try{if(typeof bnxRebuildItemGroupPills_==='function')bnxRebuildItemGroupPills_();}catch(e){}
+    try{if(typeof buildMenu==='function')buildMenu();}catch(e){}
+    return true;
+  }
+  window.__BNX_SNAPSHOT_BAR_MENU=snapshot;
+  window.__BNX_RESTORE_BAR_MENU=restoreIfMissing;
+  const oldLoad=window.loadMenuData;
+  if(typeof oldLoad==='function'&&!oldLoad.__bnxBarPersistenceV15){
+    const wrapped=async function(){
+      snapshot();
+      const r=await oldLoad.apply(this,arguments);
+      restoreIfMissing();
+      snapshot();
+      return r;
+    };
+    wrapped.__bnxBarPersistenceV15=true;
+    window.loadMenuData=wrapped;
+  }
+  document.addEventListener('DOMContentLoaded',function(){
+    setTimeout(function(){snapshot();restoreIfMissing();},120);
+    setTimeout(function(){restoreIfMissing();snapshot();},1200);
+    setTimeout(function(){restoreIfMissing();snapshot();},3000);
+  });
 })();
 </script>
 </body>
