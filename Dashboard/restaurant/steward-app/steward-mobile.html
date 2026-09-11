@@ -963,7 +963,7 @@ function bnxLogoFallback(img){
       <input type="text" id="login-user" placeholder="STW001 or Mobile No" style="width:100%;background:var(--surface2);border:1.5px solid var(--border2);border-radius:12px;padding:13px 15px;font-size:15px;font-family:'DM Sans',sans-serif;color:var(--text);outline:none;margin-bottom:14px;">
       <div style="font-size:11px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.07em;margin-bottom:5px;">PASSWORD</div>
       <input type="password" id="login-pass" placeholder="Password" style="width:100%;background:var(--surface2);border:1.5px solid var(--border2);border-radius:12px;padding:13px 15px;font-size:15px;font-family:'DM Sans',sans-serif;color:var(--text);outline:none;margin-bottom:20px;">
-      <button class="btn-primary" id="login-btn" onclick="doLogin()">Login to Steward App</button>
+      <form id="steward-login-form" onsubmit="return handleLoginSubmit(event)" autocomplete="on"><button type="submit" class="btn-primary" id="login-btn">Login to Steward App</button></form>
       <div style="text-align:center;margin-top:12px;">
         <a href="javascript:void(0)" onclick="openForgotModal()" style="font-size:12px;color:var(--gold);font-weight:700;text-decoration:none;">Forgot password?</a>
       </div>
@@ -1493,12 +1493,50 @@ async function gasApi(action,payload,endpoint){
   }
   return {success:false,offline:true,error:lastErr && lastErr.name==='AbortError' ? 'Request timed out' : (lastErr?.message||'Network error')};
 }
+let __bnxLoginInFlight = false;
+let __bnxLoginStartedAt = 0;
+
 async function authApi(action,payload){
-  try{
-    const r=await fetch(bnxApiUrl_('V2_AUTH'),{method:'POST',headers:{'Content-Type':'text/plain'},
-      body:JSON.stringify(Object.assign({action:action},payload))});
-    return await r.json();
-  }catch(e){ return {success:false,status:'error',error:e.message}; }
+  const body=JSON.stringify(Object.assign({action:action},payload||{}));
+  let lastErr=null;
+  for(let attempt=0; attempt<2; attempt++){
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),15000);
+    try{
+      const r=await fetch(bnxApiUrl_('V2_AUTH'),{
+        method:'POST',
+        headers:{'Content-Type':'text/plain;charset=utf-8'},
+        cache:'no-store',
+        credentials:'omit',
+        body:body,
+        signal:controller.signal
+      });
+      clearTimeout(timer);
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      const text=await r.text();
+      let data; try{ data=JSON.parse(text); }catch(e){ throw new Error('Invalid server response'); }
+      return data;
+    }catch(e){
+      clearTimeout(timer); lastErr=e;
+      if(attempt===0) await new Promise(r=>setTimeout(r,350));
+    }
+  }
+  return {success:false,status:'error',error:lastErr && lastErr.name==='AbortError' ? 'Login request timed out' : (lastErr?.message||'Network error')};
+}
+
+function handleLoginSubmit(event){
+  if(event) event.preventDefault();
+  doLogin();
+  return false;
+}
+
+function bnxSetLoginBusy_(busy){
+  const btn=document.getElementById('login-btn');
+  if(!btn) return;
+  btn.disabled=!!busy;
+  btn.style.pointerEvents=busy?'none':'auto';
+  btn.setAttribute('aria-busy',busy?'true':'false');
+  btn.textContent=busy?'Signing in…':'Login to Steward App';
 }
 
 /* Fallback menu — P0 FIX (external audit round 3, #2 — "LIVE menu
@@ -2342,22 +2380,31 @@ async function bnxLoadClientName_(loginResult){
   return CLIENT_ID || '';
 }
 async function doLogin(){
+  if(__bnxLoginInFlight) return false;
   const u=document.getElementById('login-user').value.trim();
   const p=document.getElementById('login-pass').value.trim();
-  if(!u||!p){ toast('Enter Login ID and Password','error'); return; }
-  const btn=document.getElementById('login-btn');
-  if(btn){ btn.disabled=true; btn.textContent='Checking…'; }
-  const result = await authApi('LOGIN',{loginId:u,password:p});
-  if(btn){ btn.disabled=false; btn.textContent='Login to Steward App'; }
+  if(!u||!p){ toast('Enter Login ID and Password','error'); return false; }
+
+  __bnxLoginInFlight=true;
+  __bnxLoginStartedAt=Date.now();
+  bnxSetLoginBusy_(true);
+  try{
+    // Use the current deployment configuration when it is already loading,
+    // but never make the user tap Login again just because config refresh is slow.
+    if(__bnxConfigReady){
+      try{ await Promise.race([__bnxConfigReady,new Promise(r=>setTimeout(r,1200))]); }catch(e){}
+    }
+
+    const result = await authApi('LOGIN',{loginId:u,password:p});
   if(!(result && result.status==='success' && result.ROLE)){
     toast(result && (result.message||result.error) || 'Invalid credentials','error');
-    return;
+    return false;
   }
   // Restrict this app to floor staff roles
   const allowedRoles=['STEWARD','WAITER','CAPTAIN','MANAGER','SUPER_ADMIN','OWNER','ADMIN'];
   if(!allowedRoles.includes((result.ROLE||'').toUpperCase())){
     toast('This account does not have steward floor access','error');
-    return;
+    return false;
   }
   // PASS #48: backfill LOGIN_ID from what the steward actually typed
   // if the LOGIN response doesn't already carry one — this is what lets
@@ -2396,12 +2443,21 @@ async function doLogin(){
   document.getElementById('prof-name').textContent=name;
   document.getElementById('prof-avatar').textContent=name[0];
   document.getElementById('prof-role').textContent=(result.ROLE||'')+' • Morning Shift';
-  await Promise.allSettled([loadBootstrapOrFallback(), loadKOTFromServer()]);
-  // FINAL: menu must be confirmed from the logged-in client's server data
-  // before New Order is presented. This removes the race where the first
-  // mobile tap saw 'Categories (0)' while the async menu request was still pending.
-  try{ await loadMenuFromServer(true); }catch(e){ console.warn('[LOGIN_MENU]',e); }
+  // IMPORTANT: navigate immediately after authentication. The old flow waited
+  // for bootstrap + KOT + menu before changing screen, which made a successful
+  // login look like it needed 2–3 taps on slow mobile networks. Data continues
+  // loading after the authenticated home screen is visible.
   showScreen('s-home');
+  toast('Login successful — loading your restaurant data…','success');
+
+  Promise.allSettled([loadBootstrapOrFallback(), loadKOTFromServer()]).then(()=>{
+    try{ return loadMenuFromServer(true); }catch(e){ console.warn('[LOGIN_MENU]',e); }
+  }).catch(e=>console.warn('[LOGIN_BOOTSTRAP]',e));
+  return true;
+  } finally {
+    __bnxLoginInFlight=false;
+    bnxSetLoginBusy_(false);
+  }
 }
 /* NEW ("password reset give option forget"): self-service "Forgot
    password?" flow on the login screen. Reuses the same V2_AUTH
