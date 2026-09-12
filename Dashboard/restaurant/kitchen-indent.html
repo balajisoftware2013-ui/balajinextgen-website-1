@@ -1077,15 +1077,25 @@ function addHistoryRow(num) {
 // dd-MM-yyyy in most browsers (reads it as MM-dd-yyyy instead).
 function parseIndentDate(s) {
   if (!s) return null;
-  // FIX: real backend format is "dd/MM/yyyy HH:mm:ss" (confirmed from
-  // actual KITCHEN_INDENT rows) — strip any time portion first, since
-  // splitting the whole string on [-/] corrupted the year field with
-  // leftover time text (e.g. "2026 00:15:30"), silently failing to
-  // parse and breaking date-range filtering for every real indent.
-  const datePart = String(s).trim().split(' ')[0];
+  // FIX (root cause, confirmed against the backend): every DATE value
+  // GET_PENDING_INDENTS returns has already passed through the backend's
+  // bnxRowToObject/bnxNormalizeDateKey_, which always normalizes DATE to
+  // "yyyy-MM-dd" — never "dd/MM/yyyy". The old dd/MM/yyyy assumption fed
+  // year/day into the wrong Date() argument (e.g. "2026-09-12" was read as
+  // day=2026, month=9, year=12), producing a garbage date outside every
+  // possible range and silently dropping every real indent from the
+  // Today/Week/Month/Quarter/Year filters (only "All" ever showed them).
+  // Detect the 4-digit segment instead of assuming a fixed field order, so
+  // both the current yyyy-MM-dd format and any legacy dd-MM-yyyy/dd/MM/yyyy
+  // rows already in the sheet parse correctly.
+  const datePart = String(s).trim().split(' ')[0].split('T')[0];
   const parts = datePart.split(/[-/]/);
   if (parts.length !== 3) return null;
-  const [d, m, y] = parts.map(Number);
+  const nums = parts.map(Number);
+  if (nums.some(n => !n && n !== 0)) return null;
+  let y, m, d;
+  if (String(parts[0]).length === 4) { [y, m, d] = nums; }      // yyyy-MM-dd (current backend format)
+  else { [d, m, y] = nums; }                                     // dd-MM-yyyy / dd/MM/yyyy (legacy rows)
   if (!d || !m || !y) return null;
   return new Date(y, m - 1, d);
 }
@@ -1133,21 +1143,30 @@ async function loadIndentHistory() {
     tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--red);padding:20px;">Could not load history — Store server unreachable.</td></tr>';
     return;
   }
-  _historyCache = (res.data && res.data.indents || []).filter(r => r.INDENT_TYPE === 'KITCHEN');
+  // FIX (root cause, confirmed against backend): GET_PENDING_INDENTS reads
+  // only the KITCHEN_INDENT sheet (bnxKitchenIndentHeaders_), so every row
+  // it returns is already a kitchen indent — there is no INDENT_TYPE column
+  // written anywhere in that sheet. This filter always evaluated to false
+  // (r.INDENT_TYPE was always undefined), so History showed "No indents"
+  // forever even though every submitted indent was really saved.
+  _historyCache = (res.data && res.data.indents || []);
   const today = todayDDMMYYYY();
   const receivedToday = _historyCache.filter(r => r.DATE === today && String(r.STATUS || '').toUpperCase() === 'ISSUED').length;
   const sumTodayEl = document.getElementById('sumToday');
   if (sumTodayEl) sumTodayEl.textContent = receivedToday;
   renderHistory();
 }
-// FIX ("not proper format inden id and shift and dept"): the table
-// header has 9 real columns (Indent#, Date, Shift, Dept, Items,
-// Ordered By, Priority, Status, Action), but this row template was
-// dumping the whole REMARKS string into one merged cell — which
-// pushed everything after it out of alignment (qty ended up under
-// "Ordered By", the requester's name ended up under "Priority").
-// This parses REMARKS ("Dept:X | Shift:Y | Priority:Z") back into
-// its three real parts so each lands in its own correct column.
+// FIX ("not proper format inden id and shift and dept" — real root
+// cause, confirmed against the backend): the backend (bnxSaveKitchenIndent)
+// writes DEPARTMENT, SHIFT and PRIORITY as their own real columns on every
+// KITCHEN_INDENT row — it never wrote a combined "Dept:X | Shift:Y |
+// Priority:Z" string into REMARKS. REMARKS holds only the item's own note
+// (or, for a custom "not in list" item, "Category:X — note"). Because
+// parseIndentRemarks() was looking for tags that were never in REMARKS,
+// Shift/Dept/Priority silently rendered as "—" for every real indent.
+// resolveIndentTags() now reads the real DEPARTMENT/SHIFT/PRIORITY fields
+// first; parseIndentRemarks() is kept only as a fallback for any indent
+// saved before this fix (or an older client sheet missing those columns).
 function parseIndentRemarks(remarks) {
   const out = { dept: '', shift: '', priority: '', extra: '' };
   if (!remarks) return out;
@@ -1161,6 +1180,14 @@ function parseIndentRemarks(remarks) {
   });
   out.extra = leftover.join(' — ');
   return out;
+}
+function resolveIndentTags(r) {
+  const legacy = parseIndentRemarks(r.REMARKS);
+  return {
+    dept: r.DEPARTMENT || legacy.dept || '',
+    shift: r.SHIFT || legacy.shift || '',
+    priority: r.PRIORITY || legacy.priority || ''
+  };
 }
 
 // FIX: full UUID indent IDs are unreadable in a list. Shows a short
@@ -1190,7 +1217,7 @@ function renderHistory() {
   }
   tbody.innerHTML = filtered.slice().reverse().map(r => {
     const status = String(r.STATUS || 'PENDING').toLowerCase();
-    const tags = parseIndentRemarks(r.REMARKS);
+    const tags = resolveIndentTags(r);
     return `<tr>
     <td><strong title="${r.IND_ID || ''}">${shortIndId(r.IND_ID)}</strong></td>
     <td>${r.DATE || ''}</td>
@@ -1213,12 +1240,19 @@ let _pendingCache = [];
 async function loadPendingIndents() {
   const tbody = document.getElementById('pendingTbody');
   tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:20px;">Loading…</td></tr>';
-  const res = await erpApi('GET_PENDING_INDENTS', { status: 'PENDING' });
+  // FIX (root cause, confirmed against backend): the backend's
+  // GET_PENDING_INDENTS only ever honored a `pendingOnly` boolean flag —
+  // it never read `status` at all, so `{status:'PENDING'}` silently did
+  // nothing server-side, and the INDENT_TYPE filter below (always false,
+  // see loadIndentHistory) hid every row anyway. Now requests pendingOnly
+  // (server-side filters to actionable PENDING/PARTIALLY_ISSUED rows —
+  // see bnxGetPendingIndents) and keeps every row it gets back.
+  const res = await erpApi('GET_PENDING_INDENTS', { pendingOnly: true });
   if (!res || !res.success) {
     tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--red);padding:20px;">Could not load pending indents — Store server unreachable.</td></tr>';
     return;
   }
-  _pendingCache = (res.data && res.data.indents || []).filter(r => r.INDENT_TYPE === 'KITCHEN');
+  _pendingCache = (res.data && res.data.indents || []);
   const sumPendingEl = document.getElementById('sumPending');
   if (sumPendingEl) sumPendingEl.textContent = _pendingCache.length;
   renderPending();
@@ -1230,7 +1264,7 @@ function renderPending() {
     return;
   }
   tbody.innerHTML = _pendingCache.map(r => {
-    const tags = parseIndentRemarks(r.REMARKS);
+    const tags = resolveIndentTags(r);
     return `<tr>
     <td><strong>${r.ITEM_NAME || ''}</strong></td><td class="num">${r.REQUIRED_QTY || 0}</td><td>${r.UNIT || ''}</td>
     <td>${r.ISSUED_BY || ''}</td><td style="color:var(--muted);font-size:11px;">${r.DATE || ''}</td>
@@ -1268,6 +1302,7 @@ function viewIndentDetail(indId) {
   if (!r) { showToast('Indent not found', 'warn'); return; }
   const status = String(r.STATUS || 'PENDING').toUpperCase();
   const isPending = status === 'PENDING' || status === 'PARTIALLY_ISSUED';
+  const tags = resolveIndentTags(r);
 
   document.getElementById('viewIndentBody').innerHTML = `
     <div style="display:grid;grid-template-columns:120px 1fr;row-gap:6px;">
@@ -1275,8 +1310,11 @@ function viewIndentDetail(indId) {
       <div style="color:var(--muted);">Date</div><div>${r.DATE || ''}</div>
       <div style="color:var(--muted);">Item</div><div><strong>${r.ITEM_NAME || ''}</strong></div>
       <div style="color:var(--muted);">Requested Qty</div><div>${r.REQUIRED_QTY || 0} ${r.UNIT || ''}</div>
+      <div style="color:var(--muted);">Issued Qty</div><div>${r.ISSUED_QTY || 0} ${r.UNIT || ''}</div>
+      <div style="color:var(--muted);">Dept / Shift</div><div>${tags.dept || '—'} / ${tags.shift || '—'}</div>
+      <div style="color:var(--muted);">Priority</div><div>${tags.priority || '—'}</div>
       <div style="color:var(--muted);">Requested By</div><div>${r.ISSUED_BY || ''}</div>
-      <div style="color:var(--muted);">Context</div><div style="color:var(--muted);font-size:12px;">${r.REMARKS || ''}</div>
+      <div style="color:var(--muted);">Remarks</div><div style="color:var(--muted);font-size:12px;">${r.REMARKS || '—'}</div>
       <div style="color:var(--muted);">Status</div><div><span class="status-badge ${status.toLowerCase()}">${status}</span></div>
     </div>
     ${isPending ? `
@@ -1311,6 +1349,7 @@ function printIndentDetail(indId) {
   const r = _pendingCache.find(x => x.IND_ID === indId) || _historyCache.find(x => x.IND_ID === indId);
   if (!r) { showToast('Indent not found', 'warn'); return; }
   const status = String(r.STATUS || 'PENDING').toUpperCase();
+  const tags = resolveIndentTags(r);
   const win = window.open('', '_blank');
   win.document.write(`
     <html><head><title>Indent ${r.IND_ID}</title>
@@ -1328,8 +1367,10 @@ function printIndentDetail(indId) {
       <tr><td>Item</td><td><strong>${r.ITEM_NAME || ''}</strong></td></tr>
       <tr><td>Requested Qty</td><td>${r.REQUIRED_QTY || 0} ${r.UNIT || ''}</td></tr>
       <tr><td>Issued Qty</td><td>${r.ISSUED_QTY || 0} ${r.UNIT || ''}</td></tr>
+      <tr><td>Dept / Shift</td><td>${tags.dept || '—'} / ${tags.shift || '—'}</td></tr>
+      <tr><td>Priority</td><td>${tags.priority || '—'}</td></tr>
       <tr><td>Requested By</td><td>${r.ISSUED_BY || ''}</td></tr>
-      <tr><td>Context</td><td>${r.REMARKS || ''}</td></tr>
+      <tr><td>Remarks</td><td>${r.REMARKS || '—'}</td></tr>
       <tr><td>Status</td><td><strong>${status}</strong></td></tr>
     </table>
     <div class="footer">Balaji NextGen ERP — Kitchen Indent · Printed ${new Date().toLocaleString('en-IN')}</div>
