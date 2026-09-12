@@ -41,7 +41,30 @@ const CLIENT_ID = (function(){
     return id;
   }catch(e){return '';}
 })();
-const KITCHEN_INDENT_API_URL = 'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec';
+const KITCHEN_INDENT_API_URL = 'https://script.google.com/macros/s/AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx/exec';
+// FIX (root cause, confirmed against the real KITCHEN_INDENT sheet staying
+// empty after a "✓ Indent submitted!" success toast): this function never
+// sent sessionToken at all. The backend's bnxVerifySession requires one —
+// `if (!token) return null;` — and doPost immediately rejects any call
+// with no session as 401 "Invalid or expired session". Every single
+// SAVE_KITCHEN_INDENT call from this page has therefore been failing
+// authentication before it ever reached bnxSaveKitchenIndent, no matter
+// what was typed in — nothing this page ever "saved" actually landed in
+// the sheet. Every other file in this suite already sends sessionToken;
+// this was the one screen still missing it. Now also detects a 401/403
+// and forces re-login instead of quietly returning a failed response that
+// looked, from the outside, like "the server didn't answer."
+let kiReauthTriggered = false;
+function kiForceReauth(message){
+  if (kiReauthTriggered) return;
+  kiReauthTriggered = true;
+  try{ showToast('🔒 ' + message, 'warn'); }catch(e){}
+  setTimeout(function(){
+    ['ERP_USER','ERP_SESSION','ERP_ROLE','ERP_CLIENT','ERP_EXPIRY','erpUser','erpToken'].forEach(function(k){ try{ localStorage.removeItem(k); }catch(e){} });
+    try{ sessionStorage.clear(); }catch(e){}
+    window.location.replace('login.html');
+  }, 900);
+}
 async function erpApi(action, payload){
   if(!CLIENT_ID){
     // FIX: refuse to save with no real client resolved, rather than
@@ -49,7 +72,8 @@ async function erpApi(action, payload){
     return { success:false, message:'No client session found — please log in again before saving.' };
   }
   try{
-    const body = Object.assign({ action: action, clientId: CLIENT_ID }, payload || {});
+    const sessionToken = localStorage.getItem('ERP_SESSION') || sessionStorage.getItem('ERP_SESSION') || localStorage.getItem('erp_session') || '';
+    const body = Object.assign({ action: action, clientId: CLIENT_ID, sessionToken: sessionToken }, payload || {});
     // DIAGNOSTIC: log the exact outgoing payload and incoming response.
     // Added to find the persistent blank ITEM_NAME/UNIT/REQUIRED_QTY bug
     // in SAVE_KITCHEN_INDENT without needing the Network tab — this
@@ -58,6 +82,9 @@ async function erpApi(action, payload){
     const resp = await fetch(KITCHEN_INDENT_API_URL, { method:'POST', body: JSON.stringify(body) });
     const json = await resp.json();
     console.log('[erpApi] ← ' + action + ' ' + JSON.stringify(json));
+    if (json && json.success === false && (json.statusCode === 401 || json.statusCode === 403)) {
+      kiForceReauth(json.statusCode === 401 ? 'Your session has expired — please log in again.' : 'This session is not authorized for this client — please log in again.');
+    }
     return json;
   }catch(e){
     console.error('[erpApi] ERROR', action, e.message);
@@ -995,7 +1022,7 @@ function submitIndent() {
     </div>`;
   indentOpenModal('confirmModal');
 }
-function finalSubmit() {
+async function finalSubmit() {
   var allItems = getAllIndentItems();
   if(!allItems.length){ showToast('Please enter at least one quantity','warn'); return; }
   var num = 'IND-' + Date.now().toString().slice(-6);
@@ -1004,23 +1031,32 @@ function finalSubmit() {
   var priority = document.getElementById('indentPriority').value;
   var by = document.getElementById('indentBy').value || 'Chef';
   indentCloseModal('confirmModal');
+  showToast('Sending indent to Store…', '');
 
-  // FIX: actually save to Store now, not just WhatsApp — same items
-  // (master-list + custom "not in list" items combined), sent through
-  // SAVE_KITCHEN_INDENT (46_LiveInventoryBridge.gs). Custom items send
-  // itemId as their generated CUSTOM-xxxx id (not a real ITEM_ID) so
-  // Store can still see them clearly in Remarks/ITEM_NAME.
-  erpApi('SAVE_KITCHEN_INDENT', {
+  // FIX (root cause, see erpApi's own comment): this used to clear the
+  // form and show "✓ submitted!" immediately, without waiting to find out
+  // whether SAVE_KITCHEN_INDENT actually succeeded — which is exactly how
+  // a 100%-failing save (missing sessionToken; fixed above) went unnoticed.
+  // Now waits for the real result before touching the form or the items
+  // list, so a genuine future failure (network blip, permission issue)
+  // keeps the entered quantities in place for a retry instead of silently
+  // discarding them behind a false success message.
+  const res = await erpApi('SAVE_KITCHEN_INDENT', {
     items: allItems.map(function(i){
       const isCustom = i.id.startsWith('CUSTOM-');
       const remarksWithCat = isCustom && i.category ? ('Category:' + i.category + (i.remarks ? ' — ' + i.remarks : '')) : i.remarks;
       return { itemId: isCustom ? '' : i.id, itemName: isCustom ? i.name + ' (NOT IN LIST)' : i.name, unit: i.uom, requiredQty: i.qty, remarks: remarksWithCat };
     }),
     dept: dept, shift: shift, priority: priority, issuedBy: by,
-  }).then(function(res){
-    if(!res || !res.success){ showToast('⚠ Indent saved locally but Store was not reachable — retry later','warn'); }
-    else { loadIndentHistory(); loadPendingIndents(); }
   });
+
+  if (!res || !res.success) {
+    showToast('⚠ Indent NOT saved — ' + (res && (res.message || res.error) || 'Store server unreachable') + '. Your entries are still here — fix the issue and press Submit again.', 'warn');
+    return; // form, qtyMap and customItems are left exactly as the user had them
+  }
+
+  loadIndentHistory();
+  loadPendingIndents();
 
   var lines = ['\u{1F4E6} *KITCHEN INDENT REQUEST*','\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501',
     '\uD83C\uDFF7\uFE0F Indent No : *'+num+'*',
@@ -1033,7 +1069,7 @@ function finalSubmit() {
   var waMsg = lines.join('\n');
 
   qtyMap = {}; customItems = []; renderTable(INDENT_ITEMS); renderCustomItems();
-  showToast('\u2713 Indent '+num+' submitted!','success');
+  showToast('\u2713 Indent '+num+' submitted and saved!','success');
 
   // FIX ("proper pdf also send after submit with text"): auto-opens
   // the paper-format PDF alongside the existing auto-WhatsApp text
