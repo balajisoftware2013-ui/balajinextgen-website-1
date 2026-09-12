@@ -1,13 +1,11 @@
-HAPPYSERVE Steward Mobile - Final opening/branding fix
+HAPPYSERVE STEWARD MOBILE — CLIENT 10 FINAL
 
-Opening flow:
-1. Branded HAPPYSERVE loading/splash is shown for about 1.35 seconds.
-2. It fades into the SAME Steward Login page.
-3. Login scroll position is reset to the top.
-4. No separate install popup is shown.
-5. The inline Install HAPPYSERVE App card remains on Login and is hidden after successful installation.
-6. Client branding is auto-captured from the existing ERP/localStorage branding records.
-7. Client 10 / CL00010 has bundled fallback assets under assets/ so it shows HASHTAG A Restro Pub if live branding has not yet synced.
-8. The client banner is used as the login brand background when available.
+Branding rules
+1. Before login: only common Balaji / HAPPYSERVE branding is shown. No restaurant/client banner.
+2. After login: branding is resolved from the authenticated CLIENT_ID/master-backed record.
+3. Client 10 aliases CL00010 / CLIENT-10 / 10 resolve to HASHTAG A Restro Pub.
+4. Client 10 uses assets/clients/CLIENT-10/logo.png and banner.png.
+5. Install card is inline. After successful PWA install, it hides and remains hidden for that browser/device.
+6. Existing order/table/KOT/report logic is retained; this package changes the branding layer only.
 
-Replace the existing steward-mobile.html with this file and keep the assets folder beside it.
+Open steward-mobile.html. Keep assets/ beside it when testing locally or deploying.
