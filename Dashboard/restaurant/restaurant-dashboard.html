@@ -8224,6 +8224,7 @@ async function bnxPullBillsFromServer(from, to){
           ? { CASH:Number(sb.payBreakdown.CASH)||0, CARD:Number(sb.payBreakdown.CARD)||0, UPI:Number(sb.payBreakdown.UPI)||0, OTHER:Number(sb.payBreakdown.OTHER)||0 }
           : { CASH:0, CARD:0, UPI:0, OTHER:0, [bucket]:fallbackTotal };
         local.push({
+          billId: sb.billId || sb.BILL_ID || '',
           no,
           dt: sb.dt || sb.BILL_DATE || sb.date,
           tm: sb.tm || sb.BILL_TIME || sb.time,
@@ -8233,6 +8234,11 @@ async function bnxPullBillsFromServer(from, to){
           items: sb.items ?? (Array.isArray(sb.itemsDetail)?sb.itemsDetail.length:0),
           itemsDetail: sb.itemsDetail || (Array.isArray(sb.items)?sb.items:[]),
           sub: sb.sub ?? sb.subtotal ?? sb.SUBTOTAL ?? 0,
+          disc: sb.disc ?? sb.BILL_DISCOUNT ?? 0,
+          discPct: sb.discPct ?? sb.BILL_DISCOUNT_PCT ?? 0,
+          sc: sb.sc ?? sb.SERVICE_CHARGE_AMOUNT ?? 0,
+          scPct: sb.scPct ?? sb.SERVICE_CHARGE_PCT ?? 0,
+          taxRows: (sb.taxRows || (sb.GST_BREAKUP && sb.GST_BREAKUP.LINES)) || [],
           gst: sb.gst ?? sb.tax ?? sb.TAX_AMOUNT ?? 0,
           total: sb.total ?? sb.grand ?? sb.GRAND_TOTAL ?? 0,
           pay: mode, payBreakdown, isSplitPayment: !!sb.isSplitPayment,
@@ -17374,8 +17380,12 @@ function blReprintBill(bill){
     billNo: bill.no || '', date: bill.dt || '', time: bill.tm || '', table: bill.table || '-', pax: bill.pax || 1,
     cname: bill.customer || 'GENERAL CUSTOMER', cmob: bill.mob || '', waiter: bill.waiter || '',
     items: (bill.itemsDetail || []).map(it => ({ name: it.name || '', qty: Number(it.qty) || 0, rate: Number(it.rate) || 0, amt: Number(it.amt != null ? it.amt : (it.qty * it.rate)) || 0 })),
-    sub: sub, discPct: 0, disc: 0, scPct: 0, sc: 0,
-    taxRows: [{ hsn: '—', taxName: 'GST', onAmt: sub, taxAmt: gst }],
+    sub: sub,
+    discPct: Number(bill.discPct ?? bill.BILL_DISCOUNT_PCT ?? 0) || 0,
+    disc: Number(bill.disc ?? bill.BILL_DISCOUNT ?? 0) || 0,
+    scPct: Number(bill.scPct ?? bill.SERVICE_CHARGE_PCT ?? 0) || 0,
+    sc: Number(bill.sc ?? bill.SERVICE_CHARGE_AMOUNT ?? 0) || 0,
+    taxRows: (Array.isArray(bill.taxRows) && bill.taxRows.length) ? bill.taxRows : [{ hsn: '—', taxName: 'GST', onAmt: sub, taxAmt: gst }],
     total: total, roundOff: +(total - (sub + gst)).toFixed(2),
     paymode: bill.pay || '', user: bill.waiter || 'STAFF', kot: '-', remarks: ''
   };
@@ -17396,36 +17406,52 @@ function blReprintBill(bill){
   setTimeout(doPrint,150);
 }
 
-function blSettle(no){
-  // FIX: now finds and saves against the REAL bill register — previously
-  // only ever matched BL_DATA (the fake sample), so settling a real bill
-  // silently changed nothing while still claiming success.
+async function blSettle(no){
+  if(!bnxRequireFullAccess('Settling a bill')) return;
+  try{
+    const bd = (typeof getBusinessDate==='function') ? getBusinessDate() : new Date().toISOString().slice(0,10);
+    await bnxPullBillsFromServer(bd, bd);
+  }catch(e){}
   const list=bnxGetBillRegister();
   const b=list.find(x=>String(x.no)===String(no));
-  if(!b){ alert('This is a read-only demo bill and cannot be settled. Settle works on real saved bills.'); return; }
-  if(confirm('Settle bill '+no+'?\nThis will mark it as Paid.')){
-    b.status='Paid';
-    bnxSaveBillRegister(list);
-    blRenderTable();
-    if (typeof showNotif==='function') showNotif('✅ Bill '+no+' settled','success'); else alert('Bill '+no+' settled!');
+  if(!b){ alert('Bill not found on the live server. Refresh Bills List and try again.'); return; }
+  if(!b.billId){ alert('This bill has no server BILL_ID. Refresh from the live server before settling.'); return; }
+  if(String(b.status||'').toLowerCase()==='paid') { if(typeof showNotif==='function') showNotif('Bill '+no+' is already paid.','success'); return; }
+  const amount=Number(b.total)||0;
+  if(!(amount>0)){ alert('Bill amount is invalid.'); return; }
+  const mode=String(b.pay||'CASH').toUpperCase();
+  if(!confirm('Settle bill '+no+'?\nAmount: ₹'+amount.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})+'\nPayment: '+mode)) return;
+  const res=await bnxGuaranteedSync('SAVE_PAYMENT',{
+    data:{BILL_ID:b.billId, AMOUNT:amount, PAYMENT_MODE:mode, LOCATION_ID:(typeof BNX_LOCATION_ID!=='undefined'?BNX_LOCATION_ID:'')}
+  });
+  if(res && res.success){
+    b.status='Paid'; bnxSaveBillRegister(list); blRenderTable();
+    if(typeof showNotif==='function') showNotif('✅ Bill '+no+' settled on server.','success');
+  }else{
+    if(typeof showNotif==='function') showNotif('⚠️ Bill '+no+' was not settled: '+(res&&res.error||'server unavailable'),'error');
+    else alert('Could not settle bill '+no+': '+(res&&res.error||'server unavailable'));
   }
 }
-function bmSettleAll(){
-  // FIX: now settles REAL pending bills — previously only ever touched
-  // BL_DATA's fake pending rows, so this button did nothing for an
-  // actual restaurant's real overdue payments.
+async function bmSettleAll(){
+  if(!bnxRequireFullAccess('Settling bills')) return;
+  const bd = (typeof getBusinessDate==='function') ? getBusinessDate() : new Date().toISOString().slice(0,10);
+  try{ await bnxPullBillsFromServer(bd, bd); }catch(e){}
   const list=bnxGetBillRegister();
-  const p=list.filter(b=>b.status==='Pending');
-  if(!p.length){ if (typeof showNotif==='function') showNotif('No pending bills to settle.','error'); else alert('No pending bills!'); return; }
+  const p=list.filter(b=>String(b.status||'').toLowerCase()==='pending' && b.billId);
+  if(!p.length){ if (typeof showNotif==='function') showNotif('No pending server bills to settle.','error'); else alert('No pending bills!'); return; }
   const total = p.reduce((a,b)=>a+(+b.total||0),0);
-  if(confirm('Settle all '+p.length+' pending bills?\nTotal: \u20b9'+total.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}))){
-    p.forEach(b=>b.status='Paid');
-    bnxSaveBillRegister(list);
-    blRenderTable();
-    if (typeof showNotif==='function') showNotif('✅ Settled '+p.length+' bill(s) — ₹'+total.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}),'success');
-    else alert('All pending bills settled!');
+  if(!confirm('Settle all '+p.length+' pending bills?\nTotal: ₹'+total.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})+'\nThis will post payments to the live server.')) return;
+  let ok=0;
+  for(const b of p){
+    const res=await bnxGuaranteedSync('SAVE_PAYMENT',{
+      data:{BILL_ID:b.billId, AMOUNT:Number(b.total)||0, PAYMENT_MODE:String(b.pay||'CASH').toUpperCase(), LOCATION_ID:(typeof BNX_LOCATION_ID!=='undefined'?BNX_LOCATION_ID:'')}
+    });
+    if(res&&res.success){ b.status='Paid'; ok++; }
   }
+  bnxSaveBillRegister(list); blRenderTable();
+  if(typeof showNotif==='function') showNotif('✅ Settled '+ok+' of '+p.length+' bill(s) on server.','success');
 }
+
 function blExport(){
   // FIX (SEVERE): this CSV export used to export ONLY the 15 fabricated
   // demo bills — a "download my real sales data" button that produced
