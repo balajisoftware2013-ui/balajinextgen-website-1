@@ -2014,6 +2014,7 @@ function bnxApiUrl_(endpoint){
    startup on this. */
 let __bnxConfigReady = null;
 async function bnxRefreshConfig(){
+  if(location.protocol==='file:') return true;
   try{
     const controller = new AbortController();
     const timer = setTimeout(()=>controller.abort(),3000);
@@ -2033,11 +2034,7 @@ async function bnxRefreshConfig(){
   }
   return true;
 }
-/* LOCAL FILE FIX: never start a Google Apps Script config request while this
-   HTML is opened directly with file://. Chrome treats every file URL as a
-   separate security origin and can emit the misleading/blocked frame error
-   seen in DevTools. The deployed HTTPS app keeps the normal live refresh. */
-__bnxConfigReady = (location.protocol === 'file:') ? Promise.resolve(true) : bnxRefreshConfig();
+__bnxConfigReady = bnxRefreshConfig();
 /* FIX (audit #1, P0 — "CLIENT_ID can still be changed from URL"):
    ?client= removed as a source entirely. Someone opening
    steward-mobile.html?client=OTHER_CLIENT can no longer make that
@@ -2086,9 +2083,6 @@ let IS_DEMO_MODE = false;
 function getSessionToken(){ return localStorage.getItem('ERP_SESSION')||''; }
 async function gasApi(action,payload,endpoint){
   payload=payload||{};
-  if(location.protocol === 'file:'){
-    return {success:false,offline:true,error:'Live server access requires the HTTPS/Netlify version of HAPPYSERVE.'};
-  }
   if((endpoint||'V2_CORE')==='V2_CORE' && __bnxConfigReady){ try{ await Promise.race([__bnxConfigReady,new Promise(r=>setTimeout(r,250))]); }catch(e){} }
   const url=bnxApiUrl_(endpoint||'V2_CORE');
   const readOnly=/^(GET_|LIST_|CHECK_|FETCH_|LOAD_|READ_)/i.test(String(action||''));
@@ -2119,40 +2113,38 @@ async function gasApi(action,payload,endpoint){
    never a normal invalid-credentials response. */
 async function authApi(action,payload){
   payload=payload||{};
-  if(location.protocol === 'file:'){
-    return {success:false,status:'local-file',error:'Local preview detected. Open the deployed HTTPS/Netlify HAPPYSERVE URL for live login; this file cannot securely complete a live server login.'};
-  }
+  try{
+    if(__bnxConfigReady){
+      await Promise.race([
+        __bnxConfigReady,
+        new Promise(function(resolve){setTimeout(resolve,4500);})
+      ]);
+    }
+  }catch(e){}
 
-  /* LOGIN TRANSPORT V6:
-     1) use the dedicated V2_AUTH deployment first;
-     2) retry once after a short delay for Apps Script cold starts;
-     3) use the original bootstrap AUTH deployment;
-     4) as a final transport fallback, try the current V2_CORE deployment supplied
-        by the user. This last fallback is harmless when CORE does not expose login:
-        it returns a normal application response instead of leaving the UI stuck.
-     Never wait for GET_CONFIG before starting login. */
   const body=JSON.stringify(Object.assign({action:action},payload));
-  const primary=bnxApiUrl_('V2_AUTH');
-  const bootstrap='https://script.google.com/macros/s/'+BNX_BOOTSTRAP_AUTH_ID+'/exec';
-  const currentCore='https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec';
-  const urls=[...new Set([primary,bootstrap,currentCore])];
-  let lastErr='Login service unavailable';
+    let primary=bnxApiUrl_('V2_AUTH');
+    let urls=[primary];
+    const bootstrap='https://script.google.com/macros/s/'+BNX_BOOTSTRAP_AUTH_ID+'/exec';
+    if(bootstrap!==primary) urls.push(bootstrap);
 
-  for(let i=0;i<urls.length;i++){
-    for(let attempt=0;attempt<2;attempt++){
-      if(i>0 && attempt===0) await new Promise(r=>setTimeout(r,350));
+    let lastErr='Login service unavailable';
+    for(let i=0;i<urls.length;i++){
       const controller=new AbortController();
-      const timer=setTimeout(()=>controller.abort(),45000);
+      const timer=setTimeout(()=>controller.abort(),15000);
       try{
         const r=await fetch(urls[i],{
-          method:'POST',mode:'cors',cache:'no-store',redirect:'follow',
+          method:'POST',
+          mode:'cors',
+          cache:'no-store',
           headers:{'Content-Type':'text/plain;charset=utf-8'},
-          body:body,signal:controller.signal
+          body:body,
+          signal:controller.signal
         });
         clearTimeout(timer);
         if(!r.ok){
           lastErr='Login server HTTP '+r.status;
-          if(r.status>=400 && r.status<500 && r.status!==408 && r.status!==429) break;
+          if(r.status>=400 && r.status<500 && r.status!==408 && r.status!==429) return {success:false,status:'error',error:lastErr};
           continue;
         }
         const text=await r.text();
@@ -2161,17 +2153,15 @@ async function authApi(action,payload){
           lastErr='Invalid login server response';
           continue;
         }
-        /* A valid application response, including invalid credentials or an
-           unsupported action, is authoritative. Do not hide it with another endpoint. */
         return data;
       }catch(e){
         clearTimeout(timer);
-        lastErr=e&&e.name==='AbortError'
-          ? 'Login server timed out after 45 seconds. Retrying the next configured server…'
-          : (e&&e.message||'Login service unavailable');
+        lastErr=e&&e.name==='AbortError'?'Login server timed out — please try again':(e&&e.message||'Login service unavailable');
+        /* A local file:// page can be opened directly, but browser security
+           can block an API transport. Do not attempt to navigate/iframe the
+           local HTML file; simply try the second HTTPS auth endpoint. */
       }
     }
-  }
   return {success:false,status:'error',error:lastErr};
 }
 
@@ -2610,30 +2600,26 @@ const BNX_MENU_FRESH_MS = 30000;
 
 async function loadMenuFromServer(force){
   force = force === true;
-  /* Direct file:// preview must stay offline/local. Live menu is loaded after
-     deployment over HTTPS, where Google Apps Script is a normal web origin. */
-  if(location.protocol === 'file:'){
+  // Local file preview must never call the live menu API. This prevents
+  // Chromium file:// security-origin errors while keeping hosted HTTPS live.
+  if(location.protocol==='file:'){
     try{
       const saved = JSON.parse(localStorage.getItem(bnxMenuKey())||'null');
       if(Array.isArray(saved) && saved.length){
         MENU = saved.map(m=>({
-          id: m.code || m.id || m.n,
-          name: m.n || m.name,
-          cat: m.c || m.cat || 'Other',
-          price: Number(m.p ?? m.price) || 0,
-          icon: m.e || m.icon || bnxDefaultIcon(m.c||m.cat),
-          avail: m.avail!==false,
-          gst: Number(m.gst)||0, group: m.group || m.itemGroup || m.ITEM_GROUP || m.GROUP_NAME || '',
-          groupType: m.groupType || m.GROUP_TYPE || m.group_type || m.itemGroupType || '',
-          veg: m.veg || m.VEG || m.VEG_NONVEG || m.foodType || ''
-        })).filter(m=>m.id && m.name && m.menuActive !== false);
-        bnxMenuSource='cache';
-        bnxMenuLastUpdated=new Date();
+          id:m.code||m.id||m.n, name:m.n||m.name, cat:m.c||m.cat||'Other',
+          price:Number(m.p??m.price)||0, icon:m.e||m.icon||m.ICON||m.PRODUCT_ICON_KEY||bnxDefaultIcon(m.c||m.cat),
+          imageSourceUrl:m.imageSourceUrl||m.IMAGE_SOURCE_URL||m.image_source_url||'',
+          imageUrl:m.imageUrl||m.IMAGE_URL||m.itemImageUrl||m.ITEM_IMAGE_URL||'',
+          iconUrl:m.iconUrl||m.ICON_URL||m.icon_url||'',
+          avail:m.avail!==false, gst:Number(m.gst)||0, group:m.group||m.itemGroup||m.ITEM_GROUP||m.GROUP_NAME||'',
+          groupType:m.groupType||m.GROUP_TYPE||m.group_type||m.itemGroupType||m.ITEM_GROUP_TYPE||'', veg:m.veg||m.VEG||m.VEG_NONVEG||m.foodType||''
+        })).filter(m=>m.id&&m.name);
+        bnxMenuSource='cache'; bnxMenuLastUpdated=new Date();
         if(document.getElementById('s-new-order')?.classList.contains('active')) renderMenu();
-        return true;
       }
     }catch(e){}
-    return false;
+    return true;
   }
   const now = Date.now();
   if(!force && bnxMenuSource === 'live' && bnxMenuLastFetchAt &&
@@ -2654,7 +2640,10 @@ async function loadMenuFromServer(force){
           name: m.n || m.name,
           cat: m.c || m.cat || 'Other',
           price: Number(m.p ?? m.price) || 0,
-          icon: m.e || m.icon || bnxDefaultIcon(m.c||m.cat),
+          icon: m.e || m.icon || m.ICON || m.PRODUCT_ICON_KEY || bnxDefaultIcon(m.c||m.cat),
+          imageSourceUrl: m.imageSourceUrl || m.IMAGE_SOURCE_URL || m.image_source_url || '',
+          imageUrl: m.imageUrl || m.IMAGE_URL || m.itemImageUrl || m.ITEM_IMAGE_URL || '',
+          iconUrl: m.iconUrl || m.ICON_URL || m.icon_url || '',
           avail: m.avail!==false,
           gst: Number(m.gst)||0, group: m.group || m.itemGroup || m.ITEM_GROUP || m.GROUP_NAME || '', groupType: m.groupType || m.GROUP_TYPE || m.group_type || m.itemGroupType || '', veg: m.veg || m.VEG || m.VEG_NONVEG || m.foodType || ''
         })).filter(m=>m.id && m.name && m.menuActive !== false);
@@ -2677,6 +2666,9 @@ async function loadMenuFromServer(force){
       cat: m.category || m.CATEGORY || m.c || 'Other',
       price: parseFloat(m.price ?? m.PRICE ?? m.p) || 0,
       icon: m.icon || m.ICON || m.e || m.emoji || m.ICON_KEY || m.CATEGORY_ICON || m.PRODUCT_ICON_KEY || bnxDefaultIcon(m.category||m.CATEGORY||m.c),
+      imageSourceUrl: m.imageSourceUrl || m.IMAGE_SOURCE_URL || m.image_source_url || '',
+      imageUrl: m.imageUrl || m.IMAGE_URL || m.itemImageUrl || m.ITEM_IMAGE_URL || '',
+      iconUrl: m.iconUrl || m.ICON_URL || m.icon_url || '',
       avail: m.avail !== false,
       gst: Number(m.gst ?? m.GST)||0,
       group: m.group || m.itemGroup || m.ITEM_GROUP || m.GROUP_NAME || '',
@@ -6162,7 +6154,7 @@ function bnxMasterItemIcon_(m){
 }
 function bnxMasterImageUrl_(m){
   if(!m) return '';
-  const u=m.itemImageUrl||m.ITEM_IMAGE_URL||m.imageUrl||m.IMAGE_URL||m.image||m.IMAGE||m.photoUrl||m.PHOTO_URL||m.PRODUCT_IMAGE_URL||m.productImageUrl||'';
+  const u=m.imageSourceUrl||m.IMAGE_SOURCE_URL||m.image_source_url||m.itemImageUrl||m.ITEM_IMAGE_URL||m.imageUrl||m.IMAGE_URL||m.image||m.IMAGE||m.photoUrl||m.PHOTO_URL||m.PRODUCT_IMAGE_URL||m.productImageUrl||m.iconUrl||m.ICON_URL||m.icon_url||'';
   if(typeof u==='string' && /^(https?:\/\/|data:image\/)/i.test(u.trim())) return u.trim();
   const cat=bnxVisualKey_(m.cat||m.category||m.CATEGORY||'');
   const grp=bnxVisualKey_(m.group||m.itemGroup||m.ITEM_GROUP||'');
@@ -7560,11 +7552,8 @@ if(getClientId() && getSessionToken()){
   window.addEventListener('load', ensureInstallButton);
 
   // Refresh after auth/client identity becomes ready.
-  window.addEventListener('online',()=>{ window.loadMenuFromServer(true); });
-  setTimeout(()=>{ try{
-    if(location.protocol === 'file:') return;
-    if(typeof CLIENT_ID!=='undefined' && !IS_DEMO_MODE) window.loadMenuFromServer(false);
-  }catch(e){} },100);
+  window.addEventListener('online',()=>{ if(location.protocol!=='file:') window.loadMenuFromServer(true); });
+  setTimeout(()=>{ try{ if(location.protocol!=='file:' && typeof CLIENT_ID!=='undefined' && !IS_DEMO_MODE) window.loadMenuFromServer(false); }catch(e){} },100);
 
 })();
 </script>
