@@ -153,7 +153,7 @@
 
   <script>
     const GAS_CONFIG = {
-      GAS_URL: 'https://script.google.com/macros/s/AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx/exec'
+      GAS_URL: 'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec'
     };
 
     // FIX — "Bill Master / Reports wrong data, Import Hub problem" (Aug
@@ -213,7 +213,45 @@
       }
     };
 
-    const CHUNK_SIZE = 500; // Rows per batch
+    
+    // CLIENT 10 HISTORICAL-IMPORT SAFETY PROFILE
+    // CL00010 historical POS exports are expected to contain duplicate POSHEAD
+    // invoice rows and occasional exact duplicate ITEMWISE rows. Those must be
+    // cleaned before IMPORT_BATCH; otherwise the same financial sale can be
+    // written twice. This check is deliberately client-scoped and never changes
+    // the existing page design or backend routing.
+    const CL00010_IMPORT_PROFILE = {
+      clientId: 'CL00010',
+      sourceName: 'CL00010_VANNS_DATA_POS_25-27',
+      posHeadKey: 'invoiceNumber',
+      itemWiseKey: 'InvoiceNumber',
+      itemWiseExactDuplicateCheck: true
+    };
+
+    function bnxClient10SourceAudit() {
+      if (CLIENT_ID !== CL00010_IMPORT_PROFILE.clientId || !sheetData) return null;
+      const rows = sheetData.rows || [];
+      if (selectedSheet === 'POSHEAD') {
+        const idx = sheetData.headers.indexOf(CL00010_IMPORT_PROFILE.posHeadKey);
+        if (idx < 0) return { duplicateKeyRows: 0, duplicateKeys: 0 };
+        const seen = new Set(), dupKeys = new Set(), dupRows = [];
+        rows.forEach((r, i) => {
+          const k = String(r[idx] == null ? '' : r[idx]).trim();
+          if (!k) return;
+          if (seen.has(k)) { dupKeys.add(k); dupRows.push(i + 2); } else seen.add(k);
+        });
+        return { duplicateKeyRows: dupRows.length, duplicateKeys: dupKeys.size };
+      }
+      if (selectedSheet === 'ITEMWISE') {
+        const key = rows.map(r => JSON.stringify(r));
+        const seen = new Set(), dup = new Set();
+        key.forEach((k) => { if (seen.has(k)) dup.add(k); else seen.add(k); });
+        return { exactDuplicateRows: key.length - seen.size, exactDuplicateSets: dup.size };
+      }
+      return null;
+    }
+
+const CHUNK_SIZE = 500; // Rows per batch
     let CLIENT_ID = getClientIdFromURL();
     let fileData = null;
     let selectedSheet = null;
@@ -397,12 +435,12 @@
       });
     }
 
-    function selectSheet(sheetName, btn) {
+    function selectSheet(sheetName) {
       selectedSheet = sheetName;
       sheetData = fileData.sheets[sheetName];
       
       document.querySelectorAll('.sheet-option').forEach(opt => opt.classList.remove('selected'));
-      btn.classList.add('selected');
+      event.target.closest('.sheet-option').classList.add('selected');
       
       showMessage('selectMessage', 
         `✅ Selected: ${sheetName} (${sheetData.rows.length} rows)`, 
@@ -486,6 +524,8 @@
 
       let statusHtml, statusClass, statusMsg;
       headerMismatch = false;
+      const client10Audit = bnxClient10SourceAudit();
+
 
       if (!rows) {
         headerMismatch = true;
@@ -519,6 +559,16 @@
             <div style="margin-top:8px;">These are the columns bnxImportPosHeadBatch_/bnxImportItemwiseBatch_ read for a ${selectedSheet} row — without them the import will silently skip most/all rows.</div>
           </div>`;
           statusMsg = `⚠️ "${selectedSheet}" is missing required columns — import blocked by default.`;
+        } else if (CLIENT_ID === 'CL00010' && client10Audit &&
+                   ((selectedSheet === 'POSHEAD' && client10Audit.duplicateKeys > 0) ||
+                    (selectedSheet === 'ITEMWISE' && client10Audit.exactDuplicateRows > 0))) {
+          headerMismatch = true;
+          statusClass = 'error';
+          const detail = selectedSheet === 'POSHEAD'
+            ? `${client10Audit.duplicateKeyRows} repeated rows across ${client10Audit.duplicateKeys} invoice number(s)`
+            : `${client10Audit.exactDuplicateRows} exact duplicate ITEMWISE row(s)`;
+          statusHtml = `<div class="status-box error"><strong>⚠️ Client CL00010 historical source contains duplicates — import blocked.</strong><br>${detail}<br><br>Clean the source first so one invoice/line cannot be posted twice. Use the deduplicated Client 10 historical import file; do not use “Import Anyway” for duplicate financial source rows.</div>`;
+          statusMsg = `⚠️ Duplicate historical source rows detected — import blocked.`;
         } else {
           const unrecognized = detected.filter(h => h && !importFormat.recognized.includes(h));
           statusHtml = `<div class="status-box success">
@@ -529,32 +579,43 @@
           </div>`;
           statusMsg = `✅ Ready to import ${rows} rows in ${chunks} batch(es)`;
         }
-      } else {
-        // FIX (root cause, confirmed against bnxImportBatch): reaching
-        // here means selectedSheet is not literally "POSHEAD" or
-        // "ITEMWISE". bnxImportBatch's dispatch is a closed switch —
-        // it only ever accepts those two exact sheet names, full stop.
-        // Matching a real DB_SCHEMA table name/columns exactly (the old
-        // `expected` branch below) does NOT make the backend accept it;
-        // there is no general "import into any live table" path on the
-        // server. The old code let this show "✅ Validation Passed" and
-        // let the user click through two confirmations into a batch
-        // import that was *guaranteed* to fail on every single chunk
-        // with "Sheet ... is not recognized" — not a risky-but-possible
-        // mismatch, a structurally impossible one. No header fix or
-        // override changes that, so this is now always a hard block —
-        // Start Import isn't offered at all for this case (see below).
+      } else if (!expected) {
+        // Sheet name doesn't match any known live table at all.
         headerMismatch = true;
         statusClass = 'error';
-        const matchesKnownTable = !!expected;
         statusHtml = `<div class="status-box error">
-          <strong>❌ This tool can't import "${bnxEsc(selectedSheet)}"</strong><br>
-          Columns: ${cols} | Rows: ${rows}<br><br>
+          <strong>⚠️ Unrecognized sheet/table name: "${selectedSheet}"</strong><br>
+          This doesn't match any table in the live database (BILL_MASTER, ORDER_MASTER, ITEM_MASTER, etc.).
+          Importing under this name likely means the data won't land where you expect — this is the exact issue that corrupted Bill Master previously.<br><br>
           <strong>Detected columns in your file:</strong>
           ${headerListHtml}
-          <div style="margin-top:8px;">${matchesKnownTable ? `Its headers do match ${bnxEsc(selectedSheet)}'s real live-database columns, but that doesn't help here — ` : ''}the live importer only accepts sheets named exactly <code>POSHEAD</code> or <code>ITEMWISE</code> (the historical POS-export format). General import into ${matchesKnownTable ? bnxEsc(selectedSheet) : 'other live tables'} isn't supported by this tool. Renaming this sheet tab won't change that unless its data is genuinely in POSHEAD/ITEMWISE format.</div>
+          If this file is meant to become e.g. BILL_MASTER, rename this sheet tab to <code>BILL_MASTER</code> and make sure its columns match that table's real columns first.
         </div>`;
-        statusMsg = `❌ "${selectedSheet}" can't be imported — this tool only accepts POSHEAD/ITEMWISE files.`;
+        statusMsg = `⚠️ "${selectedSheet}" isn't a recognized table — import blocked by default.`;
+      } else {
+        const missing = expected.filter(h => !detected.includes(h));
+        const extra = detected.filter(h => h && !expected.includes(h));
+        if (missing.length || extra.length) {
+          headerMismatch = true;
+          statusClass = 'error';
+          statusHtml = `<div class="status-box error">
+            <strong>⚠️ Headers don't match ${selectedSheet}'s real columns</strong><br>
+            Columns: ${cols} | Rows: ${rows} | Batches: ${chunks}<br><br>
+            <strong>Detected columns in your file:</strong>
+            ${headerListHtml}
+            ${missing.length ? `<div style="margin-top:8px;color:#c62828;"><strong>Missing expected columns:</strong> ${missing.join(', ')}</div>` : ''}
+            ${extra.length ? `<div style="margin-top:4px;color:#c62828;"><strong>Unrecognized columns (not in ${selectedSheet}):</strong> ${extra.join(', ')}</div>` : ''}
+            <div style="margin-top:8px;">Importing this as-is will write mismatched data into ${selectedSheet}, the same way Bill Master got corrupted before. If this is a different-format file (e.g. a raw POS export), it needs to be mapped/converted to ${selectedSheet}'s real columns first — don't import it directly.</div>
+          </div>`;
+          statusMsg = `⚠️ Header mismatch detected — import blocked by default.`;
+        } else {
+          statusHtml = `<div class="status-box success">
+            <strong>✅ Validation Passed — headers match ${selectedSheet}</strong><br>
+            Columns: ${cols} | Rows: ${rows} | Batches: ${chunks} (${CHUNK_SIZE} rows/batch)
+            ${headerListHtml}
+          </div>`;
+          statusMsg = `✅ Ready to import ${rows} rows in ${chunks} batch(es)`;
+        }
       }
 
       document.getElementById('validateResult').innerHTML = statusHtml;
@@ -562,44 +623,37 @@
 
       showMessage('validateMessage', statusMsg, headerMismatch ? 'error' : 'success');
 
-      // FIX: every headerMismatch=true case above is now a genuine hard
-      // block with no working override (no rows / blank-or-duplicate
-      // headers / missing required POSHEAD-ITEMWISE columns / not a
-      // POSHEAD-ITEMWISE sheet at all) — none of them can actually
-      // succeed against the real backend no matter what the user
-      // clicks. The old red "Headers Don't Match — Import Anyway"
-      // button offered an override that led straight to a guaranteed
-      // per-batch failure. Just hide Start Import entirely when
-      // blocked, instead of dressing up a dead end as a choice.
       const proceedBtn = document.getElementById('proceedBtn');
-      if (headerMismatch) {
-        proceedBtn.style.display = 'none';
-      } else {
-        proceedBtn.style.display = 'block';
-        proceedBtn.textContent = '🚀 Start Import (Batch)';
-        proceedBtn.style.background = '';
-      }
+      proceedBtn.style.display = 'block';
+      proceedBtn.textContent = headerMismatch ? '⚠️ Headers Don\'t Match — Import Anyway' : '🚀 Start Import (Batch)';
+      proceedBtn.style.background = headerMismatch ? '#c62828' : '';
     }
 
     function proceedToImport() {
-      // FIX (see performValidation's own comment): the backend's
-      // IMPORT_BATCH only ever accepts a sheet literally named POSHEAD
-      // or ITEMWISE — matching a real live-table name/columns was never
-      // sufficient on its own, so that's no longer treated as a valid
-      // override path here either. In practice this whole block is now
-      // unreachable through the UI (proceedBtn is hidden whenever
-      // headerMismatch is true — see performValidation), kept only as a
-      // defensive fallback.
+      if (CLIENT_ID === 'CL00010') {
+        const a = bnxClient10SourceAudit();
+        if (a && ((selectedSheet === 'POSHEAD' && a.duplicateKeys > 0) || (selectedSheet === 'ITEMWISE' && a.exactDuplicateRows > 0))) {
+          showMessage('validateMessage', '❌ Client CL00010 duplicate historical source rows must be cleaned before import. Override is disabled for duplicate financial rows.', 'error');
+          return;
+        }
+      }
+      // FIX (see performValidation's own comment): headers that don't
+      // match the target table's real columns are the exact failure
+      // mode that previously corrupted Bill Master/Reports. Require a
+      // second, explicitly-worded confirmation naming the actual
+      // mismatch before allowing that write through, rather than
+      // treating it the same as a normal clean import.
       if (headerMismatch){
+        const isKnownTable = !!DB_SCHEMA[selectedSheet];
         const isKnownImportFormat = !!IMPORT_FORMAT_SCHEMA[selectedSheet];
-        if (!isKnownImportFormat) {
-          showMessage('validateMessage', '❌ Import blocked: "' + bnxEsc(selectedSheet) + '" can\'t be imported by this tool — only POSHEAD/ITEMWISE-format sheets are accepted.', 'error');
+        if (!isKnownTable && !isKnownImportFormat) {
+          showMessage('validateMessage', '❌ Import blocked: "' + bnxEsc(selectedSheet) + '" is not an accepted import target.', 'error');
           return;
         }
         // Missing required fields are never safely overridable.
         const detected = bnxNormalizeHeaders(sheetData.headers);
         const fmt = IMPORT_FORMAT_SCHEMA[selectedSheet];
-        if (fmt.required.some(h => !detected.includes(h))) {
+        if (fmt && fmt.required.some(h => !detected.includes(h))) {
           showMessage('validateMessage', '❌ Import blocked: required import columns are missing. Fix the file first.', 'error');
           return;
         }
