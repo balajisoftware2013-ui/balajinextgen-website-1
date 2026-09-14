@@ -8281,12 +8281,17 @@ async function bnxPullBillsFromServer(from, to){
       serverBills.forEach(sb=>{
         const no = sb.no || sb.billNo || sb.bill_no || sb.BILL_NO;
         if(!no) return;
-        const mode = String(sb.pay || sb.paymode || sb.PAYMENT_MODE || 'CASH').toUpperCase();
-        const bucket = mode === 'CASH' ? 'CASH' : mode === 'UPI' ? 'UPI' : (mode.includes('CARD') || mode === 'BANK' ? 'CARD' : 'OTHER');
+        // Never invent CASH for a bill whose payment mode is genuinely absent
+        // (historical NON_CHARGE / NOT_REQUIRED rows). A missing payment mode
+        // must remain blank/—, not become a false cash receipt.
+        const rawMode = String(sb.pay || sb.paymode || sb.PAYMENT_MODE || '').trim().toUpperCase();
+        const mode = rawMode || '';
+        const bucket = mode === 'CASH' ? 'CASH' : mode === 'UPI' ? 'UPI' : (mode === 'CARD' || mode === 'BANK' || mode === 'DEBIT CARD' || mode === 'CREDIT CARD' ? 'CARD' : (mode ? 'OTHER' : ''));
         const fallbackTotal = Number(sb.total ?? sb.grand ?? sb.GRAND_TOTAL ?? 0) || 0;
         const payBreakdown = sb.payBreakdown
           ? { CASH:Number(sb.payBreakdown.CASH)||0, CARD:Number(sb.payBreakdown.CARD)||0, UPI:Number(sb.payBreakdown.UPI)||0, OTHER:Number(sb.payBreakdown.OTHER)||0 }
-          : { CASH:0, CARD:0, UPI:0, OTHER:0, [bucket]:fallbackTotal };
+          : { CASH:0, CARD:0, UPI:0, OTHER:0 };
+        if (!sb.payBreakdown && bucket && fallbackTotal > 0) payBreakdown[bucket] = fallbackTotal;
         local.push({
           no,
           dt: sb.dt || sb.BILL_DATE || sb.date,
@@ -8300,7 +8305,15 @@ async function bnxPullBillsFromServer(from, to){
           gst: sb.gst ?? sb.tax ?? sb.TAX_AMOUNT ?? 0,
           total: sb.total ?? sb.grand ?? sb.GRAND_TOTAL ?? 0,
           pay: mode, payBreakdown, isSplitPayment: !!sb.isSplitPayment,
-          status: sb.status || sb.BILL_STATUS || 'Paid',
+          // Preserve the real accounting state. NOT_REQUIRED is not Pending.
+          status: (()=>{ const st=String(sb.status || sb.BILL_STATUS || '').trim().toUpperCase();
+            if(st==='PAID') return 'Paid';
+            if(st==='DUE' || st==='PENDING') return 'Pending';
+            if(st==='CANCELLED' || st==='VOID') return 'Cancelled';
+            if(st==='NOT_REQUIRED' || st==='NON_CHARGE' || st==='COMPLIMENTARY') return 'Not Required';
+            if(st==='DRAFT') return 'Draft';
+            return st ? st : 'Pending';
+          })(),
           waiter: sb.waiter || sb.CREATED_BY || '-',
           kot: sb.kot || sb.ORDER_ID || '',
           businessDate: sb.businessDate || sb.BILL_DATE || sb.dt || sb.date || '',
@@ -17209,7 +17222,15 @@ function blRenderTable(data){
   // newest bills, and tell the person plainly to narrow the range instead
   // of silently hanging the page.
   const BL_RENDER_CAP = 500;
-  const capped = data.length > BL_RENDER_CAP ? data.slice(0, BL_RENDER_CAP) : data;
+  // Bills List is always newest-first. Historical imports are stored before
+  // current bills, so relying on sheet order made a Year view open on April
+  // history even when September bills existed.
+  const sortedData = (Array.isArray(data) ? data.slice() : []).sort((a,b)=>{
+    const ad=String(a?.dt||'')+' '+String(a?.tm||'');
+    const bd=String(b?.dt||'')+' '+String(b?.tm||'');
+    return bd.localeCompare(ad);
+  });
+  const capped = sortedData.length > BL_RENDER_CAP ? sortedData.slice(0, BL_RENDER_CAP) : sortedData;
   // FIX ("next bill prev bill fix"): the bill-detail view had no way to
   // step to the next/previous bill without closing it and re-clicking a
   // row. Next/Prev needs to walk the SAME order currently on screen
@@ -17229,20 +17250,20 @@ function blRenderTable(data){
       <td class="mono">\u20b9${b.sub.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
       <td class="mono" style="color:var(--text3);">\u20b9${b.gst.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
       <td class="mono" style="font-weight:700;color:var(--gold);">\u20b9${b.total.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
-      <td><span class="pill ${pC[b.pay]||'p-gray'}">${b.pay}</span></td>
+      <td><span class="pill ${pC[b.pay]||'p-gray'}">${b.pay||'—'}</span></td>
       <td><span class="pill ${sC[b.status]||'p-gray'}">${b.status}</span></td>
       <td><div style="display:flex;gap:4px;flex-wrap:wrap;">
         <button class="btn btn-sm btn-ghost" style="font-size:10px;" onclick="blViewBill('${b.no}')">View</button>
         <button class="btn btn-sm btn-ghost" style="font-size:10px;" onclick="blReprintBillByNo('${b.no}')">Reprint</button>
-        ${b.status!=='Cancelled'?`<button class="btn btn-sm btn-ghost" style="font-size:10px;" onclick="blEditBill('${b.no}')">Edit</button>`:''}
+        ${b.status!=='Cancelled'&&b.status!=='Not Required'?`<button class="btn btn-sm btn-ghost" style="font-size:10px;" onclick="blEditBill('${b.no}')">Edit</button>`:''}
         ${b.status==='Pending'?`<button class="btn btn-sm" style="font-size:10px;background:var(--green);color:#fff;border:none;border-radius:7px;padding:5px 10px;cursor:pointer;" onclick="blSettle('${b.no}')">Settle</button>`:''}
-        ${b.status!=='Cancelled'?`<button class="btn btn-sm" style="font-size:10px;background:var(--red,#dc2626);color:#fff;border:none;border-radius:7px;padding:5px 10px;cursor:pointer;" onclick="blCancelBill('${b.no}')">Cancel</button>`:''}
+        ${b.status!=='Cancelled'&&b.status!=='Not Required'?`<button class="btn btn-sm" style="font-size:10px;background:var(--red,#dc2626);color:#fff;border:none;border-radius:7px;padding:5px 10px;cursor:pointer;" onclick="blCancelBill('${b.no}')">Cancel</button>`:''}
       </div></td>
     </tr>`).join('');
   const sc=document.getElementById('blCount');if(sc)sc.textContent='Showing '+capped.length+' of '+data.length+' filtered ('+blGetAllBills().length+' total) bills';
   const paid=data.filter(b=>b.status==='Paid').length;
   const pending=data.filter(b=>b.status==='Pending').length;
-  const rev=data.filter(b=>b.status==='Paid').reduce((a,b)=>a+b.total,0);
+  const rev=data.filter(b=>b.status==='Paid').reduce((a,b)=>a+(Number(b.total)||0),0);
   const e1=document.getElementById('bl-total-rev');if(e1)e1.textContent='\u20b9'+rev.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
   const e2=document.getElementById('bl-paid-count');if(e2)e2.textContent=paid;
   const e3=document.getElementById('bl-pending-count');if(e3)e3.textContent=pending;
@@ -17357,7 +17378,7 @@ function blFilterBills(q){
   const pay=document.getElementById('blPayFilter')?.value||'All';
   q=(q||'').toLowerCase();
   blRenderTable(blGetAllBills().filter(b=>{
-    const mQ=!q||(b.no.toLowerCase().includes(q)||b.table.toLowerCase().includes(q)||b.customer.toLowerCase().includes(q)||String(b.total).includes(q));
+    const mQ=!q||(String(b.no||'').toLowerCase().includes(q)||String(b.table||'').toLowerCase().includes(q)||String(b.customer||'').toLowerCase().includes(q)||String(b.total??'').includes(q));
     const mS=status==='All'||b.status===status;
     const mP=pay==='All'||b.pay.includes(pay);
     const mD=blDateInRange(b.dt);
@@ -17381,7 +17402,7 @@ function blViewBill(no){
   const idx = list.findIndex(x=>String(x.no)===String(no));
   window._blViewList = list;
   window._blViewIndex = idx;
-  const sC={'Paid':'p-g','Pending':'p-o','Draft':'p-b','Complimentary':'p-gray','Cancelled':'p-r'};
+  const sC={'Paid':'p-g','Pending':'p-o','Draft':'p-b','Not Required':'p-gray','Complimentary':'p-gray','Cancelled':'p-r'};
   const items = b.itemsDetail||[];
   const itemsHtml = items.length
     ? items.map(i=>{
