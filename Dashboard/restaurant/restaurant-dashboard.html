@@ -9117,6 +9117,19 @@ async function loadRealDashboardData() {
     // starting the online-order report, despite the comment claiming they
     // were parallel. This now genuinely overlaps both requests.
     const dashPromise = bnxGetDashboardSummaryShared_(rangeParams);
+    // FIX ("wrong show data delay load" — Sep 2026): this call genuinely
+    // takes ~20s on the live site (see comment above). Until now, every
+    // field waiting on it (Cash/UPI/Card/Credit Sales collection, and
+    // everything mirrored/derived from them) sat on the same bare "—"
+    // used elsewhere for "confirmed no data" — so a real ~20s wait looked
+    // identical to broken/empty data instead of "still loading." Marking
+    // them with a visibly different in-flight state here, the moment the
+    // request starts, so the difference between "loading" and "empty" is
+    // obvious instead of guessed at.
+    ['d-cash','d-upi','d-bank','d-credit-sales','d-kpi-cash','d-kpi-upi','d-kpi-bank','d-kpi-creditsales','d-pc-online','d-pc-total'].forEach(id=>{
+      const el = document.getElementById(id);
+      if (el && !el.dataset.bnxLive) el.textContent = 'Loading…';
+    });
     window.__bnxOnlineReportPromise = erpApi(
       Object.assign({action:'GET_ONLINE_ORDER_REPORT'}, rangeParams), 'V2_CORE'
     );
@@ -9218,7 +9231,7 @@ async function loadRealDashboardData() {
     // to this same list so all 8 comparison badges are handled
     // consistently by the one honest-empty-state mechanism, instead of
     // 5 being fixed and 3 being missed.
-    ['d-turn','d-online-rev','d-online-pending','d-credit','d-due-rcvd','d-rev','d-ord','d-cov'].forEach(id=>{
+    ['d-turn','d-online-rev','d-online-pending','d-credit','d-due-rcvd','d-rev','d-ord','d-cov','d-cash','d-upi','d-bank','d-credit-sales','d-kpi-cash','d-kpi-upi','d-kpi-bank','d-kpi-creditsales','d-pc-online','d-pc-total'].forEach(id=>{
       const el = document.getElementById(id);
       if (el && !el.dataset.bnxLive) el.textContent = '—';
       const chg = document.getElementById(id+'chg');
@@ -9226,6 +9239,15 @@ async function loadRealDashboardData() {
     });
   } catch(err) {
     console.error('[Dashboard] Error loading real data:', err.message);
+    // If the request failed outright, the "Loading…" markers set before
+    // dashPromise started would otherwise be stuck forever, looking like
+    // it's still in progress when it actually isn't. Fall back to the
+    // same honest "—" used everywhere else for no-data, not a lie about
+    // still loading.
+    ['d-cash','d-upi','d-bank','d-credit-sales','d-kpi-cash','d-kpi-upi','d-kpi-bank','d-kpi-creditsales','d-pc-online','d-pc-total'].forEach(id=>{
+      const el = document.getElementById(id);
+      if (el && !el.dataset.bnxLive && el.textContent === 'Loading…') el.textContent = '—';
+    });
   }
   /* PASS #35 NEW ("order places zomato swiggy but not show dashboard"):
      now that SAVE_ONLINE_ORDER exists (Reports Hub → Online Order
@@ -10016,9 +10038,13 @@ function bnxRenderDashChartsRow_(){
         const catRows = rows.map(r=>({cat: r.CATEGORY_NAME||r.CATEGORY_ID||'Uncategorized', revenue: Number(r.NET_SALES)||0, pct: r.SALES_PERCENT}))
           .sort((a,b)=>b.revenue-a.revenue);
         const catTotal = catRows.reduce((s,r)=>s+r.revenue,0);
+        // Remember the exact range this card is showing, so clicking through
+        // to items (and then bills) stays consistent with what's on screen.
+        window.__bnxCatSalesRange_ = rangeParams;
         catBody.innerHTML = catRows.length ? catRows.map(r=>{
           const pct = r.pct!==undefined && r.pct!==null && r.pct!=='' ? Number(r.pct).toFixed(1) : (catTotal>0 ? (r.revenue/catTotal*100).toFixed(1) : '0.0');
-          return '<tr><td>'+String(r.cat).replace(/[<>]/g,'')+'</td><td class="mono">'+r.revenue.toLocaleString('en-IN',{maximumFractionDigits:0})+'</td><td class="mono">'+pct+'%</td></tr>';
+          const safeCat = String(r.cat).replace(/'/g,"\\'");
+          return '<tr style="cursor:pointer;" onclick="bnxShowCategoryItems_(\''+safeCat+'\')" title="Click to see items in this category"><td>'+String(r.cat).replace(/[<>]/g,'')+' <span style="color:var(--text3);font-size:9px;">›</span></td><td class="mono">'+r.revenue.toLocaleString('en-IN',{maximumFractionDigits:0})+'</td><td class="mono">'+pct+'%</td></tr>';
         }).join('') : '<tr><td colspan="3" style="text-align:center;color:var(--text3);padding:14px;">No items sold in this period yet.</td></tr>';
         if (catFoot && catFootAmt){
           catFoot.style.display = catRows.length ? '' : 'none';
@@ -21168,6 +21194,71 @@ async function bnxOpenBillFromReport_(billNumber){
       <button class="btn btn-sm" style="flex:1;" onclick="blReprintBillByNo('${String(b.BILL_NUMBER||'').replace(/'/g,"\\'")}')">🖨 Reprint</button>
     </div>
     <div style="margin-top:8px;font-size:10px;color:#aaa;text-align:center;">Live from server — same invoice regardless of which device or terminal created it.</div>
+  `;
+}
+
+// NEW ("item group ... click details then show category ... click then
+// items show" — Sep 2026): category -> items -> bills drill-down for the
+// Dashboard's Category Wise Sales card, chained onto the same server-
+// authoritative bnxOpenBillFromReport_ already built for Sales Day Book,
+// so a bill opened from here works the same way regardless of which
+// device created it.
+async function bnxShowCategoryItems_(categoryName){
+  const body = document.getElementById('detailModalBody');
+  const modal = document.getElementById('detailModal');
+  if (!body || !modal) return;
+  body.innerHTML = '<div style="padding:24px;text-align:center;color:#888;">Loading items in '+String(categoryName).replace(/[<>]/g,'')+'…</div>';
+  modal.style.display = 'flex';
+  const rangeParams = window.__bnxCatSalesRange_ || { range:'today' };
+  let res;
+  try{
+    res = await erpApi(Object.assign({action:'GET_ITEM_SALES_REPORT'}, rangeParams), 'V2_CORE');
+  }catch(e){
+    body.innerHTML = '<div style="padding:24px;text-align:center;color:var(--red,#dc2626);">⚠️ Could not load items — '+String(e && e.message || e).replace(/[<>]/g,'')+'</div>';
+    return;
+  }
+  const allRows = (res && res.success && res.data && res.data.rows) ? res.data.rows : [];
+  const rows = allRows.filter(r => String(r.CATEGORY_NAME||'Uncategorized') === String(categoryName));
+  const rupee = (n) => '₹'+Number(n||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+  window.__bnxCatSalesItems_ = rows; // stashed so bnxShowItemBills_ can look up bill numbers by item without a second fetch
+  const itemsHtml = rows.length
+    ? rows.map((r,i)=>`<tr style="cursor:pointer;" onclick="bnxShowItemBills_(${i})">
+        <td>${String(r.ITEM_NAME||'—').replace(/[<>]/g,'')} <span style="color:#bbb;font-size:9px;">›</span></td>
+        <td class="mono" style="text-align:right;">${Number(r.QUANTITY_SOLD||0)}</td>
+        <td class="mono" style="text-align:right;">${rupee(r.NET_SALES)}</td>
+      </tr>`).join('')
+    : '<tr><td colspan="3" style="text-align:center;color:#999;padding:14px;">No items found in this category for this period.</td></tr>';
+  body.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+      <div style="font-weight:800;font-size:15px;">${String(categoryName).replace(/[<>]/g,'')}</div>
+      <button onclick="closeDetailModal()" style="border:none;background:#f2ede5;width:28px;height:28px;border-radius:8px;font-size:14px;cursor:pointer;">✕</button>
+    </div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <thead><tr style="font-size:10.5px;font-weight:700;color:#888;border-bottom:1px solid #eee;"><th style="text-align:left;padding:4px 0;">ITEM</th><th style="text-align:right;">QTY</th><th style="text-align:right;">NET SALES</th></tr></thead>
+      <tbody>${itemsHtml}</tbody>
+    </table>
+    <div style="margin-top:10px;font-size:10px;color:#aaa;text-align:center;">Click an item to see which bills it sold in.</div>
+  `;
+}
+
+async function bnxShowItemBills_(itemIndex){
+  const rows = window.__bnxCatSalesItems_ || [];
+  const item = rows[itemIndex];
+  const body = document.getElementById('detailModalBody');
+  if (!item || !body) return;
+  const billNumbers = (item.BILL_NUMBERS || []).filter(Boolean);
+  const billsHtml = billNumbers.length
+    ? billNumbers.map(no => `<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid #f2f2f2;cursor:pointer;" onclick="bnxOpenBillFromReport_('${String(no).replace(/'/g,"\\'")}')">
+        <span class="mono">${String(no).replace(/[<>]/g,'')}</span><span style="color:#bbb;font-size:9px;">View ›</span>
+      </div>`).join('')
+    : '<div style="text-align:center;color:#999;padding:14px;">No bill numbers available for this item.</div>';
+  body.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+      <div><div style="font-weight:800;font-size:15px;">${String(item.ITEM_NAME||'').replace(/[<>]/g,'')}</div>
+        <div style="font-size:11px;color:#888;">${billNumbers.length} bill${billNumbers.length===1?'':'s'} · ${String(item.CATEGORY_NAME||'').replace(/[<>]/g,'')}</div></div>
+      <button onclick="closeDetailModal()" style="border:none;background:#f2ede5;width:28px;height:28px;border-radius:8px;font-size:14px;cursor:pointer;">✕</button>
+    </div>
+    <div>${billsHtml}</div>
   `;
 }
 
