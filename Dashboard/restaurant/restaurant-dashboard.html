@@ -8261,6 +8261,7 @@ async function bnxPullBillsFromServer(from, to){
       const params = { clientId: (typeof CLIENT_ID!=='undefined'?CLIENT_ID:undefined) };
       const hasRange = !!(from || to);
       if (hasRange){ params.FROM_DATE = from || to; params.TO_DATE = to || from; }
+      params.SUMMARY_ONLY = true;
       const res = await gasApi('LIST_BILLS', params);
       if (!res || res.success === false) throw new Error(res?.error || 'LIST_BILLS failed');
       const serverBills = res && (res.bills || res.data || (Array.isArray(res) ? res : []));
@@ -10048,6 +10049,55 @@ function bnxRenderDashAlerts_(){
   }catch(e){ console.error('[Dashboard] bnxRenderDashAlerts_ error:', e); }
 }
 
+async function bnxDashboardBillsFallback_(rangeParams){
+  // FINAL RESILIENCE FIX: if the heavier GET_DASHBOARD_SUMMARY endpoint is
+  // temporarily slow/aborted, the dashboard must still be able to show its
+  // core sales cards from the lightweight BILL_MASTER read already exposed by
+  // GET_BILLS. This is a fallback only; it never replaces the live summary
+  // when that call succeeds.
+  try{
+    const rp = rangeParams || {};
+    let from = '', to = '';
+    if (rp.range === 'today' || !rp.range) {
+      from = to = (typeof getBusinessDate === 'function') ? getBusinessDate() : new Date().toISOString().slice(0,10);
+    } else if (rp.range === 'custom' && rp.from && rp.to) {
+      from = String(rp.from); to = String(rp.to);
+    } else {
+      return false;
+    }
+    const res = await gasApi('GET_BILLS', {FROM_DATE:from, TO_DATE:to, BUSINESS_DATE:from}, 'V2_CORE');
+    if(!res || !res.success || !Array.isArray(res.data)) return false;
+    const rows = res.data.filter(b=>{
+      const st=String(b.BILL_STATUS||b.status||'').trim().toUpperCase();
+      return st!=='CANCELLED' && st!=='VOID';
+    });
+    let revenue=0,totalSales=0,covers=0;
+    rows.forEach(b=>{
+      const grand=Number(b.GRAND_TOTAL ?? b.total ?? 0)||0;
+      const tax=Number(b.TAX_AMOUNT ?? b.tax ?? 0)||0;
+      const round=Number(b.ROUND_OFF ?? b.roundOff ?? 0)||0;
+      const taxableRaw=Number(b.TAXABLE_AMOUNT);
+      const taxable=Number.isFinite(taxableRaw) && (taxableRaw!==0 || grand===0)
+        ? taxableRaw : Math.max(0,+((grand-tax-round)).toFixed(2));
+      revenue+=taxable; totalSales+=grand; covers+=Number(b.COVERS ?? b.pax ?? 0)||0;
+    });
+    const setMoney=id=>{const e=document.getElementById(id); if(e){e.textContent='₹'+revenue.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});e.dataset.bnxLive='1';}};
+    setMoney('d-rev'); setMoney('h-rev'); setMoney('rpt-rev');
+    const ord=document.getElementById('d-ord'); if(ord){ord.textContent=String(rows.length);ord.dataset.bnxLive='1';}
+    const cov=document.getElementById('d-cov'); if(cov){cov.textContent=String(covers);cov.dataset.bnxLive='1';}
+    const ro=document.getElementById('h-ord'); if(ro) ro.textContent=String(rows.length);
+    const rc=document.getElementById('h-cov'); if(rc) rc.textContent=String(covers);
+    const rb=document.getElementById('rpt-bills'); if(rb){rb.textContent=String(rows.length);rb.dataset.bnxLive='1';}
+    const rt=document.getElementById('rpt-total-sales'); if(rt){rt.textContent='₹'+totalSales.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});rt.dataset.bnxLive='1';}
+    ['d-revchg','d-ordchg','d-covchg'].forEach(id=>{const e=document.getElementById(id);if(e)e.textContent='Live · fallback';});
+    console.warn('[Dashboard] GET_DASHBOARD_SUMMARY unavailable; core cards populated from GET_BILLS fallback.');
+    return true;
+  }catch(e){
+    console.warn('[Dashboard] GET_BILLS fallback failed:',e&&e.message||e);
+    return false;
+  }
+}
+
 async function loadDashboard(){
   // Explicit user refresh must bypass the short-lived snapshot cache.
   bnxClearDashboardSummaryCache_();
@@ -10263,7 +10313,12 @@ async function loadDashboard(){
     // to diagnose from outside the source. Logging it now costs
     // nothing and turns the next one of these into a 30-second fix
     // instead of a long trace-by-hand.
-    console.error('[Dashboard] Real-data render path failed, falling back to offline mode:', e);
+    console.error('[Dashboard] Real-data render path failed; trying lightweight bills fallback:', e);
+    if (await bnxDashboardBillsFallback_(rangeParams)) {
+      buildDashKotList();
+      buildFloor('dashMap');
+      return;
+    }
   }
   // FIX — THE MAIN BUG ("dashboard till show wrong data, not live"): this
   // used to unconditionally call buildActiveOrders([]) here, AFTER the
@@ -22534,10 +22589,17 @@ async function runReportWithSync(){
   const from=document.getElementById('rptFrom')?.value||'';
   const to=document.getElementById('rptTo')?.value||from;
   if(from&&to&&from>to){showNotif('⚠️ From date cannot be after To date','error');return;}
-  rptSetLoadState('⟳ Syncing selected period from server…');
-  try{
-    await Promise.all([bnxPullBillsFromServer(from,to), bnxPullKotsFromServer()]);
+  const localSyncAnchors = new Set(['cancelled-bills','timewise','customer','user-table','parcel']);
+  // Server-backed reports render directly. Do not make DSR/Monthly DSR wait
+  // for an unrelated 60-second LIST_BILLS synchronization.
+  if(!localSyncAnchors.has(rptActiveAnchor)){
+    rptPopulateFilterSelects();
+    rptRefreshSalesKpis_();
+    runReport();
+    return;
   }
+  rptSetLoadState('⟳ Syncing selected period from server…');
+  try{ await Promise.all([bnxPullBillsFromServer(from,to), bnxPullKotsFromServer()]); }
   catch(e){ console.warn('[runReportWithSync] server sync failed:', e.message); }
   rptPopulateFilterSelects();
   rptRefreshSalesKpis_();
