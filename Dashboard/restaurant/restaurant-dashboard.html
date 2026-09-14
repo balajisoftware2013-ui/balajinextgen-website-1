@@ -9040,15 +9040,30 @@ function bnxRenderLiveDashboardWidgets_(d){
 let _bnxDashSummaryPromise = null;
 let _bnxDashSummaryKey = '';
 
+let _bnxDashSummaryCache = new Map();
+const BNX_DASH_CACHE_TTL_MS = 15000;
+
 function bnxGetDashboardSummaryShared_(rangeParams){
   const key = String(CLIENT_ID||'') + '|' + JSON.stringify(rangeParams||{});
+  const now = Date.now();
+  const cached = _bnxDashSummaryCache.get(key);
+  if (cached && (now - cached.ts) < BNX_DASH_CACHE_TTL_MS) return Promise.resolve(cached.value);
   if (_bnxDashSummaryPromise && _bnxDashSummaryKey === key) return _bnxDashSummaryPromise;
   _bnxDashSummaryKey = key;
   _bnxDashSummaryPromise = erpApi(
     Object.assign({action:'GET_DASHBOARD_SUMMARY'}, rangeParams||{}),
     'V2_CORE'
-  ).finally(()=>{ setTimeout(()=>{ if(_bnxDashSummaryKey===key) _bnxDashSummaryPromise=null; }, 1000); });
+  ).then(result=>{
+    if (result && result.success) _bnxDashSummaryCache.set(key,{ts:Date.now(),value:result});
+    return result;
+  }).finally(()=>{
+    if(_bnxDashSummaryKey===key) { _bnxDashSummaryPromise=null; _bnxDashSummaryKey=''; }
+  });
   return _bnxDashSummaryPromise;
+}
+
+function bnxClearDashboardSummaryCache_(){
+  try{ _bnxDashSummaryCache.clear(); }catch(e){}
 }
 
 async function loadRealDashboardData() {
@@ -9077,9 +9092,20 @@ async function loadRealDashboardData() {
     // now computes and returns this same split for real, as
     // data.collectionsByMode — reading that here instead of inventing a
     // second endpoint or a second full dashboard fetch.
-    // HANG FIX: loadDashboard() already requests this exact summary. Reuse its
-    // in-flight/result promise instead of starting another network call.
-    const dashRes = await bnxGetDashboardSummaryShared_(rangeParams);
+    // PERFORMANCE FIX (Sep 2026): start the independent online-order report
+    // at the same time as the shared dashboard summary. The old code waited
+    // for GET_DASHBOARD_SUMMARY (~20s on the live site) and ONLY THEN started
+    // GET_ONLINE_ORDER_REPORT, unnecessarily making startup wait for both in
+    // series. Keep the same live APIs/data, but overlap the independent reads.
+    // FINAL PERFORMANCE FIX: start independent reads together.
+    // The previous version waited for the 20s dashboard summary before
+    // starting the online-order report, despite the comment claiming they
+    // were parallel. This now genuinely overlaps both requests.
+    const dashPromise = bnxGetDashboardSummaryShared_(rangeParams);
+    window.__bnxOnlineReportPromise = erpApi(
+      Object.assign({action:'GET_ONLINE_ORDER_REPORT'}, rangeParams), 'V2_CORE'
+    );
+    const dashRes = await dashPromise;
 
     if (dashRes && dashRes.success && dashRes.data && dashRes.data.collectionsByMode) {
       const cm = dashRes.data.collectionsByMode;
@@ -9200,7 +9226,11 @@ async function loadRealDashboardData() {
     const rangeParams = (typeof bnxDashRangeParams_ === 'function')
       ? bnxDashRangeParams_()
       : { range: (typeof dashActiveRange !== 'undefined' ? dashActiveRange : 'today') };
-    const oorRes = await erpApi(Object.assign({action:'GET_ONLINE_ORDER_REPORT'}, rangeParams), 'V2_CORE');
+    const oorPromise = window.__bnxOnlineReportPromise;
+    const oorRes = oorPromise
+      ? await oorPromise
+      : await erpApi(Object.assign({action:'GET_ONLINE_ORDER_REPORT'}, rangeParams), 'V2_CORE');
+    window.__bnxOnlineReportPromise = null;
     if (oorRes && oorRes.success && oorRes.data){
       const revEl = document.getElementById('d-online-rev');
       const revChg = document.getElementById('d-online-revchg');
@@ -10005,6 +10035,8 @@ function bnxRenderDashAlerts_(){
 }
 
 async function loadDashboard(){
+  // Explicit user refresh must bypass the short-lived snapshot cache.
+  bnxClearDashboardSummaryCache_();
   try{
     bnxResetApiCircuit_('V2_CORE');
     const rangeParams = bnxDashRangeParams_();
