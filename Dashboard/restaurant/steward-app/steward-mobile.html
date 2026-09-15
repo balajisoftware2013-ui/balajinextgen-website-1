@@ -6133,6 +6133,43 @@ function bnxKOTGroupType_(item, menuItem){
   const grp=grpRaw.toLowerCase();
   return /bar|liquor|alcohol|tobacco|beer|wine|whisky|whiskey|vodka|rum|gin/.test(cat+' '+grp) ? 'BAR' : 'KITCHEN';
 }
+/* Creates the REAL server-side KOT_MASTER/KOT_ITEMS records this app was
+   never creating (see the long comment at its call site in placeOrder()
+   above). One SAVE_KOT per station split (Kitchen/Bar/Beverage — the
+   same bnxKOTGroupType_ split already used for printing), so a bar-heavy
+   order doesn't create a single KOT row that mixes food and drinks. The
+   server generates the authoritative KOT_NUMBER itself (kotNumber is
+   intentionally not sent) — never invented client-side, avoiding any
+   chance of two devices handing out the same number. */
+async function bnxSyncRealKotTickets_(entry, orderId){
+  try{
+    const parts = bnxKOTParts_(entry);
+    for(const part of parts){
+      const kotRequestId = bnxUuid();
+      const kotReq = {
+        requestId: kotRequestId,
+        orderNo: entry.orderNo || orderId,
+        table: entry.table || '',
+        waiter: entry.waiter || entry.steward || '',
+        covers: entry.covers || '',
+        customerName: entry.customerName || '',
+        remarks: '',
+        kotSource: 'STEWARD',
+        items: (part.items || []).map(i => ({
+          ITEM_ID: i.id || i.ITEM_ID || i.itemId || '',
+          name: i.name || i.ITEM_NAME || '',
+          qty: i.qty || i.QUANTITY || 1,
+          rate: i.price || i.rate || i.RATE || 0,
+          UNIT_ID: 'PIECE'
+        }))
+      };
+      try{
+        const kres = await gasApi('SAVE_KOT', kotReq, 'V2_CORE');
+        if(!kres || !kres.success) bnxQueuePending('SAVE_KOT', kotReq, kotRequestId);
+      }catch(e){ bnxQueuePending('SAVE_KOT', kotReq, kotRequestId); }
+    }
+  }catch(e){ console.error('[SAVE_KOT sync]', e); }
+}
 function bnxKOTParts_(k){
   const parts=new Map();
   (k && Array.isArray(k.items) ? k.items : []).forEach(raw=>{
@@ -7958,6 +7995,25 @@ async function placeOrder(){
   KOT.unshift(entry);
   if(KOT.length>100) KOT.length=100;
   bnxSetOpenKotsRaw(JSON.stringify(KOT));
+
+  // FIX ("KOT blank in database / order save maps with database" —
+  // confirmed root cause against the real CL00010 export: KOT_MASTER and
+  // KOT_ITEMS had ZERO real rows despite 6,000+ real ORDER_MASTER rows).
+  // placeOrder() only ever called SAVE_ORDER. The "KOT" shown on this
+  // screen (kotNo:orderId above) has always been a purely local label —
+  // this app never once called SAVE_KOT, so no real KOT_MASTER/KOT_ITEMS
+  // row was ever created for an order placed from the steward app (the
+  // one real KOT row this client's database has ever had came from
+  // restaurant-dashboard.html/kot-management.html, which already call
+  // SAVE_KOT — steward-mobile.html was simply never wired to). Fire one
+  // real SAVE_KOT per kitchen/bar/beverage station split — same grouping
+  // bnxKOTParts_ already uses for printing below — so KDS, Kitchen
+  // Performance, and every other report that reads real KOT_MASTER data
+  // finally has something to read for orders placed here. Fire-and-forget
+  // with the same queued-retry safety net SAVE_ORDER above already uses;
+  // a KOT save failure never blocks or reverses the order that already
+  // succeeded.
+  bnxSyncRealKotTickets_(entry, orderId);
 
   // FIX ("send kot direct kot printer print kot"): sending an order used
   // to only push it to the Kitchen Display — printing the physical KOT
