@@ -2489,7 +2489,22 @@ function bnxLogoFallback(img){
       <button class="tb-back" onclick="showScreen('s-home')">←</button>
       <div><div class="tb-title">KOT / Kitchen Orders</div><div class="tb-sub" id="kot-active-sub">0 active orders</div></div>
     </div>
+    <!-- FIX ("kot are show but can visible which so calender give if any
+         pending kot"): the live list above only ever showed today's
+         still-open tickets from the 30s poll — a pending KOT left over
+         from an earlier date (device offline, app closed mid-shift, etc.)
+         had no way to ever be found or cleared. This date picker looks
+         up any date's un-served/un-cancelled KOTs directly from the
+         server (GET_KOT), independent of the live poll, with a
+         Select All + Cancel Selected bar for clearing out old stuck
+         tickets in bulk. Picking today's date (the default) hides this
+         panel and leaves the normal live list exactly as before. -->
+    <div id="kot-date-bar" style="display:flex;align-items:center;gap:8px;padding:8px 14px;background:var(--surface2);border-bottom:1px solid var(--border);">
+      <span style="font-size:11px;font-weight:700;color:var(--text2);">📅 Find KOTs for date:</span>
+      <input type="date" id="kot-date-input" onchange="bnxKotDateChanged_(this.value)" style="flex:1;max-width:160px;padding:5px 8px;border-radius:8px;border:1px solid var(--border2);background:var(--surface);color:var(--text);font-size:12px;">
+    </div>
     <div class="scroll" id="kot-list"></div>
+    <div class="scroll" id="kot-date-panel" style="display:none;"></div>
     <div class="bottom-nav">
       <div class="bn-item" onclick="showScreen('s-home',this)"><span class="bn-icon"><svg viewBox="0 0 24 24"><path d="M3 10.8 12 3l9 7.8"/><path d="M5.5 9.5V21h13V9.5"/><path d="M9.5 21v-6h5v6"/></svg></span><span class="bn-label">Home</span></div>
       <div class="bn-item" onclick="showScreen('s-tables',this)"><span class="bn-icon"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 8h8v8H8z"/><path d="M8 12h8M12 8v8"/></svg></span><span class="bn-label">Tables</span></div>
@@ -5917,6 +5932,7 @@ function bnxOrderStatusLocked_(status){
   return ['READY','SERVED','BILLED','SETTLED','CANCELLED'].includes(s);
 }
 function renderKOT(){
+  bnxKotDateInputInit_();
   // PASS #50 FIX (companion to the dashboard's "In Progress always 0"
   // fix): PROGRESS/IN_PROGRESS had no color mapping here at all, so a
   // ticket cooking-in-progress rendered with the default stat-prep style
@@ -6008,6 +6024,97 @@ function cancelKot(kotNo){
   renderKOT();
   toast('🚫 KOT cancelled','error');
   bnxGuaranteedSync('UPDATE_ORDER_STATUS', {orderId:kotNo, status:'CANCELLED', remarks:reason});
+}
+
+/* ── KOT DATE BROWSER + BULK CANCEL ──
+   See the comment on #kot-date-bar in the markup for why this exists.
+   Independent of the live 30s-polled KOT list -- looks up any date's
+   real, still-open (not SERVED/CANCELLED — the server already excludes
+   those) KOT tickets straight from KOT_MASTER via GET_KOT. */
+function bnxKotTodayStr_(){
+  const n=new Date(); const p=v=>String(v).padStart(2,'0');
+  return n.getFullYear()+'-'+p(n.getMonth()+1)+'-'+p(n.getDate());
+}
+function bnxKotDateInputInit_(){
+  const el=document.getElementById('kot-date-input');
+  if(el && !el.value) el.value=bnxKotTodayStr_();
+}
+async function bnxKotDateChanged_(val){
+  const listEl=document.getElementById('kot-list');
+  const panelEl=document.getElementById('kot-date-panel');
+  const today=bnxKotTodayStr_();
+  if(!val || val===today){
+    // Back to today: normal live-polled list, panel hidden, nothing else changes.
+    if(panelEl){ panelEl.style.display='none'; panelEl.innerHTML=''; }
+    if(listEl) listEl.style.display='';
+    renderKOT();
+    return;
+  }
+  if(listEl) listEl.style.display='none';
+  if(panelEl){ panelEl.style.display=''; panelEl.innerHTML=`<div style="text-align:center;padding:30px 10px;color:var(--text3);font-size:12px;">⏳ Loading KOTs for ${bnxEscapeHtml_(val)}…</div>`; }
+  await bnxLoadKotForDate_(val);
+}
+async function bnxLoadKotForDate_(dateStr){
+  const panelEl=document.getElementById('kot-date-panel');
+  if(!panelEl) return;
+  try{
+    const res=await gasApi('GET_KOT', {FROM_DATE:dateStr, TO_DATE:dateStr}, 'V2_CORE');
+    const rows=res && res.success && Array.isArray(res.data) ? res.data : [];
+    bnxRenderKotDatePanel_(rows, dateStr);
+  }catch(e){
+    panelEl.innerHTML=`<div style="text-align:center;padding:30px 10px;color:var(--red);font-size:12px;">🔴 Could not load KOTs for this date<br><button onclick="bnxLoadKotForDate_('${bnxEscapeHtml_(dateStr)}')" style="margin-top:8px;background:var(--red,#c0392b);color:#fff;border:none;border-radius:6px;padding:6px 14px;font-size:11px;font-weight:700;cursor:pointer;">Retry</button></div>`;
+  }
+}
+function bnxRenderKotDatePanel_(rows, dateStr){
+  const panelEl=document.getElementById('kot-date-panel');
+  if(!panelEl) return;
+  if(!rows.length){
+    panelEl.innerHTML=`<div style="text-align:center;padding:30px 10px;color:var(--text3);font-size:12px;">No pending KOTs found for ${bnxEscapeHtml_(dateStr)} — every ticket that date is already served/cancelled, or none were raised.</div>`;
+    return;
+  }
+  const sc={PREPARING:'stat-prep',PROGRESS:'stat-prep',IN_PROGRESS:'stat-prep',READY:'stat-ready',NEW:'stat-pending',PENDING:'stat-pending',PRINTED:'stat-pending',DELAYED:'stat-delayed'};
+  const cards=rows.map((k,idx)=>{
+    const status=String(k.KOT_STATUS||'NEW').toUpperCase();
+    const kotNumber=k.KOT_NUMBER||k.KOT_ID||'-';
+    const orderRef=k.ORDER_NUMBER||k.ORDER_ID||'';
+    const items=Array.isArray(k.itemsDetail)?k.itemsDetail:(Array.isArray(k.items)?k.items:[]);
+    const itemsLine=items.map(i=>`${i.qty||i.QUANTITY||1}× ${bnxEscapeHtml_(i.itemName||i.name||i.ITEM_NAME||'Item')}`).join(', ')||'—';
+    return `<div class="kot-card" data-kot-idx="${idx}">
+      <div class="kot-header">
+        <input type="checkbox" class="kot-date-check" data-order-ref="${bnxEscapeHtml_(orderRef)}" data-kot-no="${bnxEscapeHtml_(kotNumber)}" style="width:17px;height:17px;flex-shrink:0;">
+        <span class="kot-table" style="flex:1;">📍 Table ${bnxEscapeHtml_(k.TABLE_ID||'-')} · Order ${bnxEscapeHtml_(orderRef||'-')} · KOT ${bnxEscapeHtml_(kotNumber)}</span>
+        <span class="kot-status ${sc[status]||'stat-prep'}">${bnxEscapeHtml_(status)}</span>
+      </div>
+      <div style="padding:8px 10px;font-size:11px;color:var(--text2);border-top:1px solid var(--border);">${itemsLine}</div>
+      <div style="padding:0 10px 8px;font-size:10px;color:var(--text3);">${bnxEscapeHtml_(k.KOT_TIME||'')}${k.STARTED_BY?' · '+bnxEscapeHtml_(k.STARTED_BY):''}</div>
+    </div>`;
+  }).join('');
+  panelEl.innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;padding:8px 14px;">
+      <label style="display:flex;align-items:center;gap:6px;font-size:11.5px;font-weight:700;color:var(--text2);cursor:pointer;">
+        <input type="checkbox" id="kot-date-select-all" onchange="bnxKotDateToggleAll_(this.checked)" style="width:17px;height:17px;">
+        Select All (${rows.length})
+      </label>
+      <button style="margin-left:auto;background:var(--red-bg);border:1px solid rgba(224,80,80,.3);color:var(--red);border-radius:8px;padding:7px 14px;font-size:11.5px;font-weight:700;cursor:pointer;" onclick="bnxKotDateCancelSelected_('${bnxEscapeHtml_(dateStr)}')">Cancel Selected ✕</button>
+    </div>
+    ${cards}`;
+}
+function bnxKotDateToggleAll_(checked){
+  document.querySelectorAll('#kot-date-panel .kot-date-check').forEach(cb=>{ cb.checked=checked; });
+}
+async function bnxKotDateCancelSelected_(dateStr){
+  const checked=[...document.querySelectorAll('#kot-date-panel .kot-date-check:checked')];
+  if(!checked.length){ toast('Select at least one KOT to cancel','error'); return; }
+  const reason=prompt('Reason for cancelling '+checked.length+' selected KOT(s)?','');
+  if(reason===null) return;
+  toast('🚫 Cancelling '+checked.length+' KOT(s)…','error');
+  for(const cb of checked){
+    const orderRef=cb.dataset.orderRef;
+    if(!orderRef) continue;
+    try{ await bnxGuaranteedSync('UPDATE_ORDER_STATUS', {orderId:orderRef, status:'CANCELLED', remarks:reason}); }catch(e){}
+  }
+  toast('✅ '+checked.length+' KOT(s) cancelled','success');
+  bnxLoadKotForDate_(dateStr);
 }
 /* FIX ("if order to print"): no print function existed anywhere in
    this app. Opens a print-formatted kitchen ticket in a hidden iframe
