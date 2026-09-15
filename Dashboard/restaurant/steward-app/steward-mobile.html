@@ -5463,6 +5463,54 @@ const ORD_HIST_STATUS_COLOR={SETTLED:'var(--green)',DUE:'var(--orange)',NC:'var(
    when the real register is genuinely empty (fresh install), same
    "real data takes over only once it exists" convention the dashboard
    uses everywhere else. */
+/* FIX (report accuracy — Item Group Wise showing "Unassigned", and
+   item/category totals not tying back to Sales):
+
+   1. GROUP WAS BEING DROPPED. placeOrder() sends itemGroupId/itemGroupName
+      and bnxSaveOrder writes them to ORDER_ITEMS.ITEM_GROUP_ID /
+      ITEM_GROUP_NAME — but both row normalizers below only ever read
+      group/GROUP/itemGroup/ITEM_GROUP. ITEM_GROUP_NAME, the actual column
+      the backend populates, was never read, so it was flattened to '' and
+      bnxReportItemGroupName_ fell through to 'Unassigned' for every line.
+      The Item-Group-Wise report was therefore one big Unassigned bucket
+      even though the data was correct in the database. Same story for
+      CATEGORY_NAME and the Category-Wise report.
+
+   2. ITEM ID WAS BEING DROPPED, so bnxReportItemMeta_()'s MENU fallback
+      (which looks up by id first) could only ever match on exact item
+      name — any rename in the menu master silently broke the fallback.
+
+   3. LINE AMOUNT WAS BEING READ AS A UNIT RATE. bnxBillToHistRow treated
+      AMOUNT as a rate candidate, but AMOUNT is the line total (qty x rate).
+      bnxReportGroups_ then computes qty x rate, i.e. qty x qty x rate — a
+      3-qty line at 100 reported as 900 instead of 300. That is why the
+      item/group/category tables could add up to more than the Sales figure
+      in the summary above them (which comes from the bill total, not from
+      the lines). Now a bare line amount is divided back down by qty. */
+function bnxNormalizeReportItem_(i){
+  i=i||{};
+  const num=v=>{ const n=Number(v); return isNaN(n)?0:n; };
+  const qty=num(i.qty!=null?i.qty:(i.QTY!=null?i.QTY:(i.quantity!=null?i.quantity:i.QUANTITY)));
+  let rate=num(i.price!=null?i.price:(i.rate!=null?i.rate:(i.RATE!=null?i.RATE:
+           (i.unitPrice!=null?i.unitPrice:(i.UNIT_PRICE!=null?i.UNIT_PRICE:
+           (i.PRICE!=null?i.PRICE:i.ITEM_RATE))))));
+  if(!rate){
+    const lineTotal=num(i.amount!=null?i.amount:(i.AMOUNT!=null?i.AMOUNT:
+                    (i.lineTotal!=null?i.lineTotal:(i.LINE_TOTAL!=null?i.LINE_TOTAL:i.TOTAL))));
+    if(lineTotal && qty>0) rate=lineTotal/qty;
+  }
+  const group=String(i.itemGroupName||i.ITEM_GROUP_NAME||i.groupName||i.GROUP_NAME||
+              i.itemGroup||i.ITEM_GROUP||i.group||i.GROUP||'').trim();
+  const category=String(i.categoryName||i.CATEGORY_NAME||i.cat||i.CATEGORY||i.category||'').trim();
+  return {
+    id:String(i.id||i.ITEM_ID||i.itemId||i.itemCode||i.ITEM_CODE||'').trim(),
+    name:i.name||i.NAME||i.itemName||i.ITEM_NAME||i.menuItem||i.MENU_ITEM||'Unknown Item',
+    qty, rate,
+    group, itemGroupName:group, ITEM_GROUP_NAME:group,
+    itemGroupId:String(i.itemGroupId||i.ITEM_GROUP_ID||'').trim(),
+    category, categoryName:category
+  };
+}
 function bnxBillToHistRow(b){
   // REPORT DATA NORMALIZATION — LIST_BILLS may return either the compact
   // frontend shape (no/dt/tm/waiter/total/itemsDetail) or the raw ERP
@@ -5473,17 +5521,15 @@ function bnxBillToHistRow(b){
     : Array.isArray(b.items) ? b.items
     : Array.isArray(b.ITEMS) ? b.ITEMS
     : [];
-  const items = rawItems.map(i=>({
-    name:i.name||i.NAME||i.itemName||i.ITEM_NAME||i.menuItem||i.MENU_ITEM||'Unknown Item',
-    qty:Number(i.qty!=null?i.qty:(i.QTY!=null?i.QTY:(i.quantity!=null?i.quantity:i.QUANTITY)))||0,
-    rate:Number(i.price!=null?i.price:(i.rate!=null?i.rate:(i.RATE!=null?i.RATE:(i.amount!=null?i.amount:i.AMOUNT))))||0,
-    group:i.group||i.GROUP||i.itemGroup||i.ITEM_GROUP||'',
-    category:i.cat||i.CATEGORY||i.category||''
-  }));
+  const items = rawItems.map(bnxNormalizeReportItem_);
   const createdBy = b.waiter||b.WAITER||b.steward||b.STEWARD||b.createdBy||b.CREATED_BY||b.createdByName||b.CREATED_BY_NAME||'';
   const createdById = b.createdById||b.CREATED_BY_ID||b.userId||b.USER_ID||'';
   const createdByLogin = b.createdByLogin||b.CREATED_BY_LOGIN||b.waiterLogin||b.WAITER_LOGIN||b.loginId||b.LOGIN_ID||b.USERNAME||'';
-  const date = b.dt||b.date||b.BILL_DATE||b.billDate||b.ORDER_DATE||b.orderDate||'';
+  // CREATED_AT is the last-resort date source: a bill row missing BILL_DATE
+  // used to end up with rawDate:'' and, because of bnxReportRangeMatch_'s old
+  // 'no date matches everything' rule, was then counted in Today AND This Week
+  // AND This Month AND every picked month at once.
+  const date = b.dt||b.date||b.BILL_DATE||b.billDate||b.ORDER_DATE||b.orderDate||b.CREATED_AT||b.createdAt||b.TIMESTAMP||b.timestamp||'';
   const time = b.tm||b.time||b.BILL_TIME||b.billTime||b.ORDER_TIME||b.orderTime||'';
   const total = Number(b.total!=null?b.total:(b.TOTAL!=null?b.TOTAL:(b.GRAND_TOTAL!=null?b.GRAND_TOTAL:(b.grandTotal!=null?b.grandTotal:(b.BILL_AMOUNT!=null?b.BILL_AMOUNT:b.billAmount)))))||0;
   const status = b.status||b.STATUS||b.BILL_STATUS||b.PAYMENT_STATUS||b.paymentStatus||'UNKNOWN';
@@ -5603,13 +5649,7 @@ async function bnxPullBillsForHistory(){
 function bnxOrderToHistRow(o){
   o=o||{};
   const rawItems=Array.isArray(o.items)?o.items:(Array.isArray(o.ITEMS)?o.ITEMS:(Array.isArray(o.ORDER_ITEMS)?o.ORDER_ITEMS:(Array.isArray(o.ITEM_DETAILS)?o.ITEM_DETAILS:[])));
-  const items=rawItems.map(i=>({
-    name:i.name||i.NAME||i.itemName||i.ITEM_NAME||'Unknown Item',
-    qty:Number(i.qty!=null?i.qty:(i.QTY!=null?i.QTY:i.quantity))||0,
-    rate:Number(i.price!=null?i.price:(i.rate!=null?i.rate:i.RATE))||0,
-    group:i.group||i.GROUP||i.itemGroup||i.ITEM_GROUP||'',
-    category:i.cat||i.CATEGORY||i.category||''
-  }));
+  const items=rawItems.map(bnxNormalizeReportItem_);
   const status=o.ORDER_STATUS||o.orderStatus||o.STATUS||o.status||'NEW';
   const createdBy=o.STARTED_BY||o.CREATED_BY||o.createdBy||o.WAITER||o.waiter||o.STEWARD||o.steward||'';
   const createdById=o.STARTED_BY_ID||o.CREATED_BY_ID||o.createdById||o.USER_ID||o.userId||'';
@@ -5704,7 +5744,16 @@ let bnxReportCustomTo='';
 let bnxLastReportSnapshot=null;
 function bnxReportRangeMatch_(dt){
   if(bnxReportRange==='all') return true;
-  const d=bnxParseAnyDate(dt); if(!d) return true;
+  const d=bnxParseAnyDate(dt);
+  /* FIX (double counting): this used to return TRUE for an unparseable date,
+     which meant any order missing a usable date was counted in Today, This
+     Week, This Month and every picked month simultaneously — inflating every
+     bounded range at once and making the same order appear in reports for
+     months it had nothing to do with. Undated rows now only appear under
+     All Time, where they are honestly unfiltered. The normalizers above were
+     also widened to fall back to CREATED_AT, so genuinely dated rows no
+     longer land here in the first place. */
+  if(!d) return false;
   const day=bnxStartOfDay_(d), today=bnxStartOfToday();
   if(bnxReportRange==='today') return day.getTime()===today.getTime();
   if(bnxReportRange==='week'){ const ws=bnxStartOfWeek(); return day>=ws && day<=today; }
@@ -5887,7 +5936,17 @@ async function bnxRenderReports(refresh){
   if(!rows.length){ list.innerHTML='<div class="report-card report-empty">No report data for you in this range.</div>'; return; }
   const title={item:'Item Wise',group:'Item Group Wise',category:'Category Wise'}[bnxReportType];
   const orderBlock=bnxReportOrderDetails_(orders).map(o=>`<div class="report-row" style="grid-template-columns:1fr"><div style="font-weight:800">#${bnxEscapeHtml_(o.orderNo)} · KOT ${bnxEscapeHtml_(o.kotNo)} · Table ${bnxEscapeHtml_(o.table)}</div><div style="font-size:10px;color:var(--text3);margin-top:3px">👤 ${bnxEscapeHtml_(o.customerName)} · ${bnxEscapeHtml_(o.status)} · ${bnxEscapeHtml_(o.groups.join(', ')||'Unassigned')} · ${bnxEscapeHtml_(o.date)} ${bnxEscapeHtml_(o.time)}</div></div>`).join('');
-  list.innerHTML=`<div class="report-card"><div class="report-row head"><span>${title}</span><span style="text-align:right">Qty</span><span style="text-align:right">Sales</span></div>${rows.map(([name,v])=>`<div class="report-row"><span style="font-weight:700;overflow-wrap:anywhere">${bnxEscapeHtml_(name)}</span><strong>${v.qty}</strong><strong>₹${Math.round(v.amount).toLocaleString('en-IN')}</strong></div>`).join('')}</div><div class="report-card" style="margin-top:10px"><div class="report-row head" style="grid-template-columns:1fr"><span>Order Details</span></div>${orderBlock||'<div class="report-row"><span>No orders in this range.</span></div>'}</div>`;
+  /* A breakdown table with no total is not a report — the steward had to add
+     the rows up by hand to check it against the Sales figure in the summary
+     card above. The note explains the gap that is left: these rows are line
+     totals (qty x rate), while Sales comes from the bill total, so discounts,
+     tax, service charge and tips legitimately make the two differ. Without
+     that line the difference reads as a bug. */
+  const totQty=rows.reduce((a,[,v])=>a+(Number(v.qty)||0),0);
+  const totAmt=rows.reduce((a,[,v])=>a+(Number(v.amount)||0),0);
+  const totalRow=`<div class="report-row" style="border-top:2px solid var(--border2);background:var(--gold-bg);"><span style="font-weight:900">Total</span><strong>${totQty}</strong><strong>₹${Math.round(totAmt).toLocaleString('en-IN')}</strong></div>`;
+  const reconNote=`<div style="font-size:9.5px;color:var(--text3);padding:7px 2px 0;line-height:1.45;">Line totals before bill-level discount, tax and tips — may differ from the Sales figure above.</div>`;
+  list.innerHTML=`<div class="report-card"><div class="report-row head"><span>${title}</span><span style="text-align:right">Qty</span><span style="text-align:right">Sales</span></div>${rows.map(([name,v])=>`<div class="report-row"><span style="font-weight:700;overflow-wrap:anywhere">${bnxEscapeHtml_(name)}</span><strong>${v.qty}</strong><strong>₹${Math.round(v.amount).toLocaleString('en-IN')}</strong></div>`).join('')}${totalRow}${reconNote}</div><div class="report-card" style="margin-top:10px"><div class="report-row head" style="grid-template-columns:1fr"><span>Order Details</span></div>${orderBlock||'<div class="report-row"><span>No orders in this range.</span></div>'}</div>`;
 }
 function bnxReportShareText_(){
   const s=bnxLastReportSnapshot||bnxReportDataSnapshot_(), label=bnxReportRangeLabel_();
@@ -5930,7 +5989,16 @@ function bnxPrintCurrentReport(){
   const client=bnxReportClientName_();
   const rows=bnxReportType==='steward' ? [['My Orders',s.orders.length],['My Sales','₹'+Math.round(s.sales).toLocaleString('en-IN')],['Average Bill','₹'+Math.round(s.active.length?s.sales/s.active.length:0).toLocaleString('en-IN')],['Settled Bills',s.settled],['Due Bills',s.due],['Cancelled',s.cancelled]] : s.rows.map(([n,v])=>[n,v.qty,'₹'+Math.round(v.amount).toLocaleString('en-IN')]);
   const head=bnxReportType==='steward'?'<tr><th>Metric</th><th>Value</th></tr>':'<tr><th>Name</th><th>Qty</th><th>Sales</th></tr>';
-  const body=rows.length?rows.map(r=>'<tr>'+r.map(x=>'<td>'+bnxReportEscape_(x)+'</td>').join('')+'</tr>').join(''):'<tr><td colspan="3" class="empty">No report data for the selected period.</td></tr>';
+  // The printed breakdown needs the same total the on-screen one now shows,
+  // and the "no data" cell has to span the real column count — colspan 3 on
+  // the 2-column steward table used to push a stray empty cell off the edge.
+  const cols=bnxReportType==='steward'?2:3;
+  let body=rows.length?rows.map(r=>'<tr>'+r.map(x=>'<td>'+bnxReportEscape_(x)+'</td>').join('')+'</tr>').join(''):'<tr><td colspan="'+cols+'" class="empty">No report data for the selected period.</td></tr>';
+  if(rows.length && bnxReportType!=='steward'){
+    const tQty=s.rows.reduce((a,[,v])=>a+(Number(v.qty)||0),0);
+    const tAmt=s.rows.reduce((a,[,v])=>a+(Number(v.amount)||0),0);
+    body+='<tr><td><b>Total</b></td><td><b>'+tQty+'</b></td><td><b>₹'+Math.round(tAmt).toLocaleString('en-IN')+'</b></td></tr>';
+  }
   const detailRows=(s.orderDetails||[]).map(o=>`<tr><td>${bnxReportEscape_(o.orderNo)}</td><td>${bnxReportEscape_(o.kotNo)}</td><td>${bnxReportEscape_(o.customerName)}</td><td>${bnxReportEscape_(o.table)}</td><td>${bnxReportEscape_(o.status)}</td><td>${bnxReportEscape_(o.groups.join(', ')||'Unassigned')}</td><td>₹${Math.round(o.total).toLocaleString('en-IN')}</td></tr>`).join('');
   const w=window.open('','_blank'); if(!w){if(typeof toast==='function')toast('Please allow popups to print the report','error');return;}
   w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>${bnxReportEscape_(client)} - ${bnxReportEscape_(title)}</title><style>@page{size:A4;margin:12mm}*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;color:#222;margin:0;font-size:10.5px}.sheet{max-width:190mm;margin:auto}.letterhead{padding-bottom:10px;border-bottom:2px solid #222}.brand-name{font-size:20px;font-weight:900}.brand-sub{font-size:10px;color:#666;margin-top:3px;text-transform:uppercase;letter-spacing:1px}.report-title{text-align:center;font-size:17px;font-weight:900;margin:18px 0 4px}.period{text-align:center;color:#666;font-size:11px;margin-bottom:15px}.meta{display:flex;justify-content:space-between;border:1px solid #ddd;border-radius:6px;padding:8px 10px;margin-bottom:12px;font-size:10.5px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-bottom:14px}.summary-box{border:1px solid #ddd;border-radius:6px;padding:8px;text-align:center}.summary-label{font-size:9px;color:#777;text-transform:uppercase}.summary-value{font-size:14px;font-weight:900;margin-top:3px}table{width:100%;border-collapse:collapse;font-size:10px;margin-bottom:14px;page-break-inside:auto}thead{display:table-header-group}tr{page-break-inside:avoid}th,td{border:1px solid #d5d5d5;padding:6px 6px;vertical-align:top}th{background:#f1f1f1;font-size:8.5px;text-transform:uppercase}td:nth-child(n+2){text-align:right}.details-title{font-size:13px;font-weight:900;margin:16px 0 7px;border-bottom:1px solid #222;padding-bottom:4px}.empty{text-align:center;color:#777;padding:20px}.footer{border-top:1px solid #ddd;margin-top:20px;padding-top:7px;display:flex;justify-content:space-between;color:#777;font-size:9px}@media print{body{print-color-adjust:exact;-webkit-print-color-adjust:exact}.sheet{max-width:none}}</style></head><body><div class="sheet"><div class="letterhead"><div class="brand-name">${bnxReportEscape_(client)}</div><div class="brand-sub">Balaji NextGen ERP · Steward Management</div></div><div class="report-title">${bnxReportEscape_(title)}</div><div class="period">${bnxReportEscape_(label)}</div><div class="meta"><span><b>Steward:</b> ${bnxReportEscape_(steward)}</span><span><b>Generated:</b> ${bnxReportEscape_(new Date().toLocaleString('en-IN'))}</span></div><div class="summary"><div class="summary-box"><div class="summary-label">Orders</div><div class="summary-value">${s.orders.length}</div></div><div class="summary-box"><div class="summary-label">Sales</div><div class="summary-value">₹${Math.round(s.sales).toLocaleString('en-IN')}</div></div><div class="summary-box"><div class="summary-label">Settled</div><div class="summary-value">${s.settled}</div></div><div class="summary-box"><div class="summary-label">Due</div><div class="summary-value">${s.due}</div></div></div><table><thead>${head}</thead><tbody>${body}</tbody></table><div class="details-title">Order Details</div><table><thead><tr><th>Order No.</th><th>KOT No.</th><th>Customer</th><th>Table</th><th>Status</th><th>Item Group</th><th>Total</th></tr></thead><tbody>${detailRows||'<tr><td colspan="7" class="empty">No orders for this period.</td></tr>'}</tbody></table><div class="footer"><span>Balaji NextGen ERP</span><span>Steward Report · <b>${bnxReportEscape_(label)}</b></span></div></div><script>window.onload=function(){setTimeout(function(){window.print();},250)};<\/script></body><!-- HAPPYSERVE FINAL VISUAL/MASTER PATCH 2026-09-13 -->
