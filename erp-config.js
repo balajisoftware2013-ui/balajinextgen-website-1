@@ -81,6 +81,14 @@ const ROLE_DASHBOARD = {
      fully-audited restaurant-dashboard.html instead. */
   STEWARD      : 'Dashboard/restaurant/restaurant-dashboard.html',
   CHEF         : 'Dashboard/restaurant/restaurant-dashboard.html',
+  /* NEW ("when login then direct open chef dashboard if assistant chef"):
+     kept SEPARATE from CHEF above on purpose — CHEF still shares
+     restaurant-dashboard.html with the rest of floor/kitchen staff, but
+     ASSISTANT_CHEF gets the dedicated, simplified chef-dashboard.html
+     (see the FIXED_ROLE_DASHBOARDS entry below for why listing it here
+     alone isn't enough). Path assumed to match chef-dashboard.html's
+     sibling files — correct if the real file lives elsewhere. */
+  ASSISTANT_CHEF: 'Dashboard/restaurant/chef-dashboard.html',
   WAITER       : 'Dashboard/employee-dashboard.html',
   STORE_MANAGER: 'Dashboard/inventory/inventory.html',
   CEO          : 'Dashboard/Ceo-dashboard.html',
@@ -162,7 +170,12 @@ const FIXED_ROLE_DASHBOARDS = [
      is not enough by itself, it also has to be listed HERE or industry
      resolution silently overrides it before ROLE_DASHBOARD is ever
      checked. */
-  'STEWARD','MANAGER'
+  'STEWARD','MANAGER',
+  /* NEW ("when login then direct open chef dashboard if assistant
+     chef"): same one-layer-deeper requirement as STEWARD/MANAGER/CAPTAIN
+     above — without this, ASSISTANT_CHEF's industry would resolve first
+     and the ROLE_DASHBOARD entry above would never be consulted. */
+  'ASSISTANT_CHEF'
 ];
 
 /* Map raw CLIENT_MASTER / USER.INDUSTRY strings → INDUSTRY_DASHBOARD keys.
@@ -277,13 +290,20 @@ function _normalise(raw) {
   const u = flat.user || {};
 
   // Resolve ROLE from all possible locations
+  // FIX (same bug already found in login.html's routeAfterLogin — see its
+  // comment): a multi-word role like "Assistant Chef" only had .toUpperCase()
+  // applied, becoming the key "ASSISTANT CHEF" with a literal space, which
+  // can never match a JS object key like ROLE_DASHBOARD.ASSISTANT_CHEF.
+  // Collapsing any run of spaces/hyphens to a single underscore makes
+  // "Assistant Chef", "assistant-chef", and "ASSISTANT_CHEF" all resolve
+  // to the same stored ERP_ROLE.
   const role = (
     flat.ROLE      ||
     flat.role      ||
     u.ROLE         ||
     u.role         ||
     ''
-  ).toString().toUpperCase().trim();
+  ).toString().toUpperCase().trim().replace(/[\s-]+/g,'_');
 
   // Resolve FULL_NAME
   const fullName = (
@@ -542,6 +562,7 @@ const _DEMO_USERS = [
   {id:'manager',  pw:'manager',  ROLE:'MANAGER',    FULL_NAME:'Manager',      BRANCH:'Main Branch', CLIENT:'Balaji NextGen'},
   {id:'cashier',  pw:'cashier',  ROLE:'CASHIER',    FULL_NAME:'Cashier',      BRANCH:'Counter 1',   CLIENT:'Balaji NextGen'},
   {id:'chef',     pw:'chef',     ROLE:'CHEF',       FULL_NAME:'Chef',         BRANCH:'Kitchen',     CLIENT:'Balaji NextGen'},
+  {id:'asstchef', pw:'asstchef', ROLE:'ASSISTANT_CHEF',FULL_NAME:'Assistant Chef',BRANCH:'Kitchen', CLIENT:'Balaji NextGen'},
   {id:'waiter',   pw:'waiter',   ROLE:'WAITER',     FULL_NAME:'Waiter',       BRANCH:'Floor 1',     CLIENT:'Balaji NextGen'},
   {id:'owner',    pw:'owner',    ROLE:'OWNER',      FULL_NAME:'Owner',        BRANCH:'HQ',          CLIENT:'Balaji NextGen'},
   {id:'developer',pw:'dev123',   ROLE:'DEVELOPER',  FULL_NAME:'Developer',    BRANCH:'Tech',        CLIENT:'Balaji NextGen'},
