@@ -7821,7 +7821,29 @@ function bnxRoleAccessKey(){ return 'bnx_role_access_v2_'+(CLIENT_ID||'default')
 function bnxGetRoleAccessStore(){
   try{ const raw = localStorage.getItem(bnxRoleAccessKey()); return raw ? JSON.parse(raw) : null; }catch(e){ return null; }
 }
-function bnxSaveRoleAccessStore(map){ try{ localStorage.setItem(bnxRoleAccessKey(), JSON.stringify(map)); }catch(e){} }
+function bnxSaveRoleAccessStore(map){
+  try{ localStorage.setItem(bnxRoleAccessKey(), JSON.stringify(map)); }catch(e){}
+}
+async function bnxLoadRoleAccessServer_(){
+  try{
+    if(typeof gasApi!=='function') return false;
+    const res=await gasApi('GET_ROLE_ACCESS',{},'V2_CORE');
+    if(!res || !res.success) throw new Error((res&&res.error)||'Role access read failed');
+    const roles=(res.data&&res.data.roles)||{};
+    bnxSaveRoleAccessStore(roles);
+    window.__BNX_ROLE_ACCESS_SERVER_LOADED__=true;
+    window.__BNX_ROLE_ACCESS_SERVER_ROLES__=roles;
+    if(typeof bnxApplyPageAccessLocks==='function') bnxApplyPageAccessLocks();
+    const sel=document.getElementById('raRoleSelect');
+    if(sel && typeof raLoadRole==='function') raLoadRole(sel.value);
+    const rv=document.getElementById('bnxRoleViewSelect');
+    if(rv && typeof bnxRenderRoleAccessPreview==='function') bnxRenderRoleAccessPreview(rv.value);
+    return true;
+  }catch(e){
+    console.warn('[ROLE ACCESS] server read failed; using client-local cached policy:',e.message);
+    return false;
+  }
+}
 function bnxGetRoleRestrictedPages(){ return bnxGetRoleAccessStore() || BNX_ROLE_RESTRICTED_PAGES; }
 function bnxPageAllowed(pageId, role){
   const roleUp = String(role||'').trim().toUpperCase().replace(/[-_]+/g,' ').replace(/\s+/g,' ');
@@ -8084,23 +8106,47 @@ function raToggleFull(btn){
   const note = document.getElementById('raSavedNote');
   if (note) note.textContent = isFull ? 'This role currently has full access — untick "Full Access" above to limit it.' : '';
 }
-function raSaveRole(){
+async function raSaveRole(){
   const sel = document.getElementById('raRoleSelect');
   const role = sel && sel.value;
   if (!role) return;
   const fullOn = document.getElementById('raFullToggle').classList.contains('on');
-  const store = Object.assign({}, bnxGetRoleAccessStore() || BNX_ROLE_RESTRICTED_PAGES);
+  let store = Object.assign({}, bnxGetRoleAccessStore() || BNX_ROLE_RESTRICTED_PAGES);
+  let picked = [];
   if (fullOn){
-    delete store[role]; // no restriction entry at all -> falls through to open-by-default / PAGE_ROLES
+    delete store[role];
   } else {
-    const picked = Array.from(document.querySelectorAll('.ra-mod-cb:checked')).map(cb=>cb.value);
-    store[role] = picked; // can be [] -> role is logged in but every page is locked until re-ticked
+    picked = Array.from(document.querySelectorAll('.ra-mod-cb:checked')).map(cb=>cb.value);
+    store[role] = picked;
   }
-  bnxSaveRoleAccessStore(store);
-  if (typeof bnxApplyPageAccessLocks === 'function') bnxApplyPageAccessLocks();
+
   const note = document.getElementById('raSavedNote');
-  if (note) note.textContent = '✅ Saved — applies immediately to every ' + role + ' login.';
-  if (typeof showNotif === 'function') showNotif('🔐 Access updated for ' + role, 'success');
+  if (note) note.textContent = '⏳ Saving client role policy…';
+
+  /* AUTHORITATIVE SAVE: persist to this client's tenant SETTINGS_TOGGLES
+     through the authenticated backend. localStorage is only a cache so
+     another device/browser for the same client receives the same policy. */
+  try{
+    if(typeof gasApi!=='function') throw new Error('Live API unavailable');
+    const res=await gasApi('SAVE_ROLE_ACCESS',{
+      role:role,
+      pages:fullOn?[]:picked,
+      full:!!fullOn
+    },'V2_CORE');
+    if(!res || !res.success) throw new Error((res&&res.error)||'Server rejected role access save');
+
+    bnxSaveRoleAccessStore(store);
+    window.__BNX_ROLE_ACCESS_SERVER_LOADED__=true;
+    if (typeof bnxApplyPageAccessLocks === 'function') bnxApplyPageAccessLocks();
+    if (typeof bnxSetRoleView === 'function') bnxSetRoleView(role);
+
+    if (note) note.textContent = '✅ Saved to client database — applies to every ' + role + ' login/device.';
+    if (typeof showNotif === 'function') showNotif('🔐 Client role access updated for ' + role, 'success');
+  }catch(e){
+    if (note) note.textContent = '❌ Not saved to server: ' + e.message;
+    if (typeof showNotif === 'function') showNotif('❌ Role access was not saved: '+e.message, 'error');
+    console.error('[ROLE ACCESS] save failed',e);
+  }
 }
 function raResetRoleToDefault(){
   const sel = document.getElementById('raRoleSelect');
@@ -8159,6 +8205,9 @@ function bnxApplyModuleAccessToNav(){
   });
 }
 document.addEventListener('DOMContentLoaded', function(){
+  try{
+    bnxLoadRoleAccessServer_();
+  }catch(e){}
   try{
     bnxApplyModuleAccessToNav();
     // If this user's landing page (Dashboard) is itself restricted, send
@@ -8455,7 +8504,7 @@ function showPage(id, el){
   if(id==='reservation'){ bnxInitReservationForm(); bnxRenderReservations(); bnxPullReservationsFromServer(); }
   if(id==='bar') loadBarManagementData();
   if(id==='settings') setTimeout(()=>checkAllDBs(false),400);
-  if(id==='bm-products') setTimeout(()=>bmBuildProductGrid('bmProductGrid','All'),50);
+  if(id==='bm-products') setTimeout(()=>{bnxRenderBillProductCategories_();bmBuildProductGrid('bmProductGrid','All');},50);
   if(id==='billing'){ bmInitClientBranch(); bnxApplyTaxModeToBillForm(); bmRefreshTableList(); bnxUpdateHoldBadge(); setTimeout(()=>bmRenderBillPreview(),50);
     /* FIX ("grand total not visible" — pad measured too early): a single
        sync 100ms after switching to this page ran before the receipt
@@ -12382,120 +12431,113 @@ function bnxIsDrinkCategory(cat){
 function bnxQuickAddItem(){
   const cats = Array.from(new Set(menuData.map(i=>i.c).filter(Boolean).concat(Array.isArray(window.bnxLiveCategories)?window.bnxLiveCategories:[]))).sort();
   const mo=document.createElement('div');
-  mo.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(6px);z-index:9999;display:flex;align-items:center;justify-content:center;';
+  mo.style.cssText='position:fixed;inset:0;background:rgba(28,18,8,.55);backdrop-filter:blur(6px);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px;';
   mo.innerHTML=`
-  <div style="background:var(--surface);border-radius:16px;padding:24px;width:380px;max-width:92vw;box-shadow:0 20px 60px rgba(0,0,0,.3);font-family:'DM Sans',sans-serif;">
-    <div style="font-family:'Playfair Display',serif;font-size:17px;font-weight:700;margin-bottom:16px;">➕ Add New Item</div>
-    <label style="font-size:11px;font-weight:700;color:#555;">Item Name *</label>
-    <input id="qaName" type="text" class="fi" placeholder="e.g. Chicken Tikka" style="width:100%;margin:5px 0 12px;padding:9px 12px;border:1px solid #ddd;border-radius:8px;font-size:13px;" autofocus>
-    <label style="font-size:11px;font-weight:700;color:#555;">Category *</label>
-    <select id="qaCat" class="fi fsel" style="width:100%;margin:5px 0 12px;padding:9px 12px;border:1px solid #ddd;border-radius:8px;font-size:13px;">
-      ${cats.map(c=>`<option value="${c.replace(/"/g,'&quot;')}"${c===currentMenuCat?' selected':''}>${c}</option>`).join('')}
-      <option value="__NEW__">+ New category…</option>
-    </select>
-    <label style="font-size:11px;font-weight:700;color:#555;">Item Group under Category</label>
-    <select id="qaGroup" class="fi fsel" style="width:100%;margin:5px 0 12px;padding:9px 12px;border:1px solid #ddd;border-radius:8px;font-size:13px;"><option value="">— No Item Group —</option></select>
-    <input id="qaCatNew" type="text" class="fi" placeholder="New category name" style="width:100%;margin:5px 0 12px;padding:9px 12px;border:1px solid #ddd;border-radius:8px;font-size:13px;display:none;">
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+  <div id="bnxQuickAddForm" style="background:var(--surface);border:1px solid var(--border2);border-radius:16px;padding:18px;width:560px;max-width:96vw;box-shadow:0 20px 60px rgba(0,0,0,.3);font-family:'DM Sans',sans-serif;max-height:92vh;overflow:auto;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+      <div><div style="font-family:'Playfair Display',serif;font-size:17px;font-weight:800;">⚡ Quick Add Item</div>
+      <div style="font-size:10px;color:var(--text3);margin-top:2px;">Add directly to the live Item Master and current POS cart</div></div>
+      <button type="button" id="qaClose" style="border:0;background:none;font-size:22px;color:var(--text3);cursor:pointer;">×</button>
+    </div>
+    <div style="display:grid;grid-template-columns:minmax(0,1fr) 150px;gap:14px;align-items:start;">
       <div>
-        <label style="font-size:11px;font-weight:700;color:#555;">Price (₹) *</label>
-        <input id="qaPrice" type="number" min="0" step="0.01" class="fi" placeholder="0" style="width:100%;margin:5px 0 12px;padding:9px 12px;border:1px solid #ddd;border-radius:8px;font-size:13px;">
+        <label style="font-size:11px;font-weight:700;color:var(--text2);">Item Name *</label>
+        <input id="qaName" type="text" class="fi" placeholder="e.g. Lemon Mint Cooler" style="width:100%;margin:5px 0 10px;" autofocus>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:9px;">
+          <div><label style="font-size:11px;font-weight:700;color:var(--text2);">Category</label>
+            <select id="qaCat" class="fi fsel" style="width:100%;margin:5px 0 10px;">
+              ${cats.map(c=>`<option value="${String(c).replace(/"/g,'&quot;')}"${c===currentMenuCat?' selected':''}>${String(c).replace(/</g,'&lt;')}</option>`).join('')}
+              <option value="__NEW__">+ New category…</option>
+            </select>
+          </div>
+          <div><label style="font-size:11px;font-weight:700;color:var(--text2);">Item Code</label>
+            <input id="qaCode" type="text" class="fi" value="ITM${Date.now().toString().slice(-6)}" style="width:100%;margin:5px 0 10px;">
+          </div>
+        </div>
+        <input id="qaCatNew" type="text" class="fi" placeholder="New category name" style="width:100%;margin:-3px 0 10px;display:none;">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:9px;">
+          <div><label style="font-size:11px;font-weight:700;color:var(--text2);">HSN Code</label><input id="qaHsn" class="fi" placeholder="e.g. 220299" style="width:100%;margin:5px 0 10px;"></div>
+          <div><label style="font-size:11px;font-weight:700;color:var(--text2);">Price *</label><input id="qaPrice" type="number" min="0" step="0.01" class="fi" placeholder="180" style="width:100%;margin:5px 0 10px;"></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:9px;">
+          <div><label style="font-size:11px;font-weight:700;color:var(--text2);">Type</label>
+            <select id="qaVeg" class="fi fsel" style="width:100%;margin:5px 0 10px;"><option value="V">🟢 Veg</option><option value="NV">🔴 Non-Veg</option><option value="">— Not applicable —</option></select>
+          </div>
+          <div><label style="font-size:11px;font-weight:700;color:var(--text2);">GST %</label><input id="qaGst" type="number" min="0" step="0.1" value="5" class="fi" style="width:100%;margin:5px 0 10px;"></div>
+        </div>
+        <div id="qaGroupWrap"><label style="font-size:11px;font-weight:700;color:var(--text2);">Item Group under Category</label>
+          <select id="qaGroup" class="fi fsel" style="width:100%;margin:5px 0 10px;"><option value="">— No Item Group —</option></select>
+        </div>
+        <label style="display:flex;align-items:center;gap:7px;font-size:11px;font-weight:700;margin:3px 0 10px;"><input id="qaFav" type="checkbox"> Add to Favourites</label>
       </div>
       <div>
-        <label style="font-size:11px;font-weight:700;color:#555;">GST %</label>
-        <input id="qaGst" type="number" min="0" step="0.1" value="5" class="fi" style="width:100%;margin:5px 0 12px;padding:9px 12px;border:1px solid #ddd;border-radius:8px;font-size:13px;">
+        <div id="qaImgPreview" style="height:145px;border:1px solid var(--border2);border-radius:11px;background:var(--surface2);display:flex;align-items:center;justify-content:center;overflow:hidden;font-size:40px;">🍹</div>
+        <div style="display:flex;gap:5px;margin-top:7px;">
+          <button type="button" id="qaUploadBtn" class="btn btn-sm" style="flex:1;font-size:10px;">📷 Upload Image</button>
+          <button type="button" id="qaGalleryBtn" class="btn btn-sm btn-ghost" style="font-size:10px;">🖼 Gallery</button>
+        </div>
+        <input id="qaImageFile" type="file" accept="image/*" style="display:none;">
+        <div style="font-size:9px;color:var(--text3);margin-top:6px;line-height:1.35;">JPG/PNG/WebP · max 2 MB<br>Selected image is saved with the item.</div>
       </div>
     </div>
-    <div id="qaVegWrap">
-      <label style="font-size:11px;font-weight:700;color:#555;display:block;margin-bottom:5px;">Veg / Non-Veg</label>
-      <div style="display:flex;gap:8px;margin-bottom:18px;">
-        <button type="button" id="qaVegBtn" class="btn btn-sm" style="flex:1;background:var(--green);color:#fff;border:none;">🟢 Veg</button>
-        <button type="button" id="qaNvBtn" class="btn btn-sm btn-ghost" style="flex:1;">🔴 Non-Veg</button>
-      </div>
-    </div>
-    <div style="display:flex;gap:10px;justify-content:flex-end;">
+    <div style="display:flex;gap:9px;justify-content:flex-end;border-top:1px solid var(--border);padding-top:12px;margin-top:2px;">
       <button class="btn btn-sm btn-ghost" id="qaCancel">Cancel</button>
-      <button class="btn btn-sm btn-primary" id="qaSave">💾 Save &amp; Add to Cart</button>
+      <button class="btn btn-sm btn-primary" id="qaSave">➕ Add Item</button>
     </div>
   </div>`;
   document.body.appendChild(mo);
-  // Quick Add is industry-aware: Restaurant opens on Food by default; Bar can be selected explicitly.
-  let qaKind = (window.__BNX_POS_MODE||'All')==='Bar' ? 'bar' : 'food';
-  const qaHost = mo.querySelector('div[style*='+'\"background:var(--surface)'+'\"]');
-  const qaList = mo.querySelector('#qaGroup')?.parentElement?.parentElement;
-  const qaTitle = mo.querySelector('div[style*='+'\"background:var(--surface)'+'\"] > div');
-  const qaSearch = mo.querySelector('#qaName');
-  const qaModal = mo.querySelector('div[style*="background:var(--surface)"]');
-  if(qaModal){
-    const tabs=document.createElement('div');
-    tabs.style.cssText='display:flex;gap:6px;margin:-4px 0 12px;';
-    tabs.innerHTML='<button type="button" id="qaFoodTab" class="btn btn-sm">🍽️ Food</button><button type="button" id="qaBarTab" class="btn btn-sm btn-ghost">🍸 Bar</button>';
-    qaModal.insertBefore(tabs, qaModal.children[2] || null);
-    const refreshQaTabs=()=>{
-      const fb=tabs.querySelector('#qaFoodTab'),bb=tabs.querySelector('#qaBarTab');
-      fb.className='btn btn-sm'+(qaKind==='food'?' btn-primary':' btn-ghost');
-      bb.className='btn btn-sm'+(qaKind==='bar'?' btn-primary':' btn-ghost');
-      const list=document.getElementById('qaName');
-    };
-    tabs.querySelector('#qaFoodTab').onclick=()=>{qaKind='food';refreshQaTabs();};
-    tabs.querySelector('#qaBarTab').onclick=()=>{qaKind='bar';refreshQaTabs();};
-    refreshQaTabs();
-  }
-  let qaVeg = 'V';
-  const vegBtn = mo.querySelector('#qaVegBtn'), nvBtn = mo.querySelector('#qaNvBtn');
-  vegBtn.onclick = ()=>{ qaVeg='V'; vegBtn.className='btn btn-sm'; vegBtn.style.cssText='flex:1;background:var(--green);color:#fff;border:none;'; nvBtn.className='btn btn-sm btn-ghost'; nvBtn.style.cssText='flex:1;'; };
-  nvBtn.onclick = ()=>{ qaVeg='NV'; nvBtn.className='btn btn-sm'; nvBtn.style.cssText='flex:1;background:var(--red,#dc2626);color:#fff;border:none;'; vegBtn.className='btn btn-sm btn-ghost'; vegBtn.style.cssText='flex:1;'; };
-  const catSel = mo.querySelector('#qaCat'), catNew = mo.querySelector('#qaCatNew');
-  const groupSel = mo.querySelector('#qaGroup');
-  const vegWrap = mo.querySelector('#qaVegWrap');
-  function bnxFillQuickGroup(){
-    if(!groupSel) return;
-    const cat = catSel.value==='__NEW__' ? catNew.value.trim() : catSel.value;
-    groupSel.innerHTML = bnxItemGroupOptionsHtml_(cat, '');
-  }
-  // FIX ("only food item then need yes/no veg/non-veg"): Veg/Non-Veg is
-  // meaningless for drinks — this hides the toggle for known beverage
-  // categories (and anything typed as a new category that matches a
-  // drink keyword, e.g. "Mocktails"/"Wine"), and shows it for everything
-  // else. Re-checked live as the person picks a category or types a new
-  // one, not just once at open.
-  function bnxUpdateVegVisibility(){
-    const cat = catSel.value==='__NEW__' ? catNew.value.trim() : catSel.value;
-    vegWrap.style.display = bnxIsDrinkCategory(cat) ? 'none' : '';
-  }
-  bnxUpdateVegVisibility();
-  bnxFillQuickGroup();
-  catNew.addEventListener('input', ()=>{ bnxUpdateVegVisibility(); bnxFillQuickGroup(); });
-  catSel.onchange = ()=>{ catNew.style.display = catSel.value==='__NEW__' ? '' : 'none'; if(catSel.value==='__NEW__') catNew.focus(); bnxUpdateVegVisibility(); bnxFillQuickGroup(); };
-  mo.querySelector('#qaCancel').onclick = ()=>mo.remove();
-  mo.querySelector('#qaSave').onclick = async ()=>{
-    const name = mo.querySelector('#qaName').value.trim();
-    const cat = (catSel.value==='__NEW__' ? catNew.value.trim() : catSel.value) || 'Uncategorised';
-    const price = Number(mo.querySelector('#qaPrice').value);
-    const gst = Number(mo.querySelector('#qaGst').value)||0;
-    const itemGroupId = groupSel?.value || '';
-    const itemGroupName = groupSel?.selectedOptions?.[0]?.textContent?.trim() || '';
-    if (!name){ alert('Enter an item name.'); return; }
-    if (!price || price<=0){ alert('Enter a valid price greater than ₹0.'); return; }
-    if (menuData.some(m=>m.n.toLowerCase()===name.toLowerCase())){ alert('An item named "'+name+'" already exists.'); return; }
-    const isDrink = bnxIsDrinkCategory(cat);
-    const isBar = qaKind==='bar' || /bar|liquor|tobacco|alcohol|spirits|scotch|vodka|whisky|whiskey|rum|gin|tequila|brandy|cognac|beer|wine|cocktail|champagne|liqueur/i.test(cat+' '+name);
-    const item = {n:name, p:price, c:cat, v:(isDrink||isBar)?'':qaVeg, e:bnxDefaultIcon(cat), fav:false, isBar, menuType:isBar?'BAR':'RESTAURANT',
-      itemGroupId, itemGroupName, code:'ITM'+Date.now().toString().slice(-6), gst};
-    menuData.push(item);
-    bnxSaveMenuData();
-    bnxRebuildCategoryPills();
-    buildMenu();
-    addToCart(item.n, item.p);
-    const saveBtn = mo.querySelector('#qaSave');
-    saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
-    const r = await bnxSaveMenuItemToBackend(item);
-    if (typeof showNotif==='function'){
-      showNotif(r && r.success ? ('✅ '+item.n+' saved to Menu Master and added to cart') : ('✅ '+item.n+' added to cart — server sync pending, will retry automatically'), 'success');
-    }
+
+  let qaKind=(window.__BNX_POS_MODE||'All')==='Bar'?'bar':'food', qaImage='';
+  const qaModal=mo.querySelector('#bnxQuickAddForm'), catSel=mo.querySelector('#qaCat'), catNew=mo.querySelector('#qaCatNew'), groupSel=mo.querySelector('#qaGroup'), vegSel=mo.querySelector('#qaVeg');
+  const close=()=>mo.remove();
+  mo.querySelector('#qaClose').onclick=close; mo.querySelector('#qaCancel').onclick=close;
+  function fillGroup(){ const cat=catSel.value==='__NEW__'?catNew.value.trim():catSel.value; if(groupSel)groupSel.innerHTML=typeof bnxItemGroupOptionsHtml_==='function'?bnxItemGroupOptionsHtml_(cat,''):'<option value="">— No Item Group —</option>'; }
+  function syncType(){ const cat=catSel.value==='__NEW__'?catNew.value.trim():catSel.value; const drink=typeof bnxIsDrinkCategory==='function'&&bnxIsDrinkCategory(cat); if(drink){vegSel.value='';} vegSel.disabled=drink; vegSel.title=drink?'Veg/Non-Veg is not used for beverage/bar items':''; }
+  catSel.onchange=()=>{catNew.style.display=catSel.value==='__NEW__'?'':'none';fillGroup();syncType();};
+  catNew.oninput=()=>{fillGroup();syncType();};
+  fillGroup(); syncType();
+
+  function setPreview(src){ qaImage=src||''; const box=mo.querySelector('#qaImgPreview'); box.innerHTML=src?'<img src="'+src.replace(/"/g,'&quot;')+'" alt="" style="width:100%;height:100%;object-fit:cover;">':'🍹'; }
+  mo.querySelector('#qaUploadBtn').onclick=()=>mo.querySelector('#qaImageFile').click();
+  mo.querySelector('#qaImageFile').onchange=e=>{
+    const f=e.target.files&&e.target.files[0]; if(!f)return;
+    if(!/^image\//i.test(f.type)){showNotif('Please choose an image file','error');return;}
+    if(f.size>2*1024*1024){showNotif('Image must be 2 MB or smaller','error');return;}
+    const rd=new FileReader(); rd.onload=()=>setPreview(String(rd.result||'')); rd.readAsDataURL(f);
+  };
+  mo.querySelector('#qaGalleryBtn').onclick=()=>{
+    const imgs=[];
+    (Array.isArray(menuData)?menuData:[]).forEach(m=>{const u=String(m.imageUrl||m.productImageUrl||m.PRODUCT_IMAGE_URL||m.IMAGE_URL||'').trim();if(u&&!imgs.some(x=>x.u===u))imgs.push({u,n:m.n||'Item'});});
+    const wrap=document.createElement('div');wrap.style.cssText='position:absolute;inset:0;background:rgba(0,0,0,.52);z-index:2;display:flex;align-items:center;justify-content:center;padding:12px;';
+    wrap.innerHTML='<div style="background:var(--surface);width:min(560px,92vw);max-height:75vh;overflow:auto;border-radius:13px;padding:14px;"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:9px;"><b>🖼 Image Gallery</b><button type="button" id="gClose" class="btn btn-sm btn-ghost">×</button></div><div id="gGrid" style="display:grid;grid-template-columns:repeat(4,1fr);gap:7px;">'+(imgs.length?imgs.map(x=>'<button type="button" class="gpick" data-u="'+x.u.replace(/"/g,'&quot;')+'" title="'+String(x.n).replace(/"/g,'&quot;')+'" style="border:1px solid var(--border2);background:var(--surface2);border-radius:8px;padding:3px;cursor:pointer;"><img src="'+x.u.replace(/"/g,'&quot;')+'" style="width:100%;height:78px;object-fit:cover;border-radius:6px;"></button>').join(''):'<div style="grid-column:1/-1;text-align:center;padding:25px;color:var(--text3);font-size:11px;">No uploaded item images yet. Use Upload Image.</div>')+'</div></div>';
+    qaModal.style.position='relative'; qaModal.appendChild(wrap); wrap.querySelector('#gClose').onclick=()=>wrap.remove();
+    wrap.querySelectorAll('.gpick').forEach(b=>b.onclick=()=>{setPreview(b.dataset.u);wrap.remove();});
+  };
+
+  mo.querySelector('#qaSave').onclick=async()=>{
+    const name=mo.querySelector('#qaName').value.trim();
+    const cat=(catSel.value==='__NEW__'?catNew.value.trim():catSel.value)||'Uncategorised';
+    const price=Number(mo.querySelector('#qaPrice').value);
+    const gst=Number(mo.querySelector('#qaGst').value)||0;
+    const code=mo.querySelector('#qaCode').value.trim()||('ITM'+Date.now().toString().slice(-6));
+    const hsn=mo.querySelector('#qaHsn').value.trim();
+    const itemGroupId=groupSel?.value||'', itemGroupName=groupSel?.selectedOptions?.[0]?.textContent?.trim()||'';
+    const v=vegSel.value;
+    if(!name){alert('Enter an item name.');return;}
+    if(!price||price<=0){alert('Enter a valid price greater than ₹0.');return;}
+    if(menuData.some(m=>String(m.n||'').toLowerCase()===name.toLowerCase())){alert('An item named "'+name+'" already exists.');return;}
+    if(menuData.some(m=>String(m.code||m.itemCode||'').toLowerCase()===code.toLowerCase())){alert('Item code "'+code+'" already exists.');return;}
+    const isDrink=typeof bnxIsDrinkCategory==='function'&&bnxIsDrinkCategory(cat);
+    const isBar=qaKind==='bar'||/bar|liquor|tobacco|alcohol|spirits|scotch|vodka|whisky|whiskey|rum|gin|tequila|brandy|cognac|beer|wine|cocktail|champagne|liqueur/i.test(cat+' '+name);
+    const item={n:name,p:price,c:cat,v:(isDrink||isBar)?'':v,e:bnxDefaultIcon(cat),fav:!!mo.querySelector('#qaFav').checked,isBar,menuType:isBar?'BAR':'RESTAURANT',itemGroupId,itemGroupName,code,gst,hsn,imageUrl:qaImage};
+    menuData.push(item); bnxSaveMenuData(); bnxRebuildCategoryPills(); buildMenu(); addToCart(item.n,item.p);
+    const saveBtn=mo.querySelector('#qaSave'); saveBtn.disabled=true;saveBtn.textContent='Saving…';
+    const r=await bnxSaveMenuItemToBackend(item);
+    if(typeof showNotif==='function')showNotif(r&&r.success?'✅ Item saved to Menu Master and added to cart':'✅ Item added — server sync pending','success');
     mo.remove();
   };
 }
+
 // P0 FIX: the actual server write for a newly-created menu item — used
 // by both the POS quick-add tile above and Settings → Menu Creation
 // below. Neither of those flows ever called the backend at all before
@@ -16530,73 +16572,27 @@ let bmQuickSearch='';
 let bmQuickActiveCat='All';
 function bmBuildProductGrid(gridId,cat){
   const grid=document.getElementById(gridId);if(!grid)return;
-  const billMenu = bnxGetBillMenu();
+  const billMenu=bnxGetBillMenu();
   let items=bmNormCat_(cat)==='all'?billMenu:billMenu.filter(m=>bmNormCat_(m.cat)===bmNormCat_(cat));
-  if(gridId==='bmProductGrid' && bmProdListSearch){
-    const q=bmProdListSearch.toLowerCase();
-    items=items.filter(m=>m.name.toLowerCase().includes(q));
-  }
-  if(gridId==='bmQuickProdGrid' && bmQuickSearch){
-    const q=bmQuickSearch.toLowerCase();
-    items=items.filter(m=>m.name.toLowerCase().includes(q));
-  }
-  if(!items.length){
-    grid.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:26px 10px;color:var(--text3);font-size:13px;">😕 No products match your search.</div>';
-    return;
-  }
-  grid.innerHTML=items.map(m=>
-    '<div class="prod-item" id="bm-pi-'+m.id+'" onclick="bmAddProductToQuickBill(\''+m.id+'\',\''+gridId+'\')">'+
-    '<div class="prod-em">'+m.em+'</div>'+
-    '<div class="prod-name">'+m.name+'</div>'+
-    '<div class="prod-price">₹'+m.price.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})+'</div>'+
-    '<div class="prod-cat">'+m.cat+'</div>'+
-    '</div>'
-  ).join('');
-}
-
-/* FIX ("2. product search option give"): the Product / Menu List page only
-   had category buttons — no way to find an item by typing its name. Added
-   a search box above the categories; it filters live, on top of whichever
-   category is currently selected. */
-function bmSearchProducts(term){
-  bmProdListSearch=(term||'').trim();
-  bmBuildProductGrid('bmProductGrid',bmProdListActiveCat);
-}
-
-function bmFilterProducts(cat,btn){
-  document.querySelectorAll('#page-bm-products .pcat').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
-  bmProdListActiveCat=cat;
-  bmBuildProductGrid('bmProductGrid',cat);
-}
-
-function bmNormCat_(v){ return String(v??'').trim().replace(/\s+/g,' ').toLowerCase(); }
-function bmFilterQuick(cat,btn){
-  document.querySelectorAll('#bmQuickAddModal .pcat').forEach(b=>b.classList.remove('active'));
-  if(btn) btn.classList.add('active');
-  const requested=String(cat||'All').trim();
-  bmQuickActiveCat=requested;
-  const grid=document.getElementById('bmQuickProdGrid');
-  if(!grid) return;
-  const menu=bnxGetBillMenu();
-  const key=bmNormCat_(requested);
-  let items=key==='all'?menu:menu.filter(m=>bmNormCat_(m.cat||m.category||m.c)===key);
-  const q=(bmQuickSearch||'').trim().toLowerCase();
-  if(q) items=items.filter(m=>String(m.name||'').toLowerCase().includes(q));
-  if(!items.length){
-    grid.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:26px 10px;color:var(--text3);font-size:13px;">😕 No products in this category.</div>';
-    return;
-  }
-  grid.innerHTML=items.map(m=>
-    '<div class="prod-item" id="bm-pi-'+String(m.id).replace(/[^a-zA-Z0-9_-]/g,'_')+'" onclick="bmAddProductToQuickBill('+bnxEscapeAttrJson_(String(m.id))+',\'bmQuickProdGrid\')">'+
-    '<div class="prod-em">'+m.em+'</div><div class="prod-name">'+m.name+'</div>'+
-    '<div class="prod-price">₹'+Number(m.price||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})+'</div>'+
-    '<div class="prod-cat">'+m.cat+'</div></div>'
-  ).join('');
-}
-function bmSearchQuick(term){
-  bmQuickSearch=(term||'').trim();
-  bmBuildProductGrid('bmQuickProdGrid',bmQuickActiveCat);
+  if(gridId==='bmProductGrid'&&bmProdListSearch){const q=bmProdListSearch.toLowerCase();items=items.filter(m=>String(m.name||'').toLowerCase().includes(q)||String(m.id||'').toLowerCase().includes(q));}
+  if(gridId==='bmQuickProdGrid'&&bmQuickSearch){const q=bmQuickSearch.toLowerCase();items=items.filter(m=>String(m.name||'').toLowerCase().includes(q)||String(m.id||'').toLowerCase().includes(q));}
+  if(!items.length){grid.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:26px 10px;color:var(--text3);font-size:13px;">😕 No products match your search.</div>';return;}
+  const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  const source=Array.isArray(window.menuData)?window.menuData:[];
+  const imageFor=m=>{
+    const raw=source.find(x=>String(x.code||x.itemCode||x.id||x.ITEM_ID||'')===String(m.id)||String(x.n||x.name||'').toLowerCase()===String(m.name||'').toLowerCase());
+    const u=String(raw?.imageUrl||raw?.productImageUrl||raw?.PRODUCT_IMAGE_URL||raw?.IMAGE_URL||raw?.ITEM_IMAGE||raw?.itemImage||raw?.image||raw?.IMAGE||'').trim();
+    if(u)return u;
+    try{return typeof bnxResolveItemImageUrl_==='function'?bnxResolveItemImageUrl_(raw||m):'';}catch(e){return '';}
+  };
+  grid.innerHTML=items.map(m=>{
+    const u=imageFor(m),em=esc(m.em||'🍽️'),safeId=String(m.id).replace(/[^a-zA-Z0-9_-]/g,'_');
+    const media=u?'<img src="'+esc(u)+'" alt="" loading="lazy" style="width:100%;height:100%;object-fit:cover;display:block;">':em;
+    return '<div class="prod-item" id="bm-pi-'+safeId+'" onclick="bmAddProductToQuickBill('+bnxEscapeAttrJson_(String(m.id))+','+bnxEscapeAttrJson_(gridId)+')">'+
+      '<div class="prod-em">'+media+'</div><div class="prod-name">'+esc(m.name)+'</div>'+
+      '<div class="prod-price">₹'+Number(m.price||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})+'</div>'+
+      '<div class="prod-cat">'+esc(m.cat)+'</div></div>';
+  }).join('');
 }
 
 /* NOTE: item-level GST/HSN is now computed automatically and correctly
@@ -20112,7 +20108,7 @@ function renderAIBars(){
 <div class="modal-ov" id="bmQuickAddModal">
   <div class="modal-box" style="width:860px;max-width:97vw;">
     <div class="modal-head">
-      <span class="modal-title">⚡ Quick Add - Select Items from Menu</span>
+      <span class="modal-title">⚡ Quick Add - Select Items from Menu</span><button type="button" class="btn btn-sm btn-ghost" style="margin-left:auto;margin-right:6px;" onclick="bnxQuickAddItem()">➕ New Item</button>
       <button class="modal-close" onclick="document.getElementById('bmQuickAddModal').classList.remove('open')">×</button>
     </div>
     <div class="modal-body" style="max-height:68vh;overflow-y:auto;">
@@ -27080,7 +27076,19 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
     const live=Array.isArray(window.bnxLiveCategories)?window.bnxLiveCategories:[];
     return [...new Set(arr.map(categoryOf).concat(live).filter(c=>c && c!=='Uncategorised'))].sort((a,b)=>a.localeCompare(b));
   }
-  function renderQuickCategories(){
+  function bnxGetLiveBillCategories_(){
+  const arr=typeof bnxGetBillMenu==='function'?bnxGetBillMenu():[];
+  return [...new Set(arr.map(x=>String(x.cat||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+}
+function bnxRenderBillProductCategories_(){
+  const page=document.getElementById('page-bm-products'); if(!page)return;
+  const wrap=page.querySelector('.prod-grid')?.previousElementSibling;
+  if(!wrap || !wrap.querySelector('.pcat')) return;
+  const cats=bnxGetLiveBillCategories_();
+  wrap.innerHTML='<button class="pcat active" onclick="bmFilterProducts(\'All\',this)">All Items</button>'+
+    cats.map(c=>'<button class="pcat" onclick="bmFilterProducts('+bnxEscapeAttrJson_(c)+',this)">'+String(c).replace(/</g,'&lt;')+'</button>').join('');
+}
+function renderQuickCategories(){
     const modal=document.getElementById('bmQuickAddModal'); if(!modal) return;
     const wrap=modal.querySelector('.modal-body > div[style*="flex-wrap"]');
     if(!wrap) return;
@@ -30214,3 +30222,13 @@ if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded'
 </script>
 </body>
 </html>
+<style id="bnx-pos-newbill-quickadd-final">
+#page-bm-products .prod-grid,#bmQuickProdGrid{grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;}
+#page-bm-products .prod-item,#bmQuickProdGrid .prod-item{min-height:156px;overflow:hidden;background:var(--surface);border:1px solid var(--border);border-radius:11px;cursor:pointer;box-shadow:0 3px 10px rgba(30,20,5,.05);padding:7px;}
+#page-bm-products .prod-em,#bmQuickProdGrid .prod-em{height:78px!important;min-height:78px!important;border-radius:8px;background:var(--surface2);display:grid;place-items:center;overflow:hidden;font-size:30px;}
+#page-bm-products .prod-em img,#bmQuickProdGrid .prod-em img{width:100%;height:100%;object-fit:cover;display:block;}
+#page-billing .bill-form{min-width:0;} #page-billing .bill-preview{min-width:0;}
+@media(max-width:1200px){#page-bm-products .prod-grid,#bmQuickProdGrid{grid-template-columns:repeat(3,minmax(0,1fr));}}
+@media(max-width:800px){#page-bm-products .prod-grid,#bmQuickProdGrid{grid-template-columns:repeat(2,minmax(0,1fr));}}
+@media(max-width:520px){#page-bm-products .prod-grid,#bmQuickProdGrid{grid-template-columns:1fr 1fr;gap:7px;}#page-bm-products .prod-item,#bmQuickProdGrid .prod-item{min-height:142px;}}
+</style>
