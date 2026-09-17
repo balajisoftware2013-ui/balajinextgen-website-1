@@ -4032,8 +4032,8 @@ function bnxMarkTableOrdersBilled(tableId, invoiceNo){
 
    LIVE STATUS: 🟢 LIVE / 🟡 SYNCING / 🔴 OFFLINE, shown in the top
    bar — never claim "saved" when only localStorage has saved it.
-   PENDING SYNC OUTBOX: any write that fails goes here (not silently
-   lost, not silently pretended successful) and retries automatically.
+   DIRECT-LIVE WRITES: every transaction is sent to the server immediately.
+   Failed writes are reported and require an explicit retry; no local replay queue.
 ══════════════════════════════════════════════════ */
 /* P0 FIX (external audit #21 — central INR formatter, shared with
    restaurant-dashboard.html's version of the same two functions).
@@ -4103,19 +4103,18 @@ bnxEnsureStatusBadges();
 function bnxOutboxKey(){ return 'bnx_outbox_' + (CLIENT_ID || 'default'); }
 function bnxGetOutbox(){ try{ return JSON.parse(localStorage.getItem(bnxOutboxKey())||'[]'); }catch(e){ return []; } }
 function bnxSetOutbox(list){ localStorage.setItem(bnxOutboxKey(), JSON.stringify(list)); bnxUpdateSyncBadge(); }
+/* DIRECT-LIVE MODE (Sep 2026): all transactional writes must go directly to
+   the live server. We deliberately do NOT create a local pending-sync queue,
+   because stale local writes can later replay against changed table/order
+   state and create duplicate or incorrect transactions. A failed live write
+   is reported to the steward and must be retried explicitly. */
 function bnxQueuePending(action, payload, requestId, onSuccess){
-  const list = bnxGetOutbox();
-  // De-duplicate by requestId so a lost response cannot create two visible
-  // pending KOTs for the same server transaction.
-  const rid = String(requestId||payload?.requestId||'').trim();
-  if(rid && list.some(e=>String(e.requestId||'')===rid)) return;
-  list.push({ requestId:rid||requestId, action, payload, attempts:0, queuedAt:new Date().toISOString(), onSuccessTag: onSuccess||null });
-  bnxSetOutbox(list);
-  if(String(action||'').toUpperCase()==='SAVE_KOT'){
-    const k = list.filter(e=>String(e.action||'').toUpperCase()==='SAVE_KOT').length;
-    if(typeof toast==='function') toast('⚠️ KOT pending server sync ('+k+') — auto-retry active','error');
-  }
+  console.warn('[DIRECT-LIVE] Server write failed; NOT queued locally:', action, requestId||'');
+  if(typeof bnxSetLiveStatus==='function') bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
+  if(typeof toast==='function') toast('🔴 Server did not confirm '+String(action||'transaction')+'. Nothing was queued locally — please retry.','error');
+  return false;
 }
+
 // P0 FIX (external audit #5 — "KOT status updates need the same
 // guaranteed outbox treatment everywhere"): gasApi() here already
 // never rejects (its catch resolves {success:false,offline:true,...}
@@ -4194,7 +4193,15 @@ function bnxSetLiveStatus(s){
   el.style.color = color;
 }
 function bnxUpdateSyncBadge(){
-  const pending = bnxGetOutbox();
+  /* DIRECT-LIVE MODE: never advertise local pending sync work. */
+  const directPendingEl = document.getElementById('bnx-pending-badge');
+  if(directPendingEl){ directPendingEl.textContent=''; directPendingEl.style.display='none'; }
+  const directFailedEl = document.getElementById('bnx-failed-badge');
+  if(directFailedEl){ directFailedEl.textContent=''; directFailedEl.style.display='none'; }
+  const directBanner = document.getElementById('bnx-kot-fail-banner');
+  if(directBanner){ directBanner.style.display='none'; }
+  const pending = [];
+
   const n = pending.length;
   const kotPending = pending.filter(e => String(e.action||'').toUpperCase()==='SAVE_KOT').length;
   const el = document.getElementById('bnx-pending-badge');
@@ -4242,6 +4249,8 @@ function bnxUpdateSyncBadge(){
 // immediately instead of starting a second parallel pass.
 let bnxFlushInProgress = false;
 async function flushOutbox(){
+  /* DIRECT-LIVE MODE: legacy outbox entries are never replayed automatically. */
+  return;
   if (bnxFlushInProgress) return;
   bnxFlushInProgress = true;
   try {
@@ -4342,10 +4351,23 @@ async function flushOutbox_impl_(){
 // a genuine bug in a future edit logs instead of silently going dark
 // on a phone with no visible console.
 setInterval(() => { flushOutbox().catch(e => console.error('[OUTBOX] flushOutbox interval rejected:', e && e.message ? e.message : e)); }, 15000);
-window.addEventListener('online', ()=>{ bnxSetLiveStatus('live'); flushOutbox(); });
+window.addEventListener('online', ()=>{ bnxSetLiveStatus('live'); });
 window.addEventListener('offline', ()=> bnxSetLiveStatus('offline'));
 bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
-bnxUpdateSyncBadge(); // reflect any items already stuck in "failed" from a previous session
+/* Quarantine stale pre-DIRECT-LIVE outbox data so it cannot replay against
+   current table/order state. Nothing is deleted; it remains recoverable under
+   a separate legacy key for audit/reconciliation. */
+try{
+  const _legacyKey = bnxOutboxKey();
+  const _legacy = localStorage.getItem(_legacyKey);
+  const _migratedKey = _legacyKey + '_legacy_20260917';
+  if(_legacy && !localStorage.getItem(_migratedKey)){
+    localStorage.setItem(_migratedKey,_legacy);
+    localStorage.removeItem(_legacyKey);
+    console.warn('[DIRECT-LIVE] Existing pending queue quarantined; no stale transaction will be replayed.');
+  }
+}catch(_e){ console.warn('[DIRECT-LIVE] Legacy queue quarantine skipped',_e); }
+bnxUpdateSyncBadge();
 
 /* FINAL LIVE REFRESH LOOP: keeps tables, KOT and online feeds synchronized for
    multi-device restaurant service. Only refreshes the lightweight live views
@@ -7395,14 +7417,25 @@ function bnxPad_(v,n,side){
   v=String(v==null?'':v); if(v.length>=n)return v.slice(0,n);
   return side==='right'?v+' '.repeat(n-v.length):' '.repeat(n-v.length)+v;
 }
+function bnxKotClientName_(k){
+  try{
+    const u=typeof currentUser==='function'?currentUser():{};
+    const cid=typeof clientId==='function'?clientId():(u.CLIENT_ID||u.clientId||u.client_id||localStorage.getItem('ERP_CLIENT')||'');
+    let b=typeof readBrand==='function'?readBrand(cid):{};
+    return String((k&& (k.clientName||k.restaurantName||k.companyName)) || b.restaurantName || u.COMPANY_NAME || u.CLIENT_NAME || u.RESTAURANT_NAME || 'HAPPYSERVE').trim();
+  }catch(e){ return 'HAPPYSERVE'; }
+}
 function bnxEscPosKot_(k,part){
   const W=42, out=[];
+  const clientName=bnxKotClientName_(k);
   const A='\x1b', GS='\x1d';
   const add=x=>out.push(x);
   const line='-'.repeat(W);
-  add(A+'@'); add(A+'a'+'\x01'); add(A+'E'+'\x01'+ 'KOT'); add(A+'E'+'\x00');
+  add(A+'@'); add(A+'a'+'\x01'); add(A+'E'+'\x01'); add(bnxEsc_(clientName)); add(A+'E'+'\x00');
+  add(A+'a'+'\x01'); add(A+'E'+'\x01'); add('KITCHEN ORDER TICKET'); add(A+'E'+'\x00');
   add(A+'a'+'\x00');
   add('==========================================');
+  add(bnxPad_('CLIENT: '+clientName,W));
   add(bnxPad_('ORDER NO: '+(k.orderNo||k.kotNo),W));
   add(bnxPad_('KOT: '+(k.kotNo||'-')+'   '+String(part.type||'KITCHEN').toUpperCase(),W));
   add(bnxPad_('TABLE: '+(k.table||'-')+'   WAITER: '+(k.waiter||'-'),W));
@@ -7423,6 +7456,7 @@ function bnxEscPosKot_(k,part){
     add(line);
   });
   add(A+'a'+'\x01'); add('*** '+String(part.type||'KITCHEN').toUpperCase()+' KOT ***');
+  add(clientName);
   add('Balaji NextGen ERP · HAPPYSERVE');
   add('\n\n\n'); add(GS+'V'+'\x41'+'\x03');
   return out.join('');
@@ -7463,6 +7497,7 @@ function printKOTTicket(kotNo, partType){
 }
 function bnxPrintKOTBrowserFallback_(k,part){
   const groups=bnxKOTGroups_({items:part.items});
+  const clientName=bnxKotClientName_(k);
   const orderNo=bnxEscapeHtml_(k.orderNo||k.kotNo);
   const groupBlocks=groups.map(g=>{
     const rows=g.items.map(i=>{
@@ -7474,7 +7509,7 @@ function bnxPrintKOTBrowserFallback_(k,part){
     return `<div class="group-block"><div class="group">${bnxEscapeHtml_(bnxKOTGroupLabel_(g.name))}</div><table>${rows}</table></div>`;
   }).join('');
   const custLine=(k.customerName||k.customerMobile)?`Customer: ${bnxEscapeHtml_([k.customerName,k.customerMobile].filter(Boolean).join(' · '))}<br>`:'';
-  const html=`<html><head><title>KOT ${orderNo} - ${bnxEscapeHtml_(part.type)}</title><style>body{font-family:monospace;width:280px;margin:0 auto;padding:8px;color:#000}.kot-sheet{page-break-after:auto}h2{text-align:center;margin:0 0 4px;font-size:22px}.type{font-weight:900;font-size:16px;border:2px solid #000;padding:5px;margin:4px 0 8px;text-align:center}.group{font-weight:900;font-size:15px;border:2px solid #000;padding:5px;margin:8px 0 5px;text-align:center;text-transform:uppercase}.meta{font-size:12px;line-height:1.45;margin-bottom:8px}.group-block{break-inside:avoid;page-break-inside:avoid}table{width:100%;border-collapse:collapse;font-size:13px}hr{border:none;border-top:1px dashed #000;margin:8px 0}.foot{text-align:center;font-size:10px;margin-top:10px}</style><style id="bnx-mobile-nav-theme-final">
+  const html=`<html><head><title>${bnxEscapeHtml_(clientName)} - KOT ${orderNo} - ${bnxEscapeHtml_(part.type)}</title><style>body{font-family:monospace;width:280px;margin:0 auto;padding:8px;color:#000}.kot-sheet{page-break-after:auto}h2{text-align:center;margin:0 0 4px;font-size:22px}.client{font-weight:900;font-size:18px;text-align:center;margin:2px 0 6px}.type{font-weight:900;font-size:16px;border:2px solid #000;padding:5px;margin:4px 0 8px;text-align:center}.group{font-weight:900;font-size:15px;border:2px solid #000;padding:5px;margin:8px 0 5px;text-align:center;text-transform:uppercase}.meta{font-size:12px;line-height:1.45;margin-bottom:8px}.group-block{break-inside:avoid;page-break-inside:avoid}table{width:100%;border-collapse:collapse;font-size:13px}hr{border:none;border-top:1px dashed #000;margin:8px 0}.foot{text-align:center;font-size:10px;margin-top:10px}</style><style id="bnx-mobile-nav-theme-final">
 /* Expanded mobile theme palette + navigation */
 @media(max-width:768px){
   .screen.active .tb-back{min-width:46px!important;min-height:46px!important;display:flex!important;align-items:center!important;justify-content:center!important;font-size:24px!important;font-weight:900!important;color:#fff!important;background:linear-gradient(135deg,var(--theme-g1),var(--theme-g2))!important;border:1px solid rgba(255,255,255,.32)!important;border-radius:12px!important;box-shadow:0 3px 10px rgba(0,0,0,.14)!important;cursor:pointer!important;touch-action:manipulation!important;}
@@ -7485,7 +7520,7 @@ function bnxPrintKOTBrowserFallback_(k,part){
   .bottom-nav .bn-icon{min-height:22px!important;}
 }
 </style>
-</head><body><section class="kot-sheet"><h2>KOT</h2><div class="type">${bnxEscapeHtml_(part.type)} KITCHEN ORDER</div><div class="meta"><b>Order No:</b> ${orderNo}<br>Table: ${bnxEscapeHtml_(k.table||'-')}<br>Waiter: ${bnxEscapeHtml_(k.waiter||'-')} &nbsp; Covers: ${bnxEscapeHtml_(k.covers||'-')}<br>${custLine}Time: ${bnxEscapeHtml_(bnxKotTimeLabel(k.time))}</div><hr>${groupBlocks}<hr><div style="text-align:center;font-size:11px;font-weight:700;">ORDER ${bnxEscapeHtml_(k.orderNo||k.kotNo)} · ${bnxEscapeHtml_(part.type)} KOT</div><div class="foot">Balaji NextGen ERP · HAPPYSERVE</div></section></body></html>`;
+</head><body><section class="kot-sheet"><h2>KOT</h2><div class="client">${bnxEscapeHtml_(clientName)}</div><div class="type">${bnxEscapeHtml_(part.type)} KITCHEN ORDER</div><div class="meta"><b>Order No:</b> ${orderNo}<br>Table: ${bnxEscapeHtml_(k.table||'-')}<br>Waiter: ${bnxEscapeHtml_(k.waiter||'-')} &nbsp; Covers: ${bnxEscapeHtml_(k.covers||'-')}<br>${custLine}Time: ${bnxEscapeHtml_(bnxKotTimeLabel(k.time))}</div><hr>${groupBlocks}<hr><div style="text-align:center;font-size:11px;font-weight:700;">ORDER ${bnxEscapeHtml_(k.orderNo||k.kotNo)} · ${bnxEscapeHtml_(part.type)} KOT</div><div class="foot">Balaji NextGen ERP · HAPPYSERVE</div></section></body></html>`;
   bnxPrintHtml(html);
 }
 // FIX ("whatsapp group also kot send direct both"): there is no real
@@ -7512,8 +7547,9 @@ function bnxPrintKOTBrowserFallback_(k,part){
 function bnxKotWhatsAppText_(k){
   const groups=bnxKOTGroups_(k);
   const orderNoLine = `Order No: ${k.orderNo||k.kotNo}`;
+  const clientLine = `Client: ${bnxKotClientName_(k)}`;
   const custLine = (k.customerName || k.customerMobile) ? `Customer: ${[k.customerName, k.customerMobile].filter(Boolean).join(' · ')}` : '';
-  const header=[`*KOT — ${k.kotNo}*`,orderNoLine,`Table: ${k.table||'-'}`,`Waiter: ${k.waiter||'-'}`,custLine,`Time: ${bnxKotTimeLabel(k.time)}`].filter(Boolean).join('\n');
+  const header=[`*${clientLine}*`,`*KOT — ${k.kotNo}*`,orderNoLine,`Table: ${k.table||'-'}`,`Waiter: ${k.waiter||'-'}`,custLine,`Time: ${bnxKotTimeLabel(k.time)}`].filter(Boolean).join('\n');
   const sections=groups.map((g,i)=>`\n*${i+1}. ${bnxKOTGroupLabel_(g.name)}*\n${g.items.map(x=>{ const c=String(x._kotCategory||'').trim(); return `• ${x.qty} × ${x.name}${c && c.toLowerCase()!==String(g.name).toLowerCase() ? ` [${c}]` : ''}`; }).join('\n')}`).join('\n');
   return header + sections + `\n\n_Balaji NextGen ERP_`;
 }
