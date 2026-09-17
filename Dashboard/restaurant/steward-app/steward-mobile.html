@@ -82,6 +82,18 @@ function bnxKotElapsedMin_(order){
 
 </script>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<!-- FIX ("theme colours / dark mode not visible" — still happening despite
+     the many @media(prefers-color-scheme:dark) blocks already in this file):
+     none of those blocks can fully win against Android WebView/Chrome's own
+     algorithmic "force dark" inversion, because that inversion happens at
+     the rendering layer, AFTER the page's CSS has already been applied —
+     it doesn't care how correct the author's own dark-mode CSS is. The
+     browser only turns that heuristic off, and trusts the page's own
+     @media(prefers-color-scheme:dark) rules completely, once the page
+     declares color-scheme itself. That declaration was missing here, which
+     is why elements kept flipping to random/inverted colours no matter how
+     many more !important dark-mode rules got added on top. -->
+<meta name="color-scheme" content="light dark">
 <title>HAPPYSERVE — Balaji NextGen ERP · Steward Mobile</title>
 
 <!-- ── PWA: install to home screen ── -->
@@ -227,6 +239,7 @@ function bnxKotElapsedMin_(order){
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=DM+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
 :root{
+  color-scheme:light dark; /* pairs with the <meta name="color-scheme"> above */
   --gold:#d4a017;--gold2:#f0c040;--gold-bg:rgba(212,160,23,.12);
   --green:#2eb85c;--green-bg:rgba(46,184,92,.12);
   --red:#e05050;--red-bg:rgba(224,80,80,.12);
@@ -3357,6 +3370,27 @@ function bnxEnsureStatusBadges(){
     <div id="bnx-failed-badge" style="display:none;background:var(--red,#c0392b);color:#fff;font-size:9.5px;font-weight:700;padding:3px 9px;border-radius:20px;pointer-events:auto;cursor:pointer;"></div>
   `;
   document.body.appendChild(wrap);
+  // FIX ("KOT not save" — confirmed against the client's own
+  // CL00010 transaction DB export: two of three orders placed today
+  // never got a real KOT_MASTER row, because SAVE_KOT kept failing
+  // — the backend's own ERROR_LOG shows repeated "Lock timeout"
+  // failures on bnxGetKotNumberBatch/bnxSaveOrder across three
+  // separate days, i.e. the Apps Script backend itself intermittently
+  // can't hand out the next sequential KOT/Order number under load.
+  // That part can only be fixed in the backend script, not here.
+  // What THIS file controls is what the steward sees when it happens:
+  // previously, a KOT that failed all 10 retries moved to a "failed"
+  // store with nothing but a 9.5px pill bottom-left — easy to never
+  // notice, so a permanently-lost KOT could go to the kitchen without
+  // anyone knowing it never actually saved. This adds a banner no one
+  // can miss, pinned to the top of every screen, whenever ANY KOT has
+  // failed to sync — separate from the existing small badge, which stays
+  // for the general pending/offline state.
+  const topBanner = document.createElement('div');
+  topBanner.id = 'bnx-kot-fail-banner';
+  topBanner.style.cssText = 'display:none;position:fixed;top:0;left:0;right:0;z-index:10000;background:#7a1414;color:#fff;padding:10px 14px;padding-top:calc(10px + env(safe-area-inset-top,0px));font-size:12.5px;font-weight:700;text-align:center;box-shadow:0 2px 10px rgba(0,0,0,.35);cursor:pointer;';
+  topBanner.onclick = function(){ if(typeof bnxHandleFailedBadgeTap==='function') bnxHandleFailedBadgeTap(); };
+  document.body.appendChild(topBanner);
 }
 bnxEnsureStatusBadges();
 function bnxOutboxKey(){ return 'bnx_outbox_' + (CLIENT_ID || 'default'); }
@@ -3474,6 +3508,20 @@ function bnxUpdateSyncBadge(){
     fel.style.display = nf ? '' : 'none';
     fel.onclick = bnxHandleFailedBadgeTap;
   }
+  // FIX ("KOT not save"): the small badge above is easy to miss —
+  // a KOT ticket that has actually stopped retrying (moved to the
+  // failed store) is called out separately here with a banner that
+  // sits on top of every screen until the steward acknowledges it.
+  const kotFailedCount = bnxGetFailedOutbox().filter(e=>String(e.action||'').toUpperCase()==='SAVE_KOT').length;
+  const banner = document.getElementById('bnx-kot-fail-banner');
+  if(banner){
+    if(kotFailedCount){
+      banner.textContent = '🔴 '+kotFailedCount+' KOT'+(kotFailedCount>1?'s':'')+' did NOT reach the kitchen — tap here to retry now';
+      banner.style.display = 'block';
+    } else {
+      banner.style.display = 'none';
+    }
+  }
 }
 // FIX (external review — "outbox polling can overlap"): flushOutbox is
 // called from 4 independent places (the 15s interval, the 'online'
@@ -3545,11 +3593,23 @@ async function flushOutbox_impl_(){
           const k = KOT.find(x=>x.kotNo===kotNo);
           if(k){ k.pendingLocalEdit = false; bnxSetOpenKotsRaw(JSON.stringify(KOT)); }
         }
-      } else if(entry.attempts < 10){
+      } else if(entry.attempts < 30){
+        // FIX ("KOT not save" — confirmed against the client's real
+        // ERROR_LOG: "Lock timeout: another process was holding the
+        // lock for too long" on bnxGetKotNumberBatch/bnxSaveOrder,
+        // recurring across multiple days). At the old cap (10 attempts,
+        // capped 5-min backoff) a lock-contention episode lasting more
+        // than roughly 20-25 minutes could exhaust every retry and
+        // permanently drop a real KOT before the backend ever recovered.
+        // Raised to 30 attempts at the same capped backoff — worst case
+        // keeps trying for several hours instead of giving up in under
+        // half an hour — while still eventually surfacing to the failed
+        // store below if the backend is down for good, not retrying forever
+        // in silence.
         remaining.push(entry);
         anyFailed = true;
       } else {
-        console.error('[OUTBOX] gave up after 10 attempts, moved to failed store:', entry);
+        console.error('[OUTBOX] gave up after 30 attempts, moved to failed store:', entry);
         const failed = bnxGetFailedOutbox();
         failed.push(entry);
         bnxSetFailedOutbox(failed);
