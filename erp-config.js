@@ -14,25 +14,7 @@
 const ERP_REGISTRY_SHEET_ID   = '1FuNJ_XejE2ekYTnk71wXVZ79hRJgu7pmIA6fuE-Iu7I';
 const ERP_REGISTRY_SHEET_NAME = 'TEMPLATE_REGISTRY';
 
-const ERP_DIRECT_APIS = {
-  V2_CORE: 'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec',
-  V2_AUTH: 'https://script.google.com/macros/s/AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx/exec'
-};
-const ERP_SAME_ORIGIN_APIS = {
-  V2_CORE: '/api/core',
-  V2_AUTH: '/api/auth'
-};
-function erpApiEndpoint_(endpoint){
-  endpoint = endpoint || 'V2_CORE';
-  if (typeof location !== 'undefined' && location.protocol !== 'file:') {
-    return new URL(
-      ERP_SAME_ORIGIN_APIS[endpoint] || ERP_SAME_ORIGIN_APIS.V2_CORE,
-      location.origin
-    ).href;
-  }
-  return ERP_DIRECT_APIS[endpoint] || ERP_DIRECT_APIS.V2_CORE;
-}
-const ERP_FALLBACK_API = erpApiEndpoint_('V2_AUTH');
+const ERP_FALLBACK_API = 'https://script.google.com/macros/s/AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx/exec';
 
 const ERP_KEYS = {
   USER:    'ERP_USER',
@@ -536,7 +518,7 @@ const ERP = {
   },
 };
 
-let _ERP_API_URL = erpApiEndpoint_('V2_CORE');
+let _ERP_API_URL = ERP_FALLBACK_API;
 
 /* ── FIX ("data doesn't sync between devices" — inventory.html): every
    page in this suite (purchase-module.html, bar_module.html, kitchen-
@@ -562,7 +544,7 @@ const IS_LOCAL_FILE = (typeof location !== 'undefined' && location.protocol === 
 if (IS_LOCAL_FILE) { console.log('[ERP] Local file mode - GAS calls disabled'); }
 
 function erpLoadRegistry(cb){
-  // Hosted site uses Cloudflare same-origin functions; local file mode uses GAS directly.
+  // Use direct fallback URL — avoids JSONP errors on Netlify
   console.log('✅ ERP API URL:', _ERP_API_URL);
   if(cb) cb(_ERP_API_URL);
 }
@@ -602,29 +584,28 @@ function _erpDemoLogin(loginId, password) {
 async function erpApiRequest(payload, endpoint){
   let raw;
   const ep = endpoint || 'V2_CORE';
-  const url = erpApiEndpoint_(ep);
+  const target = (ep === 'V2_AUTH' && typeof GAS_APIS_DASH !== 'undefined' && GAS_APIS_DASH.V2_AUTH)
+    ? GAS_APIS_DASH.V2_AUTH : _ERP_API_URL;
 
   if(payload && payload.action === 'PING'){
-    const r = await fetch(url + '?action=PING', {
-      method:'GET',
-      redirect:'follow',
-      credentials:'same-origin'
-    });
+    const r = await fetch(target + '?action=PING', { method:'GET', redirect:'follow' });
     const t = await r.text();
     raw = JSON.parse(t);
     return raw;
   }
 
-  const resp = await fetch(url, {
+  const resp = await fetch(target, {
     method  : 'POST',
-    headers : { 'Content-Type': 'text/plain;charset=utf-8' },
+    headers : { 'Content-Type': 'text/plain' },
     body    : JSON.stringify(payload),
     redirect: 'follow',
-    credentials: 'same-origin'
   });
   const text = await resp.text();
+  if(!resp.ok) {
+    const e=new Error('ERP API HTTP '+resp.status+' at '+target);
+    e.status=resp.status; e.responseText=text.slice(0,300); throw e;
+  }
   raw = JSON.parse(text);
-
   return _normalise(raw);
 }
 
@@ -676,7 +657,7 @@ function _safeNavigate(url) {
 }
 
 // ── API ENDPOINT ALIASES (required by dashboard pages) ─────────
-async function erpFrontendApi(payload) { return erpApiRequest(payload, 'V2_CORE'); }
+async function erpFrontendApi(payload) { return erpApiRequest(payload, 'V2_FRONTEND'); }
 async function erpCoreApi(payload)     { return erpApiRequest(payload, 'V2_CORE'); }
 async function erpAuthApi(payload)     { return erpApiRequest(payload, 'V2_AUTH'); }
 
@@ -861,7 +842,7 @@ async function erpAuthApi(payload)     { return erpApiRequest(payload, 'V2_AUTH'
         const token = localStorage.getItem(ERP_KEYS.SESSION) || '';
         if (token) {
           try {
-            navigator.sendBeacon(erpApiEndpoint_('V2_CORE'), new Blob(
+            navigator.sendBeacon(_ERP_API_URL, new Blob(
               [JSON.stringify({ action: 'LOGOUT', token, reason: 'browser_close' })],
               { type: 'text/plain' }
             ));
