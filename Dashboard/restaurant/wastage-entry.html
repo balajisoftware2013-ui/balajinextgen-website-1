@@ -381,12 +381,10 @@ async function submitWastage(){
   try{
     const res=await wastageApi('SAVE_WASTAGE',{voucherNo,date,time,reportedBy,shift,remarks,entries});
     if(!res||!res.success) throw new Error(res?.message||res?.error||'Wastage save failed');
-    const log=loadWastageLog();
-    entries.forEach(e=>log.push({voucherNo,date,time,item:e.itemName,category:e.category,qty:e.qty,unit:e.unit,rate:e.rate,value:e.qty*e.rate,reason:e.reason,notes:e.notes,by:reportedBy,shift,remarks,status:'pending'}));
-    saveWastageLog(log);
-    WASTAGE_SERVER_READY=false;
-    renderHistory(); clearWastageForm();
-    await loadRealWastageLog();
+     // Server is authoritative; reload the saved record from Google Sheets.
+     WASTAGE_SERVER_READY=false;
+     await loadRealWastageLog();
+     renderHistory(); clearWastageForm();
     gasToast('✅ '+voucherNo+' saved to Inventory — '+entries.length+' item(s)', 'success');
   }catch(e){gasToast('⚠ '+e.message+' — form kept for retry','error');}
   finally{if(btn){btn.disabled=false;btn.textContent='Submit Wastage Entry';}}
@@ -436,8 +434,9 @@ function gasToast(msg, type){
 }
 
 // Init
-document.getElementById('wasteDateField').value = new Date().toISOString().slice(0,10);
-document.getElementById('histDateFilter').value = new Date().toISOString().slice(0,10);
+const _bnxToday = (typeof ERP!=='undefined' && typeof ERP.getBusinessDate==='function') ? ERP.getBusinessDate() : new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Kolkata'});
+document.getElementById('wasteDateField').value = _bnxToday;
+document.getElementById('histDateFilter').value = _bnxToday;
 document.getElementById('voucherNoLabel').textContent = nextVoucherNo();
 addWastageRow(); addWastageRow(); addWastageRow();
 renderHistory();
@@ -445,45 +444,15 @@ setTimeout(async()=>{ await loadKitchenIndentItemsForWastage(); await loadRealWa
 </script>
 <script src="erp-config.js"></script>
 <script>
-/* ── FIX ("Wire-up point" comment in submitWastage() below asked for
-   exactly this): self-contained API bridge so wastage entries actually
-   reach the backend (SAVE_WASTAGE, 46_LiveInventoryBridge.gs) instead
-   of staying local to this browser only. Kept separate from whatever
-   ERP.* already provides in erp-config.js, so this can't conflict with
-   it — if ERP already exposes a generic API-call method, this can be
-   consolidated into that later. */
-const WASTAGE_CLIENT_ID = (function(){
-  /* FIX: matches restaurant-dashboard.html's real, safe CLIENT_ID
-     resolution exactly — checks the actual logged-in session first
-     (ERP_USER), never falls back to a hardcoded real client ID like
-     'CL00010' (which risked silently writing test/wrong data into
-     VANN'S real sheets if opened without a proper session). Returns
-     empty string if truly nothing is found — callers must check for
-     this and refuse to save rather than guessing a client. */
+/* LIVE ERP BRIDGE — use the authenticated shared ERP connector. */
+const WASTAGE_CLIENT_ID=(function(){try{const u=JSON.parse(sessionStorage.getItem('ERP_USER')||localStorage.getItem('ERP_USER')||sessionStorage.getItem('erpUser')||localStorage.getItem('erpUser')||'{}');const id=u.CLIENT_ID||u.clientId||u.client_id||localStorage.getItem('ERP_CLIENT')||localStorage.getItem('bnx_client_id')||'';if(id)localStorage.setItem('bnx_client_id',id);return id;}catch(e){return '';}})();
+async function wastageApi(action,payload){
+  if(!WASTAGE_CLIENT_ID)return {success:false,message:'No client session found — please log in again before saving.'};
   try{
-    var u=JSON.parse(sessionStorage.getItem('ERP_USER')||localStorage.getItem('ERP_USER')||sessionStorage.getItem('erpUser')||localStorage.getItem('erpUser')||'{}');
-    var fromSession = u.CLIENT_ID||u.clientId||u.client_id||'';
-    var fromFlatKey = localStorage.getItem('ERP_CLIENT')||'';
-    var fromUrl = new URLSearchParams(location.search).get('client')||'';
-    var id = fromSession || fromFlatKey || fromUrl || localStorage.getItem('bnx_client_id') || '';
-    if(id) localStorage.setItem('bnx_client_id', id);
-    return id;
-  }catch(e){return '';}
-})();
-const WASTAGE_API_URL = 'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec';
-async function wastageApi(action, payload){
-  if(!WASTAGE_CLIENT_ID){
-    // FIX: refuse to save with no real client resolved, rather than
-    // silently sending an empty/wrong clientId to the backend.
-    return { success:false, message:'No client session found — please log in again before saving.' };
-  }
-  try{
-    const body = Object.assign({ action: action, clientId: WASTAGE_CLIENT_ID }, payload || {});
-    const resp = await fetch(WASTAGE_API_URL, { method:'POST', body: JSON.stringify(body) });
-    return await resp.json();
-  }catch(e){
-    return { success:false, message: e.message };
-  }
+    if(typeof erpCoreApi==='function')return await erpCoreApi(Object.assign({action:action},payload||{}));
+    if(typeof gasApi==='function')return await gasApi(action,payload||{},'V2_CORE');
+    return {success:false,message:'Live ERP connector is not loaded — please refresh after login.'};
+  }catch(e){return {success:false,message:e.message||'ERP request failed'};}
 }
 </script>
 
@@ -508,31 +477,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     }
 });
 
-// Maps the real KITCHEN_CONSUMPTION sheet's columns to this page's local
-// shape, then MERGES with (never overwrites) local data.
-//
-// FIX (2026-08-16): this used to call saveWastageLog(mapped) directly —
-// REPLACING the entire local log with the server's response. But the
-// real backend has no VOUCHER_NO, CATEGORY, RATE, TIME, NOTES, REMARKS,
-// or STATUS columns (confirmed directly from KitchenConsumption_Direct.
-// gs's own schema/header note) — GET_WASTAGE_LOG can only ever return
-// DATE/ITEM_NAME/QTY/UNIT/REPORTED_BY, with everything else hardcoded
-// blank/0 server-side. So every refresh was silently wiping out the
-// richer detail (category, cost, reason, notes, voucher number) the
-// person had just entered, replacing it with blanks. Now merges: a
-// local entry that matches a server row (by date+item+qty+reportedBy)
-// keeps its full local detail as-is; only entries genuinely NOT in
-// local storage (e.g. logged from another device/session) get added
-// using the server's limited shape — better than nothing for cross-
-// device visibility, but never destroys richer data that already exists
-// locally.
-//
-// PERMANENT FIX (needs your decision, not made here): add VOUCHER_NO/
-// CATEGORY/RATE/REASON/NOTES/SHIFT/REMARKS/STATUS columns to the real
-// KITCHEN_CONSUMPTION sheet and update KC_saveWastage_/KC_getWastageLog_
-// to actually persist/return them — only then can this data survive a
-// refresh on a DIFFERENT device with full detail intact. Ask if you want
-// that schema change done.
+// Live WASTAGE_MASTER is the source of truth; loader preserves server fields.
 async function loadRealWastageLog(){
   const res = await wastageApi('GET_WASTAGE_LOG', {});
   if (!(res && res.success && res.data && Array.isArray(res.data.entries))) {
