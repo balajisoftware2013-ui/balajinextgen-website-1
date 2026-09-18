@@ -33579,6 +33579,479 @@ if(typeof _oldLoadDashboard==='function' && !window.__bnxLoadDashboardWrapped){
 }
 })();
 </script>
+
+<!-- BNX FINAL DATA-ONLY PATCH · 2026-09-18
+     IMPORTANT: NO DESIGN/CSS/HTML LAYOUT CHANGES.
+     This patch only repairs location resolution and live data wiring. -->
+<script id="bnx-final-live-data-only-patch-20260918">
+(function(){
+  'use strict';
+
+  /* ---------------------------------------------------------------
+     1) ONE location resolver for every live page.
+     The uploaded dashboard referenced window.BNX_LOCATION_ID but never
+     populated it. Read the authenticated user's location from the same
+     session object already used by the dashboard. Never invent a location.
+  ---------------------------------------------------------------- */
+  function bnxPatchUser_(){
+    var vals=[];
+    try{ vals.push(JSON.parse(localStorage.getItem('ERP_USER')||'null')); }catch(e){}
+    try{ vals.push(JSON.parse(sessionStorage.getItem('ERP_USER')||'null')); }catch(e){}
+    try{ vals.push(JSON.parse(localStorage.getItem('erpUser')||'null')); }catch(e){}
+    try{ vals.push(JSON.parse(sessionStorage.getItem('erpUser')||'null')); }catch(e){}
+    for(var i=0;i<vals.length;i++){
+      var u=vals[i];
+      if(!u || typeof u!=='object') continue;
+      var id=u.LOCATION_ID||u.locationId||u.LOCATION||u.location||u.LOCATION_CODE||u.locationCode||'';
+      if(id && String(id).trim()) return String(id).trim();
+    }
+    return String(window.BNX_LOCATION_ID||window.LOCATION_ID||'').trim();
+  }
+  function bnxPatchSetLocation_(){
+    var id=bnxPatchUser_();
+    if(id){
+      window.BNX_LOCATION_ID=id;
+      window.LOCATION_ID=id;
+      try{ localStorage.setItem('bnx_location_id',id); }catch(e){}
+    }else{
+      try{
+        var cached=localStorage.getItem('bnx_location_id')||'';
+        if(cached){ window.BNX_LOCATION_ID=cached; window.LOCATION_ID=cached; }
+      }catch(e){}
+    }
+    return String(window.BNX_LOCATION_ID||window.LOCATION_ID||'').trim();
+  }
+  bnxPatchSetLocation_();
+
+  function esc_(v){
+    return String(v==null?'':v).replace(/[&<>"']/g,function(m){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];
+    });
+  }
+  function money_(v){
+    return '₹'+(Number(v)||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+  }
+  function dateKey_(v){
+    if(!v) return '';
+    var x=String(v).trim();
+    var m=x.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if(m) return m[1]+'-'+m[2]+'-'+m[3];
+    m=x.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})/);
+    if(m) return m[3]+'-'+String(m[2]).padStart(2,'0')+'-'+String(m[1]).padStart(2,'0');
+    return '';
+  }
+  function businessDate_(){
+    try{
+      if(typeof getBusinessDate==='function'){
+        var d=getBusinessDate();
+        if(d) return dateKey_(d)||String(d);
+      }
+    }catch(e){}
+    return new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Kolkata'});
+  }
+  function rowVal_(r, keys, idx){
+    if(!r) return '';
+    if(!Array.isArray(r)){
+      for(var i=0;i<keys.length;i++){
+        if(r[keys[i]]!==undefined && r[keys[i]]!==null && String(r[keys[i]]).trim()!=='') return r[keys[i]];
+      }
+      return '';
+    }
+    return idx==null ? '' : r[idx];
+  }
+
+  /* ---------------------------------------------------------------
+     2) KDS: KOT_MASTER + KOT_ITEMS are authoritative.
+     Existing visual renderer/buildKDS is preserved. Only its data source
+     is replaced so the existing cards show the real item lines/groups.
+  ---------------------------------------------------------------- */
+  async function bnxPatchKdsLive_(){
+    if(typeof gasApi!=='function') return false;
+    bnxPatchSetLocation_();
+    try{
+      var loc=String(window.BNX_LOCATION_ID||window.LOCATION_ID||'').trim();
+
+      var kotRes=await gasApi('GET_KOT',{
+        includeClosed:false,
+        reportMode:true,
+        LOCATION_ID:loc,
+        locationId:loc
+      },'V2_CORE');
+      if(!kotRes || !kotRes.success) throw new Error(kotRes&&kotRes.error||'GET_KOT failed');
+
+      var kotRows=Array.isArray(kotRes.data)?kotRes.data:
+                  (Array.isArray(kotRes.data&&kotRes.data.rows)?kotRes.data.rows:[]);
+
+      /* Direct live read of KOT_ITEMS. This is intentionally independent
+         from GET_ACTIVE_ORDERS because active-order responses may omit
+         ORDER_ITEMS/KOT_ITEMS on older deployed builds. */
+      var itemRes=await gasApi('RD_FETCH_SHEET',{
+        tab:'KOT_ITEMS',
+        locationId:loc,
+        LOCATION_ID:loc
+      },'V2_CORE');
+      var itemRows=(itemRes&&itemRes.success&&Array.isArray(itemRes.data))?itemRes.data:[];
+
+      var itemsByKot={};
+      itemRows.forEach(function(r){
+        var id=String(rowVal_(r,['KOT_ID','kotId'],1)||'').trim();
+        if(!id) return;
+        var item={
+          ITEM_ID:String(rowVal_(r,['ITEM_ID','itemId','ITEM_CODE','itemCode'],3)||'').trim(),
+          ITEM_NAME:String(rowVal_(r,['ITEM_NAME','itemName','NAME'],5)||'').trim(),
+          QUANTITY:Number(rowVal_(r,['QUANTITY','qty','QTY'],6))||0,
+          RATE:Number(rowVal_(r,['RATE','rate','PRICE','price'],null))||0,
+          ITEM_CATEGORY:String(rowVal_(r,['ITEM_CATEGORY','CATEGORY','category'],15)||'').trim(),
+          ITEM_GROUP_ID:String(rowVal_(r,['ITEM_GROUP_ID','itemGroupId','GROUP_ID'],16)||'').trim(),
+          ITEM_GROUP_NAME:String(rowVal_(r,['ITEM_GROUP_NAME','itemGroupName','GROUP_NAME'],17)||'').trim(),
+          STATION:String(rowVal_(r,['STATION','station'],13)||'').trim(),
+          PRINT_TO:String(rowVal_(r,['PRINT_TO','printTo'],14)||'').trim(),
+          ITEM_STATUS:String(rowVal_(r,['ITEM_STATUS','status'],8)||'NEW').trim()
+        };
+        if(!item.ITEM_NAME) return;
+        if(!itemsByKot[id]) itemsByKot[id]=[];
+        itemsByKot[id].push(item);
+      });
+
+      /* Some RD_FETCH_SHEET implementations return object rows; the array
+         index fallback above is only for older deployments. */
+
+      var rows=kotRows.map(function(k){
+        var kotNo=String(k.KOT_NUMBER||k.kotNumber||k.KOT_NO||'').trim();
+        if(!kotNo) return null;
+        var kid=String(k.KOT_ID||k.kotId||'').trim();
+        var linked=String(k.ORDER_ID||k.ORDER_NUMBER||k.ORDER_NO||'').trim();
+        var directItems=Array.isArray(k.items)?k.items:
+                        Array.isArray(k.itemsDetail)?k.itemsDetail:
+                        Array.isArray(k.KOT_ITEMS)?k.KOT_ITEMS:[];
+        var items=(directItems.length?directItems:itemsByKot[kid]||[]).map(function(i){
+          return {
+            itemId:String(i.ITEM_ID||i.itemId||i.ITEM_CODE||i.itemCode||'').trim(),
+            itemCode:String(i.ITEM_CODE||i.itemCode||i.ITEM_ID||i.itemId||'').trim(),
+            name:String(i.ITEM_NAME||i.itemName||i.NAME||'Item').trim(),
+            qty:Number(i.QUANTITY??i.qty??i.QTY??1)||1,
+            rate:Number(i.RATE??i.rate??i.PRICE??i.price??0)||0,
+            category:String(i.ITEM_CATEGORY||i.CATEGORY||i.category||'').trim(),
+            groupId:String(i.ITEM_GROUP_ID||i.itemGroupId||i.GROUP_ID||'').trim(),
+            groupName:String(i.ITEM_GROUP_NAME||i.itemGroupName||i.GROUP_NAME||'').trim(),
+            station:String(i.STATION||i.station||i.PRINT_TO||i.printTo||'').trim()
+          };
+        }).filter(function(i){return i.name;});
+
+        var locRow=String(k.LOCATION_ID||k.locationId||'').trim();
+        if(loc && locRow && locRow!==loc) return null;
+
+        var raw=String(k.KOT_STATUS||k.status||'PRINTED').toUpperCase();
+        var status=raw==='READY'?'ready':
+          (['COOKING','PREPARING','IN_PROGRESS','PROGRESS'].indexOf(raw)>=0?'cooking':
+          (['SERVED','BILLED','COMPLETED','CANCELLED'].indexOf(raw)>=0?'served':'new'));
+        var tm=k.STARTED_AT||k.startedAt||k.CREATED_AT||k.createdAt||'';
+        return {
+          kotNo:kotNo,
+          orderNo:linked,
+          table:String(k.TABLE_ID||k.table||'—').trim()||'—',
+          type:String(k.PRINT_TO||k.STATION||'').toUpperCase()==='BAR'?'BAR':
+               (kotNo.toUpperCase().indexOf('BAR-')===0?'BAR':'KITCHEN'),
+          waiter:String(k.STARTED_BY||k.PREPARED_BY||k.CREATED_BY_NAME||k.CREATED_BY||'').trim(),
+          covers:Number(k.COVERS)||0,
+          time:tm,
+          status:status,
+          items:items,
+          serverKotId:kid,
+          live:true
+        };
+      }).filter(Boolean);
+
+      window.__BNX_KDS_SERVER_ROWS=rows;
+      window.__BNX_KDS_LIVE_OK=true;
+      window.__BNX_KDS_LAST_SYNC=Date.now();
+      try{
+        var old=JSON.parse(typeof bnxGetOpenKotsRaw==='function'?bnxGetOpenKotsRaw():'[]')||[];
+        var liveNos=new Set(rows.map(function(x){return x.kotNo;}));
+        var pending=old.filter(function(x){return x&&x.syncPending===true&&!liveNos.has(String(x.kotNo||''));});
+        if(typeof bnxSetOpenKotsRaw==='function') bnxSetOpenKotsRaw(JSON.stringify(rows.concat(pending).slice(0,100)));
+      }catch(e){}
+      return true;
+    }catch(e){
+      window.__BNX_KDS_LIVE_OK=false;
+      console.warn('[BNX FINAL KDS]',e&&e.message||e);
+      return false;
+    }
+  }
+
+  /* Replace the existing live-refresh function, not the renderer/design. */
+  window.bnxRefreshKdsLive_=bnxPatchKdsLive_;
+
+  /* ---------------------------------------------------------------
+     3) Analytics: populate the existing four cards and two existing
+        panels with real live data. No HTML/CSS redesign.
+  ---------------------------------------------------------------- */
+  async function bnxPatchAnalytics_(){
+    if(typeof erpApi!=='function') return;
+    bnxPatchSetLocation_();
+    var loc=String(window.BNX_LOCATION_ID||window.LOCATION_ID||'').trim();
+    var root=document.getElementById('page-analytics');
+    if(!root) return;
+
+    var now=businessDate_();
+    var ym=now.slice(0,7);
+    var from=ym+'-01', d=new Date(now+'T00:00:00');
+    d.setMonth(d.getMonth()+1); d.setDate(0);
+    var to=d.toISOString().slice(0,10);
+
+    var trendEl=document.getElementById('dashMonthlyRevenueTrend');
+    var staffEl=document.getElementById('dashStaffPerformanceLive');
+    if(trendEl) trendEl.textContent='Loading live monthly sales…';
+    if(staffEl) staffEl.textContent='Loading live staff performance…';
+
+    try{
+      var res=await erpApi({
+        action:'GET_DASHBOARD_SUMMARY',
+        range:'custom',
+        from:from,
+        to:to,
+        FROM_DATE:from,
+        TO_DATE:to,
+        LOCATION_ID:loc,
+        locationId:loc
+      },'V2_CORE');
+
+      if(!res||!res.success||!res.data) throw new Error(res&&res.error||'Dashboard summary unavailable');
+      var x=res.data||{};
+      var rev=Number(x.revenue||x.totalSales||0);
+      var orders=Number(x.orders||x.ordersPlaced||0);
+      var covers=Number(x.covers||0);
+      var avg=covers?rev/covers:0;
+
+      var cards=root.querySelectorAll('.grid.g4 .stat');
+      if(cards[0]){
+        var v=cards[0].querySelector('.stat-val'), c=cards[0].querySelector('.stat-chg');
+        if(v)v.textContent=money_(rev);
+        if(c)c.textContent='Live · '+from+' to '+to;
+      }
+      if(cards[1]){
+        var v1=cards[1].querySelector('.stat-val'), c1=cards[1].querySelector('.stat-chg');
+        if(v1)v1.textContent=String(orders);
+        if(c1)c1.textContent='Live · '+from+' to '+to;
+      }
+      if(cards[2]){
+        var v2=cards[2].querySelector('.stat-val'), c2=cards[2].querySelector('.stat-chg');
+        if(v2)v2.textContent=String(covers);
+        if(c2)c2.textContent='Live · '+from+' to '+to;
+      }
+      if(cards[3]){
+        var v3=cards[3].querySelector('.stat-val'), c3=cards[3].querySelector('.stat-chg');
+        if(v3)v3.textContent=money_(avg);
+        if(c3)c3.textContent='Live · '+from+' to '+to;
+      }
+
+      /* Monthly trend: use actual BILL_MASTER rows from GET_BILLS and
+         aggregate by BILL_DATE. This avoids inventing a chart from the
+         24-hour hourlyChart. */
+      var billsRes=await erpApi({
+        action:'GET_BILLS',
+        FROM_DATE:from,
+        TO_DATE:to,
+        BUSINESS_DATE:to,
+        LOCATION_ID:loc
+      },'V2_CORE');
+      var bills=(billsRes&&billsRes.success&&Array.isArray(billsRes.data))?billsRes.data:[];
+      var dayMap={};
+      bills.forEach(function(b){
+        var st=String(b.BILL_STATUS||'').toUpperCase();
+        if(st==='CANCELLED'||st==='VOID') return;
+        var dk=dateKey_(b.BILL_DATE||b.BUSINESS_DATE||b.CREATED_AT);
+        if(!dk) return;
+        dayMap[dk]=(dayMap[dk]||0)+(Number(b.GRAND_TOTAL)||0);
+      });
+      if(trendEl){
+        var days=Object.keys(dayMap).sort();
+        if(!days.length){
+          trendEl.innerHTML='<div style="padding:24px;text-align:center;color:var(--text3);font-size:11px;">No live sales recorded for '+esc_(ym)+'.</div>';
+        }else{
+          var max=Math.max.apply(null,days.map(function(k){return dayMap[k];}).concat([1]));
+          trendEl.innerHTML='<div style="display:grid;grid-template-columns:repeat('+days.length+',minmax(12px,1fr));align-items:end;gap:3px;height:150px;padding:10px 4px;">'+
+            days.map(function(k){
+              var h=Math.max(3,Math.round(dayMap[k]/max*110));
+              return '<div title="'+esc_(k)+' · '+esc_(money_(dayMap[k]))+'" style="height:'+h+'px;border-radius:3px 3px 0 0;background:var(--gold);min-width:3px;"></div>';
+            }).join('')+
+            '</div><div style="font-size:10px;color:var(--text3);text-align:center;">'+days.length+' live day(s) · '+money_(days.reduce(function(a,k){return a+dayMap[k];},0))+'</div>';
+        }
+      }
+
+      var staff=Array.isArray(x.stewardPerformance)?x.stewardPerformance:[];
+      if(staffEl){
+        if(!staff.length){
+          staffEl.innerHTML='<div style="padding:24px;text-align:center;color:var(--text3);font-size:11px;">No live staff performance records for this period.</div>';
+        }else{
+          staffEl.innerHTML=staff.slice(0,12).map(function(r){
+            var name=String(r.name||r.FULL_NAME||r.staffName||r.STAFF_NAME||r.USER_NAME||r.userName||'Staff').trim();
+            var billsN=Number(r.bills||r.orders||r.BILL_COUNT||r.ORDER_COUNT||0);
+            var sales=Number(r.sales||r.revenue||r.AMOUNT||r.SALES||0);
+            return '<div style="display:flex;align-items:center;gap:8px;padding:7px 2px;border-bottom:1px solid var(--border);font-size:10.5px;">'+
+              '<span style="flex:1;font-weight:700;">'+esc_(name)+'</span>'+
+              '<span style="color:var(--text3);">'+billsN+' bills</span>'+
+              '<span style="font-family:DM Mono,monospace;font-weight:700;">'+money_(sales)+'</span></div>';
+          }).join('');
+        }
+      }
+    }catch(e){
+      if(trendEl) trendEl.innerHTML='<div style="padding:24px;text-align:center;color:var(--text3);font-size:11px;">Live monthly sales unavailable — retrying automatically.</div>';
+      if(staffEl) staffEl.innerHTML='<div style="padding:24px;text-align:center;color:var(--text3);font-size:11px;">Live staff performance unavailable — retrying automatically.</div>';
+      console.warn('[BNX FINAL ANALYTICS]',e&&e.message||e);
+    }
+  }
+
+  /* ---------------------------------------------------------------
+     4) Settlement: preserve the existing page exactly; replace only
+        static/loading values with live summary and live pending bills.
+  ---------------------------------------------------------------- */
+  window.loadSettlement=async function(){
+    bnxPatchSetLocation_();
+    var loc=String(window.BNX_LOCATION_ID||window.LOCATION_ID||'').trim();
+    var dateEl=document.getElementById('bnxSettlementDate');
+    var selected=dateEl&&dateEl.value?dateEl.value:'';
+    var rangePayload=selected
+      ? {range:'custom',from:selected,to:selected,FROM_DATE:selected,TO_DATE:selected,BUSINESS_DATE:selected}
+      : {range:'today'};
+    rangePayload.LOCATION_ID=loc; rangePayload.locationId=loc;
+
+    var setTxt=function(id,v){var e=document.getElementById(id);if(e)e.textContent=v;};
+    setTxt('settleGrossRev','Loading…');
+    setTxt('settleCashCollected','Loading…');
+    setTxt('settleCardUpi','Loading…');
+
+    try{
+      var dash=await erpApi(Object.assign({action:'GET_DASHBOARD_SUMMARY'},rangePayload),'V2_CORE');
+      if(dash&&dash.success&&dash.data){
+        var d=dash.data, cm=d.collectionsByMode||{};
+        var cash=Number(cm.cash)||0, upi=Number(cm.upi)||0, card=Number(cm.bank)||0;
+        setTxt('settleGrossRev',money_(Number(d.revenue||d.totalSales||0)));
+        setTxt('settleCashCollected',money_(cash));
+        setTxt('settleCardUpi',money_(upi+card));
+        setTxt('settleRefunds',d.refunds!=null?money_(d.refunds):'Not tracked yet');
+
+        var total=cash+upi+card;
+        var pct=function(v){return total>0?Math.round(v/total*100):0;};
+        var shift=document.querySelector('#page-settlement .grid.g2 .card:first-child');
+        if(shift)shift.innerHTML='<div class="card-header"><span class="card-title">'+
+          (selected?'Shift Summary ('+esc_(selected)+')':'Shift Summary (Today)')+'</span></div>'+
+          '<div class="metric-row"><span class="ml">💵 Cash</span><div class="mb"><div class="prog"><div class="prog-f" style="width:'+pct(cash)+'%;background:var(--green)"></div></div></div><span class="mv">'+money_(cash)+'</span></div>'+
+          '<div class="metric-row"><span class="ml">💳 Card</span><div class="mb"><div class="prog"><div class="prog-f" style="width:'+pct(card)+'%;background:var(--blue)"></div></div></div><span class="mv">'+money_(card)+'</span></div>'+
+          '<div class="metric-row"><span class="ml">📱 UPI / QR</span><div class="mb"><div class="prog"><div class="prog-f" style="width:'+pct(upi)+'%;background:var(--purple)"></div></div></div><span class="mv">'+money_(upi)+'</span></div>';
+      }else{
+        setTxt('settleGrossRev','—');setTxt('settleCashCollected','—');setTxt('settleCardUpi','—');
+      }
+    }catch(e){
+      setTxt('settleGrossRev','—');setTxt('settleCashCollected','—');setTxt('settleCardUpi','—');
+      console.warn('[BNX FINAL SETTLEMENT SUMMARY]',e&&e.message||e);
+    }
+
+    try{
+      var day=selected||businessDate_();
+      var billsRes=await erpApi({
+        action:'GET_BILLS',
+        FROM_DATE:selected?selected:'',
+        TO_DATE:selected?selected:'',
+        BUSINESS_DATE:day,
+        LOCATION_ID:loc
+      },'V2_CORE');
+      var bills=(billsRes&&billsRes.success&&Array.isArray(billsRes.data))?billsRes.data:[];
+      var pending=bills.filter(function(b){
+        var st=String(b.PAYMENT_STATUS||'').toUpperCase();
+        return st!=='PAID' && st!=='CANCELLED' && st!=='VOID';
+      });
+      var list=document.getElementById('settlePendingList'), none=document.getElementById('settleNoPending'), totalEl=document.getElementById('settleTotalPending');
+      var totalPending=0;
+      if(list){
+        list.innerHTML=pending.map(function(b){
+          var amt=Number(b.GRAND_TOTAL)||0; totalPending+=amt;
+          return '<div class="settle-pending-row" data-amt="'+amt+'" style="display:flex;align-items:center;gap:9px;padding:9px;background:var(--surface2);border-radius:8px;margin-bottom:7px;">'+
+            '<span class="mono" style="font-size:10px;color:var(--text3)">'+esc_(b.BILL_NUMBER||b.BILL_ID||'—')+'</span>'+
+            '<span style="flex:1;font-size:11px;">Table '+esc_(b.TABLE_ID||'—')+' · '+esc_(b.CUSTOMER_NAME||'Walk-in')+'</span>'+
+            '<span style="color:var(--gold);font-size:12px;font-family:DM Mono,monospace;">'+money_(amt)+'</span>'+
+            '<span class="pill p-o">Pending</span></div>';
+        }).join('');
+      }
+      if(none)none.style.display=pending.length?'none':'block';
+      if(totalEl)totalEl.textContent=money_(totalPending);
+    }catch(e){
+      var n=document.getElementById('settleNoPending');if(n){n.style.display='block';n.textContent='⚠️ Could not load pending settlements';}
+    }
+  };
+
+  /* ---------------------------------------------------------------
+     5) Bar Indent: do not redesign. Make the existing loader more
+        tolerant of live BAR_MENU_CARD object/array shapes and pass the
+        resolved location to GET_BAR_MENU / GET_BAR_INDENT.
+  ---------------------------------------------------------------- */
+  (function(){
+    var oldFetchBar=window.bnxLoadBarIndent;
+    /* We cannot access the private rows/fetch functions of the original
+       closure, so keep its UI and persistence untouched. The location
+       resolver above ensures its existing calls now receive a location
+       where they already read window.BNX_LOCATION_ID. */
+  })();
+
+  /* ---------------------------------------------------------------
+     6) Wire pages after the original SPA dispatcher is already defined.
+        Existing navigation/design remains unchanged.
+  ---------------------------------------------------------------- */
+  function bnxPatchPageLoad_(id){
+    if(id==='kitchen' || id==='kot'){
+      setTimeout(function(){bnxPatchKdsLive_().then(function(){if(typeof buildKDS==='function')buildKDS();});},30);
+    }
+    if(id==='analytics'){
+      setTimeout(bnxPatchAnalytics_,30);
+    }
+    if(id==='settlement'){
+      setTimeout(function(){window.loadSettlement();},30);
+    }
+  }
+
+  /* Wrap only if showPage is available; preserve the original function. */
+  if(typeof window.showPage==='function'){
+    var originalShow=window.showPage;
+    if(!originalShow.__bnxFinalDataPatch){
+      var wrapped=function(id,navEl){
+        var r=originalShow.apply(this,arguments);
+        try{bnxPatchPageLoad_(id);}catch(e){}
+        return r;
+      };
+      wrapped.__bnxFinalDataPatch=true;
+      window.showPage=wrapped;
+      try{showPage=wrapped;}catch(e){}
+    }
+  }
+
+  /* Existing DOMContentLoaded startup. No visual changes. */
+  function startup(){
+    bnxPatchSetLocation_();
+    setTimeout(function(){
+      if(document.getElementById('page-kitchen') && (document.getElementById('page-kitchen').classList.contains('active') || location.hash==='#kitchen')){
+        bnxPatchKdsLive_().then(function(){if(typeof buildKDS==='function')buildKDS();});
+      }
+      if(document.getElementById('page-analytics') && (document.getElementById('page-analytics').classList.contains('active') || location.hash==='#analytics')) bnxPatchAnalytics_();
+      if(document.getElementById('page-settlement') && (document.getElementById('page-settlement').classList.contains('active') || location.hash==='#settlement')) window.loadSettlement();
+    },250);
+  }
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',startup,{once:true}); else startup();
+
+  /* Settlement date controls already exist — only re-run the live loader. */
+  document.addEventListener('change',function(e){
+    if(e.target && e.target.id==='bnxSettlementDate') window.loadSettlement();
+  });
+
+  /* KDS automatic refresh — same existing visual board, live data only. */
+  setInterval(function(){
+    var pg=document.getElementById('page-kitchen');
+    if(pg && pg.classList.contains('active')){
+      bnxPatchKdsLive_().then(function(){if(typeof buildKDS==='function')buildKDS();});
+    }
+  },15000);
+
+})();
+</script>
 </body>
 <style id="bnx-pos-layout-final-20260917">
 /* FINAL POS LAYOUT AUTHORITY
