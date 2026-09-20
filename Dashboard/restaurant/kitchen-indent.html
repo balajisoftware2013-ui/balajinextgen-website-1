@@ -713,6 +713,9 @@ let INDENT_ITEMS = []; // LIVE ONLY: never use demo/fallback items for a client 
 let qtyMap = {};
 let fullItemList = [...INDENT_ITEMS];
 let indentSubmitBusy = false;
+// After a successful save, keep the next entry screen genuinely blank.
+// Auto-minimum suggestions are restored on a fresh page load.
+let suppressAutoSuggestedQtyAfterSave = false;
 
 function resetIndentFormAfterSuccess() {
   qtyMap = {};
@@ -903,10 +906,11 @@ function renderTable(items) {
       const calculated = calculateIndentQty(item);
       // Auto-suggest only the remaining balance. Existing user-entered qty
       // remains editable and is never overwritten on re-render.
-      const val = Object.prototype.hasOwnProperty.call(qtyMap, item.id)
+      const hasUserQty = Object.prototype.hasOwnProperty.call(qtyMap, item.id);
+      const val = hasUserQty
         ? qtyMap[item.id]
-        : (calculated > 0 ? calculated : '');
-      if (calculated > 0 && !Object.prototype.hasOwnProperty.call(qtyMap, item.id)) {
+        : (suppressAutoSuggestedQtyAfterSave ? '' : (calculated > 0 ? calculated : ''));
+      if (!suppressAutoSuggestedQtyAfterSave && calculated > 0 && !hasUserQty) {
         qtyMap[item.id] = calculated;
       }
       const lowStock = item.stock < item.min;
@@ -1108,7 +1112,7 @@ async function finalSubmit() {
   loadIndentHistory();
   loadPendingIndents();
 
-  var clientName = bnxKitchenClientName();
+  var clientName = await getKitchenClientName_();
   var lines = ['\u{1F4E6} *KITCHEN INDENT REQUEST*','\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501',
     '\uD83C\uDFE2 Client    : *'+clientName+'*',
     '\uD83C\uDFF7\uFE0F Indent No : *'+num+'*',
@@ -1125,9 +1129,12 @@ async function finalSubmit() {
   // the next kitchen indent always starts with a clean entry screen.
   qtyMap = {};
   customItems = [];
+  // Keep the post-save entry grid genuinely blank; do not immediately
+  // re-apply minimum-stock auto suggestions until the page is refreshed.
+  suppressAutoSuggestedQtyAfterSave = true;
   try {
     document.querySelectorAll('.qty-input').forEach(function(el){
-      el.value = '0';
+      el.value = '';
       el.classList.remove('filled');
     });
     document.querySelectorAll('.remark-input, .item-remark, textarea[data-id]').forEach(function(el){ el.value = ''; });
@@ -1524,24 +1531,46 @@ function bnxKitchenClientName(){
   try{
     var u=JSON.parse(localStorage.getItem('ERP_USER')||sessionStorage.getItem('ERP_USER')||localStorage.getItem('erpUser')||sessionStorage.getItem('erpUser')||'{}');
     var n=fromObj(u); if(n) return n;
-    if(typeof ERP!=='undefined' && typeof ERP.getClient==='function'){
-      var c=ERP.getClient();
-      if(typeof c==='string' && clean(c)) return clean(c);
-      n=fromObj(c); if(n) return n;
-    }
     var cid=(u.CLIENT_ID||u.clientId||u.client_id||localStorage.getItem('bnx_client_id')||'').toString().trim();
     if(cid){
       var b=JSON.parse(localStorage.getItem('erp_restaurant_brand_'+cid)||'{}');
       n=fromObj(b); if(n) return n;
     }
+    if(typeof ERP!=='undefined' && typeof ERP.getClient==='function'){
+      var c=ERP.getClient();
+      if(typeof c==='object'){
+        n=fromObj(c); if(n) return n;
+      } else if(clean(c) && !/^CL[A-Z0-9_-]+$/i.test(clean(c))){
+        return clean(c);
+      }
+    }
   }catch(e){}
-  return 'Balaji NextGen';
+  return cid || 'Balaji NextGen';
 }
 
-function shareIndentWhatsApp(indId) {
+// Resolve the authoritative company name from the V3 Core.
+// This prevents WhatsApp/PDF from displaying only the tenant ID (for example CL00010).
+async function getKitchenClientName_(){
+  var cached='';
+  try{ cached=sessionStorage.getItem('BNX_KITCHEN_CLIENT_NAME')||''; }catch(e){}
+  if(cached) return cached;
+  var local=bnxKitchenClientName();
+  try{
+    var res=await erpApi('GET_CLIENT_INFO',{});
+    var d=res && res.success && (res.data||res.client||res) || {};
+    var name=String(d.companyName||d.CLIENT_NAME||d.name||d.restaurantName||d.COMPANY_NAME||'').trim();
+    if(name){
+      try{ sessionStorage.setItem('BNX_KITCHEN_CLIENT_NAME',name); }catch(e){}
+      return name;
+    }
+  }catch(e){ console.warn('[Kitchen Indent] client-name lookup failed:',e); }
+  return local;
+}
+
+async function shareIndentWhatsApp(indId) {
   const r = _pendingCache.find(x => x.IND_ID === indId) || _historyCache.find(x => x.IND_ID === indId);
   if (!r) { showToast('Indent not found', 'warn'); return; }
-  const clientName = bnxKitchenClientName();
+  const clientName = await getKitchenClientName_();
   const lines = ['📦 *KITCHEN INDENT REQUEST*', '━━━━━━━━━',
     '🏢 Client    : *' + clientName + '*',
     '🏷️ Indent No : *' + r.IND_ID + '*',
@@ -1689,21 +1718,22 @@ function generateIndentPDF() {
   openIndentPDFWindow(allItems);
 }
 
-function openIndentPDFWindow(allItems) {
+async function openIndentPDFWindow(allItems, companyName) {
   const meta = {
     date: document.getElementById('indentDate').value,
     dept: document.getElementById('indentDept').value,
     shift: document.getElementById('indentShift').value,
     priority: document.getElementById('indentPriority').value,
     by: document.getElementById('indentBy').value || 'Chef',
-    company: 'Balaji NextGen',
+    company: companyName || await getKitchenClientName_(),
   };
   const win = window.open('', '_blank');
+  if(!win){ showToast('Allow pop-ups to open the Kitchen Indent PDF', 'warn'); return; }
   win.document.write(buildIndentPDFHtml(allItems, meta));
   win.document.close();
 }
 
-function shareCurrentIndentWhatsApp() {
+async function shareCurrentIndentWhatsApp() {
   const allItems = getAllIndentItems();
   if (!allItems.length) { showToast('Enter at least one quantity first', 'warn'); return; }
   const dept = document.getElementById('indentDept').value;
