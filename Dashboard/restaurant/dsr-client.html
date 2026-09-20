@@ -100,19 +100,175 @@ function getClientId_(){
 }
 const CLIENT_ID = getClientId_();
 
+/* ================================================================
+   SESSION KEEP-ALIVE / ROLLING SESSION FIX
+   - AUTH VALIDATE_SESSION refreshes the server-side rolling session.
+   - Validate every 4 minutes while the page is open.
+   - Validate again when the browser tab becomes visible/focused.
+   - Never log the user out just because a background heartbeat fails.
+   - Only mark authExpired when the server explicitly rejects the token.
+   ================================================================ */
+let BNX_SESSION_LAST_VALIDATED = 0;
+let BNX_SESSION_VALIDATING = null;
+let BNX_SESSION_EXPIRED = false;
+
+function bnxSessionCandidateTokens_(){
+  const arr=[];
+  const add=v=>{const t=bnxPickToken_(v);if(t && !arr.includes(t))arr.push(t);};
+  try{if(typeof ERP!=='undefined' && typeof ERP.getSession==='function')add(ERP.getSession());}catch(e){}
+  try{if(typeof ERP!=='undefined' && typeof ERP.getToken==='function')add(ERP.getToken());}catch(e){}
+  [
+    'ERP_SESSION','erp_session','erp_token','sessionToken','SESSION_TOKEN'
+  ].forEach(k=>{
+    try{add(sessionStorage.getItem(k));}catch(e){}
+    try{add(localStorage.getItem(k));}catch(e){}
+  });
+  ['ERP_USER','erpUser','ERP_SESSION_USER'].forEach(k=>{
+    try{add(sessionStorage.getItem(k));}catch(e){}
+    try{add(localStorage.getItem(k));}catch(e){}
+  });
+  return arr;
+}
+
+async function bnxValidateSession_(force){
+  const now=Date.now();
+  if(!force && BNX_SESSION_LAST_VALIDATED && (now-BNX_SESSION_LAST_VALIDATED)<240000){
+    return {success:true,cached:true};
+  }
+  if(BNX_SESSION_VALIDATING) return await BNX_SESSION_VALIDATING;
+
+  const tokens=bnxSessionCandidateTokens_();
+  if(!tokens.length){
+    return {success:false,authExpired:true,error:'SESSION TOKEN MISSING'};
+  }
+
+  BNX_SESSION_VALIDATING=(async()=>{
+    let last={success:false,authExpired:true,error:'SESSION EXPIRED'};
+    for(const token of tokens){
+      try{
+        const url=GAS_APIS_DSR.V2_AUTH;
+        const body={
+          action:'VALIDATE_SESSION',
+          clientId:getClientId_() || CLIENT_ID,
+          sessionToken:token,
+          token:token
+        };
+        const r=await fetch(url,{
+          method:'POST',
+          headers:{'Content-Type':'text/plain;charset=utf-8'},
+          body:JSON.stringify(body)
+        });
+        const j=await r.json();
+        if(j && (j.success===true || j.status==='SUCCESS')){
+          BNX_SESSION_LAST_VALIDATED=Date.now();
+          BNX_SESSION_EXPIRED=false;
+          /* Keep the working token first so stale ERP.getSession() cannot
+             override a valid token stored by the login/session manager. */
+          try{sessionStorage.setItem('ERP_SESSION',token);}catch(e){}
+          try{localStorage.setItem('ERP_SESSION',token);}catch(e){}
+          return Object.assign({success:true},j);
+        }
+        if(j && (j.error==='Invalid or expired session' ||
+                 /SESSION EXPIRED|TOKEN REQUIRED|TOKEN MISSING/i.test(String(j.message||j.error||'')) ||
+                 j.status===401)){
+          last={success:false,authExpired:true,error:j.error||j.message||'SESSION EXPIRED'};
+          continue;
+        }
+        /* Network/backend response that is not explicitly an auth failure:
+           do not destroy an otherwise usable login. */
+        last={success:false,transient:true,error:j&&((j.error||j.message))||'Session validation unavailable'};
+      }catch(e){
+        last={success:false,transient:true,error:e.message};
+      }
+    }
+    if(last.authExpired) BNX_SESSION_EXPIRED=true;
+    return last;
+  })();
+
+  try{return await BNX_SESSION_VALIDATING;}
+  finally{BNX_SESSION_VALIDATING=null;}
+}
+
+function bnxShowSessionExpired_(){
+  BNX_SESSION_EXPIRED=true;
+  gasToast('🔐 Session expired — please login again','error');
+  setStatus('🔐 Session expired — please login again.');
+  try{
+    document.body.classList.add('bnx-session-expired');
+    let el=document.getElementById('bnxSessionExpiredBanner');
+    if(!el){
+      el=document.createElement('div');
+      el.id='bnxSessionExpiredBanner';
+      el.innerHTML='<b>🔐 Session expired</b><span>Your login session has expired. Please login again to continue live ERP operations.</span>';
+      document.body.appendChild(el);
+    }
+  }catch(e){}
+}
+
+async function bnxSessionHeartbeat_(){
+  const r=await bnxValidateSession_(false);
+  if(r && r.authExpired) bnxShowSessionExpired_();
+  return r;
+}
+
 async function gasApi(action,payload,endpoint){
   payload=payload||{};
-  const url=GAS_APIS_DSR[endpoint||'V2_CORE'];
+  const ep=endpoint||'V2_CORE';
+  const url=GAS_APIS_DSR[ep];
   if(!url)return {success:false,error:'API endpoint is not configured'};
+
+  /* Refresh the rolling session before normal CORE calls when the 4-minute
+     validation window has elapsed. AUTH validation itself is excluded. */
+  if(ep!=='V2_AUTH' && action!=='VALIDATE_SESSION'){
+    const vr=await bnxValidateSession_(false);
+    if(vr && vr.authExpired){
+      return {success:false,authExpired:true,error:vr.error||'Invalid or expired session'};
+    }
+  }
+
   const body=Object.assign({
     action:action,
     clientId:getClientId_() || CLIENT_ID,
     sessionToken:getSessionToken_()
   },payload);
+
   try{
-    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(body)});
+    const r=await fetch(url,{
+      method:'POST',
+      headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body:JSON.stringify(body)
+    });
     const j=await r.json();
-    if(j && (j.error==='Invalid or expired session' || j.status===401)){
+    if(j && (j.error==='Invalid or expired session' ||
+             /SESSION EXPIRED|TOKEN REQUIRED|TOKEN MISSING/i.test(String(j.message||j.error||'')) ||
+             j.status===401 ||
+             j.unauthorized===true ||
+             j.sessionExpired===true)){
+      /* One final validation/retry path handles a stale token in ERP.getSession()
+         when another tab/login has already issued the current token. */
+      const vr=await bnxValidateSession_(true);
+      if(vr && vr.success){
+        const retryBody=Object.assign({
+          action:action,
+          clientId:getClientId_() || CLIENT_ID,
+          sessionToken:getSessionToken_()
+        },payload);
+        try{
+          const rr=await fetch(url,{
+            method:'POST',
+            headers:{'Content-Type':'text/plain;charset=utf-8'},
+            body:JSON.stringify(retryBody)
+          });
+          const rj=await rr.json();
+          if(rj && !(rj.error==='Invalid or expired session' ||
+                     /SESSION EXPIRED|TOKEN REQUIRED|TOKEN MISSING/i.test(String(rj.message||rj.error||'')) ||
+                     rj.status===401 || rj.unauthorized===true || rj.sessionExpired===true)){
+            return rj;
+          }
+          return {success:false,authExpired:true,error:rj.error||rj.message||'Invalid or expired session'};
+        }catch(e){}
+      }
+      bnxShowSessionExpired_();
       return {success:false,authExpired:true,error:j.error||j.message||'Invalid or expired session'};
     }
     return j;
@@ -1150,6 +1306,18 @@ label{font-family:Arial,Helvetica,sans-serif!important;font-weight:700!important
 /* Export controls use the same accounting front */
 .export-actions,.wa-action-row{display:flex!important;gap:7px!important;flex-wrap:wrap!important;align-items:center!important;}
 .export-actions .btn,.wa-action-row .btn{font-family:Arial,Helvetica,sans-serif!important;font-weight:800!important;border-radius:2px!important;}
+</style>
+<style id="bnx-session-fix-css">
+#bnxSessionExpiredBanner{
+  position:fixed;left:50%;top:18px;transform:translateX(-50%);
+  z-index:100000;display:flex;align-items:center;gap:14px;
+  max-width:min(720px,calc(100vw - 24px));padding:11px 16px;
+  border:1px solid #fecaca;border-radius:10px;background:#fff7f7;
+  color:#991b1b;font:600 12px/1.4 Poppins,Arial,sans-serif;
+  box-shadow:0 8px 24px rgba(15,23,42,.16);
+}
+#bnxSessionExpiredBanner b{white-space:nowrap;font-size:13px;}
+#bnxSessionExpiredBanner span{font-weight:500;color:#7f1d1d;}
 </style>
 </head>
 <body style="visibility:hidden">
@@ -2684,6 +2852,16 @@ function clearDS(){if(!confirm('Clear saved data?'))return;localStorage.removeIt
 // INIT
 // ═══════════════════════════════════════
 window.addEventListener('DOMContentLoaded',async function(){
+  /* SESSION FIX: validate immediately, then keep the rolling server session alive. */
+  try{
+    await bnxValidateSession_(true);
+    setInterval(bnxSessionHeartbeat_,240000);
+    document.addEventListener('visibilitychange',function(){
+      if(!document.hidden) bnxSessionHeartbeat_();
+    });
+    window.addEventListener('focus',function(){ bnxSessionHeartbeat_(); });
+  }catch(e){ console.warn('[SESSION HEARTBEAT]',e); }
+
   setTheme(2);
   /* Production live mode: show only the live DSR workflow. Upload/Auto Map/SALES_STD remain in code for legacy compatibility but are hidden. */
   try{ document.querySelectorAll('#step-1,#step-2,#step-3').forEach(function(el){el.classList.remove('active');}); }catch(e){} /* professional light-blue default */
