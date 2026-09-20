@@ -7623,7 +7623,7 @@ document.addEventListener('DOMContentLoaded', function(){
     </div>
     <div class="card" id="rpt-anchor-kot-register" style="margin-bottom:14px;">
       <div class="card-header"><span class="card-title">🧾 KOT Register Report</span><div class="rpt-actions"><button class="btn btn-sm btn-ghost rpt-icon-btn" data-export-trigger title="Export" aria-label="Export" onclick="openExportFormatMenu(this,'kot-register')">📥<span class="rpt-caret">▾</span></button><button class="btn btn-sm btn-ghost rpt-icon-btn" data-print-trigger title="Print" aria-label="Print" onclick="openPrintFormatMenu(this)">🖨<span class="rpt-caret">▾</span></button><span data-send-menu="sendMenu_kot_register"></span></div></div>
-      <table class="tbl"><thead><tr><th>KOT No.</th><th>Order No.</th><th>KOT Date</th><th>Order Time</th><th>KOT Time</th><th>Table</th><th>Steward</th><th>Status</th><th>Items</th></tr></thead>
+      <table class="tbl"><thead><tr><th>KOT No.</th><th>Order No.</th><th>KOT Date</th><th>Order Time</th><th>KOT Time</th><th>Table</th><th>Steward</th><th>Status</th><th>Item ID / Item</th></tr></thead>
       <tbody><tr><td colspan="9" style="text-align:center;color:var(--text3);padding:14px;">Loading…</td></tr></tbody></table>
     </div>
     <div class="card" id="rpt-anchor-item-group-wise" style="margin-bottom:14px;"><div class="card-header"><span class="card-title">🧩 Item Group Wise Report</span><div class="rpt-actions"><button class="btn btn-sm btn-ghost rpt-icon-btn" onclick="openExportFormatMenu(this,'item-group-wise')">📥</button><button class="btn btn-sm btn-ghost rpt-icon-btn" onclick="openPrintFormatMenu(this)">🖨</button></div></div><div style="overflow:auto"><table class="tbl" style="min-width:680px"><thead><tr><th>Item Group</th><th>Category</th><th>Items</th><th>Qty</th><th>Revenue</th></tr></thead><tbody><tr><td colspan="5" style="text-align:center;color:var(--text3);padding:18px">Live invoice data will load here.</td></tr></tbody></table></div></div>
@@ -14893,99 +14893,233 @@ function quickBillFromKOT(kotNo){
   }, 60);
 }
 
-/* FIX ("KDS shows fake orders forever, disconnected from real KOTs"):
-   kdsData was a permanently hardcoded array of 7 demo tickets —
-   completely separate from bnx_open_kots, the store buildKOT()/
-   sendKOT()/steward-mobile.html all actually write to. A real order
-   never appeared here, and Accept/Reject/Mark Ready never touched any
-   real ticket. This now derives its view straight from the SAME
-   bnxGetKotStore() the KOT page reads (so this app and Steward Mobile
-   both feed it), with its own NEW→COOKING→READY→SERVED lifecycle
-   layered on the store's status field — kdsAction()/kdsReject() below
-   write straight back into that same shared store and fire the real
-   UPDATE_ORDER_STATUS sync, exactly like kotReady() already does. */
+/* FINAL KDS LIVE + ITEM_ID HISTORY FIX
+   - Server-first KDS: GET_KOT is authoritative for KOT_MASTER.
+   - Enrich KOT lines from GET_ACTIVE_ORDERS when GET_KOT does not embed items.
+   - Preserve ITEM_ID, ITEM_NAME, ITEM_GROUP_ID/NAME and category on every line.
+   - Never show an order number as the KOT number.
+   - Never fabricate KDS tickets when live data is unavailable.
+   - Bad/missing KOT timestamps are displayed as "—" instead of huge timers.
+*/
 let kdsFilter = 'all';
+window.__BNX_KDS_SERVER_ROWS = window.__BNX_KDS_SERVER_ROWS || [];
+window.__BNX_KDS_LIVE_OK = false;
+window.__BNX_KDS_LAST_SYNC = 0;
+window.__BNX_KDS_SYNC_PROMISE = null;
+
+function bnxKdsEsc_(v){
+  return String(v ?? '').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+function bnxKdsItem_(i){
+  i=i||{};
+  return {
+    itemId:String(i.ITEM_ID||i.itemId||i.id||i.itemCode||i.ITEM_CODE||'').trim(),
+    itemCode:String(i.ITEM_CODE||i.itemCode||i.code||i.ITEM_ID||'').trim(),
+    name:String(i.ITEM_NAME||i.itemName||i.name||i.ITEM||'Item').trim(),
+    qty:Number(i.QUANTITY??i.qty??i.QTY??1)||1,
+    rate:Number(i.RATE??i.rate??i.PRICE??i.price??0)||0,
+    category:String(i.ITEM_CATEGORY||i.CATEGORY||i.category||i.CATEGORY_NAME||'').trim(),
+    groupId:String(i.ITEM_GROUP_ID||i.itemGroupId||i.GROUP_ID||'').trim(),
+    groupName:String(i.ITEM_GROUP_NAME||i.itemGroupName||i.GROUP_NAME||'').trim(),
+    station:String(i.STATION||i.station||i.PRINT_TO||i.printTo||'').trim()
+  };
+}
+function bnxKdsValidTime_(v){
+  if(v===null||v===undefined||v==='') return '';
+  const d=new Date(v);
+  return isNaN(d.getTime()) ? '' : d.toISOString();
+}
 function bnxKdsTimerLabel(iso){
-  const mins = bnxKotElapsedMin(iso);
+  const t=bnxKdsValidTime_(iso);
+  if(!t) return '—';
+  const mins=Math.max(0, Math.round((Date.now()-new Date(t).getTime())/60000));
   const h=Math.floor(mins/60), m=mins%60;
   return (h?String(h).padStart(2,'0')+':':'')+String(m).padStart(2,'0')+':00';
 }
 function bnxKdsMapStatus(s){
   const u=String(s||'NEW').toUpperCase();
-  if(u==='COOKING') return 'cooking';
+  if(['COOKING','PREPARING','IN_PROGRESS','PROGRESS'].includes(u)) return 'cooking';
   if(u==='READY') return 'ready';
-  if(u==='SERVED'||u==='BILLED') return 'served';
+  if(['SERVED','BILLED','COMPLETED'].includes(u)) return 'served';
   return 'new';
 }
+function bnxKdsExtractItems_(k){
+  const a=Array.isArray(k?.items)?k.items:
+          Array.isArray(k?.itemsDetail)?k.itemsDetail:
+          Array.isArray(k?.ITEMS)?k.ITEMS:[];
+  return a.map(bnxKdsItem_).filter(x=>x.name);
+}
+function bnxKdsOrderKey_(v){
+  return String(v||'').trim().toUpperCase();
+}
+function bnxKdsBuildServerRows_(kotRows, orderRows){
+  const orders={};
+  (Array.isArray(orderRows)?orderRows:[]).forEach(o=>{
+    const keys=[o.ORDER_ID,o.ORDER_NUMBER,o.ORDER_NO,o.orderId,o.orderNo].map(bnxKdsOrderKey_).filter(Boolean);
+    keys.forEach(k=>{orders[k]=o;});
+  });
+  const sm={PRINTED:'NEW',NEW:'NEW',PENDING:'NEW',KOT_PRINTED:'NEW',
+    COOKING:'COOKING',PREPARING:'COOKING',IN_PROGRESS:'COOKING',PROGRESS:'COOKING',
+    READY:'READY',SERVED:'SERVED',BILLED:'SERVED',COMPLETED:'SERVED'};
+  return (Array.isArray(kotRows)?kotRows:[]).map(k=>{
+    const kotNo=String(k.KOT_NUMBER||k.kotNumber||k.KOT_NO||'').trim();
+    if(!kotNo) return null;
+    const orderKey=bnxKdsOrderKey_(k.ORDER_ID||k.ORDER_NUMBER||k.ORDER_NO);
+    const order=orders[orderKey]||{};
+    let items=bnxKdsExtractItems_(k);
+    if(!items.length) items=bnxKdsExtractItems_(order);
+    const started=bnxKdsValidTime_(k.STARTED_AT||k.startedAt||k.CREATED_AT||k.createdAt);
+    const rawStatus=String(k.KOT_STATUS||k.status||'PRINTED').toUpperCase();
+    return {
+      kotNo,
+      orderNo:String(k.ORDER_ID||k.ORDER_NUMBER||k.ORDER_NO||order.ORDER_NUMBER||order.ORDER_NO||'').trim(),
+      table:String(k.TABLE_ID||k.table||order.TABLE_ID||'—').trim()||'—',
+      type:String(k.PRINT_TO||k.STATION||'').toUpperCase()==='BAR' || kotNo.toUpperCase().startsWith('BAR-')?'BAR':'KITCHEN',
+      waiter:String(k.STARTED_BY||k.PREPARED_BY||order.CREATED_BY||order.STEWARD_NAME||'').trim(),
+      covers:Number(k.COVERS??order.PAX??0)||0,
+      time:started,
+      status:sm[rawStatus]||'NEW',
+      items,
+      serverKotId:String(k.KOT_ID||'').trim(),
+      live:true
+    };
+  }).filter(Boolean);
+}
+async function bnxRefreshKdsLive_(){
+  if(typeof gasApi!=='function'||!window.CLIENT_ID) return false;
+  if(window.__BNX_KDS_SYNC_PROMISE) return window.__BNX_KDS_SYNC_PROMISE;
+  window.__BNX_KDS_SYNC_PROMISE=(async()=>{
+    try{
+      const kotRes=await gasApi('GET_KOT',{includeClosed:false,reportMode:true},'V2_CORE');
+      if(!kotRes?.success) throw new Error(kotRes?.message||'GET_KOT failed');
+      const kotRows=Array.isArray(kotRes.data)?kotRes.data:[];
+      let orderRows=[];
+      /* GET_KOT is authoritative for the ticket, but some backend builds
+         return only KOT_MASTER columns. GET_ACTIVE_ORDERS is used only to
+         enrich the same ticket with its real ORDER_ITEMS/ITEM_ID values. */
+      try{
+        const ordRes=await erpApi({action:'GET_ACTIVE_ORDERS'},'V2_CORE');
+        if(ordRes?.success){
+          orderRows=Array.isArray(ordRes.data?.orders)?ordRes.data.orders:
+                    Array.isArray(ordRes.data)?ordRes.data:[];
+        }
+      }catch(e){}
+      const rows=bnxKdsBuildServerRows_(kotRows,orderRows);
+      window.__BNX_KDS_SERVER_ROWS=rows;
+      window.__BNX_KDS_LIVE_OK=true;
+      window.__BNX_KDS_LAST_SYNC=Date.now();
+      let local=[];try{local=JSON.parse(bnxGetOpenKotsRaw()||'[]');}catch(e){}
+      const liveNos=new Set(rows.map(x=>x.kotNo));
+      const localPending=local.filter(x=>x?.syncPending===true&&!liveNos.has(String(x.kotNo||'')));
+      const merged=rows.concat(localPending).slice(0,100);
+      bnxSetOpenKotsRaw(JSON.stringify(merged));
+      return true;
+    }catch(e){
+      window.__BNX_KDS_LIVE_OK=false;
+      console.warn('[KDS LIVE]',e?.message||e);
+      return false;
+    }finally{
+      window.__BNX_KDS_SYNC_PROMISE=null;
+    }
+  })();
+  return window.__BNX_KDS_SYNC_PROMISE;
+}
 function bnxGetKdsData(){
-  return bnxGetKotStore().filter(k=>k.status!=='CANCELLED').map(k=>({
-    kotNo: k.kotNo, table: k.table, order: '#'+k.kotNo,
-    status: bnxKdsMapStatus(k.status),
-    timer: bnxKdsTimerLabel(k.time),
-    items: (k.items||[]).map(i=>(i.qty||1)+'× '+(i.name||i.n))
+  if(window.__BNX_KDS_LIVE_OK && Array.isArray(window.__BNX_KDS_SERVER_ROWS))
+    return window.__BNX_KDS_SERVER_ROWS.filter(k=>k.status!=='served');
+  return bnxGetKotStore().filter(k=>!['CANCELLED','SERVED','BILLED'].includes(String(k.status||'').toUpperCase())).map(k=>({
+    kotNo:k.kotNo, table:k.table||'—', orderNo:k.orderNo||'', order:'#'+String(k.kotNo||''),
+    status:bnxKdsMapStatus(k.status), timer:bnxKdsTimerLabel(k.time), items:(k.items||[]).map(bnxKdsItem_)
   }));
+}
+function bnxKdsRenderItems_(items){
+  if(!items?.length) return '<li style="list-style:none;color:var(--text3);font-size:10px;padding:4px 0;">⚠ No item lines returned</li>';
+  return items.map(i=>{
+    const id=i.itemId||'ITEM_ID pending';
+    const nm=bnxKdsEsc_(i.name);
+    return `<li style="display:flex;gap:7px;align-items:flex-start;">
+      <span style="font-weight:800;min-width:28px;">${Number(i.qty)||1}×</span>
+      <span style="flex:1;"><b>${nm}</b><small style="display:block;color:var(--text3);font-family:monospace;font-size:8.5px;">${bnxKdsEsc_(id)}</small></span>
+    </li>`;
+  }).join('');
 }
 function buildKDS(){
   const g=document.getElementById('kdsGrid'); if(!g) return;
-  const kdsData = bnxGetKdsData();
-  const visible = kdsFilter==='all' ? kdsData : kdsData.filter(k=>k.status===kdsFilter);
+  const kdsData=bnxGetKdsData();
+  const visible=kdsFilter==='all'?kdsData:kdsData.filter(k=>k.status===kdsFilter);
   const lbls={new:'🆕 New Order',cooking:'🔥 Cooking',ready:'✅ Ready to Serve',served:'🍽️ Served'};
   const btntxt={new:'▶ Accept & Start Cooking',cooking:'✅ Mark Ready',ready:'🍽️ Mark Served'};
-  g.innerHTML = visible.length ? visible.map(k=>{
-    return `<div class="kds-card kds-${k.status}">
-      <div class="kds-timer">${k.timer}</div>
-      <div class="kds-id">${k.order}</div>
-      <div class="kds-table">📍 ${k.table}</div>
-      <ul class="kds-items">${k.items.map(i=>`<li class="${k.status==='ready'||k.status==='served'?'done':''}">${i}</li>`).join('')}</ul>
-      ${k.status!=='served' ? `<button class="btn-full ${k.status==='ready'?'grn':'sec'}" style="font-size:11px;margin-bottom:5px;" onclick="kdsAction('${k.kotNo}')">${btntxt[k.status]}</button>` : ''}
-      ${k.status==='new' ? `<button class="btn-full" style="font-size:11px;margin-bottom:5px;background:var(--red);color:#fff;" onclick="kdsReject('${k.kotNo}')">✖ Reject to Manager</button>` : ''}
-      <div style="text-align:center;font-size:10px;color:var(--text3);">${lbls[k.status]}</div>
+  const topNote=window.__BNX_KDS_LIVE_OK
+    ? `<div style="grid-column:1/-1;font-size:10px;color:var(--green);padding:0 4px 5px;">● LIVE · KOT_MASTER + KOT_ITEMS · ${kdsData.length} active ticket(s)</div>`
+    : `<div style="grid-column:1/-1;font-size:10px;color:var(--gold);padding:0 4px 5px;">⚠️ Live data unavailable · retrying server sync…</div>`;
+  g.innerHTML=topNote+(visible.length?visible.map(k=>{
+    const status=k.status;
+    const orderLabel=k.orderNo ? 'Order '+bnxKdsEsc_(k.orderNo) : 'KOT '+bnxKdsEsc_(k.kotNo);
+    return `<div class="kds-card kds-${status}">
+      <div class="kds-timer">${bnxKdsTimerLabel(k.time)}</div>
+      <div class="kds-id">KOT ${bnxKdsEsc_(k.kotNo)} · ${orderLabel}</div>
+      <div class="kds-table">📍 ${bnxKdsEsc_(k.table)}</div>
+      <ul class="kds-items">${bnxKdsRenderItems_(k.items)}</ul>
+      ${status!=='served' ? `<button class="btn-full ${status==='ready'?'grn':'sec'}" style="font-size:11px;margin-bottom:5px;" onclick="kdsAction('${bnxKdsEsc_(k.kotNo)}')">${btntxt[status]||'Update'}</button>` : ''}
+      ${status==='new' ? `<button class="btn-full" style="font-size:11px;margin-bottom:5px;background:var(--red);color:#fff;" onclick="kdsReject('${bnxKdsEsc_(k.kotNo)}')">✖ Reject to Manager</button>` : ''}
+      <div style="text-align:center;font-size:10px;color:var(--text3);">${lbls[status]||status}</div>
     </div>`;
-  }).join('') : '<div style="grid-column:1/-1;text-align:center;padding:30px;color:var(--text3);font-size:13px;">No orders in this status.</div>';
+  }).join(''):'<div style="grid-column:1/-1;text-align:center;padding:30px;color:var(--text3);font-size:13px;">No live KOT orders in this status.</div>');
   kdsUpdateCounts();
 }
 function kdsUpdateCounts(){
-  const kdsData = bnxGetKdsData();
-  const cnt = {new:0,cooking:0,ready:0};
-  kdsData.forEach(k=>{ if (cnt[k.status]!=null) cnt[k.status]++; });
-  const wrap = document.querySelector('#page-kitchen .section-h > div:last-child');
-  if (!wrap) return;
-  wrap.innerHTML = `
-    <span class="pill p-b" style="padding:4px 10px;cursor:pointer;${kdsFilter==='new'?'outline:2px solid var(--gold);':''}" onclick="kdsSetFilter('new')">🆕 New (${cnt.new})</span>
+  const kdsData=bnxGetKdsData();
+  const cnt={new:0,cooking:0,ready:0};
+  kdsData.forEach(k=>{if(cnt[k.status]!=null)cnt[k.status]++;});
+  const wrap=document.querySelector('#page-kitchen .section-h > div:last-child'); if(!wrap)return;
+  wrap.innerHTML=`<span class="pill p-b" style="padding:4px 10px;cursor:pointer;${kdsFilter==='new'?'outline:2px solid var(--gold);':''}" onclick="kdsSetFilter('new')">🆕 New (${cnt.new})</span>
     <span class="pill p-o" style="padding:4px 10px;cursor:pointer;${kdsFilter==='cooking'?'outline:2px solid var(--gold);':''}" onclick="kdsSetFilter('cooking')">🔥 Cooking (${cnt.cooking})</span>
     <span class="pill p-g" style="padding:4px 10px;cursor:pointer;${kdsFilter==='ready'?'outline:2px solid var(--gold);':''}" onclick="kdsSetFilter('ready')">✅ Ready (${cnt.ready})</span>
     <span class="pill" style="padding:4px 10px;cursor:pointer;background:var(--surface2);${kdsFilter==='all'?'outline:2px solid var(--gold);':''}" onclick="kdsSetFilter('all')">All</span>
-    <button class="btn btn-sm btn-ghost" onclick="buildKDS()">🔄 Refresh</button>
-  `;
+    <button class="btn btn-sm btn-ghost" onclick="bnxRefreshKdsLive_().then(buildKDS)">🔄 Refresh</button>`;
 }
-function kdsSetFilter(f){ kdsFilter = f; buildKDS(); }
-function kdsAction(kotNo){
-  const next = { new:'COOKING', cooking:'READY', ready:'SERVED' };
-  let open = []; try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
-  const rec = open.find(k=>k.kotNo===kotNo);
-  if(!rec) return; // demo sample card — nothing real to persist
-  const cur = bnxKdsMapStatus(rec.status);
-  const n = next[cur]; if(!n) return;
-  rec.status = n;
-  bnxSetOpenKotsRaw(JSON.stringify(open));
-  const msg = { COOKING:'🔥 Kitchen accepted — cooking started', READY:'✅ Marked Ready to Serve', SERVED:'🍽️ Served' };
-  if (typeof showNotif === 'function') showNotif(msg[n] || 'Updated', 'success');
+function kdsSetFilter(f){kdsFilter=f;buildKDS();}
+async function kdsAction(kotNo){
+  const next={new:'COOKING',cooking:'READY',ready:'SERVED'};
+  const live=(window.__BNX_KDS_SERVER_ROWS||[]).find(k=>String(k.kotNo)===String(kotNo));
+  let open=[];try{open=JSON.parse(bnxGetOpenKotsRaw()||'[]');}catch(e){}
+  const rec=open.find(k=>String(k.kotNo)===String(kotNo));
+  const cur=bnxKdsMapStatus(live?.status||rec?.status||'NEW');
+  const n=next[cur];if(!n)return;
+  if(rec){rec.status=n;bnxSetOpenKotsRaw(JSON.stringify(open));}
+  const idx=(window.__BNX_KDS_SERVER_ROWS||[]).findIndex(k=>String(k.kotNo)===String(kotNo));
+  if(idx>=0)window.__BNX_KDS_SERVER_ROWS[idx].status=bnxKdsMapStatus(n);
+  if(typeof showNotif==='function')showNotif(n==='COOKING'?'🔥 Kitchen accepted — cooking started':n==='READY'?'✅ Marked Ready to Serve':'🍽️ Served','success');
   buildKDS();
-  bnxGuaranteedSync('UPDATE_ORDER_STATUS', {orderId:kotNo, status:n});
+  try{await bnxGuaranteedSync('UPDATE_ORDER_STATUS',{orderId:live?.orderNo||rec?.orderNo||kotNo,status:n});}catch(e){}
+  await bnxRefreshKdsLive_(); buildKDS();
 }
-function kdsReject(kotNo){
-  let open = []; try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
-  const rec = open.find(k=>k.kotNo===kotNo);
-  if(!rec) return;
-  const reason = prompt('Reject '+kotNo+' ('+rec.table+') to Manager — reason?', 'Item unavailable');
-  if (reason===null) return;
-  rec.status='CANCELLED'; rec.cancelReason=reason;
-  bnxSetOpenKotsRaw(JSON.stringify(open));
-  if (typeof showNotif === 'function') showNotif('⚠️ '+kotNo+' rejected to Manager — '+reason, 'error');
-  buildKDS();
-  bnxGuaranteedSync('UPDATE_ORDER_STATUS', {orderId:kotNo, status:'CANCELLED', remarks:reason});
+async function kdsReject(kotNo){
+  const live=(window.__BNX_KDS_SERVER_ROWS||[]).find(k=>String(k.kotNo)===String(kotNo));
+  let open=[];try{open=JSON.parse(bnxGetOpenKotsRaw()||'[]');}catch(e){}
+  const rec=open.find(k=>String(k.kotNo)===String(kotNo));
+  const reason=prompt('Reject '+kotNo+' ('+(live?.table||rec?.table||'—')+') to Manager — reason?','Item unavailable');
+  if(reason===null)return;
+  if(rec){rec.status='CANCELLED';bnxSetOpenKotsRaw(JSON.stringify(open));}
+  const idx=(window.__BNX_KDS_SERVER_ROWS||[]).findIndex(k=>String(k.kotNo)===String(kotNo));
+  if(idx>=0)window.__BNX_KDS_SERVER_ROWS[idx].status='served';
+  if(typeof showNotif==='function')showNotif('⚠️ '+kotNo+' rejected to Manager — '+reason,'error');
+  try{await bnxGuaranteedSync('UPDATE_ORDER_STATUS',{orderId:live?.orderNo||rec?.orderNo||kotNo,status:'CANCELLED',remarks:reason});}catch(e){}
+  await bnxRefreshKdsLive_();buildKDS();
 }
-setInterval(()=>{ if (document.getElementById('page-kitchen')?.classList.contains('active')) buildKDS(); }, 12000);
+/* Initial server refresh + periodic live refresh. Never replace a real
+   server result with demo/sample tickets. */
+(async function bnxKdsInitialLiveLoad_(){
+  try{
+    await bnxRefreshKdsLive_();
+    if(document.getElementById('page-kitchen')?.classList.contains('active'))buildKDS();
+  }catch(e){}
+})();
+setInterval(async()=>{
+  if(document.getElementById('page-kitchen')?.classList.contains('active')){
+    await bnxRefreshKdsLive_(); buildKDS();
+  }
+},12000);
 
 /* ── BILLING ── */
 function selBillPay(btn){ document.querySelectorAll('.bill-preview .pay-opt').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); }
@@ -24272,7 +24406,10 @@ function bnxRenderKotRegisterReport(from,to){
     const rows=(res&&res.success&&Array.isArray(res.data))?res.data:[];
     const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
     tbody.innerHTML=rows.length?rows.map(k=>{
-      const items=(k.items||k.itemsDetail||[]).map(i=>esc((i.name||i.itemName||'Item')+' × '+(i.qty||0))).join(', ')||'—';
+      const items=(k.items||k.itemsDetail||[]).map(i=>{
+        const iid=i.ITEM_ID||i.itemId||i.id||i.ITEM_CODE||i.itemCode||'ITEM_ID pending';
+        return `<div><span class="mono">${esc(iid)}</span> · ${esc(i.name||i.itemName||i.ITEM_NAME||'Item')} × ${esc(i.qty||i.QUANTITY||0)}</div>`;
+      }).join('')||'—';
       return `<tr><td class="mono">${esc(k.KOT_NUMBER||'—')}</td><td class="mono">${esc(k.ORDER_ID||'—')}</td><td class="mono">${esc(k.KOT_DATE||'—')}</td><td class="mono">${esc(k.ORDER_TIME||k.orderTime||'—')}</td><td class="mono">${esc(k.KOT_TIME||'—')}</td><td>${esc(k.TABLE_ID||'—')}</td><td>${esc(k.STARTED_BY||'—')}</td><td>${esc(k.KOT_STATUS||'PRINTED')}</td><td>${items}</td></tr>`;
     }).join('') + `<tr class="rpt-total-row"><td colspan="8">TOTAL KOTs</td><td class="mono">${rows.length}</td></tr>`:'<tr><td colspan="9" style="text-align:center;color:var(--text3);padding:14px;">No KOT records for this range yet.</td></tr>';
     const note=card.querySelector('.rpt-live-note')||(()=>{const d=document.createElement('div');d.className='rpt-live-note';d.style.cssText='text-align:center;font-size:10px;color:var(--text3);margin-top:6px;';tbody.closest('table').insertAdjacentElement('afterend',d);return d;})();
@@ -27551,8 +27688,11 @@ document.addEventListener('DOMContentLoaded',()=>{try{bnxClearKnownStaticTables_
           const tbody=card?.querySelector('table tbody');
           const rows=Array.isArray(res.data)?res.data:[];
           if(tbody) tbody.innerHTML=rows.length?rows.map(k=>{
-            const items=(k.items||k.itemsDetail||[]).map(i=>String(i.name||i.itemName||'Item')+' × '+(i.qty||0)).join(', ')||'—';
             const esc=x=>String(x??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+            const items=(k.items||k.itemsDetail||[]).map(i=>{
+              const iid=i.ITEM_ID||i.itemId||i.id||i.ITEM_CODE||i.itemCode||'ITEM_ID pending';
+              return `<div><span class="mono">${esc(iid)}</span> · ${esc(i.name||i.itemName||i.ITEM_NAME||'Item')} × ${esc(i.qty||i.QUANTITY||0)}</div>`;
+            }).join('')||'—';
             return `<tr><td class="mono">${esc(k.KOT_NUMBER||'—')}</td><td class="mono">${esc(k.ORDER_ID||k.ORDER_NUMBER||'—')}</td><td class="mono">${esc(k.KOT_DATE||'—')}</td><td class="mono">${esc(k.ORDER_TIME||'—')}</td><td class="mono">${esc(k.KOT_TIME||'—')}</td><td>${esc(k.TABLE_ID||'—')}</td><td>${esc(k.STARTED_BY||'—')}</td><td>${esc(k.KOT_STATUS||'PRINTED')}</td><td>${esc(items)}</td></tr>`;
           }).join(''):'<tr><td colspan="9" style="text-align:center;color:var(--text3);padding:18px;">No KOT records in the selected range.</td></tr>';
           let n=card?.querySelector('.rpt-live-note');if(card&&!n){n=document.createElement('div');n.className='rpt-live-note';n.style.cssText='text-align:center;font-size:10px;color:var(--text3);margin-top:6px;';card.querySelector('table')?.insertAdjacentElement('afterend',n);}if(n)n.textContent='✅ LIVE · '+rows.length+' KOT record(s) from this client TRANSACTION_DB';
@@ -32962,189 +33102,870 @@ mo.observe(document.body,{subtree:true,childList:true});
 })();
 </script>
 
-<!-- FINAL MONTHLY DSR REPORT FIX — 2026-09-20
-     Date calendar + Gross Before GST + Net Including GST + page sizing.
-     Existing live report logic remains the source of data. -->
-<style id="bnx-monthly-dsr-final-20260920">
-/* Keep Reports Hub usable on desktop: report uses the available content width
-   and horizontal scroll only inside the wide monthly matrix. */
-#page-reports{
-  overflow:auto!important;
-}
-#page-reports .dsr-monthly-wrap,
-#page-reports #dsr-csv,
-#page-reports .monthly-dsr-wrap{
-  max-width:100%!important;
-  width:100%!important;
-  box-sizing:border-box!important;
-}
-#page-reports #dsrMonthlyTable,
-#page-reports .dsr-monthly-table,
-#page-reports table.dsr-monthly{
-  width:max-content!important;
-  min-width:100%!important;
-  border-collapse:collapse!important;
-}
-#page-reports .dsr-monthly-scroll,
-#page-reports #dsrMonthlyScroll{
-  max-width:100%!important;
-  overflow-x:auto!important;
-  overflow-y:visible!important;
-}
-
-/* Clear labels: Gross excludes GST; Net includes GST. */
-#page-reports .bnx-gross-before-tax,
-#page-reports [data-dsr-total="gross"]{
-  background:#ffe36b!important;
-  font-weight:800!important;
-}
-#page-reports .bnx-net-including-tax,
-#page-reports [data-dsr-total="net"]{
-  background:#ffe36b!important;
-  font-weight:800!important;
-}
-</style>
-
-<script id="bnx-monthly-dsr-final-20260920">
+<script id="bnx-final-report-drilldown-gst-fix">
 (function(){
   'use strict';
 
-  function num_(v){
-    var n=Number(String(v==null?'':v).replace(/[^0-9.\-]/g,''));
-    return isFinite(n)?n:0;
-  }
-  function money_(v){
-    return num_(v).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
-  }
+  const money=v=>'₹'+Number(v||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const num=v=>Number(v)||0;
+  const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  const key=v=>String(v==null?'':v).trim().toLowerCase();
 
-  /* Add a real month calendar immediately above the Monthly DSR table,
-     without replacing the existing report controls. */
-  function ensureMonthCalendar_(){
-    var host=document.getElementById('dsr-csv') ||
-             document.querySelector('#page-reports [id*="dsr"]');
-    if(!host || document.getElementById('bnxMonthlyDsrMonth')) return;
-
-    var box=document.createElement('div');
-    box.id='bnxMonthlyDsrControls';
-    box.style.cssText='display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 10px;margin:6px 0;background:#faf7ef;border:1px solid #e5d9c6;border-radius:8px;';
-    box.innerHTML=
-      '<label style="font-weight:800;font-size:12px;">📅 Report Month</label>'+
-      '<input id="bnxMonthlyDsrMonth" type="month" style="height:34px;padding:5px 9px;border:1px solid #cdbb9c;border-radius:7px;font-weight:700;">'+
-      '<button type="button" id="bnxMonthlyDsrToday" style="height:34px;padding:5px 12px;border:1px solid #cdbb9c;border-radius:7px;background:#fff;font-weight:700;">Current Month</button>'+
-      '<span id="bnxMonthlyDsrHint" style="font-size:11px;color:#777;">Select month to refresh the live DSR matrix.</span>';
-
-    host.insertBefore(box,host.firstChild);
-
-    var input=document.getElementById('bnxMonthlyDsrMonth');
-    var now=new Date();
-    input.value=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0');
-
-    function applyMonth_(){
-      var v=input.value;
-      if(!v) return;
-
-      /* Reuse the existing report's date/month controls when present. */
-      ['dsrMonth','monthlyDsrMonth','reportMonth','monthFilter'].forEach(function(id){
-        var el=document.getElementById(id);
-        if(el && el!==input){
-          if(el.type==='month') el.value=v;
-          else if(el.value!==undefined) el.value=v;
-          el.dispatchEvent(new Event('change',{bubbles:true}));
-        }
-      });
-
-      /* Existing report renderers are called if exposed. */
-      var fns=['loadMonthlyDSR','renderMonthlyDSR','refreshMonthlyDSR','loadDsrCsv','renderDsrCsv'];
-      for(var i=0;i<fns.length;i++){
-        try{
-          if(typeof window[fns[i]]==='function'){
-            window[fns[i]](v);
-            break;
-          }
-        }catch(e){}
-      }
-      var hint=document.getElementById('bnxMonthlyDsrHint');
-      if(hint) hint.textContent='Live DSR month: '+v;
+  /* ---------------------------------------------------------------
+     AUTHORITATIVE DASHBOARD TOTALS
+     Use BILL_MASTER/GET_BILLS header values for Gross, Taxable and GST.
+     The previous dashboard path calculated GST as GRAND_TOTAL - REVENUE;
+     that is unsafe when the backend's revenue/taxable aggregate is stale
+     or based on a different source. Invoice TAX_AMOUNT is the authority.
+  ---------------------------------------------------------------- */
+  let dashBillCacheKey='', dashBillCacheAt=0, dashBillCachePromise=null;
+  async function getAuthoritativeBills_(from,to){
+    const k=String(from||'')+'|'+String(to||'');
+    const now=Date.now();
+    if(dashBillCachePromise && dashBillCacheKey===k) return dashBillCachePromise;
+    if(window.__BNX_AUTH_BILLS_CACHE__ && window.__BNX_AUTH_BILLS_CACHE__.key===k &&
+       now-window.__BNX_AUTH_BILLS_CACHE__.at<15000){
+      return window.__BNX_AUTH_BILLS_CACHE__.promise;
     }
-
-    input.addEventListener('change',applyMonth_);
-    document.getElementById('bnxMonthlyDsrToday').addEventListener('click',function(){
-      var n=new Date();
-      input.value=n.getFullYear()+'-'+String(n.getMonth()+1).padStart(2,'0');
-      applyMonth_();
-    });
-  }
-
-  /* Normalize visible monthly DSR totals from component rows.
-     Gross = Liquor + Liquor MRP + Food + Beverage + HashFreezer + Others
-     Net = Gross + Tax + Round Off
-     Therefore GST is never included in Gross. */
-  function normalizeMonthlyTotals_(){
-    try{
-      var table=document.getElementById('dsrMonthlyTable') ||
-                 document.querySelector('#page-reports table');
-      if(!table) return;
-
-      var rows=Array.from(table.querySelectorAll('tr'));
-      var byLabel={};
-      rows.forEach(function(tr){
-        var cells=tr.querySelectorAll('th,td');
-        if(!cells.length) return;
-        var label=(cells[0].textContent||'').trim().toLowerCase();
-        if(label) byLabel[label]=tr;
+    dashBillCacheKey=k;
+    dashBillCachePromise=(async()=>{
+      const p={FROM_DATE:from||'',TO_DATE:to||'',BUSINESS_DATE:from||''};
+      const r=await gasApi('GET_BILLS',p,'V2_CORE');
+      if(!r || r.success===false) throw new Error(r?.error||'GET_BILLS failed');
+      const rows=Array.isArray(r.data)?r.data:(Array.isArray(r.bills)?r.bills:(Array.isArray(r.data?.rows)?r.data.rows:[]));
+      return rows.filter(b=>{
+        const st=String(b.BILL_STATUS??b.status??'').toUpperCase();
+        return st!=='CANCELLED' && st!=='VOID';
       });
+    })();
+    window.__BNX_AUTH_BILLS_CACHE__={key:k,at:now,promise:dashBillCachePromise};
+    return dashBillCachePromise;
+  }
 
-      var componentLabels=['liquor','liquor mrp','food','beverage','hashfreezer','others'];
-      var taxRow=byLabel['tax'];
-      var roundRow=byLabel['round off'];
-      var grossRow=byLabel['gross sale'];
-      var netRow=byLabel['net sale'];
-      if(!grossRow || !netRow) return;
-
-      var grossCells=grossRow.querySelectorAll('th,td');
-      var netCells=netRow.querySelectorAll('th,td');
-      var max=Math.max(grossCells.length,netCells.length);
-
-      for(var c=1;c<max;c++){
-        var gross=0;
-        componentLabels.forEach(function(lbl){
-          var tr=byLabel[lbl];
-          if(tr){
-            var cells=tr.querySelectorAll('th,td');
-            gross += c<cells.length ? num_(cells[c].textContent) : 0;
-          }
-        });
-        var tax=taxRow ? (c<taxRow.querySelectorAll('th,td').length ? num_(taxRow.querySelectorAll('th,td')[c].textContent):0) : 0;
-        var round=roundRow ? (c<roundRow.querySelectorAll('th,td').length ? num_(roundRow.querySelectorAll('th,td')[c].textContent):0) : 0;
-        var net=gross+tax+round;
-
-        if(c<grossCells.length) grossCells[c].textContent=money_(gross);
-        if(c<netCells.length) netCells[c].textContent=money_(net);
+  async function refreshDashboardAuthoritative_(){
+    try{
+      if(typeof bnxDashRangeParams_!=='function') return;
+      const rp=bnxDashRangeParams_()||{};
+      let from='',to='';
+      if(rp.range==='custom' && rp.from && rp.to){from=String(rp.from);to=String(rp.to);}
+      else if(rp.range==='today'||!rp.range){
+        from=to=(typeof getBusinessDate==='function'?getBusinessDate():new Date().toISOString().slice(0,10));
+      } else if(typeof _rptRangeDates_==='function'){
+        const x=_rptRangeDates_(rp.range); from=x[0];to=x[1];
+      } else {
+        /* The dashboard already supplies range values to its own summary;
+           if a non-custom range cannot be resolved here, leave the summary
+           untouched rather than guessing a date. */
+        return;
       }
-
-      grossRow.classList.add('bnx-gross-before-tax');
-      netRow.classList.add('bnx-net-including-tax');
-      if(grossCells[0]) grossCells[0].textContent='Gross Sale (Before GST)';
-      if(netCells[0]) netCells[0].textContent='Net Sale (Including GST)';
-    }catch(e){}
+      if(!from||!to)return;
+      const bills=await getAuthoritativeBills_(from,to);
+      let gross=0,tax=0,taxable=0,covers=0;
+      bills.forEach(b=>{
+        const grand=num(b.GRAND_TOTAL??b.total);
+        const tx=num(b.TAX_AMOUNT??b.tax);
+        const round=num(b.ROUND_OFF??b.roundOff);
+        const traw=b.TAXABLE_AMOUNT;
+        const t=Number(traw);
+        const tb=Number.isFinite(t) && (t!==0 || grand===0) ? t : Math.max(0,grand-tx-round);
+        gross+=grand; tax+=tx; taxable+=tb; covers+=num(b.COVERS??b.pax);
+      });
+      const set=(id,v)=>{const e=document.getElementById(id);if(e){e.textContent=money(v);e.dataset.bnxLive='1';}};
+      const setN=(id,v)=>{const e=document.getElementById(id);if(e){e.textContent=String(v);e.dataset.bnxLive='1';}};
+      set('d-gross',gross);
+      set('d-gst',tax);
+      set('d-rev',taxable);
+      set('h-rev',taxable);
+      set('rpt-rev',taxable);
+      setN('d-ord',bills.length);
+      setN('d-cov',covers);
+      set('d-avgbill',bills.length?gross/bills.length:0);
+      set('d-op-avgspend',covers?gross/covers:0);
+      window.__bnxAuthoritativeDashboardTotals__={from,to,gross,tax,taxable,bills:bills.length,covers,at:Date.now()};
+      const d=window.__bnxLastDashboardSummary;
+      if(d && typeof d==='object'){
+        d.totalSales=gross;
+        d.taxTotal=tax;
+        d.revenue=taxable;
+        d.orders=bills.length;
+        d.covers=covers;
+      }
+    }catch(e){
+      console.warn('[Dashboard] authoritative invoice totals unavailable:',e?.message||e);
+    }
   }
 
-  function init_(){
-    ensureMonthCalendar_();
-    [100,500,1200,2500].forEach(function(ms){
-      setTimeout(normalizeMonthlyTotals_,ms);
+  /* Wrap the existing loadDashboard without changing its UI. */
+  try{
+    const oldLoadDashboard=window.loadDashboard;
+    if(typeof oldLoadDashboard==='function' && !oldLoadDashboard.__bnxAuthWrapped){
+      const wrapped=async function(){
+        const result=await oldLoadDashboard.apply(this,arguments);
+        refreshDashboardAuthoritative_();
+        return result;
+      };
+      wrapped.__bnxAuthWrapped=true;
+      window.loadDashboard=wrapped;
+    }
+  }catch(e){}
+
+  /* Also correct the currently displayed dashboard after any existing
+     startup load finishes, without polling the server repeatedly. */
+  document.addEventListener('DOMContentLoaded',()=>setTimeout(refreshDashboardAuthoritative_,250));
+
+  /* ---------------------------------------------------------------
+     CATEGORY → ITEM GROUP → ITEM → TRANSACTION INVOICE
+     One live item-sales fetch supplies the hierarchy. Invoice details
+     come from the same selected period via GET_BILLS. Results are cached
+     for 20 seconds so moving between drill levels is instant.
+  ---------------------------------------------------------------- */
+  let drillCache={key:'',at:0,itemRows:[],bills:[]};
+  let drillLoading=null;
+
+  async function getDrillData_(from,to){
+    const k=String(from||'')+'|'+String(to||'');
+    if(drillCache.key===k && Date.now()-drillCache.at<20000) return drillCache;
+    if(drillLoading && drillLoading.key===k) return drillLoading.promise;
+    const promise=(async()=>{
+      const p={range:'custom',from,to,FROM_DATE:from,TO_DATE:to};
+      const [ir,br]=await Promise.all([
+        gasApi('GET_ITEM_SALES_REPORT',p,'V2_CORE'),
+        gasApi('GET_BILLS',{FROM_DATE:from,TO_DATE:to,BUSINESS_DATE:from,range:'custom',from,to},'V2_CORE')
+      ]);
+      if(!ir || ir.success===false) throw new Error(ir?.error||'Item sales report unavailable');
+      if(!br || br.success===false) throw new Error(br?.error||'Invoice register unavailable');
+      const itemRows=Array.isArray(ir?.data?.rows)?ir.data.rows:[];
+      const bills=Array.isArray(br.data)?br.data:(Array.isArray(br.bills)?br.bills:(Array.isArray(br.data?.rows)?br.data.rows:[]));
+      const liveBills=bills.filter(b=>{const st=String(b.BILL_STATUS??b.status??'').toUpperCase();return st!=='CANCELLED'&&st!=='VOID';});
+      drillCache={key:k,at:Date.now(),itemRows,bills:liveBills};
+      return drillCache;
+    })();
+    drillLoading={key:k,promise};
+    try{return await promise;}finally{if(drillLoading?.key===k)drillLoading=null;}
+  }
+
+  function selectedRange_(){
+    const from=document.getElementById('rptFrom')?.value||'';
+    const to=document.getElementById('rptTo')?.value||from;
+    return {from,to};
+  }
+
+  function ensureDrillBar_(card){
+    let bar=card.querySelector('.bnx-cat-drill-bar');
+    if(!bar){
+      bar=document.createElement('div');
+      bar.className='bnx-cat-drill-bar';
+      bar.style.cssText='display:flex;align-items:center;gap:7px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid #e5e7eb;background:#fbfcfd;font-size:11px;';
+      const table=card.querySelector('table');
+      if(table) table.parentElement.insertBefore(bar,table);
+    }
+    return bar;
+  }
+
+  function renderDrill_(card,level,ctx){
+    const table=card.querySelector('table'); if(!table)return;
+    const thead=table.querySelector('thead'), tbody=table.querySelector('tbody');
+    if(!thead||!tbody)return;
+    const bar=ensureDrillBar_(card);
+    const escAttr=s=>esc(s).replace(/"/g,'&quot;');
+
+    let heads=[], rows=[];
+    if(level==='category'){
+      heads=['Category','Qty Sold','Gross Sales','Discount','Tax','Net Sales','Food Cost','Gross Profit','Margin %','Bills','Share %'];
+      rows=ctx.categories;
+      thead.innerHTML='<tr>'+heads.map(h=>'<th>'+h+'</th>').join('')+'</tr>';
+      tbody.innerHTML=rows.length?rows.map(x=>'<tr class="bnx-drill-row" data-level="category" data-name="'+escAttr(x.name)+'" style="cursor:pointer;">'
+        +'<td><button type="button" class="bnx-drill-btn" data-drill="category" data-name="'+escAttr(x.name)+'">'+esc(x.name)+' →</button></td>'
+        +'<td>'+x.qty+'</td><td>'+money(x.gross)+'</td><td>'+money(x.discount)+'</td><td>'+money(x.tax)+'</td><td>'+money(x.net)+'</td><td>'+money(x.cost)+'</td><td>'+money(x.net-x.cost)+'</td><td>'+((x.net?((x.net-x.cost)/x.net*100):0).toFixed(2))+'%</td><td>'+x.bills.size+'</td><td>'+((ctx.totalNet?x.net/ctx.totalNet*100:0).toFixed(2))+'%</td></tr>').join(''):'<tr><td colspan="11" class="rpt-pro-empty">No item sales for the selected period.</td></tr>';
+      bar.innerHTML='<strong>Category Wise Sales</strong><span>Click a category to open Item Groups.</span>';
+    } else if(level==='group'){
+      heads=['Item Group','Category','Qty Sold','Gross Sales','Discount','Tax','Net Sales','Bills'];
+      rows=ctx.groups;
+      thead.innerHTML='<tr>'+heads.map(h=>'<th>'+h+'</th>').join('')+'</tr>';
+      tbody.innerHTML=rows.length?rows.map(x=>'<tr style="cursor:pointer;"><td><button type="button" class="bnx-drill-btn" data-drill="group" data-category="'+escAttr(ctx.category)+'" data-name="'+escAttr(x.name)+'">'+esc(x.name)+' →</button></td><td>'+esc(ctx.category)+'</td><td>'+x.qty+'</td><td>'+money(x.gross)+'</td><td>'+money(x.discount)+'</td><td>'+money(x.tax)+'</td><td>'+money(x.net)+'</td><td>'+x.bills.size+'</td></tr>').join(''):'<tr><td colspan="8" class="rpt-pro-empty">No item groups for this category.</td></tr>';
+      bar.innerHTML='<button type="button" class="bnx-drill-back" data-back="category">← Categories</button><strong>'+esc(ctx.category)+'</strong><span>Click an Item Group to open Items.</span>';
+    } else if(level==='item'){
+      heads=['Item','Category','Item Group','Qty Sold','Gross Sales','Discount','Tax','Net Sales','Bills'];
+      rows=ctx.items;
+      thead.innerHTML='<tr>'+heads.map(h=>'<th>'+h+'</th>').join('')+'</tr>';
+      tbody.innerHTML=rows.length?rows.map(x=>'<tr style="cursor:pointer;"><td><button type="button" class="bnx-drill-btn" data-drill="item" data-category="'+escAttr(ctx.category)+'" data-group="'+escAttr(ctx.group)+'" data-name="'+escAttr(x.name)+'">'+esc(x.name)+' →</button></td><td>'+esc(ctx.category)+'</td><td>'+esc(ctx.group)+'</td><td>'+x.qty+'</td><td>'+money(x.gross)+'</td><td>'+money(x.discount)+'</td><td>'+money(x.tax)+'</td><td>'+money(x.net)+'</td><td>'+x.bills.size+'</td></tr>').join(''):'<tr><td colspan="9" class="rpt-pro-empty">No items for this group.</td></tr>';
+      bar.innerHTML='<button type="button" class="bnx-drill-back" data-back="group" data-category="'+escAttr(ctx.category)+'">← '+esc(ctx.category)+'</button><strong>'+esc(ctx.group)+'</strong><span>Click an item to open transaction invoices.</span>';
+    } else if(level==='invoice'){
+      heads=['Invoice No','Date','Time','Table','Customer','Qty','Rate','Net','GST','Grand Total','Payment'];
+      thead.innerHTML='<tr>'+heads.map(h=>'<th>'+h+'</th>').join('')+'</tr>';
+      tbody.innerHTML=ctx.invoices.length?ctx.invoices.map(b=>{
+        const its=Array.isArray(b.itemsDetail)?b.itemsDetail:[];
+        const match=its.filter(it=>key(it.name||it.ITEM_NAME)===key(ctx.item));
+        const qty=match.reduce((s,it)=>s+num(it.qty??it.QUANTITY),0);
+        const rate=match.length?num(match[0].rate??match[0].RATE??match[0].price):0;
+        return '<tr><td class="mono">'+esc(b.BILL_NUMBER??b.BILL_NO??b.no??b.BILL_ID??'—')+'</td><td>'+esc(b.BILL_DATE??b.dt??b.date??'—')+'</td><td>'+esc(b.BILL_TIME??b.tm??b.time??'—')+'</td><td>'+esc(b.TABLE_NUMBER??b.TABLE_ID??b.table??'—')+'</td><td>'+esc(b.CUSTOMER_NAME??b.customer??'—')+'</td><td>'+qty+'</td><td>'+money(rate)+'</td><td>'+money(b.TAXABLE_AMOUNT??b.sub??0)+'</td><td>'+money(b.TAX_AMOUNT??b.tax??0)+'</td><td>'+money(b.GRAND_TOTAL??b.total??0)+'</td><td>'+esc(b.PAYMENT_MODE??b.pay??'—')+'</td></tr>';
+      }).join(''):'<tr><td colspan="11" class="rpt-pro-empty">No transaction invoices found for this item.</td></tr>';
+      bar.innerHTML='<button type="button" class="bnx-drill-back" data-back="item" data-category="'+escAttr(ctx.category)+'" data-group="'+escAttr(ctx.group)+'">← '+esc(ctx.group)+'</button><strong>'+esc(ctx.item)+'</strong><span>Transaction invoices for selected period.</span>';
+    }
+  }
+
+  function aggregate_(items, filterFn, fieldName){
+    const m=new Map();
+    items.filter(filterFn).forEach(r=>{
+      const name=String(r[fieldName]||'Unassigned').trim()||'Unassigned';
+      const k=key(name);
+      if(!m.has(k))m.set(k,{name,qty:0,gross:0,discount:0,tax:0,net:0,cost:0,bills:new Set()});
+      const x=m.get(k);
+      x.qty+=num(r.QUANTITY_SOLD);x.gross+=num(r.GROSS_SALES);x.discount+=num(r.DISCOUNT);x.tax+=num(r.TAX);x.net+=num(r.NET_SALES);x.cost+=num(r.FOOD_COST);
+      (Array.isArray(r.BILL_IDS)?r.BILL_IDS:[]).forEach(id=>{if(id)x.bills.add(String(id));});
     });
+    return Array.from(m.values()).sort((a,b)=>b.net-a.net);
   }
 
-  if(document.readyState==='loading'){
-    document.addEventListener('DOMContentLoaded',init_,{once:true});
-  }else init_();
+  async function openCategory_(card){
+    const {from,to}=selectedRange_();
+    if(!from){return;}
+    try{
+      const d=await getDrillData_(from,to);
+      const categories=aggregate_(d.itemRows,()=>true,'CATEGORY_NAME');
+      const totalNet=categories.reduce((s,x)=>s+x.net,0);
+      renderDrill_(card,'category',{categories,totalNet});
+    }catch(e){
+      const tb=card.querySelector('tbody');if(tb)tb.innerHTML='<tr><td colspan="11" class="rpt-pro-empty">⚠️ '+esc(e?.message||'Category report unavailable')+'</td></tr>';
+    }
+  }
 
-  window.addEventListener('hashchange',function(){
-    if(location.hash==='#reports' || location.hash==='#dsr-csv'){
-      setTimeout(init_,100);
+  async function openGroup_(card,category){
+    const {from,to}=selectedRange_();
+    const d=await getDrillData_(from,to);
+    const rows=d.itemRows.filter(r=>key(r.CATEGORY_NAME)===key(category));
+    const groups=aggregate_(rows,()=>true,'ITEM_GROUP_NAME');
+    renderDrill_(card,'group',{category,groups});
+  }
+
+  async function openItem_(card,category,group){
+    const {from,to}=selectedRange_();
+    const d=await getDrillData_(from,to);
+    const rows=d.itemRows.filter(r=>key(r.CATEGORY_NAME)===key(category)&&key(r.ITEM_GROUP_NAME)===key(group));
+    const items=aggregate_(rows,()=>true,'ITEM_NAME');
+    renderDrill_(card,'item',{category,group,items});
+  }
+
+  async function openInvoice_(card,category,group,item){
+    const {from,to}=selectedRange_();
+    const d=await getDrillData_(from,to);
+    const matchingIds=new Set();
+    d.itemRows.filter(r=>key(r.CATEGORY_NAME)===key(category)&&key(r.ITEM_GROUP_NAME)===key(group)&&key(r.ITEM_NAME)===key(item))
+      .forEach(r=>(Array.isArray(r.BILL_IDS)?r.BILL_IDS:[]).forEach(id=>matchingIds.add(String(id))));
+    const invoices=d.bills.filter(b=>{
+      const id=String(b.BILL_ID??b.id??'');
+      const no=String(b.BILL_NUMBER??b.BILL_NO??b.no??'');
+      return matchingIds.has(id)||matchingIds.has(no);
+    });
+    renderDrill_(card,'invoice',{category,group,item,invoices});
+  }
+
+  /* Override the current report dispatcher only for Category Sales.
+     All other reports continue through the existing engine untouched. */
+  try{
+    const oldR1=window.rptRenderOne;
+    if(typeof oldR1==='function' && !oldR1.__bnxDrillWrapped){
+      const wrapped=async function(anchor,shouldScroll){
+        if(anchor==='category-sales'){
+          const card=document.getElementById('rpt-anchor-category-sales');
+          if(card){ await openCategory_(card); return; }
+        }
+        return oldR1.apply(this,arguments);
+      };
+      wrapped.__bnxDrillWrapped=true;
+      window.rptRenderOne=wrapped;
+    }
+  }catch(e){}
+
+  /* Event delegation keeps the existing report buttons/DOM intact. */
+  document.addEventListener('click',async function(e){
+    const btn=e.target.closest?.('.bnx-drill-btn,.bnx-drill-back');
+    if(!btn)return;
+    const card=btn.closest('#rpt-anchor-category-sales');if(!card)return;
+    try{
+      if(btn.dataset.drill==='category'){
+        await openGroup_(card,btn.dataset.name);
+      }else if(btn.dataset.drill==='group'){
+        await openItem_(card,btn.dataset.category,btn.dataset.name);
+      }else if(btn.dataset.drill==='item'){
+        await openInvoice_(card,btn.dataset.category,btn.dataset.group,btn.dataset.name);
+      }else if(btn.dataset.back==='category'){
+        await openCategory_(card);
+      }else if(btn.dataset.back==='group'){
+        await openGroup_(card,btn.dataset.category);
+      }else if(btn.dataset.back==='item'){
+        await openItem_(card,btn.dataset.category,btn.dataset.group);
+      }
+    }catch(err){
+      const tb=card.querySelector('tbody');if(tb)tb.innerHTML='<tr><td colspan="11" class="rpt-pro-empty">⚠️ '+esc(err?.message||'Drill-down failed')+'</td></tr>';
     }
   });
+
+  const style=document.createElement('style');
+  style.textContent='.bnx-drill-btn,.bnx-drill-back{border:0;background:none;color:#2563eb;font-weight:800;cursor:pointer;padding:2px 4px;font-size:11px}.bnx-drill-btn:hover,.bnx-drill-back:hover{text-decoration:underline}.bnx-cat-drill-bar strong{color:#1f4f6d}.bnx-cat-drill-bar span{color:#64748b}';
+  document.head.appendChild(style);
+
+  /* If the category card was already open when this script loaded,
+     replace it with the live drill-down immediately. */
+  document.addEventListener('DOMContentLoaded',()=>{
+    setTimeout(()=>{
+      const card=document.getElementById('rpt-anchor-category-sales');
+      if(card && card.classList.contains('rpt-anchor-active')) openCategory_(card);
+    },100);
+  });
+})();
+</script>
+
+<script id="bnx-final-gst-authoritative-report">
+(function(){
+  'use strict';
+  const money=v=>'₹'+Number(v||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const n=v=>Number(v)||0;
+  const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  async function renderGST_(anchor){
+    const card=document.getElementById('rpt-anchor-'+anchor);
+    if(!card)return;
+    const tbody=card.querySelector('table tbody');if(!tbody)return;
+    const from=document.getElementById('rptFrom')?.value||'';
+    const to=document.getElementById('rptTo')?.value||from;
+    tbody.innerHTML='<tr><td colspan="8" class="rpt-pro-empty">Loading invoice GST totals…</td></tr>';
+    try{
+      const r=await gasApi('GET_BILLS',{FROM_DATE:from,TO_DATE:to,BUSINESS_DATE:from,range:'custom',from,to},'V2_CORE');
+      if(!r||r.success===false)throw new Error(r?.error||'Invoice register unavailable');
+      const bills=(Array.isArray(r.data)?r.data:(Array.isArray(r.bills)?r.bills:(Array.isArray(r.data?.rows)?r.data.rows:[]))).filter(b=>{
+        const st=String(b.BILL_STATUS??b.status??'').toUpperCase();return st!=='CANCELLED'&&st!=='VOID';
+      });
+      const by=new Map();
+      let totalTax=0,totalTaxable=0,totalGross=0,cgst=0,sgst=0,igst=0;
+      bills.forEach(b=>{
+        const tax=n(b.TAX_AMOUNT??b.tax), gross=n(b.GRAND_TOTAL??b.total), round=n(b.ROUND_OFF??b.roundOff);
+        const raw=Number(b.TAXABLE_AMOUNT);
+        const taxable=Number.isFinite(raw)&&(raw!==0||gross===0)?raw:Math.max(0,gross-tax-round);
+        totalTax+=tax;totalTaxable+=taxable;totalGross+=gross;
+        let br=null;try{br=typeof b.GST_BREAKUP==='string'?JSON.parse(b.GST_BREAKUP):b.GST_BREAKUP||null}catch(e){}
+        const bc=n(br?.CGST),bs=n(br?.SGST),bi=n(br?.IGST);
+        if(bc||bs||bi){cgst+=bc;sgst+=bs;igst+=bi;}else if(tax){cgst+=tax/2;sgst+=tax/2;}
+        const rate=taxable>0?+(tax/taxable*100).toFixed(2):0;
+        const k=String(rate);
+        if(!by.has(k))by.set(k,{rate,taxable:0,tax:0,bills:0});
+        const x=by.get(k);x.taxable+=taxable;x.tax+=tax;x.bills++;
+      });
+      const rows=Array.from(by.values()).sort((a,b)=>b.taxable-a.taxable);
+      tbody.innerHTML=(rows.length?rows.map(x=>'<tr><td class="mono">INVOICE-HEADER</td><td>GST @ '+x.rate.toFixed(2)+'%</td><td class="mono">'+money(x.taxable)+'</td><td>'+x.rate.toFixed(2)+'%</td><td class="mono">—</td><td class="mono">—</td><td class="mono">—</td><td class="mono">'+money(x.tax)+'</td></tr>').join(''):'<tr><td colspan="8" class="rpt-pro-empty">No GST-bearing invoices for this period.</td></tr>');
+      tbody.innerHTML+='<tr class="rpt-total-row"><td colspan="2">AUTHORITATIVE INVOICE TOTAL</td><td class="mono">'+money(totalTaxable)+'</td><td>'+bills.length+' bill(s)</td><td class="mono">'+money(cgst)+'</td><td class="mono">'+money(sgst)+'</td><td class="mono">'+money(igst)+'</td><td class="mono" style="color:var(--gold)">'+money(totalTax)+'</td></tr>';
+      let note=card.querySelector('.rpt-live-note');
+      if(!note){note=document.createElement('div');note.className='rpt-live-note';note.style.cssText='text-align:center;font-size:10px;margin-top:6px;color:var(--text3)';card.appendChild(note);}
+      note.textContent='✅ GST collection is taken from invoice BILL_MASTER.TAX_AMOUNT for '+from+' to '+to+'. HSN-wise detail is not reconstructed from the invoice header; no tax is fabricated.';
+    }catch(e){
+      tbody.innerHTML='<tr><td colspan="8" class="rpt-pro-empty">⚠️ '+esc(e?.message||'GST report unavailable')+'</td></tr>';
+    }
+  }
+  try{
+    const old=window.rptRenderOne;
+    if(typeof old==='function'&&!old.__bnxGSTWrapped){
+      const w=async function(anchor,shouldScroll){
+        if(anchor==='tax-summary'||anchor==='gst-report')return renderGST_(anchor);
+        return old.apply(this,arguments);
+      };
+      w.__bnxGSTWrapped=true;window.rptRenderOne=w;
+    }
+  }catch(e){}
+})();
+</script>
+
+<!-- BNX FINAL ACTIVE-ORDERS + DAILY-TARGET LIVE FIX 2026-09-18 -->
+<script id="bnx-final-active-target-live-fix">
+(function(){
+'use strict';
+
+/* ACTIVE ORDERS: only genuinely open/unsettled orders belong in the
+   Active Orders panel. Historical COMPLETED/SERVED/BILLED/CANCELLED rows
+   must never appear as active. */
+window.buildActiveOrders=function(data){
+  const t=document.getElementById('activeOrdersTbl');
+  if(!t) return;
+  const ACTIVE=new Set(['OPEN','NEW','CONFIRMED','KOT','SENT','IN_PROGRESS','PROGRESS','PREPARING','COOKING','READY','HOLD','PENDING','PARTIAL','RUNNING']);
+  const rows=(Array.isArray(data)?data:[]).filter(function(o){
+    const st=String(o&&o.st!=null?o.st:(o&&o.status!=null?o.status:(o&&o.ORDER_STATUS!=null?o.ORDER_STATUS:''))).trim().toUpperCase();
+    return ACTIVE.has(st);
+  });
+  window._activeOrders=rows;
+  if(!rows.length){
+    t.innerHTML='<tr><td colspan="5" style="text-align:center;padding:14px;color:var(--text3);font-size:11.5px">No active orders right now.</td></tr>';
+    return;
+  }
+  t.innerHTML=rows.map(function(o,idx){
+    return '<tr style="cursor:pointer;" onclick="openActiveOrderDetail('+idx+')">'
+      +'<td class="mono">'+(o.tbl||'—')+'</td>'
+      +'<td>'+(o.w||'—')+'</td>'
+      +'<td class="mono" style="color:var(--text3)">'+(o.tm||'—')+'</td>'
+      +'<td class="mono" style="color:var(--gold)">'+(o.amt||'—')+'</td>'
+      +'<td>'+String(o.st||'—')+'</td></tr>';
+  }).join('');
+};
+
+/* DAILY TARGET: the target is a DAILY target, therefore its achievement
+   must always use TODAY's live sales, even when the dashboard is currently
+   displaying This Month/Quarter/Year/Custom. */
+var _targetBusy=false, _targetLast=0;
+async function refreshDailyTargetLive(){
+  if(_targetBusy || Date.now()-_targetLast<15000) return;
+  _targetBusy=true;
+  try{
+    if(typeof ensureTargetStrip==='function') ensureTargetStrip();
+    const today=(typeof getBusinessDate==='function')?getBusinessDate():new Date().toISOString().slice(0,10);
+    if(typeof gasApi!=='function') return;
+    const res=await gasApi('GET_BILLS',{FROM_DATE:today,TO_DATE:today,BUSINESS_DATE:today},'V2_CORE');
+    if(!res || !res.success || !Array.isArray(res.data)) return;
+    let net=0;
+    res.data.forEach(function(b){
+      const st=String(b&& (b.BILL_STATUS||b.status||'')).trim().toUpperCase();
+      if(st==='CANCELLED'||st==='VOID') return;
+      const grand=Number(b&& (b.GRAND_TOTAL??b.total??0))||0;
+      const tax=Number(b&& (b.TAX_AMOUNT??b.tax??0))||0;
+      const round=Number(b&& (b.ROUND_OFF??b.roundOff??0))||0;
+      const tr=Number(b&&b.TAXABLE_AMOUNT);
+      net += Number.isFinite(tr) && (tr!==0 || grand===0) ? tr : Math.max(0,grand-tax-round);
+    });
+    _targetLast=Date.now();
+    if(typeof renderTarget==='function') renderTarget(net);
+    const host=document.getElementById('bnxHeroTargetStrip');
+    if(host) host.dataset.targetLive='1';
+  }catch(e){
+    console.warn('[Dashboard] Daily target live refresh failed:',e&&e.message||e);
+  }finally{_targetBusy=false;}
+}
+
+/* Ensure the strip is visible and positioned inside the hero banner. */
+function ensureDailyTargetVisible(){
+  try{
+    if(typeof ensureTargetStrip==='function') ensureTargetStrip();
+    const banner=document.getElementById('heroBanner');
+    const strip=document.getElementById('bnxHeroTargetStrip');
+    if(!banner||!strip) return;
+    if(getComputedStyle(banner).position==='static') banner.style.position='relative';
+    strip.style.display='flex';
+    strip.style.visibility='visible';
+    strip.style.opacity='1';
+    strip.style.zIndex='20';
+  }catch(e){}
+}
+
+function boot(){
+  ensureDailyTargetVisible();
+  refreshDailyTargetLive();
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',boot,{once:false}); else boot();
+window.addEventListener('pageshow',boot);
+window.addEventListener('focus',refreshDailyTargetLive);
+setInterval(function(){
+  if(document.getElementById('page-dashboard')?.classList.contains('active')){
+    ensureDailyTargetVisible();
+    refreshDailyTargetLive();
+  }
+},30000);
+
+/* Whenever loadDashboard completes, refresh the independent DAILY target
+   shortly afterward. This avoids changing the existing report/date-range
+   logic while guaranteeing the target uses today's data. */
+const _oldLoadDashboard=window.loadDashboard;
+if(typeof _oldLoadDashboard==='function' && !window.__bnxLoadDashboardWrapped){
+  window.__bnxLoadDashboardWrapped=true;
+  window.loadDashboard=async function(){
+    const result=await _oldLoadDashboard.apply(this,arguments);
+    setTimeout(refreshDailyTargetLive,50);
+    return result;
+  };
+}
+})();
+</script>
+
+<!-- QUICK FLOOR MAP — ALL TABLES / PROFESSIONAL LAYOUT EDITOR — 2026-09-20
+     Live source remains GET_TABLE_AVAILABILITY.
+     Adds: all-table floor canvas, room/floor filters, live status, drag layout,
+     Auto Arrange, Save Layout, Reset Layout, zoom, and table count.
+     Layout is stored per client/location in browser localStorage.
+     No reservation, billing, API or database logic is replaced. -->
+<style id="bnx-quick-floor-map-pro-20260920">
+#tmGrid.bnx-floor-host{
+  max-height:none!important;
+  overflow:auto!important;
+  padding:0!important;
+  background:#f6f7f9;
+  border:1px solid var(--border2,#e5e7eb);
+  border-radius:12px;
+}
+.bnx-fm-toolbar{
+  display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:0 0 9px;
+}
+.bnx-fm-btn{
+  border:1px solid #d8d1c5;background:#fff;color:#3b3329;border-radius:8px;
+  padding:7px 10px;font-size:11px;font-weight:800;cursor:pointer;
+}
+.bnx-fm-btn.primary{background:#b8690e;color:#fff;border-color:#b8690e;}
+.bnx-fm-btn.active{background:#2563eb;color:#fff;border-color:#2563eb;}
+.bnx-fm-stat{font-size:11px;font-weight:800;color:var(--text2);margin-left:auto;}
+.bnx-fm-rooms{
+  display:flex;gap:5px;overflow-x:auto;padding:2px 0 8px;scrollbar-width:thin;
+}
+.bnx-fm-room{
+  flex:0 0 auto;border:1px solid #ddd5c8;background:#fff;border-radius:18px;
+  padding:6px 10px;font-size:10.5px;font-weight:800;cursor:pointer;
+}
+.bnx-fm-room.active{background:#b8690e;color:#fff;border-color:#b8690e;}
+.bnx-fm-canvas{
+  position:relative;min-width:1080px;height:660px;
+  background:
+    linear-gradient(rgba(120,120,120,.07) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(120,120,120,.07) 1px,transparent 1px);
+  background-size:24px 24px;
+  border-radius:10px;overflow:hidden;
+}
+.bnx-fm-zone{
+  position:absolute;border:1px dashed rgba(120,105,85,.35);border-radius:14px;
+  background:rgba(255,255,255,.46);pointer-events:none;box-sizing:border-box;
+}
+.bnx-fm-zone-title{
+  position:absolute;left:10px;top:7px;font-size:10px;font-weight:900;
+  letter-spacing:.04em;color:#6b6258;text-transform:uppercase;
+}
+.bnx-fm-table{
+  position:absolute;width:92px;height:66px;box-sizing:border-box;
+  border:2px solid #22c55e;background:#f0fdf4;border-radius:12px;
+  display:flex;flex-direction:column;justify-content:center;align-items:center;
+  text-align:center;user-select:none;cursor:pointer;
+  box-shadow:0 2px 7px rgba(0,0,0,.08);transition:box-shadow .12s,transform .12s;
+  z-index:5;
+}
+.bnx-fm-table.sold{border-color:#ef4444;background:#fef2f2;}
+.bnx-fm-table.selected{border-color:#2563eb!important;box-shadow:0 0 0 3px rgba(37,99,235,.20),0 4px 12px rgba(0,0,0,.12);}
+.bnx-fm-table.editable{cursor:grab;}
+.bnx-fm-table.dragging{cursor:grabbing;opacity:.82;z-index:50;transform:scale(1.04);}
+.bnx-fm-name{font-size:12px;font-weight:900;line-height:1.1;color:#28231e;max-width:84px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.bnx-fm-meta{font-size:9px;color:#766d63;margin-top:3px;}
+.bnx-fm-status{font-size:8.5px;font-weight:900;margin-top:3px;color:#166534;}
+.bnx-fm-table.sold .bnx-fm-status{color:#991b1b;}
+.bnx-fm-count{
+  display:inline-flex;align-items:center;gap:5px;padding:5px 9px;border-radius:16px;
+  background:#fff;border:1px solid #ddd5c8;font-size:10px;font-weight:800;
+}
+.bnx-fm-help{font-size:10px;color:#7b7269;margin-left:3px;}
+@media(max-width:800px){
+  .bnx-fm-stat{margin-left:0;}
+}
+</style>
+
+<script id="bnx-quick-floor-map-pro-20260920-script">
+(function(){
+  'use strict';
+
+  var STORAGE_PREFIX='BNX_FLOOR_LAYOUT_V2_';
+  var state={tables:[],room:'ALL',edit:false,zoom:1,positions:{}};
+
+  function esc_(v){
+    return String(v==null?'':v).replace(/[&<>"']/g,function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+  function key_(){
+    var cid=window.BNX_CLIENT_ID||window.CLIENT_ID||window.ERP_CLIENT_ID||
+            (window.erpSession&&window.erpSession.CLIENT_ID)||'DEFAULT';
+    var lid=window.BNX_LOCATION_ID||window.LOCATION_ID||'DEFAULT';
+    return STORAGE_PREFIX+String(cid)+'_'+String(lid);
+  }
+  function save_(){
+    try{localStorage.setItem(key_(),JSON.stringify(state.positions));}catch(e){}
+  }
+  function load_(){
+    try{
+      var x=JSON.parse(localStorage.getItem(key_())||'{}');
+      state.positions=x&&typeof x==='object'?x:{};
+    }catch(e){state.positions={};}
+  }
+  function posKey_(t,i){return String(t.id||t.tableId||t.name||i);}
+  function autoPositions_(tables){
+    var cols=10, x0=24, y0=52, dx=104, dy=94;
+    var p={};
+    tables.forEach(function(t,i){
+      var k=posKey_(t,i);
+      p[k]={x:x0+(i%cols)*dx,y:y0+Math.floor(i/cols)*dy};
+    });
+    return p;
+  }
+  function tableData_(){
+    return state.tables;
+  }
+
+  function buildToolbar_(host){
+    var old=document.getElementById('bnxFloorToolbar');
+    if(old) old.remove();
+    var bar=document.createElement('div');
+    bar.id='bnxFloorToolbar';
+    bar.className='bnx-fm-toolbar';
+    bar.innerHTML=
+      '<button type="button" class="bnx-fm-btn primary" id="bnxFloorEdit">✏️ Edit Layout</button>'+
+      '<button type="button" class="bnx-fm-btn" id="bnxFloorAuto">↔ Auto Arrange</button>'+
+      '<button type="button" class="bnx-fm-btn" id="bnxFloorSave">💾 Save Layout</button>'+
+      '<button type="button" class="bnx-fm-btn" id="bnxFloorReset">↺ Reset</button>'+
+      '<button type="button" class="bnx-fm-btn" id="bnxFloorZoomOut">−</button>'+
+      '<span class="bnx-fm-count" id="bnxFloorZoom">100%</span>'+
+      '<button type="button" class="bnx-fm-btn" id="bnxFloorZoomIn">+</button>'+
+      '<span class="bnx-fm-stat" id="bnxFloorCount"></span>';
+    host.parentNode.insertBefore(bar,host);
+
+    document.getElementById('bnxFloorEdit').onclick=function(){
+      state.edit=!state.edit;
+      this.classList.toggle('active',state.edit);
+      this.textContent=state.edit?'✅ Editing — Drag Tables':'✏️ Edit Layout';
+      render_();
+    };
+    document.getElementById('bnxFloorAuto').onclick=function(){
+      state.positions=autoPositions_(state.tables); save_(); render_();
+    };
+    document.getElementById('bnxFloorSave').onclick=function(){
+      save_();
+      if(typeof showNotif==='function') showNotif('✅ Floor layout saved on this device','success');
+      else alert('Floor layout saved on this device.');
+    };
+    document.getElementById('bnxFloorReset').onclick=function(){
+      state.positions={}; save_(); render_();
+    };
+    document.getElementById('bnxFloorZoomIn').onclick=function(){
+      state.zoom=Math.min(1.25,state.zoom+.1); render_();
+    };
+    document.getElementById('bnxFloorZoomOut').onclick=function(){
+      state.zoom=Math.max(.75,state.zoom-.1); render_();
+    };
+  }
+
+  function buildRooms_(host){
+    var old=document.getElementById('bnxFloorRooms');
+    if(old) old.remove();
+    var rooms=document.createElement('div');
+    rooms.id='bnxFloorRooms';
+    rooms.className='bnx-fm-rooms';
+    var names=['ALL'].concat(Array.from(new Set(state.tables.map(function(t){return String(t.section||'MAIN HALL');}))));
+    rooms.innerHTML=names.map(function(n){
+      var count=n==='ALL'?state.tables.length:state.tables.filter(function(t){return String(t.section||'MAIN HALL')===n;}).length;
+      return '<button type="button" class="bnx-fm-room '+(state.room===n?'active':'')+
+        '" data-room="'+esc_(n)+'">'+esc_(n)+' · '+count+'</button>';
+    }).join('');
+    host.parentNode.insertBefore(rooms,host);
+    rooms.querySelectorAll('.bnx-fm-room').forEach(function(b){
+      b.onclick=function(){state.room=this.getAttribute('data-room');buildRooms_(host);render_();};
+    });
+  }
+
+  function drag_(el,t,i,canvas){
+    if(!state.edit)return;
+    el.addEventListener('pointerdown',function(ev){
+      ev.preventDefault(); el.setPointerCapture(ev.pointerId); el.classList.add('dragging');
+      var rect=canvas.getBoundingClientRect(), sx=ev.clientX, sy=ev.clientY;
+      var k=posKey_(t,i), p=state.positions[k]||{x:20,y:20};
+      function move(e){
+        var nx=p.x+(e.clientX-sx)/state.zoom, ny=p.y+(e.clientY-sy)/state.zoom;
+        nx=Math.max(4,Math.min(1080-98,nx)); ny=Math.max(38,Math.min(660-72,ny));
+        state.positions[k]={x:Math.round(nx),y:Math.round(ny)};
+        el.style.left=nx+'px';el.style.top=ny+'px';
+      }
+      function up(){
+        el.classList.remove('dragging');
+        el.releasePointerCapture(ev.pointerId);
+        save_();
+      }
+      el.addEventListener('pointermove',move);
+      el.addEventListener('pointerup',up,{once:true});
+    });
+  }
+
+  function render_(){
+    var grid=document.getElementById('tmGrid');
+    if(!grid)return;
+    grid.classList.add('bnx-floor-host');
+
+    var filtered=state.tables.filter(function(t){
+      return state.room==='ALL'||String(t.section||'MAIN HALL')===state.room;
+    });
+
+    var canvas=document.getElementById('bnxFloorCanvas');
+    if(!canvas){
+      canvas=document.createElement('div');canvas.id='bnxFloorCanvas';canvas.className='bnx-fm-canvas';
+      grid.innerHTML='';grid.appendChild(canvas);
+    }else canvas.innerHTML='';
+
+    var allPos=Object.keys(state.positions).length?state.positions:autoPositions_(state.tables);
+    state.positions=allPos;
+
+    var visibleSections=Array.from(new Set(filtered.map(function(t){return String(t.section||'MAIN HALL');})));
+    visibleSections.forEach(function(sec,si){
+      var zone=document.createElement('div');zone.className='bnx-fm-zone';
+      var col=si%3,row=Math.floor(si/3);
+      zone.style.left=(col*360+10)+'px';zone.style.top=(row*205+8)+'px';
+      zone.style.width='340px';zone.style.height='185px';
+      zone.innerHTML='<div class="bnx-fm-zone-title">📍 '+esc_(sec)+'</div>';
+      canvas.appendChild(zone);
+    });
+
+    filtered.forEach(function(t,i){
+      var idx=state.tables.indexOf(t),k=posKey_(t,idx),p=state.positions[k];
+      if(!p){p={x:24+(idx%10)*104,y:52+Math.floor(idx/10)*94};state.positions[k]=p;}
+      var sold=String(t.status||'').toUpperCase()==='SOLD_OUT';
+      var el=document.createElement('div');
+      el.className='bnx-fm-table '+(sold?'sold ':'')+(state.edit?'editable ':'');
+      el.dataset.tableId=t.id;
+      el.style.left=(p.x*state.zoom)+'px';
+      el.style.top=(p.y*state.zoom)+'px';
+      el.style.transform='scale('+state.zoom+')';
+      el.style.transformOrigin='top left';
+      el.innerHTML='<div class="bnx-fm-name">'+esc_(t.name)+'</div>'+
+        '<div class="bnx-fm-meta">'+esc_(t.capacity||'')+' pax · '+esc_(t.section||'')+'</div>'+
+        '<div class="bnx-fm-status">'+(sold?'● SOLD OUT':'● AVAILABLE')+'</div>';
+      el.onclick=function(){
+        if(state.edit)return;
+        try{bnxSelectMapTable(t.id,t.name,t.minSpend||0,t.status,(t.booking&&t.booking.guest)||'');}catch(e){}
+      };
+      if(state.edit)drag_(el,t,idx,canvas);
+      canvas.appendChild(el);
+    });
+
+    canvas.style.transform='scale(1)';
+    canvas.style.transformOrigin='top left';
+    canvas.style.width=Math.max(1080,Math.ceil(1080*state.zoom))+'px';
+    canvas.style.height='660px';
+
+    var c=document.getElementById('bnxFloorCount');
+    if(c)c.textContent=state.tables.length+' Tables · '+filtered.length+' Shown · '+Math.round(state.zoom*100)+'%';
+    var z=document.getElementById('bnxFloorZoom');if(z)z.textContent=Math.round(state.zoom*100)+'%';
+  }
+
+  function enhance_(){
+    var grid=document.getElementById('tmGrid');
+    if(!grid)return;
+    var cards=Array.from(grid.querySelectorAll('[data-table-id]'));
+    if(!cards.length)return;
+
+    state.tables=cards.map(function(el){
+      var panel=el.closest('.tm-zone-panel');
+      var sec=panel?((panel.querySelector('.tm-zone-label')||{}).textContent||'').replace(/^[^A-Za-z0-9]+/,'').trim():'MAIN HALL';
+      var id=el.dataset.tableId;
+      var txt=el.textContent||'';
+      var name=(el.querySelector('div[style*="font-weight"]')||{}).textContent||txt.split('\n')[0]||id;
+      var cap=(txt.match(/(\d+)\s*pax/i)||[])[1]||'';
+      var status=/SOLD OUT/i.test(txt)?'SOLD_OUT':'AVAILABLE';
+      return {id:id,name:name.trim(),capacity:cap,status:status,section:sec,minSpend:0};
+    });
+
+    load_();
+    if(!Object.keys(state.positions).length)state.positions=autoPositions_(state.tables);
+    var card=document.getElementById('tmGrid').closest('.card');
+    if(card)buildToolbar_(card.querySelector('.card-header')||card);
+    buildRooms_(grid);
+    render_();
+  }
+
+  var oldLoad=window.bnxLoadTableMap;
+  if(typeof oldLoad==='function'){
+    window.bnxLoadTableMap=async function(date){
+      var r=await oldLoad.apply(this,arguments);
+      setTimeout(enhance_,40);
+      setTimeout(enhance_,250);
+      setTimeout(enhance_,900);
+      return r;
+    };
+  }
+
+  document.addEventListener('DOMContentLoaded',function(){
+    setTimeout(enhance_,700);
+  });
+})();
+</script>
+
+
+<!-- FULL AUDIT RUNTIME REPAIR — 2026-09-20
+     Repairs only confirmed missing inline handlers:
+     bmFilterProducts, bmFilterQuick, bnxPrintBarIndent.
+     No existing business/API/database functions are replaced. -->
+<script id="bnx-full-audit-runtime-repair-20260920">
+(function(){
+  'use strict';
+
+  /* New Bill → Products category filter. */
+  if(typeof window.bmFilterProducts!=='function'){
+    window.bmFilterProducts=function(cat,btn){
+      try{
+        var value=String(cat==null?'All':cat);
+        var grid=document.getElementById('bmProductGrid');
+        if(typeof window.bmBuildProductGrid==='function' && grid){
+          window.bmBuildProductGrid('bmProductGrid',value);
+        }
+        var page=document.getElementById('page-bm-products');
+        if(page){
+          page.querySelectorAll('.pcat').forEach(function(x){x.classList.remove('active');});
+          if(btn)btn.classList.add('active');
+        }
+      }catch(e){console.error('[BM_FILTER_PRODUCTS]',e);}
+    };
+  }
+
+  /* Quick Add legacy category filter. The current V4 hierarchy remains the
+     authoritative renderer when present; otherwise use the existing grid. */
+  if(typeof window.bmFilterQuick!=='function'){
+    window.bmFilterQuick=function(cat,btn){
+      try{
+        var value=String(cat==null?'All':cat);
+        var grid=document.getElementById('bmQuickProdGrid');
+        if(typeof window.bmBuildProductGrid==='function' && grid){
+          window.bmBuildProductGrid('bmQuickProdGrid',value);
+        }
+        var modal=document.getElementById('bmQuickAddModal');
+        if(modal){
+          modal.querySelectorAll('.pcat').forEach(function(x){x.classList.remove('active');});
+          if(btn)btn.classList.add('active');
+        }
+        if(window.__BNX_MENU_HIERARCHY_V4__ &&
+           typeof window.__BNX_MENU_HIERARCHY_V4__.renderQuick==='function'){
+          try{window.__BNX_MENU_HIERARCHY_V4__.renderQuick();}catch(_){}
+        }
+      }catch(e){console.error('[BM_FILTER_QUICK]',e);}
+    };
+  }
+
+  /* Bar Indent print action. Uses the current live-rendered rows only. */
+  if(typeof window.bnxPrintBarIndent!=='function'){
+    window.bnxPrintBarIndent=function(){
+      try{
+        var rows=document.getElementById('barIndentRows');
+        var date=document.getElementById('barIndentDate');
+        if(!rows){alert('Bar Indent is not loaded yet.');return;}
+        var title='BAR INDENT';
+        var dt=date&&date.value?date.value:new Date().toISOString().slice(0,10);
+        var w=window.open('','_blank','width=900,height=700');
+        if(!w){alert('Please allow pop-ups to print the Bar Indent.');return;}
+        w.document.open();
+        w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>'+
+          title+' '+dt+'</title><style>'+
+          'body{font-family:Arial,sans-serif;margin:20px;color:#111}'+
+          'h2{margin:0 0 4px}p{font-size:12px;margin:0 0 14px;color:#555}'+
+          '.rows{border:1px solid #bbb;border-bottom:0}'+
+          '.rows>*{border-bottom:1px solid #bbb;padding:7px 9px}'+
+          '@media print{body{margin:8mm}}'+
+          '</style></head><body><h2>'+title+'</h2><p>Date: '+dt+'</p>'+
+          '<div class="rows">'+rows.innerHTML+'</div></body></html>');
+        w.document.close();
+        w.focus();
+        setTimeout(function(){w.print();},250);
+      }catch(e){
+        console.error('[BAR_INDENT_PRINT]',e);
+        alert('Unable to open Bar Indent print preview.');
+      }
+    };
+  }
+
+  /* Small live-status helper for the audit/diagnostic console. */
+  window.BNX_FULL_AUDIT_STATUS={
+    missingHandlersFixed:['bmFilterProducts','bmFilterQuick','bnxPrintBarIndent'],
+    source:'restaurant-dashboard-FULL-AUDITED-LIVE-FINAL-2026-09-20'
+  };
 })();
 </script>
 
@@ -33246,7 +34067,7 @@ mo.observe(document.body,{subtree:true,childList:true});
 </style>
 
 
-<script id="bnx-pos-layout-final-20260917">
+<script id="bnx-pos-layout-final-20260917-script">
 (function(){
   'use strict';
   function placeFilterRows(){
