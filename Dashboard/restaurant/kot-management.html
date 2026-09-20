@@ -808,14 +808,17 @@ window.addEventListener('DOMContentLoaded', async () => {
    order updates/creates its card here instead of duplicating it on
    every refresh. Local-only KOTs (not yet synced, or created before
    this fix existed) are left alone. */
+let kmKotsLoading = false;
 async function syncLiveKOTs(){
+  if(kmKotsLoading) return;
+  kmKotsLoading = true;
   const STATUS_MAP = { NEW:'pending', KOT_PRINTED:'pending', PENDING:'pending',
     COOKING:'cooking', PREPARING:'cooking', IN_PROGRESS:'cooking',
     READY:'ready', SERVED:'served', CANCELLED:'cancelled' };
   let res;
-  try{ res = await kmApi('GET_ACTIVE_ORDERS', {}); }catch(e){ return; }
+  try{ res = await kmApi('GET_ACTIVE_ORDERS', {}); }catch(e){ kmKotsLoading=false; return; }
   const orders = res && res.success && res.data && Array.isArray(res.data.orders) ? res.data.orders : null;
-  if(!orders || !orders.length) return; // no live data — leave local board as-is
+  if(!orders || !orders.length){ kmKotsLoading=false; return; } // no live data — leave local board as-is
 
   const STATUS_RANK = { pending:0, cooking:1, ready:2, served:3, cancelled:3 };
   const local = dbGet();
@@ -848,6 +851,7 @@ async function syncLiveKOTs(){
     }
   });
   dbSave(local);
+  kmKotsLoading = false;
 }
 
 
@@ -1025,26 +1029,34 @@ function renderKitchenView(kots) {
 }
 
 // ── STATUS UPDATE ─────────────────────────────────────────
-function updateKOTStatus(id, newStatus) {
-  const kot = dbGet().find(x=>x.id===id);
-  dbUpdate(id, { status: newStatus });
-  renderAll();
-  const labels = {cooking:'🔥 Cooking started!', ready:'✅ Order ready — notify waiter!', served:'🍽️ Served!'};
-  toast(labels[newStatus] || 'Status updated', 'success');
-  // FIX: now also syncs the status to the backend (UPDATE_KOT_STATUS,
-  // 47_ChefKotBridge.gs) using the KOT's server-side number (kot.no),
-  // not this browser's local id — so Chef Dashboard (a different
-  // screen, different device) sees the same status change.
-  if(kot) kmApi('UPDATE_KOT_STATUS', { kotId: kot.serverId || kot.serverNo || kot.no, status: newStatus }).catch(()=>{});
+async function updateKOTStatus(id,newStatus){
+  const kot=dbGet().find(x=>x.id===id); if(!kot)return;
+  const serverKotId=kot.serverId||kot.serverNo||kot.no;
+  const res=await kmApi('UPDATE_KOT_STATUS',{kotId:serverKotId,status:newStatus});
+  if(!res||!res.success){
+    kmQueuePending('UPDATE_KOT_STATUS',{kotId:serverKotId,status:newStatus},
+      'status-'+id+'-'+newStatus+'-'+Date.now());
+    dbUpdate(id,{status:newStatus,syncPending:true});renderAll();
+    toast('⚠ Status saved locally and queued for server sync.','warn');return;
+  }
+  dbUpdate(id,{status:newStatus,syncPending:false});renderAll();
+  const labels={cooking:'🔥 Cooking started!',ready:'✅ Order ready — notify waiter!',served:'🍽️ Served!'};
+  toast(labels[newStatus]||'Status updated','success');
 }
 
-function cancelKOT(id) {
-  if(!confirm('Cancel this KOT?')) return;
-  const kot = dbGet().find(x=>x.id===id);
-  dbUpdate(id, { status: 'cancelled' });
-  renderAll();
-  toast('KOT cancelled', 'warn');
-  if(kot) kmApi('UPDATE_KOT_STATUS', { kotId: kot.serverId || kot.serverNo || kot.no, status: 'cancelled' }).catch(()=>{});
+async function cancelKOT(id){
+  if(!confirm('Cancel this KOT?'))return;
+  const kot=dbGet().find(x=>x.id===id);if(!kot)return;
+  const serverKotId=kot.serverId||kot.serverNo||kot.no;
+  const res=await kmApi('UPDATE_KOT_STATUS',{kotId:serverKotId,status:'cancelled'});
+  if(!res||!res.success){
+    kmQueuePending('UPDATE_KOT_STATUS',{kotId:serverKotId,status:'cancelled'},
+      'cancel-'+id+'-'+Date.now());
+    dbUpdate(id,{status:'cancelled',syncPending:true});renderAll();
+    toast('⚠ Cancel saved locally and queued for server sync.','warn');return;
+  }
+  dbUpdate(id,{status:'cancelled',syncPending:false});renderAll();
+  toast('KOT cancelled','success');
 }
 
 // ── KOT DETAIL ────────────────────────────────────────────
@@ -1109,7 +1121,10 @@ const TABLES_FALLBACK_DEMO = [
 
 const RD_STATUS_MAP = { AVAILABLE:'available', OCCUPIED:'occupied', RESERVED:'reserved', CLEANING:'cleaning', RUNNING:'running', DINING:'running' };
 
+let kmTablesLoading = false;
 async function loadLiveTables(){
+  if(kmTablesLoading) return;
+  kmTablesLoading = true;
   let res;
   try{ res = await kmApi('RD_FETCH_SHEET', { tab: '04_TABLE_MASTER' }); }catch(e){ res = null; }
   const rows = res && res.success && Array.isArray(res.data) ? res.data : null;
@@ -1117,6 +1132,7 @@ async function loadLiveTables(){
     TABLES = TABLES_FALLBACK_DEMO;
     toast('⚠️ Could not load live tables — showing a placeholder list. Check connection.', 'error');
     populateTableDropdown();
+    kmTablesLoading = false;
     return;
   }
   // Row shape from bnxRdFetchSheet: [tableNo, section, '', status, capacity, '', covers, startTime, '', '', 0, billAmount]
@@ -1125,6 +1141,7 @@ async function loadLiveTables(){
     status: RD_STATUS_MAP[String(r[3] || 'AVAILABLE').toUpperCase()] || 'available'
   }));
   populateTableDropdown();
+  kmTablesLoading = false;
 }
 
 function populateTableDropdown(){
@@ -1144,20 +1161,25 @@ function populateTableDropdown(){
 // in Code.gs), scoped to this client's real USER_MASTER rows.
 const WAITER_FALLBACK_DEMO = [{ FULL_NAME: 'Staff (offline)', USER_CODE: 'STAFF' }];
 
+let kmStaffLoading = false;
 async function loadLiveStaff(){
+  if(kmStaffLoading) return;
+  kmStaffLoading = true;
   let res;
   try{ res = await kmApi('GET_STAFF_LIST', { roles: [] }); }catch(e){ res = null; }
   const staff = res && res.success && res.data && Array.isArray(res.data.staff) ? res.data.staff : null;
   const sel = document.getElementById('kot-waiter');
-  if(!sel) return;
+  if(!sel){ kmStaffLoading=false; return; }
   if(!staff || !staff.length){
     toast('⚠️ Could not load live staff list — check connection.', 'error');
     sel.innerHTML = '<option value="">-- Select Waiter --</option>' +
       WAITER_FALLBACK_DEMO.map(s => `<option value="${s.FULL_NAME}">${s.FULL_NAME}</option>`).join('');
+    kmStaffLoading=false;
     return;
   }
   sel.innerHTML = '<option value="">-- Select Waiter --</option>' +
     staff.map(s => `<option value="${s.FULL_NAME}">${s.FULL_NAME}${s.ROLE ? ' ('+s.ROLE+')' : ''}</option>`).join('');
+  kmStaffLoading=false;
 }
 
 function buildFloor() {
@@ -1332,103 +1354,69 @@ setInterval(kmFlushOutbox, 15000);
 window.addEventListener('online', kmFlushOutbox);
 document.addEventListener('DOMContentLoaded', kmUpdateOutboxBadge);
 
-function saveKOT() {
-  const table  = document.getElementById('kot-table')?.value;
-  const waiter = document.getElementById('kot-waiter')?.value;
-  const covers = document.getElementById('kot-covers')?.value || 2;
-  const type   = document.getElementById('kot-type')?.value || 'dine-in';
-  const notes  = document.getElementById('kot-notes')?.value || '';
-  if(!table) { toast('Select a table first!', 'error'); return; }
-  if(!activeCart.length) { toast('Add at least one item!', 'error'); return; }
-  // FIX ("multiple KOTs shown at billing time / duplicated to kitchen"):
-  // nothing here ever checked whether the selected table already had a
-  // live, unbilled ticket before creating another one. A stale ticket
-  // (e.g. an order sitting unbilled for hours) or a re-print after a
-  // sync hiccup silently created a second, fully independent KOT_MASTER
-  // row for the same food — no shared ORDER_ID links the two rows, so
-  // the kitchen board, list view, and kitchen display (all three render
-  // off the same merged array) each showed the same items twice. This
-  // guard blocks that at the source: creating a duplicate now requires
-  // an explicit confirm instead of happening silently.
-  const existingActive = dbGet().filter(k => k.table === table && (k.status==='pending' || k.status==='cooking' || k.status==='ready'));
-  if (existingActive.length) {
-    const ageMins = Math.floor((new Date() - new Date(existingActive[0].created)) / 60000);
-    const proceed = confirm(
-      `Table ${table} already has an active ticket (${existingActive[0].no}, ${ageMins}m ago) with ${existingActive[0].items.length} item(s) not yet served.\n\n` +
-      `Creating another KOT for this table will send a SEPARATE ticket to the kitchen — it will NOT merge with the existing one. ` +
-      `If this is meant to be an add-on to the same order, close this and use "+ Item" on the existing ticket instead.\n\n` +
-      `Continue and create a new, separate KOT anyway?`
-    );
-    if (!proceed) return;
+let kmSaveInFlight = false;
+
+async function saveKOT() {
+  if (kmSaveInFlight) { toast('⏳ KOT save already in progress — please wait.', 'warn'); return null; }
+
+  const table=document.getElementById('kot-table')?.value;
+  const waiter=document.getElementById('kot-waiter')?.value;
+  const covers=document.getElementById('kot-covers')?.value||2;
+  const type=document.getElementById('kot-type')?.value||'dine-in';
+  const notes=document.getElementById('kot-notes')?.value||'';
+
+  if(!table){toast('Select a table first!','error');return null;}
+  if(!activeCart.length){toast('Add at least one item!','error');return null;}
+  if(usingFallbackMenu){toast('⚠️ Real menu not loaded yet — cannot send this KOT to the kitchen.','error');return null;}
+
+  const existingActive=dbGet().filter(k=>k.table===table&&['pending','cooking','ready'].includes(k.status));
+  if(existingActive.length){
+    const ageMins=Math.floor((new Date()-new Date(existingActive[0].created))/60000);
+    if(!confirm(`Table ${table} already has an active ticket (${existingActive[0].no}, ${ageMins}m ago).\\n\\nCreate a separate KOT anyway?`)) return null;
   }
-  // P0 FIX ("no dummy data if login" — same principle as
-  // customer-order.html/steward-mobile.html): refuse to send a KOT
-  // built against the hardcoded fallback menu to the real kitchen —
-  // those item names/prices don't correspond to anything the client
-  // actually sells or the backend actually has priced.
-  if (usingFallbackMenu){
-    toast('⚠️ Real menu not loaded yet — cannot send this KOT to the kitchen. Wait for the menu to sync or refresh.', 'error');
-    return;
-  }
-  const kots = dbGet();
-  const kotNo = 'KOT-' + String(kots.length + 1).padStart(3,'0'); // LOCAL display number only — see note below
-  const zone = TABLES.find(t=>t.n===table)?.zone || 'Main Hall';
-  const newKOT = {
-    id: uid(), no: kotNo, table, waiter, covers: parseInt(covers),
-    type, zone, notes, status: 'pending',
-    items: activeCart.map(i=>({...i})),
-    created: now(), printed: false
-  };
-  dbAdd(newKOT);
-  activeCart = [];
-  renderCart();
-  closeModal('new-kot-modal');
-  renderAll();
-  buildFloor();
-  toast('✅ ' + kotNo + ' sent to kitchen!', 'success');
-  // FIX: now actually posts to the backend (SAVE_KOT, matching the
-  // same 45_LiveKotBridge.gs KOT_MASTER used everywhere else), not
-  // just this browser's local IndexedDB/localStorage copy.
-  // P0 FIX: orderNo intentionally NOT sent — the confirmed backend
-  // trusts a client-supplied orderNo as an already-printed ticket
-  // number; sending our own locally-generated kotNo here would let
-  // two devices collide on the same number. The server-generated
-  // serverId becomes the real, authoritative KOT number; kotNo above
-  // remains only this device's local/offline display label.
-  const kmRequestId = (typeof bnxUuid==='function') ? bnxUuid() : ('km-'+Date.now()+'-'+Math.random().toString(36).slice(2,8));
-  const kmPayload = {
-    table: table, waiter: waiter, covers: parseInt(covers), remarks: notes,
-    items: newKOT.items.map(i => ({ ITEM_ID: i.id || '', name: i.n, qty: i.q, price: i.p })),
-    requestId: kmRequestId,
-  };
-  kmApi('SAVE_KOT', kmPayload).then(res => {
-    if(res && res.success){
-      // FIX ("KOT status changes never reach the kitchen server"):
-      // updateKOTStatus()/cancelKOT() below send kmApi('UPDATE_KOT_STATUS',
-      // {kotId: kot.no, ...}) — but kot.no here was only ever this
-      // device's local display label ('KOT-001', see note above), never
-      // the server's real KOT_ID/KOT_NUMBER. Every status change was
-      // silently targeting a row that doesn't exist server-side. Storing
-      // the real identifiers SAVE_KOT just confirmed, so later status
-      // updates can actually find and update the right KOT_MASTER row.
-      dbUpdate(newKOT.id, { serverId: res.transactionId || '', serverNo: res.kotNumber || '' });
-    } else {
-      kmQueuePending('SAVE_KOT', kmPayload, kmRequestId);
-      toast('⚠ Saved locally — kitchen server sync failed, queued for retry', 'warn');
+
+  kmSaveInFlight=true;
+  try{
+    const zone=TABLES.find(t=>t.n===table)?.zone||'Main Hall';
+    const localId=uid();
+    const requestId=(typeof bnxUuid==='function')?bnxUuid():('km-'+Date.now()+'-'+Math.random().toString(36).slice(2,8));
+    const items=activeCart.map(i=>({...i}));
+    const localRecord={id:localId,no:'PENDING',table,waiter,covers:parseInt(covers),type,zone,notes,status:'pending',items,created:now(),printed:false,syncPending:true};
+    const payload={table,waiter,covers:parseInt(covers),remarks:notes,
+      items:items.map(i=>({ITEM_ID:i.id||'',name:i.n,qty:i.q,price:i.p})),requestId};
+
+    // Server first so the printed KOT number is authoritative.
+    const res=await kmApi('SAVE_KOT',payload);
+    if(!res||!res.success){
+      kmQueuePending('SAVE_KOT',payload,requestId);
+      dbAdd(localRecord);
+      activeCart=[];renderCart();closeModal('new-kot-modal');renderAll();buildFloor();
+      toast('⚠ Saved locally — server sync failed and was queued for retry.','warn');
+      return localId;
     }
-  }).catch(()=>{
-    kmQueuePending('SAVE_KOT', kmPayload, kmRequestId);
-    toast('⚠ Saved locally — kitchen server sync failed, queued for retry', 'warn');
-  });
+
+    localRecord.serverNo=res.kotNumber||res.KOT_NUMBER||res.orderNo||'';
+    localRecord.serverId=res.transactionId||res.KOT_ID||res.kotId||'';
+    localRecord.no=localRecord.serverNo||('LOCAL-'+localId.slice(-6));
+    localRecord.syncPending=false;
+    dbAdd(localRecord);
+
+    activeCart=[];renderCart();closeModal('new-kot-modal');renderAll();buildFloor();
+    toast('✅ '+localRecord.no+' sent to kitchen!','success');
+    return localId;
+  } finally { kmSaveInFlight=false; }
 }
 
-function saveKOTAndPrint() {
-  saveKOT();
-  setTimeout(() => {
-    const kots = dbGet();
-    const last = kots[kots.length-1];
-    if(last) printKOTSlip(last.id);
-  }, 200);
+async function saveKOTAndPrint(){
+  const id=await saveKOT();
+  if(!id)return;
+  const k=dbGet().find(x=>x.id===id);
+  if(!k)return;
+  if(k.syncPending||!k.serverNo){
+    toast('⚠ KOT is queued. Print only after server confirmation of the KOT number.','warn');
+    return;
+  }
+  printKOTSlip(id);
 }
 
 function addItemToKOT(id) {
@@ -1460,7 +1448,7 @@ function printKOTSlip(id) {
         <div class="kot-slip-hdr">
           <div style="font-size:11px;margin-bottom:4px;">BALAJI NEXTGEN ERP</div>
           <h2>KOT — KITCHEN ORDER TICKET</h2>
-          <div style="font-size:13px;margin-top:6px;">KOT No: <strong>${k.no}</strong></div>
+          <div style="font-size:13px;margin-top:6px;">KOT No: <strong>${k.serverNo || k.no}</strong></div>
         </div>
         <div class="kot-slip-info">
           <div>Table : <strong>${k.table}</strong></div>
