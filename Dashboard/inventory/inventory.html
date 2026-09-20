@@ -1720,7 +1720,7 @@ window.INV_REPORT_DB = localStorage.getItem('bnx_report_db_id') || '';
            what Kitchen actually submitted. -->
       <div class="alert i">ℹ️ Kitchen raises indents from the Kitchen app → they appear below → Store Manager clicks Issue to approve &amp; deduct stock in one step. No direct inventory deduction until Store issues.</div>
       <div class="card">
-        <div class="card-h"><h3>📋 Kitchen Indent History &amp; Pending Issue</h3></div>
+        <div class="card-h"><h3>📋 Pending Kitchen Indents</h3></div>
         <div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Item</th><th>Qty Required</th><th>Qty Issued</th><th>Status</th><th>Actions</th></tr></thead><tbody id="ki-history-body"><tr><td colspan="6" class="tbl-empty">Loading…</td></tr></tbody></table></div>
       </div>
     </div>
@@ -4378,6 +4378,52 @@ async function syncPurchaseInvoiceRowToServer(pi){
     return {success:false,message:e.message};
   }
 }
+let _purchaseRegisterRefreshing=false;
+async function refreshPurchaseInvoicesFromServer(){
+  if(!_hasRealSession()) return {success:false,message:'no session'};
+  try{
+    const r=await erpApi('GET_PURCHASE_INVOICES',{});
+    if(!r||!r.success||!Array.isArray(r.data)) return r||{success:false,message:'No purchase data'};
+
+    const mapped=r.data.map(x=>({
+      _id:x._id,
+      inv_no:x.inv_no,
+      party_id:x.party_id,
+      party_name:x.party_name,
+      inv_date:x.inv_date,
+      due_date:x.due_date,
+      wh_id:x.wh_id,
+      taxable:Number(x.taxable)||0,
+      cgst:Number(x.cgst)||0,
+      sgst:Number(x.sgst)||0,
+      igst:Number(x.igst)||0,
+      other_charges:Number(x.other_charges)||0,
+      total:Number(x.total)||0,
+      status:x.status||x.payment_status||'unpaid',
+      items:(x.items||[]).map(it=>({
+        item_id:it.ITEM_ID||it.item_id||'',
+        item_name:it.ITEM_NAME||it.item_name||'',
+        hsn:it.HSN_CODE||it.hsn||'',
+        qty:Number(it.QUANTITY!=null?it.QUANTITY:it.qty)||0,
+        unit_id:it.UNIT_ID||it.unit_id||'',
+        rate:Number(it.RATE!=null?it.RATE:it.rate)||0,
+        gst_rate:Number(it.GST_RATE!=null?it.GST_RATE:it.gst_rate)||0,
+        cgst:Number(it.CGST!=null?it.CGST:it.cgst)||0,
+        sgst:Number(it.SGST!=null?it.SGST:it.sgst)||0,
+        igst:Number(it.IGST!=null?it.IGST:it.igst)||0,
+        amount:Number(it.LINE_TOTAL!=null?it.LINE_TOTAL:it.amount)||0
+      })),
+      _synced:true
+    }));
+
+    // When the server pull succeeds, the server is authoritative for this
+    // register. Do not merge old browser-only invoices back into it.
+    DB.set(CID+'_purchase_invoices',mapped);
+    return r;
+  }catch(e){
+    return {success:false,message:e.message};
+  }
+}
 async function deletePurchaseInvoiceRowFromServer(id){
   if(!_hasRealSession())return {success:false,message:'no session'};
   try{
@@ -6311,7 +6357,7 @@ function calcPurchaseTotals() {
   if(total>0) document.getElementById('pi-acc-preview').innerHTML=`<table><thead><tr><th>Ledger</th><th class="r">Dr</th><th class="r">Cr</th></tr></thead><tbody><tr><td>Purchase A/c</td><td class="r">${fmt(taxable)}</td><td class="r">—</td></tr>${cgst>0?`<tr><td>Input CGST</td><td class="r">${fmt(cgst)}</td><td class="r">—</td></tr><tr><td>Input SGST</td><td class="r">${fmt(sgst)}</td><td class="r">—</td></tr>`:''}<tr><td>${vName} (Creditor)</td><td class="r">—</td><td class="r">${fmt(total)}</td></tr></tbody><tfoot><tr class="rep-total"><td>Total</td><td class="r">${fmt(total)}</td><td class="r">${fmt(total)}</td></tr></tfoot></table>`;
 }
 
-function savePurchase() {
+async function savePurchase() {
   const supplier = document.getElementById('pi-supplier').value;
   const invno = document.getElementById('pi-invno').value.trim();
   const invdate = document.getElementById('pi-invdate').value;
@@ -6367,28 +6413,14 @@ function savePurchase() {
   // comment above. The generic DB.save() full-array push (fired
   // automatically by DB.insert/DB.update) still runs too as the
   // existing safety net.
-  syncPurchaseInvoiceRowToServer(pi);
+  const serverSave=await syncPurchaseInvoiceRowToServer(pi);
+  if(serverSave&&serverSave.success===false){
+    toast('Server save failed: '+(serverSave.message||serverSave.error||'Unknown error'),'e');
+    return;
+  }
   window._piBillAttachments = []; renderPIBillPreview();
-  // Post stock entries for the (new or edited) quantities
-  const wh=pi.wh_id||'WH001';
-  items_rows.forEach(ir=>{
-    const prev=getStockBalance(ir.item_id,wh);
-    DB.insert('stock_ledger',{_id:uid('SL'),item_id:ir.item_id,wh_id:wh,date:invdate,txn_type:'purchase',ref_id:pi._id,ref_type:'purchase_invoice',qty_in:ir.qty,qty_out:0,balance:prev+ir.qty,rate:ir.rate,value:ir.qty*ir.rate});
-    // BUG FIX ("Stock Value ₹760 doesn't match Purchase ₹976.50"): the
-    // Stock Value KPI (and Category-wise Stock, Warehouse-wise Stock, Item
-    // Master value column, everywhere else) all value stock as
-    // qty * item.purchase_price — but item.purchase_price is a static
-    // default that's only ever set once (in the Item Master form / Quick
-    // Add), never updated by an actual purchase. So after a real purchase
-    // at a different rate, every stock valuation kept using the old/
-    // default rate instead of what was actually paid, and drifted further
-    // from reality with every purchase. Fix: keep item.purchase_price in
-    // sync with the rate actually paid on the most recent purchase (a
-    // standard "last purchase cost" valuation, same convention Tally uses
-    // by default) so Stock Value stays accurate without needing to touch
-    // every place that reads it.
-    if(ir.rate>0){ DB.update('items',ir.item_id,{purchase_price:ir.rate}); }
-  });
+  // IMPORTANT: physical stock is NOT posted by Purchase Invoice. GRN owns stock.
+  // The server writes PURCHASE_INVOICE_ITEMS and supplier dues; stock is posted only by SAVE_GRN.
   // Post voucher — on edit, replace the old one rather than adding a
   // second, so accounting reports don't double-count this invoice.
   if(isEdit){
@@ -6396,7 +6428,7 @@ function savePurchase() {
     DB.save('vouchers', remainingVouchers);
   }
   DB.insert('vouchers',{_id:uid('VCH'),type:'purchase',v_no:'PI/'+invno,date:invdate,narration:'Purchase from '+vendor?.name+' | Inv: '+invno,total,ref_doc:pi._id,ref_type:'purchase_invoice',entries:[{ledger:'Purchase',dr:taxable,cr:0},{ledger:'Input CGST',dr:cgst,cr:0},{ledger:'Input SGST',dr:sgst,cr:0},{ledger:vendor?.name||supplier,dr:0,cr:total}]});
-  toast(isEdit?`${pi.inv_no} updated & stock adjusted ✓`:'Purchase invoice saved & accounting posted ✓','s');
+  toast(isEdit?`${pi.inv_no} updated ✓`:'Purchase invoice saved & accounting posted ✓','s');
   editingPiId=null;
   document.getElementById('pi-items-body').innerHTML='';
   document.getElementById('pi-invno').value='';
@@ -6475,31 +6507,30 @@ function editPI(id){
 // always safe: it's inserted last, so its own balance is computed
 // correctly from the current state, and every entry before it stays
 // exactly as it was — genuine, auditable history.
-function reversePurchaseStockImpact(pi, reasonNote){
-  const wh = pi.wh_id || 'WH001';
-  (pi.items||[]).forEach(ir=>{
-    const prev=getStockBalance(ir.item_id,wh);
-    DB.insert('stock_ledger',{_id:uid('SL'),item_id:ir.item_id,wh_id:wh,date:today(),txn_type:'purchase_reversal',ref_id:pi._id,ref_type:'purchase_invoice_reversal',qty_in:0,qty_out:ir.qty,balance:prev-ir.qty,rate:ir.rate,value:ir.qty*ir.rate,notes:reasonNote});
-  });
-}
 async function deletePI(id, skipConfirm){
-  const pi = DB.findOne('purchase_invoices',{_id:id});
-  if(!pi){ toast('Invoice not found','e'); return; }
-  if(!skipConfirm && !confirm(`Delete invoice ${pi.inv_no} (${pi.party_name}, ${fmt(pi.total)})?\n\nThis will:\n• Remove it from Purchase Register and all reports\n• Reverse its stock impact (posts a compensating entry — the original entries stay in history, same as real accounting practice)\n\nThis cannot be undone.`))return;
-  reversePurchaseStockImpact(pi, 'Reversal for deleted invoice '+pi.inv_no);
-  const remaining = DB.all('purchase_invoices').filter(p=>p._id!==id);
-  DB.save('purchase_invoices', remaining);
-  const remainingVouchers = DB.all('vouchers').filter(v=>!(v.ref_doc===id && v.ref_type==='purchase_invoice'));
-  DB.save('vouchers', remainingVouchers);
-  // FIX ("backend copies from business os files" — Aug 2026): authoritative
-  // per-row delete on the shared table — see deletePurchaseInvoiceRowFrom
-  // Server()'s header comment above for why this is what actually keeps
-  // this deletion from being resurrected by another tab/session.
-  await deletePurchaseInvoiceRowFromServer(id);
-  toast(`${pi.inv_no} deleted. Stock reversed.`,'s');
-  loadPurchaseRegister();
+  const pi=DB.findOne('purchase_invoices',{_id:id});
+  if(!pi){toast('Invoice not found','e');return;}
+
+  if(!skipConfirm && !confirm(`Delete invoice ${pi.inv_no} (${pi.party_name}, ${fmt(pi.total)})?\n\nThis will:\n• Remove the invoice and its line items from the live Purchase Register\n• Reverse the supplier payable created by this invoice\n• Leave physical stock untouched because stock is controlled by GRN\n\nThis cannot be undone.`)) return;
+
+  if(_hasRealSession()){
+    const serverResult=await deletePurchaseInvoiceRowFromServer(id);
+    if(!serverResult || serverResult.success===false){
+      toast('Server delete failed: '+(serverResult?.message||serverResult?.error||'Unknown error'),'e');
+      return;
+    }
+  }
+
+  const remaining=DB.all('purchase_invoices').filter(p=>p._id!==id);
+  DB.set(CID+'_purchase_invoices',remaining);
+  const remainingVouchers=DB.all('vouchers').filter(v=>!(v.ref_doc===id&&v.ref_type==='purchase_invoice'));
+  DB.set(CID+'_vouchers',remainingVouchers);
+
+  toast(`${pi.inv_no} deleted. Supplier payable reversed.`,'s');
+  await loadPurchaseRegister();
   loadDashboard();
-  const box=document.getElementById('pr-detail-box'); if(box)box.style.display='none';
+  const box=document.getElementById('pr-detail-box');
+  if(box)box.style.display='none';
 }
 
 // FIX ("SELECT ALL" — Aug 2026): bulk-select support for the Purchase
@@ -6530,13 +6561,19 @@ async function bulkDeletePurchaseMtdSelected(){
   if(!recs.length){ toast('Selected record(s) not found','e'); return; }
   const totalAmt=recs.reduce((s,p)=>s+(+p.total||0),0);
   const preview=recs.slice(0,5).map(p=>`• ${p.inv_no} — ${p.party_name} — ${fmt(p.total)}`).join('\n')+(recs.length>5?`\n…and ${recs.length-5} more`:'');
-  if(!confirm(`Delete ${recs.length} selected invoice(s), totaling ${fmt(totalAmt)}?\n\n${preview}\n\nThis will:\n• Remove them from Purchase Register and all reports\n• Reverse each one's stock impact (compensating entries — original entries stay in history)\n\nThis cannot be undone.`))return;
+  if(!confirm(`Delete ${recs.length} selected invoice(s), totaling ${fmt(totalAmt)}?\n\n${preview}\n\nThis will:\n• Remove them from Purchase Register and all reports\n• Reverse each supplier payable; physical stock remains controlled by GRN\n\nThis cannot be undone.`))return;
   for(const id of ids){ await deletePI(id, true); }
-  toast(`${recs.length} invoice(s) deleted. Stock reversed.`,'s');
+  toast(`${recs.length} invoice(s) deleted. Supplier dues reversed; stock untouched.`,'s');
   showKPIDetail('purchase-mtd');
 }
 
-function loadPurchaseRegister() {
+async function loadPurchaseRegister() {
+  // Server is authoritative. Refresh first, then render the local cache.
+  if(!_purchaseRegisterRefreshing && _hasRealSession()){
+    _purchaseRegisterRefreshing=true;
+    try{ await refreshPurchaseInvoicesFromServer(); }catch(e){ console.warn('[Purchase Register]',e.message); }
+    _purchaseRegisterRefreshing=false;
+  }
   const from = document.getElementById('pr-from')?.value||'';
   const to = document.getElementById('pr-to')?.value||'';
   const sid = document.getElementById('pr-supplier-filter')?.value||'';
@@ -6764,7 +6801,7 @@ async function loadKitchenHistory(silent){
   if (!silent) body.innerHTML = '<tr><td colspan="6" class="tbl-empty">Loading…</td></tr>';
   let res;
   try {
-    res = await erpApi('GET_PENDING_INDENTS', {pendingOnly:false});
+    res = await erpApi('GET_PENDING_INDENTS', {});
   } catch (fetchErr) {
     console.error('[loadKitchenHistory] fetch failed:', fetchErr);
     // FIX (same session): a background poll hiccup should never wipe
@@ -6779,7 +6816,7 @@ async function loadKitchenHistory(silent){
     return;
   }
   try {
-    const indents = (res.data && (res.data.indents || res.data.rows)) || res.indents || res.rows || [];
+    const indents = (res.data && res.data.indents) || res.indents || [];
     // Newest first — real DATE values come back as ISO timestamps or
     // dd-MM-yyyy strings depending on how Sheets stored the cell (see the
     // same issue already fixed in kitchen-indent.html's parseIndentDate);
@@ -12600,8 +12637,10 @@ function savePurchaseReturn() {
     wh_id: wh, taxable, cgst, sgst, total, items: returnItems, status: 'posted'
   };
   DB.insert('purchase_returns', prDoc);
+  // Live server posting: Purchase Return owns the physical stock reversal.
+  erpApi('SAVE_PURCHASE_RETURN',{returnId:prDoc._id,returnNumber:rno,returnDate:rdate,locationId:wh,supplierId:pi.party_id,purchaseId:piId,reason:reason,status:'POSTED',items:returnItems.map(x=>({itemId:x.item_id,itemName:x.item_name,qty:x.qty,rate:x.rate,taxRate:x.gst_rate,unitId:x.unit_id||''}))}).then(r=>{if(r&&r.success===false)toast('Server purchase return failed: '+(r.message||r.error||'Unknown error'),'e');});
 
-  // 2. Reverse stock — reduce from warehouse
+  // 2. Reverse stock — local cache only; server is authoritative.
   returnItems.forEach(ri => {
     const prev = getStockBalance(ri.item_id, wh);
     DB.insert('stock_ledger', {
