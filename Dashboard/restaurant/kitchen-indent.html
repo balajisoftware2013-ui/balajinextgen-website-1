@@ -781,18 +781,54 @@ async function loadPendingIndentBalances() {
 // and re-renders the New Indent table. No demo/fallback catalog is used.
 async function loadRealItems() {
   // KITCHEN INDENT = RAW_MATERIAL_MASTER only.
-  // Never load restaurant menu/bar ITEM_MASTER records here.
+  // Primary action: GET_RAW_MATERIALS.
+  // Compatibility fallback: GET_MASTER(category='ingredients') from the
+  // current V3 Core. This does NOT use ITEM_MASTER, BAR_ITEM_MASTER,
+  // demo data, or a hardcoded catalogue.
   let res = null;
   let lastError = '';
+
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       res = await erpApi('GET_RAW_MATERIALS', { liveOnly: true, attempt: attempt });
       if (res && res.success && res.data && Array.isArray(res.data.items) && res.data.items.length) break;
-      lastError = (res && (res.message || res.error)) || 'Client RAW_MATERIAL_MASTER returned no active raw materials';
+      lastError = (res && (res.message || res.error)) || 'GET_RAW_MATERIALS returned no rows';
     } catch (e) {
       lastError = e && e.message ? e.message : 'GET_RAW_MATERIALS failed';
     }
-    if (attempt < 3) await new Promise(r => setTimeout(r, 700 * attempt));
+    if (attempt < 3) await new Promise(r => setTimeout(r, 500 * attempt));
+  }
+
+  // FIX: some deployed V3 Core revisions expose RAW_MATERIAL_MASTER through
+  // the generic GET_MASTER endpoint as category "ingredients", but do not
+  // expose the dedicated GET_RAW_MATERIALS action. Use that live backend
+  // route before declaring RAW_MATERIAL_MASTER unavailable.
+  if (!res || !res.success || !(res.data && Array.isArray(res.data.items) && res.data.items.length)) {
+    try {
+      const masterRes = await erpApi('GET_MASTER', { category: 'ingredients' });
+      const rawRows = masterRes && masterRes.success && Array.isArray(masterRes.data)
+        ? masterRes.data
+        : [];
+      const activeRows = rawRows.filter(function(r) {
+        const code = String(r.ITEM_CODE || r.RAW_MATERIAL_ID || r.ITEM_ID || '').trim();
+        const name = String(r.ITEM_NAME || r.MATERIAL_NAME || r.NAME || '').trim();
+        const status = String(r.STATUS || 'ACTIVE').trim().toUpperCase();
+        return code && name && status !== 'INACTIVE';
+      });
+      if (activeRows.length) {
+        res = {
+          success: true,
+          data: { items: activeRows },
+          count: activeRows.length,
+          source: 'GET_MASTER:ingredients/RAW_MATERIAL_MASTER'
+        };
+        console.log('[loadRealItems] Compatibility route loaded RAW_MATERIAL_MASTER:', activeRows.length);
+      } else if (masterRes && masterRes.error) {
+        lastError = masterRes.error;
+      }
+    } catch (e) {
+      lastError = (e && e.message ? e.message : String(e)) + ' | GET_MASTER ingredients fallback failed';
+    }
   }
 
   if (!res || !res.success || !(res.data && Array.isArray(res.data.items) && res.data.items.length)) {
@@ -803,22 +839,25 @@ async function loadRealItems() {
     renderTable([]);
     updateSummary();
     console.error('[loadRealItems] LIVE RAW_MATERIAL_MASTER unavailable:', lastError);
-    showToast('⚠ Client RAW_MATERIAL_MASTER is not available. No menu/bar/demo items are loaded.', 'warn');
+    showToast('⚠ RAW_MATERIAL_MASTER could not be read from the live ERP backend. No menu/bar/demo items are used.', 'warn');
     const label = document.getElementById('itemsFilledLabel');
     if (label) label.textContent = 'Live raw materials unavailable';
     return;
   }
 
   INDENT_ITEMS = res.data.items.map(i => ({
-    id: String(i.ITEM_CODE || i.ITEM_ID || '').trim(),
-    name: String(i.ITEM_NAME || i.NAME || '').trim(),
-    cat: i.CATEGORY || 'Other',
-    uom: i.UOM || i.UNIT || '',
-    stock: Number(i.STOCK) || 0,
-    stockSource: String(i.STOCK_SOURCE || ''),
+    id: String(i.ITEM_CODE || i.ITEM_ID || i.RAW_MATERIAL_ID || '').trim(),
+    name: String(i.ITEM_NAME || i.NAME || i.MATERIAL_NAME || '').trim(),
+    cat: String(i.CATEGORY || i.CATEGORY_NAME || 'Other').trim() || 'Other',
+    uom: String(i.UOM || i.UNIT || i.UNIT_NAME || '').trim(),
+    stock: Number(i.STOCK != null ? i.STOCK :
+      (i.CURRENT_STOCK != null ? i.CURRENT_STOCK :
+      (i.CURRENT_QUANTITY != null ? i.CURRENT_QUANTITY : i.AVAILABLE_QUANTITY))) || 0,
+    stockSource: String(i.STOCK_SOURCE || (i.CURRENT_STOCK != null ? 'CURRENT_STOCK' : '') || ''),
     stockStatus: String(i.STOCK_STATUS || ''),
-    min: Number(i.MIN_STOCK || i.REORDER_LEVEL) || 0,
-    rate: Number(i.RATE || i.COST_PRICE) || 0,
+    min: Number(i.MIN_STOCK != null ? i.MIN_STOCK : i.REORDER_LEVEL) || 0,
+    rate: Number(i.RATE != null ? i.RATE :
+      (i.COST_PRICE != null ? i.COST_PRICE : i.PURCHASE_RATE)) || 0,
   })).filter(i => i.id && i.name);
 
   fullItemList = [...INDENT_ITEMS];
