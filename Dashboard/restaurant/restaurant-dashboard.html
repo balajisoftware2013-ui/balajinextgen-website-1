@@ -9348,27 +9348,33 @@ function showNotif(msg, type){
    client's key), and only show the generic "Balaji NextGen" name if
    there truly is no client logged in / nothing found anywhere. */
 async function bnxResolveClientBrand(){
+  // Wait for the authenticated/configured session when this function is
+  // called during the first page paint. Running too early used to save the
+  // generic Balaji/Restaurant ERP fallback and then a refresh lost the
+  // client logo because no second successful branding read was guaranteed.
+  try{ if(window.__bnxConfigReady && typeof window.__bnxConfigReady.then==='function') await window.__bnxConfigReady; }catch(e){}
   const existing = loadBrand();
-  if (!CLIENT_ID){ applyBrand(existing && existing.name ? existing : {}); return; }
+  if (!CLIENT_ID){ applyBrand(existing && (existing.name||existing.logoDataUrl) ? existing : {}); return; }
   try{
-    const res = await gasApi('GET_CLIENT_INFO', { clientId: CLIENT_ID });
+    const res = await gasApi('GET_CLIENT_INFO', { clientId: CLIENT_ID }, 'V2_CORE');
     const info = res && (res.data || res);
-    const realName = info && (info.restaurantName || info.name || info.CLIENT_NAME);
-    if (realName){
-      // Refresh BOTH name and logo from the live client record. This is
-      // important when another device uploaded/replaced the logo.
-      const brand = {
-        name: realName,
-        tagline: info.tagline || (existing && existing.tagline) || 'Restaurant ERP',
-        logoDataUrl: info.logoUrl || (existing && existing.logoDataUrl) || undefined
-      };
+    const realName = info && (info.restaurantName || info.name || info.CLIENT_NAME || info.companyName);
+    const realLogo = info && (info.logoUrl || info.LOGO_URL || info.logo || info.LOGO);
+    const brand = {
+      name: realName || existing.name || 'Restaurant ERP',
+      tagline: (info && info.tagline) || existing.tagline || 'Restaurant ERP',
+      logoDataUrl: realLogo || existing.logoDataUrl || undefined
+    };
+    // Save/apply whenever EITHER the real name OR the real logo exists.
+    // Never replace a known client logo with the Balaji fallback.
+    if(realName || realLogo || existing.name || existing.logoDataUrl){
       saveBrand(brand);
       applyBrand(brand);
-      return;
     }
+    return;
   }catch(e){ /* backend not reachable — use this client's local fallback */ }
   const known = (typeof DEMO_CLIENT_FALLBACK!=='undefined') ? DEMO_CLIENT_FALLBACK[CLIENT_ID] : null;
-  applyBrand(existing && existing.name ? existing : (known ? { name: known.name } : {}));
+  applyBrand(existing && (existing.name||existing.logoDataUrl) ? existing : (known ? { name: known.name } : {}));
 }
 // FIX ("check full... load to save to all"): bnxResolveClientBrand() and
 // loadDashboard() were each registered as DOMContentLoaded listeners
@@ -10153,10 +10159,20 @@ document.addEventListener('DOMContentLoaded', ()=>{ try{ if (typeof bnxSyncKotBa
 document.addEventListener('DOMContentLoaded', async ()=>{
   await window.__bnxConfigReady;
   // Pull live KOTs/orders once on load, then re-render whichever KOT view is on screen
-  if (typeof bnxSyncLiveKots === 'function') bnxSyncLiveKots().then(()=>{
-    if (typeof buildKOT === 'function') buildKOT();
-    if (typeof buildDashKotList === 'function') buildDashKotList();
-  });
+  if (typeof bnxPullKotsFromServer === 'function') {
+    bnxPullKotsFromServer().finally(()=>{
+      if (typeof bnxSyncLiveKots === 'function') return bnxSyncLiveKots();
+    }).finally(()=>{
+      if (typeof buildKOT === 'function') buildKOT();
+      if (typeof buildDashKotList === 'function') buildDashKotList();
+      if (typeof bnxSyncKotBadge === 'function') bnxSyncKotBadge();
+    });
+  } else if (typeof bnxSyncLiveKots === 'function') {
+    bnxSyncLiveKots().finally(()=>{
+      if (typeof buildKOT === 'function') buildKOT();
+      if (typeof buildDashKotList === 'function') buildDashKotList();
+    });
+  }
 });
 
 /* ── DEEP LINK: ?page=xxx ──
@@ -13643,7 +13659,7 @@ function bnxRecordKOT(table, type, waiter, covers, items, orderNo, orderSyncItem
   // to): orderNo was already known here and sent to the server below, but
   // never saved onto the LOCAL entry, so the Pending KOTs list had no way
   // to display it. Stored now so it can be shown alongside the KOT number.
-  const entry = { kotNo, table, type, time: new Date().toISOString(), waiter:waiter||'', covers:covers||'', items:items||[], status:'NEW', orderNo: orderNo||'', localOnly:true };
+  const entry = { kotNo, table, type, time: new Date().toISOString(), waiter:waiter||'', covers:covers||'', items:items||[], status:'NEW', orderNo: orderNo||'', localOnly:true, syncPending:true };
   open.unshift(entry);
   if (open.length>100) open = open.slice(0,100);
   bnxSetOpenKotsRaw(JSON.stringify(open));
@@ -13659,7 +13675,15 @@ function bnxRecordKOT(table, type, waiter, covers, items, orderNo, orderSyncItem
     items:items||[]
   };
   gasApi('SAVE_KOT', kotReq, 'V2_CORE').then(res=>{
-    if(!res || !res.success) bnxQueuePending('SAVE_KOT', kotReq, kotRequestId);
+    if(res && res.success){
+      try{
+        let cur=[]; try{cur=JSON.parse(bnxGetOpenKotsRaw()||'[]');}catch(e){}
+        const ix=cur.findIndex(k=>k.kotNo===kotNo);
+        if(ix>=0){ cur[ix].syncPending=false; cur[ix].localOnly=false; cur[ix].serverKotId=res.transactionId||res.kotId||''; cur[ix].serverKotNumber=res.kotNumber||kotNo; bnxSetOpenKotsRaw(JSON.stringify(cur)); }
+      }catch(e){}
+    } else {
+      bnxQueuePending('SAVE_KOT', kotReq, kotRequestId);
+    }
   }).catch(()=>bnxQueuePending('SAVE_KOT', kotReq, kotRequestId));
 
   if (orderSyncItems === false) return kotNo; // this station's ticket only — the order itself was already synced by an earlier station in this same split
@@ -14490,14 +14514,18 @@ async function bnxPullKotsFromServer(){
   if (typeof gasApi !== 'function' || !CLIENT_ID) return false;
   try{
     const res = await gasApi('GET_KOT', { includeClosed:false }, 'V2_CORE');
-    if(!res || !res.success || !Array.isArray(res.data)) return false;
-    const rows = res.data;
+    if(!res || !res.success) return false;
+    const rows = Array.isArray(res.data) ? res.data : (res.data && (Array.isArray(res.data.rows) ? res.data.rows : (Array.isArray(res.data.kots) ? res.data.kots : [])));
+    if(!Array.isArray(rows)) return false;
     let local=[]; try{ local=JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
     const map={PRINTED:'NEW',NEW:'NEW',PENDING:'NEW',COOKING:'PROGRESS',PREPARING:'PROGRESS',IN_PROGRESS:'PROGRESS',PROGRESS:'PROGRESS',READY:'READY',SERVED:'SERVED'};
     const server=[];
     const seen=new Set();
+    const businessDay = (typeof getBusinessDate==='function' ? String(getBusinessDate()||'') : new Date().toISOString().slice(0,10));
     rows.forEach(k=>{
       const no=String(k.KOT_NUMBER||'').trim(); if(!no || seen.has(no)) return;
+      const kd=String(k.KOT_DATE||'').slice(0,10);
+      if(kd && businessDay && kd!==businessDay) return;
       seen.add(no);
       server.push({
         kotNo:no, table:k.TABLE_ID||'—', type:no.startsWith('BAR-')?'BAR':'KITCHEN',
@@ -17271,10 +17299,27 @@ function bnxMarkOrdersPicked(orderIds){
   const merged = existing.concat(orderIds).filter((v,i,a)=>v && a.indexOf(v)===i);
   localStorage.setItem(bnxPickedOrdersKey(), JSON.stringify(merged));
 }
-function bmOpenKotPicker(){
+async function bmOpenKotPicker(){
   const tblVal = (document.getElementById('bm-bf-table')?.value || '').trim().toUpperCase();
+  // LIVE FIX: New Bill must not depend only on this browser's localStorage.
+  // Pull the authoritative client KOT register every time the picker opens so
+  // KOTs sent from Steward/KDS/another POS/device appear immediately. Keep
+  // unsynced local tickets only when the server is temporarily unreachable.
+  try{ await bnxPullKotsFromServer(); }catch(e){}
+  try{ if(typeof loadOrderRegister==='function') await loadOrderRegister(); }catch(e){}
   let open = [];
   try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
+  // Never display stale local tickets from previous business days. The
+  // screenshot showed 62,500+ minutes old KOTs; those were browser leftovers,
+  // not current pending KOTs. Unsynced tickets remain visible regardless of
+  // age because they may still need retry.
+  const nowDay = new Date().toISOString().slice(0,10);
+  open = open.filter(k=>{
+    if(k && k.syncPending===true) return true;
+    const t=Date.parse(k && k.time);
+    return !Number.isFinite(t) || new Date(t).toISOString().slice(0,10)===nowDay;
+  });
+  bnxSetOpenKotsRaw(JSON.stringify(open));
   const bareTbl = tblVal.replace('T-','');
   // FIX ("after added load remove ... otherwise multiple add"): same
   // `billed` exclusion as bmHandleTableChange — once a KOT's items have
@@ -27553,8 +27598,15 @@ function renderQuickCategories(){
          latitude:get(['latitude','LATITUDE','LAT','MAP_LAT']),
          longitude:get(['longitude','LONGITUDE','LNG','LON','MAP_LNG'])
       };
-      if(!info.restaurantName && !info.gst && !info.address && !info.phone) return false;
+      if(!info.restaurantName && !info.gst && !info.address && !info.phone && !info.logoUrl) return false;
       window.BNX_LIVE_CLIENT_INFO=Object.assign({},window.BNX_LIVE_CLIENT_INFO||{},info,{source:'CLIENT_MASTER'});
+      // Keep the visible client branding tied to the same live record. This
+      // prevents a refresh from falling back to the bundled Balaji logo.
+      if(info.restaurantName || info.logoUrl){
+        const current=loadBrand();
+        const liveBrand={name:info.restaurantName||current.name||'Restaurant ERP',tagline:current.tagline||'Restaurant ERP',logoDataUrl:info.logoUrl||current.logoDataUrl||undefined};
+        saveBrand(liveBrand); applyBrand(liveBrand);
+      }
       try{localStorage.setItem('bnx_restaurant_info_'+cid,JSON.stringify(info));}catch(e){}
       try{localStorage.setItem('erp_restaurant_info_'+cid,JSON.stringify(info));}catch(e){}
       const set=(id,v)=>{const el=document.getElementById(id);if(el&&v)el.value=v;};
