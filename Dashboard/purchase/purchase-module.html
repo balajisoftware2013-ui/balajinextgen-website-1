@@ -1846,14 +1846,19 @@ function _mapDocToSyncPurchaseRecord(doc){
     status: 'unpaid', // this app tracks payment separately via DB.payments/vendor.outstanding, not a per-invoice flag — 'unpaid' matches inventory.html's own default until a dedicated payment-status field exists here
     approval_status: doc.status||'Pending Approval', // this app's real Draft/Pending Approval/Approved/Rejected/On Hold state — see _mapSyncRecordToDoc's use of this above; keeps the approval workflow intact across the shared table instead of everything silently arriving pre-"Approved"
     items: (doc.items||[]).map(it=>({
-      item_id: it.itemId||('I'+uid()),
-      item_name: it.name||'',
+      item_id: it.itemId||it.item_id||'',
+      item_name: it.name||it.item_name||'',
       hsn: it.hsn||'',
       qty: +it.qty||0,
+      unit_id: it.unitId||it.unit_id||it.unit||'',
       rate: +it.rate||0,
-      gst_rate: +it.gst||0,
-      cgst: 0, sgst: 0,
-      amount: +it.amt||0
+      discount_pct: +it.disc||it.discount_pct||0,
+      gst_rate: +it.gst||it.gst_rate||0,
+      taxable_amount: +(it.lineNet!=null ? it.lineNet : ((+it.amt||0)-(+it.taxAmt||0)))||0,
+      cgst: +it.cgst||0, sgst: +it.sgst||0, igst: +it.igst||0,
+      tax_amount: +it.taxAmt||0,
+      extra_charges: +it.extraShare||0,
+      amount: +(it.pcTaxable!=null ? it.pcTaxable : (it.amt||0))||0
     })),
     _ts: doc.createdAt||new Date().toISOString(),
     _synced: true
@@ -1900,6 +1905,51 @@ async function deletePurchaseInvoiceRowFromServer(id){
     return {success:false,message:e.message};
   }
 }
+async function refreshPurchaseInvoicesFromServer(options={}){
+  if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return {success:false,message:'no session'};
+  try{
+    const r=await erpApi('GET_PURCHASE_INVOICES',{});
+    if(!r||r.success===false)return r||{success:false,message:'empty server response'};
+    const rows=Array.isArray(r.data)?r.data:[];
+    const pending=new Set(window._pendingDeletes||[]);
+    const localUnsynced=(DB.purchases||[]).filter(p=>p && p.synced!==true && !pending.has(p.id));
+    const mapped=rows.filter(rec=>rec && rec._id && !pending.has(rec._id)).map(rec=>{
+      const taxable=+rec.taxable||0,cgst=+rec.cgst||0,sgst=+rec.sgst||0,igst=+rec.igst||0;
+      const items=(Array.isArray(rec.items)?rec.items:[]).map(it=>({
+        itemId:it.ITEM_ID||it.item_id||'',
+        name:it.ITEM_NAME||it.item_name||'',
+        hsn:it.HSN_CODE||it.hsn||'',
+        qty:+(it.QUANTITY!=null?it.QUANTITY:it.qty)||0,
+        unit:it.UNIT_ID||it.unit_id||it.unit||'Nos',
+        rate:+(it.RATE!=null?it.RATE:it.rate)||0,
+        disc:+(it.DISCOUNT_PCT!=null?it.DISCOUNT_PCT:it.discount_pct)||0,
+        gst:+(it.GST_RATE!=null?it.GST_RATE:it.gst_rate)||0,
+        taxAmt:+(it.TAX_AMOUNT!=null?it.TAX_AMOUNT:it.tax_amount)||0,
+        lineNet:+(it.TAXABLE_AMOUNT!=null?it.TAXABLE_AMOUNT:it.taxable_amount)||0,
+        extraShare:+(it.EXTRA_CHARGES!=null?it.EXTRA_CHARGES:it.extra_charges)||0,
+        pcTaxable:+(it.LINE_TOTAL!=null?it.LINE_TOTAL:(it.amount!=null?it.amount:0))||0,
+        amt:+(it.LINE_TOTAL!=null?it.LINE_TOTAL:(it.amount!=null?it.amount:0))||0
+      }));
+      return {
+        id:rec._id,no:rec.inv_no||'',date:normalizeDateStr(rec.inv_date)||rec.inv_date||'',
+        vendorId:rec.party_id||'',vendorName:rec.party_name||'',poRef:'',grnRef:'',mode:'inventory',
+        whId:rec.wh_id||'',paymentMode:'Credit',items,subtotal:taxable,discount:0,taxable,
+        gstTotal:cgst+sgst+igst,cgst,sgst,igst,grand:+rec.total||0,due:rec.due_date||'',notes:'',
+        status:rec.approval_status||rec.status||'Draft',tcs:+rec.tcs_amount||0,tcsRate:+rec.tcs_rate||0,tds:+rec.tds_amount||0,tdsRate:+rec.tds_rate||0,billFileUrl:'',tallyStatus:'PENDING',
+        createdAt:rec.created_at||rec._ts||new Date().toISOString(),synced:true
+      };
+    });
+    // Server is authoritative for confirmed rows. Preserve only truly unsynced local rows.
+    DB.purchases=[...mapped,...localUnsynced.filter(p=>!mapped.some(m=>m.id===p.id))];
+    saveLocalOnly();
+    try{rendDash();}catch(e){} try{rendPurchaseList();}catch(e){} try{rendRegs();}catch(e){} try{updateApprCount();}catch(e){}
+    return {success:true,data:mapped,count:mapped.length};
+  }catch(e){
+    console.warn('[Purchase] GET_PURCHASE_INVOICES failed:',e.message);
+    return {success:false,message:e.message};
+  }
+}
+
 async function pushPurchaseInvoicesToSyncTable(){
   if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return;
   // FIX ("delete blank but after a sec same data reflect — not deleted" —
@@ -2005,16 +2055,10 @@ function saveLocalOnly(){
   try{localStorage.setItem('BALAJI_PROCUREMENT',JSON.stringify(DB))}catch(e){}
 }
 function save(){
+  // Local cache only. Purchase Invoice cloud persistence is row-authoritative
+  // through SYNC_PURCHASE_INVOICE_ROW / GET_PURCHASE_INVOICES. A full-array
+  // push here could resurrect another user's deleted invoice from a stale tab.
   saveLocalOnly();
-  // NOTE: previously also called InventoryBridge.syncSnapshot('procurement', DB)
-  // here — that was part of an abandoned design (Drive-folder-based backend,
-  // confirmed incompatible with this project's real rbClientSpreadsheetId_
-  // architecture) and had become a silent no-op. Removed.
-  // Real cross-device sync for Purchase Invoices now ALSO goes through the
-  // shared SYNC_purchase_invoices table (see pushPurchaseInvoicesToSyncTable
-  // above) — fire-and-forget, so the UI never waits on network, same
-  // pattern inventory.html's own DB.save() already uses for every table.
-  pushPurchaseInvoicesToSyncTable();
 }
 function load(){
   // FIX ("clear browser also when login purchase module load so no
@@ -2282,39 +2326,13 @@ function load(){
         // field mapping. Same merge-safety pattern as the block above:
         // respects in-flight local pushes/deletes, doesn't let an
         // empty/partial incoming items[] wipe a good local one.
+        // Purchase Invoice cloud pull is authoritative and tenant-scoped.
+        // Do NOT use SYNC_PULL_ALL here: the production Purchase backend does not
+        // expose that action. GET_PURCHASE_INVOICES reads PURCHASE_INVOICE plus
+        // PURCHASE_INVOICE_ITEMS directly and replaces confirmed local rows.
         try{
-          const syncRes = await erpApi('SYNC_PULL_ALL', {});
-          const incoming = syncRes && syncRes.success && syncRes.tables && syncRes.tables.purchase_invoices;
-          if (Array.isArray(incoming) && incoming.length){
-            const pendingDel2 = window._pendingDeletes || new Set();
-            const pendingPush = window._pushingPurchaseSyncTable;
-            if (!pendingPush){ // a push is currently in flight — skip this pull cycle so it can't stomp on data still being sent
-              const incomingIds = new Set(incoming.map(r=>r._id));
-              incoming.forEach(rec=>{
-                if (pendingDel2.has(rec._id)) return; // delete in flight on this tab — don't resurrect
-                const mapped = _mapSyncRecordToDoc(rec);
-                const idx = DB.purchases.findIndex(x=>x.id===rec._id);
-                if (idx>=0){
-                  const orig = DB.purchases[idx];
-                  const merged = {...orig, ...mapped};
-                  if ((!Array.isArray(mapped.items)||!mapped.items.length) && Array.isArray(orig.items) && orig.items.length){
-                    merged.items = orig.items;
-                  }
-                  merged.synced = true;
-                  DB.purchases[idx] = merged;
-                } else {
-                  mapped.synced = true;
-                  DB.purchases.push(mapped);
-                }
-              });
-              // Same "genuinely deleted upstream" reconciliation as the
-              // block above, scoped to this shared table's own id set.
-              DB.purchases = DB.purchases.filter(p =>
-                pendingDel2.has(p.id) || p.synced!==true || incomingIds.has(p.id)
-              );
-            }
-          }
-        }catch(e){ console.warn('[Shared Sync] pull failed:', e.message); }
+          if(!(window._pushingPurchaseSyncTable)) await refreshPurchaseInvoicesFromServer({silent:true});
+        }catch(e){ console.warn('[Purchase] authoritative pull failed:',e.message); }
         // Same deletion reconciliation for Accounting invoices — same
         // field-name caveat as the confirmed purchaseInvoices above
         // applies here too (d.acctInvoices isn't independently verified
@@ -2676,6 +2694,7 @@ function load(){
     const item=matchInventoryItem(name.trim());
     if(!item)return;
     const set=(id,val)=>{const e=document.getElementById(id);if(e)e.value=val;};
+    set('pit-itemid-'+n,item._id||item.id||item.item_id||'');
     set('pit-hsn-'+n,item.hsn||'');
     set('pit-unit-'+n,item.unit||'Nos');
     // FIX (RATE auto-fill): Always populate rate from inventory when item picked
@@ -3598,7 +3617,7 @@ function addPRow(){
   pitRowCount++;const n=pitRowCount;
   const row=`<tr id="prow-${n}">
     <td style="color:var(--text3);font-size:11px">${n}</td>
-    <td><input type="text" placeholder="Item / description..." id="pit-name-${n}" list="itemMasterDL" onchange="pitItemPicked(${n})"></td>
+    <td><input type="hidden" id="pit-itemid-${n}"><input type="text" placeholder="Item / description..." id="pit-name-${n}" list="itemMasterDL" onchange="pitItemPicked(${n})"></td>
     <td><input type="text" id="pit-hsn-${n}" placeholder="HSN" style="width:65px"></td>
     <td><input type="number" id="pit-qty-${n}" value="1" min="0" step="0.01" oninput="pitFieldChanged(${n})" style="width:55px"></td>
     <td><input type="text" id="pit-unit-${n}" value="Nos" style="width:45px" onblur="this.value=normalizeUnit(this.value)"></td>
@@ -3920,7 +3939,7 @@ function editPurchase(id,mode){
   { const banner=el('reconcileWarnBanner');if(banner)banner.style.display='none'; }
   (p.items||[]).forEach(it=>{
     addPRow();const n=pitRowCount;
-    sv('pit-name-'+n,it.name);sv('pit-hsn-'+n,it.hsn||'');sv('pit-qty-'+n,it.qty);sv('pit-unit-'+n,it.unit||'Nos');
+    sv('pit-name-'+n,it.name);sv('pit-itemid-'+n,it.itemId||it.item_id||'');sv('pit-hsn-'+n,it.hsn||'');sv('pit-qty-'+n,it.qty);sv('pit-unit-'+n,it.unit||'Nos');
     sv('pit-rate-'+n,it.rate);sv('pit-disc-'+n,it.disc||0);
     const gstSel=el('pit-gst-'+n);if(gstSel)gstSel.value=String(it.gst||0);
   });
@@ -3930,7 +3949,7 @@ function editPurchase(id,mode){
   toast('Editing '+p.no+' — Save will update this record','warn','✏️');
 }
 
-function savePurchase(sendApproval,forceSave){
+async function savePurchase(sendApproval,forceSave){
   const vendId=v('p-vend-id'),vend=DB.vendors.find(v=>v.id===vendId);
   if(!vend){toast('Please select a vendor','err','⚠️');return;}
   if(curMode!=='accounting'&&!v('p-wh')){toast('Please select a Warehouse','err','⚠️');return;}
@@ -3964,7 +3983,7 @@ function savePurchase(sendApproval,forceSave){
     sub+=lineAmt;disc+=lineDis;taxable+=lineNet;gstTotal+=lineTax;
     // FIX: split correctly so saved doc always carries an accurate CGST/SGST/IGST breakdown
     if(interState){igst+=lineTax;}else{cgst+=lineTax/2;sgst+=lineTax/2;}
-    rawLines.push({name,hsn:v('pit-hsn-'+n),qty,unit:v('pit-unit-'+n),rate,disc:d,gst,taxAmt:lineTax,lineNet});
+    rawLines.push({itemId:v('pit-itemid-'+n),name,hsn:v('pit-hsn-'+n),qty,unit:v('pit-unit-'+n),rate,disc:d,gst,taxAmt:lineTax,lineNet});
   }
   if(!rawLines.length){toast('Add at least one item','err','⚠️');return;}
 
@@ -3981,7 +4000,7 @@ function savePurchase(sendApproval,forceSave){
     const itemGstForCost=itcReverse?it.taxAmt:0;
     const pcTaxable=it.lineNet+itemExtra+itemGstForCost;
     items.push({
-      name:it.name,hsn:it.hsn,qty:it.qty,unit:it.unit,rate:it.rate,disc:it.disc,gst:it.gst,
+      itemId:it.itemId||'',name:it.name,hsn:it.hsn,qty:it.qty,unit:it.unit,rate:it.rate,disc:it.disc,gst:it.gst,
       taxAmt:it.taxAmt,
       lineNet:it.lineNet,
       extraShare:+itemExtra.toFixed(2),
@@ -4061,8 +4080,10 @@ function savePurchase(sendApproval,forceSave){
     });
     const arr=editingPurchaseMode==='accounting'?DB.acctInvs:DB.purchases;
     const idx=arr.findIndex(x=>x.id===editingPurchaseId);
+    let originalBeforeEdit=null;
     if(idx>=0){
       const orig=arr[idx];
+      originalBeforeEdit=JSON.parse(JSON.stringify(orig));
       doc.id=editingPurchaseId;
       doc.createdAt=orig.createdAt;
       if(!doc.billFileUrl)doc.billFileUrl=orig.billFileUrl||''; // editing without a fresh scan keeps the original bill link
@@ -4073,41 +4094,38 @@ function savePurchase(sendApproval,forceSave){
       doc.department=doc.department||orig.department;doc.ackAt=orig.ackAt;
       arr[idx]=doc;
     }
+    // Server-first edit for inventory purchase invoices. Purchase Invoice is
+    // financial/AP only; physical stock is changed by GRN, never here.
+    if(doc.mode==='inventory'){
+      const serverResult=await syncPurchaseInvoiceRowToServer(doc);
+      if(!serverResult || serverResult.success===false){
+        if(idx>=0 && originalBeforeEdit) arr[idx]=originalBeforeEdit;
+        saveLocalOnly();
+        editingPurchaseId=null;editingPurchaseMode=null;pendingBillDriveLink=null;
+        rendDash();rendRegs();rendPurchaseList();updateApprCount();
+        toast(`⚠️ ${doc.no} was NOT updated on the server: ${(serverResult&&serverResult.message)||'sync failed'}`,'err','☁️');
+        return;
+      }
+    }
+    if(originalBeforeEdit && doc.mode==='inventory'){
+      const oldVendorId=originalBeforeEdit.vendorId, newVendorId=doc.vendorId;
+      const oldAmt=+originalBeforeEdit.grand||0, newAmt=+doc.grand||0;
+      if(oldVendorId!==newVendorId || Math.abs(oldAmt-newAmt)>0.005){
+        const ov=DB.vendors.findIndex(v=>v.id===oldVendorId);
+        if(ov>=0)DB.vendors[ov].outstanding=Math.max(0,(DB.vendors[ov].outstanding||0)-oldAmt);
+        const nv=DB.vendors.findIndex(v=>v.id===newVendorId);
+        if(nv>=0)DB.vendors[nv].outstanding=(DB.vendors[nv].outstanding||0)+newAmt;
+      }
+    }
     editingPurchaseId=null;editingPurchaseMode=null;pendingBillDriveLink=null;
-    save();closeM('mPurch');rendDash();rendRegs();rendPurchaseList();updateApprCount();
+    saveLocalOnly();closeM('mPurch');rendDash();rendRegs();rendPurchaseList();updateApprCount();
+    if(doc.mode==='inventory'){
+      doc.synced=true;
+      broadcastInventoryChange('PURCHASE_UPDATED', doc);
+    }
     toast(`${doc.no} updated successfully.`,'ok','✏️');
-    // FIX ("backend copies from business os files" — Aug 2026): this is
-    // now the AUTHORITATIVE sync for this edit — see
-    // syncPurchaseInvoiceRowToServer()'s header comment above. save()'s
-    // full-array push (triggered just above) still runs too as a
-    // safety net, but this row-level call is what actually guarantees
-    // this specific edit reaches the server correctly even if this
-    // tab's full local array happened to be stale in some other way.
-    if(doc.mode==='inventory')syncPurchaseInvoiceRowToServer(doc);
     savePurchaseToDrive(doc,vend);
     if(pendingManualBillFile)uploadManualBillAndAttach(doc.id,doc.mode);
-    erpApi('UPDATE_PURCHASE_INVOICE', doc).then(r=>{
-      if(r&&r.success===false){
-        toast('⚠️ '+doc.no+' updated locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️');
-      }else if(r&&r.success){
-        broadcastInventoryChange('PURCHASE_UPDATED', doc);
-        const arr3=doc.mode==='accounting'?DB.acctInvs:DB.purchases;
-        const idx3=arr3.findIndex(x=>x.id===doc.id);
-        if(idx3>=0){arr3[idx3].synced=true;save();rendDash();rendRegs();}
-        // FIX: inventory sync intentionally does NOT run on update.
-        // INV_syncPurchaseToInventory_ has no idempotency/delta logic —
-        // it just adds invoiceDoc's current quantities to stock on every
-        // call. This used to run here too, so re-saving the same invoice
-        // (even just editing the vendor note) silently added its full
-        // quantities to stock again each time — 2 edits = 2x stock, 5
-        // edits = 5x stock, with no error anywhere. It now only runs
-        // once, on initial creation (see SAVE_PURCHASE_INVOICE below).
-        // If item quantities need to stay editable after creation, the
-        // backend needs a diff-based sync (old qty vs new qty) before
-        // this can safely be re-enabled here.
-      }
-    });
-    if(doc.mode==='inventory'){ try{ pushPurchaseToInventory(doc,vend); }catch(e){ console.warn('Inventory push skipped:',e); } }
     enqueueTallyVoucher(doc,vend);
     return;
   }
@@ -4120,44 +4138,23 @@ function savePurchase(sendApproval,forceSave){
   if(vi>=0)DB.vendors[vi].outstanding=(DB.vendors[vi].outstanding||0)+grand;
   save();updateApprCount();
   toast(sendApproval?`${doc.no} sent for approval!`:`${doc.no} saved as draft.`,'ok','📦');
-  // FIX ("backend copies from business os files" — Aug 2026): same
-  // authoritative row-level sync as the edit path above — see
-  // syncPurchaseInvoiceRowToServer()'s header comment for why this
-  // closes the resurrection-bug class that the full-array push alone
-  // couldn't.
-  if(doc.mode==='inventory')syncPurchaseInvoiceRowToServer(doc);
-  // ── AUTO SAVE PURCHASE INVOICE TO GOOGLE DRIVE (client-wise) ──
-  savePurchaseToDrive(doc, vend);
-  if(pendingManualBillFile)uploadManualBillAndAttach(doc.id,doc.mode);
-  // ── PUSH TO REAL BACKEND (client-wise database — see CLIENT_ID/erpApi note at top of file) ──
-  erpApi('SAVE_PURCHASE_INVOICE', doc).then(r=>{
-    if(r&&r.success===false){
-      toast('⚠️ '+doc.no+' saved locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️');
-    }else if(r&&r.success){
-      const arr2=doc.mode==='accounting'?DB.acctInvs:DB.purchases;
-      const idx2=arr2.findIndex(x=>x.id===doc.id);
-      if(idx2>=0){arr2[idx2].synced=true;save();rendDash();rendRegs();}
-      // FIX: inventory sync now runs here — once, on creation — instead
-      // of on every update. See note in the UPDATE_PURCHASE_INVOICE
-      // handler above for why it was moved.
-      if(doc.mode==='inventory' && typeof erpApi==='function'){
-        erpApi('SYNC_PURCHASE_TO_INVENTORY', {invoiceDoc:doc, operation:'ADD'}).then(r2=>{
-          if(r2&&r2.success){
-            console.log('Inventory synced:', r2.synced, 'items updated');
-            erpApi('RECALC_INVENTORY_TOTALS', {});
-          }else if(r2&&r2.success===false){
-            console.warn('Inventory sync failed:', r2.message);
-          }
-        }).catch(e2=>{
-          console.warn('Inventory sync failed:', e2.message);
-        });
-      }
-    }else{
-      toast('⚠️ '+doc.no+' saved locally, but got no confirmation from server — check connection','warn','☁️');
+  // Inventory Purchase Invoice is persisted by the row-authoritative backend.
+  // Do not call SYNC_PURCHASE_TO_INVENTORY here: the production backend rejects
+  // that action because physical stock is posted only by GRN.
+  if(doc.mode==='inventory'){
+    const serverResult=await syncPurchaseInvoiceRowToServer(doc);
+    if(!serverResult || serverResult.success===false){
+      const vi2=DB.vendors.findIndex(v=>v.id===vendId);
+      if(vi2>=0)DB.vendors[vi2].outstanding=Math.max(0,(DB.vendors[vi2].outstanding||0)-(grand||0));
+      DB.purchases=DB.purchases.filter(x=>x.id!==doc.id);
+      saveLocalOnly();rendDash();rendRegs();rendPurchaseList();updateApprCount();
+      toast(`⚠️ ${doc.no} was NOT saved to the server: ${(serverResult&&serverResult.message)||'sync failed'}`,'err','☁️');
+      return;
     }
-  });
-  // ── PUSH TO INVENTORY: updates Item Master, Purchase Register & Voucher (accounting only — stock moves on GRN acceptance, see pushGRNStockLedger) ──
-  if(doc.mode==='inventory'){ try{ pushPurchaseToInventory(doc,vend); }catch(e){ console.warn('Inventory push skipped:',e); } }
+    const idx2=DB.purchases.findIndex(x=>x.id===doc.id);
+    if(idx2>=0){DB.purchases[idx2].synced=true;DB.purchases[idx2].syncUnconfirmed=false;}
+    saveLocalOnly();rendDash();rendRegs();rendPurchaseList();
+  }
   // ── QUEUE FOR TALLY (posted later, only when this page is open on the PC with Tally — see pollTallyQueue) ──
   enqueueTallyVoucher(doc,vend);
 }
@@ -4590,7 +4587,7 @@ function approveP(id){
     // for delete just below. Reload the page or check from another
     // device and the sheet still said "Pending Approval" forever,
     // because this never actually told the server.
-    erpApi('UPDATE_PURCHASE_INVOICE', DB.purchases[i]).then(r=>{ if(r&&r.success===false) toast('⚠️ Approved locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️'); });
+    syncPurchaseInvoiceRowToServer(DB.purchases[i]).then(r=>{ if(r&&r.success===false) toast('⚠️ Approved locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️'); });
   }
 }
 // ════ DELETE PURCHASE / ACCOUNTING INVOICE ════
@@ -4599,94 +4596,33 @@ async function deletePurchase(id,mode){
   const idx=arr.findIndex(x=>x.id===id);
   if(idx<0){toast('Record not found','err','⚠️');return;}
   const p=arr[idx];
-  if(!confirm(`Delete invoice ${p.no} (${p.vendorName}, ${fmt(p.grand)})?\n\nThis will:\n• Remove from all reports\n• Roll back inventory\n• Delete Drive files\n\nThis cannot be undone.`))return;
-  // Roll back the vendor's outstanding balance that this invoice added
+  if(!confirm(`Delete invoice ${p.no} (${p.vendorName}, ${fmt(p.grand)})?\n\nThis will:\n• Remove the purchase invoice from the live database and reports\n• Reverse the supplier payable created by this invoice\n• Delete the invoice detail rows\n• NOT change physical stock (stock is controlled by GRN)\n\nThis cannot be undone.`))return;
+
+  window._pendingDeletes=window._pendingDeletes||new Set();
+  window._pendingDeletes.add(id);
+
+  // For inventory Purchase Invoice, delete the authoritative server row first.
+  // The backend removes PURCHASE_INVOICE_ITEMS and reverses supplier payable.
+  // It deliberately does NOT touch STOCK_MOVEMENT/STOCK_BALANCE.
+  if(mode==='inventory'){
+    const result=await deletePurchaseInvoiceRowFromServer(id);
+    if(!result || result.success===false){
+      window._pendingDeletes.delete(id);
+      toast(`⚠️ ${p.no} was NOT deleted: ${(result&&result.message)||'server delete failed'}`,'err','☁️');
+      return;
+    }
+  }
+
+  // Only after server confirmation remove the local row.
   const vi=DB.vendors.findIndex(v=>v.id===p.vendorId);
   if(vi>=0)DB.vendors[vi].outstanding=Math.max(0,(DB.vendors[vi].outstanding||0)-(p.grand||0));
   arr.splice(idx,1);
   if(editingPurchaseId===id){editingPurchaseId=null;editingPurchaseMode=null;}
-  // FIX ("one time click then show delete but again show, 2nd time
-  // delete click then final deleted" — Aug 2026): this file polls
-  // pullInventorySyncData() every 20 seconds. If that poll happened to
-  // land in the small window between this optimistic local removal and
-  // the DELETE_PURCHASE_INVOICE call below actually finishing server-
-  // side, the poll would still see this invoice on the server and add
-  // it straight back — looking exactly like "delete didn't work".
-  // window._pendingDeletes marks this id as "a delete is in flight for
-  // this one" so pullInventorySyncData()'s merge skips re-adding it no
-  // matter how many polls land before the server confirms.
-  window._pendingDeletes = window._pendingDeletes || new Set();
-  window._pendingDeletes.add(id);
-  // IMPORTANT: persist locally WITHOUT triggering the legacy full-array
-  // purchase_invoices push. The row-level delete below is the authoritative
-  // server mutation; a full-array push here can race it and resurrect the
-  // deleted invoice from this or another stale tab.
-  saveLocalOnly();rendDash();rendRegs();rendPurchaseList();updateApprCount();
-  toast(`${p.no} deleted locally. Syncing with server...`,'ok','🗑️');
-  // FIX ("backend copies from business os files" — Aug 2026, replaces
-  // the "root-cause pass" fix below): pushPurchaseInvoicesToSyncTable()
-  // pushed this tab's ENTIRE local array as an upsert, relying on
-  // window._pendingDeletes (a per-tab in-memory Set) to tell the
-  // backend which ids to actually remove. That's exactly what let
-  // deletions get undone by ANY other tab/session pushing its own
-  // stale full snapshot afterward — the actual bug behind every
-  // "duplicate invoice reappears" incident this session. deletePurchase
-  // InvoiceRowFromServer() is a single-row, server-side-locked delete
-  // (see its header comment) — it reads the CURRENT server state and
-  // removes just this one id, so no other tab's stale snapshot can
-  // resurrect it afterward, regardless of what that tab still has
-  // cached locally.
-  if(mode==='inventory'){
-    const rowDeleteResult=await deletePurchaseInvoiceRowFromServer(id);
-    if(!rowDeleteResult || rowDeleteResult.success===false){
-      // Server deletion failed: restore the local record immediately so the
-      // UI cannot claim a successful delete while the authoritative table
-      // still contains the invoice.
-      arr.splice(idx,0,p);
-      saveLocalOnly();
-      window._pendingDeletes.delete(id);
-      rendDash();rendRegs();rendPurchaseList();updateApprCount();
-      toast(`⚠️ ${p.no} was NOT deleted from the server: ${(rowDeleteResult&&rowDeleteResult.message)||'unknown sync error'}`,'err','☁️');
-      return;
-    }
-  }
-  // FIX ("delete bills but wrong shown in some places / not match"): this
-  // used to remove only the record locally — deleteGRN() right below already
-  // calls the backend on delete, this never did, so a "deleted" invoice
-  // stayed in the backend/sheet forever and kept showing up anywhere else
-  // that reads from there. Now matches deleteGRN's pattern exactly.
-  // NEW: Enhanced delete with inventory rollback + Drive cleanup
-  // The row-level delete above is the authoritative deletion for
-  // inventory-mode purchase invoices. DELETE_PURCHASE_INVOICE below is
-  // retained only for its legacy side effects (inventory rollback / Drive
-  // cleanup); its failure must never restore the deleted row.
-  erpApi('DELETE_PURCHASE_INVOICE', {id:p.id, no:p.no, mode, billFileUrl:p.billFileUrl}).then(r=>{
-    if(r&&r.success===false){
-      window._pendingDeletes.delete(id);
-      toast('✅ '+p.no+' deleted (inventory rollback / file cleanup may need a manual check: '+(r.message||'unknown error')+')','warn','⚠️');
-    }else if(r&&r.success){
-      window._pendingDeletes.delete(id);
-      // FIX ("delete problem check" — Aug 2026): the backend
-      // (PurchaseInvoice_Direct.gs v6) can return success:true for the
-      // row deletion itself while still reporting a non-empty
-      // `warnings` array underneath — e.g. inventory rollback failed,
-      // or the Drive file couldn't be cleaned up. This used to always
-      // show the same "fully deleted. Inventory rolled back." message
-      // no matter what — telling the person their stock was rolled
-      // back even on the exact runs where the backend was reporting
-      // it wasn't. Now checks for warnings and shows the honest
-      // outcome instead of a blanket claim.
-      if(r.warnings&&r.warnings.length){
-        toast(`⚠️ ${p.no} deleted, but: `+r.warnings.join('; '),'warn','⚠️');
-      }else{
-        toast(`${p.no} fully deleted. Inventory rolled back.`,'ok','✅');
-      }
-      broadcastInventoryChange('PURCHASE_DELETED', {no:p.no, id:p.id});
-    }
-  }).catch(e=>{
-    window._pendingDeletes.delete(id);
-    toast('⚠️ Sync error: '+e.message,'err','⚠️');
-  });
+  saveLocalOnly();
+  window._pendingDeletes.delete(id);
+  rendDash();rendRegs();rendPurchaseList();updateApprCount();
+  broadcastInventoryChange('PURCHASE_DELETED',{no:p.no,id:p.id});
+  toast(`${p.no} deleted successfully. Supplier payable reversed; physical stock unchanged.` ,'ok','🗑️');
 }
 // ════ PURCHASE INVOICE REGISTER — BULK SELECT / DUPLICATE SELECT / BULK DELETE ════
 // (Requested: "duplicate fix and can all select and can delete and work" —
@@ -4732,90 +4668,37 @@ async function bulkDeleteSelectedPurchases(){
   if(!checks.length)return;
   const ids=checks.map(c=>c.dataset.id);
   const recs=ids.map(id=>DB.purchases.find(p=>p.id===id)).filter(Boolean);
-  if(!recs.length){ toast('Selected record(s) not found','err','⚠️'); return; }
+  if(!recs.length){toast('Selected record(s) not found','err','⚠️');return;}
   const totalAmt=recs.reduce((s,p)=>s+(+p.grand||0),0);
   const preview=recs.slice(0,5).map(p=>`• ${p.no} — ${p.vendorName} — ${fmt(p.grand)}`).join('\n')+(recs.length>5?`\n…and ${recs.length-5} more`:'');
-  if(!confirm(`Delete ${recs.length} selected invoice(s), totaling ${fmt(totalAmt)}?\n\n${preview}\n\nThis will:\n• Remove from all reports\n• Roll back inventory\n• Delete Drive files\n\nThis cannot be undone.`))return;
-  window._pendingDeletes = window._pendingDeletes || new Set();
-  const removed=[];
-  recs.forEach(p=>{
-    const idx=DB.purchases.findIndex(x=>x.id===p.id);
-    if(idx<0)return;
-    const vi=DB.vendors.findIndex(v=>v.id===p.vendorId);
-    if(vi>=0)DB.vendors[vi].outstanding=Math.max(0,(DB.vendors[vi].outstanding||0)-(p.grand||0));
-    DB.purchases.splice(idx,1);
-    window._pendingDeletes.add(p.id);
-    removed.push(p);
-  });
-  if(!removed.length)return;
-  if(typeof editingPurchaseId!=='undefined' && ids.includes(editingPurchaseId)){editingPurchaseId=null;editingPurchaseMode=null;}
-  // Persist the local deletion only. Do not launch a full-array
-  // SYNC_PUSH_TABLE; each selected id is deleted authoritatively below.
-  saveLocalOnly();rendDash();rendRegs();rendPurchaseList();updateApprCount();
-  toast(`${removed.length} invoice(s) deleted locally. Syncing with server...`,'ok','🗑️');
-  // FIX ("backend copies from business os files" — Aug 2026, replaces
-  // the "root-cause pass" fix below): same reasoning as deletePurchase()
-  // above — window._pendingDeletes only protects against THIS tab's own
-  // next poll; it does nothing about any OTHER tab/session pushing its
-  // stale full snapshot afterward, which is what actually resurrected
-  // bulk-deleted duplicates. deletePurchaseInvoiceRowFromServer() is a
-  // single-row, server-side-locked delete — fired for every removed row
-  // in parallel, each one reading the CURRENT server state at the
-  // moment it runs rather than trusting any tab's local memory.
-  const inventoryRemoved=removed.filter(p=>p.mode==='inventory');
-  const rowDeleteResults=await Promise.all(inventoryRemoved.map(async p=>({p,result:await deletePurchaseInvoiceRowFromServer(p.id)})));
-  const rowDeleteFailed=rowDeleteResults.filter(x=>!x.result || x.result.success===false);
-  if(rowDeleteFailed.length){
-    rowDeleteFailed.forEach(x=>{
-      const existing=DB.purchases.findIndex(p=>p.id===x.p.id);
-      if(existing<0)DB.purchases.push(x.p);
-      window._pendingDeletes.delete(x.p.id);
-    });
-    saveLocalOnly();
-    rendDash();rendRegs();rendPurchaseList();updateApprCount();
-    const reason=rowDeleteFailed.map(x=>(x.result&&x.result.message)||'server delete failed').slice(0,2).join('; ');
-    toast(`⚠️ ${rowDeleteFailed.length} invoice(s) were NOT deleted from the server: ${reason}`,'err','☁️');
+  if(!confirm(`Delete ${recs.length} selected invoice(s), totaling ${fmt(totalAmt)}?\n\n${preview}\n\nThis will:\n• Remove invoices from the live database and reports\n• Reverse supplier payables\n• Delete invoice detail rows\n• NOT change physical stock (GRN controls stock)\n\nThis cannot be undone.`))return;
+
+  window._pendingDeletes=window._pendingDeletes||new Set();
+  recs.forEach(p=>window._pendingDeletes.add(p.id));
+  const results=await Promise.all(recs.map(async p=>({p,result:await deletePurchaseInvoiceRowFromServer(p.id)})));
+  const failed=results.filter(x=>!x.result||x.result.success===false);
+  const ok=results.filter(x=>x.result&&x.result.success!==false);
+
+  failed.forEach(x=>window._pendingDeletes.delete(x.p.id));
+  if(failed.length){
+    const reason=failed.map(x=>(x.result&&x.result.message)||'server delete failed').slice(0,2).join('; ');
+    toast(`⚠️ ${failed.length} invoice(s) were NOT deleted: ${reason}`,'err','☁️');
   }
-  const rowDeleteFailedIds=new Set(rowDeleteFailed.map(x=>x.p.id));
-  const confirmedRemoved=removed.filter(p=>p.mode!=='inventory' || !rowDeleteFailedIds.has(p.id));
-  removed.splice(0,removed.length,...confirmedRemoved);
-  // Legacy DELETE_PURCHASE_INVOICE below is retained only for side effects;
-  // it must never restore a row after the authoritative row delete.
-  const results=await Promise.allSettled(removed.map(p=>
-    erpApi('DELETE_PURCHASE_INVOICE',{id:p.id, no:p.no, mode:p.mode||'inventory', billFileUrl:p.billFileUrl})
-  ));
-  let sideEffectFailed=0, warned=0;
-  const failReasons=new Set();
-  results.forEach((res,i)=>{
-    const p=removed[i];
-    window._pendingDeletes.delete(p.id);
-    const r = res.status==='fulfilled' ? res.value : {success:false, message:(res.reason&&res.reason.message)||'network error'};
-    if(r&&r.success===false){
-      sideEffectFailed++;
-      failReasons.add(r.message||'unknown error');
-    }else if(r&&r.warnings&&r.warnings.length){
-      warned++;
+
+  ok.forEach(x=>{
+    const i=DB.purchases.findIndex(p=>p.id===x.p.id);
+    if(i>=0){
+      const p=DB.purchases[i];
+      const vi=DB.vendors.findIndex(v=>v.id===p.vendorId);
+      if(vi>=0)DB.vendors[vi].outstanding=Math.max(0,(DB.vendors[vi].outstanding||0)-(p.grand||0));
+      DB.purchases.splice(i,1);
     }
+    window._pendingDeletes.delete(x.p.id);
   });
-  saveLocalOnly();rendDash();rendRegs();rendPurchaseList();
-  if(sideEffectFailed){
-    const reasonText=[...failReasons].slice(0,2).join('; ')+(failReasons.size>2?` (+${failReasons.size-2} more distinct reason(s))`:'');
-    toast(`✅ ${removed.length} invoice(s) deleted. ${sideEffectFailed} may need a manual inventory/Drive cleanup check: ${reasonText}`,'warn','⚠️');
-  }else if(warned){
-    toast(`${removed.length} deleted, ${warned} with warnings (check inventory rollback).`,'warn','⚠️');
-  }else{
-    toast(`${removed.length} invoice(s) fully deleted. Inventory rolled back.`,'ok','✅');
-  }
-  // FIX ("Broadcasted: PURCHASE_DELETED undefined" in console — Aug 2026):
-  // was passing {count:removed.length} into a function that always reads
-  // .no and .id off whatever object it's given — neither field exists on
-  // {count}, so every bulk-delete broadcast silently sent invoiceNo:
-  // undefined, invoiceId:undefined to every other open tab/device. The
-  // receiving handler (see the listener above) doesn't actually key off
-  // those fields — it just re-pulls everything — so this was harmless to
-  // OTHER tabs, but made this tab's own console log actively misleading
-  // while debugging. Passing a real, readable id list instead.
-  broadcastInventoryChange('PURCHASE_DELETED', {no:`${removed.length} invoice(s)`, id:removed.map(p=>p.id).join(',')});
+  saveLocalOnly();rendDash();rendRegs();rendPurchaseList();updateApprCount();
+  if(ok.length)broadcastInventoryChange('PURCHASE_DELETED',{count:ok.length,ids:ok.map(x=>x.p.id)});
+  if(ok.length===recs.length)toast(`${ok.length} invoice(s) deleted. Supplier payables reversed; physical stock unchanged.`,'ok','🗑️');
+  else if(ok.length)toast(`${ok.length} deleted; ${failed.length} not deleted.`,'warn','⚠️');
 }
 // ════ ACCOUNTING ENTRY WORKFLOW: Approve → Acknowledge (per Department) → Complete ════
 
@@ -5341,8 +5224,8 @@ async function saveAttachment(){
         try{ rendPurchaseList(); }catch(e){}
         try{ rendRegs(); }catch(e){}
         try{ rendDash(); }catch(e){}
-        if(typeof erpApi==='function'){
-          erpApi('UPDATE_PURCHASE_INVOICE', linkedPurch).then(r=>{
+        if(linkedPurch.mode==='inventory' && typeof syncPurchaseInvoiceRowToServer==='function'){
+          syncPurchaseInvoiceRowToServer(linkedPurch).then(r=>{
             if(r&&r.success===false)toast('⚠️ Bill linked locally to '+linkedPurch.no+', but server sync failed: '+(r.message||'unknown error'),'warn','☁️');
           });
         }
@@ -6123,7 +6006,7 @@ function _attachDriveLinkToSavedInvoice(link,invNo,vendorName,mode){
   rec.billFileUrl=link;
   save();
   if(typeof rendPurchaseList==='function')rendPurchaseList();
-  if(typeof erpApi==='function')erpApi('UPDATE_PURCHASE_INVOICE',rec).then(r=>{ if(r&&r.success===false)console.warn('[Scan] Drive link attach: server sync failed',r.message); });
+  if(typeof erpApi==='function')syncPurchaseInvoiceRowToServer(rec).then(r=>{ if(r&&r.success===false)console.warn('[Scan] Drive link attach: server sync failed',r.message); });
   toast('📁 Scanned bill attached to '+rec.no,'ok','📁');
 }
 async function processInvoiceScan(file){
@@ -6543,8 +6426,8 @@ function rendApprovals(){
     </div>
   </div>`).join('');
 }
-function rejectP(id){const i=DB.purchases.findIndex(p=>p.id===id);if(i>=0){DB.purchases[i].status='Rejected';save();rendApprovals();updateApprCount();toast('Purchase Rejected','warn','❌');erpApi('UPDATE_PURCHASE_INVOICE', DB.purchases[i]).then(r=>{ if(r&&r.success===false) toast('⚠️ Rejected locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️'); });}}
-function holdP(id){const i=DB.purchases.findIndex(p=>p.id===id);if(i>=0){DB.purchases[i].status='On Hold';save();rendApprovals();updateApprCount();toast('Purchase put on Hold','warn','⏸️');erpApi('UPDATE_PURCHASE_INVOICE', DB.purchases[i]).then(r=>{ if(r&&r.success===false) toast('⚠️ Hold status saved locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️'); });}}
+function rejectP(id){const i=DB.purchases.findIndex(p=>p.id===id);if(i>=0){DB.purchases[i].status='Rejected';save();rendApprovals();updateApprCount();toast('Purchase Rejected','warn','❌');syncPurchaseInvoiceRowToServer(DB.purchases[i]).then(r=>{ if(r&&r.success===false) toast('⚠️ Rejected locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️'); });}}
+function holdP(id){const i=DB.purchases.findIndex(p=>p.id===id);if(i>=0){DB.purchases[i].status='On Hold';save();rendApprovals();updateApprCount();toast('Purchase put on Hold','warn','⏸️');syncPurchaseInvoiceRowToServer(DB.purchases[i]).then(r=>{ if(r&&r.success===false) toast('⚠️ Hold status saved locally, but server sync failed: '+(r.message||'unknown error'),'warn','☁️'); });}}
 
 // ════ DASHBOARD ════
 // FIX ("duplicate fix and can all select and can delete and work" —
