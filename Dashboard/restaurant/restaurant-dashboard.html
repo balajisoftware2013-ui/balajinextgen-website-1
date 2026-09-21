@@ -12279,10 +12279,19 @@ window.__BNX_LIVE_CATEGORY_ASSET_MAP = window.__BNX_LIVE_CATEGORY_ASSET_MAP || O
 function bnxAssetUrl_(p){
   const s = String(p||'').trim();
   if(!s) return '';
-  if(/^(https?:)?\/\//i.test(s) || s.startsWith('data:')) return s;
-  let resolved=s.replace(/^\.?\//,''); if(/^assets\/(item-groups|category-icons)\//i.test(resolved)) resolved='steward-app/'+resolved;
+  if(/^(https?:)?\/\//i.test(s) || s.startsWith('data:') || s.startsWith('blob:')) return s;
+  let resolved=s.replace(/^\.?\//,'');
   const base = String(window.BNX_ASSET_BASE_URL||'').replace(/\/+$/,'');
-  return (base ? base+'/' : '') + resolved;
+  /*
+   * Asset paths stored by CL00010 are canonical paths such as
+   * assets/item-groups/GRP00003.png and assets/category-icons/CAT00023.png.
+   * Do NOT permanently rewrite these to steward-app/. That made the same
+   * dashboard work for some pages and 404 for others depending on the
+   * current URL depth. If a client explicitly configured BNX_ASSET_BASE_URL
+   * use it; otherwise keep the canonical root-relative asset path.
+   */
+  if(/^assets\//i.test(resolved)) return (base ? base+'/'+resolved : '/'+resolved);
+  return (base ? base+'/'+resolved : '/'+resolved);
 }
 function bnxResolveItemImageUrl_(item){
   if(!item) return '';
@@ -12303,7 +12312,19 @@ function bnxResolveItemImageUrl_(item){
 // the instant a resolved asset path fails to load, instead of a broken icon.
 window.bnxImgFallback_ = function(imgEl){
   try{
-    const host = imgEl.closest('.mi-em,.prod-em');
+    /* First try the legacy steward-app path for installations that still
+       host the asset bundle there. Only after that fails do we show the
+       normal emoji fallback. */
+    if(imgEl && !imgEl.dataset.bnxAltTried){
+      const src=String(imgEl.getAttribute('src')||'');
+      const m=src.match(/\/assets\/(item-groups|category-icons)\/([^?#]+)/i);
+      if(m){
+        imgEl.dataset.bnxAltTried='1';
+        const alt='/steward-app/assets/'+m[1]+'/'+m[2];
+        if(alt!==src){ imgEl.src=alt; return; }
+      }
+    }
+    const host = imgEl.closest('.mi-em,.prod-em,.pos-table-thumb');
     if(host) host.innerHTML = host.getAttribute('data-fallback') || '🍽️';
   }catch(e){}
 };
@@ -30401,12 +30422,21 @@ button,input,select,textarea{font-family:'DM Sans',sans-serif;-webkit-font-smoot
     if(!out.length){box.innerHTML='<div style="padding:30px;text-align:center;color:var(--text3);font-size:12px;">No live items in this section.</div>';return;}
     box.innerHTML=out.map(r=>{const idx=rows.indexOf(r);return '<div class="bnx-indent-row"><div><div class="bnx-indent-item">'+esc(r.name)+(r.live?'<span class="bnx-indent-live">● LIVE</span>':'<span class="bnx-indent-live">● SAVED</span>')+'</div><div class="bnx-indent-sub">'+esc(r.itemCode||'Live master')+'</div></div><div><span class="bnx-indent-pill">'+esc(r.group||r.cat)+'</span></div><div class="bnx-indent-uom">'+esc(r.uom||'—')+'</div><div class="bnx-indent-stock" title="Live available/current stock">'+(r.stockKnown?'<b>'+Number(r.currentStock||0).toLocaleString('en-IN',{maximumFractionDigits:3})+'</b> '+esc(r.uom||''):'—')+'</div><div class="bnx-indent-qty"><input type="number" min="0" step="0.01" value="'+escAttr(r.qty)+'" data-idx="'+idx+'" onchange="bnxUpdateBarIndentQty(this)"><span class="unit">'+esc(r.uom||'')+'</span></div><input class="fi" style="padding:7px 8px;font-size:10.5px;" placeholder="Optional note" value="'+escAttr(r.note||'')+'" data-note-idx="'+idx+'" onchange="bnxUpdateBarIndentNote(this)"></div>';}).join('');
   };
-  async function fetchSheet(tab){
+  /* BAR INDENT LIVE MASTER READ:
+     Do not use RD_FETCH_SHEET here. In the live V3 backend that action is
+     intentionally restricted to the table-master reader. Bar Indent must
+     use the real master actions instead:
+       GET_MASTER(category=ingredients) -> RAW_MATERIAL_MASTER
+       GET_BAR_MENU                  -> BAR_ITEM_MASTER/BAR_MENU_CARD
+       GET_ITEMS                     -> ITEM_MASTER fallback
+       GET_BAR_INDENT_CATALOG        -> combined authoritative catalog
+  */
+  async function fetchMasterCategory(category){
     if(typeof gasApi!=='function') return {rows:[],error:'gasApi unavailable'};
     try{
-      const r=await gasApi('RD_FETCH_SHEET',{tab,locationId:(window.BNX_LOCATION_ID||window.LOCATION_ID||'')},'V2_CORE');
-      if(r&&r.success&&Array.isArray(r.data)) return {rows:r.data,error:''};
-      return {rows:[],error:r?.error||r?.message||('RD_FETCH_SHEET failed for '+tab)};
+      const r=await gasApi('GET_MASTER',{category:category},'V2_CORE');
+      const a=Array.isArray(r?.data)?r.data:(Array.isArray(r?.data?.rows)?r.data.rows:[]);
+      return {rows:a,error:r?.success===false?(r?.error||r?.message||('GET_MASTER '+category+' failed')):''};
     }catch(e){return {rows:[],error:e?.message||String(e)};}
   }
   async function fetchItemCatalog(){
@@ -30430,7 +30460,16 @@ button,input,select,textarea{font-family:'DM Sans',sans-serif;-webkit-font-smoot
     const date=dateValue(),draft=loadDraft();
     const progress=function(n,label){var p=document.getElementById('barIndentLoadPct');if(p)p.textContent=Math.round(n)+'%';var tip=document.getElementById('barIndentLivePill');if(tip&&label)tip.textContent='● '+label;};
     progress(10,'LOADING MASTER');
-    const [rawR,barSheetR,barDirectR,catalogR,savedR,itemR,stockR,unitR]=await Promise.all([fetchSheet('RAW_MATERIAL_MASTER'),fetchSheet('BAR_MENU_CARD'),fetchBarDirect(),fetchBarIndentCatalog(),fetchSaved(date),fetchItemCatalog(),fetchBarIndentStock(),fetchSheet('UNIT_MASTER')]);
+    const [rawR,barSheetR,barDirectR,catalogR,savedR,itemR,stockR,unitR]=await Promise.all([
+      fetchMasterCategory('ingredients'),
+      Promise.resolve({rows:[],error:''}),
+      fetchBarDirect(),
+      fetchBarIndentCatalog(),
+      fetchSaved(date),
+      fetchItemCatalog(),
+      fetchBarIndentStock(),
+      Promise.resolve({rows:[],error:''})
+    ]);
     if(seq!==requestSeq)return;
     progress(55,'PROCESSING MASTER');
     const raw0=rawR.rows||[],barSheet0=barSheetR.rows||[],barDirect0=barDirectR.rows||[],catalog0=catalogR.rows||[],saved0=savedR.rows||[],item0=itemR.rows||[],stock0=stockR.rows||[],unit0=unitR.rows||[];
