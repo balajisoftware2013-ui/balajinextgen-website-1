@@ -12279,19 +12279,10 @@ window.__BNX_LIVE_CATEGORY_ASSET_MAP = window.__BNX_LIVE_CATEGORY_ASSET_MAP || O
 function bnxAssetUrl_(p){
   const s = String(p||'').trim();
   if(!s) return '';
-  if(/^(https?:)?\/\//i.test(s) || s.startsWith('data:') || s.startsWith('blob:')) return s;
-  let resolved=s.replace(/^\.?\//,'');
+  if(/^(https?:)?\/\//i.test(s) || s.startsWith('data:')) return s;
+  let resolved=s.replace(/^\.?\//,''); if(/^assets\/(item-groups|category-icons)\//i.test(resolved)) resolved='steward-app/'+resolved;
   const base = String(window.BNX_ASSET_BASE_URL||'').replace(/\/+$/,'');
-  /*
-   * Asset paths stored by CL00010 are canonical paths such as
-   * assets/item-groups/GRP00003.png and assets/category-icons/CAT00023.png.
-   * Do NOT permanently rewrite these to steward-app/. That made the same
-   * dashboard work for some pages and 404 for others depending on the
-   * current URL depth. If a client explicitly configured BNX_ASSET_BASE_URL
-   * use it; otherwise keep the canonical root-relative asset path.
-   */
-  if(/^assets\//i.test(resolved)) return (base ? base+'/'+resolved : '/'+resolved);
-  return (base ? base+'/'+resolved : '/'+resolved);
+  return (base ? base+'/' : '') + resolved;
 }
 function bnxResolveItemImageUrl_(item){
   if(!item) return '';
@@ -12312,19 +12303,7 @@ function bnxResolveItemImageUrl_(item){
 // the instant a resolved asset path fails to load, instead of a broken icon.
 window.bnxImgFallback_ = function(imgEl){
   try{
-    /* First try the legacy steward-app path for installations that still
-       host the asset bundle there. Only after that fails do we show the
-       normal emoji fallback. */
-    if(imgEl && !imgEl.dataset.bnxAltTried){
-      const src=String(imgEl.getAttribute('src')||'');
-      const m=src.match(/\/assets\/(item-groups|category-icons)\/([^?#]+)/i);
-      if(m){
-        imgEl.dataset.bnxAltTried='1';
-        const alt='/steward-app/assets/'+m[1]+'/'+m[2];
-        if(alt!==src){ imgEl.src=alt; return; }
-      }
-    }
-    const host = imgEl.closest('.mi-em,.prod-em,.pos-table-thumb');
+    const host = imgEl.closest('.mi-em,.prod-em');
     if(host) host.innerHTML = host.getAttribute('data-fallback') || '🍽️';
   }catch(e){}
 };
@@ -17381,41 +17360,87 @@ function bnxMarkOrdersPicked(orderIds){
   const merged = existing.concat(orderIds).filter((v,i,a)=>v && a.indexOf(v)===i);
   localStorage.setItem(bnxPickedOrdersKey(), JSON.stringify(merged));
 }
-function bmOpenKotPicker(){
+async function bmOpenKotPicker(){
   const tblVal = (document.getElementById('bm-bf-table')?.value || '').trim().toUpperCase();
-  let open = [];
-  try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
-  const bareTbl = tblVal.replace('T-','');
-  // FIX ("after added load remove ... otherwise multiple add"): same
-  // `billed` exclusion as bmHandleTableChange — once a KOT's items have
-  // been pulled into a bill, it drops out of this list so re-opening
-  // "Pending KOTs & Orders" (or clicking Load again) can't offer it a
-  // second time and double the qty on the bill.
+  let localOpen = [];
+  try{ localOpen = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
+  const bareTbl = tblVal.replace(/^T-/,'');
+
+  /* LIVE KOT FIX (21-09-2026): Pending KOTs used to read only
+     bnx_open_kots from this browser. That is a local print/outbox cache,
+     not the authoritative KOT_MASTER. If the KOT was created by another
+     POS/steward device, the browser cache was empty and the picker either
+     showed old local tickets or showed nothing. Always read live KOT_MASTER
+     through the existing GET_KOT endpoint, then merge it with local entries
+     for tickets that have not reached the server yet. */
+  let serverKots = [];
+  try{
+    const liveRes = await gasApi('GET_KOT', {includeClosed:false}, 'V2_CORE');
+    const rows = liveRes && liveRes.success && Array.isArray(liveRes.data) ? liveRes.data : [];
+    serverKots = rows.map(function(k){
+      const items = Array.isArray(k.items) ? k.items.map(function(it){
+        const qty = Number(it.qty != null ? it.qty : it.QUANTITY) || 0;
+        const rate = Number(it.rate != null ? it.rate : it.RATE) || 0;
+        return { itemName:it.itemName||it.ITEM_NAME||'', name:it.name||it.ITEM_NAME||'', qty, rate, amount:Number(it.amount != null ? it.amount : it.AMOUNT)||qty*rate };
+      }) : [];
+      const stations = items.map(it=>String(it.STATION||it.station||it.PRINT_TO||it.printTo||'').toUpperCase());
+      let type = 'KITCHEN';
+      if (stations.some(x=>x.includes('BAR'))) type='BAR';
+      else if (stations.some(x=>x.includes('COUNTER')||x.includes('HASH'))) type='COUNTER';
+      const t = k.STARTED_AT || k.CREATED_AT || (k.KOT_DATE && k.KOT_TIME ? String(k.KOT_DATE).slice(0,10)+'T'+String(k.KOT_TIME) : '') || '';
+      return {
+        kotNo:String(k.KOT_NUMBER||k.kotNumber||k.KOT_ID||k.kotId||'').trim(),
+        kotId:String(k.KOT_ID||k.kotId||'').trim(),
+        table:String(k.TABLE_ID||k.table||'').trim(),
+        type,
+        time:t,
+        waiter:k.STARTED_BY||k.waiter||'',
+        covers:k.COVERS||k.covers||'',
+        orderNo:String(k.ORDER_NUMBER||k.orderNumber||k.ORDER_ID||k.orderId||'').trim(),
+        items,
+        status:String(k.KOT_STATUS||k.status||'PRINTED').toUpperCase(),
+        billed:false,
+        localOnly:false,
+        _server:true
+      };
+    }).filter(k=>k.kotNo && !['SERVED','CANCELLED','BILLED','READY'].includes(k.status));
+  }catch(e){
+    console.warn('[KOT PICKER] live GET_KOT failed; using local outbox cache:', e && e.message || e);
+  }
+
+  /* Server is authoritative. Local entries are retained only when the same
+     KOT number is not already present from KOT_MASTER (e.g. still uploading). */
+  const seenKot = new Set();
+  const open = [];
+  serverKots.forEach(k=>{ seenKot.add(String(k.kotNo).toUpperCase()); open.push(k); });
+  localOpen.forEach(k=>{
+    const no=String(k.kotNo||'').trim();
+    if(!no || seenKot.has(no.toUpperCase())) return;
+    if(k.status==='READY' || k.billed) return;
+    open.push(k);
+  });
+
   const pickedOrderIds = bnxGetPickedOrderIds();
   const rawOrders = (typeof orderRegData!=='undefined' ? orderRegData : []).filter(o => {
-    if (o.ORDER_STATUS==='BILLED' || o.ORDER_STATUS==='CANCELLED') return false;
-    if (pickedOrderIds.includes(o.ORDER_ID)) return false; // already pulled into a draft bill this session -- see bnxMarkOrdersPicked
+    if (String(o.ORDER_STATUS||'').toUpperCase()==='BILLED' || String(o.ORDER_STATUS||'').toUpperCase()==='CANCELLED') return false;
+    if (pickedOrderIds.includes(o.ORDER_ID)) return false;
     if (!tblVal) return true;
     const tid=(o.TABLE_ID||'').trim().toUpperCase();
     return tid===tblVal || tid===bareTbl;
   });
   const orders = bmGroupOrdersByNo(rawOrders);
-  // FIX ("bill loads items 3x" / New Bill KOT Reference picker): a local
-  // bnx_open_kots entry and a server ORDER_MASTER row can represent the
-  // exact SAME physical ticket (the local entry carries the order's
-  // orderNo — see bnxRecordKOT). Offering both here let staff tick BOTH
-  // boxes for one ticket, and bmConfirmKotPicker's merge then summed
-  // that ticket's items twice on top of whatever bmGroupOrdersByNo had
-  // already correctly summed across genuine add-on order rows — this is
-  // what produced items showing qty x3 on the bill for food that was
-  // only ever cooked once. A local KOT entry is now excluded from this
-  // list whenever an order sharing its orderNo is already being shown
-  // in "Pending Orders" below, so each real ticket can only be picked
-  // from ONE place.
-  const shownOrderNos = new Set(orders.map(o => o.ORDER_NO || o.ORDER_ID).filter(Boolean));
-  const kots = open.filter(k => k.status!=='READY' && !k.billed
-    && (!tblVal || (k.table||'').trim().toUpperCase() === tblVal)
-    && !(k.orderNo && shownOrderNos.has(k.orderNo)));
+
+  /* Match table variants T-12 / 12 and order references from either the
+     friendly ORDER_NUMBER or the real ORDER_ID. */
+  const shownOrderNos = new Set(orders.flatMap(o=>[o.ORDER_NO,o.ORDER_ID].filter(Boolean)).map(String));
+  const kots = open.filter(k=>{
+    if (k.status==='READY' || k.billed) return false;
+    const kt=String(k.table||'').trim().toUpperCase();
+    if (tblVal && kt!==tblVal && kt!==bareTbl && kt.replace(/^T-/,'')!==bareTbl) return false;
+    if (k.orderNo && shownOrderNos.has(String(k.orderNo))) return false;
+    return true;
+  });
+
   window._bmPicker = { kots, orders, sel: new Set() };
   const body = document.getElementById('bmKotPickerBody');
   if (!kots.length && !orders.length){
@@ -17425,27 +17450,21 @@ function bmOpenKotPicker(){
   } else {
     let html='';
     if (!tblVal){
-      html += `<div style="font-size:10.5px;color:var(--text3);margin-bottom:8px;">Showing all pending tickets — enter a Table No above to narrow this list, or just pick one below and the table will fill in automatically.</div>`;
+      html += `<div style="font-size:10.5px;color:var(--text3);margin-bottom:8px;">Showing all live pending tickets — enter a Table No above to narrow this list.</div>`;
     }
     if (kots.length){
-      html += `<div style="font-size:10.5px;font-weight:800;color:var(--text3);text-transform:uppercase;letter-spacing:.4px;margin:4px 0 6px;">🍳 Pending KOTs</div>`;
+      html += `<div style="font-size:10.5px;font-weight:800;color:var(--text3);text-transform:uppercase;letter-spacing:.4px;margin:4px 0 6px;">🍳 Pending KOTs (${kots.length})</div>`;
       html += kots.map((k,i)=>`
         <label style="display:flex;align-items:center;gap:9px;padding:8px 10px;border:1px solid var(--border,#eee);border-radius:9px;margin-bottom:6px;cursor:pointer;">
           <input type="checkbox" onchange="bmPickerToggle('k',${i},this.checked)">
           <div style="flex:1;">
-            <div style="font-weight:700;">${k.kotNo} <span style="font-size:9.5px;font-weight:700;color:var(--gold);">· ${k.table||'-'}</span> <span style="font-size:9.5px;font-weight:600;color:var(--text3);">· ${k.type==='BAR'?'Bar':(k.type==='COUNTER'?'Counter':'Kitchen')} · ${bnxKotElapsedMin(k.time)}m ago</span>${k.orderNo?` <span style="font-size:9.5px;font-weight:700;color:var(--text3);">· ${k.orderNo}</span>`:''}</div>
+            <div style="font-weight:700;">${k.kotNo} <span style="font-size:9.5px;font-weight:700;color:var(--gold);">· ${k.table||'-'}</span> <span style="font-size:9.5px;font-weight:600;color:var(--text3);">· ${k.type==='BAR'?'Bar':(k.type==='COUNTER'?'Counter':'Kitchen')} · ${bnxKotElapsedMin(k.time)}m ago</span>${k.orderNo?` <span style="font-size:9.5px;font-weight:700;color:var(--text3);">· ${k.orderNo}</span>`:''}${k._server?` <span style="font-size:9px;color:#16834b;font-weight:800;">· LIVE</span>`:''}</div>
             <div style="font-size:10.5px;color:var(--text3);">${(k.items||[]).map(it=>{
               const rt = it.rate!=null?it.rate:it.price;
-              return (it.name||it.n)+' x'+(it.qty||1)+(rt!=null?' @'+formatINR(rt):'');
+              return (it.name||it.n||it.itemName)+' x'+(it.qty||1)+(rt!=null?' @'+formatINR(rt):'');
             }).join(', ')}</div>
           </div>
-          <!-- FIX ("kot can cancel"): no way existed to clear a stale or
-               mistaken ticket from this list — it just sat here forever,
-               growing the list every shift. Cancel removes it from this
-               device's pending queue and marks it CANCELLED so it won't
-               resurface; stopPropagation keeps the click from also
-               toggling the checkbox above it. -->
-          <button type="button" onclick="event.stopPropagation();event.preventDefault();bmCancelPendingKot('${k.kotNo.replace(/'/g,"\\'")}')" title="Cancel this KOT" style="width:26px;height:26px;flex-shrink:0;background:var(--red-bg);border:1px solid rgba(212,43,43,.2);border-radius:7px;cursor:pointer;font-size:12px;color:var(--red);">✕</button>
+          <button type="button" onclick="event.stopPropagation();event.preventDefault();bmCancelPendingKot('${String(k.kotNo).replace(/'/g,"\\'")}')" title="Cancel this KOT" style="width:26px;height:26px;flex-shrink:0;background:var(--red-bg);border:1px solid rgba(212,43,43,.2);border-radius:7px;cursor:pointer;font-size:12px;color:var(--red);">✕</button>
         </label>`).join('');
     }
     if (orders.length){
@@ -30422,21 +30441,12 @@ button,input,select,textarea{font-family:'DM Sans',sans-serif;-webkit-font-smoot
     if(!out.length){box.innerHTML='<div style="padding:30px;text-align:center;color:var(--text3);font-size:12px;">No live items in this section.</div>';return;}
     box.innerHTML=out.map(r=>{const idx=rows.indexOf(r);return '<div class="bnx-indent-row"><div><div class="bnx-indent-item">'+esc(r.name)+(r.live?'<span class="bnx-indent-live">● LIVE</span>':'<span class="bnx-indent-live">● SAVED</span>')+'</div><div class="bnx-indent-sub">'+esc(r.itemCode||'Live master')+'</div></div><div><span class="bnx-indent-pill">'+esc(r.group||r.cat)+'</span></div><div class="bnx-indent-uom">'+esc(r.uom||'—')+'</div><div class="bnx-indent-stock" title="Live available/current stock">'+(r.stockKnown?'<b>'+Number(r.currentStock||0).toLocaleString('en-IN',{maximumFractionDigits:3})+'</b> '+esc(r.uom||''):'—')+'</div><div class="bnx-indent-qty"><input type="number" min="0" step="0.01" value="'+escAttr(r.qty)+'" data-idx="'+idx+'" onchange="bnxUpdateBarIndentQty(this)"><span class="unit">'+esc(r.uom||'')+'</span></div><input class="fi" style="padding:7px 8px;font-size:10.5px;" placeholder="Optional note" value="'+escAttr(r.note||'')+'" data-note-idx="'+idx+'" onchange="bnxUpdateBarIndentNote(this)"></div>';}).join('');
   };
-  /* BAR INDENT LIVE MASTER READ:
-     Do not use RD_FETCH_SHEET here. In the live V3 backend that action is
-     intentionally restricted to the table-master reader. Bar Indent must
-     use the real master actions instead:
-       GET_MASTER(category=ingredients) -> RAW_MATERIAL_MASTER
-       GET_BAR_MENU                  -> BAR_ITEM_MASTER/BAR_MENU_CARD
-       GET_ITEMS                     -> ITEM_MASTER fallback
-       GET_BAR_INDENT_CATALOG        -> combined authoritative catalog
-  */
-  async function fetchMasterCategory(category){
+  async function fetchSheet(tab){
     if(typeof gasApi!=='function') return {rows:[],error:'gasApi unavailable'};
     try{
-      const r=await gasApi('GET_MASTER',{category:category},'V2_CORE');
-      const a=Array.isArray(r?.data)?r.data:(Array.isArray(r?.data?.rows)?r.data.rows:[]);
-      return {rows:a,error:r?.success===false?(r?.error||r?.message||('GET_MASTER '+category+' failed')):''};
+      const r=await gasApi('RD_FETCH_SHEET',{tab,locationId:(window.BNX_LOCATION_ID||window.LOCATION_ID||'')},'V2_CORE');
+      if(r&&r.success&&Array.isArray(r.data)) return {rows:r.data,error:''};
+      return {rows:[],error:r?.error||r?.message||('RD_FETCH_SHEET failed for '+tab)};
     }catch(e){return {rows:[],error:e?.message||String(e)};}
   }
   async function fetchItemCatalog(){
@@ -30460,16 +30470,7 @@ button,input,select,textarea{font-family:'DM Sans',sans-serif;-webkit-font-smoot
     const date=dateValue(),draft=loadDraft();
     const progress=function(n,label){var p=document.getElementById('barIndentLoadPct');if(p)p.textContent=Math.round(n)+'%';var tip=document.getElementById('barIndentLivePill');if(tip&&label)tip.textContent='● '+label;};
     progress(10,'LOADING MASTER');
-    const [rawR,barSheetR,barDirectR,catalogR,savedR,itemR,stockR,unitR]=await Promise.all([
-      fetchMasterCategory('ingredients'),
-      Promise.resolve({rows:[],error:''}),
-      fetchBarDirect(),
-      fetchBarIndentCatalog(),
-      fetchSaved(date),
-      fetchItemCatalog(),
-      fetchBarIndentStock(),
-      Promise.resolve({rows:[],error:''})
-    ]);
+    const [rawR,barSheetR,barDirectR,catalogR,savedR,itemR,stockR,unitR]=await Promise.all([fetchSheet('RAW_MATERIAL_MASTER'),fetchSheet('BAR_MENU_CARD'),fetchBarDirect(),fetchBarIndentCatalog(),fetchSaved(date),fetchItemCatalog(),fetchBarIndentStock(),fetchSheet('UNIT_MASTER')]);
     if(seq!==requestSeq)return;
     progress(55,'PROCESSING MASTER');
     const raw0=rawR.rows||[],barSheet0=barSheetR.rows||[],barDirect0=barDirectR.rows||[],catalog0=catalogR.rows||[],saved0=savedR.rows||[],item0=itemR.rows||[],stock0=stockR.rows||[],unit0=unitR.rows||[];
