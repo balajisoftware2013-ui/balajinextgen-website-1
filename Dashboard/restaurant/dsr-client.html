@@ -31,8 +31,9 @@ const GAS_URL = GAS_APIS_DSR.V2_CORE;
 const DSR_CFG = (function(){
   try{return JSON.parse(localStorage.getItem('bnx_dsr_config')||'{}');}catch(e){return {};}
 })();
-const DSR_MODE = DSR_CFG.dsrMode || 'DIRECT_POS';
-const DSR_POS_SYSTEM = DSR_CFG.posSystem || 'RISTA';
+let DSR_MODE = DSR_CFG.dsrMode || 'DIRECT_POS';
+let DSR_POS_SYSTEM = DSR_CFG.posSystem || 'RISTA';
+const DSR_SOURCE_DB = 'TRANSACTION_DB';
 
 function bnxTodayKey_(){
   const d=new Date();
@@ -176,41 +177,68 @@ async function bnxPostJson_(ep,body,opts){
 
 async function bnxValidateSession_(force){
   const now=Date.now();
-  if(!force && BNX_SESSION_LAST_VALIDATED && now-BNX_SESSION_LAST_VALIDATED<180000) return {success:true,cached:true};
+  if(!force && BNX_SESSION_LAST_VALIDATED && (now-BNX_SESSION_LAST_VALIDATED)<180000){
+    return {success:true,cached:true};
+  }
   if(BNX_SESSION_VALIDATING) return await BNX_SESSION_VALIDATING;
+
   const tokens=bnxSessionCandidateTokens_();
-  if(!tokens.length)return {success:false,authExpired:true,error:'SESSION TOKEN MISSING'};
+  if(!tokens.length) return {success:false,authExpired:true,error:'SESSION TOKEN MISSING'};
+
   BNX_SESSION_VALIDATING=(async()=>{
-    let last={success:false,transient:true,error:'Session validation unavailable'};
-    // First ask the production CORE. This avoids false AUTH failures.
+    let sawAuthFailure=false;
+    let lastTransient={success:false,transient:true,error:'Session validation unavailable'};
     for(const token of tokens){
-      const core=await bnxPostJson_('V2_CORE',{action:'HEARTBEAT',clientId:getClientId_()||CLIENT_ID,sessionToken:token},{timeout:20000});
-      if(core && core.success!==false && !bnxIsAuthFailure_(core)){
-        bnxStoreWorkingToken_(token); BNX_SESSION_LAST_VALIDATED=Date.now(); BNX_SESSION_EXPIRED=false;
-        return Object.assign({success:true},core);
+      try{
+        /* V2_CORE is authoritative for this live report. Do NOT use the
+           secondary V2_AUTH deployment to decide that a valid ERP session
+           is expired. */
+        const core=await bnxPostJson_('V2_CORE',{
+          action:'HEARTBEAT',
+          clientId:getClientId_()||CLIENT_ID,
+          sessionToken:token
+        },{timeout:20000});
+        if(core && core.success!==false && !bnxIsAuthFailure_(core)){
+          bnxStoreWorkingToken_(token);
+          BNX_SESSION_LAST_VALIDATED=Date.now();
+          BNX_SESSION_EXPIRED=false;
+          return Object.assign({success:true},core);
+        }
+        if(bnxIsAuthFailure_(core)){
+          sawAuthFailure=true;
+          continue;
+        }
+        lastTransient={success:false,transient:true,error:String(core&&((core.error||core.message))||'Core heartbeat unavailable')};
+      }catch(e){
+        lastTransient={success:false,transient:true,error:e.message||'Session validation unavailable'};
       }
-      if(bnxIsAuthFailure_(core)) last={success:false,authExpired:true,error:core.error||core.message||'Invalid or expired session'};
-      else last={success:false,transient:true,error:core&&((core.error||core.message))||'Core heartbeat unavailable'};
     }
-    // Only when CORE explicitly rejects the token do we use AUTH to refresh it.
-    for(const token of tokens){
-      const auth=await bnxPostJson_('V2_AUTH',{action:'VALIDATE_SESSION',clientId:getClientId_()||CLIENT_ID,sessionToken:token,token:token},{timeout:20000});
-      if(auth && (auth.success===true || auth.status==='SUCCESS')){
-        const fresh=String(auth.sessionToken||auth.token||auth.session?.token||auth.user?.sessionToken||token||'').trim();
-        if(fresh)bnxStoreWorkingToken_(fresh);
-        BNX_SESSION_LAST_VALIDATED=Date.now(); BNX_SESSION_EXPIRED=false;
-        return Object.assign({success:true},auth,{sessionToken:fresh||token});
-      }
-      if(bnxIsAuthFailure_(auth))last={success:false,authExpired:true,error:auth.error||auth.message||'SESSION EXPIRED'};
-      else last={success:false,transient:true,error:auth&&((auth.error||auth.message))||'Auth validation unavailable'};
+    /* Only show Session Expired when every available token was explicitly
+       rejected by V2_CORE. Network/timeout/secondary-service failures must
+       never log the user out. */
+    if(sawAuthFailure){
+      BNX_SESSION_EXPIRED=true;
+      return {success:false,authExpired:true,error:'Invalid or expired session'};
     }
-    if(last.authExpired)BNX_SESSION_EXPIRED=true;
-    return last;
+    return lastTransient;
   })();
   try{return await BNX_SESSION_VALIDATING;}finally{BNX_SESSION_VALIDATING=null;}
 }
 
-async function bnxCoreHeartbeat_(){return await bnxValidateSession_(true);}
+async function bnxCoreHeartbeat_(){
+  const tokens=bnxSessionCandidateTokens_();
+  if(!tokens.length) return {success:false,authExpired:true,error:'SESSION TOKEN MISSING'};
+  for(const token of tokens){
+    const r=await bnxPostJson_('V2_CORE',{
+      action:'HEARTBEAT',clientId:getClientId_()||CLIENT_ID,sessionToken:token
+    },{timeout:20000});
+    if(r && r.success!==false && !bnxIsAuthFailure_(r)){
+      bnxStoreWorkingToken_(token); BNX_SESSION_LAST_VALIDATED=Date.now(); BNX_SESSION_EXPIRED=false;
+      return Object.assign({success:true},r);
+    }
+  }
+  return await bnxValidateSession_(true);
+}
 
 function bnxShowSessionExpired_(){
   BNX_SESSION_EXPIRED=true;
@@ -219,25 +247,63 @@ function bnxShowSessionExpired_(){
   try{
     document.body.classList.add('bnx-session-expired');
     let el=document.getElementById('bnxSessionExpiredBanner');
-    if(!el){el=document.createElement('div');el.id='bnxSessionExpiredBanner';el.innerHTML='<b>🔐 Session expired</b><span>Your login session has expired. Please login again to continue live ERP operations.</span>';document.body.appendChild(el);}
+    if(!el){
+      el=document.createElement('div');
+      el.id='bnxSessionExpiredBanner';
+      el.innerHTML='<b>🔐 Session expired</b><span>Your login session has expired. Please login again to continue live ERP operations.</span>';
+      document.body.appendChild(el);
+    }
   }catch(e){}
 }
-async function bnxSessionHeartbeat_(){const r=await bnxValidateSession_(true);if(r&&r.authExpired)bnxShowSessionExpired_();return r;}
+
+async function bnxSessionHeartbeat_(){
+  const r=await bnxValidateSession_(false);
+  if(r&&r.authExpired)bnxShowSessionExpired_();
+  return r;
+}
 
 async function gasApi(action,payload,endpoint){
-  payload=payload||{}; const ep=endpoint||'V2_CORE'; const token=getSessionToken_();
-  if(!token)return {success:false,authExpired:true,error:'SESSION TOKEN MISSING'};
-  const body=Object.assign({action:action,clientId:getClientId_()||CLIENT_ID,sessionToken:token},payload);
-  let j=await bnxPostJson_(ep,body,{timeout:ep==='V2_CORE'&&/^(GET_|LIST_|LOAD_|READ_|FETCH_|CHECK_)/i.test(action)?25000:30000});
-  if(bnxIsAuthFailure_(j) && ep!=='V2_AUTH'){
-    const vr=await bnxValidateSession_(true);
-    if(vr&&vr.success){
-      const fresh=getSessionToken_();
-      j=await bnxPostJson_(ep,Object.assign({action:action,clientId:getClientId_()||CLIENT_ID,sessionToken:fresh},payload),{timeout:30000});
+  payload=payload||{};
+  const ep=endpoint||'V2_CORE';
+  const url=GAS_APIS_DSR[ep];
+  if(!url)return {success:false,error:'API endpoint is not configured'};
+
+  const tokens=bnxSessionCandidateTokens_();
+  if(!tokens.length)return {success:false,authExpired:true,error:'SESSION TOKEN MISSING'};
+
+  let lastTransient=null;
+  let rejected=0;
+  for(const token of tokens){
+    const body=Object.assign({
+      action:action,
+      clientId:getClientId_()||CLIENT_ID,
+      sessionToken:token
+    },payload);
+    try{
+      const r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(body)});
+      let j;
+      try{j=await r.json();}catch(e){j={success:false,error:'Invalid server response (HTTP '+r.status+')'};}
+      if(j && !(j.error==='Invalid or expired session' ||
+          /SESSION EXPIRED|TOKEN REQUIRED|TOKEN MISSING/i.test(String(j.message||j.error||'')) ||
+          j.status===401 || j.unauthorized===true || j.sessionExpired===true)){
+        bnxStoreWorkingToken_(token);
+        BNX_SESSION_LAST_VALIDATED=Date.now();
+        BNX_SESSION_EXPIRED=false;
+        return j;
+      }
+      rejected++;
+    }catch(e){
+      lastTransient={success:false,transient:true,error:e.message||'Network error'};
     }
   }
-  if(bnxIsAuthFailure_(j)){bnxShowSessionExpired_();return {success:false,authExpired:true,error:j.error||j.message||'Invalid or expired session'};}
-  return j;
+
+  /* Every candidate was explicitly rejected. This is a real authentication
+     failure, not a failed AUTH deployment or a temporary network problem. */
+  if(rejected===tokens.length){
+    bnxShowSessionExpired_();
+    return {success:false,authExpired:true,error:'Invalid or expired session'};
+  }
+  return lastTransient||{success:false,error:'Server request failed'};
 }
 
 function gasToast(m,t){
@@ -292,7 +358,7 @@ function mapLiveDsrDay_(raw){
 }
 
 async function fetchDsrMonthLive_(year,month){
-  const r=await gasApi('GET_DSR_MATRIX',{year:Number(year),month:Number(month)});
+  const r=await gasApi('GET_DSR_MATRIX',{year:Number(year),month:Number(month),sourceDb:DSR_SOURCE_DB,posSystem:DSR_POS_SYSTEM});
   if(!r || !r.success || !r.data || !r.data.byDay){
     if(r&&r.authExpired){
       gasToast('🔐 Session expired — please login again','error');
@@ -317,7 +383,7 @@ async function fetchDsrMonthLive_(year,month){
 
 async function fetchDsrYtdLive_(asOfDate){
   const y=Number(String(asOfDate).slice(0,4));
-  const r=await gasApi('GET_DSR_YTD',{year:y,asOfDate:asOfDate});
+  const r=await gasApi('GET_DSR_YTD',{year:y,asOfDate:asOfDate,sourceDb:DSR_SOURCE_DB,posSystem:DSR_POS_SYSTEM});
   return !!(r&&r.success&&r.data);
 }
 
@@ -1844,6 +1910,40 @@ label{font-family:Arial,Helvetica,sans-serif!important;font-weight:700!important
 
   <!-- ══════ TAB: SETTINGS ══════ -->
   <div class="tab-panel" id="itab-settings">
+    <!-- DIRECT POS / TRANSACTION DB CONTROL -->
+    <div class="sett-highlight sett-sec" id="directPosSourceSettings">
+      <h4>🔴 Direct POS Report Source</h4>
+      <div class="frow"><label>DSR Mode</label>
+        <select id="s_dsr_mode">
+          <option value="DIRECT_POS">🔴 Direct POS — Live</option>
+          <option value="UPLOAD">📤 Upload Mode</option>
+        </select>
+      </div>
+      <div class="frow"><label>POS System</label>
+        <select id="s_pos_system">
+          <option value="RISTA">RISTA POS</option>
+          <option value="Petpooja">Petpooja</option>
+          <option value="Torqus">Torqus</option>
+          <option value="UrbanPiper">UrbanPiper</option>
+          <option value="Generic">Generic</option>
+        </select>
+      </div>
+      <div class="frow"><label>Report Source DB</label>
+        <input id="s_source_db" value="TRANSACTION_DB" readonly style="font-weight:800"/>
+      </div>
+      <div class="frow"><label>Client</label>
+        <input id="s_client_id" value="" readonly placeholder="Current authenticated client"/>
+      </div>
+      <div style="font-size:10px;color:var(--green);font-weight:800;margin-top:7px">
+        ✅ Direct POS reports are generated from the client's live TRANSACTION_DB. REPORT_DB is not used as the sales source.
+      </div>
+      <div class="frow" style="margin-top:8px;gap:7px">
+        <button class="btn btn-green btn-sm" type="button" onclick="saveDsrPosSettings_()">💾 Save POS Report Settings</button>
+        <button class="btn btn-ghost btn-sm" type="button" onclick="resetDsrPosSettings_()">↺ Reset</button>
+      </div>
+      <div id="s_source_status" style="font-size:10px;margin-top:6px;color:var(--muted)"></div>
+    </div>
+
     <!-- HIGHLIGHT: Outlet Config -->
     <div class="sett-highlight sett-sec">
       <h4>🏢 Outlet Configuration</h4>
@@ -3538,6 +3638,49 @@ window.addEventListener('error',function(ev){
 });
 
 /* ═══════════════════════════════════════════════ */
+// DIRECT POS REPORT SETTINGS — authoritative browser configuration
+function loadDsrPosSettings_(){
+  const mode=document.getElementById('s_dsr_mode');
+  const sys=document.getElementById('s_pos_system');
+  const cid=document.getElementById('s_client_id');
+  const src=document.getElementById('s_source_db');
+  if(mode) mode.value=DSR_MODE;
+  if(sys) sys.value=DSR_POS_SYSTEM;
+  if(cid) cid.value=getClientId_()||CLIENT_ID||'';
+  if(src) src.value=DSR_SOURCE_DB;
+  const st=document.getElementById('s_source_status');
+  if(st) st.textContent='LIVE SOURCE: '+DSR_SOURCE_DB+' · CLIENT: '+(getClientId_()||CLIENT_ID||'resolving')+' · POS: '+DSR_POS_SYSTEM;
+}
+function saveDsrPosSettings_(){
+  const mode=document.getElementById('s_dsr_mode')?.value||'DIRECT_POS';
+  const sys=document.getElementById('s_pos_system')?.value||'RISTA';
+  DSR_MODE=mode;
+  DSR_POS_SYSTEM=sys;
+  DSR_CFG.dsrMode=mode;
+  DSR_CFG.posSystem=sys;
+  DSR_CFG.sourceDb=DSR_SOURCE_DB;
+  DSR_CFG.reportSource='TRANSACTION_DB';
+  try{localStorage.setItem('bnx_dsr_config',JSON.stringify(DSR_CFG));}catch(e){}
+  const client=getClientId_()||CLIENT_ID||'';
+  const src=document.getElementById('s_source_db'); if(src)src.value=DSR_SOURCE_DB;
+  const cid=document.getElementById('s_client_id'); if(cid)cid.value=client;
+  switchInputMode(DSR_MODE);
+  const st=document.getElementById('s_source_status');
+  if(st) st.textContent='✅ Saved · '+DSR_MODE+' · '+DSR_POS_SYSTEM+' · '+DSR_SOURCE_DB+' · '+client;
+  try{
+    const sysEl=document.getElementById('dpr-system'); if(sysEl)sysEl.value=DSR_POS_SYSTEM;
+  }catch(e){}
+  showToast('✅ Direct POS settings saved — source: TRANSACTION_DB','ok',3500);
+}
+function resetDsrPosSettings_(){
+  DSR_MODE='DIRECT_POS'; DSR_POS_SYSTEM='RISTA';
+  DSR_CFG.dsrMode='DIRECT_POS'; DSR_CFG.posSystem='RISTA'; DSR_CFG.sourceDb=DSR_SOURCE_DB;
+  try{localStorage.setItem('bnx_dsr_config',JSON.stringify(DSR_CFG));}catch(e){}
+  loadDsrPosSettings_();
+  switchInputMode('DIRECT_POS');
+  showToast('↺ Direct POS reset — RISTA · TRANSACTION_DB','ok');
+}
+
 // INIT — Apply config from admin-setup on load
 // ═══════════════════════════════════════════════
 (function initDSRMode() {
