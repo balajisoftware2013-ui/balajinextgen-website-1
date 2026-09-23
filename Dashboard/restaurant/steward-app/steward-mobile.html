@@ -5190,7 +5190,9 @@ if(typeof window.liveTableOwner !== 'function'){
     }catch(e){ return false; }
   };
 }
-const liveTableOwner = window.liveTableOwner;
+/* PASS #73: delegate at call time — a plain alias froze the first, name-only
+   owner check and locked stewards out of repeat orders on their own table. */
+const liveTableOwner = function(t){ return window.liveTableOwner(t); };
 
 function openTable(id){
   selTable=TABLES.find(t=>t.id===id);
@@ -10710,5 +10712,243 @@ button,.menu-view-toggle,.menu-type-btn,.menu-quick-btn,.cat-tab{touch-action:ma
 })();
 </script>
 
+<script id="bnx-pass73-steward-tables">
+/* ═══════════════════════════════════════════════════════════════════════
+   PASS #73 — STEWARD: RUNNING TABLE ⇄ REPEAT ORDER · TRANSFER · MERGE
+   Root causes fixed:
+   1. `const liveTableOwner = window.liveTableOwner` froze the FIRST (name-only)
+      owner check, so openTable / New Order / Send KOT never used the later
+      KOT-aware check. Once the backend row had no captain name, the steward
+      who opened the table was locked out of adding the next round.
+   2. KOTs marked SERVED stopped counting as ownership → after food was served
+      the same steward could not place a repeat order on his own table.
+   3. Transfer Table / Transfer Ticket were "Future / not connected".
+   Server truth now comes from GET_TABLE_FLOOR (open orders + owners + items),
+   TRANSFER_TABLE and MERGE_TABLES.
+═══════════════════════════════════════════════════════════════════════ */
+(function(){
+  'use strict';
+  const W = window;
+  const FLOOR = { byId:{}, at:0 };
+  const esc = v => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+  const jsq = v => String(v == null ? '' : v).replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+  const norm = v => String(v == null ? '' : v).trim().toLowerCase();
+  const money = v => '₹' + Number(v || 0).toLocaleString('en-IN', { maximumFractionDigits:2 });
+  const say = (m, t) => { try { toast(m, t || 'info'); } catch (e) {} };
+  const me = () => (typeof getCurrentStaffIdentity === 'function' ? getCurrentStaffIdentity() : {});
+  const running = t => t && (t.status === 'OCCUPIED' || t.status === 'RUNNING');
+  const call = async (a, p) => { try { return await gasApi(a, p || {}, 'V2_CORE'); } catch (e) { return { success:false, error:e.message }; } };
+  const uuid = () => (typeof bnxUuid === 'function' ? bnxUuid() : 'r' + Date.now() + Math.random().toString(36).slice(2));
+
+  /* Captains / managers may serve any running table; stewards their own. */
+  function elevated(){
+    const r = String(me().role || '').toUpperCase();
+    return /CAPTAIN|MANAGER|ADMIN|OWNER|SUPERVISOR|DEVELOPER|MD|CEO/.test(r);
+  }
+  function floorOwner(t){
+    const f = FLOOR.byId[String(t && t.id || '').trim().toUpperCase()]; if (!f) return false;
+    const i = me();
+    if (i.userId && f.ownerId && norm(f.ownerId) === norm(i.userId)) return true;
+    if (i.loginId && f.ownerLogin && norm(f.ownerLogin) === norm(i.loginId)) return true;
+    if (i.fullName && [f.ownerName, f.captain].some(v => v && norm(v) === norm(i.fullName))) return true;
+    return false;
+  }
+  function servedKotOwner(t){
+    try {
+      const i = me(), tid = norm(t.id);
+      return (Array.isArray(KOT) ? KOT : []).some(k => norm(k.table || k.TABLE_ID) === tid &&
+        !['CANCELLED','BILLED'].includes(String(k.status || '').toUpperCase()) &&
+        ((i.userId && [k.userId, k.USER_ID, k.createdById].some(v => v && norm(v) === norm(i.userId))) ||
+         (i.loginId && [k.loginId, k.createdByLogin].some(v => v && norm(v) === norm(i.loginId))) ||
+         (i.fullName && [k.waiter, k.steward, k.createdByName].some(v => v && norm(v) === norm(i.fullName)))));
+    } catch (e) { return false; }
+  }
+  const prevOwner = W.liveTableOwner;
+  W.liveTableOwner = function(t){
+    if (!t) return false;
+    try { if (typeof prevOwner === 'function' && prevOwner(t)) return true; } catch (e) {}
+    return floorOwner(t) || servedKotOwner(t) || (running(t) && elevated());
+  };
+
+  /* ---------- live floor merge ---------- */
+  async function mergeFloor(){
+    const r = await call('GET_TABLE_FLOOR', { includeItems:true });
+    if (!r || !r.success || !r.data || !Array.isArray(r.data.tables)) return false;
+    FLOOR.byId = {}; FLOOR.at = Date.now();
+    r.data.tables.forEach(f => { FLOOR.byId[String(f.tableNo).toUpperCase()] = f; if (f.tableId) FLOOR.byId[String(f.tableId).toUpperCase()] = f; });
+    TABLES = TABLES.map(t => {
+      const f = FLOOR.byId[String(t.id).trim().toUpperCase()]; if (!f) return t;
+      if (f.status === 'OCCUPIED') {
+        return Object.assign({}, t, { status:'RUNNING', bill:f.amount, covers:Math.max(Number(t.covers) || 0, f.guests || 0), kotCount:f.kotCount,
+          steward:t.steward || f.ownerName || f.captain || '', stewardId:t.stewardId || f.ownerId || '', stewardLogin:t.stewardLogin || f.ownerLogin || '',
+          orderIds:f.orderIds || [], rounds:(f.lines || []).length, startTime:t.startTime || f.startTime, elapsedMin:f.elapsedMin });
+      }
+      /* server says nothing is open → a stale local RUNNING flag must not block the table */
+      if ((t.status === 'RUNNING' || t.status === 'OCCUPIED') && f.status === 'AVAILABLE') return Object.assign({}, t, { status:'AVAILABLE', bill:0, covers:0, kotCount:0, orderIds:[], rounds:0 });
+      return t;
+    });
+    return true;
+  }
+  const origLoad = W.loadTablesLive;
+  if (typeof origLoad === 'function') {
+    W.loadTablesLive = async function(){
+      const ok = await origLoad.apply(this, arguments);
+      try {
+        if (await mergeFloor()) {
+          if (document.getElementById('s-tables')?.classList.contains('active') && typeof renderMobTables === 'function') renderMobTables();
+          if (document.getElementById('s-home')?.classList.contains('active') && typeof renderMyTables === 'function') renderMyTables();
+        }
+      } catch (e) { console.debug('[PASS73 floor]', e); }
+      return ok;
+    };
+  }
+
+  /* ---------- table sheet: repeat / add / transfer / merge ---------- */
+  const origOpen = W.openTable;
+  W.openTable = function(id){
+    const res = origOpen.apply(this, arguments);
+    try {
+      const t = selTable; if (!t) return res;
+      const mine = W.liveTableOwner(t);
+      const body = document.getElementById('mob-table-body');
+      const newBtn = document.querySelector('#table-modal button[onclick="openOrderForTable()"]');
+      if (newBtn) {
+        const allow = t.status === 'AVAILABLE' || mine;
+        newBtn.style.display = allow ? '' : 'none'; newBtn.disabled = !allow;
+        newBtn.textContent = running(t) ? '➕ Add Order' : '+ New Order';
+      }
+      if (running(t) && mine && body) {
+        const f = FLOOR.byId[String(t.id).toUpperCase()];
+        const rounds = f && f.lines ? f.lines : [];
+        const hist = rounds.length ? `<div style="margin-top:10px;background:var(--surface2);border-radius:10px;padding:9px 10px;max-height:150px;overflow:auto">
+          <div style="font-size:10px;color:var(--text3);font-weight:800;margin-bottom:4px">RUNNING ORDER · ${rounds.length} ROUND${rounds.length > 1 ? 'S' : ''}</div>
+          ${rounds.map((l, i) => `<div style="font-size:11px;padding:3px 0;border-top:${i ? '1px dashed var(--border)' : '0'}"><b>#${i + 1}</b> ${esc(String(l.time || '').slice(0,5))} · ${l.items.map(x => esc(x.name) + ' ×' + x.qty).join(', ') || '—'}</div>`).join('')}</div>` : '';
+        const div = document.createElement('div');
+        div.id = 'bnx73-table-actions';
+        div.innerHTML = hist + `
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px">
+            <button type="button" onclick="bnx73RepeatOrder()" style="padding:10px;border:0;border-radius:9px;background:var(--orange,#f57c00);color:#fff;font-weight:800">🔁 Repeat Last Round</button>
+            <button type="button" onclick="openOrderForTable()" style="padding:10px;border:0;border-radius:9px;background:var(--gold);color:#fff;font-weight:800">➕ Add More Items</button>
+            <button type="button" onclick="bnx73MoveDlg('transfer')" style="padding:10px;border:1px solid var(--border2,#ddd);border-radius:9px;background:var(--surface,#fff);font-weight:800">🔀 Transfer Table</button>
+            <button type="button" onclick="bnx73MoveDlg('merge')" style="padding:10px;border:1px solid var(--border2,#ddd);border-radius:9px;background:var(--surface,#fff);font-weight:800">🔗 Merge Table</button>
+          </div>`;
+        const old = document.getElementById('bnx73-table-actions'); if (old) old.remove();
+        body.appendChild(div);
+      }
+    } catch (e) { console.debug('[PASS73 openTable]', e); }
+    return res;
+  };
+
+  /* Repeat: same items as the last round on this table, loaded into the cart for review */
+  function resolveMenu(itemId, name){
+    const list = Array.isArray(MENU) ? MENU : [];
+    return list.find(m => itemId && String(m.id) === String(itemId)) ||
+           list.find(m => norm(m.name) === norm(name)) || null;
+  }
+  W.bnx73RepeatOrder = async function(){
+    const t = selTable; if (!t) return;
+    if (!W.liveTableOwner(t)) { say('🔒 This running table belongs to another steward', 'error'); return; }
+    let f = FLOOR.byId[String(t.id).toUpperCase()];
+    if (!f || !f.lines || !f.lines.length || Date.now() - FLOOR.at > 60000) { await mergeFloor(); f = FLOOR.byId[String(t.id).toUpperCase()]; }
+    let items = [];
+    if (f && f.lines && f.lines.length) items = f.lines[f.lines.length - 1].items || [];
+    if (!items.length) {
+      const k = (Array.isArray(KOT) ? KOT : []).find(k => norm(k.table) === norm(t.id) && !['CANCELLED'].includes(String(k.status || '').toUpperCase()) && Array.isArray(k.items) && k.items.length);
+      if (k) items = k.items.map(x => ({ itemId:x.id || x.itemId || x.ITEM_ID, name:x.name || x.ITEM_NAME, qty:Number(x.qty || x.QUANTITY) || 1 }));
+    }
+    if (!items.length) { say('No previous round found for table ' + t.id, 'error'); return; }
+    if (!Array.isArray(MENU) || !MENU.length) { say('Menu is still loading — try again in a moment', 'error'); return; }
+    const next = {}, missing = [];
+    items.forEach(x => {
+      const m = resolveMenu(x.itemId, x.name);
+      if (!m || m.avail === false) { missing.push(x.name); return; }
+      next[String(m.id)] = (next[String(m.id)] || 0) + (Number(x.qty) || 1);
+    });
+    if (!Object.keys(next).length) { say('Last round items are not on the current menu', 'error'); return; }
+    closeModal();
+    order = next;
+    const title = document.getElementById('no-title'); if (title) title.textContent = `Repeat Order — Table ${t.id}`;
+    showScreen('s-new-order');
+    try { if (typeof renderMenu === 'function') renderMenu(); } catch (e) {}
+    try { Object.keys(next).forEach(id => { if (typeof updateMenuQtyUI_ === 'function') updateMenuQtyUI_(id); }); } catch (e) {}
+    try { updateOrderBadge(); } catch (e) {}
+    try { if (typeof bnxToggleOrderDrawer_ === 'function') bnxToggleOrderDrawer_(true); } catch (e) {}
+    say('🔁 Last round loaded — check quantities, then Send KOT' + (missing.length ? ' (not available: ' + missing.join(', ') + ')' : ''), missing.length ? 'error' : 'success');
+  };
+
+  /* Transfer / merge sheet */
+  function sheet(html){
+    let m = document.getElementById('bnx73-move');
+    if (!m) {
+      m = document.createElement('div'); m.id = 'bnx73-move'; m.className = 'modal-overlay';
+      m.innerHTML = '<div class="modal"><div class="modal-handle"></div><div id="bnx73-move-body"></div></div>';
+      m.addEventListener('click', e => { if (e.target === m) m.classList.remove('open'); });
+      document.body.appendChild(m);
+    }
+    document.getElementById('bnx73-move-body').innerHTML = html;
+    m.classList.add('open');
+  }
+  W.bnx73MoveDlg = async function(mode, fromId){
+    if (Date.now() - FLOOR.at > 20000) await mergeFloor();
+    const from = fromId || (selTable && selTable.id) || '';
+    const mineRunning = TABLES.filter(t => running(t) && W.liveTableOwner(t));
+    if (!mineRunning.length) { say('You have no running table to ' + (mode === 'merge' ? 'merge' : 'transfer'), 'error'); return; }
+    const targets = TABLES.filter(t => mode === 'merge' ? running(t) : (t.status === 'AVAILABLE' && !t.reserved));
+    const opt = (list, sel) => list.map(t => `<option value="${esc(t.id)}" ${String(t.id) === String(sel) ? 'selected' : ''}>${esc(t.id)}${t.section ? ' · ' + esc(t.section) : ''}${running(t) ? ' · ' + money(t.bill) : ' · ' + (t.pax || 4) + ' seats'}</option>`).join('');
+    closeModal();
+    sheet(`
+      <div class="modal-title">${mode === 'merge' ? '🔗 Merge Table' : '🔀 Transfer Table'}</div>
+      <div style="font-size:11.5px;color:var(--text3);margin:-4px 0 10px">${mode === 'merge' ? 'All rounds, items and KOTs of the first table move into the second running table. Bill once from the second table.' : 'The whole running order (all rounds, items and KOTs) moves to a free table. Amount does not change.'}</div>
+      <label style="font-size:11px;font-weight:800;color:var(--text3)">From (your running table)</label>
+      <select id="bnx73-from" style="width:100%;padding:11px;border-radius:10px;border:1px solid var(--border2,#ddd);margin:4px 0 10px;font-size:14px">${opt(mineRunning, from)}</select>
+      <label style="font-size:11px;font-weight:800;color:var(--text3)">${mode === 'merge' ? 'Into running table' : 'To free table'}</label>
+      <select id="bnx73-to" style="width:100%;padding:11px;border-radius:10px;border:1px solid var(--border2,#ddd);margin:4px 0 14px;font-size:14px">${targets.length ? '<option value="">— choose —</option>' + opt(targets.filter(t => String(t.id) !== String(from))) : '<option value="">No table available</option>'}</select>
+      <div style="display:flex;gap:8px">
+        <button class="btn-ghost" style="flex:1" onclick="document.getElementById('bnx73-move').classList.remove('open')">Cancel</button>
+        <button class="btn-primary" id="bnx73-go" style="flex:1.4" onclick="bnx73DoMove('${mode}')">${mode === 'merge' ? '🔗 Merge' : '🔀 Transfer'}</button>
+      </div>`);
+  };
+  W.bnx73DoMove = async function(mode){
+    const from = document.getElementById('bnx73-from')?.value, to = document.getElementById('bnx73-to')?.value;
+    if (!from || !to) { say('Choose both tables', 'error'); return; }
+    if (from === to) { say('Choose two different tables', 'error'); return; }
+    const t = TABLES.find(x => String(x.id) === String(from));
+    if (t && !W.liveTableOwner(t)) { say('🔒 Only the table owner or a captain can move this table', 'error'); return; }
+    const b = document.getElementById('bnx73-go'); if (b) { if (b.disabled) return; b.disabled = true; b.textContent = 'Working…'; }
+    const r = await call(mode === 'merge' ? 'MERGE_TABLES' : 'TRANSFER_TABLE', { requestId:uuid(), fromTable:from, toTable:to });
+    if (!r || !r.success) { if (b) { b.disabled = false; b.textContent = mode === 'merge' ? '🔗 Merge' : '🔀 Transfer'; } say('❌ ' + (r && r.error ? r.error : 'Server did not confirm — nothing was moved'), 'error'); return; }
+    /* keep this device's local KOT / order cache on the new table */
+    try {
+      if (typeof bnxLoadOpenKots === 'function') bnxLoadOpenKots();
+      KOT.forEach(k => { if (norm(k.table) === norm(from) && !['CANCELLED','BILLED'].includes(String(k.status || '').toUpperCase())) { k.table = to; if (mode === 'merge' && r.data.targetOrderNo) k.mergedInto = r.data.targetOrderNo; } });
+      if (typeof bnxSetOpenKotsRaw === 'function') bnxSetOpenKotsRaw(JSON.stringify(KOT));
+      if (typeof PLACED_ORDERS !== 'undefined') Object.values(PLACED_ORDERS).forEach(o => { if (norm(o.table) === norm(from)) o.table = to; });
+      const src = TABLES.find(x => String(x.id) === String(from)), dst = TABLES.find(x => String(x.id) === String(to));
+      if (src && dst) {
+        const own = { steward:src.steward, stewardId:src.stewardId, stewardLogin:src.stewardLogin };
+        Object.assign(dst, own, { status:'RUNNING', bill:(mode === 'merge' ? Number(dst.bill) || 0 : 0) + (Number(src.bill) || 0), covers:(mode === 'merge' ? Number(dst.covers) || 0 : 0) + (Number(src.covers) || 0) });
+        Object.assign(src, { status:'AVAILABLE', bill:0, covers:0, kotCount:0, steward:'', stewardId:'', stewardLogin:'' });
+      }
+      if (selTable && String(selTable.id) === String(from)) selTable = dst || selTable;
+    } catch (e) { console.debug('[PASS73 move local]', e); }
+    document.getElementById('bnx73-move')?.classList.remove('open');
+    say(mode === 'merge' ? `✅ ${from} merged into ${to} (${r.data.movedItems} items, ${r.data.movedKots} KOTs)` : `✅ Table ${from} moved to ${to}`, 'success');
+    try { if (document.getElementById('s-tables')?.classList.contains('active')) renderMobTables(); if (document.getElementById('s-home')?.classList.contains('active')) renderMyTables(); } catch (e) {}
+    setTimeout(() => W.loadTablesLive().catch(() => {}), 300);
+  };
+
+  /* "Transfer Ticket" menu entries were placeholders — point them at the real transfer */
+  function wireMenus(){
+    document.querySelectorAll('[onclick*="Transfer Ticket"],[onclick*="Ticket transfer"]').forEach(el => {
+      el.setAttribute('onclick', "bnx73MoveDlg('transfer')");
+      el.classList.remove('future');
+      const em = el.querySelector('em'); if (em) em.remove();
+      const lbl = el.querySelector('b,.ml-text'); if (lbl) lbl.textContent = 'Transfer Table';
+    });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wireMenus); else wireMenus();
+  setTimeout(() => { mergeFloor().then(ok => { if (ok) { try { if (document.getElementById('s-tables')?.classList.contains('active')) renderMobTables(); if (document.getElementById('s-home')?.classList.contains('active')) renderMyTables(); } catch (e) {} } }); }, 1500);
+})();
+</script>
 </body>
 </html>
