@@ -10672,6 +10672,57 @@ function bnxDashQuickReport_(cat, anchor){
 // (orderRegData) every other live report on this page already reads.
 // No new backend calls, no invented numbers — anything not genuinely
 // derivable from what's already loaded is left as an honest "—".
+// FIX ("full audit" — 🏦 Cash Position, Sep 2026): every card in the
+// 4-panel row gets its period label ('(Today)' / '(This Month)' / etc.)
+// switched by the SAME rangeParams the moment the person picks a
+// different dashboard range (see the '(...)' relabel loop below), but
+// Cash Position's actual numbers were still always looked up under
+// getBusinessDate() alone — i.e. only today's Daily Collection entry,
+// no matter what the header said. Looking at "This Month" with no
+// entry filled in for today specifically (the common case) showed a
+// card titled "This Month" with every figure blank, even on months
+// with real entries on other days — and looking at "Today" for a past
+// date correctly showed nothing at all, since it never even looked at
+// the offered date. This resolves the same from/to the selected range
+// actually covers and aggregates every Daily Collection entry inside
+// it (DCR_MANUAL is the person's own, already fully loaded locally —
+// no extra server round-trip needed).
+function bnxDashDatesForRange_(p){
+  const pad2=x=>String(x).padStart(2,'0');
+  const toISO=(y,m,d)=>y+'-'+pad2(m)+'-'+pad2(d);
+  const today=(typeof getBusinessDate==='function')?getBusinessDate():new Date().toISOString().slice(0,10);
+  const clamp=k=>k>today?today:k;
+  const range=(p&&p.range)||'today';
+  if(range==='custom'&&p.from&&p.to) return p.from<=p.to?{from:p.from,to:p.to}:{from:p.to,to:p.from};
+  if(range==='yesterday'){ const d=new Date(today+'T00:00:00'); d.setDate(d.getDate()-1); const k=toISO(d.getFullYear(),d.getMonth()+1,d.getDate()); return {from:k,to:k}; }
+  if(range==='week'){
+    let monday;
+    if(p.weekStart&&/^\d{4}-W\d{2}$/.test(p.weekStart)){
+      const mm=p.weekStart.match(/^(\d{4})-W(\d{2})$/); const jan4=new Date(Number(mm[1]),0,4); const jan4Dow=(jan4.getDay()+6)%7;
+      monday=new Date(jan4); monday.setDate(jan4.getDate()-jan4Dow+(Number(mm[2])-1)*7);
+    }else{ const bd=new Date(today+'T00:00:00'); monday=new Date(bd); monday.setDate(bd.getDate()-((bd.getDay()+6)%7)); }
+    const sunday=new Date(monday); sunday.setDate(monday.getDate()+6);
+    return {from:toISO(monday.getFullYear(),monday.getMonth()+1,monday.getDate()),to:clamp(toISO(sunday.getFullYear(),sunday.getMonth()+1,sunday.getDate()))};
+  }
+  if(range==='month'){
+    let y,m;
+    if(p.month&&/^\d{4}-\d{2}$/.test(p.month)){y=Number(p.month.slice(0,4));m=Number(p.month.slice(5,7));}
+    else{ const bd=new Date(today+'T00:00:00'); y=bd.getFullYear(); m=bd.getMonth()+1; }
+    return {from:toISO(y,m,1),to:clamp(toISO(y,m,new Date(y,m,0).getDate()))};
+  }
+  if(range==='quarter'){
+    let fy,q;
+    if(p.quarter&&p.fyYear){q=Math.max(1,Math.min(4,Number(p.quarter)));fy=Number(p.fyYear);}
+    else{ const bd=new Date(today+'T00:00:00'),mo=bd.getMonth(); fy=mo>=3?bd.getFullYear():bd.getFullYear()-1; q=Math.floor(((mo-3+12)%12)/3)+1; }
+    const startMonth=3+(q-1)*3, start=new Date(fy+Math.floor(startMonth/12),startMonth%12,1), end=new Date(start.getFullYear(),start.getMonth()+3,0);
+    return {from:toISO(start.getFullYear(),start.getMonth()+1,start.getDate()),to:clamp(toISO(end.getFullYear(),end.getMonth()+1,end.getDate()))};
+  }
+  if(range==='year'){
+    const fy=p.fyYear?Number(p.fyYear):(function(){const bd=new Date(today+'T00:00:00');return bd.getMonth()>=3?bd.getFullYear():bd.getFullYear()-1;})();
+    return {from:toISO(fy,4,1),to:clamp(toISO(fy+1,3,31))};
+  }
+  return {from:today,to:today};
+}
 function bnxComputeDashExtras_(){
   try{
     // Dashboard extras are server-truth only. Never derive selected-period
@@ -10745,14 +10796,31 @@ function bnxComputeDashExtras_(){
     // the received amount itself is always the live payment-ledger value.
     mirrorTxt('d-cash','d-cp-received');
     if(typeof DCR_MANUAL!=='undefined'){
-      const businessDate=typeof getBusinessDate==='function'?getBusinessDate():new Date().toISOString().slice(0,10),manual=DCR_MANUAL[businessDate],noteEl=document.getElementById('dashCashPositionNote');
-      if(manual){
-        const opening=manual.openingCash!=null?manual.openingCash:(typeof DCR_OPENING_FLOAT!=='undefined'?DCR_OPENING_FLOAT:0),cashReceived=n(document.getElementById('d-cp-received')?.textContent?.replace(/[^0-9.]/g,''));
-        setTxt('d-cp-opening',rupee(opening));setTxt('d-cp-duercvd',rupee(manual.dueCash||0));setTxt('d-cp-totalinflow',rupee(cashReceived+n(manual.dueCash)));
-        setTxt('d-cp-expenses',rupee(manual.dailyExp||0));setTxt('d-cp-bazar',rupee(manual.dailyBazar||0));setTxt('d-cp-deposit',rupee(manual.cashDeposit||0));
-        const totalIn= cashReceived+n(manual.dueCash);
-        setTxt('d-cp-closing',rupee(totalIn-n(manual.dailyExp)-n(manual.dailyBazar)-n(manual.cashDeposit)-n(manual.othersBank)));if(noteEl)noteEl.style.display='none';
-      }else if(noteEl)noteEl.style.display='';
+      const noteEl=document.getElementById('dashCashPositionNote');
+      const {from,to}=bnxDashDatesForRange_(rangeParams);
+      const todayKey=(typeof getBusinessDate==='function')?getBusinessDate():new Date().toISOString().slice(0,10);
+      const datesInRange=Object.keys(DCR_MANUAL).filter(k=>k>=from&&k<=to).sort();
+      if(datesInRange.length){
+        let dueCash=0,exp=0,bazar=0,dep=0,othersBank=0;
+        datesInRange.forEach(k=>{const m=DCR_MANUAL[k]||{}; dueCash+=n(m.dueCash); exp+=n(m.dailyExp); bazar+=n(m.dailyBazar); dep+=n(m.cashDeposit); othersBank+=n(m.othersBank);});
+        const firstManual=DCR_MANUAL[datesInRange[0]]||{};
+        const opening=firstManual.openingCash!=null?n(firstManual.openingCash):(typeof DCR_OPENING_FLOAT!=='undefined'?DCR_OPENING_FLOAT:0);
+        const cashReceived=n(document.getElementById('d-cp-received')?.textContent?.replace(/[^0-9.]/g,''));
+        const totalIn=cashReceived+dueCash;
+        setTxt('d-cp-opening',rupee(opening));setTxt('d-cp-duercvd',rupee(dueCash));setTxt('d-cp-totalinflow',rupee(totalIn));
+        setTxt('d-cp-expenses',rupee(exp));setTxt('d-cp-bazar',rupee(bazar));setTxt('d-cp-deposit',rupee(dep));
+        setTxt('d-cp-closing',rupee(totalIn-exp-bazar-dep-othersBank));
+        if(noteEl){
+          if(dashActiveRange!=='today'&&!DCR_MANUAL[todayKey]){
+            noteEl.style.display='';
+            noteEl.innerHTML='Showing '+datesInRange.length+' day'+(datesInRange.length===1?'':'s')+' with a Daily Collection entry in this period; today (' + todayKey + ') has none yet — <a href="#" onclick="event.preventDefault();goToDetail(\'accounts-ledger\',\'dailycollection\')" style="color:var(--gold);">add one →</a>';
+          } else noteEl.style.display='none';
+        }
+      }else if(noteEl){
+        noteEl.style.display='';
+        const rl={today:'today',yesterday:'yesterday',week:'this week',month:'this month',quarter:'this quarter',year:'this year',custom:'this period'}[dashActiveRange]||'the selected period';
+        noteEl.innerHTML='Opening/Due Received/Expenses/Bazar/Deposit/Closing need a Daily Collection entry for '+rl+' — <a href="#" onclick="event.preventDefault();goToDetail(\'accounts-ledger\',\'dailycollection\')" style="color:var(--gold);">add one →</a>';
+      }
     }
 
     const rangeLabel={today:'today',yesterday:'yesterday',week:'this week',month:'this month',quarter:'this quarter',year:'this year',custom:'this period'}[dashActiveRange]||'selected period';
@@ -10768,10 +10836,45 @@ function bnxComputeDashExtras_(){
 }
 
 let _bnxTrendRequestSeq=0;
+// FIX ("full audit" — Sep 2026): the 📊 Category Wise Sales card
+// (#dashCategorySalesBody) had HTML markup and a real backend action
+// (GET_CATEGORY_SALES_REPORT — already used by the Reports Hub's own
+// Category Sales Report) but nothing on the dashboard ever called it or
+// wrote into that table, so the card's "Loading…" placeholder from the
+// initial page HTML never went away, on every range. Wired here as its
+// own fetch (same rangeParams every other dashboard card already uses)
+// so it renders the real per-category net-sales split and total, with
+// an honest empty state when a range genuinely has no sales.
+async function bnxRenderDashCategorySales_(p){
+  const body=document.getElementById('dashCategorySalesBody');
+  if(!body) return;
+  try{
+    const res=await gasApi('GET_CATEGORY_SALES_REPORT',p,'V2_CORE');
+    const rows=(res&&res.success&&Array.isArray(res.data?.rows))?res.data.rows:[];
+    const foot=document.getElementById('dashCategorySalesFoot'), footAmt=document.getElementById('dashCatSalesFootAmt');
+    if(!rows.length){
+      body.innerHTML='<tr><td colspan="3" style="text-align:center;color:var(--text3);padding:14px;">No sales recorded for this range yet.</td></tr>';
+      if(foot) foot.style.display='none';
+      return;
+    }
+    const sorted=rows.slice().sort((a,b)=>(Number(b.NET_SALES)||0)-(Number(a.NET_SALES)||0));
+    const total=sorted.reduce((s,r)=>s+(Number(r.NET_SALES)||0),0);
+    const money=n=>Math.round(Number(n)||0).toLocaleString('en-IN',{maximumFractionDigits:0});
+    body.innerHTML=sorted.map(r=>{
+      const net=Number(r.NET_SALES)||0, pct=total>0?(net/total*100):0;
+      return '<tr><td>'+(r.CATEGORY_NAME||'Uncategorized')+'</td><td class="mono">'+money(net)+'</td><td class="mono">'+pct.toFixed(1)+'%</td></tr>';
+    }).join('');
+    if(foot){ foot.style.display=''; if(footAmt) footAmt.textContent=money(total); }
+  }catch(e){
+    console.error('[Dashboard] bnxRenderDashCategorySales_ error:',e);
+    body.innerHTML='<tr><td colspan="3" style="text-align:center;color:var(--text3);padding:14px;">Category sales unavailable.</td></tr>';
+  }
+}
 async function bnxRenderDashChartsRow_(){
   const seq=++_bnxTrendRequestSeq;
   try{
     const p=typeof bnxDashRangeParams_==='function'?bnxDashRangeParams_():{range:'today'};
+    bnxRenderDashCategorySales_(p);
     const res=await gasApi('GET_SALES_DAY_BOOK_REPORT',p,'V2_CORE');
     if(seq!==_bnxTrendRequestSeq)return;
     const rows=Array.isArray(res?.data?.rows)?res.data.rows:[];
