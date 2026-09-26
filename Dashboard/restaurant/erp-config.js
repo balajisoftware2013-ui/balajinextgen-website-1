@@ -1,86 +1,57 @@
-/* ============================================================================
- * erp-config.js — DSR Client Configuration
- * This file is loaded by dsr-client.html to configure API endpoints and
- * auth validation. Place this file in the same directory as dsr-client.html
- * or one directory level up (../).
- * ============================================================================ */
+/* ═══════════════════════════════════════════════════════════════════════
+   Balaji NextGen ERP — Configuration File
+   Deployment IDs for Google Apps Script backends (V2_CORE, V2_AUTH, etc.)
+   
+   📝 IMPORTANT: Replace YOUR_DEPLOYMENT_ID with actual deployment IDs
+   from your Google Apps Script deployments.
+   
+   TO GET YOUR DEPLOYMENT ID:
+   1. Open your Google Apps Script project (script.google.com)
+   2. Click "Deploy" → "Manage Deployments"
+   3. Copy the Deployment ID (looks like: AKfycbw...)
+   4. Replace the placeholder below
+═══════════════════════════════════════════════════════════════════════ */
 
-// ============ CONFIGURE THESE FOR YOUR DEPLOYMENT ============
-// Replace with YOUR actual Google Apps Script deployment URL
-const GAS_DEPLOYMENT_URL = 'https://script.google.com/macros/d/YOUR_DEPLOYMENT_ID/usercallable';
-
-// Map logical endpoint names to deployment URLs
-// If you have separate deployments for different services, list them here
+// Google Apps Script deployment IDs — MUST be configured for live reports to work
 const GAS_APIS_DSR = {
-  'V2_CORE': GAS_DEPLOYMENT_URL,        // Main DSR / Core ERP API
-  'RESTAURANT': GAS_DEPLOYMENT_URL,     // Restaurant-specific endpoints
-  'WIZARD': GAS_DEPLOYMENT_URL,         // Client wizard / onboarding
-  'FALLBACK': GAS_DEPLOYMENT_URL        // Fallback if primary is down
+  // V2_CORE handles: GET_DSR_MATRIX, GET_DSR_YTD, GET_BOOTSTRAP, etc.
+  // This is the main backend for live POS/DSR data
+  V2_CORE: 'https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID_V2_CORE/exec',
+  
+  // V2_AUTH handles: session tokens, user auth, access control
+  V2_AUTH: 'https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID_V2_AUTH/exec'
 };
 
-// ============ AUTHENTICATION GATE ============
-/**
- * initAuthGate_() — Validates session before DSR loads
- * Called by initDSRMode() in dsr-client.html before any data fetch
- * Throws error if session is invalid or missing
- */
-function initAuthGate_() {
-  // Get auth contexts (token + client pairs) from browser storage
-  const contexts = bnxGetAuthContexts_();
-  
-  if (!contexts || contexts.length === 0) {
-    throw new Error('NO_SESSION — No active auth context found. Redirecting to login.');
-  }
+// OPTIONAL: If you have other deployments (TALLY_SYNC, IMPORT, etc.), add them here
+const GAS_APIS_EXTRA = {
+  // TALLY_SYNC: 'https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID_TALLY/exec',
+  // IMPORT: 'https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID_IMPORT/exec'
+};
 
-  const context = contexts[0]; // Primary auth context
-  const token = context.token;
-  const clientId = context.client;
-
-  // Validate token
-  if (!token || token.trim() === '') {
-    throw new Error('INVALID_TOKEN — Session token is missing or empty.');
-  }
-
-  // Validate client ID (can be empty for single-client deployments)
-  // Remove this check if your deployment supports anonymous/default client
-  if (!clientId || clientId.trim() === '') {
-    console.warn('[AUTH] Warning: No client ID provided. Using default or URL parameter.');
-  }
-
-  console.log('[AUTH] Gate passed. Context: ', { 
-    client: clientId, 
-    tokenLength: token.length,
-    source: context.source 
-  });
-
-  // Store in session for DSR operations
-  try {
-    sessionStorage.setItem('_bnx_auth_token', token);
-    sessionStorage.setItem('_bnx_auth_client', clientId);
-  } catch (e) {
-    console.warn('[AUTH] Could not cache auth in sessionStorage:', e.message);
-  }
-}
-
-// ============ DSR_MODE CONFIGURATION (Optional) ============
-// These can also be set via URL params (?dsrMode=UPLOAD_MODE&posSystem=SQUARE)
-// Default: DIRECT_POS (auto-fetch from GAS backend)
-// Alternative: UPLOAD_MODE (manual upload → process)
-
-if (!window.DSR_CFG) {
-  window.DSR_CFG = {
-    dsrMode: 'DIRECT_POS',      // 'DIRECT_POS' | 'UPLOAD_MODE'
-    posSystem: 'RISTA',          // 'RISTA' | 'SQUARE' | 'CLOVER' | 'MANUAL'
-    theme: 'light',              // 'light' | 'dark'
-    autoRefresh: true,           // Auto-refresh POS data every 5 min
-    refreshInterval: 300000      // 5 minutes in ms
-  };
-  try {
-    localStorage.setItem('bnx_dsr_config', JSON.stringify(window.DSR_CFG));
-  } catch (e) {
-    console.warn('[CONFIG] Could not save DSR_CFG to localStorage:', e.message);
-  }
-}
-
-console.log('[CONFIG] erp-config.js loaded. GAS_APIS_DSR configured.');
-console.log('[CONFIG] DSR Mode:', window.DSR_CFG.dsrMode, '| POS System:', window.DSR_CFG.posSystem);
+// ═══════════════════════════════════════════════════════════════════════
+// QUICK START — Find your deployment IDs:
+// ═══════════════════════════════════════════════════════════════════════
+// 
+// 1. Google Apps Script Editor
+//    → Open your Balaji NextGen GAS project
+//    → Click "Deploy" (top right)
+//    → Select "Manage Deployments"
+//    → Copy the Deployment ID next to your latest release
+//
+// 2. Browser DevTools (if live reports are working anywhere)
+//    → F12 → Console
+//    → Type: window.GAS_APIS_DSR
+//    → You'll see the actual URLs being used
+//
+// 3. Balaji Dashboard Settings
+//    → Some deployments store these in Admin Settings → DB
+//    → Check bnx_api_v2_core, bnx_api_v2_auth in localStorage
+//
+// ═══════════════════════════════════════════════════════════════════════
+// 
+// FORMAT: https://script.google.com/macros/s/{DEPLOYMENT_ID}/exec
+// 
+// ❌ WRONG: /macros/d/{...}/usercallable  (Execution API, no CORS)
+// ✅ RIGHT: /macros/s/{...}/exec          (Web App, CORS-enabled)
+//
+// ═══════════════════════════════════════════════════════════════════════
