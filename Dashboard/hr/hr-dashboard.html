@@ -3953,34 +3953,62 @@ function empHaveNew(){
     (currentExportData?.entries||[]).map(e=>({name:e.name,tallySynced:false}));
   return fullList.some(e=>!e.tallySynced);
 }
+// Asks Tally for its real list of Cost Centres (via the relay, which passes
+// any XML through and returns Tally's raw reply). Returns a Set of
+// normalised names, or null if the reply couldn't be read.
+function _normName(n){return String(n||'').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&#39;/g,"'").replace(/\s+/g,' ').trim().toLowerCase();}
+async function fetchTallyCostCentreNames(){
+  const co=cv('t-company');
+  const xml=['<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>HRCCList</ID></HEADER>',
+    '<BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>'+svCurrentCompanyTag(co)+'</STATICVARIABLES>',
+    '<TDL><TDLMESSAGE><COLLECTION NAME="HRCCList"><TYPE>Cost Centre</TYPE><FETCH>Name</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>'].join('');
+  try{
+    const res=await fetch(`http://localhost:${TALLY_RELAY_PORT}`,{method:'POST',headers:{'Content-Type':'text/plain'},body:xml});
+    const j=await res.json();
+    const raw=j.raw||'';
+    const names=new Set();
+    let m; const re=/<COSTCENTRE\b[^>]*\bNAME="([^"]+)"/gi;
+    while((m=re.exec(raw))) names.add(_normName(m[1]));
+    if(!names.size){ // fallback: <NAME>..</NAME> inside COSTCENTRE blocks
+      const blocks=raw.match(/<COSTCENTRE\b[\s\S]*?<\/COSTCENTRE>/gi)||[];
+      blocks.forEach(b=>{const n=b.match(/<NAME>([^<]+)<\/NAME>/i); if(n) names.add(_normName(n[1]));});
+    }
+    return names.size?names:null;
+  }catch(e){ return null; }
+}
 async function postEmployeeMaster(){
   if(!empHaveNew()){
     tallyLog(`✔ Employee Master: all employees already synced — nothing new to send, ignored.`,'ok');
     refreshTallySyncBadge();
     return {ok:true, created:0, altered:0, skipped:true};
   }
-  // Snapshot exactly which employees this post will attempt to send —
-  // BEFORE calling buildEmpMasterXML() — so we know precisely who to (or
-  // not to) mark synced once Tally's response comes back. buildEmpMasterXML
-  // filters on the same !tallySynced condition, so this matches its XML 1:1.
   const fullList=employees.length?employees:
     (currentExportData?.entries||[]).map(e=>({name:e.name,tallySynced:false}));
   const toSend = fullList.filter(e=>!e.tallySynced);
   const r = await postToTally(buildEmpMasterXML(), 'Employee Master', true);
   if(r.ok){
-    const expectedObjects = toSend.length*2; // EMPLOYEE + COSTCENTRE per person
-    const actualObjects = (r.created||0)+(r.altered||0);
-    if(actualObjects >= expectedObjects){
-      toSend.forEach(e=>e.tallySynced=true);
+    // Tally's Created/Altered counts don't reliably map to "2 per employee"
+    // (e.g. existing records show as Altered, and the company record adds one),
+    // so instead of guessing from the count we ask Tally which Cost Centres
+    // really exist and compare against the names we sent.
+    tallyLog(`▶ Verifying ${toSend.length} Cost Centre(s) actually exist in Tally…`);
+    const have = await fetchTallyCostCentreNames();
+    if(have){
+      const missing = toSend.filter(e=>!have.has(_normName(e.name)));
+      toSend.filter(e=>have.has(_normName(e.name))).forEach(e=>e.tallySynced=true);
       save();
+      if(!missing.length){
+        tallyLog(`✔ Employee Master: all ${toSend.length} Cost Centres verified present in Tally.`,'ok');
+      } else {
+        tallyLog(`⚠ Employee Master: ${toSend.length-missing.length} of ${toSend.length} verified. These ${missing.length} Cost Centre(s) are NOT in Tally: ${missing.map(e=>e.name).join(', ')}.`,'err');
+        tallyLog(`   Check in Tally that Cost Category "${cv('t-costcat')}" exists and that "Cost Centres" (F11 → Accounting Features) and payroll are enabled, then post Employee Master again. Only the missing ones will be resent.`,'err');
+        toast(`Employee Master: ${missing.length} Cost Centre(s) missing in Tally — see log`,'err');
+        r.ok=false; r.error='partial-batch';
+      }
     } else {
-      const names = toSend.map(e=>esc(e.name)).join(', ');
-      tallyLog(`⚠ Employee Master: sent ${toSend.length} employee(s) (expected ${expectedObjects} objects created/altered — Employee + Cost Centre each) but Tally only reported ${actualObjects}. At least one employee's Cost Centre likely was NOT created, even though Tally didn't flag it as an error.`,'err');
-      tallyLog(`   None of this batch has been marked as synced, so it will be resent next time: ${names}.`,'err');
-      tallyLog(`   Check Tally (Accounting Masters → Cost Centres) for which of these names is missing or mismatched, fix it there, then post Employee Master again.`,'err');
-      toast(`Employee Master: Tally accepted fewer objects than expected — see log`,'err');
-      r.ok = false;
-      r.error = 'partial-batch';
+      tallyLog(`⚠ Employee Master: Tally accepted the post (Created ${r.created}, Altered ${r.altered}) but I couldn't read its Cost Centre list to verify. Open Tally → Accounting Masters → Cost Centres and confirm the names exist; batch NOT marked synced.`,'err');
+      toast(`Employee Master: could not verify Cost Centres — see log`,'err');
+      r.ok=false; r.error='unverified';
     }
   }
   refreshTallySyncBadge();
