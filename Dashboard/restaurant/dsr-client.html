@@ -561,7 +561,8 @@ function bnxIgRecon_(from,to,src,fromDsr){
 }
 
 function bnxToday_(){var d=new Date();return d.getFullYear()+'-'+('0'+(d.getMonth()+1)).slice(-2)+'-'+('0'+d.getDate()).slice(-2);}
-var BNX_RM_ = { diag:{}, stats:null, unalloc:{} };
+var BNX_RM_ = { diag:{}, stats:null, unalloc:{}, cItem:{}, cPay:{} };
+var BNX_FY_LOADED_ = null;   // {from,to} of the last successful fiscal-range load
 
 function bnxRmKey_(k){ return String(k).toLowerCase().replace(/[^a-z0-9]/g,''); }
 function bnxRmGet_(row,names){
@@ -684,7 +685,7 @@ function bnxRmPayKey_(mode){
   if(/ZOMATO/.test(m)) return 'zomato';
   if(/SWIGGY/.test(m)) return 'swiggy';
   if(/CREDIT|DUE/.test(m)) return 'credit';
-  return 'otherpay';
+  return 'gpay';
 }
 async function bnxRmPaymentDays_(from,to,st){
   var today=bnxToday_(), list=[];
@@ -697,13 +698,27 @@ async function bnxRmPaymentDays_(from,to,st){
   }
   list=list.slice(-45);                       // never more than 45 extra calls
   if(!list.length) return;
-  var first=await bnxRmCall_('GET_PAYMENT_REPORT_V2',list[list.length-1],list[list.length-1]);
-  if(!first.ok) return;                       // backend has no payment feed
-  await bnxRmPool_(list,4,async function(ds){
-    var rs=(ds===list[list.length-1])?first:await bnxRmCall_('GET_PAYMENT_REPORT_V2',ds,ds);
-    if(!rs.ok||!rs.rows.length) return;
-    var acc={cash:0,card:0,gpay:0,zomato:0,swiggy:0,credit:0,otherpay:0}, n=0;
-    rs.rows.forEach(function(r){
+  var need=list.filter(function(d){ return BNX_RM_.cPay[d]===undefined; });
+  if(need.length){
+    var probe=await bnxRmCall_('GET_PAYMENT_REPORT_V2',need[0],need[need.length-1]);
+    if(!probe.ok) return;                     // backend has no payment feed
+    var hasDate=probe.rows.length&&bnxRmGet_(probe.rows[0],['PAYMENT_DATE','SALE_DATE','DATE','BUSINESS_DATE']);
+    if(hasDate){
+      var byD={}; probe.rows.forEach(function(r){ var d=bnxRmDate_(bnxRmGet_(r,['PAYMENT_DATE','SALE_DATE','DATE','BUSINESS_DATE'])); if(d)(byD[d]=byD[d]||[]).push(r); });
+      need.forEach(function(d){ BNX_RM_.cPay[d]=byD[d]||[]; });
+    }else if(probe.rows.length){
+      await bnxRmPool_(need,4,async function(ds){
+        var rs=await bnxRmCall_('GET_PAYMENT_REPORT_V2',ds,ds);
+        if(rs.ok&&(rs.rows.length||ds<today)) BNX_RM_.cPay[ds]=rs.rows;
+      });
+    }else{
+      need.forEach(function(d){ if(d<today) BNX_RM_.cPay[d]=[]; });
+    }
+  }
+  list.forEach(function(ds){
+    var rows=BNX_RM_.cPay[ds]; if(!rows||!rows.length) return;
+    var acc={cash:0,card:0,gpay:0,zomato:0,swiggy:0,credit:0}, n=0;
+    rows.forEach(function(r){
       var amt=bnxRmNum_(r,['NET_AMOUNT','AMOUNT','COLLECTED']); if(!(amt>0)) return;
       acc[bnxRmPayKey_(bnxRmGet_(r,['PAYMENT_MODE','MODE','MODE_NAME'])||'')]+=amt;
       n+=bnxRmNum_(r,['TRANSACTION_COUNT','TXN_COUNT']);
@@ -750,21 +765,38 @@ async function bnxReportMap_(from,to){
     });
 
     // Item-group split for days whose categories do not reach the day's gross.
+    // Order: cache -> ONE range call bucketed by date (if rows carry a date) -> per-day calls.
     var splitDone={};
     if(short.length){
-      var lo=short[0].ds, hi=short[short.length-1].ds;
-      var probe=await bnxRmCall_('GET_ITEM_SALES_REPORT',lo,hi);
-      if(probe.ok&&probe.rows.length){
-        var list=short.slice(-60);            // most recent 60 days max
-        await bnxRmPool_(list,4,async function(s){
-          var rs=await bnxRmCall_('GET_ITEM_SALES_REPORT',s.ds,s.ds);
-          if(!rs.ok||!rs.rows.length) return;
-          var g=bnxRmSplitItems_(rs.rows,s.target); if(!g) return;
-          var e=STANDARD_DATA[s.ds];
-          e.liquor=g.liquor; e.liquormrp=g.liquormrp; e.food=g.food; e.bev=g.bev; e.hf=g.hf; e.others=g.others;
-          splitDone[s.ds]=true; st.itemSplitDays++;
-        });
+      var todayS=bnxToday_();
+      var need=short.filter(function(x){ return BNX_RM_.cItem[x.ds]===undefined; });
+      if(need.length){
+        var lo=need[0].ds, hi=need[need.length-1].ds;
+        var probe=await bnxRmCall_('GET_ITEM_SALES_REPORT',lo,hi);
+        if(probe.ok){
+          var hasDate=probe.rows.length&&bnxRmGet_(probe.rows[0],['SALE_DATE','BILL_DATE','BUSINESS_DATE','DATE']);
+          if(hasDate){
+            var byD={}; probe.rows.forEach(function(r){ var d=bnxRmDate_(bnxRmGet_(r,['SALE_DATE','BILL_DATE','BUSINESS_DATE','DATE'])); if(d)(byD[d]=byD[d]||[]).push(r); });
+            need.forEach(function(x){ BNX_RM_.cItem[x.ds]=(byD[x.ds]||[]); });
+          }else if(probe.rows.length){
+            await bnxRmPool_(need.slice(-60),4,async function(x){
+              var rs=await bnxRmCall_('GET_ITEM_SALES_REPORT',x.ds,x.ds);
+              if(rs.ok) BNX_RM_.cItem[x.ds]=rs.rows;
+            });
+          }else{
+            need.forEach(function(x){ if(x.ds<todayS) BNX_RM_.cItem[x.ds]=[]; });   // nothing sold in item DB for this span
+          }
+        }
       }
+      short.forEach(function(x){
+        var rows=BNX_RM_.cItem[x.ds]; if(!rows||!rows.length) return;
+        var e=STANDARD_DATA[x.ds];
+        var cat0=(e.liquor||0)+(e.liquormrp||0)+(e.food||0)+(e.bev||0)+(e.hf||0)+(e.others||0);
+        if(cat0>0) return;                       // never overwrite non-zero server categories
+        var g=bnxRmSplitItems_(rows,x.target); if(!g) return;
+        e.liquor=g.liquor; e.liquormrp=g.liquormrp; e.food=g.food; e.bev=g.bev; e.hf=g.hf; e.others=g.others;
+        splitDone[x.ds]=true; st.itemSplitDays++;
+      });
     }
     // Anything still short is unallocated sales (no item detail) -> Others.
     short.forEach(function(s){
@@ -780,7 +812,8 @@ async function bnxReportMap_(from,to){
     days.forEach(function(ds){
       var e=STANDARD_DATA[ds]; if(!e) return;
       var cat=(e.liquor||0)+(e.liquormrp||0)+(e.food||0)+(e.bev||0)+(e.hf||0)+(e.others||0);
-      if(cat>0){ e.gross=cat; e.net=cat+(e.tax||0)+(e.round||0); }
+      var touched=!!(splitDone[ds]||BNX_RM_.unalloc[ds]!==undefined);
+      if(cat>0&&(touched||!(e.net>0)||!(e.gross>0))){ e.gross=cat; e.net=cat+(e.tax||0)+(e.round||0); }
       bnxRmTotalCash_(e);
     });
   }catch(err){
@@ -818,7 +851,7 @@ function bnxRmShow_(){
   p.querySelector('pre').textContent=txt;
   document.body.appendChild(p);
   p.querySelector('#bnx-rm-copy').onclick=function(){ try{navigator.clipboard.writeText(txt);}catch(e){} };
-  p.querySelector('#bnx-rm-reload').onclick=function(){ p.remove(); try{ onDsrDateChange(); }catch(e){} };
+  p.querySelector('#bnx-rm-reload').onclick=function(){ p.remove(); BNX_FY_LOADED_=null; BNX_RM_.cItem={}; BNX_RM_.cPay={}; try{ onDsrDateChange(); }catch(e){} };
   p.querySelector('#bnx-rm-close').onclick=function(){ p.remove(); };
 }
 
@@ -858,6 +891,8 @@ async function ensureDsrMonthLoaded_(date){
 
 async function ensureDsrFiscalRangeLoaded_(date){
   const ds=String(date||'').slice(0,10); if(!/^\d{4}-\d{2}-\d{2}$/.test(ds)) return false;
+  { const dtc=new Date(ds+'T00:00:00'); const fyc=(dtc.getMonth()>=3?dtc.getFullYear():dtc.getFullYear()-1)+'-04-01';
+    if(BNX_FY_LOADED_&&BNX_FY_LOADED_.from<=fyc&&BNX_FY_LOADED_.to>=ds&&Object.keys(STANDARD_DATA).length) return true; }
   const dt=new Date(ds+'T00:00:00');
   const fy=dt.getMonth()>=3?dt.getFullYear():dt.getFullYear()-1;
   const fyStart=fy+'-04-01';
@@ -970,6 +1005,7 @@ async function directPOSFetchRange(fromDate,toDate){
   try{ await bnxReportMap_(fromDate,toDate); }catch(e){ console.warn('[REPORT MAP]',e); }
   if(Object.keys(STANDARD_DATA).length) okCount=okCount||1;
   if(okCount){
+    BNX_FY_LOADED_={from:fromDate,to:toDate};
     gasToast('✅ Loaded '+Object.keys(STANDARD_DATA).length+' live days','success');
     return true;
   }
@@ -2854,7 +2890,10 @@ function loadDayData() {
     sv('d_tax',d.tax);sv('d_round',d.round||0);sv('d_cash',d.cash);sv('d_card',d.card);sv('d_gpay',d.gpay);sv('d_pvt',d.pvt||0);
     sv('d_duesales',d.credit);sv('d_zomato',d.zomato);sv('d_swiggy',d.swiggy);sv('d_duerecvcash',d.duerecvcash);sv('d_duerecvbank',d.duerecvbank);sv('d_disc',d.disc); d.opengd=Number($('d_opengd')?.value)||0; d.guestcn=Number($('d_guestcn')?.value)||0;
     showToast('✅ POS data loaded for '+ds,'ok');
-  } else { setStatus('NO LIVE POS DATA FOR '+ds); }
+  } else {
+    ['d_liquor','d_liquormrp','d_food','d_bev','d_hf','d_others','d_tax','d_round','d_cash','d_card','d_gpay','d_pvt','d_duesales','d_zomato','d_swiggy','d_duerecvcash','d_duerecvbank','d_disc'].forEach(function(id){ var e=$(id); if(e&&e.value!==undefined) e.value=0; });
+    setStatus('NO LIVE POS DATA FOR '+ds);
+  }
   const dt=new Date(ds),yr=dt.getFullYear(),mo=dt.getMonth()+1;
   // MTD
   // FIX ("due received not show" on MTD/YTD — full audit, Sep 2026): this
