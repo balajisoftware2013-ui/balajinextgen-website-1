@@ -3,7 +3,7 @@
 <head>
 <script>
 /* ═══════════════════════════════════════════════════════════════════════
-   Balaji NextGen ERP — DSR Client v4.0 LIVE / AUDITED
+   Balaji NextGen ERP — DSR Client v4.1 LIVE / REPORT-MAPPED
    Source of truth: authenticated V2_CORE → GET_DSR_MATRIX / GET_DSR_YTD.
    No embedded sales/demo data is used for the live view.
 ═══════════════════════════════════════════════════════════════════════ */
@@ -499,19 +499,266 @@ function mapLiveDsrDay_(raw){
   };
 }
 
+
+/* ═══════════════════════════════════════════════════════════════════════
+   REPORT MAP LAYER (Sep 30 2026)
+   WHY: DSR rows showed 0 (Liquor/Food/Bev/Cash…) while Reports Hub had data.
+     1) recalcAll() rebuilds Gross/Net from the category boxes. When a day has
+        bills but no BILL_ITEMS rows, every category = 0, so Gross/Net = 0 even
+        though the server sent a gross.
+     2) CASH came only from GET_DSR_MATRIX; the Reports Hub reads payments from
+        GET_SALES_DAY_BOOK_REPORT, which had it.
+   WHAT: after the matrix loads, read the SAME feeds the Reports Hub uses
+     (V2_CORE, payload {range:'custom',from,to}):
+        GET_SALES_DAY_BOOK_REPORT  -> per-day gross / tax / round / net /
+                                      bills / discount / cash / upi / card /
+                                      online / credit / zomato / swiggy
+        GET_ITEM_SALES_REPORT      -> item-group split (Liquor/MRP/Food/Bev/HF)
+   RULES: server values that are already non-zero are NEVER overwritten.
+     Only zeros are filled. Sales with no item detail go to "Others" so totals
+     reconcile, and are flagged in the 🔎 Report Map badge. Nothing is invented.
+═══════════════════════════════════════════════════════════════════════ */
+var BNX_RM_ = { diag:{}, stats:null, unalloc:{} };
+
+function bnxRmKey_(k){ return String(k).toLowerCase().replace(/[^a-z0-9]/g,''); }
+function bnxRmGet_(row,names){
+  if(!row||typeof row!=='object') return undefined;
+  var low=row.__bnxLow;
+  if(!low){
+    low={}; Object.keys(row).forEach(function(k){ low[bnxRmKey_(k)]=row[k]; });
+    try{ Object.defineProperty(row,'__bnxLow',{value:low,enumerable:false}); }catch(e){}
+  }
+  for(var i=0;i<names.length;i++){
+    var v=low[bnxRmKey_(names[i])];
+    if(v!==undefined&&v!==null&&v!=='') return v;
+  }
+  return undefined;
+}
+function bnxRmNum_(row,names){
+  var v=bnxRmGet_(row,names); if(v===undefined) return 0;
+  var n=Number(String(v).replace(/[₹,\s]/g,''));
+  return isFinite(n)?n:0;
+}
+function bnxRmHas_(row,names){ return bnxRmGet_(row,names)!==undefined; }
+function bnxRmDate_(v){
+  var s=String(v==null?'':v).trim(); if(!s) return '';
+  var m=/^(\d{4})-(\d{2})-(\d{2})/.exec(s); if(m) return m[1]+'-'+m[2]+'-'+m[3];
+  m=/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})/.exec(s);
+  if(m) return m[3]+'-'+('0'+m[2]).slice(-2)+'-'+('0'+m[1]).slice(-2);
+  var d=new Date(s); if(isNaN(d)) return '';
+  return d.getFullYear()+'-'+('0'+(d.getMonth()+1)).slice(-2)+'-'+('0'+d.getDate()).slice(-2);
+}
+function bnxRmRows_(r){
+  var d=r&&r.data; if(!d) return Array.isArray(r&&r.rows)?r.rows:[];
+  if(Array.isArray(d)) return d;
+  var a=d.rows||d.days||d.items||(Array.isArray(d.byDate)?d.byDate:null);
+  if(Array.isArray(a)) return a;
+  var m=d.byDate||d.byDay;
+  if(m&&typeof m==='object'){
+    return Object.keys(m).map(function(k){ var o=Object.assign({},m[k]); if(!bnxRmGet_(o,['SALE_DATE','DATE'])) o.SALE_DATE=k; return o; });
+  }
+  return [];
+}
+async function bnxRmCall_(action,from,to){
+  var t0=Date.now(), r;
+  try{ r=await gasApi(action,{range:'custom',from:from,to:to},'V2_CORE'); }
+  catch(e){ r={success:false,error:String(e&&e.message||e)}; }
+  var ok=!!(r&&r.success!==false&&!r.error);
+  var rows=ok?bnxRmRows_(r):[];
+  var keys=Object.keys(BNX_RM_.diag); if(keys.length>40) delete BNX_RM_.diag[keys[0]];
+  BNX_RM_.diag[action+' '+from+'..'+to]={ok:ok,error:(r&&r.error)||null,rows:rows.length,
+    fields:rows[0]?Object.keys(rows[0]).slice(0,40):[],ms:Date.now()-t0};
+  return {ok:ok,rows:rows};
+}
+
+/* Day-book rows -> one aggregate per date (shift rows are summed). */
+function bnxRmBookByDay_(rows,from,to){
+  var by={};
+  rows.forEach(function(r){
+    var ds=bnxRmDate_(bnxRmGet_(r,['SALE_DATE','BUSINESS_DATE','DATE','BILL_DATE','SALEDATE','DAY']));
+    if(!ds||ds<from||ds>to) return;
+    var o=by[ds]||(by[ds]={bills:0,net:0,grossRaw:0,tax:0,round:0,disc:0,cash:0,upi:0,card:0,online:0,credit:0,zomato:0,swiggy:0,hasTax:false,hasRound:false});
+    o.bills+=bnxRmNum_(r,['BILL_COUNT','TOTAL_BILLS','BILLS']);
+    o.net+=bnxRmNum_(r,['NET_SALES','GRAND_TOTAL','TOTAL_SALES','NET_AMOUNT']);
+    o.grossRaw+=bnxRmNum_(r,['GROSS_SALES','SUBTOTAL','TAXABLE_SALES','GROSS']);
+    var taxN=['TAX_AMOUNT','TOTAL_TAX','GST_AMOUNT','GST','TAX'];
+    if(bnxRmHas_(r,taxN)){ o.hasTax=true; o.tax+=bnxRmNum_(r,taxN); }
+    var rN=['ROUND_OFF','ROUNDOFF','ROUNDING'];
+    if(bnxRmHas_(r,rN)){ o.hasRound=true; o.round+=bnxRmNum_(r,rN); }
+    o.disc+=bnxRmNum_(r,['DISCOUNT','TOTAL_DISCOUNT','DISCOUNT_AMOUNT']);
+    o.cash+=bnxRmNum_(r,['CASH_SALES','CASH','CASH_COLLECTION']);
+    o.upi+=bnxRmNum_(r,['UPI_SALES','UPI','GPAY']);
+    o.card+=bnxRmNum_(r,['CARD_SALES','CARD']);
+    o.online+=bnxRmNum_(r,['ONLINE_COLLECTION','ONLINE','ONLINE_SALES']);
+    o.credit+=bnxRmNum_(r,['CREDIT_SALES','CREDIT','DUE_SALES']);
+    o.zomato+=bnxRmNum_(r,['ZOMATO_SALES','ZOMATO']);
+    o.swiggy+=bnxRmNum_(r,['SWIGGY_SALES','SWIGGY']);
+  });
+  Object.keys(by).forEach(function(ds){
+    var o=by[ds];
+    if(!(o.net>0)&&o.grossRaw>0) o.net=o.grossRaw;
+    // Identity used by the DSR: Net = Gross(pre-tax) + Tax + Round
+    if(o.hasTax) o.pre=o.net-o.tax-o.round;
+    else{ o.pre=(o.grossRaw>0&&o.grossRaw<=o.net)?o.grossRaw:o.net; if(!o.hasRound) o.round=0; o.tax=Math.max(0,o.net-o.pre-o.round); }
+    if(o.pre<0) o.pre=0;
+  });
+  return by;
+}
+
+/* Item-sales rows -> DSR category split, reconciled to the day's pre-tax gross. */
+function bnxRmSplitItems_(rows,target){
+  var g={liquor:0,liquormrp:0,food:0,bev:0,hf:0,others:0}, S=0;
+  rows.forEach(function(r){
+    var amt=bnxRmNum_(r,['NET_SALES','GROSS_SALES','LINE_TOTAL','AMOUNT','SALES']); if(!amt) return;
+    var grp=String(bnxRmGet_(r,['ITEM_GROUP_NAME','GROUP_NAME','ITEM_GROUP','GROUP','CATEGORY_NAME','CATEGORY'])||'').toUpperCase();
+    var nm=String(bnxRmGet_(r,['ITEM_NAME','NAME'])||'');
+    var k;
+    if(/LIQUOR|\bBAR\b|WINE|BEER|SPIRIT|WHISK|VODKA|\bGIN\b|\bRUM\b|TEQUILA|SCOTCH/.test(grp)) k=/\bMRP\b/i.test(nm)?'liquormrp':'liquor';
+    else if(/BEVERAGE|SOFT|JUICE|MOCKTAIL/.test(grp)) k='bev';
+    else if(/TOBACCO|CIGAR|HOOKAH|HASH/.test(grp)) k='hf';
+    else if(/FOOD|KITCHEN|ADD-?ON|DESSERT|STARTER/.test(grp)) k='food';
+    else k='others';
+    g[k]+=amt; S+=amt;
+  });
+  if(!(S>0)) return null;
+  if(S>target*1.01){ var f=target/S; Object.keys(g).forEach(function(k){ g[k]*=f; }); }
+  else if(S<target-1){ g.others+=target-S; }
+  return g;
+}
+
+async function bnxRmPool_(items,limit,fn){
+  var i=0, out=new Array(items.length);
+  async function worker(){ while(i<items.length){ var n=i++; try{ out[n]=await fn(items[n],n); }catch(e){ out[n]=null; } } }
+  var ws=[]; for(var w=0;w<Math.min(limit,items.length);w++) ws.push(worker());
+  await Promise.all(ws); return out;
+}
+
+function bnxRmTotalCash_(e){
+  e.totalcash=(e.cash||0)+(e.card||0)+(e.gpay||0)+(e.credit||0)+(e.zomato||0)+(e.swiggy||0)+(e.otherpay||0)+(e.unalloc||0)+(e.duerecvcash||0)+(e.duerecvbank||0);
+}
+
+async function bnxReportMap_(from,to){
+  var st={from:from,to:to,bookDays:0,created:0,filledPay:0,filledTax:0,unallocDays:0,unallocAmt:0,itemSplitDays:0,notes:[]};
+  try{
+    var book=await bnxRmCall_('GET_SALES_DAY_BOOK_REPORT',from,to);
+    if(!book.ok){ st.notes.push('Day-book report unavailable — DSR shows matrix values only.'); }
+    var by=bnxRmBookByDay_(book.rows,from,to), days=Object.keys(by).sort();
+    st.bookDays=days.length;
+    var short=[];
+    days.forEach(function(ds){
+      var b=by[ds]; if(!(b.net>0||b.pre>0)) return;
+      var e=STANDARD_DATA[ds];
+      if(!e){ e=mapLiveDsrDay_({}); STANDARD_DATA[ds]=e; st.created++; }
+      if(!e.tax&&b.tax>0){ e.tax=b.tax; st.filledTax++; }
+      if(!e.round&&b.round){ e.round=b.round; }
+      if(!e.disc&&b.disc>0) e.disc=b.disc;
+      if(!e.bills&&b.bills>0) e.bills=b.bills;
+      var p=0;
+      if(!e.cash&&b.cash>0){ e.cash=b.cash; p++; }
+      if(!e.card&&b.card>0){ e.card=b.card; p++; }
+      if(!e.gpay&&(b.upi+b.online)>0){ e.gpay=b.upi+b.online; p++; }
+      if(!e.credit&&b.credit>0){ e.credit=b.credit; p++; }
+      if(!e.zomato&&b.zomato>0){ e.zomato=b.zomato; p++; }
+      if(!e.swiggy&&b.swiggy>0){ e.swiggy=b.swiggy; p++; }
+      if(p) st.filledPay++;
+      var cat=(e.liquor||0)+(e.liquormrp||0)+(e.food||0)+(e.bev||0)+(e.hf||0)+(e.others||0);
+      var target=b.pre>0?b.pre:(e.gross||0);
+      if(target>0&&cat<target-1){
+        short.push({ds:ds,target:target,have:cat});
+      }
+      e.source='LIVE_DSR_MATRIX+REPORT_MAP';
+    });
+
+    // Item-group split for days whose categories do not reach the day's gross.
+    var splitDone={};
+    if(short.length){
+      var lo=short[0].ds, hi=short[short.length-1].ds;
+      var probe=await bnxRmCall_('GET_ITEM_SALES_REPORT',lo,hi);
+      if(probe.ok&&probe.rows.length){
+        var list=short.slice(-60);            // most recent 60 days max
+        await bnxRmPool_(list,4,async function(s){
+          var rs=await bnxRmCall_('GET_ITEM_SALES_REPORT',s.ds,s.ds);
+          if(!rs.ok||!rs.rows.length) return;
+          var g=bnxRmSplitItems_(rs.rows,s.target); if(!g) return;
+          var e=STANDARD_DATA[s.ds];
+          e.liquor=g.liquor; e.liquormrp=g.liquormrp; e.food=g.food; e.bev=g.bev; e.hf=g.hf; e.others=g.others;
+          splitDone[s.ds]=true; st.itemSplitDays++;
+        });
+      }
+    }
+    // Anything still short is unallocated sales (no item detail) -> Others.
+    short.forEach(function(s){
+      var e=STANDARD_DATA[s.ds];
+      var cat=(e.liquor||0)+(e.liquormrp||0)+(e.food||0)+(e.bev||0)+(e.hf||0)+(e.others||0);
+      if(cat<s.target-1){
+        e.others=(e.others||0)+(s.target-cat);
+        BNX_RM_.unalloc[s.ds]=s.target-cat; st.unallocDays++; st.unallocAmt+=s.target-cat;
+      }
+    });
+    // Final reconcile: Gross = categories, Net = Gross + Tax + Round, Total Collection.
+    days.forEach(function(ds){
+      var e=STANDARD_DATA[ds]; if(!e) return;
+      var cat=(e.liquor||0)+(e.liquormrp||0)+(e.food||0)+(e.bev||0)+(e.hf||0)+(e.others||0);
+      if(cat>0){ e.gross=cat; e.net=cat+(e.tax||0)+(e.round||0); }
+      bnxRmTotalCash_(e);
+    });
+  }catch(err){
+    st.notes.push('Report map error: '+(err&&err.message||err));
+    try{ console.error('[REPORT MAP]',err); }catch(_){}
+  }
+  BNX_RM_.stats=st;
+  try{ bnxRmBadge_(); }catch(_){}
+  return Object.keys(STANDARD_DATA).length;
+}
+
+function bnxRmBadge_(){
+  if(!document.body) return;
+  var st=BNX_RM_.stats; if(!st) return;
+  var b=document.getElementById('bnx-rm-badge');
+  if(!b){
+    b=document.createElement('button'); b.id='bnx-rm-badge'; b.type='button';
+    b.style.cssText='position:fixed;left:10px;bottom:10px;z-index:9998;font:600 11px Poppins,sans-serif;padding:6px 11px;border-radius:16px;border:1px solid #cbd5e1;background:#fff;color:#0f172a;box-shadow:0 2px 8px rgba(0,0,0,.15);cursor:pointer';
+    b.onclick=bnxRmShow_; document.body.appendChild(b);
+  }
+  var bad=st.notes.length||st.unallocDays;
+  b.style.borderColor=bad?'#d97706':'#16a34a';
+  b.textContent='🔎 Report Map · '+st.bookDays+' day(s) '+(st.unallocDays?'· '+st.unallocDays+' w/o item detail':'· ✓ reconciled');
+}
+function bnxRmShow_(){
+  var id='bnx-rm-panel', p=document.getElementById(id); if(p){ p.remove(); return; }
+  p=document.createElement('div'); p.id=id;
+  p.style.cssText='position:fixed;left:10px;bottom:46px;z-index:9999;width:min(560px,94vw);max-height:70vh;overflow:auto;background:#fff;color:#0f172a;border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.25);padding:12px;font:12px Poppins,sans-serif';
+  var st=BNX_RM_.stats||{};
+  var txt=JSON.stringify({summary:st,unallocatedByDay:BNX_RM_.unalloc,sources:BNX_RM_.diag},null,1);
+  p.innerHTML='<div style="font-weight:700;margin-bottom:6px">Report Map — DSR ⇄ Reports Hub</div>'+
+    '<div style="margin-bottom:8px;color:#475569">Days with sales but no item detail are shown under <b>Others</b> so Gross/Net still match the Day Book. Non-zero server values are never overwritten.</div>'+
+    '<pre style="white-space:pre-wrap;font:11px monospace;background:#f1f5f9;padding:8px;border-radius:6px;max-height:36vh;overflow:auto"></pre>'+
+    '<div style="display:flex;gap:8px;margin-top:8px"><button id="bnx-rm-copy" style="padding:5px 10px">Copy</button><button id="bnx-rm-reload" style="padding:5px 10px">Reload live</button><button id="bnx-rm-close" style="padding:5px 10px">Close</button></div>';
+  p.querySelector('pre').textContent=txt;
+  document.body.appendChild(p);
+  p.querySelector('#bnx-rm-copy').onclick=function(){ try{navigator.clipboard.writeText(txt);}catch(e){} };
+  p.querySelector('#bnx-rm-reload').onclick=function(){ p.remove(); try{ onDsrDateChange(); }catch(e){} };
+  p.querySelector('#bnx-rm-close').onclick=function(){ p.remove(); };
+}
+
 async function fetchDsrMonthLive_(year,month){
   const r=await gasApi('GET_DSR_MATRIX',{year:Number(year),month:Number(month)});
   bnxLogShape_('GET_DSR_MATRIX '+year+'-'+month,r);
-  if(!r || !r.success || !r.data || !r.data.byDay){
-    if(r&&r.authExpired)gasToast('🔐 Session expired — please login again','error');
-    return false;
-  }
   const mm=String(month).padStart(2,'0');
+  const mFrom=year+'-'+mm+'-01', mTo=year+'-'+mm+'-'+String(new Date(Number(year),Number(month),0).getDate()).padStart(2,'0');
+  if(!r || !r.success || !r.data || !r.data.byDay){
+    if(r&&r.authExpired){gasToast('🔐 Session expired — please login again','error');return false;}
+    // REPORT MAP: matrix unavailable -> build the month from the Reports Hub feeds.
+    await bnxReportMap_(mFrom,mTo);
+    return Object.keys(STANDARD_DATA).some(k=>k>=mFrom&&k<=mTo);
+  }
   // Keep the full server matrix. Do not fabricate a row when POS has no sales.
   Object.keys(r.data.byDay).forEach(day=>{
     const d=String(day).padStart(2,'0');
     STANDARD_DATA[year+'-'+mm+'-'+d]=mapLiveDsrDay_(r.data.byDay[day]);
   });
+  // REPORT MAP: fill zeros from the Reports Hub feeds (never overwrites non-zero).
+  await bnxReportMap_(mFrom,mTo);
   return true;
 }
 
@@ -637,6 +884,9 @@ async function directPOSFetchRange(fromDate,toDate){
     okCount=res.filter(Boolean).length;
   }
   Object.keys(STANDARD_DATA).forEach(k=>{if(k<fromDate||k>toDate)delete STANDARD_DATA[k];});
+  // REPORT MAP: fill zeros / missing days from the Reports Hub feeds.
+  try{ await bnxReportMap_(fromDate,toDate); }catch(e){ console.warn('[REPORT MAP]',e); }
+  if(Object.keys(STANDARD_DATA).length) okCount=okCount||1;
   if(okCount){
     gasToast('✅ Loaded '+Object.keys(STANDARD_DATA).length+' live days','success');
     return true;
