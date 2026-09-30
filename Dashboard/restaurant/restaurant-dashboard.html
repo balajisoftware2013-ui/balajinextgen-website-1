@@ -4123,9 +4123,14 @@ var LOGO_CANDIDATES = [
 function bnxFindLogo(cb){
   // 1) A logo saved in Settings → Branding always wins (per-client, real data)
   try{
-    var raw = localStorage.getItem('erp_restaurant_brand_' + (window.CLIENT_ID||'default'));
+    var cid = window.CLIENT_ID || localStorage.getItem('bnx_client_id') || 'default';
+    var raw = localStorage.getItem('erp_restaurant_brand_' + cid);
     var brand = raw ? JSON.parse(raw) : null;
-    if (brand && brand.logoDataUrl){ cb(brand.logoDataUrl); return; }
+    var own = brand && (brand.logoLocal || brand.logoDataUrl || brand.logoUrl);
+    if (own){ cb(own); return; }
+    /* a client is logged in but has no saved logo yet: do NOT flash the Balaji logo,
+       wait for bnxResolveClientBrand() to load this client's real logo from the server */
+    if (cid && cid !== 'default'){ cb(null); return; }
   }catch(e){}
   // 2) Otherwise probe every candidate path AT ONCE — first one to load wins
   var settled = false;
@@ -9306,6 +9311,26 @@ function loadBrand(){
   try{ return JSON.parse(localStorage.getItem(bnxBrandKey())||'{}'); }catch(e){ return {}; }
 }
 
+
+/* Logo sources for a brand, best first. Google Drive links are normalised to the image CDN;
+   the locally stored copy (logoLocal / data URL) is always the last resort so a refresh
+   never falls back to the Balaji logo or the plain "B". */
+function bnxDriveId_(u){
+  var s=String(u||''), m=s.match(/drive\.google\.com\/(?:uc|open|thumbnail)\?[^#]*\bid=([\w-]{20,})/)||s.match(/drive\.google\.com\/file\/d\/([\w-]{20,})/)||s.match(/googleusercontent\.com\/d\/([\w-]{20,})/);
+  return m?m[1]:'';
+}
+function bnxLogoSources_(brand){
+  brand=brand||{}; var out=[], seen={};
+  function add(u){ u=String(u||'').trim(); if(u&&!seen[u]){ seen[u]=1; out.push(u); } }
+  var hosted=brand.logoUrl||((/^https?:/i.test(String(brand.logoDataUrl||'')))?brand.logoDataUrl:'');
+  var id=bnxDriveId_(hosted);
+  if(id){ add('https://lh3.googleusercontent.com/d/'+id+'=w512'); add('https://drive.google.com/thumbnail?id='+id+'&sz=w512'); }
+  add(hosted);
+  add(brand.logoLocal);
+  if(/^data:/i.test(String(brand.logoDataUrl||''))) add(brand.logoDataUrl);
+  return out;
+}
+
 function applyBrand(brand){
   // FIX (same class as invoice fallback bug): 'HASHTAG SILIGURI' is a
   // real client's real trading name, not a generic placeholder -- a
@@ -9323,12 +9348,18 @@ function applyBrand(brand){
   const hn = document.getElementById('heroRestaurantName');
   if(hn) hn.textContent = name;
 
-  // Sidebar logo
-  if(brand.logoDataUrl){
-    const sl = document.getElementById('sidebarLogo');
-    if(sl){ sl.innerHTML = `<img src="${brand.logoDataUrl}" alt="Logo" style="width:100%;height:100%;object-fit:cover;border-radius:8px;" onerror="this.style.display='none'">`; }
-    const hl = document.getElementById('heroLogo');
-    if(hl){ hl.innerHTML = `<img src="${brand.logoDataUrl}" alt="Logo" style="width:100%;height:100%;object-fit:cover;border-radius:10px;" onerror="this.style.display='none'">`; }
+  // Logo (sidebar, hero, splash): hosted URL first, local copy as guaranteed fallback
+  const _srcs = bnxLogoSources_(brand);
+  if(_srcs.length){
+    ['sidebarLogo','heroLogo','bnxSplashMark'].forEach(function(id){
+      const el = document.getElementById(id); if(!el) return;
+      const img = document.createElement('img');
+      img.alt='Logo'; img.referrerPolicy='no-referrer';
+      img.style.cssText='width:100%;height:100%;object-fit:contain;border-radius:inherit;';
+      let i=0; img.onerror=function(){ i++; if(i<_srcs.length){ this.src=_srcs[i]; } else { this.onerror=null; } };
+      img.src=_srcs[0];
+      el.innerHTML=''; el.appendChild(img);
+    });
   }
 
   // Sidebar banner
@@ -9395,7 +9426,8 @@ function openBrandingModal(){
     readFile(this.files[0], d=>{ pendingBanner=d; document.getElementById('bannerDropZone').innerHTML=`<img src="${d}" style="width:100%;height:60px;object-fit:cover;border-radius:8px;">`; });
   };
   document.getElementById('bm-save').onclick = function(){
-    const b={name:document.getElementById('bm-name').value, logoDataUrl:pendingLogo, bannerDataUrl:pendingBanner};
+    const _old=loadBrand(); const _isData=/^data:/i.test(String(pendingLogo||''));
+    const b={name:document.getElementById('bm-name').value, tagline:_old.tagline, logoDataUrl:pendingLogo, logoLocal:(_isData?pendingLogo:_old.logoLocal), logoUrl:(_isData?undefined:(_old.logoUrl||pendingLogo)), bannerDataUrl:pendingBanner};
     saveBrand(b); applyBrand(b); mo.remove();
     showNotif('✅ Branding updated successfully!','success');
     // FIX ("logo and address save but not save in record"): saveBrand()
@@ -9410,7 +9442,7 @@ function openBrandingModal(){
     // file and writes a real https:// link into LOGO_URL instead of the
     // image data itself, so use that instead — same 2MB ceiling the
     // backend enforces, well above what any reasonable logo needs.
-    if (pendingLogo && typeof gasApi === 'function'){
+    if (pendingLogo && /^data:/i.test(String(pendingLogo)) && typeof gasApi === 'function'){
       const approxBytes = Math.floor(pendingLogo.length * 0.75);
       if (approxBytes > 2 * 1024 * 1024){
         showNotif('⚠️ Logo saved on this device only — image is too large to sync across devices (max 2MB, use a smaller file)', 'error');
@@ -9423,8 +9455,11 @@ function openBrandingModal(){
               // too, so a reprint/reload uses the same permanent link
               // rather than the local base64 copy.
               const b = loadBrand();
-              b.logoDataUrl = res.logoUrl;
-              saveBrand(b);
+              b.logoUrl = res.logoUrl;              /* hosted link (synced across devices) */
+              /* keep the uploaded image itself as the local copy - never replace it with the link */
+              b.logoLocal = b.logoLocal || b.logoDataUrl;
+              b.logoDataUrl = b.logoLocal || res.logoUrl;
+              saveBrand(b); applyBrand(b);
             } else if (res && res.error){
               showNotif('⚠️ Logo saved on this device only — sync failed: '+res.error, 'error');
             }
@@ -9485,11 +9520,14 @@ async function bnxResolveClientBrand(){
     const brand = {
       name: realName || existing.name || 'Restaurant ERP',
       tagline: (info && info.tagline) || existing.tagline || 'Restaurant ERP',
-      logoDataUrl: realLogo || existing.logoDataUrl || undefined
+      logoUrl: realLogo || existing.logoUrl || undefined,
+      logoLocal: existing.logoLocal || (/^data:/i.test(String(existing.logoDataUrl||''))?existing.logoDataUrl:undefined),
+      logoDataUrl: existing.logoLocal || (/^data:/i.test(String(existing.logoDataUrl||''))?existing.logoDataUrl:'') || realLogo || existing.logoDataUrl || undefined,
+      bannerDataUrl: existing.bannerDataUrl
     };
     // Save/apply whenever EITHER the real name OR the real logo exists.
     // Never replace a known client logo with the Balaji fallback.
-    if(realName || realLogo || existing.name || existing.logoDataUrl){
+    if(realName || realLogo || existing.name || existing.logoDataUrl || existing.logoUrl){
       saveBrand(brand);
       applyBrand(brand);
     }
@@ -28290,7 +28328,8 @@ function renderQuickCategories(){
       // prevents a refresh from falling back to the bundled Balaji logo.
       if(info.restaurantName || info.logoUrl){
         const current=loadBrand();
-        const liveBrand={name:info.restaurantName||current.name||'Restaurant ERP',tagline:current.tagline||'Restaurant ERP',logoDataUrl:info.logoUrl||current.logoDataUrl||undefined};
+        const _loc=current.logoLocal||(/^data:/i.test(String(current.logoDataUrl||''))?current.logoDataUrl:undefined);
+        const liveBrand={name:info.restaurantName||current.name||'Restaurant ERP',tagline:current.tagline||'Restaurant ERP',logoUrl:info.logoUrl||current.logoUrl||undefined,logoLocal:_loc,logoDataUrl:_loc||info.logoUrl||current.logoDataUrl||undefined,bannerDataUrl:current.bannerDataUrl};
         saveBrand(liveBrand); applyBrand(liveBrand);
       }
       try{localStorage.setItem('bnx_restaurant_info_'+cid,JSON.stringify(info));}catch(e){}
@@ -29253,13 +29292,13 @@ html,body{min-height:100%;}
     const card=document.getElementById('rpt-anchor-item-group-sales'); if(!card)return Promise.resolve();
     return server('GET_ITEM_SALES_REPORT',rangePayload(from,to)).then(function(itemRes){
       if(!itemRes||itemRes.success===false){setBody(card,'<tr><td colspan="6" class="rpt-pro-empty">⚠️ Live item sales unavailable — '+esc(itemRes&&itemRes.error||'server error')+'</td></tr>');note(card,'No group totals fabricated.',true);return;}
-      const sales=Array.isArray(itemRes&&itemRes.data&&itemRes.data.rows)?itemRes.data.rows:[];
+      const _d=itemRes&&itemRes.data; const sales=Array.isArray(_d)?_d:Array.isArray(_d&&_d.rows)?_d.rows:Array.isArray(_d&&_d.items)?_d.items:Array.isArray(_d&&_d.data)?_d.data:Array.isArray(itemRes&&itemRes.rows)?itemRes.rows:[];
       const agg=new Map();
       sales.forEach(function(r){
-        const name=String(r.ITEM_GROUP_NAME||r.ITEM_GROUP||r.GROUP_NAME||'Unassigned').trim()||'Unassigned';
+        const name=(typeof window.bnxItemGroupOfRow_==='function'?window.bnxItemGroupOfRow_(r):(String(r.ITEM_GROUP_NAME||r.ITEM_GROUP||r.GROUP_NAME||'Unassigned').trim()||'Unassigned'));
         const key=name.toLowerCase();
         if(!agg.has(key))agg.set(key,{name:name,qty:0,sales:0,bills:new Set()});
-        const a=agg.get(key); a.qty+=Number(r.QUANTITY_SOLD)||0; a.sales+=Number(r.NET_SALES||r.GROSS_SALES||0)||0;
+        const a=agg.get(key); a.qty+=Number(r.QUANTITY_SOLD)||0; a.sales+=(typeof window.bnxItemAmtOfRow_==='function'?window.bnxItemAmtOfRow_(r):(Number(r.NET_SALES||r.GROSS_SALES||0)||0));
         const ids=Array.isArray(r.BILL_IDS)?r.BILL_IDS:[]; ids.forEach(function(id){if(id)a.bills.add(String(id));});
       });
       const rows=Array.from(agg.values()).sort(function(a,b){return b.sales-a.sales;});
@@ -30572,14 +30611,14 @@ document.addEventListener('DOMContentLoaded',()=>{setTimeout(()=>{try{bnxInitIte
       try{console.log('[Item Group Wise] rows:',src.length,'dataKeys:',d1&&typeof d1==='object'&&!Array.isArray(d1)?Object.keys(d1).slice(0,10):typeof d1,'sample:',src[0]);}catch(e){}
       const g={};
       src.forEach(it=>{
-        const group=String(pick(it,['ITEM_GROUP_NAME','ITEM_GROUP','GROUP_NAME','itemGroupName','itemGroup','group','ITEM_GROUP_ID'])||'Unassigned').trim()||'Unassigned';
+        const group=(typeof window.bnxItemGroupOfRow_==='function'?window.bnxItemGroupOfRow_(it):String(pick(it,['ITEM_GROUP_NAME','ITEM_GROUP','GROUP_NAME','itemGroupName','itemGroup','group','ITEM_GROUP_ID'])||'Unassigned').trim()||'Unassigned');
         const cat=String(pick(it,['CATEGORY_NAME','CATEGORY','ITEM_CATEGORY','categoryName','category','CATEGORY_ID'])||'Uncategorized').trim()||'Uncategorized';
         const key=group.toLowerCase()+'|'+cat.toLowerCase();
         if(!g[key])g[key]={group,cat,items:new Set(),qty:0,rev:0};
         const x=g[key];
         x.items.add(String(pick(it,['ITEM_ID','ITEM_CODE','itemId','code','ITEM_NAME','itemName','name'])||('ROW-'+x.items.size)));
         x.qty+=Number(pick(it,['QUANTITY_SOLD','QTY','QUANTITY','qty','quantity']))||0;
-        x.rev+=Number(pick(it,['NET_SALES','GROSS_SALES','SALES','AMOUNT','netSales','amount','revenue']))||0;
+        x.rev+=(typeof window.bnxItemAmtOfRow_==='function'?window.bnxItemAmtOfRow_(it):Number(pick(it,['NET_SALES','GROSS_SALES','SALES','AMOUNT','netSales','amount','revenue']))||0);
       });
       const rows=Object.values(g).sort((a,b)=>b.rev-a.rev);
       const tq=rows.reduce((n,x)=>n+x.qty,0),tr=rows.reduce((n,x)=>n+x.rev,0),ti=rows.reduce((n,x)=>n+x.items.size,0);
@@ -35996,6 +36035,60 @@ body:has(#page-customer-credit.active) #bnxGlobalPeriodBar,body:has(#page-due-co
   apply();
   document.addEventListener('DOMContentLoaded',apply);
   window.addEventListener('load',function(){apply();setTimeout(apply,400);});
+})();
+</script>
+<script id="bnx-bill-items-map">
+/* BILL_ITEMS -> Item Group mapping shared by every item-group report.
+   Order: ITEM_GROUP_NAME -> ITEM_GROUP_ID (GRP0000x) -> live ITEM_MASTER (item id / name)
+   -> category + item-name classifier. Rows never fall into a blank "Unassigned" if the
+   group can be inferred. */
+(function(){
+  var ID={GRP00001:'FOOD',GRP00002:'BEVERAGE',GRP00003:'LIQUOR',GRP00004:'TOBACCO',GRP00005:'ADD-ONS'};
+  function low(o){var m={};if(o&&typeof o==='object')Object.keys(o).forEach(function(k){m[String(k).toLowerCase().replace(/[^a-z0-9]/g,'')]=o[k];});return m;}
+  function g(m,names){for(var i=0;i<names.length;i++){var v=m[names[i].toLowerCase().replace(/[^a-z0-9]/g,'')];if(v!==undefined&&v!==null&&v!=='')return v;}return '';}
+  var idx=null,idxLen=-1;
+  function master(){
+    var md=Array.isArray(window.menuData)?window.menuData:[];
+    if(idx&&idxLen===md.length)return idx;
+    idx={byId:{},byName:{}};idxLen=md.length;
+    md.forEach(function(it){
+      var m=low(it),nm=String(g(m,['ITEM_GROUP_NAME','itemGroupName','groupName'])||'').trim();
+      var gid=String(g(m,['ITEM_GROUP_ID','itemGroupId','groupId'])||'').trim().toUpperCase();
+      var grp=(nm&&!/^GRP\d+$/i.test(nm))?nm.toUpperCase():(ID[gid]||'');
+      if(!grp)return;
+      var iid=String(g(m,['ITEM_ID','itemId','id','code','ITEM_CODE'])||'').trim().toUpperCase();
+      var n=String(g(m,['ITEM_NAME','name','n'])||'').trim().toUpperCase();
+      if(iid)idx.byId[iid]=grp; if(n)idx.byName[n]=grp;
+    });
+    return idx;
+  }
+  window.bnxItemGroupOfRow_=function(r){
+    var m=low(r);
+    var name=String(g(m,['ITEM_GROUP_NAME','ITEM_GROUP','GROUP_NAME','itemGroupName','itemGroup','group'])||'').trim();
+    var gid=String(g(m,['ITEM_GROUP_ID','GROUP_ID','itemGroupId'])||'').trim().toUpperCase();
+    if(name&&!/^GRP\d+$/i.test(name)&&!/^unassigned$/i.test(name))return name.toUpperCase();
+    if(ID[gid])return ID[gid]; if(ID[name.toUpperCase()])return ID[name.toUpperCase()];
+    var mi=master(), iid=String(g(m,['ITEM_ID','ITEM_CODE','itemId'])||'').trim().toUpperCase(), nm=String(g(m,['ITEM_NAME','itemName','name'])||'').trim().toUpperCase();
+    if(iid&&mi.byId[iid])return mi.byId[iid]; if(nm&&mi.byName[nm])return mi.byName[nm];
+    var cat=String(g(m,['CATEGORY_NAME','CATEGORY','ITEM_CATEGORY','categoryName','category'])||'').toUpperCase(), T=cat+' '+nm;
+    if(/TOBACCO|CIGAR|HOOKAH|HASH ?FREEZ|\bHF\b/.test(T))return 'TOBACCO';
+    if(/LIQUOR|\bBAR\b|WINE|BEER|SPIRIT|WHISK|VODKA|\bGIN\b|\bRUM\b|TEQUILA|SCOTCH|SINGLE MALT|BRANDY|COGNAC|LIQUEUR|SHOTS|COCKTAIL|ALCOPOP|\bMRP\b/.test(T))return 'LIQUOR';
+    if(/BEVERAGE|SOFT|JUICE|MOCKTAIL|WATER|COFFEE|\bTEA\b|SODA|COLA|LASSI|SHAKE/.test(T))return 'BEVERAGE';
+    if(/ADD-?ON/.test(T))return 'ADD-ONS';
+    return 'FOOD';
+  };
+  /* Pre-tax amount of a bill-item row (BILL_ITEMS.LINE_TOTAL is tax-inclusive). */
+  window.bnxItemAmtOfRow_=function(r){
+    var m=low(r),num=function(v){v=Number(String(v).replace(/[₹,\s]/g,''));return isFinite(v)?v:0;};
+    var a=num(g(m,['NET_SALES','GROSS_SALES','SALES','netSales','revenue']));
+    if(a)return a;
+    var q=num(g(m,['QUANTITY_SOLD','QUANTITY','QTY'])),dr=num(g(m,['DISCOUNTED_RATE']));
+    if(q&&dr)return q*dr;
+    a=num(g(m,['TAXABLE_AMOUNT','TAXABLE_SALES']));if(a)return a;
+    a=num(g(m,['AMOUNT','amount']));if(a)return a;
+    var lt=num(g(m,['LINE_TOTAL'])),tx=num(g(m,['TAX_AMOUNT','TOTAL_TAX']))||(num(g(m,['TAX_PER_ITEM']))*q);
+    return Math.max(0,lt-tx);
+  };
 })();
 </script>
 
