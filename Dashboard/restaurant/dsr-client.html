@@ -430,8 +430,48 @@ function setStatus(msg){
 
 /* Backend GET_DSR_MATRIX → the exact common STANDARD_DATA contract used by
    Daily/MTD/YTD/Excel/WhatsApp. */
+/* FIX (Sep 30 2026): backend field names are matched case/underscore-insensitively
+   with aliases, so a day is not silently mapped to 0 when a key is spelled
+   differently (e.g. LIQUOR, grossSales, food_sale). Canonical keys already
+   present are never overridden. */
+var BNX_DSR_ALIASES_ = {
+  liquor:['liquorsale','liquorsales','liquornet'], liquorMrp:['liquormrp'],
+  food:['foodsale','foodsales'], beverage:['bev','beverages','beveragesale'],
+  hashFreezer:['hf','hashfreezersale','tobacco'], others:['other_items','othersale','othersales'],
+  grossSale:['gross','grosssales','grosssale','taxable','taxablesale','subtotal'],
+  netSale:['net','netsales','netsale','total','totalsale','totalsales'],
+  tax:['gst','totaltax','taxamount'], roundOff:['round','roundoff','rounding'],
+  cash:['cashsale','cashsales'], iciciCard:['card','cardsale','cardsales'],
+  iciciGpay:['gpay','upi','upisale','gpaysale'], online:['onlinesale'], other:['otherpay','otherpayment'],
+  guestDueSales:['duesales','guestdue','credit','creditsale','creditsales'],
+  zomato:['zomatosale'], swiggy:['swiggysale'],
+  dueReceivedCash:['duerecvcash','duecash','duesreceivedcash'], dueReceivedIcici:['duerecvbank','duebank','duesreceivedbank'],
+  discount:['disc','totaldiscount'], bills:['billcount','totalbills','billscount'], covers:['pax','guests'],
+  ncBills:['ncbill'], pvt:['pvtsale'], unallocatedPaid:['unallocated'], guestDuesCN:['guestcn','creditnote']
+};
+function bnxNormRaw_(raw){
+  if(!raw||typeof raw!=='object') return raw||{};
+  var low={}; Object.keys(raw).forEach(function(k){ low[String(k).toLowerCase().replace(/[^a-z0-9]/g,'')]=raw[k]; });
+  var out=Object.assign({},raw);
+  Object.keys(BNX_DSR_ALIASES_).forEach(function(canon){
+    if(out[canon]!==undefined&&out[canon]!==null&&out[canon]!=='') return;
+    var names=[canon].concat(BNX_DSR_ALIASES_[canon]);
+    for(var i=0;i<names.length;i++){
+      var v=low[String(names[i]).toLowerCase().replace(/[^a-z0-9]/g,'')];
+      if(v!==undefined&&v!==null&&v!==''){ out[canon]=v; break; }
+    }
+  });
+  return out;
+}
+function bnxLogShape_(tag,r){
+  try{
+    var d=r&&r.data, keys=d&&typeof d==='object'?Object.keys(d).slice(0,12):[];
+    var m=d&&(d.byDate||d.byDay), sk=m&&typeof m==='object'?Object.keys(m):[];
+    console.log('[DSR SHAPE] '+tag,{success:r&&r.success,error:r&&r.error,dataKeys:keys,days:sk.length,sampleDay:sk.length?m[sk[sk.length-1]]:undefined});
+  }catch(e){}
+}
 function mapLiveDsrDay_(raw){
-  raw=raw||{};
+  raw=bnxNormRaw_(raw||{});
   const n=v=>Number(v)||0;
   const liquor=n(raw.liquor), food=n(raw.food), bev=n(raw.beverage), hf=n(raw.hashFreezer), others=n(raw.others);
   const categoryGross=liquor+food+bev+hf+others;
@@ -461,6 +501,7 @@ function mapLiveDsrDay_(raw){
 
 async function fetchDsrMonthLive_(year,month){
   const r=await gasApi('GET_DSR_MATRIX',{year:Number(year),month:Number(month)});
+  bnxLogShape_('GET_DSR_MATRIX '+year+'-'+month,r);
   if(!r || !r.success || !r.data || !r.data.byDay){
     if(r&&r.authExpired)gasToast('🔐 Session expired — please login again','error');
     return false;
@@ -570,8 +611,18 @@ async function directPOSFetchRange(fromDate,toDate){
      GET_DSR_MATRIX round-trip per month — 6-12 calls for an FY view). */
   try{
     const r=await gasApi('GET_DSR_RANGE',{from:fromDate,to:toDate});
-    if(r&&r.success&&r.data&&r.data.byDate){
-      Object.keys(r.data.byDate).forEach(k=>{STANDARD_DATA[k]=mapLiveDsrDay_(r.data.byDate[k]);});
+    bnxLogShape_('GET_DSR_RANGE '+fromDate+'..'+toDate,r);
+    let dayMap=null;
+    if(r&&r.success&&r.data){
+      const d0=r.data;
+      if(d0.byDate&&typeof d0.byDate==='object'&&!Array.isArray(d0.byDate)) dayMap=d0.byDate;
+      else{
+        const arr=Array.isArray(d0.byDate)?d0.byDate:Array.isArray(d0.rows)?d0.rows:Array.isArray(d0.days)?d0.days:Array.isArray(d0)?d0:null;
+        if(arr){dayMap={};arr.forEach(x=>{const k=String((x&&(x.date||x.DATE||x.day))||'').slice(0,10);if(/^\d{4}-\d{2}-\d{2}$/.test(k))dayMap[k]=x;});}
+      }
+    }
+    if(dayMap){
+      Object.keys(dayMap).forEach(k=>{STANDARD_DATA[k]=mapLiveDsrDay_(dayMap[k]);});
       okCount=1;
     }else if(r&&r.authExpired){gasToast('🔐 Session expired — please login again','error');return false;}
   }catch(e){}
@@ -3796,7 +3847,11 @@ async function loadItemGroupDsr_(){
       throw new Error(r?.error||'Live item sales report unavailable');
     }
 
-    const src=Array.isArray(r?.data?.rows)?r.data.rows:[];
+    try{ console.log('[Item Group DSR] response shape',{dataKeys:r&&r.data&&typeof r.data==='object'?Object.keys(r.data).slice(0,12):typeof (r&&r.data),isArray:Array.isArray(r&&r.data)}); }catch(e){}
+    const d1=r&&r.data;
+    const src=Array.isArray(d1)?d1
+      :Array.isArray(d1?.rows)?d1.rows:Array.isArray(d1?.items)?d1.items:Array.isArray(d1?.data)?d1.data
+      :Array.isArray(d1?.report)?d1.report:Array.isArray(d1?.details)?d1.details:Array.isArray(r?.rows)?r.rows:Array.isArray(r?.items)?r.items:[];
     const groups=new Map();
 
     src.forEach(it=>{
@@ -3825,7 +3880,20 @@ async function loadItemGroupDsr_(){
       if(one)g.bills.add(String(one));
     });
 
-    const rows=Array.from(groups.values()).sort((a,b)=>b.sales-a.sales);
+    let rows=Array.from(groups.values()).sort((a,b)=>b.sales-a.sales);
+    /* FIX (Sep 30 2026, "groupwise not show"): if the item report returns nothing for the
+       period, fall back to the live DSR category totals (Liquor/Food/Beverage/Tobacco/Others)
+       for the same dates so this tab is never blank while DSR has sales. */
+    let fromDsr=false;
+    if(!rows.length){
+      const acc={liquor:0,food:0,bev:0,hf:0,others:0,bills:0};
+      Object.keys(STANDARD_DATA).forEach(k=>{ if(k>=from&&k<=to){ const x=STANDARD_DATA[k]||{};
+        acc.liquor+=Number(x.liquor)||0; acc.food+=Number(x.food)||0; acc.bev+=Number(x.bev)||0; acc.hf+=Number(x.hf)||0; acc.others+=Number(x.others)||0; acc.bills+=Number(x.bills)||0; }});
+      [['Liquor','liquor'],['Food','food'],['Beverage','bev'],['Tobacco (HashFreezer)','hf'],['Others','others']].forEach(a=>{
+        if(acc[a[1]]>0) rows.push({group:a[0],cat:'All items (DSR total)',items:new Set(),qty:0,bills:new Set(),sales:acc[a[1]]});
+      });
+      rows.sort((a,b)=>b.sales-a.sales); fromDsr=rows.length>0;
+    }
     const totalSales=rows.reduce((n,r)=>n+r.sales,0);
     const totalQty=rows.reduce((n,r)=>n+r.qty,0);
     const totalItems=rows.reduce((n,r)=>n+r.items.size,0);
@@ -3839,12 +3907,12 @@ async function loadItemGroupDsr_(){
       return '<tr>'+
         '<td><b>'+esc(r.group)+'</b></td>'+
         '<td>'+esc(r.cat)+'</td>'+
-        '<td class="r">'+r.items.size+'</td>'+
-        '<td class="r">'+r.qty+'</td>'+
-        '<td class="r">'+r.bills.size+'</td>'+
+        '<td class="r">'+(fromDsr?'—':r.items.size)+'</td>'+
+        '<td class="r">'+(fromDsr?'—':r.qty)+'</td>'+
+        '<td class="r">'+(fromDsr?'—':r.bills.size)+'</td>'+
         '<td class="r" style="color:var(--blue);font-weight:700">₹'+money(r.sales)+'</td>'+
         '<td class="r">'+share+'%</td>'+
-        '<td><span class="tag tag-ok">LIVE</span></td>'+
+        '<td><span class="tag tag-ok">'+(fromDsr?'DSR':'LIVE')+'</span></td>'+
       '</tr>';
     }).join(''):'<tr><td colspan="8" style="text-align:center;padding:18px;color:var(--muted)">No live item-group sales for '+esc(from)+' to '+esc(to)+'.</td></tr>';
 
@@ -3855,7 +3923,7 @@ async function loadItemGroupDsr_(){
         '<td>₹'+money(totalSales)+'</td><td>100%</td><td>LIVE</td></tr>':'';
     }
     if(note){
-      note.textContent='✅ Live Transaction DB · '+from+' to '+to+' · '+rows.length+' item group/category row(s) · '+billSet.size+' bill(s).';
+      note.textContent=(fromDsr?'ℹ️ Item report returned no rows — showing DSR category totals · ':'✅ Live Transaction DB · ')+from+' to '+to+' · '+rows.length+' row(s)'+(fromDsr?'.':' · '+billSet.size+' bill(s).');
       note.style.color='var(--green)';
     }
     if(live){live.textContent='LIVE · TRANSACTION DB';live.style.color='var(--green)';}
@@ -3864,6 +3932,20 @@ async function loadItemGroupDsr_(){
     return r;
   }catch(e){
     console.error('[Item Group DSR]',e);
+    /* Item report failed (slow/unsupported backend action): still show DSR category totals for the period. */
+    try{
+      const acc={liquor:0,food:0,bev:0,hf:0,others:0};
+      Object.keys(STANDARD_DATA).forEach(k=>{ if(k>=from&&k<=to){ const x=STANDARD_DATA[k]||{}; Object.keys(acc).forEach(f=>{acc[f]+=Number(x[f])||0;}); }});
+      const list=[['Liquor','liquor'],['Food','food'],['Beverage','bev'],['Tobacco (HashFreezer)','hf'],['Others','others']].filter(a=>acc[a[1]]>0);
+      if(list.length){
+        const tot=list.reduce((n,a)=>n+acc[a[1]],0), mny=n=>Number(n||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+        tb.innerHTML=list.map(a=>'<tr><td><b>'+a[0]+'</b></td><td>All items (DSR total)</td><td class="r">—</td><td class="r">—</td><td class="r">—</td><td class="r" style="color:var(--blue);font-weight:700">₹'+mny(acc[a[1]])+'</td><td class="r">'+(acc[a[1]]/tot*100).toFixed(1)+'%</td><td><span class="tag tag-ok">DSR</span></td></tr>').join('');
+        if(foot)foot.innerHTML='<tr style="font-weight:800;background:var(--accent-bg)"><td colspan="5">TOTAL</td><td>₹'+mny(tot)+'</td><td>100%</td><td>DSR</td></tr>';
+        if(note){note.textContent='ℹ️ Item report unavailable ('+String(e.message||e).replace(/[<>]/g,'')+') — showing DSR category totals.';note.style.color='var(--muted)';}
+        if(live){live.textContent='DSR TOTALS';live.style.color='var(--accent)';}
+        return {success:false,error:e.message,fallback:true};
+      }
+    }catch(e2){}
     tb.innerHTML='<tr><td colspan="8" style="text-align:center;padding:18px;color:var(--red)">⚠️ '+String(e.message||e).replace(/[<>]/g,'')+'</td></tr>';
     if(note){note.textContent='Live Transaction DB report failed. No demo values shown.';note.style.color='var(--red)';}
     if(live){live.textContent='LIVE · ERROR';live.style.color='var(--red)';}
