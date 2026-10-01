@@ -7508,10 +7508,22 @@ async function printKOTTicket(kotNo, partType){
       BAR:pick(cfg.pr4,'pr4-name',DEFAULT_IPS.BAR)
     };
   }
+  /* FINAL KOT PRINTER ROUTING
+     The saved KOT part type is not always literally "BAR": the live
+     ITEM_GROUP_MASTER in this steward file also uses BEVERAGE, while
+     liquor/drink categories can arrive as group/category names.  Normalize
+     ALL of those to the physical BAR printer without changing the server
+     KOT type stored in KOT_MASTER/KOT_ITEMS.
+     Physical destinations for Client 10:
+       KITCHEN -> 192.168.0.192:9100
+       BAR     -> 192.168.0.151:9100
+       HUKKA   -> 192.168.0.195:9100
+       BILL    -> 192.168.0.210:9100 (receipt flow only)
+  */
   function role_(type){
-    const t=String(type||'').toUpperCase();
-    if(t.includes('HUKKA')||t.includes('HOOKAH')||t.includes('SHEESHA')) return 'HUKKA';
-    if(t.includes('BAR')) return 'BAR';
+    const t=String(type||'').toUpperCase().trim();
+    if(/HUKKA|HOOKAH|SHEESHA/.test(t)) return 'HUKKA';
+    if(/BAR|BEVERAGE|LIQUOR|SPIRITS|ALCOHOL|COCKTAIL|MOCKTAIL|JUICE|BEER|WINE|WHISKY|WHISKEY|VODKA|RUM|GIN|TEQUILA|CIGARETTE|TOBACCO/.test(t)) return 'BAR';
     return 'KITCHEN';
   }
   function text_(v){
@@ -7622,20 +7634,62 @@ async function printKOTTicket(kotNo, partType){
       return false;
     }
   };
-  window.bnxDirectKOTPrint_=async function(type,d){
-    try{
-      const role=role_(type);
-      const ip=ipSettings_()[role];
-      await direct_(role,kotRaw_(Object.assign({},d,{type})), 'BNX '+role+' KOT '+String(d&&d.kotNo||''));
-      console.info('[BNX STEWARD KOT IP] sent',{role,ip,kotNo:d&&d.kotNo,orderNo:d&&d.orderNo,table:d&&d.table,items:Array.isArray(d&&d.items)?d.items.length:0});
-      return true;
-    }catch(e){
-      console.warn('[BNX STEWARD KOT IP] failed',qzError_(e),e);
-      return false;
-    }
+  /* One physical printer must receive one complete station ticket at a time.
+     Multiple KOT parts used to call qz.print() concurrently, so mixed
+     Kitchen/Bar/Hukka orders could overlap on QZ/TCP and appear on the wrong
+     printer or be partially printed.  A single promise chain now serializes
+     every direct KOT job while preserving the station split. */
+  window.__bnxStewardKotPrintQueue=window.__bnxStewardKotPrintQueue||Promise.resolve();
+  window.bnxDirectKOTPrint_=function(type,d){
+    const payload=Object.assign({},d,{type});
+    const run=async function(){
+      try{
+        const role=role_(type);
+        const ip=ipSettings_()[role];
+        if(!ip) throw new Error('No '+role+' printer IP configured');
+        const items=Array.isArray(payload.items)?payload.items:[];
+        if(!items.length) throw new Error('No items for '+role+' KOT');
+        console.info('[BNX STEWARD KOT SPLIT] queue',{role,ip,kotNo:payload.kotNo,orderNo:payload.orderNo,itemCount:items.length,itemNames:items.map(i=>String(i.name||i.n||i.ITEM_NAME||'Item'))});
+        await direct_(role,kotRaw_(payload),'BNX '+role+' KOT '+String(payload.kotNo||''));
+        console.info('[BNX STEWARD KOT IP] sent',{role,ip,kotNo:payload.kotNo,orderNo:payload.orderNo,table:payload.table,items:items.length});
+        return true;
+      }catch(e){
+        console.warn('[BNX STEWARD KOT IP] failed',qzError_(e),e);
+        return false;
+      }
+    };
+    const job=window.__bnxStewardKotPrintQueue.then(run,run);
+    window.__bnxStewardKotPrintQueue=job.catch(function(){});
+    return job;
   };
   try{ localStorage.setItem('bnx_direct_ip_print','1'); }catch(e){}
 })();
+
+/* Diagnostic: inspect the exact station split before printing a live KOT.
+   Returns only station names, configured IPs and item names; it does not
+   change the order or database. */
+window.bnxPreviewStewardKOTSplit=function(kotNo){
+  try{
+    bnxLoadOpenKots();
+    const k=KOT.find(x=>String(x.kotNo)===String(kotNo));
+    if(!k) return {ok:false,error:'KOT not found'};
+    const parts=bnxKOTParts_(k);
+    const out={ok:true,kotNo:kotNo,orderNo:k.orderNo||'',KITCHEN:[],BAR:[],HUKKA:[]};
+    parts.forEach(p=>{
+      const role=(function(t){
+        const u=String(t||'').toUpperCase();
+        if(/HUKKA|HOOKAH|SHEESHA/.test(u)) return 'HUKKA';
+        if(/BAR|BEVERAGE|LIQUOR|SPIRITS|ALCOHOL|COCKTAIL|MOCKTAIL|JUICE|BEER|WINE|WHISKY|WHISKEY|VODKA|RUM|GIN|TEQUILA|CIGARETTE|TOBACCO/.test(u)) return 'BAR';
+        return 'KITCHEN';
+      })(p.type);
+      (p.items||[]).forEach(i=>out[role].push(String(i.name||i.n||i.ITEM_NAME||'Item')));
+    });
+    const ips=ipSettings_();
+    out.IP={KITCHEN:ips.KITCHEN,BAR:ips.BAR,HUKKA:ips.HUKKA};
+    console.info('[BNX STEWARD KOT PREVIEW]',out);
+    return out;
+  }catch(e){ return {ok:false,error:String(e&&e.message||e)}; }
+};
 
 function bnxPrintHtml(html){
   const w = window.open('', '_blank', 'width=380,height=600');
@@ -9028,8 +9082,18 @@ async function bnxPlaceOrderImpl_(){
   // server, so "Send to KDS" also sends straight to the KOT printer.
   // Wrapped so a print failure (no printer connected, popup blocked)
   // never breaks the order that has already been successfully placed.
-  try{ if(typeof printKOTTicket==='function') bnxKOTParts_(entry).forEach(p=>printKOTTicket(orderId,p.type)); }
-  catch(e){ console.error('[KOT PRINT]', e); toast('⚠️ Order sent, but KOT ticket did not print — check printer','error'); }
+  try{
+    if(typeof printKOTTicket==='function'){
+      const printParts=bnxKOTParts_(entry);
+      for(const p of printParts){
+        try{ await printKOTTicket(orderId,p.type); }
+        catch(e){ console.error('[KOT PRINT PART]',p.type,e); }
+      }
+    }
+  }catch(e){
+    console.error('[KOT PRINT]', e);
+    toast('⚠️ Order sent, but KOT ticket did not print — check printer','error');
+  }
   PLACED_ORDERS[orderId] = {
     id: orderId, table: selTable.id, items: JSON.parse(JSON.stringify(items)), amount, steward: stewardName,
     status: 'PLACED', timestamp: Date.now(), originalItems: JSON.parse(JSON.stringify(items)), hasServerId: true
