@@ -17658,7 +17658,11 @@ async function bmDoPrint(){
 
   if (!saved || !saved.billno){
     if(w){ try { w.close(); } catch(e){} }
-    if(typeof showNotif==='function') showNotif('❌ Invoice was not saved; nothing was sent to the printer.','error');
+    /* bmSaveBill already queued the transaction when the server was
+       unreachable. Do not send anything to the thermal printer without a
+       confirmed invoice number. */
+    if(typeof showNotif==='function') showNotif('❌ Invoice save was not confirmed. Nothing was sent to the printer; check Pending Sync and retry when Core is live.','error');
+    console.warn('[BNX INVOICE] print stopped because SAVE_BILL was not confirmed');
     return;
   }
 
@@ -17883,33 +17887,44 @@ async function bmSaveBill(reprintAfter){
       orderNo: typeof posOrderNo !== 'undefined' ? String(posOrderNo).replace(/^#/, '') : ''
     };
 
-    /* FAST LIVE-SAVE RETRY: transient Core/API connection drops were causing
-       Save & Print Invoice to enter Pending Sync immediately. Retry the same
-       request a few times before queueing. This does NOT create duplicates:
-       requestId stays identical for every attempt and the backend can de-dupe
-       the transaction. Printing still happens ONLY after a confirmed save. */
+    /* V11 SAVE FIX: a previous failed Core request could open the page-level
+       V2_CORE circuit for 20-30 seconds. The next SAVE_BILL attempts then
+       failed locally with 'API circuit open' even though the server was back.
+       Clear only the V2_CORE circuit before each idempotent SAVE_BILL retry.
+       The SAME requestId is reused for every attempt, so the backend can
+       de-duplicate and the bill is never intentionally duplicated. */
     let res = null, lastSaveError = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    const maxSaveAttempts = 4;
+    for (let attempt = 1; attempt <= maxSaveAttempts; attempt++) {
       try {
+        if (typeof bnxResetApiCircuit_ === 'function') bnxResetApiCircuit_('V2_CORE');
         res = await gasApi('SAVE_BILL', { requestId, bill: draftBill }, 'V2_CORE');
-        if (res && res.success) break;
+        /* Accept the normal success response and also tolerate a response
+           where the backend supplies BILL_NUMBER/data but omits a literal
+           success=true flag. A BILL_NUMBER is proof that the write completed. */
+        const hasConfirmedBill = !!(res && ((res.data && res.data.BILL_NUMBER) || res.serverId || res.billNo));
+        if (res && (res.success === true || hasConfirmedBill)) break;
         lastSaveError = new Error((res && (res.message || res.error)) || 'SAVE_BILL returned no success');
       } catch (e) {
         lastSaveError = e;
-        console.warn('[BM_SAVE] SAVE_BILL retry '+attempt+'/3 failed:', e);
+        console.warn('[BM_SAVE] SAVE_BILL retry '+attempt+'/'+maxSaveAttempts+' failed:', e);
       }
-      if (attempt < 3) {
-        try { if (typeof showNotif==='function') showNotif('⏳ Connecting to server… retry '+(attempt+1)+'/3', 'warning'); } catch(e) {}
-        await new Promise(r => setTimeout(r, attempt === 1 ? 500 : 900));
+      if (attempt < maxSaveAttempts) {
+        try {
+          if (typeof showNotif==='function') showNotif('⏳ Connecting to server… retry '+(attempt+1)+'/'+maxSaveAttempts, 'warning');
+        } catch(e) {}
+        /* Short bounded backoff: 350ms, 700ms, 1100ms. */
+        await new Promise(r => setTimeout(r, attempt === 1 ? 350 : attempt === 2 ? 700 : 1100));
       }
     }
 
-    if (!res || !res.success){
+    const saveConfirmed = !!(res && (res.success === true || (res.data && res.data.BILL_NUMBER) || res.serverId || res.billNo));
+    if (!saveConfirmed){
       bnxQueuePending('SAVE_BILL', { requestId, bill: draftBill }, requestId);
       bnxSetLiveStatus('offline');
-      console.error('[BM_SAVE] SAVE_BILL failed after 3 attempts:', lastSaveError || res);
-      if (typeof showNotif==='function') showNotif('📴 Server unavailable after 3 quick retries — bill queued as Pending Sync. NOT printed as a tax invoice because it is not recorded yet.', 'error');
-      else alert('⚠️ Server unavailable after 3 quick retries. The bill is queued and will save automatically once connection is back — it is NOT recorded or printed as a tax invoice yet.');
+      console.error('[BM_SAVE] SAVE_BILL failed after '+maxSaveAttempts+' attempts:', lastSaveError || res);
+      if (typeof showNotif==='function') showNotif('📴 Server unavailable after '+maxSaveAttempts+' quick retries — bill queued as Pending Sync. NOT printed as a tax invoice because it is not recorded yet.', 'error');
+      else alert('⚠️ Server unavailable after '+maxSaveAttempts+' quick retries. The bill is queued and will save automatically once connection is back — it is NOT recorded or printed as a tax invoice yet.');
       return null;
     }
     bnxSetLiveStatus('live');
