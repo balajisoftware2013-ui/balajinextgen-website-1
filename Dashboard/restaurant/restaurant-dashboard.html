@@ -12591,71 +12591,6 @@ async function bnxSyncActiveOrdersForTables(){
   window._activeOrders = orders.map(bnxNormalizeActiveOrder);
   if (typeof buildRichTbls === 'function') buildRichTbls();
 }
-/* FIX 2026-10-01 — TABLE CARD → BILL AUTO LOAD
-   When staff click BILL directly on an occupied table card, the old action
-   only changed the POS table label and opened New Bill. It did NOT populate
-   #bm-bf-table, so the New Bill KOT picker had no table context and showed
-   every pending KOT/order. The bill therefore stayed on the blank/default
-   item row until staff manually selected a ticket.
-
-   New flow:
-   Table Management → occupied table → Bill
-     1) open a fresh New Bill safely;
-     2) put the clicked table number into the actual bill Table field;
-     3) refresh live KOT/order data;
-     4) auto-load the table's single pending ticket, or open the picker
-        filtered to that table when there are multiple tickets;
-     5) leave KOT Reference + items + quantities + rates visible.
-*/
-async function bnxOpenBillForTable(tableNo){
-  const table = String(tableNo||'').trim();
-  if(!table) return;
-
-  // Do not silently destroy an in-progress manually edited bill.
-  let hasItems = false;
-  try {
-    const d = (typeof bmGetBillData === 'function') ? bmGetBillData() : null;
-    hasItems = !!(d && Array.isArray(d.items) && d.items.some(it=>String(it.name||it.itemName||'').trim()));
-  } catch(e){}
-  if(hasItems){
-    const current = String(document.getElementById('bm-bf-table')?.value||'').trim();
-    if(current !== table && !confirm('A bill is already being edited. Start a new bill for table '+table+' and clear the current draft?')) return;
-  }
-
-  try { showPage('billing', document.querySelector('[onclick*="billing"]')); } catch(e){}
-
-  // Wait for the billing page DOM/showPage initialisation to finish.
-  await new Promise(r=>setTimeout(r,80));
-
-  try {
-    if (hasItems && typeof bmResetBillForm==='function') bmResetBillForm();
-    else if (!hasItems) {
-      const rows=document.getElementById('bmItemRows');
-      const currentItems=rows ? Array.from(rows.querySelectorAll('[id^="bm-irow-"]')).filter(row=>String(row.querySelector('input[name="itemName"]')?.value||row.querySelector('.bm-item-name')?.value||'').trim()) : [];
-      if(!currentItems.length && typeof bmResetBillForm==='function') bmResetBillForm();
-    }
-  } catch(e){ console.warn('[TABLE→BILL reset]',e); }
-
-  const tEl=document.getElementById('bm-bf-table');
-  if(tEl) tEl.value=table;
-  const posTable=document.getElementById('posTable');
-  if(posTable) posTable.textContent=table;
-  const cartTable=document.getElementById('cartTable');
-  if(cartTable) cartTable.textContent=table;
-
-  // This is the same live table-change path used when a user types/selects a
-  // table manually; it refreshes server KOTs + Order Register and auto-loads
-  // a single matching ticket, or opens a table-filtered picker for multiples.
-  try {
-    if(typeof bmHandleTableChange==='function') await bmHandleTableChange();
-  } catch(e){
-    console.warn('[TABLE→BILL KOT LOAD]',e);
-    if(typeof showNotif==='function') showNotif('⚠️ Table set, but KOT auto-load needs the live server connection.','error');
-  }
-  try { if(typeof bmRecalc==='function') bmRecalc(); } catch(e){}
-  try { if(typeof bmRenderBillPreview==='function') bmRenderBillPreview(); } catch(e){}
-}
-
 function bnxBuildRichTblsFromMaster(){
   return tableData.map(t=>{
     const num = String(t.n);
@@ -12678,7 +12613,7 @@ function bnxBuildRichTblsFromMaster(){
     if (t.s==='available') actions=[{l:'Start Order',p:'pos'},{l:'Reserve',p:'reservation'}];
     else if (t.s==='reserved') actions=[{l:'View',p:'reservation'},{l:'Start Order',p:'pos'}];
     else if (t.s==='cleaning') actions=[{l:'Mark Ready',fn:`bnxMarkTableAvailable('${t.n}')`}];
-    else actions=[{l:'Add Item',p:'pos'},{l:'Bill',fn:`bnxOpenBillForTable(${JSON.stringify(num)})`},{l:'KOT',p:'kot'}];
+    else actions=[{l:'Add Item',p:'pos'},{l:'Bill',p:'billing'},{l:'KOT',p:'kot'}];
     // FIX ("kot not hid"): the KOT badge on a table card used t.kot, a
     // field the table master never actually sets, so it was always
     // blank — effectively permanently hidden even when the table had
@@ -17746,6 +17681,22 @@ async function bmDoPrint(){
       roff: Number(saved.roff ?? dNow.roff),
       total: Number(saved.total ?? dNow.total)
     });
+    /* DIRECT BILL PRINTER: once SAVE_BILL returns the confirmed invoice
+       number, send the exact same invoice data to Client-10 BILL printer.
+       Only thermal mode is routed to the raw 80/58mm printer; A4 remains the
+       existing browser/A4 print flow. */
+    if(!isA4 && typeof window.bnxDirectBillInvoice==='function'){
+      try{
+        const directOk=await window.bnxDirectBillInvoice(printData);
+        if(directOk){
+          try{ w.close(); }catch(ignore){}
+          if(!saved.isEditingExisting && typeof bmResetBillForm==='function'){ try{ bmResetBillForm(); }catch(e){} }
+          if(typeof bmClosePrintModal==='function') bmClosePrintModal();
+          return;
+        }
+      }catch(e){ console.warn('[PRINT] direct BILL route failed; using browser invoice print:',e); }
+    }
+
     if(isA4){
       const el=document.getElementById('bmModalA4');
       if(!el) throw new Error('A4 invoice container not found');
@@ -38101,6 +38052,30 @@ function bnxOpenImportHub(){
     return out;
   }
 
+  // SAFETY FIX: KOT raw printing must never depend on the browser-print
+  // wrapText helper. Some deployed copies still contained a bnxKotWrapText_()
+  // reference inside kotRaw(), which caused ReferenceError and forced
+  // direct IP KOT printing to fall back to browser print. Keep this helper
+  // local to the direct-printer module so the raw KOT path is self-contained.
+  function bnxKotWrapText_(text,maxChars){
+    const s=String(text==null?'':text);
+    const n=Math.max(1,Number(maxChars)||48);
+    const words=s.split(/\s+/).filter(Boolean);
+    const lines=[]; let line='';
+    words.forEach(function(word){
+      if(word.length>n){
+        if(line){ lines.push(line); line=''; }
+        for(let i=0;i<word.length;i+=n) lines.push(word.slice(i,i+n));
+        return;
+      }
+      if(!line) line=word;
+      else if((line+' '+word).length<=n) line+=' '+word;
+      else { lines.push(line); line=word; }
+    });
+    if(line) lines.push(line);
+    return lines.length?lines:[''];
+  }
+
   function kotRaw(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks){
     const width=Number((typeof bnxPaperSize==='function'?bnxPaperSize():80))===58?32:48;
     const role=roleForKOT(title);
@@ -38213,6 +38188,24 @@ function bnxOpenImportHub(){
       console.warn('[BNX IP TEST]',qzErrorText_(e),e);
       if(typeof showNotif==='function') showNotif('⚠️ '+qzErrorText_(e)+' Browser print is still available.','error');
       if(typeof originalTest==='function') originalTest(label);
+    }
+  };
+
+  /* DIRECT BILL INVOICE API — used by New Bill -> Save & Print Invoice.
+     It deliberately does NOT open a browser print fallback. The caller decides
+     whether to use the normal browser invoice window if QZ/IP is unavailable. */
+  window.bnxDirectBillInvoice=async function(d){
+    try{
+      const enabled=localStorage.getItem('bnx_direct_ip_print')!=='0';
+      if(!enabled) return false;
+      const data=billRaw(d||{});
+      console.info('[BNX BILL IP] sending', {ip:ipSettings().BILL,billNo:d&&d.billNo,items:Array.isArray(d&&d.items)?d.items.length:0});
+      await directPrintRaw('BILL',data,'Invoice '+String((d&&d.billNo)||''));
+      if(typeof showNotif==='function') showNotif('🧾 Bill / Invoice sent directly to '+ipSettings().BILL,'success');
+      return true;
+    }catch(e){
+      console.warn('[BNX BILL IP] direct invoice failed:',qzErrorText_(e),e);
+      return false;
     }
   };
 
