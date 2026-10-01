@@ -13015,7 +13015,10 @@ function bnxNormalizeMenuVeg_(){
 }
 let currentVegFilter = 'All'; // All | V | NV
 function bnxItemHSN(item){
-  try{ return (getTaxConfig()[getItemTaxCat(item.n,item.c)]||{}).hsn || ''; }catch(e){ return ''; }
+  try{
+    const meta=bnxMasterTaxMeta_(item,item&&item.n);
+    return meta.hsn || (getTaxConfig()[getItemTaxCat(item.n,item.c,item)]||{}).hsn || '';
+  }catch(e){ return ''; }
 }
 function onMenuSearchInput(val){
   menuSearchTerm = (val||'').trim().toLowerCase();
@@ -13889,15 +13892,57 @@ document.addEventListener('keydown', function(e){
 // e.g. 0 for liquor, 0.05 for food) is computed and stored on the cart
 // entry the moment it's added, then threaded through to every place
 // that turns cart entries into an items[] payload for the server.
-function bnxItemTaxRateFraction_(name){
+/* AUTHORITATIVE ITEM TAX RESOLUTION — 2026-10-01
+   Table/KOT ORDER_ITEMS may contain a stale ITEM_TAX_RATE captured when the
+   order was created. Billing must NOT trust that captured value. Resolve
+   the current rate from the live Item Master / Bar Item Master metadata
+   carried by menuData, with the CL00010 master TAX_ID mapping as fallback:
+     TAX00001 = 5% GST
+     TAX00002 = 0% GST (liquor / non-GST)
+     TAX00003 = 40% GST (Hashfrezer / Hukka tax bucket)
+   This keeps Table -> Bill, Quick Add, POS and invoice tax calculation on
+   the same item-wise master rule. */
+const BNX_MASTER_TAX_FALLBACK = {
+  TAX00001:{key:'FOOD',rate:.05,hsn:'996331',label:'GST @5%'},
+  TAX00002:{key:'SPIRITS',rate:0,hsn:'22084',label:'Exempted'},
+  TAX00003:{key:'TOBACCO',rate:.40,hsn:'24039',label:'GST @40%'}
+};
+function bnxFindLiveBillItem_(name){
+  const target=String(name||'').trim().toLowerCase();
+  if(!target || typeof menuData==='undefined') return null;
+  return menuData.find(m=>{
+    const n=String(m.n||m.name||m.ITEM_NAME||'').trim().toLowerCase();
+    return n===target;
+  })||null;
+}
+function bnxMasterTaxMeta_(item,name){
+  const x=item||{};
+  const taxId=String(x.taxId||x.TAX_ID||x.taxID||'').trim().toUpperCase();
+  if(taxId && BNX_MASTER_TAX_FALLBACK[taxId]) return Object.assign({taxId},BNX_MASTER_TAX_FALLBACK[taxId]);
+  const groupId=String(x.itemGroupId||x.ITEM_GROUP_ID||x.groupId||'').trim().toUpperCase();
+  const group=String(x.itemGroupName||x.ITEM_GROUP_NAME||x.groupName||x.GROUP_NAME||'').trim().toUpperCase();
+  const cat=String(x.c||x.category||x.MENU_SECTION||x.barCategory||'').trim().toUpperCase();
+  const nm=String(name||x.n||'').trim().toUpperCase();
+
+  /* Explicit Hashfreezer/Hukka bucket from the current CL00010 tax setup. */
+  if(/HASH\s*FREEZ(?:E|ER)|HASHFREZ|HUKKA|HOOKAH|SHEESHA/.test(nm))
+    return Object.assign({taxId:'TAX00003'},BNX_MASTER_TAX_FALLBACK.TAX00003);
+
+  /* BAR_ITEM_MASTER tax ID is authoritative when available. */
+  if(x.isBar===true || String(x.menuType||'').toUpperCase()==='BAR'){
+    if(/SOFT BEVERAGE|DRINK & DRIVE|VIRGIN|MOJITO|JUICE|MOCKTAIL|BEVERAGE/.test(cat+' '+nm) && taxId==='TAX00001')
+      return Object.assign({taxId:'TAX00001'},BNX_MASTER_TAX_FALLBACK.TAX00001);
+    if(group==='LIQUOR' || group==='BAR' || /LIQUOR|SPIRIT|ALCOHOL|BEER|WINE|WHISK|WHISKY|VODKA|RUM|GIN|TEQUILA|BRANDY|COCKTAIL|CHAMPAGNE|LIQUEUR|APERITIF/.test(group+' '+cat+' '+nm))
+      return Object.assign({taxId:'TAX00002'},BNX_MASTER_TAX_FALLBACK.TAX00002);
+  }
+  if(groupId==='GRP00003' || group==='LIQUOR') return Object.assign({taxId:'TAX00002'},BNX_MASTER_TAX_FALLBACK.TAX00002);
+  return Object.assign({taxId:'TAX00001'},BNX_MASTER_TAX_FALLBACK.TAX00001);
+}
+function bnxItemTaxRateFraction_(name,itemMeta){
   try{
-    const catByName = {};
-    if (typeof menuData !== 'undefined') menuData.forEach(m=>{ catByName[m.n] = m.c; });
-    const tc = getItemTaxCat(name, catByName[name]);
-    const taxCfg = getTaxConfig();
-    const rate = taxCfg[tc] || TAX_CONFIG_DEFAULT.FOOD;
-    return +(((rate.cgst||0) + (rate.sgst||0)) / 100).toFixed(4);
-  }catch(e){ return 0.18; } // only reached if menuData/tax config genuinely unavailable
+    const live=itemMeta||bnxFindLiveBillItem_(name)||{};
+    return Number(bnxMasterTaxMeta_(live,name).rate);
+  }catch(e){ return .05; }
 }
 function addToCart(name,price){
   const liveItem=(typeof menuData!=='undefined')?menuData.find(m=>String(m.n||'').toLowerCase()===String(name||'').toLowerCase()):null;
@@ -14324,9 +14369,12 @@ const ITEM_TAXCAT_OVERRIDE = { 'Pepsi / Coke':'SOFT_DRINKS' };
 // the real work for these items; removed the dead map and the unused
 // bmId parameter rather than leave misleading dead code referencing
 // an ID scheme that no longer exists anywhere in this file.
-function getItemTaxCat(name, category){
+function getItemTaxCat(name, category, itemMeta){
   if (ITEM_TAXCAT_OVERRIDE[name]) return ITEM_TAXCAT_OVERRIDE[name];
-  return CATEGORY_TO_TAXCAT[category] || 'FOOD';
+  const live=itemMeta||bnxFindLiveBillItem_(name)||{};
+  const meta=bnxMasterTaxMeta_(live,name);
+  if(meta && meta.key) return meta.key;
+  return CATEGORY_TO_TAXCAT[String(category||'').trim().toUpperCase()] || 'FOOD';
 }
 /* FIX (Aug 27 2026, "category bar group kitchen and counter 3 ... fix
    all"): BAR_CATEGORIES below was a Set of DEMO category names
@@ -14800,7 +14848,8 @@ function printOneKOT(title, table, waiter, covers, items, kotNo, orderNo, splitI
       <div>Order No: <b>${bnxPrintEsc_(orderNo||'-')}</b></div>
       <div>Table: <b>${bnxPrintEsc_(table)}</b> &nbsp; Pax: ${bnxPrintEsc_(covers)}</div>
       <div>Customer: ${bnxPrintEsc_(customerName||'Default Customer')}</div>
-      <div>OrderTaker: ${bnxPrintEsc_(waiter||'-')}</div>
+      <div>Steward: <b>${bnxPrintEsc_(waiter||'-')}</b></div>
+      <div>Order By: <b>${bnxPrintEsc_(waiter||'-')}</b></div>
       <div>Date: ${now.toLocaleString('en-IN')}</div>
       <hr style="border:none;border-top:1px dashed #000;margin:6px 0;">
       <div style="display:grid;grid-template-columns:1fr 65px 45px;font-size:12px;font-weight:800;border-bottom:1px solid #000;padding-bottom:3px;"><span>ITEM</span><span>SIZE</span><span style="text-align:right;">QTY</span></div>
@@ -14884,8 +14933,15 @@ function printBill(confirmedBillNo){
   let cgst=0, sgst=0;
   items.forEach(i=>{
     const lineAmt = i.amt * discFactor;
-    const tc = getItemTaxCat(i.name, catByName[i.name]);
-    const rate = taxCfg[tc] || TAX_CONFIG_DEFAULT.FOOD;
+    const liveItem=bnxFindLiveBillItem_(i.name)||{};
+    const masterMeta=bnxMasterTaxMeta_(liveItem,i.name);
+    const tc = masterMeta.key || getItemTaxCat(i.name, catByName[i.name], liveItem);
+    const configured=taxCfg[tc] || TAX_CONFIG_DEFAULT.FOOD;
+    const rate = {
+      cgst: masterMeta.taxId==='TAX00002' ? 0 : masterMeta.taxId==='TAX00003' ? 20 : configured.cgst,
+      sgst: masterMeta.taxId==='TAX00002' ? 0 : masterMeta.taxId==='TAX00003' ? 20 : configured.sgst,
+      hsn: masterMeta.hsn || configured.hsn
+    };
     const rowKey = tc;
     if (!taxRowsMap[rowKey]) taxRowsMap[rowKey] = { hsn:rate.hsn, taxName:(rate.cgst+rate.sgst)>0?('GST @'+(rate.cgst+rate.sgst)+'%'):'Exempted', onAmt:0, taxAmt:0 };
     taxRowsMap[rowKey].onAmt += lineAmt;
@@ -17105,7 +17161,10 @@ function resetVoucherNumbering(){
    everywhere, with zero separate state that can go stale. */
 function bnxGetBillMenu(){
   return menuData.map(m=>({
-    id: m.code, em: m.e || bnxDefaultIcon(m.c), name: m.n, cat: m.c, price: Number(m.p)||0
+    id: m.code, em: m.e || bnxDefaultIcon(m.c), name: m.n, cat: m.c, price: Number(m.p)||0,
+    taxId:m.taxId||m.TAX_ID||'', hsn:m.hsn||m.HSN_CODE||'',
+    itemGroupId:m.itemGroupId||m.ITEM_GROUP_ID||'', itemGroupName:m.itemGroupName||m.ITEM_GROUP_NAME||'',
+    isBar:!!m.isBar, menuType:m.menuType||m.MENU_TYPE||''
   }));
 }
 let bmItemRowCount=0;
@@ -17281,8 +17340,15 @@ function bmComputeTax(items, discPct, scPct){
     const lineAmt = i.amt * discFactor;
     taxOnAmt += lineAmt;
     if (bmItem){
-      const tc = getItemTaxCat(i.name, bmItem.cat);
-      const rate = taxCfg[tc] || TAX_CONFIG_DEFAULT.FOOD;
+      const liveMeta = Object.assign({},bmItem,{taxId:i.taxId||bmItem.taxId||'',itemGroupName:i.itemGroupName||bmItem.itemGroupName||'',isBar:!!(i.isBar||bmItem.isBar)});
+      const masterMeta = bnxMasterTaxMeta_(liveMeta,i.name);
+      const tc = masterMeta.key || getItemTaxCat(i.name, bmItem.cat, liveMeta);
+      const configured = taxCfg[tc] || TAX_CONFIG_DEFAULT.FOOD;
+      const rate = {
+        cgst: masterMeta.taxId==='TAX00002' ? 0 : masterMeta.taxId==='TAX00003' ? 20 : configured.cgst,
+        sgst: masterMeta.taxId==='TAX00002' ? 0 : masterMeta.taxId==='TAX00003' ? 20 : configured.sgst,
+        hsn: masterMeta.hsn || configured.hsn
+      };
       cgst += lineAmt*rate.cgst/100; sgst += lineAmt*rate.sgst/100;
       const key = tc;
       if (!taxRowsMap[key]) taxRowsMap[key] = { hsn:rate.hsn, taxName:(rate.cgst+rate.sgst)>0?('GST @'+(rate.cgst+rate.sgst)+'%'):'Exempted', onAmt:0, taxAmt:0 };
@@ -17533,9 +17599,10 @@ function bmGetBillData(){
       if(live && Number(live.price)>0){ r=Number(live.price); if(rateEl) rateEl.value=r; }
     }
     if(!Number.isFinite(r) || r<0) r=0;
-    const cat=(typeof bnxGetBillMenu==='function' ? bnxGetBillMenu().find(m=>String(m.name||'').trim().toLowerCase()===String(n).trim().toLowerCase()) : null)?.cat;
-    const taxRate=bnxItemTaxRateFraction_(n);
-    items.push({name:n,qty:q,rate:r,amt:q*r,taxRate,category:cat||''});
+    const live=(typeof bnxGetBillMenu==='function' ? bnxGetBillMenu().find(m=>String(m.name||'').trim().toLowerCase()===String(n).trim().toLowerCase()) : null);
+    const cat=live?.cat||'';
+    const taxRate=bnxItemTaxRateFraction_(n,live);
+    items.push({name:n,qty:q,rate:r,amt:q*r,taxRate,category:cat,taxId:live?.taxId||'',itemGroupName:live?.itemGroupName||'',isBar:!!live?.isBar});
   });
   if(!items.length)items=[{name:'OPEN FOOD',qty:1,rate:0,amt:0}];
   const discPct=parseFloat(document.getElementById('bm-bf-disc').value)||0;
@@ -20062,11 +20129,11 @@ async function bnxLoadMenuDataCore(){
     const barWords=/\b(bar|liquor|tobacco|alcohol|spirits|scotch|vodka|whisky|whiskey|rum|gin|tequila|brandy|cognac|beer|wine|cocktail|champagne|liqueur)\b/i;
     const isBar=bool(raw)||ids.some(id=>barIds.has(String(id).toUpperCase()))||barWords.test(groupText+' '+categoryText+' '+typeText);
     if(isBar) return null;
-    return {n:name,p:Number(row.price??row.PRICE??row.p)||0,c:String(row.category||row.CATEGORY_NAME||row.MENU_SECTION||row.c||row.MENU_CATEGORY||row.CATEGORY||'Food').trim(),v:isBar?'':bnxNormalizeVeg_(row.veg||row.v||row.VEG_TYPE||row.VEG_NONVEG||row.dietaryType||''),e:row.icon||row.e||bnxDefaultIcon(row.category||row.MENU_SECTION),fav:bool(row.favorite??row.favourite??row.FAVOURITE),pop:bool(row.popular??row.POPULAR),code:row.id||row.ITEM_ID||row.itemCode||row.ITEM_CODE||'',itemCode:row.itemCode||row.ITEM_CODE||row.id||row.ITEM_ID||'',isBar,menuType:row.menuType||row.MENU_TYPE||(isBar?'BAR':'RESTAURANT'),menuSection:row.menuSection||row.MENU_SECTION||row.category||(isBar?'BAR':''),menuActive:true,imageUrl:row.imageUrl||row.productImageUrl||row.PRODUCT_IMAGE_URL||row.IMAGE_URL||row.ITEM_IMAGE||row.itemImage||row.image||row.IMAGE||'',gst:Number(row.gst??row.GST)||0,itemGroupId:row.itemGroupId||row.ITEM_GROUP_ID||'',itemGroupName:row.itemGroupName||row.ITEM_GROUP_NAME||row.groupName||row.GROUP_NAME||'',hsn:row.hsn||row.HSN_CODE||'',printTo:row.printTo||row.PRINT_TO||row.PRINT_STATION||(isBar?'BAR':''),avail:row.avail||row.AVAILABILITY_STATUS||'available',aliases:Array.isArray(row.aliases)?row.aliases:[],menuCardKey:row.menuCardKey||((isBar?'BAR|':'FOOD|')+String(row.id||row.ITEM_ID||row.itemCode||name))};
+    return {n:name,p:Number(row.price??row.PRICE??row.p)||0,c:String(row.category||row.CATEGORY_NAME||row.MENU_SECTION||row.c||row.MENU_CATEGORY||row.CATEGORY||'Food').trim(),v:isBar?'':bnxNormalizeVeg_(row.veg||row.v||row.VEG_TYPE||row.VEG_NONVEG||row.dietaryType||''),e:row.icon||row.e||bnxDefaultIcon(row.category||row.MENU_SECTION),fav:bool(row.favorite??row.favourite??row.FAVOURITE),pop:bool(row.popular??row.POPULAR),code:row.id||row.ITEM_ID||row.itemCode||row.ITEM_CODE||'',itemCode:row.itemCode||row.ITEM_CODE||row.id||row.ITEM_ID||'',isBar,menuType:row.menuType||row.MENU_TYPE||(isBar?'BAR':'RESTAURANT'),menuSection:row.menuSection||row.MENU_SECTION||row.category||(isBar?'BAR':''),menuActive:true,imageUrl:row.imageUrl||row.productImageUrl||row.PRODUCT_IMAGE_URL||row.IMAGE_URL||row.ITEM_IMAGE||row.itemImage||row.image||row.IMAGE||'',gst:Number(row.gst??row.GST)||0,taxId:row.taxId||row.TAX_ID||row.taxID||'',itemGroupId:row.itemGroupId||row.ITEM_GROUP_ID||'',itemGroupName:row.itemGroupName||row.ITEM_GROUP_NAME||row.groupName||row.GROUP_NAME||'',hsn:row.hsn||row.HSN_CODE||'',printTo:row.printTo||row.PRINT_TO||row.PRINT_STATION||(isBar?'BAR':''),avail:row.avail||row.AVAILABILITY_STATUS||'available',aliases:Array.isArray(row.aliases)?row.aliases:[],menuCardKey:row.menuCardKey||((isBar?'BAR|':'FOOD|')+String(row.id||row.ITEM_ID||row.itemCode||name))};
   };
   const barNorm=row=>{
     const name=String(row.name||row.ITEM_NAME||'').trim(), id=String(row.itemId||row.ITEM_ID||row.id||row.itemCode||row.ITEM_CODE||'').trim(); if(!name||!id)return null;
-    return {n:name,p:Number(row.price??row.sellingPrice??row.SERVING_PRICE??0)||0,c:String(row.category||row.barCategory||row.menuSection||'BAR').trim(),v:'',e:row.icon||'🍸',fav:bool(row.favorite??row.FAVOURITE),pop:bool(row.popular??row.POPULAR),code:id,itemCode:row.itemCode||row.ITEM_CODE||id,isBar:true,menuType:row.menuType||'BAR',menuSection:row.menuSection||row.category||row.barCategory||'BAR',menuActive:true,imageUrl:row.imageUrl||row.productImageUrl||row.PRODUCT_IMAGE_URL||row.IMAGE_URL||row.ITEM_IMAGE||row.itemImage||row.image||row.IMAGE||'',gst:Number(row.gst??row.GST)||0,itemGroupId:row.itemGroupId||row.ITEM_GROUP_ID||'',itemGroupName:row.itemGroupName||row.ITEM_GROUP_NAME||row.groupName||row.GROUP_NAME||'',hsn:row.hsn||row.HSN_CODE||'',printTo:row.printTo||row.PRINT_TO||'BAR',avail:row.availability||row.AVAILABILITY_STATUS||'available',aliases:Array.isArray(row.aliases)?row.aliases:[],menuCardKey:row.menuCardKey||('BAR|'+id+'|'+String(row.menuSection||row.category||row.barCategory||'BAR')+'|'+String(row.price??row.sellingPrice??''))};
+    return {n:name,p:Number(row.price??row.sellingPrice??row.SERVING_PRICE??0)||0,c:String(row.category||row.barCategory||row.menuSection||'BAR').trim(),v:'',e:row.icon||'🍸',fav:bool(row.favorite??row.FAVOURITE),pop:bool(row.popular??row.POPULAR),code:id,itemCode:row.itemCode||row.ITEM_CODE||id,isBar:true,menuType:row.menuType||'BAR',menuSection:row.menuSection||row.category||row.barCategory||'BAR',menuActive:true,imageUrl:row.imageUrl||row.productImageUrl||row.PRODUCT_IMAGE_URL||row.IMAGE_URL||row.ITEM_IMAGE||row.itemImage||row.image||row.IMAGE||'',gst:Number(row.gst??row.GST)||0,taxId:row.taxId||row.TAX_ID||row.taxID||'',itemGroupId:row.itemGroupId||row.ITEM_GROUP_ID||'',itemGroupName:row.itemGroupName||row.ITEM_GROUP_NAME||row.groupName||row.GROUP_NAME||'',hsn:row.hsn||row.HSN_CODE||'',printTo:row.printTo||row.PRINT_TO||'BAR',avail:row.availability||row.AVAILABILITY_STATUS||'available',aliases:Array.isArray(row.aliases)?row.aliases:[],menuCardKey:row.menuCardKey||('BAR|'+id+'|'+String(row.menuSection||row.category||row.barCategory||'BAR')+'|'+String(row.price??row.sellingPrice??''))};
   };
 
   let r=null; try{ r=await gasApi('GET_POS_MENU',{},'V2_CORE'); }catch(e){ r={success:false,error:e.message}; }
@@ -38620,41 +38687,97 @@ function bnxOpenImportHub(){
     return lines.length?lines:[''];
   }
 
-  function kotRaw(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks){
+  async function kotRaw(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks){
     const width=Number((typeof bnxPaperSize==='function'?bnxPaperSize():80))===58?32:48;
     const role=roleForKOT(title);
     let outlet=''; let phone='';
-    try{ const ri=typeof bnxGetRestaurantInfo==='function'?bnxGetRestaurantInfo():{}; outlet=ri.name||ri.entity||''; phone=ri.phone||''; }catch(e){}
+    try{
+      const ri=typeof bnxGetRestaurantInfo==='function'?bnxGetRestaurantInfo():{};
+      outlet=ri.name||ri.entity||'';
+      phone=ri.phone||'';
+    }catch(e){}
     try{ outlet=outlet||document.querySelector('[data-brand-name]')?.textContent||''; }catch(e){}
-    const splitLabel=splitTotal>1 ? 'Split '+splitIndex+'/'+splitTotal : '';
+    outlet=String(outlet||'HASHTAG SILIGURI').trim();
+
+    const splitLabel=splitTotal>1 ? '  Split '+splitIndex+'/'+splitTotal : '';
     const now=new Date();
-    const out=['\x1B@','\x1Ba1','\x1BE1','******** KOT ********\n','\x1BE0'];
-    out.push('PRINTER : '+escPosText(role)+'\n');
-    out.push('DATE    : '+escPosText(now.toLocaleString('en-IN'))+'\n');
-    if(outlet) out.push('Outlet  : '+escPosText(outlet)+'\n');
-    if(phone) out.push('Phone   : '+escPosText(phone)+'\n');
-    if(orderNo) out.push('Order No: '+escPosText(orderNo)+(splitLabel?'  '+splitLabel:'')+'\n');
-    out.push('Table   : '+escPosText(table||'-')+'\n');
-    out.push('KOT No  : '+escPosText(kotNo||'-')+'\n');
-    out.push('Customer: '+escPosText(customerName||'Default Customer')+'\n');
-    out.push(line('-',width)+'\n');
-    out.push('\n');
-    out.push(cols(width,'ITEM','SIZE     QTY')+'\n');
-    out.push(line('-',width)+'\n');
+    const orderBy=String(waiter||'').trim() || '-';
+
+    /* Physical KOT format:
+       Logo -> Outlet -> station KOT -> KOT No -> Order No -> Table/Pax ->
+       Steward/Order By -> Date -> Item/Size/Qty.
+       Logo is sent as ESC/POS raster and cached, so first print loads it
+       and subsequent KOTs remain fast. */
+    const text=[];
+    text.push('\x1B@','\x1Ba1','\x1BE1');
+
+    const logoHex=await bnxBillLogoHex_();
+    const logoPrefix=text.join('');
+    if(logoHex){
+      text.length=0;
+      text.push({type:'raw',format:'command',flavor:'plain',data:logoPrefix});
+      text.push({type:'raw',format:'command',flavor:'hex',data:logoHex});
+      text.push({type:'raw',format:'command',flavor:'plain',data:'\x1Ba1\x1BE1'});
+      text.push({type:'raw',format:'command',flavor:'plain',data:
+        escPosText(outlet)+'\n'+
+        String(role+' KOT')+'\n'+
+        (kotNo?'KOT No   : '+escPosText(kotNo)+'\n':'')+
+        (orderNo?'Order No : '+escPosText(orderNo)+(splitLabel?splitLabel:'')+'\n':'')+
+        'Table    : '+escPosText(table||'-')+'\n'+
+        'Pax      : '+escPosText(covers||'-')+'\n'+
+        'Steward  : '+escPosText(orderBy)+'\n'+
+        'Order By : '+escPosText(orderBy)+'\n'+
+        'Date     : '+escPosText(now.toLocaleString('en-IN',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',hour12:true}))+'\n'
+      });
+    }else{
+      text.push(
+        escPosText(outlet)+'\n',
+        role+' KOT\n',
+        (kotNo?'KOT No   : '+escPosText(kotNo)+'\n':''),
+        (orderNo?'Order No : '+escPosText(orderNo)+(splitLabel?splitLabel:'')+'\n':''),
+        'Table    : '+escPosText(table||'-')+'\n',
+        'Pax      : '+escPosText(covers||'-')+'\n',
+        'Steward  : '+escPosText(orderBy)+'\n',
+        'Order By : '+escPosText(orderBy)+'\n',
+        'Date     : '+escPosText(now.toLocaleString('en-IN',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',hour12:true}))+'\n'
+      );
+    }
+
+    text.push(line('-',width)+'\n');
+    text.push(cols(width,'QTY','ITEM')+'\n');
+    text.push(line('-',width)+'\n');
+
     (Array.isArray(items)?items:[]).forEach(i=>{
       const qty=Number(i.qty||i.QUANTITY||1);
+      const qtyText=Number.isInteger(qty)?String(qty):qty.toFixed(2);
       const name=String(i.name||i.n||i.ITEM_NAME||'Item');
       const size=String(i.size||i.SIZE||i.package||i.PACKAGE||i.unit||'');
-      const itemLine=cols(width,name,padLeft(size,8)+' '+padLeft(String(qty),5));
-      out.push(itemLine+'\n');
+      const itemWidth=Math.max(8,width-8);
+      const itemLines=bnxKotWrapText_(name,itemWidth);
+      itemLines.forEach((nm,idx)=>{
+        if(idx===0){
+          const suffix=size ? ' '+size : '';
+          const right=padLeft(qtyText,5);
+          const leftMax=Math.max(4,width-right.length);
+          let lineText=padRight(nm.slice(0,leftMax),leftMax)+right;
+          if(suffix && lineText.length+suffix.length<=width) lineText=lineText.slice(0,width-suffix.length)+suffix;
+          text.push(lineText+'\n');
+        }else{
+          text.push('  '+nm+'\n');
+        }
+      });
       const note=String(i.note||i.notes||i.remark||i.remarks||i.instruction||'').trim();
-      if(note) out.push('  NOTE: '+escPosText(note)+'\n');
+      if(note) text.push('  NOTE: '+escPosText(note)+'\n');
     });
-    out.push(line('-',width)+'\n');
-    out.push('OrderTaker: '+escPosText(waiter||'-')+'\n');
-    if(remarks) out.push('Remarks: '+escPosText(remarks)+'\n');
-    out.push('\n\n\n','\x1DVA0');
-    return out;
+
+    text.push(line('-',width)+'\n');
+    text.push('Items : '+String(Array.isArray(items)?items.length:0)+
+              '    Total Qty : '+String((Array.isArray(items)?items:[]).reduce((a,i)=>a+(Number(i.qty||i.QUANTITY)||0),0))+'\n');
+    if(customerName) text.push('Customer : '+escPosText(customerName)+'\n');
+    if(remarks) text.push('Remarks  : '+escPosText(remarks)+'\n');
+    text.push('\n','\x1BE0','\x1DVA0');
+
+    return text;
   }
 
   const bnxQzConfigCache_={};
@@ -38789,7 +38912,7 @@ function bnxOpenImportHub(){
     try{
       const enabled=localStorage.getItem('bnx_direct_ip_print')!=='0';
       if(!enabled) return originalKot(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks);
-      const kotData=kotRaw(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks);
+      const kotData=await kotRaw(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks);
       console.info('[BNX KOT IP] sending', {role, ip:ipSettings()[role], kotNo, orderNo, splitIndex, splitTotal, lines:kotData.length});
       await directPrintRaw(role,kotData,(title||role)+' '+String(kotNo||''));
       if(typeof showNotif==='function') showNotif('🖨️ '+role+' KOT sent to '+ipSettings()[role],'success');
@@ -39948,3 +40071,213 @@ function bnxOpenImportHub(){
   });
 })();
 </script>
+
+<!-- BNX FINAL UI / QUICK-ADD / STAFF-NAME / TABLE-MEDIUM PATCH 2026-10-01 -->
+<style id="bnx-final-ui-all-fix-20261001">
+/* Medium professional table cards — no oversized cards/icons. */
+#page-tables #richTblGrid{grid-template-columns:repeat(4,minmax(220px,1fr))!important;gap:12px!important;}
+#page-tables .rtc{min-height:150px!important;height:auto!important;padding:11px 12px 10px!important;border-radius:12px!important;}
+#page-tables .rtc-no{font-size:22px!important;line-height:1.05!important;}
+#page-tables .rtc-zone{font-size:11px!important;font-weight:700!important;}
+#page-tables .rtc-info{font-size:9.5px!important;line-height:1.45!important;}
+#page-tables .rtc-btn{font-size:9.5px!important;padding:5px 8px!important;}
+#page-tables .bnx-table-type-icon{font-size:17px;line-height:1;display:inline-flex;align-items:center;justify-content:center;margin-right:5px;vertical-align:middle;}
+#page-tables .bnx-table-code{font:700 8px 'DM Mono',monospace;color:var(--text3);margin-top:2px;}
+#page-tables .rtc-delete{border-color:rgba(212,43,43,.25)!important;color:var(--red)!important;background:var(--red-bg)!important;}
+@media(max-width:1100px){#page-tables #richTblGrid{grid-template-columns:repeat(3,minmax(210px,1fr))!important;}}
+@media(max-width:800px){#page-tables #richTblGrid{grid-template-columns:repeat(2,minmax(180px,1fr))!important;}}
+@media(max-width:520px){#page-tables #richTblGrid{grid-template-columns:1fr!important;}}
+/* Quick Add must never remain as a ghost overlay after navigating back. */
+#bmQuickAddModal:not(.open){display:none!important;pointer-events:none!important;visibility:hidden!important;}
+</style>
+<script id="bnx-final-ui-all-fix-20261001-js">
+(function(){
+  'use strict';
+  var esc=function(v){return String(v==null?'':v).replace(/[&<>"']/g,function(m){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m];});};
+
+  /* ================================================================
+     1) QUICK ADD: close the modal whenever Billing/navigation changes.
+        Previously the modal could stay mounted over every page after
+        Quick Add -> item -> Back, making the menu appear everywhere.
+     ================================================================ */
+  function closeQuickAddGhost(){
+    try{
+      var m=document.getElementById('bmQuickAddModal');
+      if(m){m.classList.remove('open');m.style.display='none';m.style.visibility='hidden';m.style.opacity='';m.style.pointerEvents='none';m.setAttribute('aria-hidden','true');}
+    }catch(e){}
+  }
+  window.bnxCloseQuickAddGhost_=closeQuickAddGhost;
+  var oldShow=window.showPage;
+  if(typeof oldShow==='function' && !oldShow.__bnxGhostFix){
+    var fixedShow=function(){closeQuickAddGhost();return oldShow.apply(this,arguments);};
+    fixedShow.__bnxGhostFix=true; fixedShow.__bnxOriginal=oldShow; window.showPage=fixedShow;
+  }
+  document.addEventListener('click',function(e){
+    var t=e.target&&e.target.closest?e.target.closest('a,button,[onclick]'):null;
+    if(t && !t.closest('#bmQuickAddModal') && (String(t.getAttribute('onclick')||'').indexOf('showPage(')>=0 || String(t.getAttribute('href')||'').indexOf('#')===0)) setTimeout(closeQuickAddGhost,0);
+  },true);
+  window.addEventListener('hashchange',closeQuickAddGhost);
+
+  /* ================================================================
+     2) USER_MASTER NAME RESOLUTION: never display STF615/STFxxx in
+        Staff Performance/KOT/Bill UI when FULL_NAME exists.
+     ================================================================ */
+  window.__BNX_STAFF_NAME_MAP=window.__BNX_STAFF_NAME_MAP||{};
+  function staffRowsFromResponse(res){
+    var d=res&&res.data!==undefined?res.data:res;
+    if(d&&d.data!==undefined&&!Array.isArray(d.data))d=d.data;
+    if(Array.isArray(d))return d;
+    for(var k of ['staff','users','userMaster','USER_MASTER','rows'])if(d&&Array.isArray(d[k]))return d[k];
+    return [];
+  }
+  function putStaffRows(rows){
+    if(rows.length&&Array.isArray(rows[0])){
+      var h=rows[0].map(function(x){return String(x==null?'':x).trim().toUpperCase();});
+      rows=rows.slice(1).map(function(r){var o={};h.forEach(function(k,i){if(k)o[k]=r[i];});return o;});
+    }
+    rows.forEach(function(r){
+      var name=String(r.FULL_NAME||r.NAME||r.USER_NAME||r.DISPLAY_NAME||r.EMPLOYEE_NAME||'').trim();
+      var code=String(r.USERNAME||r.USER_CODE||r.USER_ID||r.EMPLOYEE_ID||r.ID||'').trim();
+      if(name&&code){window.__BNX_STAFF_NAME_MAP[code.toUpperCase()]=name;window.__BNX_STAFF_NAME_MAP[name.toUpperCase()]=name;}
+    });
+    try{localStorage.setItem('bnx_staff_name_map_'+(window.CLIENT_ID||'default'),JSON.stringify(window.__BNX_STAFF_NAME_MAP));}catch(e){}
+  }
+  try{
+    var saved=JSON.parse(localStorage.getItem('bnx_staff_name_map_'+(window.CLIENT_ID||'default'))||'{}');
+    if(saved&&typeof saved==='object')Object.assign(window.__BNX_STAFF_NAME_MAP,saved);
+  }catch(e){}
+  window.bnxResolveStaffDisplayName_=function(v){
+    var x=String(v==null?'':v).trim(); if(!x)return '-';
+    var hit=window.__BNX_STAFF_NAME_MAP[x.toUpperCase()];
+    if(hit)return hit;
+    return (typeof window.bnxSafeStaffName_==='function'?window.bnxSafeStaffName_(x):x);
+  };
+  async function refreshStaffMap(){
+    if(typeof window.gasApi!=='function')return;
+    try{var r=await window.gasApi('GET_STAFF_LIST',{roles:['STEWARD','WAITER','CAPTAIN','CHEF','BARTENDER']},'V2_CORE');putStaffRows(staffRowsFromResponse(r));}
+    catch(e){console.warn('[STAFF NAME MAP]',e);}
+  }
+  window.bnxRefreshStaffNameMap_=refreshStaffMap;
+  function patchPerfRenderer(){
+    if(typeof window.bnxRenderStewardPerformance_!=='function'||window.bnxRenderStewardPerformance_.__bnxNameFix)return;
+    var old=window.bnxRenderStewardPerformance_;
+    var f=function(rows){
+      if(Array.isArray(rows))rows=rows.map(function(x){var y=Object.assign({},x);y.name=window.bnxResolveStaffDisplayName_(x&&x.name);return y;});
+      return old(rows);
+    };
+    f.__bnxNameFix=true;window.bnxRenderStewardPerformance_=f;
+  }
+  function refreshPerf(){
+    try{
+      if(typeof window.loadRealDashboardData==='function')window.loadRealDashboardData();
+      else if(typeof window.loadDashboard==='function')window.loadDashboard();
+    }catch(e){}
+  }
+  refreshStaffMap().then(function(){patchPerfRenderer();setTimeout(refreshPerf,50);});
+  setTimeout(patchPerfRenderer,500);setTimeout(patchPerfRenderer,1500);
+
+  /* ================================================================
+     3) FRIENDLY TABLE NAME + TYPE ICON + MEDIUM CARD + SAFE DELETE.
+     TABLE_MASTER currently uses TABLE_NUMBER/SECTION; display the
+     human section/type clearly and keep the code secondary.
+     ================================================================ */
+  window.bnxTableTypeIcon_=function(t){
+    var z=String((t&& (t.tableType||t.typeName||t.zone||t.name))||'').toUpperCase();
+    if(/FAMILY/.test(z))return '👨‍👩‍👧';
+    if(/LOUNGE/.test(z))return '🛋️';
+    if(/BAR|BREW|PUB/.test(z))return '🍺';
+    if(/VIP/.test(z))return '⭐';
+    if(/ROOFTOP|TERRACE/.test(z))return '🌇';
+    if(/DJ|LIVE/.test(z))return '🎤';
+    if(/GARDEN|OUTDOOR/.test(z))return '🌳';
+    if(/HOOKAH|HUKKA|SHEESHA/.test(z))return '💨';
+    if(/DINING|HALL|SITTING/.test(z))return '🍽️';
+    return '🪑';
+  };
+  window.bnxTableFriendlyName_=function(t){
+    var n=String(t&& (t.displayName||t.tableName||t.name)||'').trim();
+    var code=String(t&&t.n||'').trim();
+    /* Do not expose internal UUIDs as a table name. */
+    if(!n||/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(n))n=String(t&&t.zone||'').trim();
+    return n&&n.toUpperCase()!==code.toUpperCase()?n:(String(t&&t.tableType||t.zone||'').trim()||code);
+  };
+  var oldBuild=window.bnxBuildRichTblsFromMaster;
+  if(typeof oldBuild==='function'&&!oldBuild.__bnxFriendly){
+    var build=function(){var arr=oldBuild.apply(this,arguments)||[];return arr.map(function(x){var raw=(window.tableData||[]).find(function(t){return String(t.n)===String(x.id);})||{};x.name=window.bnxTableFriendlyName_(raw);x.tableType=raw.tableType||raw.type||raw.zone||'';x.icon=window.bnxTableTypeIcon_(raw);x.code=String(x.id||'');return x;});};
+    build.__bnxFriendly=true;window.bnxBuildRichTblsFromMaster=build;
+  }
+  window.bnxDeleteTableLive_=async function(code){
+    code=String(code||'').trim(); if(!code)return false;
+    var t=(window.tableData||[]).find(function(x){return String(x.n)===code;});
+    if(!t)return false;
+    if(String(t.s||'available').toLowerCase()!=='available'){if(typeof showNotif==='function')showNotif('⚠️ Only an available/empty table can be deleted.','error');return false;}
+    if(!confirm('Delete table '+code+'?\n\nThis removes the table from the live table master.'))return false;
+    try{
+      if(typeof gasApi!=='function')throw new Error('ERP API unavailable');
+      var r=await gasApi('SAVE_TABLE_CONFIG',{mode:'DELETE',tableNo:code},'V2_CORE');
+      if(!r||!r.success)throw new Error((r&& (r.error||r.message))||'Server rejected table delete');
+      window.tableData=window.tableData.filter(function(x){return String(x.n)!==code;});
+      try{
+        var k='bnx_table_master_extra_'+(window.CLIENT_ID||'default');var ex=JSON.parse(localStorage.getItem(k)||'[]').filter(function(x){return String(x.n)!==code;});localStorage.setItem(k,JSON.stringify(ex));
+        var nk='bnx_table_names_'+(window.CLIENT_ID||'default');var ns=JSON.parse(localStorage.getItem(nk)||'{}');delete ns[code];localStorage.setItem(nk,JSON.stringify(ns));
+        var lk='bnx_floor_layout_'+(window.CLIENT_ID||'default');var ls=JSON.parse(localStorage.getItem(lk)||'{}');delete ls[code];localStorage.setItem(lk,JSON.stringify(ls));
+      }catch(e){}
+      if(typeof buildFloor==='function'){buildFloor('floorMap');buildFloor('dashMap');} if(typeof buildRichTbls==='function')buildRichTbls(); if(typeof bnxUpdateTableStats==='function')bnxUpdateTableStats();
+      if(typeof showNotif==='function')showNotif('🗑️ Table '+code+' deleted from live TABLE_MASTER','success');
+      return true;
+    }catch(e){if(typeof showNotif==='function')showNotif('❌ Delete failed: '+e.message,'error');return false;}
+  };
+  function renderTablesAgain(){try{if(typeof window.buildRichTbls==='function')window.buildRichTbls();}catch(e){}}
+  /* Replace the compact table card renderer so name/type/delete are always visible. */
+  window.renderRTC=function(g,cards){
+    if(!g)return;
+    if(!cards||!cards.length){
+      g.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:30px;color:var(--text3);font-size:13px;">No tables match this filter.</div>';
+      return;
+    }
+    window._rtcLastCards=cards;
+    g.innerHTML=cards.map(function(t){
+      var code=String(t.code||t.id||'');
+      var safeCode=code.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+      var acts=(t.actions||[]).map(function(a){
+        var fn='';
+        if(a.p){
+          fn="document.getElementById('posTable')&&(document.getElementById('posTable').textContent='"+safeCode+"');"+
+             "document.getElementById('cartTable')&&(document.getElementById('cartTable').textContent='"+safeCode+"');"+
+             "showPage('"+String(a.p).replace(/'/g,"\\'")+"',document.querySelector('[onclick*=\\\"'"+String(a.p).replace(/'/g,"\\'")+"'\\\"]'));";
+        }else fn=a.fn||'';
+        return '<button class="rtc-btn" onclick="event.stopPropagation();'+fn+'">'+esc(a.l)+'</button>';
+      }).join('');
+      if(String(t.type)==='available'){
+        acts+='<button class="rtc-btn rtc-delete" onclick="event.stopPropagation();bnxDeleteTableLive_(\''+safeCode+'\')">🗑 Delete</button>';
+      }
+      var name=window.bnxTableFriendlyName_({displayName:t.name,n:code,tableType:t.tableType,zone:t.zone});
+      var icon=t.icon||window.bnxTableTypeIcon_(t);
+      var html='<div class="rtc tc-'+esc(t.type)+'" onclick="openTableGallery(\''+safeCode+'\')">';
+      if(t.kot)html+='<div class="rtc-kot">'+esc(t.kot)+'</div>';
+      html+='<div><div class="rtc-top"><div><div class="rtc-no"><span class="bnx-table-type-icon">'+icon+'</span>'+esc(name)+'</div><div class="bnx-table-code">'+esc(code)+'</div></div><div class="rtc-pax">'+esc(t.pax)+' PAX</div></div>';
+      html+='<div class="rtc-zone">'+esc(t.zone)+'</div><div class="rtc-info">Staff : '+esc(window.bnxResolveStaffDisplayName_(t.captain||'-'))+'<br>';
+      if(t.guests)html+='Guests : '+esc(t.guests)+'<br>';
+      html+=esc(t.extra)+'</div></div><div class="rtc-bottom"><div class="rtc-amt">'+esc(t.amount||'')+'</div><div class="rtc-actions">'+acts+'</div></div></div>';
+      return html;
+    }).join('');
+  };
+  /* Re-render once the name map is ready so existing dashboard/table cards
+     immediately replace STF codes with full names. */
+  refreshStaffMap().then(function(){renderTablesAgain();});
+
+  /* KOT/Bill print UI: resolve Steward/OrderTaker code to the live name. */
+  function patchPrintFunctions(){
+    try{
+      if(typeof window.kotRaw==='function'&&!window.kotRaw.__bnxStaffName){
+        var oldKot=window.kotRaw;
+        var f=function(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks){return oldKot.call(this,title,table,window.bnxResolveStaffDisplayName_(waiter),covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks);};
+        f.__bnxStaffName=true;window.kotRaw=f;
+      }
+    }catch(e){}
+  }
+  patchPrintFunctions();setTimeout(patchPrintFunctions,700);setTimeout(patchPrintFunctions,1800);
+})();
+</script>
+
+</body></html>
