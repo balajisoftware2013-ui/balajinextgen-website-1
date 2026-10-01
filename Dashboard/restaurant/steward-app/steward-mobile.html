@@ -3937,11 +3937,23 @@ function bnxUpdateSyncBadge(){
 let bnxFlushInProgress = false;
 async function flushOutbox(){
   if (bnxFlushInProgress) return;
+  /* PASS #75: the installed app and a browser tab share one outbox in localStorage. Without a lease
+     both flushed the same entries at the same moment = same order sent twice. One tab at a time. */
+  const LK='bnx_flush_lock', me=String(Date.now())+Math.random().toString(36).slice(2);
+  try{
+    const cur=JSON.parse(localStorage.getItem(LK)||'null');
+    if(cur && Date.now()-cur.t<45000) return;
+    localStorage.setItem(LK,JSON.stringify({id:me,t:Date.now()}));
+    await new Promise(r=>setTimeout(r,60));
+    const chk=JSON.parse(localStorage.getItem(LK)||'null');
+    if(!chk || chk.id!==me) return;
+  }catch(e){}
   bnxFlushInProgress = true;
   try {
     await flushOutbox_impl_();
   } finally {
     bnxFlushInProgress = false;
+    try{ localStorage.removeItem(LK); }catch(e){}
   }
 }
 async function flushOutbox_impl_(){
@@ -4023,6 +4035,12 @@ async function flushOutbox_impl_(){
       console.error('[OUTBOX] post-sync handling threw for entry', entry.action, e && e.message ? e.message : e);
     }
   }
+  /* PASS #75: entries queued WHILE this flush was awaiting the network used to be wiped by this
+     overwrite (steward then re-entered the "missing" order = duplicate). Keep them. */
+  try{
+    const seen=new Set(list.map(e=>String(e.requestId||'')));
+    bnxGetOutbox().forEach(e=>{ if(!seen.has(String(e.requestId||''))) remaining.push(e); });
+  }catch(e){}
   bnxSetOutbox(remaining);
   if(!remaining.length && !bnxGetFailedOutbox().length) bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
   else if(anyFailed) bnxSetLiveStatus('syncing');
@@ -6766,13 +6784,17 @@ async function bnxSyncRealKotTickets_(entry, orderId, locationId){
   */
   const result={success:true,count:0,failed:0,tickets:[]};
   try{
+    window.__BNX_KOT_SYNCED_ = window.__BNX_KOT_SYNCED_ || {};
+    const syncKey=String(orderId||entry.orderNo||entry.kotNo||'');
+    if(syncKey && window.__BNX_KOT_SYNCED_[syncKey]){ console.warn('[STEWARD KOT SYNC] skipped duplicate call for',syncKey); return {success:true,count:0,failed:0,tickets:[],skipped:true}; }
+    if(syncKey) window.__BNX_KOT_SYNCED_[syncKey]=true;
     const parts=bnxKOTParts_(entry);
     if(!parts.length){result.success=false;result.failed=1;return result;}
     const identity=getCurrentStaffIdentity();
     // SPEED FIX: Kitchen/Bar/Beverage station tickets are independent.
     // Save them concurrently instead of waiting one-by-one.
     const results = await Promise.all(parts.map(async function(part){
-      const kotRequestId=bnxUuid();
+      const kotRequestId='KOT-'+syncKey+'-'+String(part.type||'KITCHEN');   // same order+station => server dedupes
       const kotReq={
         requestId:kotRequestId,
         orderNo:String(entry.orderNo||orderId||'').trim(),
@@ -8468,6 +8490,28 @@ async function bnxSendKOTFromView(){
   await placeOrder('send');
 }
 
+/* PASS #75 helpers — duplicate-order protection */
+const BNX_ATTEMPTS_ = {};            // fingerprint -> {id, at, done}
+function bnxOrderFingerprint_(tableId, items){
+  const lines=(items||[]).map(i=>String(i.itemId||i.id)+'x'+(Number(i.qty)||0)).sort().join('|');
+  return String(tableId)+'::'+lines;
+}
+function bnxAttemptId_(fp){
+  const a=BNX_ATTEMPTS_[fp];
+  if(a && !a.done && Date.now()-a.at<10*60*1000) return a.id;      // same cart, unfinished -> same id
+  const id=bnxUuid(); BNX_ATTEMPTS_[fp]={id:id,at:Date.now(),done:false}; return id;
+}
+function bnxMarkAttemptDone_(fp){ if(BNX_ATTEMPTS_[fp]){ BNX_ATTEMPTS_[fp].done=true; BNX_ATTEMPTS_[fp].doneAt=Date.now(); } }
+function bnxForgetAttempt_(fp){ delete BNX_ATTEMPTS_[fp]; }
+function bnxDupCheck_(fp){
+  const a=BNX_ATTEMPTS_[fp];
+  /* an identical order sitting in the retry outbox: never send a second copy by hand */
+  try{
+    if(a && !a.done && bnxGetOutbox().some(e=>e.action==='SAVE_ORDER' && e.requestId===a.id)) return 'PENDING';
+  }catch(e){}
+  if(a && a.done && Date.now()-(a.doneAt||0)<30000) return 'RECENT';   // identical order confirmed <30s ago
+  return 'OK';
+}
 async function placeOrder(){
   // FINAL ANTI-DUPLICATE GUARD: two fast taps on a phone can enter an
   // async handler before the first fetch disables the button. Keep ONE
@@ -8543,7 +8587,17 @@ async function bnxPlaceOrderImpl_(){
   // has actually confirmed it — matching the backend's v2 handler,
   // which generates the authoritative ID itself and ignores anything
   // the client sends as an orderId for a new order.
-  const requestId = bnxUuid();
+  /* PASS #75 DUPLICATE-ORDER GUARD.
+     Same table + same cart = same requestId, so a retry (manual re-tap after a timeout, or the
+     outbox) is recognised by the server as the SAME order instead of creating a second one. */
+  const fp = bnxOrderFingerprint_(selTable.id, items);
+  const dupState = bnxDupCheck_(fp);
+  if(dupState==='PENDING'){ toast('⏳ This exact order is already queued/sending — do not send again. Use Profile → Sync Now.','error'); return; }
+  if(dupState==='RECENT'){
+    if(!confirm('This same order was sent for '+selTable.id+' a few seconds ago.\n\nSend it AGAIN as a new round?')) return;
+    bnxForgetAttempt_(fp);   /* deliberate repeat -> new request id */
+  }
+  const requestId = bnxAttemptId_(fp);
   const btn = document.querySelector('#s-new-order .btn-primary[onclick="placeOrder()"]');
   if(btn){ btn.disabled = true; btn.textContent = 'Sending…'; }
   toast('Sending KOT…','info');
@@ -8589,11 +8643,13 @@ async function bnxPlaceOrderImpl_(){
       waiter:stewardName, steward:stewardName, covers:(window.bnxGuests74?window.bnxGuests74():''), items, amount, customerName:customerFields.customerName, customerMobile:customerFields.customerMobile, orderTime, status:'PENDING_SYNC', userId:identity.userId, USER_ID:identity.userId, createdById:identity.userId, CREATED_BY_ID:identity.userId, loginId:identity.loginId, LOGIN_ID:identity.loginId, createdByLogin:identity.loginId, CREATED_BY_LOGIN:identity.loginId, createdByName:stewardName, CREATED_BY_NAME:stewardName };
     bnxLoadOpenKots(); KOT.unshift(localTag); bnxSetOpenKotsRaw(JSON.stringify(KOT));
     order={};
+    try{ updateOrderBadge(); refreshCurrentMenuView_(); bnxToggleOrderDrawer_(false); }catch(e){}
     setTimeout(() => showScreen('s-home'), 1200);
     return;
   }
 
   bnxSetLiveStatus('live');
+  bnxMarkAttemptDone_(fp);
   // FIX ("new orders show KOT number 'undefined'"): res.serverId and
   // res.orderId have never existed on bnxSaveOrder's response — the
   // backend actually returns {success, transactionId, data: {...,
@@ -8675,6 +8731,7 @@ async function bnxPlaceOrderImpl_(){
   order={};
   selectOccasion('None');
   bnxClearOrderCustomerFields_();
+  try{ updateOrderBadge(); refreshCurrentMenuView_(); bnxToggleOrderDrawer_(false); }catch(e){}
 
   // FIX ("My Orders / My Running Tables not showing on Home"):
   // bnxUpdateTableOverlay() previously only patched status/covers/bill —
