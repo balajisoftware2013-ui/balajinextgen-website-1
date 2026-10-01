@@ -37831,6 +37831,8 @@ function bnxOpenImportHub(){
   const QZ_SRC='https://cdn.jsdelivr.net/npm/qz-tray@2.3.0/qz-tray.js';
   let qzLoadPromise=null;
   let qzConnectPromise=null;
+  let qzUnavailableUntil=0;
+  const QZ_RETRY_COOLDOWN=30000;
 
   const DEFAULT_IPS={
     BILL:'192.168.0.210',
@@ -37875,14 +37877,23 @@ function bnxOpenImportHub(){
     return qzLoadPromise;
   }
 
-  function connectQz(){
-    if(!window.qz) return loadQz().then(connectQz);
-    try{ if(qz.websocket.isActive()) return Promise.resolve(); }catch(e){}
+  function connectQz(force){
+    if(!force && Date.now()<qzUnavailableUntil) return Promise.reject(new Error('QZ Tray unavailable. Start QZ Tray on this Windows PC and retry Connect.'));
     if(qzConnectPromise) return qzConnectPromise;
-    qzConnectPromise=qz.websocket.connect().finally(()=>{qzConnectPromise=null;});
+    qzConnectPromise=(async function(){
+      await loadQz();
+      if(qz.websocket.isActive()){qzUnavailableUntil=0;return;}
+      try{
+        // One secure endpoint, not the default eight-port/two-host scan.
+        await qz.websocket.connect({host:'localhost',port:{secure:[8181],insecure:[8182]},usingSecure:true,retries:0});
+        qzUnavailableUntil=0;
+      }catch(e){
+        qzUnavailableUntil=Date.now()+QZ_RETRY_COOLDOWN;
+        throw new Error('QZ Tray is not running/reachable at localhost:8181. Install/start it, allow browser local-device access, then retry. '+(e.message||e));
+      }
+    })().finally(()=>{qzConnectPromise=null;});
     return qzConnectPromise;
   }
-
   function escPosText(s){
     return String(s==null?'':s)
       .replace(/₹/g,'Rs ')
@@ -37980,15 +37991,17 @@ function bnxOpenImportHub(){
     const ips=ipSettings();
     try{
       setStatus('Connecting QZ Tray…',false);
-      await connectQz();
+      await connectQz(true);
       const checks=Object.entries(ips).filter(([k,v])=>v).map(([role,ip])=>{
         const cfg=qz.configs.create({host:ip,port:9100});
         return qz.print(cfg,['\x1B@','IP TEST '+role+' '+ip+'\n','\n','\x1DVA0']).then(()=>role+' '+ip+' ✓');
       });
-      const done=await Promise.all(checks);
-      setStatus('IP printing connected · '+done.length+' printer(s)',true);
-      if(typeof showNotif==='function') showNotif('✅ IP printer test sent to '+done.length+' printer(s)','success');
-      return true;
+      const results=await Promise.allSettled(checks);
+      const good=results.filter(r=>r.status==='fulfilled').length;
+      const failed=results.length-good;
+      setStatus('QZ connected · '+good+' job(s) accepted · '+failed+' failed. Confirm physical slips.',failed===0);
+      if(typeof showNotif==='function') showNotif('Printer tests: '+good+' accepted, '+failed+' failed. Check physical slips.',failed?'error':'success');
+      return failed===0;
     }catch(e){
       setStatus('QZ Tray not connected — browser print remains active',false);
       if(typeof showNotif==='function') showNotif('⚠️ IP printing unavailable: install/start QZ Tray, then connect again','error');
@@ -38005,11 +38018,11 @@ function bnxOpenImportHub(){
       const data=['\x1B@','\x1Ba1','\x1BE1',escPosText(label||role)+'\n','\x1BE0',line('-',width)+'\n','Balaji NextGen ERP\n','DIRECT IP / ESC-POS TEST\n','Printer: '+ipSettings()[role]+'\n',new Date().toLocaleString('en-IN')+'\n',line('-',width)+'\n','PRINT OK\n','\n\n\n','\x1DVA0'];
       await directPrintRaw(role,data,'BNX '+role+' Test');
       setStatus(role+' IP print OK · '+ipSettings()[role],true);
-      if(typeof showNotif==='function') showNotif('✅ '+role+' IP printer received test print','success');
+      if(typeof showNotif==='function') showNotif('Test job accepted for '+role+' — confirm printed slip','success');
     }catch(e){
       setStatus('Direct IP unavailable — using browser print',false);
       console.warn('[BNX IP TEST]',e);
-      if(typeof originalTest==='function') originalTest(label);
+      if(typeof showNotif==='function') showNotif('Direct test failed: '+(e.message||e)+' — use browser print if needed','error');
     }
   };
 
@@ -38019,7 +38032,7 @@ function bnxOpenImportHub(){
       const enabled=localStorage.getItem('bnx_direct_ip_print')!=='0';
       if(!enabled) return originalBill(d);
       await directPrintRaw('BILL',billRaw(d),'Bill '+String(d?.billNo||''));
-      if(typeof showNotif==='function') showNotif('🖨️ Bill sent directly to '+ipSettings().BILL,'success');
+      if(typeof showNotif==='function') showNotif('Bill print job accepted: '+ipSettings().BILL,'success');
     }catch(e){
       console.warn('[BNX BILL IP PRINT] falling back to browser print:',e);
       if(typeof showNotif==='function') showNotif('⚠️ Direct IP print unavailable — opening normal print','error');
@@ -38034,7 +38047,7 @@ function bnxOpenImportHub(){
       const enabled=localStorage.getItem('bnx_direct_ip_print')!=='0';
       if(!enabled) return originalKot(title,table,waiter,covers,items,kotNo);
       await directPrintRaw(role,kotRaw(title,table,waiter,covers,items,kotNo),(title||role)+' '+String(kotNo||''));
-      if(typeof showNotif==='function') showNotif('🖨️ '+role+' KOT sent to '+ipSettings()[role],'success');
+      if(typeof showNotif==='function') showNotif(role+' KOT job accepted: '+ipSettings()[role],'success');
     }catch(e){
       console.warn('[BNX KOT IP PRINT] falling back to browser print:',e);
       if(typeof showNotif==='function') showNotif('⚠️ Direct IP KOT unavailable — opening normal print','error');
@@ -38043,8 +38056,7 @@ function bnxOpenImportHub(){
   };
 
   document.addEventListener('DOMContentLoaded',()=>{
-    try{ localStorage.setItem('bnx_direct_ip_print','1'); }catch(e){}
-    setStatus('Direct IP printing ready · QZ Tray required',false);
+    setStatus('QZ Tray connection not yet tested · click Connect IP Printers',false);
   });
 })();
 
