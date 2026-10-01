@@ -38402,3 +38402,200 @@ function bnxOpenImportHub(){
 })();
 </script>
 
+
+
+<!-- =====================================================================
+     FINAL LIVE DASHBOARD FIX — 2026-10-01
+     Fixes observed in live screenshot:
+       1) KOT queue showing impossible 77701m-style stale timers
+       2) old/stale KOTs being treated as active
+       3) DB status bar remaining on "Checking connections…"
+       4) accidental POS/menu filter layer leaking over Dashboard
+       5) dashboard KOT queue using the same safe live-time rules
+     This patch is intentionally LAST so it owns the final runtime behavior.
+===================================================================== -->
+<style id="bnx-final-live-dashboard-fix-20261001">
+/* Dashboard must never inherit POS menu/filter layers.  Only the active
+   .page may be visible; this is scoped to page containers and does not touch
+   legitimate modal overlays. */
+.page:not(.active){display:none!important;visibility:hidden!important;pointer-events:none!important;}
+#page-dashboard.active{display:block!important;visibility:visible!important;pointer-events:auto!important;}
+/* If a POS filter was left sticky/positioned by an older runtime, it must stay
+   inside POS and can never paint over Dashboard. */
+#page-pos:not(.active) #posCats,
+#page-pos:not(.active) #posGroups,
+#page-pos:not(.active) #posSubCats,
+#page-pos:not(.active) .pos-cats,
+#page-pos:not(.active) .pos-groups{display:none!important;visibility:hidden!important;pointer-events:none!important;}
+/* Connection text should remain readable and compact. */
+#dbSync{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:230px;}
+</style>
+<script id="bnx-final-live-dashboard-fix-20261001-js">
+(function(){
+  'use strict';
+
+  /* ------------------------------------------------------------------
+     1. KOT TIME SAFETY
+     Google Sheets can return several date shapes.  A queue ticket is an
+     operational object, not a historical record: an active KOT older than
+     24 hours is treated as stale and is not shown as live.  This prevents
+     impossible values such as 77,701 minutes from reaching the UI.
+  ------------------------------------------------------------------ */
+  const KOT_MAX_LIVE_AGE_MS = 24 * 60 * 60 * 1000;
+
+  function kotDateMs_(value){
+    if(value instanceof Date){
+      const n=value.getTime(); return Number.isFinite(n)?n:NaN;
+    }
+    if(value===null || value===undefined || value==='') return NaN;
+    const raw=String(value).trim();
+    if(!raw) return NaN;
+
+    /* Numeric epoch values. */
+    if(/^\d{10,13}$/.test(raw)){
+      const n=Number(raw);
+      const ms=raw.length===10?n*1000:n;
+      return Number.isFinite(ms)?ms:NaN;
+    }
+
+    /* ISO / normal JS date strings. */
+    const direct=Date.parse(raw);
+    if(Number.isFinite(direct)) return direct;
+
+    /* DD-MM-YYYY / DD/MM/YYYY HH:mm[:ss] fallback. */
+    let m=raw.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})(?:[ T]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+    if(m){
+      const d=new Date(Number(m[3]),Number(m[2])-1,Number(m[1]),Number(m[4]||0),Number(m[5]||0),Number(m[6]||0));
+      const n=d.getTime(); return Number.isFinite(n)?n:NaN;
+    }
+    return NaN;
+  }
+
+  function kotOperational_(k){
+    if(!k) return false;
+    const status=String(k.status||'NEW').trim().toUpperCase();
+    if(['READY','SERVED','BILLED','CANCELLED','VOID','COMPLETED','SETTLED'].includes(status)) return false;
+    const ms=kotDateMs_(k.time);
+    if(!Number.isFinite(ms)) return false;
+    const age=Date.now()-ms;
+    /* Future timestamps can happen because of small clock differences; allow
+       up to 10 minutes into the future, but never an invalid/ancient ticket. */
+    return age >= -10*60*1000 && age <= KOT_MAX_LIVE_AGE_MS;
+  }
+  window.bnxKotOperational_=kotOperational_;
+  window.bnxKotElapsedMin=function(value){
+    const ms=kotDateMs_(value);
+    if(!Number.isFinite(ms)) return 0;
+    const age=Math.max(0,Date.now()-ms);
+    return Math.min(Math.floor(age/60000),24*60);
+  };
+  window.nxKotElapsedMin=window.bnxKotElapsedMin;
+
+  /* Replace the two live dashboard/KOT renderers with stale-safe versions
+     while preserving all existing card/detail behavior. */
+  function liveKots_(){
+    try{
+      const all=typeof bnxGetKotStore==='function'?bnxGetKotStore():[];
+      return Array.isArray(all)?all.filter(kotOperational_):[];
+    }catch(e){ return []; }
+  }
+
+  window.bnxSyncKotBadge=function(){
+    const all=liveKots_();
+    const active=all.filter(k=>!['READY','SERVED','BILLED','CANCELLED'].includes(String(k.status||'').toUpperCase()));
+    const n=active.length;
+    const badge=document.getElementById('kotBadge');
+    if(badge){badge.textContent=String(n);badge.style.display=n?'':'none';}
+    document.querySelectorAll('.card-header .card-title').forEach(function(el){
+      if(el.textContent.trim()==='KOT Queue' && el.nextElementSibling && el.nextElementSibling.classList.contains('nav-badge')){
+        el.nextElementSibling.textContent=String(n);
+        el.nextElementSibling.style.display=n?'':'none';
+      }
+    });
+    const fresh=active.filter(k=>!k.status||String(k.status).toUpperCase()==='NEW').length;
+    const progress=active.filter(k=>['PROGRESS','IN_PROGRESS'].includes(String(k.status||'').toUpperCase())).length;
+    const ready=all.filter(k=>String(k.status||'').toUpperCase()==='READY').length;
+    const delayed=active.filter(k=>window.bnxKotElapsedMin(k.time)>=20).length;
+    const set=(id,v)=>{const el=document.getElementById(id);if(el)el.textContent=String(v);};
+    set('kot-stat-new',fresh); set('kot-stat-progress',progress); set('kot-stat-ready',ready); set('kot-stat-delayed',delayed);
+    const subText=n+' active · '+delayed+' urgent · Real-time sync';
+    const sub=document.getElementById('kotPageSub'); if(sub)sub.textContent=subText;
+    if(typeof PAGE_META!=='undefined'&&PAGE_META.kot)PAGE_META.kot[1]=subText;
+    const topSub=document.getElementById('pgSub');
+    if(topSub&&document.getElementById('page-kot')?.classList.contains('active'))topSub.textContent=subText;
+  };
+
+  window.buildDashKotList=function(){
+    const el=document.getElementById('dashKotList'); if(!el)return;
+    const store=liveKots_().slice(0,5);
+    if(!store.length){el.innerHTML='<div style="font-size:11px;color:var(--text3);padding:8px 0;">No active KOTs right now.</div>';window._dashKots=[];return;}
+    const kots=store.map(k=>{
+      const mins=window.bnxKotElapsedMin(k.time);
+      return {t:k.table||'—',tm:mins+'m',u:mins>=20,i:(k.items||[]).map(it=>(it.name||it.n||'Item')+' x'+(it.qty||1)).join(', ')||'—',chef:k.type==='BAR'?'Bar Station':'Kitchen Station',captain:k.waiter||'—',kotNo:k.kotNo,status:k.status||'NEW',items:k.items||[],covers:k.covers||'2',type:k.type||'KITCHEN'};
+    });
+    el.innerHTML=kots.map((k,idx)=>`<div style="display:flex;align-items:center;gap:7px;padding:7px 0;border-bottom:1px solid var(--border);cursor:pointer;" onclick="openKotDetail(${idx})"><span class="mono" style="font-size:11px;font-weight:700">${String(k.t).replace(/[<>&\"']/g,'')}</span><span style="flex:1;font-size:10px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${String(k.i).replace(/[<>&\"']/g,'')}</span><span class="pill ${k.u?'p-r':'p-gold'}" style="font-size:9px;">⏱ ${k.tm}</span></div>`).join('');
+    window._dashKots=kots;
+  };
+
+  /* ------------------------------------------------------------------
+     2. CONNECTION STATUS
+     The original checkAllDBs() only ran from Settings, so the dashboard
+     header could remain on its static "Checking connections…" text forever.
+     Run it once after startup and periodically, without blocking the page.
+  ------------------------------------------------------------------ */
+  let healthBusy=false;
+  async function runHealth_(){
+    if(healthBusy)return;
+    healthBusy=true;
+    const sync=document.getElementById('dbSync');
+    if(sync)sync.textContent='Checking connections…';
+    try{
+      if(typeof checkAllDBs==='function') await Promise.race([
+        checkAllDBs(false),
+        new Promise(resolve=>setTimeout(resolve,12000))
+      ]);
+      const auth=document.getElementById('dbAuth'), core=document.getElementById('dbCore');
+      const ok=!!(auth?.classList.contains('online')&&core?.classList.contains('online'));
+      if(sync){
+        const t=new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});
+        sync.textContent=ok?'Connected · '+t:'Connection check failed · retrying';
+        sync.title=ok?'Auth and Core are online':'One or more ERP services could not be verified';
+      }
+    }catch(e){
+      if(sync){sync.textContent='Connection check failed · retrying';sync.title=String(e&&e.message||e);}
+    }finally{healthBusy=false;}
+  }
+  window.bnxRunLiveHealthCheck_=runHealth_;
+
+  /* ------------------------------------------------------------------
+     3. PAGE VISIBILITY GUARD
+     A stale POS runtime must not leave its filter rail visible over the
+     Dashboard.  Keep exactly one page active according to navigation state.
+  ------------------------------------------------------------------ */
+  function enforcePage_(){
+    const current=String(window._navCurrentPage||((location.hash||'#dashboard').replace(/^#/,'')||'dashboard'));
+    const target=document.getElementById('page-'+current)||document.getElementById('page-dashboard');
+    if(!target)return;
+    document.querySelectorAll('.page').forEach(function(p){
+      if(p===target){p.classList.add('active');p.style.removeProperty('display');p.style.removeProperty('visibility');p.style.removeProperty('pointer-events');}
+      else{p.classList.remove('active');p.style.setProperty('display','none','important');p.style.setProperty('visibility','hidden','important');p.style.setProperty('pointer-events','none','important');}
+    });
+  }
+  window.bnxEnforceSinglePage_=enforcePage_;
+
+  function start_(){
+    enforcePage_();
+    setTimeout(enforcePage_,100);
+    setTimeout(enforcePage_,700);
+    setTimeout(runHealth_,900);
+    setInterval(function(){
+      enforcePage_();
+      if(document.getElementById('page-dashboard')?.classList.contains('active')){
+        try{bnxSyncKotBadge();buildDashKotList();}catch(e){}
+      }
+    },15000);
+    setInterval(runHealth_,60000);
+  }
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start_,{once:true});else start_();
+})();
+</script>
