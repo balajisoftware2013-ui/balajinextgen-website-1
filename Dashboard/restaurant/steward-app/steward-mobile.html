@@ -3,7 +3,7 @@
 <head>
 <!-- BNX PASS39 — steward live audit: outbox online-handler rejection guard; no demo/live data changes. -->
 
-<meta charset="UTF-8">
+<meta charset="UTF-8">\n<!-- BNX PASS40 — ONE ITEM DELETE SAFE: UPDATE_ORDER_ITEMS only; never SAVE_ORDER/cancel whole KOT. -->
 <script>
 /* ══════════════════════════════════════════════════════
    FIX ("auto colour changes and flash"): the steward theme
@@ -6928,15 +6928,29 @@ async function bnxSyncRealKotTickets_(entry, orderId, locationId){
     result.success=false;result.failed=Math.max(1,result.failed);console.error('[STEWARD SAVE_KOT]',e);return result;
   }
 }
+/* PASS: physical station resolver. Use the same authoritative item-group
+   routing used for SAVE_KOT/KDS, so direct printing cannot diverge from the
+   server split. */
+function bnxPhysicalKOTRole_(item){
+  item=item||{};
+  let m=null;
+  try{ m=(Array.isArray(MENU)?MENU:[]).find(x=>String(x.id||x.ITEM_ID||x.itemId)===String(item.id||item.ITEM_ID||item.itemId)); }catch(e){}
+  const t=bnxKOTGroupType_(item,m);
+  const u=String(t||'').toUpperCase().trim();
+  if(/HUKKA|HOOKAH|SHEESHA|SHISHA/.test(u)) return 'HUKKA';
+  if(/BAR|BEVERAGE|LIQUOR|SPIRITS/.test(u)) return 'BAR';
+  return 'KITCHEN';
+}
+
 function bnxKOTParts_(k){
   const parts=new Map();
   (k && Array.isArray(k.items) ? k.items : []).forEach(raw=>{
     const i=Object.assign({},raw);
-    let m=null;
-    try{ m=MENU.find(x=>String(x.id)===String(i.id||i.ITEM_ID||i.itemId)); }catch(e){}
-    const type=bnxKOTGroupType_(i,m);
-    if(!parts.has(type)) parts.set(type,[]);
-    parts.get(type).push(i);
+    const role=bnxPhysicalKOTRole_(i);
+    /* Keep the physical role as the part type. Server/KDS metadata remains
+       untouched; this function only decides where the physical ticket goes. */
+    if(!parts.has(role)) parts.set(role,[]);
+    parts.get(role).push(i);
   });
   return Array.from(parts.entries()).map(([type,items])=>({type,items}));
 }
@@ -7507,7 +7521,7 @@ async function printKOTTicket(kotNo, partType){
    ======================================================================== */
 (function(){
   if(window.__bnxStewardDirectKotV1) return;
-  window.__bnxStewardDirectKotV1=true;
+  window.__bnxStewardDirectKotV2=true;
 
   const QZ_SRC='https://cdn.jsdelivr.net/npm/qz-tray@2.3.0/qz-tray.js';
   let qzLoadPromise=null, qzConnectPromise=null;
@@ -7549,7 +7563,13 @@ async function printKOTTicket(kotNo, partType){
   */
   function role_(type){
     const t=String(type||'').toUpperCase().trim();
-    if(/HUKKA|HOOKAH|SHEESHA/.test(t)) return 'HUKKA';
+    /* Explicit station names always win. This prevents a test/print call
+       using BILL/KITCHEN/BAR/HUKKA from being reclassified by keyword rules. */
+    if(t==='BILL'||t==='BILLING'||t==='RECEIPT') return 'BILL';
+    if(t==='HUKKA'||t==='HOOKAH'||t==='SHEESHA'||t==='SHISHA') return 'HUKKA';
+    if(t==='BAR'||t==='BEVERAGE'||t==='LIQUOR'||t==='SPIRITS') return 'BAR';
+    if(t==='KITCHEN'||t==='KDS'||t==='FOOD') return 'KITCHEN';
+    if(/HUKKA|HOOKAH|SHEESHA|SHISHA/.test(t)) return 'HUKKA';
     if(/BAR|BEVERAGE|LIQUOR|SPIRITS|ALCOHOL|COCKTAIL|MOCKTAIL|JUICE|BEER|WINE|WHISKY|WHISKEY|VODKA|RUM|GIN|TEQUILA|CIGARETTE|TOBACCO/.test(t)) return 'BAR';
     return 'KITCHEN';
   }
@@ -7695,6 +7715,8 @@ async function printKOTTicket(kotNo, partType){
 /* Diagnostic: inspect the exact station split before printing a live KOT.
    Returns only station names, configured IPs and item names; it does not
    change the order or database. */
+window.bnxClient10KOTPrinters=function(){ return {BILL:'192.168.0.210:9100',KITCHEN:'192.168.0.192:9100',HUKKA:'192.168.0.195:9100',BAR:'192.168.0.151:9100'}; };
+
 window.bnxKOTItemGroupRouting=function(items){
   const arr=Array.isArray(items)?items:[];
   const out={KITCHEN:[],BAR:[],HUKKA:[]};
@@ -9124,16 +9146,32 @@ async function bnxPlaceOrderImpl_(){
   // Wrapped so a print failure (no printer connected, popup blocked)
   // never breaks the order that has already been successfully placed.
   try{
-    if(typeof printKOTTicket==='function'){
-      const printParts=bnxKOTParts_(entry);
-      for(const p of printParts){
-        try{ await printKOTTicket(orderId,p.type); }
-        catch(e){ console.error('[KOT PRINT PART]',p.type,e); }
-      }
+    /* DIRECT PRINT FIX: do NOT call printKOTTicket(orderId, ... ) here.
+       orderId is the ORDER_MASTER id, while printKOTTicket() searches the
+       local KOT list by KOT number. Those identifiers are different, so the
+       automatic print could say KOT not found even though SAVE_ORDER/SAVE_KOT
+       succeeded. Print the exact already-confirmed entry/part directly to
+       its physical station printer instead. */
+    const printParts=bnxKOTParts_(entry);
+    for(const p of printParts){
+      try{
+        const ok=await bnxDirectKOTPrint_(p.type,{
+          title:String(p.type||'KITCHEN')+' KOT',
+          table:entry.table||'',
+          waiter:entry.waiter||entry.steward||'',
+          covers:entry.covers||'',
+          items:p.items||[],
+          kotNo:entry.kotNumber||entry.kotNo||'',
+          orderNo:entry.orderNo||orderId||'',
+          customerName:entry.customerName||'Default Customer',
+          remarks:entry.remarks||''
+        });
+        if(!ok) console.warn('[KOT PRINT PART] direct printer unavailable',p.type);
+      }catch(e){ console.error('[KOT PRINT PART]',p.type,e); }
     }
   }catch(e){
     console.error('[KOT PRINT]', e);
-    toast('⚠️ Order sent, but KOT ticket did not print — check printer','error');
+    toast('⚠️ Order saved, but direct KOT printer failed — check QZ Tray/printer','error');
   }
   PLACED_ORDERS[orderId] = {
     id: orderId, table: selTable.id, items: JSON.parse(JSON.stringify(items)), amount, steward: stewardName,
@@ -9319,12 +9357,16 @@ function adjustOrderQty(orderId, itemIdx, delta){
 function removeOrderItem(orderId, itemIdx){
   const order = PLACED_ORDERS[orderId];
   if(!order || !order.items[itemIdx]) return;
-  order.items.splice(itemIdx, 1);
-  if(order.items.length === 0){
-    closeOrderReplacementModal();
-    toast('No items left in order','info');
+
+  // Never allow the item editor's Remove button to turn a live KOT into an
+  // empty order. One-item removal is an ITEM edit; whole-order cancellation
+  // remains a separate Cancel Order action.
+  if(order.items.length <= 1){
+    toast('⚠️ This is the last item. Use Cancel Order if you want to cancel the whole KOT.','error');
     return;
   }
+
+  order.items.splice(itemIdx, 1);
   openOrderReplacementModal(orderId);
 }
 
@@ -9406,26 +9448,85 @@ async function sendModifiedOrder(orderId){
   order.originalItems = JSON.parse(JSON.stringify(order.items));
   renderKOT();
 
-  // FIX (audit #5): requestId was generated but never put INSIDE the
-  // payload sent to SAVE_ORDER, so idempotency protection did nothing
-  // for a modified KOT — a network retry of this exact call could
-  // create a duplicate server-side update. Now included in the
-  // payload for both the live call and the queued retry payload.
+  // FIX v7 — ONE-ITEM DELETE MUST NEVER CANCEL/RECREATE THE WHOLE ORDER.
+  // The normal SAVE_ORDER endpoint is CREATE/ADD-ITEMS logic in V2 CORE:
+  // sending a modified item list to SAVE_ORDER can append/reconcile the
+  // wrong way and is NOT an order-edit API. The live V2 CORE already exposes
+  // UPDATE_ORDER_ITEMS, which replaces ONLY this order's ORDER_ITEMS rows
+  // while leaving ORDER_MASTER and the other order lines intact.
+  //
+  // Keep the complete original snapshot so a future retry/diagnostic can
+  // distinguish the one removed line from the lines that must remain.
   const requestId = bnxUuid();
   const i = getCurrentStaffIdentity();
   const authoritativeOrderId = order.orderId || (existingKot && existingKot.orderId) || order.id;
   const authoritativeOrderNo = order.orderNo || (existingKot && existingKot.orderNo) || order.id;
-  const editPayload = {requestId, stewardApp:true, orderId:authoritativeOrderId, orderNumber:authoritativeOrderNo, kotNo:order.id, updateExisting:true, mode:'UPDATE', tableId:order.table, locationId:i.locationId||'', orderType:'DINEIN', orderSource:'POS', waiter:order.steward, steward:order.steward, waiterName:order.steward, waiterLogin:i.loginId, createdById:i.userId, createdByLogin:i.loginId, createdByName:order.steward, items:JSON.parse(JSON.stringify(order.items))};
-  const res = await gasApi('SAVE_ORDER', editPayload, 'V2_CORE');
+  const beforeItems = Array.isArray(order.originalItems)
+    ? JSON.parse(JSON.stringify(order.originalItems))
+    : (existingKot && Array.isArray(existingKot.items)
+        ? JSON.parse(JSON.stringify(existingKot.items))
+        : []);
+  const afterItems = JSON.parse(JSON.stringify(order.items));
+
+  // Safety: UPDATE_ORDER_ITEMS requires at least one item. Never turn a
+  // single remaining line into an accidental whole-order cancellation.
+  if(!afterItems.length){
+    toast('⚠️ At least one item must remain. Use Cancel Order for the whole KOT.','error');
+    return;
+  }
+
+  const afterKeys = new Set(afterItems.map(function(x){
+    return String(x.id||x.ITEM_ID||x.itemId||x.name||'').trim();
+  }));
+  const removedItems = beforeItems.filter(function(x){
+    const key=String(x.id||x.ITEM_ID||x.itemId||x.name||'').trim();
+    return key && !afterKeys.has(key);
+  });
+
+  const editPayload = {
+    requestId,
+    stewardApp:true,
+    orderId:authoritativeOrderId,
+    orderNumber:authoritativeOrderNo,
+    kotNo:order.id,
+    updateExisting:true,
+    mode:'UPDATE_ITEMS',
+    tableId:order.table,
+    locationId:i.locationId||'',
+    orderType:'DINEIN',
+    orderSource:'POS',
+    waiter:order.steward,
+    steward:order.steward,
+    waiterName:order.steward,
+    waiterLogin:i.loginId,
+    createdById:i.userId,
+    createdByLogin:i.loginId,
+    createdByName:order.steward,
+    items:afterItems,
+    originalItems:beforeItems,
+    removedItems:removedItems,
+    removedItemCount:removedItems.length
+  };
+
+  // IMPORTANT: use the dedicated order-edit API, NOT SAVE_ORDER.
+  const res = await gasApi('UPDATE_ORDER_ITEMS', editPayload, 'V2_CORE');
   if(!res || !res.success){
-    bnxQueuePending('SAVE_ORDER', editPayload, requestId, 'kot-edit:'+order.id);
-    toast('📴 Could not confirm the change with the server — queued, will retry automatically. Kitchen still sees the update on this device.','error');
+    bnxQueuePending('UPDATE_ORDER_ITEMS', editPayload, requestId, 'kot-edit:'+order.id);
+    toast('📴 Item change could not be confirmed — queued for retry. Other items were not cancelled.','error');
     bnxSetLiveStatus('offline');
   } else {
     bnxLoadOpenKots();
     const k2 = KOT.find(x=>x.kotNo===order.id);
-    if(k2){ k2.pendingLocalEdit = false; bnxSetOpenKotsRaw(JSON.stringify(KOT)); }
-    toast('✅ Modified KOT sent to kitchen — confirmed on server','success');
+    if(k2){
+      k2.items = JSON.parse(JSON.stringify(afterItems));
+      k2.amount = newTotal;
+      k2.status = 'MODIFIED';
+      k2.pendingLocalEdit = false;
+      bnxSetOpenKotsRaw(JSON.stringify(KOT));
+    }
+    toast(removedItems.length
+      ? '✅ Item removed — remaining items kept and order updated'
+      : '✅ Order updated — remaining items kept','success');
   }
 
   closeOrderReplacementModal();
