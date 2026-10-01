@@ -37880,22 +37880,49 @@ function bnxOpenImportHub(){
     if(!window.qz) return loadQz().then(connectQz);
     try{ if(qz.websocket.isActive()) return Promise.resolve(); }catch(e){}
     if(qzConnectPromise) return qzConnectPromise;
-    /* QZ Tray is a LOCAL desktop service. Retry its documented secure
-       localhost ports briefly, but never create a request storm. */
-    qzConnectPromise=qz.websocket.connect({
-      retries: 3,
-      delay: 1,
-      host: ['localhost','localhost.qz.io']
-    }).finally(()=>{qzConnectPromise=null;});
+
+    /* QZ Tray is a LOCAL desktop service.  Try the documented secure
+       WebSocket ports first.  On current Chromium/Edge builds, if the
+       secure localhost handshake is blocked by certificate/LNA policy,
+       make one bounded insecure-port attempt.  Never create a request storm. */
+    qzConnectPromise=(async function(){
+      let secureErr=null;
+      try{
+        return await qz.websocket.connect({
+          retries: 3,
+          delay: 1,
+          host: ['localhost','localhost.qz.io'],
+          usingSecure: true
+        });
+      }catch(e){ secureErr=e; }
+
+      try{
+        return await qz.websocket.connect({
+          retries: 2,
+          delay: 1,
+          host: ['localhost','localhost.qz.io'],
+          usingSecure: false
+        });
+      }catch(insecureErr){
+        const a=String(secureErr&&secureErr.message||secureErr||'').replace(/\s+/g,' ').trim();
+        const b=String(insecureErr&&insecureErr.message||insecureErr||'').replace(/\s+/g,' ').trim();
+        const err=new Error('QZ Tray connection failed. Secure: '+(a||'failed')+' | Insecure: '+(b||'failed'));
+        err.secureError=secureErr;
+        err.insecureError=insecureErr;
+        throw err;
+      }
+    })().finally(()=>{qzConnectPromise=null;});
     return qzConnectPromise;
   }
 
   function qzErrorText_(e){
     const m=String(e&&e.message||e||'').replace(/\s+/g,' ').trim();
     if(/ERR_CONNECTION_REFUSED|connection refused|failed to connect/i.test(m))
-      return 'QZ Tray is not running on this Windows PC (localhost ports 8181/8282/8383/8484 refused).';
-    if(/permission|access.*denied|blocked|local network/i.test(m))
-      return 'Browser blocked the local QZ Tray connection. Allow Local Network Access for this site and retry.';
+      return 'QZ Tray is not running on this Windows PC. Start QZ Tray, then Retry IP Printers.';
+    if(/permission|access.*denied|blocked|local network|ERR_FAILED|private network/i.test(m))
+      return 'Edge blocked local QZ Tray access. Choose Allow for Local Network Access, then reload and Retry.';
+    if(/certificate|ssl|wss|secure/i.test(m) && /qz|localhost/i.test(m))
+      return 'QZ Tray secure connection was rejected. QZ Tray must be running; reload once and allow Local Network Access.';
     return m || 'QZ Tray connection failed.';
   }
 
@@ -37988,26 +38015,57 @@ function bnxOpenImportHub(){
     const ips=ipSettings(), ip=ips[role];
     if(!ip) throw new Error('No IP configured for '+role);
     await connectQz();
-    const config=qz.configs.create({host:ip,port:9100},{jobName:jobName||('Balaji '+role+' Print')});
+
+    /* QZ supports direct host printing with {host, port}; plain strings are
+       raw command data, which is appropriate for ESC/POS network printers. */
+    const config=qz.configs.create(
+      {host:ip,port:9100},
+      {jobName:jobName||('Balaji '+role+' Print')}
+    );
     return qz.print(config,data);
   }
 
   window.bnxConnectIpPrinters=async function(){
     const ips=ipSettings();
+    const roles=Object.entries(ips).filter(([role,ip])=>!!String(ip||'').trim());
+    const passed=[], failed=[];
     try{
       setStatus('Connecting QZ Tray…',false);
       await connectQz();
-      const checks=Object.entries(ips).filter(([k,v])=>v).map(([role,ip])=>{
-        const cfg=qz.configs.create({host:ip,port:9100});
-        return qz.print(cfg,['\x1B@','IP TEST '+role+' '+ip+'\n','\n','\x1DVA0']).then(()=>role+' '+ip+' ✓');
-      });
-      const done=await Promise.all(checks);
-      setStatus('IP printing connected · '+done.length+' printer(s)',true);
-      if(typeof showNotif==='function') showNotif('✅ IP printer test sent to '+done.length+' printer(s)','success');
-      return true;
+
+      /* Test printers one-by-one. Promise.all() used to launch four socket
+         jobs at once and made it impossible to tell which printer failed. */
+      for(const [role,ip] of roles){
+        try{
+          const cfg=qz.configs.create({host:ip,port:9100},{jobName:'BNX '+role+' IP Test'});
+          await qz.print(cfg,[
+            '\x1B@','\x1Ba1','\x1BE1',
+            'BALAJI NEXTGEN ERP\n',
+            'IP TEST - '+role+'\n',
+            'Printer: '+ip+'\n',
+            new Date().toLocaleString('en-IN')+'\n',
+            '\x1BE0','PRINT OK\n','\n\n\n','\x1DVA0'
+          ]);
+          passed.push(role+' '+ip);
+        }catch(e){
+          failed.push(role+' '+ip+' — '+qzErrorText_(e));
+        }
+      }
+
+      if(!failed.length){
+        setStatus('IP printing ready · '+passed.length+' printer(s) tested',true);
+        if(typeof showNotif==='function') showNotif('✅ IP printer test sent successfully to '+passed.length+' printer(s)','success');
+        return true;
+      }
+
+      const summary=(passed.length?'OK: '+passed.join(', ')+' | ':'')+'FAILED: '+failed.join(' | ');
+      setStatus('IP printer test: '+passed.length+' OK, '+failed.length+' failed',false);
+      if(typeof showNotif==='function') showNotif('⚠️ '+summary,'error');
+      console.warn('[BNX IP PRINT] '+summary);
+      return false;
     }catch(e){
       setStatus('QZ Tray unavailable · browser print remains active',false);
-      if(typeof showNotif==='function') showNotif('⚠️ '+qzErrorText_(e)+' Start QZ Tray, allow local-network access, then Retry.','error');
+      if(typeof showNotif==='function') showNotif('⚠️ '+qzErrorText_(e)+' Browser print remains available.','error');
       console.warn('[BNX IP PRINT]',qzErrorText_(e),e);
       return false;
     }
@@ -38021,7 +38079,7 @@ function bnxOpenImportHub(){
       const data=['\x1B@','\x1Ba1','\x1BE1',escPosText(label||role)+'\n','\x1BE0',line('-',width)+'\n','Balaji NextGen ERP\n','DIRECT IP / ESC-POS TEST\n','Printer: '+ipSettings()[role]+'\n',new Date().toLocaleString('en-IN')+'\n',line('-',width)+'\n','PRINT OK\n','\n\n\n','\x1DVA0'];
       await directPrintRaw(role,data,'BNX '+role+' Test');
       setStatus(role+' IP print OK · '+ipSettings()[role],true);
-      if(typeof showNotif==='function') showNotif('✅ '+role+' IP printer received test print','success');
+      if(typeof showNotif==='function') showNotif('✅ '+role+' IP test job sent to '+ipSettings()[role],'success');
     }catch(e){
       setStatus('Direct IP unavailable · browser print available',false);
       console.warn('[BNX IP TEST]',qzErrorText_(e),e);
