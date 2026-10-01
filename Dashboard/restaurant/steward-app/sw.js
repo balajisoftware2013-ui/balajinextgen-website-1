@@ -3,8 +3,8 @@
    - HTML: network-first (so fixes reach stewards), cache fallback offline.
    - Google Apps Script / any cross-origin / non-GET request is NEVER cached
      (orders, KOTs and transfers must always hit the live server). */
-const VERSION = 'happyserve-steward-v3';
-const SHELL = ['./steward-mobile.html', './manifest.json', './icon-192.png', './icon-512.png', './icon-180.png', './assets/balaji-happyserve-96.png'];
+const VERSION = 'happyserve-steward-v4';
+const SHELL = ['./steward-mobile.html', './manifest.json', './icon-192.png', './icon-512.png', './icon-180.png', './icon-180.png'];
 
 self.addEventListener('install', e => {
   e.waitUntil((async () => {
