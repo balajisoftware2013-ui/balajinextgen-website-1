@@ -14494,7 +14494,12 @@ async function sendKOT(){
    exactly ONCE, with the whole order's items, on the first station it
    sends — every other station just prints/records its ticket without
    creating another ORDER_MASTER row. */
-function bnxRecordKOT(table, type, waiter, covers, items, orderNo, orderSyncItems){
+function bnxRecordKOT(table, type, waiter, covers, items, orderNo, orderSyncItems, splitMeta){
+  splitMeta = splitMeta || {};
+  const splitIndex = Number(splitMeta.splitIndex||0) || 0;
+  const splitTotal = Number(splitMeta.splitTotal||0) || 0;
+  const customerName = String(splitMeta.customerName || document.getElementById('custNameInput')?.value || 'Default Customer').trim() || 'Default Customer';
+  const remarks = String(splitMeta.remarks || document.getElementById('remarksInput')?.value || '').trim();
   // FIX ("NEXT ID" — closing the gap this comment used to flag):
   // sequence numbers now come from bnxNextKotSeq(), which pops from a
   // small BATCH of numbers pre-fetched from the server ahead of time
@@ -14513,7 +14518,7 @@ function bnxRecordKOT(table, type, waiter, covers, items, orderNo, orderSyncItem
   // to): orderNo was already known here and sent to the server below, but
   // never saved onto the LOCAL entry, so the Pending KOTs list had no way
   // to display it. Stored now so it can be shown alongside the KOT number.
-  const entry = { kotNo, table, type, time: new Date().toISOString(), waiter:waiter||'', covers:covers||'', items:items||[], status:'NEW', orderNo: orderNo||'', localOnly:true, syncPending:true };
+  const entry = { kotNo, table, type, time: new Date().toISOString(), waiter:waiter||'', covers:covers||'', items:items||[], status:'NEW', orderNo: orderNo||'', splitIndex, splitTotal, customerName, remarks, localOnly:true, syncPending:true };
   open.unshift(entry);
   if (open.length>100) open = open.slice(0,100);
   bnxSetOpenKotsRaw(JSON.stringify(open));
@@ -14524,8 +14529,9 @@ function bnxRecordKOT(table, type, waiter, covers, items, orderNo, orderSyncItem
   const kotReq = {
     requestId:kotRequestId, kotNumber:kotNo, orderNo:orderNo||'',
     table:table, waiter:waiter||'', covers:covers||'',
-    customerName:document.getElementById('custNameInput')?.value||'',
-    remarks:document.getElementById('remarksInput')?.value||'',
+    customerName:customerName,
+    remarks:remarks,
+    splitIndex:splitIndex, splitTotal:splitTotal,
     items:items||[]
   };
   gasApi('SAVE_KOT', kotReq, 'V2_CORE').then(res=>{
@@ -14580,38 +14586,43 @@ function bnxRecordKOT(table, type, waiter, covers, items, orderNo, orderSyncItem
    #ORD-1040). Now the real order number is threaded through from
    sendKOT() so every split is recorded against the SAME order. */
 function printKOTSplit(table, waiter, covers, items, orderNo){
-  // Client 10 has four physical destinations: KITCHEN, HUKKA, BAR and BILL.
-  // BILL is handled by the settlement/receipt print flow; KOTs route only to
-  // the three preparation stations below.
-  if (window.BAR_MODULE_ENABLED === false){
-    const kitchenItems = items.filter(i=>bnxKotStation(i)==='KITCHEN');
-    const hukkaItems = items.filter(i=>bnxKotStation(i)==='HUKKA');
-    const barItems = items.filter(i=>bnxKotStation(i)==='BAR');
-    const jobs=[];
-    if(kitchenItems.length){ const no=bnxRecordKOT(table,'KITCHEN',waiter,covers,kitchenItems,orderNo); jobs.push(()=>printOneKOT('KITCHEN KOT',table,waiter,covers,kitchenItems,no)); }
-    if(hukkaItems.length){ const no=bnxRecordKOT(table,'HUKKA',waiter,covers,hukkaItems,orderNo); jobs.push(()=>printOneKOT('HUKKA KOT',table,waiter,covers,hukkaItems,no)); }
-    if(barItems.length){ const no=bnxRecordKOT(table,'BAR',waiter,covers,barItems,orderNo); jobs.push(()=>printOneKOT('BAR KOT',table,waiter,covers,barItems,no)); }
-    bnxPrintKotQueue_(jobs);
-    return;
-  }
-  const hukkaItems = [], barItems = [], kitchenItems = [];
+  // One POS order can create multiple station tickets. The order reference
+  // MUST stay identical on every split; only the KOT number/station changes.
+  const customerName = String(document.getElementById('custNameInput')?.value || 'Default Customer').trim() || 'Default Customer';
+  const remarks = String(document.getElementById('remarksInput')?.value || '').trim();
+
+  const route = {KITCHEN:[], HUKKA:[], BAR:[]};
   items.forEach(i=>{
     const liveMenuItem=menuData.find(m=>String(m.n||'').toLowerCase()===String(i.name||'').toLowerCase());
     const routeItem=Object.assign({}, liveMenuItem||{}, i, {GROUP_TYPE:i.GROUP_TYPE||liveMenuItem?.GROUP_TYPE||''});
     const station=bnxKotStation(routeItem);
-    if(station==='HUKKA') hukkaItems.push(i);
-    else if(station==='BAR') barItems.push(i);
-    else kitchenItems.push(i);
+    (route[station] || route.KITCHEN).push(i);
   });
 
-  // Sync the real order exactly once with the complete item list, while each
-  // station records/prints only its own subset.
+  const activeStations = ['KITCHEN','HUKKA','BAR'].filter(st=>route[st].length);
+  const splitTotal = activeStations.length;
   const jobs=[];
   let orderAlreadySynced=false;
-  const syncItemsFor=()=>{if(orderAlreadySynced)return false;orderAlreadySynced=true;return items;};
-  if(kitchenItems.length){const no=bnxRecordKOT(table,'KITCHEN',waiter,covers,kitchenItems,orderNo,syncItemsFor());jobs.push(()=>printOneKOT('KITCHEN KOT',table,waiter,covers,kitchenItems,no));}
-  if(hukkaItems.length){const no=bnxRecordKOT(table,'HUKKA',waiter,covers,hukkaItems,orderNo,syncItemsFor());jobs.push(()=>printOneKOT('HUKKA KOT',table,waiter,covers,hukkaItems,no));}
-  if(barItems.length){const no=bnxRecordKOT(table,'BAR',waiter,covers,barItems,orderNo,syncItemsFor());jobs.push(()=>printOneKOT('BAR KOT',table,waiter,covers,barItems,no));}
+  const syncItemsFor=()=>{
+    if(orderAlreadySynced) return false;
+    orderAlreadySynced=true;
+    return items;
+  };
+
+  activeStations.forEach((station, idx)=>{
+    const stationItems = route[station];
+    const no = bnxRecordKOT(
+      table, station, waiter, covers, stationItems, orderNo,
+      syncItemsFor(),
+      {splitIndex:idx+1, splitTotal, customerName, remarks}
+    );
+    const title = station==='HUKKA' ? 'HUKKA KOT' : station==='BAR' ? 'BAR KOT' : 'KITCHEN KOT';
+    // Pass the real order number + split position through to BOTH browser
+    // and direct-IP printers. This keeps every physical ticket tied to the
+    // same POS order while showing only that station's own items.
+    jobs.push(()=>printOneKOT(title,table,waiter,covers,stationItems,no,orderNo,idx+1,splitTotal,customerName,remarks));
+  });
+
   bnxPrintKotQueue_(jobs);
 }
 
@@ -14685,20 +14696,25 @@ function bnxResolvePrintLogo_(){
    window after printing (w.close()), matching every other print
    function in this file (bmDoKOTPrint/blReprintBill/printBill) —
    printOneKOT was the one place still leaving print windows open. */
-function printOneKOT(title, table, waiter, covers, items, kotNo){
+function printOneKOT(title, table, waiter, covers, items, kotNo, orderNo, splitIndex, splitTotal, customerName, remarks){
   const now = new Date();
   const pw = bnxPaperWidthPx();
+  const splitLabel = splitTotal>1 ? ` · Split ${splitIndex}/${splitTotal}` : '';
   const body = `
     <div class="kot-print-body ${bnxPaperClass()}">
       <div style="text-align:center;margin-bottom:4px;"><img src="${bnxResolvePrintLogo_()}" alt="" style="width:36px;height:36px;border-radius:8px;"></div>
-      <div style="text-align:center;font-weight:800;font-size:16px;letter-spacing:.08em;border-bottom:2px solid #000;padding-bottom:6px;margin-bottom:6px;">${title}${kotNo?' · '+kotNo:''}</div>
-      <div>Table: <b>${table}</b> &nbsp; Pax: ${covers}</div>
-      <div>Steward: ${waiter||'-'}</div>
-      <div>Time: ${now.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})} · ${now.toLocaleDateString('en-GB')}</div>
+      <div style="text-align:center;font-weight:800;font-size:16px;letter-spacing:.08em;border-bottom:2px solid #000;padding-bottom:6px;margin-bottom:6px;">${title}${kotNo?' · '+kotNo:''}${splitLabel}</div>
+      <div>Order No: <b>${bnxPrintEsc_(orderNo||'-')}</b></div>
+      <div>Table: <b>${bnxPrintEsc_(table)}</b> &nbsp; Pax: ${bnxPrintEsc_(covers)}</div>
+      <div>Customer: ${bnxPrintEsc_(customerName||'Default Customer')}</div>
+      <div>OrderTaker: ${bnxPrintEsc_(waiter||'-')}</div>
+      <div>Date: ${now.toLocaleString('en-IN')}</div>
       <hr style="border:none;border-top:1px dashed #000;margin:6px 0;">
-      ${items.map(i=>`<div style="display:flex;justify-content:space-between;font-size:16px;font-weight:700;padding:3px 0;"><span>${bnxPrintEsc_(i.name)}</span><span>x${i.qty}</span></div>`).join('')}
+      <div style="display:grid;grid-template-columns:1fr 65px 45px;font-size:12px;font-weight:800;border-bottom:1px solid #000;padding-bottom:3px;"><span>ITEM</span><span>SIZE</span><span style="text-align:right;">QTY</span></div>
+      ${(Array.isArray(items)?items:[]).map(i=>{ const size=i.size||i.SIZE||i.package||i.PACKAGE||i.unit||''; return `<div style="display:grid;grid-template-columns:1fr 65px 45px;font-size:14px;font-weight:700;padding:3px 0;"><span>${bnxPrintEsc_(i.name||i.n||i.ITEM_NAME||'Item')}</span><span>${bnxPrintEsc_(size)}</span><span style="text-align:right;">${bnxPrintEsc_(i.qty||i.QUANTITY||1)}</span></div>`; }).join('')}
+      ${remarks?`<hr style="border:none;border-top:1px dashed #000;margin:6px 0;"><div>Remarks: ${bnxPrintEsc_(remarks)}</div>`:''}
       <hr style="border:none;border-top:1px dashed #000;margin:6px 0;">
-      <div style="text-align:center;font-size:12px;">Balaji NextGen ERP</div>
+      <div style="text-align:center;font-size:12px;">${bnxPrintEsc_(title.replace(/\s*KOT.*$/i,'')||'KITCHEN')}</div>
     </div>`;
   const w = window.open('','_blank','width=420,height=600');
   if (!w){
@@ -14706,19 +14722,9 @@ function printOneKOT(title, table, waiter, covers, items, kotNo){
     else alert('Print popup blocked — please allow pop-ups for this site and try again.');
     return;
   }
-  const kotCss = '@page{size:'+bnxPaperSize()+'mm auto;margin:0;}*{margin:0;padding:0;box-sizing:border-box;}body{font-family:"DM Mono","Courier New",monospace;background:#fff;}.kot-print-body{width:'+pw+'px;font-size:14px;font-weight:600;line-height:1.7;color:#000;margin:0 auto;padding:10px 6px;}@media print{body{margin:0;}}';
+  const kotCss = '@page{size:'+bnxPaperSize()+'mm auto;margin:0;}*{margin:0;padding:0;box-sizing:border-box;}body{font-family:"DM Mono","Courier New",monospace;background:#fff;}.kot-print-body{width:'+pw+'px;font-size:14px;font-weight:600;line-height:1.55;color:#000;margin:0 auto;padding:10px 6px;}@media print{body{margin:0;}}';
   w.document.write('<html><head><title>'+title+' - Balaji NextGen ERP</title><style>'+kotCss+'</style></head><body>'+body+'</body></html>');
-
   w.document.close();
-  // FIX ("print invoice super fast"): this always waited a blind, fixed
-  // 500ms before calling print() — on every single KOT ticket — even
-  // though this popup has no external font/network dependency (DM Mono/
-  // Courier are local) and, for the very common bundled-logo case, no
-  // network image either, so w.onload actually fires almost instantly.
-  // Same onload-first / capped-fallback pattern bmDoKOTPrint (New Invoice
-  // module) already uses: print the moment the window is actually ready,
-  // only falling back to the flat wait if onload is somehow slow (a real
-  // client-hosted logo URL over a slow LAN, etc.).
   let bnxKotPrinted = false;
   const bnxDoKotPrint = () => { if (bnxKotPrinted) return; bnxKotPrinted = true; try { w.print(); } catch(e){} setTimeout(()=>{ try{ w.close(); }catch(e){} }, 300); };
   w.onload = bnxDoKotPrint;
@@ -15713,7 +15719,7 @@ function kotReprint(kotNo){
   const open = bnxGetKotStore();
   const k = open.find(x=>x.kotNo===kotNo);
   if (!k){ alert('KOT not found.'); return; }
-  printOneKOT(k.type==='BAR'?'BAR KOT (REPRINT)':k.type==='HUKKA'?'HUKKA KOT (REPRINT)':'KITCHEN KOT (REPRINT)', k.table, k.waiter, k.covers, (k.items||[]).map(i=>({name:i.name||i.n, qty:i.qty||1})), k.kotNo);
+  printOneKOT(k.type==='BAR'?'BAR KOT (REPRINT)':k.type==='HUKKA'?'HUKKA KOT (REPRINT)':'KITCHEN KOT (REPRINT)', k.table, k.waiter, k.covers, (k.items||[]).map(i=>({name:i.name||i.n, qty:i.qty||1, size:i.size||i.SIZE||i.package||i.PACKAGE||i.unit||''})), k.kotNo, k.orderNo||'', Number(k.splitIndex||0), Number(k.splitTotal||0), k.customerName||'Default Customer', k.remarks||'');
 }
 function printAllKOT(){
   const store = bnxGetKotStore().filter(k=>k.status!=='READY');
@@ -37824,7 +37830,10 @@ function bnxOpenImportHub(){
   /* iframe printing is not popup-blocked, so tickets can follow each other quickly */
   window.bnxPrintKotQueue_=function(fns){ fns.forEach(function(fn,i){ setTimeout(fn,i*350); }); };
 
-  /* BNX DIRECT LAN/IP POS PRINTING — QZ Tray + ESC/POS */
+  /* FIX 2026-10-01 — SPLIT ORDER PRINT: every station ticket keeps the same POS Order No;
+   KITCHEN/HUKKA/BAR print only their own item subset, with Split X/Y, KOT No,
+   printer role, outlet, customer, size, quantity and OrderTaker. */
+/* BNX DIRECT LAN/IP POS PRINTING — QZ Tray + ESC/POS */
 (function(){
   if(window.__bnxDirectIpPrintV1) return;
   window.__bnxDirectIpPrintV1=true;
@@ -37950,152 +37959,82 @@ function bnxOpenImportHub(){
   }
 
   function billRaw(d){
-    /* CLIENT 10 — DIRECT POS BILL FORMAT
-       Keep the direct LAN bill visually aligned with the existing thermal
-       invoice, but optimize it for ESC/POS: fixed numeric columns, wrapped
-       item names, tax breakup, payment, KOT and remarks. */
     d=d||{};
     const width=Number((typeof bnxPaperSize==='function'?bnxPaperSize():80))===58?32:48;
-    const esc=escPosText;
-    const money=v=>'Rs '+(Number(v)||0).toFixed(2);
-    const sub=Number(d.sub)||0;
-    const disc=Number(d.disc)||0;
-    const sc=Number(d.sc)||0;
-    const cgst=Number(d.cgst)||0, sgst=Number(d.sgst)||0, igst=Number(d.igst)||0;
-    const taxAmt=cgst+sgst+igst || (Array.isArray(d.taxRows)?d.taxRows.reduce((a,r)=>a+(Number(r.taxAmt)||0),0):0);
-    const taxBase=d.taxBase!=null?Number(d.taxBase):(sub-disc);
-    const total=d.total!=null?Number(d.total):(taxBase+sc+taxAmt);
-    const rounded=Math.round(total);
-    const roundOff=d.roundOff!=null?Number(d.roundOff):(rounded-total);
-    const items=Array.isArray(d.items)?d.items:[];
-    const qtyTotal=items.reduce((a,i)=>a+(Number(i.qty||i.QUANTITY)||0),0);
-
-    function wrapText(text,max){
-      text=esc(text);
-      if(text.length<=max) return [text];
-      const words=text.split(/\s+/), out=[]; let line='';
-      words.forEach(w=>{
-        if(!line) line=w;
-        else if((line+' '+w).length<=max) line+=' '+w;
-        else { out.push(line); line=w; }
-      });
-      if(line) out.push(line);
-      return out.length?out:[''];
-    }
-    function itemLines(i){
+    const out=[];
+    out.push('\x1B@','\x1Ba1','\x1BE1');
+    let shop=d.entity||''; try{shop=shop||(typeof shopName==='function'?shopName():'')||'';}catch(e){}
+    if(shop) out.push(escPosText(shop).toUpperCase()+'\n');
+    out.push('\x1BE0');
+    if(d.addr) out.push(escPosText(d.addr)+'\n');
+    if(d.phone) out.push('Ph: '+escPosText(d.phone)+'\n');
+    if(d.gstin) out.push('GSTIN: '+escPosText(d.gstin)+'\n');
+    out.push('\x1BE1',(d.isEstimate?'ESTIMATE (NOT A TAX INVOICE)':'TAX INVOICE')+'\n','\x1BE0','\x1Ba0');
+    out.push(line('-',width)+'\n');
+    if(d.billNo) out.push(cols(width,'Bill No',String(d.billNo))+'\n');
+    if(d.date) out.push(cols(width,'Date',String(d.date)+' '+String(d.time||''))+'\n');
+    if(d.table) out.push(cols(width,'Table',String(d.table))+'\n');
+    if(d.waiter) out.push(cols(width,'Steward',String(d.waiter))+'\n');
+    const cust=d.customer||d.cname; if(cust) out.push(cols(width,'Customer',String(cust))+'\n');
+    out.push(line('-',width)+'\n');
+    out.push(cols(width,'ITEM','QTY      AMT')+'\n');
+    out.push(line('-',width)+'\n');
+    (Array.isArray(d.items)?d.items:[]).forEach(i=>{
       const name=String(i.name||i.ITEM_NAME||'Item');
       const qty=Number(i.qty||i.QUANTITY||0);
-      const rate=Number(i.rate||i.RATE||0);
-      const amt=Number(i.amt!=null?i.amt:(i.line!=null?i.line:(i.amount!=null?i.amount:qty*rate)));
-      const right=padLeft(String(qty),3)+' '+padLeft(money(amt),10);
-      const maxName=Math.max(8,width-right.length-1);
-      const lines=wrapText(name,maxName);
-      const out=[];
-      lines.forEach((ln,n)=>out.push(n===0?padRight(ln,maxName)+' '+right:'   '+ln));
-      if(i.mrpNote) out.push('  MRP: '+esc(i.mrpNote));
-      if(i.note||i.notes||i.remark||i.remarks) out.push('  Note: '+esc(i.note||i.notes||i.remark||i.remarks));
-      return out;
-    }
-
-    const out=['\x1B@','\x1Ba1','\x1BE1'];
-    let shop=d.entity||''; try{shop=shop||(typeof shopName==='function'?shopName():'')||'';}catch(e){}
-    if(shop) out.push(esc(shop).toUpperCase()+'\n');
-    out.push('\x1BE0');
-    if(d.addr) out.push(esc(d.addr)+'\n');
-    if(d.phone) out.push('Ph: '+esc(d.phone)+'\n');
-    if(d.gstin) out.push('GSTIN: '+esc(d.gstin)+'\n');
-    out.push(line('*',width)+'\n');
-    out.push('\x1BE1',(d.isEstimate?'ESTIMATE - NOT A TAX INVOICE':'TAX INVOICE')+'\n','\x1BE0');
+      const amt=Number(i.amt!=null?i.amt:(i.line!=null?i.line:(i.amount!=null?i.amount:(i.AMOUNT!=null?i.AMOUNT:qty*Number(i.rate||i.RATE||0)))));
+      out.push(cols(width,name,padLeft(String(qty),3)+' '+padLeft(money(amt),10))+'\n');
+    });
     out.push(line('-',width)+'\n');
-    out.push(cols(width,'Bill No',String(d.billNo||d.billno||'-'))+'\n');
-    out.push(cols(width,'Date',String(d.date||'')+(d.time?' '+String(d.time):''))+'\n');
-    out.push(cols(width,'Table',String(d.table||'-'))+'\n');
-    out.push(cols(width,'Pax',String(d.pax||1))+'\n');
-    out.push(cols(width,'Customer',String(d.cname||d.customer||'GENERAL CUSTOMER'))+'\n');
-    if(d.cmob) out.push(cols(width,'MOB',String(d.cmob))+'\n');
-    if(d.waiter) out.push(cols(width,'Steward',String(d.waiter))+'\n');
-    out.push(line('-',width)+'\n');
-    const amtHead='QTY      AMT';
-    out.push(cols(width,'ITEM',amtHead)+'\n',line('-',width)+'\n');
-    items.forEach(i=>itemLines(i).forEach(x=>out.push(x+'\n')));
-    if(!items.length) out.push('No items\n');
-    out.push(line('-',width)+'\n');
-    out.push(cols(width,'Sub Total',money(sub))+'\n');
-    if(disc) out.push(cols(width,'Discount',('-'+money(disc)))+'\n');
-    if(sc) out.push(cols(width,'Service Charge',money(sc))+'\n');
-    if(cgst) out.push(cols(width,'CGST',money(cgst))+'\n');
-    if(sgst) out.push(cols(width,'SGST',money(sgst))+'\n');
-    if(igst) out.push(cols(width,'IGST',money(igst))+'\n');
-    if(!cgst&&!sgst&&!igst) out.push(cols(width,'Tax',money(taxAmt))+'\n');
-    out.push(cols(width,'Round Off',(roundOff>=0?'+':'')+money(roundOff))+'\n');
-    out.push(line('=',width)+'\n','\x1BE1',cols(width,'TOTAL',money(rounded))+'\n','\x1BE0');
-    out.push(cols(width,'Items / Qty',items.length+' / '+qtyTotal)+'\n');
-    out.push(line('-',width)+'\n');
-    if(Array.isArray(d.taxRows)&&d.taxRows.length){
-      out.push('TAX BREAKUP\n');
-      d.taxRows.forEach(r=>{
-        out.push(esc(String(r.hsn||'-'))+' '+esc(String(r.taxName||''))+'\n');
-        out.push(cols(width,'Taxable',money(r.onAmt))+'\n');
-        out.push(cols(width,'Tax Amt',money(r.taxAmt))+'\n');
-      });
-      out.push(line('-',width)+'\n');
-    }
-    out.push('PAYMENT ADJUSTMENT\n');
-    out.push(cols(width,'PAYMODE',String(d.paymode||d.paymentMode||'-').toUpperCase())+'\n');
-    out.push(cols(width,'AdjustAmt',money(rounded))+'\n');
-    out.push(cols(width,'User',String(d.user||'STAFF'))+'\n');
-    out.push(cols(width,'KOT',String(d.kot||'-'))+'\n');
-    if(d.remarks) out.push('Remarks: '+esc(d.remarks)+'\n');
-    out.push(line('-',width)+'\n','\x1Ba1','THANK YOU, VISIT AGAIN\n','\n\n\n','\x1DVA0');
+    if(d.sub!=null) out.push(cols(width,'Subtotal',money(d.sub))+'\n');
+    if(Number(d.disc)) out.push(cols(width,'Discount','-'+money(d.disc))+'\n');
+    if(Number(d.sc)) out.push(cols(width,'Service Charge',money(d.sc))+'\n');
+    if(Number(d.cgst)) out.push(cols(width,'CGST',money(d.cgst))+'\n');
+    if(Number(d.sgst)) out.push(cols(width,'SGST',money(d.sgst))+'\n');
+    if(Number(d.igst)) out.push(cols(width,'IGST',money(d.igst))+'\n');
+    const tax=(Number(d.cgst)||0)+(Number(d.sgst)||0)+(Number(d.igst)||0);
+    const total=d.total!=null?Number(d.total):((Number(d.sub)||0)-(Number(d.disc)||0)+(Number(d.sc)||0)+tax);
+    out.push(line('=',width)+'\n','\x1BE1',cols(width,'TOTAL',money(total))+'\n','\x1BE0');
+    if(d.paymode||d.paymentMode) out.push(cols(width,'Payment',String(d.paymode||d.paymentMode))+'\n');
+    if(d.remarks) out.push('Note: '+escPosText(d.remarks)+'\n');
+    out.push(line('-',width)+'\n','\x1Ba1','Thank you, visit again\n','\n\n\n','\x1DVA0');
     return out;
   }
 
-  function kotRaw(title,table,waiter,covers,items,kotNo){
-    /* CLIENT 10 — match the verified physical KOT format:
-       ******** KOT ********
-       PRINTER / DATE / OUTLET / TABLE / KOT No / CUSTOMER
-       ITEM | SIZE | QTY
-       ORDER TAKER
-    */
+  function kotRaw(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks){
     const width=Number((typeof bnxPaperSize==='function'?bnxPaperSize():80))===58?32:48;
     const role=roleForKOT(title);
-    const printerLabel=role==='HUKKA'?'HUKKA':role==='BAR'?'BAR':'KOT';
+    let outlet=''; let phone='';
+    try{ const ri=typeof bnxGetRestaurantInfo==='function'?bnxGetRestaurantInfo():{}; outlet=ri.name||ri.entity||''; phone=ri.phone||''; }catch(e){}
+    try{ outlet=outlet||document.querySelector('[data-brand-name]')?.textContent||''; }catch(e){}
+    const splitLabel=splitTotal>1 ? 'Split '+splitIndex+'/'+splitTotal : '';
     const now=new Date();
-    const out=['\x1B@','\x1Ba1','\x1BE1'];
-    let shop=''; try{shop=(typeof shopName==='function'?shopName():'')||'';}catch(e){}
-    out.push(line('*',width)+'\n');
-    out.push('KOT\n');
-    out.push(line('*',width)+'\n','\x1BE0');
-    out.push(cols(width,'PRINTER',printerLabel)+'\n');
-    out.push(cols(width,'DATE',now.toISOString().slice(0,10)+' '+now.toLocaleTimeString('en-IN',{hour12:false}))+'\n');
+    const out=['\x1B@','\x1Ba1','\x1BE1','******** KOT ********\n','\x1BE0'];
+    out.push('PRINTER : '+escPosText(role)+'\n');
+    out.push('DATE    : '+escPosText(now.toLocaleString('en-IN'))+'\n');
+    if(outlet) out.push('Outlet  : '+escPosText(outlet)+'\n');
+    if(phone) out.push('Phone   : '+escPosText(phone)+'\n');
+    if(orderNo) out.push('Order No: '+escPosText(orderNo)+(splitLabel?'  '+splitLabel:'')+'\n');
+    out.push('Table   : '+escPosText(table||'-')+'\n');
+    out.push('KOT No  : '+escPosText(kotNo||'-')+'\n');
+    out.push('Customer: '+escPosText(customerName||'Default Customer')+'\n');
     out.push(line('-',width)+'\n');
-    if(shop) out.push(cols(width,'Outlet',escPosText(shop).toUpperCase())+'\n');
-    out.push(cols(width,'Table',String(table||'-'))+'\n');
-    out.push(cols(width,'KOT No',String(kotNo||'-'))+'\n');
-    out.push(cols(width,'Customer','Default Customer')+'\n');
-    out.push(line('-',width)+'\n');
-    const sizeCol=7, qtyCol=5, itemCol=Math.max(8,width-sizeCol-qtyCol-2);
-    out.push(padRight('ITEM',itemCol)+' '+padRight('SIZE',sizeCol)+' '+padLeft('QTY',qtyCol)+'\n');
+    out.push('\n');
+    out.push(cols(width,'ITEM','SIZE     QTY')+'\n');
     out.push(line('-',width)+'\n');
     (Array.isArray(items)?items:[]).forEach(i=>{
       const qty=Number(i.qty||i.QUANTITY||1);
-      const size=String(i.size||i.SIZE||i.package||i.PACKAGE||i.unit||'');
       const name=String(i.name||i.n||i.ITEM_NAME||'Item');
-      const lines=wrapText(name,Math.max(8,itemCol));
-      lines.forEach((ln,n)=>{
-        if(n===0) out.push(padRight(ln,itemCol)+' '+padRight(escPosText(size).slice(0,sizeCol),sizeCol)+' '+padLeft(String(qty),qtyCol)+'\n');
-        else out.push('  '+ln+'\n');
-      });
+      const size=String(i.size||i.SIZE||i.package||i.PACKAGE||i.unit||'');
+      const itemLine=cols(width,name,padLeft(size,8)+' '+padLeft(String(qty),5));
+      out.push(itemLine+'\n');
       const note=String(i.note||i.notes||i.remark||i.remarks||i.instruction||'').trim();
-      if(note) out.push('  Note: '+escPosText(note)+'\n');
+      if(note) out.push('  NOTE: '+escPosText(note)+'\n');
     });
     out.push(line('-',width)+'\n');
-    const totalQty=(Array.isArray(items)?items:[]).reduce((a,i)=>a+(Number(i.qty||i.QUANTITY)||0),0);
-    out.push(cols(width,'Items',String((items||[]).length))+'\n');
-    out.push(cols(width,'Total Qty',String(totalQty))+'\n');
-    out.push(line('-',width)+'\n');
-    out.push(cols(width,'OrderTaker',String(waiter||'-'))+'\n');
-    out.push('\x1BE1','\n\n','\x1BE0','\n\n','\x1DVA0');
+    out.push('OrderTaker: '+escPosText(waiter||'-')+'\n');
+    if(remarks) out.push('Remarks: '+escPosText(remarks)+'\n');
+    out.push('\n\n\n','\x1DVA0');
     return out;
   }
 
@@ -38191,12 +38130,12 @@ function bnxOpenImportHub(){
   };
 
   const originalKot=window.printOneKOT;
-  window.printOneKOT=async function(title,table,waiter,covers,items,kotNo){
+  window.printOneKOT=async function(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks){
     const role=roleForKOT(title);
     try{
       const enabled=localStorage.getItem('bnx_direct_ip_print')!=='0';
-      if(!enabled) return originalKot(title,table,waiter,covers,items,kotNo);
-      await directPrintRaw(role,kotRaw(title,table,waiter,covers,items,kotNo),(title||role)+' '+String(kotNo||''));
+      if(!enabled) return originalKot(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks);
+      await directPrintRaw(role,kotRaw(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks),(title||role)+' '+String(kotNo||''));
       if(typeof showNotif==='function') showNotif('🖨️ '+role+' KOT sent to '+ipSettings()[role],'success');
     }catch(e){
       console.warn('[BNX KOT IP PRINT] falling back to browser print:',e);
