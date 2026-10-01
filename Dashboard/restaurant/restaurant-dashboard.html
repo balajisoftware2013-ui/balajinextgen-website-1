@@ -14368,15 +14368,28 @@ function bnxItemGroupType_(item){
   }catch(e){return '';}
 }
 function bnxKotStation(itemOrCategory){
-  // AUTHORITATIVE: ITEM_GROUP_MASTER.GROUP_TYPE. Multiple item groups of the
-  // same station are merged into ONE station KOT.
+  // AUTHORITATIVE routing order: explicit GROUP_TYPE -> HUKKA/HOOKAH
+  // category/name -> BAR category/name -> KITCHEN fallback. Every item is
+  // assigned to exactly one physical station, so mixed orders always split
+  // into independent tickets.
   const gt=bnxItemGroupType_(itemOrCategory);
-  if(gt==='HUKKA' || gt==='HOOKAH') return 'HUKKA';
+  if(gt==='HUKKA' || gt==='HOOKAH' || gt==='SHEESHA') return 'HUKKA';
   if(gt==='BAR') return 'BAR';
   if(gt) return 'KITCHEN';
-  const c=String(typeof itemOrCategory==='string'?itemOrCategory:(itemOrCategory?.category||itemOrCategory?.c||itemOrCategory?.itemGroupName||itemOrCategory?.GROUP_NAME||'')).trim().toUpperCase();
-  if(/^(HUKKA|HOOKAH|SHEESHA)(\b|[ _-])/.test(c) || c.includes('HUKKA') || c.includes('HOOKAH') || c.includes('SHEESHA')) return 'HUKKA';
-  if (BAR_STATION_CATEGORIES.has(c)) return 'BAR';
+
+  const x=typeof itemOrCategory==='string' ? {category:itemOrCategory} : (itemOrCategory||{});
+  const vals=[x.category,x.c,x.itemGroupName,x.ITEM_GROUP_NAME,x.GROUP_NAME,x.name,x.n,x.ITEM_NAME]
+    .map(v=>String(v==null?'':v).trim().toUpperCase()).filter(Boolean);
+  const text=vals.join(' | ');
+
+  // HUKKA gets first priority so an item which also has a beverage-like
+  // name cannot accidentally go to BAR.
+  if(/(?:^|[ _-])(HUKKA|HOOKAH|SHEESHA)(?:$|[ _-])/.test(text) || /HUKKA|HOOKAH|SHEESHA/.test(text)) return 'HUKKA';
+
+  if(BAR_STATION_CATEGORIES.has(String(x.category||x.c||x.itemGroupName||'').trim().toUpperCase()) ||
+     /(?:^|[ _-])(BAR|LIQUOR|SPIRITS|WHISKY|WHISKEY|BEER|WINE|COCKTAIL|MOCKTAIL|JUICE|BEVERAGE)(?:$|[ _-])/.test(text)){
+    return 'BAR';
+  }
   return 'KITCHEN';
 }
 const BAR_CATEGORIES = BAR_STATION_CATEGORIES;
@@ -14600,45 +14613,52 @@ function bnxRecordKOT(table, type, waiter, covers, items, orderNo, orderSyncItem
    #ORD-1040). Now the real order number is threaded through from
    sendKOT() so every split is recorded against the SAME order. */
 function printKOTSplit(table, waiter, covers, items, orderNo){
-  // One POS order can create multiple station tickets. The order reference
-  // MUST stay identical on every split; only the KOT number/station changes.
-  const customerName = String(document.getElementById('custNameInput')?.value || 'Default Customer').trim() || 'Default Customer';
-  const remarks = String(document.getElementById('remarksInput')?.value || '').trim();
+  const allItems=Array.isArray(items)?items.filter(Boolean):[];
+  if(!allItems.length) return;
+  const customerName=String(document.getElementById('custNameInput')?.value||'Default Customer').trim()||'Default Customer';
+  const remarks=String(document.getElementById('remarksInput')?.value||'').trim();
 
-  const route = {KITCHEN:[], HUKKA:[], BAR:[]};
-  items.forEach(i=>{
-    const liveMenuItem=menuData.find(m=>String(m.n||'').toLowerCase()===String(i.name||'').toLowerCase());
-    const routeItem=Object.assign({}, liveMenuItem||{}, i, {GROUP_TYPE:i.GROUP_TYPE||liveMenuItem?.GROUP_TYPE||''});
-    const station=bnxKotStation(routeItem);
-    (route[station] || route.KITCHEN).push(i);
+  // Build station buckets once. Do not re-use the whole cart for each printer.
+  const route={KITCHEN:[],HUKKA:[],BAR:[]};
+  allItems.forEach(item=>{
+    let live=null;
+    try{
+      live=menuData.find(m=>{
+        const a=String(m?.n||m?.name||m?.ITEM_NAME||'').trim().toLowerCase();
+        const b=String(item?.name||item?.n||item?.ITEM_NAME||'').trim().toLowerCase();
+        return a===b;
+      });
+    }catch(e){}
+    const merged=Object.assign({},live||{},item||{});
+    const station=bnxKotStation(merged);
+    route[station].push(item);
   });
 
-  const activeStations = ['KITCHEN','HUKKA','BAR'].filter(st=>route[st].length);
-  const splitTotal = activeStations.length;
+  // Fixed physical order: KITCHEN -> BAR -> HUKKA. This is only the queue
+  // order; each ticket still goes to its own IP from the printer settings.
+  const stations=['KITCHEN','BAR','HUKKA'].filter(st=>route[st].length);
+  const splitTotal=stations.length;
   const jobs=[];
-  let orderAlreadySynced=false;
-  const syncItemsFor=()=>{
-    if(orderAlreadySynced) return false;
-    orderAlreadySynced=true;
-    return items;
-  };
+  let orderSynced=false;
 
-  activeStations.forEach((station, idx)=>{
-    const stationItems = route[station];
-    const no = bnxRecordKOT(
-      table, station, waiter, covers, stationItems, orderNo,
-      syncItemsFor(),
-      {splitIndex:idx+1, splitTotal, customerName, remarks}
+  stations.forEach((station,idx)=>{
+    const stationItems=route[station];
+    const no=bnxRecordKOT(
+      table,station,waiter,covers,stationItems,orderNo,
+      orderSynced ? false : allItems,
+      {splitIndex:idx+1,splitTotal,customerName,remarks}
     );
-    const title = station==='HUKKA' ? 'HUKKA KOT' : station==='BAR' ? 'BAR KOT' : 'KITCHEN KOT';
-    // Pass the real order number + split position through to BOTH browser
-    // and direct-IP printers. This keeps every physical ticket tied to the
-    // same POS order while showing only that station's own items.
+    orderSynced=true;
+    const title=station==='HUKKA'?'HUKKA KOT':station==='BAR'?'BAR KOT':'KITCHEN KOT';
+    console.info('[BNX KOT SPLIT]',{station,splitIndex:idx+1,splitTotal,kotNo:no,orderNo,items:stationItems.length});
     jobs.push(()=>window.printOneKOT(title,table,waiter,covers,stationItems,no,orderNo,idx+1,splitTotal,customerName,remarks));
   });
 
+  // One awaited queue prevents cross-printer overlap. Each printOneKOT
+  // resolves only after qz.print accepts that station's raw ESC/POS job.
   bnxPrintKotQueue_(jobs);
 }
+
 
 /* FIX ("icon add with order placement, logo also add small"): KOT tickets
    and the printed bill/receipt only ever showed the restaurant NAME as
@@ -38028,8 +38048,21 @@ function bnxOpenImportHub(){
       '.hd .n{flex:1}';
     printDoc(title+(kotNo?' '+kotNo:''),css,body);
   };
-  /* iframe printing is not popup-blocked, so tickets can follow each other quickly */
-  window.bnxPrintKotQueue_=function(fns){ fns.forEach(function(fn,i){ setTimeout(fn,i*350); }); };
+  /* DIRECT KOT QUEUE — station tickets must print one-by-one.
+     Do not fire Kitchen/Bar/Hukka jobs on independent timers: network
+     printers can receive overlapping jobs and the second ticket may be
+     delayed, merged, or appear on the wrong physical queue. Each printOneKOT
+     returns a Promise for direct QZ printing, so await it before the next
+     station. A short 80ms gap lets the printer socket flush without making
+     split printing feel slow. */
+  window.bnxPrintKotQueue_=async function(fns){
+    const jobs=Array.isArray(fns)?fns:[];
+    for(let i=0;i<jobs.length;i++){
+      try{ await Promise.resolve(jobs[i]()); }
+      catch(e){ console.warn('[BNX KOT QUEUE] job '+(i+1)+' failed',e); }
+      if(i<jobs.length-1) await new Promise(r=>setTimeout(r,80));
+    }
+  };
 
   /* FIX 2026-10-01 — SPLIT ORDER PRINT: every station ticket keeps the same POS Order No;
    KITCHEN/HUKKA/BAR print only their own item subset, with Split X/Y, KOT No,
@@ -38620,14 +38653,26 @@ function bnxOpenImportHub(){
     }
   };
 
+  // Diagnostic helper: returns the station/IP assignment without printing.
+  window.bnxPreviewKOTSplit=function(items){
+    const arr=Array.isArray(items)?items:[];
+    const out={KITCHEN:[],BAR:[],HUKKA:[]};
+    arr.forEach(i=>{ out[bnxKotStation(i)].push(String(i?.name||i?.n||i?.ITEM_NAME||'Item')); });
+    const ips=ipSettings();
+    return {KITCHEN:{ip:ips.KITCHEN,items:out.KITCHEN},BAR:{ip:ips.BAR,items:out.BAR},HUKKA:{ip:ips.HUKKA,items:out.HUKKA}};
+  };
+
   const originalKot=window.printOneKOT;
   window.printOneKOT=async function(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks){
     const role=roleForKOT(title);
     try{
       const enabled=localStorage.getItem('bnx_direct_ip_print')!=='0';
       if(!enabled) return originalKot(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks);
+      const ips=ipSettings();
+      const targetIp=String(ips[role]||'').trim();
+      if(!targetIp) throw new Error('No '+role+' printer IP configured');
       const kotData=kotRaw(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks);
-      console.info('[BNX KOT IP] sending', {role, ip:ipSettings()[role], kotNo, orderNo, splitIndex, splitTotal, lines:kotData.length});
+      console.info('[BNX KOT IP] sending', {role,ip:targetIp,kotNo,orderNo,splitIndex,splitTotal,lines:kotData.length,itemCount:Array.isArray(items)?items.length:0});
       await directPrintRaw(role,kotData,(title||role)+' '+String(kotNo||''));
       if(typeof showNotif==='function') showNotif('🖨️ '+role+' KOT sent to '+ipSettings()[role],'success');
     }catch(e){
