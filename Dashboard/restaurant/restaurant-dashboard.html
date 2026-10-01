@@ -19626,26 +19626,39 @@ document.addEventListener('keydown', function(e){
 async function blReprintBillByNo(no){
   const list = (typeof bnxGetBillRegister === 'function') ? bnxGetBillRegister() : [];
   const local = list.find(x => String(x.no) === String(no)) || null;
+
+  /* REPRINT FIX: printing must not depend on the optional REPRINT_BILL audit
+     endpoint. If that endpoint is unavailable, use the saved bill-register
+     record immediately and send it to the direct BILL IP printer. The red
+     “server reprint audit unavailable” message was misleading because the
+     cached bill itself was valid and printable. */
+  let liveMapped = null;
   try{
     const res = await gasApi('REPRINT_BILL', {billNumber:no}, 'V2_CORE');
     if(res && res.success && res.data && res.data.bill){
       const d=res.data, b=d.bill||{};
       const items=(d.items||[]).map(it=>({name:it.name||it.ITEM_NAME||'',qty:Number(it.qty??it.QUANTITY)||0,rate:Number(it.rate??it.RATE)||0,amt:Number(it.amount??it.LINE_TOTAL)||0}));
-      const mapped={no:b.BILL_NUMBER||no,dt:b.BILL_DATE||'',tm:b.BILL_TIME||'',table:b.TABLE_ID||'-',pax:b.PAX||1,customer:b.CUSTOMER_NAME||'GENERAL CUSTOMER',mob:(b.NOTES||'').replace('Customer mobile: ','')||'',waiter:b.CREATED_BY||'',itemsDetail:items,sub:Number(b.SUBTOTAL)||0,gst:Number(b.TAX_AMOUNT)||0,total:Number(b.GRAND_TOTAL)||0,pay:(d.payments&&d.payments.length)?String(d.payments[0].mode||''):String(b.PAYMENT_MODE||''),status:String(b.PAYMENT_STATUS||'')};
-      blReprintBill(mapped);
-      if(typeof showNotif==='function') showNotif('🖨 Reprinting '+(mapped.no||no)+' from live bill record','success');
-      return;
+      liveMapped={no:b.BILL_NUMBER||no,dt:b.BILL_DATE||'',tm:b.BILL_TIME||'',table:b.TABLE_ID||'-',pax:b.PAX||1,customer:b.CUSTOMER_NAME||'GENERAL CUSTOMER',mob:(b.NOTES||'').replace('Customer mobile: ','')||'',waiter:b.CREATED_BY||'',itemsDetail:items,sub:Number(b.SUBTOTAL)||0,gst:Number(b.TAX_AMOUNT)||0,total:Number(b.GRAND_TOTAL)||0,pay:(d.payments&&d.payments.length)?String(d.payments[0].mode||''):String(b.PAYMENT_MODE||''),status:String(b.PAYMENT_STATUS||'')};
     }
-    if(res && res.error) throw new Error(res.error);
   }catch(e){
-    console.warn('[Reprint] live server lookup failed:',e&&e.message||e);
-    if(local){
-      blReprintBill(local);
-      if(typeof showNotif==='function') showNotif('⚠️ Server reprint audit unavailable — printed cached bill copy','error');
-      return;
-    }
+    console.warn('[Reprint] optional live audit lookup unavailable:',e&&e.message||e);
   }
-  if(!local) alert('Bill '+no+' not found in the live register.');
+
+  const source = liveMapped || local;
+  if(!source){
+    alert('Bill '+no+' not found in the live register.');
+    return;
+  }
+
+  try{
+    await blReprintBill(source);
+    if(typeof showNotif==='function'){
+      showNotif((liveMapped?'🖨 Reprint sent from live bill record':'🖨 Reprint sent from saved bill record')+' — '+(source.no||no),'success');
+    }
+  }catch(e){
+    console.warn('[Reprint] print failed:',e&&e.message||e);
+    if(typeof showNotif==='function') showNotif('⚠️ Reprint failed — check QZ Tray and BILL printer connection','error');
+  }
 }
 /* PASS #15 FIX ("bill print ok but bill reg reprint format changes,
    css files also check"): confirmed root cause -- this built its OWN
@@ -19671,7 +19684,7 @@ async function blReprintBillByNo(no){
    it -- the sub/gst/total figures themselves are still the bill's real,
    saved numbers. A byte-for-byte reprint would need those columns added
    to BILL_MASTER/bnxSaveBill first; tell me if that's worth doing. */
-function blReprintBill(bill){
+async function blReprintBill(bill){
   if (!bill) return;
   // Reprint must use the current client master identity too, not stale
   // browser-cached address/GST details.
@@ -19687,8 +19700,23 @@ function blReprintBill(bill){
     sub: sub, discPct: 0, disc: 0, scPct: 0, sc: 0,
     taxRows: [{ hsn: '—', taxName: 'GST', onAmt: sub, taxAmt: gst }],
     total: total, roundOff: +(total - (sub + gst)).toFixed(2),
+    cgst: +(gst/2).toFixed(2), sgst: +(gst/2).toFixed(2),
     paymode: bill.pay || '', user: bill.waiter || 'STAFF', kot: '-', remarks: ''
   };
+
+  /* Bills List -> Reprint must use the same direct BILL printer route as
+     New Bill -> Save & Print Invoice.  If QZ/IP is unavailable, preserve the
+     existing browser reprint as a fallback. */
+  if(typeof window.bnxDirectBillInvoice==='function') {
+    try {
+      const directOk=await window.bnxDirectBillInvoice(mapped);
+      if(directOk){
+        if(typeof showNotif==='function') showNotif('🧾 Reprint sent directly to '+(typeof ipSettings==='function'?ipSettings().BILL:'BILL printer'),'success');
+        return;
+      }
+    } catch(e) { console.warn('[Reprint] direct BILL route failed; using browser reprint:',e); }
+  }
+
   const scale = bnxPosScaleVal();
   const pw = bnxPaperWidthPx();
   const css = '@page{size:'+bnxPaperSize()+'mm auto;margin:0;}*{margin:0;padding:0;box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact;}'+
@@ -38011,43 +38039,81 @@ function bnxOpenImportHub(){
 
   function billRaw(d){
     d=d||{};
-    const width=Number((typeof bnxPaperSize==='function'?bnxPaperSize():80))===58?32:48;
+    /* Direct thermal receipts are deliberately kept inside a conservative
+       printable character width.  Some 80mm/58mm network printers report a
+       wider paper size than their actual firmware line width; using the full
+       48 columns was causing the right amount column to wrap (e.g. "Rs 1" /
+       "985.00").  42 columns for 80mm and 32 for 58mm leave a safe margin. */
+    const width=Number((typeof bnxPaperSize==='function'?bnxPaperSize():80))===58?32:42;
     const out=[];
+    const wrap=function(text,max){
+      const s=escPosText(text==null?'':text), n=Math.max(1,Number(max)||width);
+      if(!s) return [''];
+      const words=s.split(/\s+/).filter(Boolean), lines=[]; let cur='';
+      words.forEach(function(w){
+        if(w.length>n){
+          if(cur){lines.push(cur);cur='';}
+          for(let j=0;j<w.length;j+=n) lines.push(w.slice(j,j+n));
+        }else if(!cur) cur=w;
+        else if((cur+' '+w).length<=n) cur+=' '+w;
+        else {lines.push(cur);cur=w;}
+      });
+      if(cur) lines.push(cur);
+      return lines.length?lines:[''];
+    };
+    const pushWrap=function(text,max){ wrap(text,max).forEach(function(x){out.push(x+'\n');}); };
+    const money0=function(v){return 'Rs '+(Number(v)||0).toFixed(2);};
+    const itemRightWidth=10; // qty + amount area
+    const itemNameWidth=Math.max(12,width-itemRightWidth-1);
     out.push('\x1B@','\x1Ba1','\x1BE1');
+
     let shop=d.entity||''; try{shop=shop||(typeof shopName==='function'?shopName():'')||'';}catch(e){}
-    if(shop) out.push(escPosText(shop).toUpperCase()+'\n');
+    if(shop) pushWrap(String(shop).toUpperCase(),width);
     out.push('\x1BE0');
-    if(d.addr) out.push(escPosText(d.addr)+'\n');
+    if(d.addr) pushWrap(d.addr,width);
     if(d.phone) out.push('Ph: '+escPosText(d.phone)+'\n');
     if(d.gstin) out.push('GSTIN: '+escPosText(d.gstin)+'\n');
     out.push('\x1BE1',(d.isEstimate?'ESTIMATE (NOT A TAX INVOICE)':'TAX INVOICE')+'\n','\x1BE0','\x1Ba0');
     out.push(line('-',width)+'\n');
-    if(d.billNo) out.push(cols(width,'Bill No',String(d.billNo))+'\n');
-    if(d.date) out.push(cols(width,'Date',String(d.date)+' '+String(d.time||''))+'\n');
-    if(d.table) out.push(cols(width,'Table',String(d.table))+'\n');
+    if(d.billNo||d.billno) out.push(cols(width,'Bill No',String(d.billNo||d.billno))+'\n');
+    if(d.date) out.push(cols(width,'Date',String(d.date)+(d.time?' '+String(d.time):''))+'\n');
+    if(d.table!=null && String(d.table).trim() && String(d.table)!=='-') out.push(cols(width,'Table',String(d.table))+'\n');
+    if(d.pax!=null && String(d.pax).trim()) out.push(cols(width,'Pax',String(d.pax))+'\n');
     if(d.waiter) out.push(cols(width,'Steward',String(d.waiter))+'\n');
     const cust=d.customer||d.cname; if(cust) out.push(cols(width,'Customer',String(cust))+'\n');
+    if(d.cmob) out.push(cols(width,'Mobile',String(d.cmob))+'\n');
     out.push(line('-',width)+'\n');
-    out.push(cols(width,'ITEM','QTY      AMT')+'\n');
+
+    const qtyHead=padLeft('QTY',3), amtHead=padLeft('AMT',7);
+    out.push(padRight('ITEM',itemNameWidth)+' '+qtyHead+' '+amtHead+'\n');
     out.push(line('-',width)+'\n');
-    (Array.isArray(d.items)?d.items:[]).forEach(i=>{
+    (Array.isArray(d.items)?d.items:[]).forEach(function(i){
       const name=String(i.name||i.ITEM_NAME||'Item');
       const qty=Number(i.qty||i.QUANTITY||0);
       const amt=Number(i.amt!=null?i.amt:(i.line!=null?i.line:(i.amount!=null?i.amount:(i.AMOUNT!=null?i.AMOUNT:qty*Number(i.rate||i.RATE||0)))));
-      out.push(cols(width,name,padLeft(String(qty),3)+' '+padLeft(money(amt),10))+'\n');
+      const right=padLeft(String(qty),3)+' '+padLeft(money0(amt),7);
+      const nameLines=wrap(name,itemNameWidth);
+      nameLines.forEach(function(nm,idx){
+        if(idx===nameLines.length-1) out.push(padRight(nm,itemNameWidth)+' '+right+'\n');
+        else out.push(padRight(nm,itemNameWidth)+'\n');
+      });
+      const note=String(i.note||i.notes||i.remark||i.remarks||i.instruction||'').trim();
+      if(note) wrap('Note: '+note,width-2).forEach(function(n){out.push('  '+n+'\n');});
     });
     out.push(line('-',width)+'\n');
-    if(d.sub!=null) out.push(cols(width,'Subtotal',money(d.sub))+'\n');
-    if(Number(d.disc)) out.push(cols(width,'Discount','-'+money(d.disc))+'\n');
-    if(Number(d.sc)) out.push(cols(width,'Service Charge',money(d.sc))+'\n');
-    if(Number(d.cgst)) out.push(cols(width,'CGST',money(d.cgst))+'\n');
-    if(Number(d.sgst)) out.push(cols(width,'SGST',money(d.sgst))+'\n');
-    if(Number(d.igst)) out.push(cols(width,'IGST',money(d.igst))+'\n');
+    if(d.sub!=null) out.push(cols(width,'Subtotal',money0(d.sub))+'\n');
+    if(Number(d.disc)) out.push(cols(width,'Discount','-'+money0(d.disc))+'\n');
+    if(Number(d.sc)) out.push(cols(width,'Service Charge',money0(d.sc))+'\n');
+    if(Number(d.cgst)) out.push(cols(width,'CGST',money0(d.cgst))+'\n');
+    if(Number(d.sgst)) out.push(cols(width,'SGST',money0(d.sgst))+'\n');
+    if(Number(d.igst)) out.push(cols(width,'IGST',money0(d.igst))+'\n');
     const tax=(Number(d.cgst)||0)+(Number(d.sgst)||0)+(Number(d.igst)||0);
     const total=d.total!=null?Number(d.total):((Number(d.sub)||0)-(Number(d.disc)||0)+(Number(d.sc)||0)+tax);
-    out.push(line('=',width)+'\n','\x1BE1',cols(width,'TOTAL',money(total))+'\n','\x1BE0');
-    if(d.paymode||d.paymentMode) out.push(cols(width,'Payment',String(d.paymode||d.paymentMode))+'\n');
-    if(d.remarks) out.push('Note: '+escPosText(d.remarks)+'\n');
+    const roff=Number(d.roff!=null?d.roff:(d.roundOff!=null?d.roundOff:0))||0;
+    if(roff) out.push(cols(width,'Round Off',(roff>0?'+':'')+money0(roff))+'\n');
+    out.push(line('=',width)+'\n','\x1BE1',cols(width,'TOTAL',money0(total))+'\n','\x1BE0');
+    if(d.paymode||d.paymentMode||d.pay) out.push(cols(width,'Payment',String(d.paymode||d.paymentMode||d.pay))+'\n');
+    if(d.remarks) pushWrap('Note: '+d.remarks,width);
     out.push(line('-',width)+'\n','\x1Ba1','Thank you, visit again\n','\n\n\n','\x1DVA0');
     return out;
   }
