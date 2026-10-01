@@ -4377,7 +4377,30 @@ async function loadTablesLive(){
     // truth for a table currently in service.
     try{
       const ao = await gasApi('GET_ACTIVE_ORDERS', {}, 'V2_CORE');
-      const activeOrders = ao && ao.success && Array.isArray(ao.data?.orders) ? ao.data.orders : [];
+      const rawActiveOrders = ao && ao.success && Array.isArray(ao.data?.orders) ? ao.data.orders : [];
+      /* FINAL TABLE STATUS FIX — never let stale/closed orders turn free tables
+         into RUNNING during the 20-second refresh. Some deployments return
+         historical ORDER_MASTER rows from GET_ACTIVE_ORDERS. The old code
+         treated every returned row as active, so a refresh could jump from
+         1 RUNNING table to dozens of RUNNING tables even though the live
+         TABLE_MASTER said they were free.
+         Only today's business-date orders with an explicitly open status may
+         promote a table to RUNNING. BILLED/CANCELLED/CLOSED/SETTLED/etc. are
+         ignored here; TABLE_MASTER remains the base truth. */
+      const ACTIVE_ORDER_STATUS = new Set([
+        'NEW','KOT_PRINTED','PENDING','COOKING','PREPARING','IN_PROGRESS',
+        'PROGRESS','READY','SERVED','OPEN','RUNNING','IN SERVICE','IN_SERVICE'
+      ]);
+      const bd = businessDate();
+      const activeOrders = rawActiveOrders.filter(o=>{
+        o=o||{};
+        const st=String(o.ORDER_STATUS||o.orderStatus||o.STATUS||o.status||'').trim().toUpperCase();
+        if(st && !ACTIVE_ORDER_STATUS.has(st)) return false;
+        const rawDate=o.ORDER_DATE||o.orderDate||o.BUSINESS_DATE||o.businessDate||o.CREATED_AT||o.CREATED_ON||'';
+        if(!rawDate) return true; // older backend: status is the only live signal available
+        const ds=String(rawDate).slice(0,10);
+        return !/^\d{4}-\d{2}-\d{2}$/.test(ds) || ds===bd;
+      });
       const byTable={};
       activeOrders.forEach(o=>{ const tid=String(o.TABLE_ID||o.TABLE_NO||o.tableId||o.table||'').trim(); if(!tid) return; const oid=String(o.ORDER_ID||o.ORDER_NUMBER||o.ORDER_NO||'').trim(); const amt=bnxActiveOrderValue_(o); const ownerName=o.CREATED_BY||o.STARTED_BY||o.WAITER||o.STEWARD||o.CAPTAIN||o.createdBy||o.waiter||o.steward||''; const ownerId=o.CREATED_BY_ID||o.STARTED_BY_ID||o.USER_ID||o.userId||o.createdById||''; const ownerLogin=o.CREATED_BY_LOGIN||o.STARTED_BY_LOGIN||o.USER_CODE||o.LOGIN_ID||o.loginId||o.createdByLogin||''; if(!byTable[tid]) byTable[tid]={amount:0,pax:0,kot:0,orders:[],steward:ownerName,started:o.START_TIME||o.ORDER_TIME||o.startTime||'',stewardId:ownerId,stewardLogin:ownerLogin}; byTable[tid].amount+=amt; byTable[tid].pax=Math.max(byTable[tid].pax,Number(o.PAX)||Number(o.COVERS)||0); byTable[tid].kot+=1; if(oid) byTable[tid].orders.push(oid); });
       TABLES=TABLES.map(t=>{ const a=byTable[String(t.id).trim()]; if(!a) return t; return Object.assign({},t,{status:'RUNNING',bill:Math.max(Number(t.bill)||0,Number(a.amount)||0),covers:Math.max(Number(t.covers)||0,Number(a.pax)||0),kotCount:Math.max(Number(t.kotCount)||0,Number(a.kot)||0),steward:t.steward||a.steward,stewardId:t.stewardId||a.stewardId,stewardLogin:t.stewardLogin||a.stewardLogin,startTime:t.startTime||a.started,activeOrderIds:a.orders||[]}); });
