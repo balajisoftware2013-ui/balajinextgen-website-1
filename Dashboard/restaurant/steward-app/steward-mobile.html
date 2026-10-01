@@ -3163,8 +3163,10 @@ function bnxLogoFallback(img){
       </div>
       <div style="display:flex;gap:8px;">
         <button class="btn-ghost" style="flex:1;" onclick="clearOrder()">Clear</button>
+        <button class="btn-ghost" style="flex:1;" onclick="bnxHoldOrder_()">⏸ Hold</button>
         <button class="btn-primary" style="flex:1.35;" onclick="bnxOpenOrderView()">View Order 👁️</button>
         <button class="btn-primary" style="flex:1.35;" onclick="placeOrder()">Send KOT 📤</button>
+        <button class="btn-ghost" style="grid-column:1/-1;width:100%;" onclick="bnxRecallHeldOrders_()">↩ Recall Held Orders</button>
       </div>
     </div>
   </div>
@@ -3671,7 +3673,10 @@ function bnxVisualForMenu_(m){
   const itemIcon=String(m.icon||m.itemIcon||m.productIconKey||m.PRODUCT_ICON_KEY||m.ICON||'').trim();
   if(itemIcon){
     const asset=bnxIconAsset_(itemIcon);
-    return {kind:'icon-image',src:asset,icon:itemIcon};
+    // Only request a real asset when a valid ASCII asset key exists.
+    // Emoji/blank icon keys must render as text, not assets/item-icons/.png.
+    if(asset && !/\/item-icons\/[-.]*\.png$/i.test(asset)) return {kind:'icon-image',src:asset,icon:itemIcon};
+    return {kind:'icon',src:'',icon:itemIcon};
   }
 
   const catId=String(m.categoryId||m.CATEGORY_ID||'').trim();
@@ -4876,6 +4881,36 @@ async function submitForgotPassword(){
    trip); if it's not available yet server-side or fails, falls back
    to the two separate calls this app already had, so nothing breaks
    for a backend that hasn't added the bootstrap handler yet. */
+
+/* PASS #93 HOTFIX — GLOBAL MENU ROW MAPPER
+   loadBootstrapOrFallback() runs outside loadMenuLive(). The older code
+   declared mapRow with const inside loadMenuLive(), so GET_BOOTSTRAP caused
+   ReferenceError: mapRow is not defined and aborted bootstrap. Keep the
+   existing local mapper untouched, but expose the same mapper globally for
+   the bootstrap path. */
+function mapRow(m,isBarDefault){
+  m=m||{};
+  return {
+    id: m.id || m.ITEM_ID || m.code || m.name,
+    name: m.name || m.ITEM_NAME || m.n,
+    cat: m.category || m.CATEGORY || m.c || m.CATEGORY_NAME || 'Other',
+    price: parseFloat(m.price ?? m.PRICE ?? m.p) || 0,
+    icon: m.icon || m.ICON || m.e || m.emoji || m.ICON_KEY || m.CATEGORY_ICON || m.PRODUCT_ICON_KEY || bnxDefaultIcon(m.category||m.CATEGORY||m.c||m.CATEGORY_NAME),
+    avail: m.avail !== false && m.AVAILABLE !== false && m.IS_ACTIVE !== false,
+    gst: Number(m.gst ?? m.GST ?? m.GST_RATE ?? m.TAX_RATE)||0,
+    group: m.group || m.itemGroup || m.ITEM_GROUP || m.GROUP_NAME || m.ITEM_GROUP_NAME || '',
+    groupType: m.groupType || m.GROUP_TYPE || m.group_type || m.itemGroupType || m.ITEM_GROUP_TYPE || '',
+    veg: m.veg || m.VEG || m.VEG_NONVEG || m.foodType || '',
+    isBar: m.isBar===true || m.IS_BAR===true || isBarDefault===true || String(m.menuType||m.MENU_TYPE||'').toUpperCase()==='BAR',
+    menuType: m.menuType || m.MENU_TYPE || (isBarDefault?'BAR':'FOOD'),
+    menuSection: m.menuSection || m.MENU_SECTION || (isBarDefault?'BAR':'FOOD'),
+    favorite: m.favorite ?? m.FAVOURITE ?? false,
+    popular: m.popular ?? m.POPULAR ?? false,
+    itemCode: m.itemCode || m.ITEM_CODE || m.code || '',
+    menuActive: m.menuActive !== false && m.MENU_ACTIVE !== false
+  };
+}
+
 async function loadBootstrapOrFallback(){
   const res = await gasApi('GET_BOOTSTRAP', {}, 'V2_CORE');
   if(res && res.success && res.data){
@@ -8798,17 +8833,128 @@ function bnxClearOrderCustomerFields_(){
 }
 
 function clearOrder(){order={};orderItemRemarks={};selectOccasion('None');bnxClearOrderCustomerFields_();refreshCurrentMenuView_();updateOrderBadge();bnxToggleOrderDrawer_(false);bnxCloseOrderView();toast('Order cleared','info');}
+
+/* =====================================================================
+   HOLD / RECALL ORDER — local browser hold, table-aware and safe
+   - Holds the current cart BEFORE KOT / SAVE_ORDER.
+   - Does not create a KOT, bill, stock movement or kitchen ticket.
+   - Stores item quantities, remarks, customer fields and table context.
+   - Recall restores the exact cart; original held record is removed only
+     after a successful restore.
+   - Scoped to this browser/client so one steward cannot accidentally see
+     another client's held carts.
+===================================================================== */
+function bnxHoldStoreKey_(){
+  let cid='LOCAL';
+  try{
+    const u=JSON.parse(sessionStorage.getItem('ERP_USER')||localStorage.getItem('ERP_USER')||'{}');
+    cid=u.CLIENT_ID||u.clientId||u.client_id||localStorage.getItem('ERP_CLIENT')||localStorage.getItem('bnx_client_id')||'LOCAL';
+  }catch(e){}
+  return 'BNX_HELD_ORDERS_'+String(cid).replace(/[^A-Za-z0-9_-]/g,'_');
+}
+function bnxGetHeldOrders_(){
+  try{ const a=JSON.parse(localStorage.getItem(bnxHoldStoreKey_())||'[]'); return Array.isArray(a)?a:[]; }catch(e){ return []; }
+}
+function bnxSetHeldOrders_(a){
+  try{ localStorage.setItem(bnxHoldStoreKey_(),JSON.stringify(Array.isArray(a)?a:[])); return true; }catch(e){ toast('Unable to save held order','error'); return false; }
+}
+function bnxCurrentTableLabel_(){
+  try{ return String((typeof selTable!=='undefined'&&selTable&&(selTable.no||selTable.tableNo||selTable.TABLE_NO||selTable.name||selTable.id))||''); }catch(e){ return ''; }
+}
+function bnxHoldOrder_(){
+  const rows=Object.entries(order||{}).filter(([,q])=>Number(q)>0);
+  if(!rows.length){ toast('No items to hold','error'); return false; }
+  const table=bnxCurrentTableLabel_()||'No Table';
+  const customer=bnxOrderCustomerFields_();
+  const held={
+    id:'HOLD-'+Date.now()+'-'+Math.random().toString(36).slice(2,7).toUpperCase(),
+    heldAt:new Date().toISOString(), table,
+    order:Object.fromEntries(rows.map(([id,q])=>[String(id),Number(q)||0])),
+    remarks:Object.assign({},orderItemRemarks||{}),
+    customerName:customer.customerName||'', customerMobile:customer.customerMobile||'',
+    occasion:(typeof selectedOccasion!=='undefined'?selectedOccasion:'None')||'None'
+  };
+  const a=bnxGetHeldOrders_();
+  a.unshift(held);
+  if(a.length>50) a.length=50;
+  if(!bnxSetHeldOrders_(a)) return false;
+  order={}; orderItemRemarks={}; bnxClearOrderCustomerFields_();
+  try{selectOccasion('None');}catch(e){}
+  refreshCurrentMenuView_(); updateOrderBadge(); bnxToggleOrderDrawer_(false); bnxCloseOrderView();
+  toast('⏸ Order held — KOT not sent','success');
+  return false;
+}
+function bnxRecallHeldOrders_(){
+  const a=bnxGetHeldOrders_();
+  if(!a.length){ toast('No held orders','info'); return false; }
+  let modal=document.getElementById('bnx-held-orders-modal');
+  if(!modal){ modal=document.createElement('div'); modal.id='bnx-held-orders-modal'; modal.className='modal-overlay'; modal.style.cssText='display:flex;z-index:1250;'; document.body.appendChild(modal); }
+  const escv=v=>String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const money=v=>'₹'+(Number(v)||0).toLocaleString('en-IN');
+  modal.innerHTML='<div class="modal" style="max-height:88vh;overflow:auto;"><div class="modal-handle"></div><div class="modal-title">↩ Recall Held Orders</div><div style="font-size:11px;color:var(--text3);margin-bottom:10px;">Held orders are not sent to kitchen until you press Send KOT.</div><div id="bnx-held-list">'+a.map((h,i)=>{
+    let qty=0,total=0; Object.entries(h.order||{}).forEach(([id,q])=>{const m=(typeof MENU!=='undefined'?MENU:[]).find(x=>String(x.id)===String(id)); qty+=Number(q)||0; total+=(Number(m?.price)||0)*(Number(q)||0);});
+    const dt=new Date(h.heldAt); const when=isNaN(dt)?'':dt.toLocaleString('en-IN',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+    return '<div style="border:1px solid var(--border);border-radius:12px;padding:10px;margin-bottom:8px;background:var(--surface2);"><div style="display:flex;justify-content:space-between;gap:8px;font-weight:800;font-size:12px;"><span>🪑 '+escv(h.table||'No Table')+'</span><span>'+escv(when)+'</span></div><div style="font-size:11px;color:var(--text3);margin:4px 0;">'+qty+' qty · '+money(total)+(h.customerName?' · '+escv(h.customerName):'')+'</div><div style="display:flex;gap:6px;"><button type="button" class="btn-primary" style="flex:1;" onclick="bnxRestoreHeldOrder_(\''+escv(h.id)+'\')">Restore</button><button type="button" class="btn-ghost" onclick="bnxDeleteHeldOrder_(\''+escv(h.id)+'\')">Delete</button></div></div>';
+  }).join('')+'</div><button type="button" class="btn-ghost" style="width:100%;margin-top:6px;" onclick="bnxCloseHeldOrders_()">Close</button></div>';
+  return false;
+}
+function bnxCloseHeldOrders_(){ const m=document.getElementById('bnx-held-orders-modal'); if(m) m.remove(); }
+function bnxDeleteHeldOrder_(id){ const a=bnxGetHeldOrders_().filter(h=>String(h.id)!==String(id)); bnxSetHeldOrders_(a); bnxRecallHeldOrders_(); toast('Held order deleted','info'); }
+function bnxRestoreHeldOrder_(id){
+  const a=bnxGetHeldOrders_(); const idx=a.findIndex(h=>String(h.id)===String(id)); if(idx<0){toast('Held order not found','error');return;}
+  const h=a[idx];
+  const current=Object.entries(order||{}).filter(([,q])=>Number(q)>0);
+  if(current.length && !confirm('Current order has items. Replace it with this held order?')) return;
+  order=Object.assign({},h.order||{}); orderItemRemarks=Object.assign({},h.remarks||{});
+  try{
+    const n=document.getElementById('order-customer-name'), m=document.getElementById('order-customer-mobile');
+    if(n)n.value=h.customerName||''; if(m)m.value=h.customerMobile||'';
+    selectOccasion(h.occasion||'None');
+  }catch(e){}
+  a.splice(idx,1); bnxSetHeldOrders_(a); bnxCloseHeldOrders_();
+  refreshCurrentMenuView_(); updateOrderBadge(); bnxToggleOrderDrawer_(false);
+  toast('↩ Held order restored','success');
+  try{bnxOpenOrderView();}catch(e){}
+  return false;
+}
 // Track placed orders for replacement/modification
 const PLACED_ORDERS = {};
 let lastOrderId = null;
 
+function bnxEnsureOrderViewModal_(){
+  let modal=document.getElementById('bnx-order-view-modal');
+  if(modal && document.getElementById('bnx-order-view-body')) return modal;
+
+  // Self-heal deployments where an older/stale HTML omitted the modal.
+  // This also prevents the user-facing "View Order window is unavailable".
+  if(!modal){
+    modal=document.createElement('div');
+    modal.id='bnx-order-view-modal';
+    modal.className='modal-overlay';
+    modal.style.cssText='display:none;z-index:1200;';
+    document.body.appendChild(modal);
+  }
+  modal.innerHTML=`
+    <div class="modal" style="max-height:88vh;overflow:auto;">
+      <div class="modal-handle"></div>
+      <div class="modal-title">View Order</div>
+      <div id="bnx-order-view-body"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px;">
+        <button type="button" class="btn-ghost" onclick="return bnxCloseOrderView(event)">Back</button>
+        <button type="button" class="btn-primary" onclick="return bnxSavePrintKOT(event)">💾 Save + Print KOT</button>
+        <button type="button" class="btn-primary" style="grid-column:1/-1;" onclick="return bnxSendKOTFromView(event)">📤 Send KOT to Kitchen</button>
+      </div>
+    </div>`;
+  return modal;
+}
+
 function bnxOpenOrderView(ev){
   try{if(ev&&ev.preventDefault)ev.preventDefault();if(ev&&ev.stopPropagation)ev.stopPropagation();}catch(e){}
   const rows=Object.entries(order||{}).filter(([,q])=>Number(q)>0);
-  const modal=document.getElementById('bnx-order-view-modal');
-  const body=document.getElementById('bnx-order-view-body');
-  if(!modal||!body){try{toast('View Order window is unavailable','error');}catch(e){}return false;}
   if(!rows.length){try{toast('No items in order','error');}catch(e){}return false;}
+  const modal=bnxEnsureOrderViewModal_();
+  const body=document.getElementById('bnx-order-view-body');
+  if(!modal||!body){try{toast('Unable to open View Order','error');}catch(e){}return false;}
   bnxRenderOrderView_();
   modal.style.display='flex';
   modal.classList.add('open');
@@ -8816,6 +8962,7 @@ function bnxOpenOrderView(ev){
   return false;
 }
 function bnxRenderOrderView_(){
+  bnxEnsureOrderViewModal_();
   const body=document.getElementById('bnx-order-view-body');
   if(!body)return;
   const rows=Object.entries(order||{}).filter(([,q])=>Number(q)>0);
