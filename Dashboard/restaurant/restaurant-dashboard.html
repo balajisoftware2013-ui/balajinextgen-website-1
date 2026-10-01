@@ -15401,6 +15401,26 @@ async function bnxPullKotsFromServer(){
     if(!Array.isArray(rows)) return false;
     let local=[]; try{ local=JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
     const map={PRINTED:'NEW',NEW:'NEW',PENDING:'NEW',COOKING:'PROGRESS',PREPARING:'PROGRESS',IN_PROGRESS:'PROGRESS',PROGRESS:'PROGRESS',READY:'READY',SERVED:'SERVED'};
+
+    /* LIVE ITEM LOAD FIX: GET_KOT may return KOT_MASTER header rows without
+       nested items. New Bill previously displayed the KOT but loaded zero
+       items. Read KOT_ITEMS as the authoritative child table and attach the
+       rows by KOT_ID. This is the same live child-table path used by KDS. */
+    let itemRows=[];
+    try{
+      const ir=await gasApi('RD_FETCH_SHEET',{tab:'KOT_ITEMS',LOCATION_ID:CLIENT_ID,locationId:CLIENT_ID},'V2_CORE');
+      if(ir && ir.success && Array.isArray(ir.data)) itemRows=ir.data;
+    }catch(e){ console.warn('[KOT ITEMS] child load failed:',e.message); }
+    const byKot={};
+    itemRows.forEach(r=>{
+      const kid=String(r.KOT_ID||r.kotId||'').trim(); if(!kid)return;
+      const name=String(r.ITEM_NAME||r.itemName||r.NAME||r.name||'').trim();
+      if(!name)return;
+      const qty=Number(r.QUANTITY??r.qty??r.QTY??1)||1;
+      const rate=Number(r.RATE??r.rate??r.PRICE??r.price??0)||0;
+      (byKot[kid]||(byKot[kid]=[])).push({name,qty,rate,itemId:String(r.ITEM_ID||r.itemId||r.ITEM_CODE||r.itemCode||'').trim(),size:String(r.SIZE||r.size||r.PACKAGE||r.package||r.UNIT||r.unit||'').trim()});
+    });
+
     const server=[];
     const seen=new Set();
     const businessDay = (typeof getBusinessDate==='function' ? String(getBusinessDate()||'') : new Date().toISOString().slice(0,10));
@@ -15409,11 +15429,20 @@ async function bnxPullKotsFromServer(){
       const kd=String(k.KOT_DATE||'').slice(0,10);
       if(kd && businessDay && kd!==businessDay) return;
       seen.add(no);
+      const kid=String(k.KOT_ID||k.kotId||'').trim();
+      const direct=Array.isArray(k.items)?k.items:(Array.isArray(k.itemsDetail)?k.itemsDetail:(Array.isArray(k.KOT_ITEMS)?k.KOT_ITEMS:[]));
+      const source=direct.length?direct:(byKot[kid]||[]);
+      const items=source.map(i=>({
+        name:i.name||i.itemName||i.ITEM_NAME||i.n||'',
+        qty:Number(i.qty??i.QUANTITY??i.QTY??1)||1,
+        rate:Number(i.rate??i.RATE??i.price??i.PRICE??0)||0,
+        size:i.size||i.SIZE||i.package||i.PACKAGE||i.unit||i.UNIT||''
+      })).filter(i=>i.name);
       server.push({
         kotNo:no, table:k.TABLE_ID||'—', type:no.startsWith('BAR-')?'BAR':'KITCHEN',
         waiter:k.STARTED_BY||'', covers:k.COVERS||'', time:k.STARTED_AT||((k.KOT_DATE||'')+'T'+(k.KOT_TIME||'00:00:00')),
-        orderNo:k.ORDER_ID||'', items:(k.items||k.itemsDetail||[]).map(i=>({name:i.name||i.itemName||'',qty:Number(i.qty||0),rate:Number(i.rate||0)})),
-        status:map[String(k.KOT_STATUS||'PRINTED').toUpperCase()]||'NEW', serverKotId:k.KOT_ID||''
+        orderNo:k.ORDER_ID||k.ORDER_NUMBER||k.ORDER_NO||'', items,
+        status:map[String(k.KOT_STATUS||'PRINTED').toUpperCase()]||'NEW', serverKotId:kid
       });
     });
     // Server is authoritative. Keep only genuinely unsynced local tickets;
@@ -18094,7 +18123,7 @@ window._bmPicker = { kots:[], orders:[] };
    bill (no extra clicks); more than one opens the picker already filtered
    to that table so the person just chooses which; zero matches does
    nothing (so it never fights with someone building a fresh manual bill). */
-function bmHandleTableChange(){
+async function bmHandleTableChange(){
   const tblVal = (document.getElementById('bm-bf-table')?.value || '').trim().toUpperCase();
   // FIX ("if bill also effect advance adjustment fix"): re-check for a
   // reservation advance every time the table field changes, not just at
@@ -18103,6 +18132,12 @@ function bmHandleTableChange(){
   if (typeof bmRecalc === 'function') bmRecalc();
   if (!tblVal) return;
   const kotEl = document.getElementById('bm-bf-kot');
+  /* LIVE TABLE→BILL FIX: a table can be selected before Order Register/KOT
+     background loading has completed. Refresh the two live sources here so
+     selecting a table never produces an empty bill just because startup was
+     still loading. */
+  try{ await bnxPullKotsFromServer(); }catch(e){}
+  try{ if(typeof loadOrderRegister==='function') await loadOrderRegister(); }catch(e){}
   if (kotEl && kotEl.value.trim()) return; // a reference is already loaded — don't override it
   let open = [];
   try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
@@ -18123,7 +18158,7 @@ function bmHandleTableChange(){
   const orderNosHere = new Set(orders.map(o => o.ORDER_NO || o.ORDER_ID).filter(Boolean));
   const kots = open.filter(k => k.status!=='READY' && !k.billed
     && (k.table||'').trim().toUpperCase() === tblVal
-    && !(k.orderNo && orderNosHere.has(k.orderNo)));
+    && !(k.orderNo && orderNosHere.has(k.orderNo) && orders.some(o => String(o.ORDER_NO||o.ORDER_ID||'').trim()===String(k.orderNo).trim() && Array.isArray(o.items) && o.items.length)));
   const total = kots.length + orders.length;
   if (total === 1){
     window._bmPicker = { kots, orders, sel: new Set([kots.length ? 'k0' : 'o0']) };
@@ -18243,7 +18278,7 @@ async function bmOpenKotPicker(){
   // list whenever an order sharing its orderNo is already being shown
   // in "Pending Orders" below, so each real ticket can only be picked
   // from ONE place.
-  const shownOrderNos = new Set(orders.map(o => o.ORDER_NO || o.ORDER_ID).filter(Boolean));
+  const shownOrderNos = new Set(orders.filter(o=>Array.isArray(o.items)&&o.items.length).map(o => o.ORDER_NO || o.ORDER_ID).filter(Boolean));
   const kots = open.filter(k => k.status!=='READY' && !k.billed
     && (!tblVal || (k.table||'').trim().toUpperCase() === tblVal)
     && !(k.orderNo && shownOrderNos.has(k.orderNo)));
