@@ -38141,7 +38141,9 @@ function bnxOpenImportHub(){
     let ri={}; try{ri=(typeof bnxGetRestaurantInfo==='function'?bnxGetRestaurantInfo():{})||{};}catch(e){}
     let brand={}; try{brand=(typeof loadBrand==='function'?loadBrand():{})||{};}catch(e){}
     let live={}; try{live=(window.BNX_LIVE_CLIENT_INFO&&typeof window.BNX_LIVE_CLIENT_INFO==='object')?window.BNX_LIVE_CLIENT_INFO:{};}catch(e){}
-    const name=String(d.clientName||d.entity||ri.name||brand.name||live.name||live.clientName||live.companyName||'').trim();
+    let domName='';
+    try{ domName=String(document.querySelector('[data-brand-name]')?.textContent||document.querySelector('.brand-name')?.textContent||'').trim(); }catch(e){}
+    const name=String(d.clientName||d.entity||ri.name||brand.name||live.name||live.clientName||live.companyName||domName||'').trim();
     const clientId=String(d.clientId||window.CLIENT_ID||live.clientId||live.CLIENT_ID||'').trim();
     return {name,clientId,ri,brand,live};
   }
@@ -38159,6 +38161,11 @@ function bnxOpenImportHub(){
         add(brand.logoLocal); add(/^data:/i.test(String(brand.logoDataUrl||''))?brand.logoDataUrl:''); add(brand.logoUrl);
       }catch(e){}
       try{ const ri=(typeof bnxGetRestaurantInfo==='function'?bnxGetRestaurantInfo():{})||{}; add(ri.logoUrl); }catch(e){}
+      /* Prefer the already-rendered client logo from the page when available.
+         This avoids a broken/late branding URL during Reprint. */
+      try{
+        document.querySelectorAll('#sidebarLogo img,#heroLogo img,#logoPreview img,[data-brand-logo] img').forEach(function(el){ add(el.currentSrc||el.src||''); });
+      }catch(e){}
       try{ add(typeof BNX_PRINT_LOGO_DATA_URI!=='undefined'?BNX_PRINT_LOGO_DATA_URI:''); }catch(e){}
 
       for(const src of candidates){
@@ -38169,10 +38176,13 @@ function bnxOpenImportHub(){
           img.src=src;
           if(img.decode) await img.decode().catch(()=>{});
           if(!img.complete || !(img.naturalWidth||img.width)) await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=reject;});
-          const maxW=192;
-          const iw=img.naturalWidth||img.width||192, ih=img.naturalHeight||img.height||64;
-          const scale=Math.min(1,maxW/iw,64/ih);
-          const w=Math.max(8,Math.round(iw*scale)), h=Math.max(1,Math.round(ih*scale));
+          /* 80mm ESC/POS receipt: use a clearly visible logo, but keep the
+             raster small enough for fast IP printing. 320 dots is a good
+             compromise for the common 576-dot/80mm thermal head. */
+          const maxW=360, maxH=96;
+          const iw=img.naturalWidth||img.width||320, ih=img.naturalHeight||img.height||96;
+          const scale=Math.min(1,maxW/iw,maxH/ih);
+          const w=Math.max(16,Math.round(iw*scale)), h=Math.max(1,Math.round(ih*scale));
           const c=document.createElement('canvas'); c.width=w; c.height=h;
           const ctx=c.getContext('2d',{willReadFrequently:true});
           ctx.fillStyle='#fff'; ctx.fillRect(0,0,w,h); ctx.drawImage(img,0,0,w,h);
@@ -38188,7 +38198,7 @@ function bnxOpenImportHub(){
                 const x=xb*8+bit; if(x>=w) continue;
                 const k=(y*w+x)*4, a=px[k+3]/255;
                 const lum=(0.299*px[k]+0.587*px[k+1]+0.114*px[k+2])*a+255*(1-a);
-                if(lum<185) v|=(0x80>>bit);
+                if(lum<220) v|=(0x80>>bit);
               }
               bytes[p++]=v;
             }
@@ -38218,6 +38228,9 @@ function bnxOpenImportHub(){
     return [
       {type:'raw',format:'command',flavor:'plain',data:prefix},
       {type:'raw',format:'command',flavor:'hex',data:logoHex},
+      /* Re-assert center after the raster so firmware which resets alignment
+         during image output does not shift the following header. */
+      {type:'raw',format:'command',flavor:'plain',data:'\x1Ba1'},
       {type:'raw',format:'command',flavor:'plain',data:rest}
     ];
   }
@@ -38258,6 +38271,8 @@ function bnxOpenImportHub(){
     let shop=ident.name||d.entity||'';
     try{shop=shop||(typeof shopName==='function'?shopName():'')||'';}catch(e){}
     if(shop) pushWrap(String(shop).toUpperCase(),width);
+    /* Client ID must always appear on direct/reprint receipts when known. */
+    if(ident.clientId) out.push('Client ID: '+escPosText(ident.clientId)+'\n');
     out.push('\x1BE0');
     if(ident.ri && ident.ri.address) pushWrap(ident.ri.address,width);
     else if(d.addr) pushWrap(d.addr,width);
@@ -38281,20 +38296,24 @@ function bnxOpenImportHub(){
     const items=Array.isArray(d.items)?d.items:[];
     let itemQty=0;
     items.forEach(function(i){
-      const name=String(i.name||i.ITEM_NAME||'Item');
+      let name=String(i.name||i.ITEM_NAME||'Item');
+      /* Some legacy BILL_ITEMS rows carry a separate numeric zero inside the
+         item-name text (for example `Bloody Mary\n0`). Never print that as
+         a second item line. */
+      name=name.replace(/(?:\r?\n|\s+)0\s*$/,'').replace(/(?:^|\n)0(?=\n|$)/g,'').trim();
       const qty=Number(i.qty||i.QUANTITY||0);
       const rate=Number(i.rate||i.RATE||0);
       const amt=Number(i.amt!=null?i.amt:(i.line!=null?i.line:(i.amount!=null?i.amount:(i.AMOUNT!=null?i.AMOUNT:qty*rate))));
       itemQty += qty;
       const right=padLeft(String(qty),qtyW)+' '+padLeft(money0(rate),rateW)+' '+padLeft(money0(amt),amtW);
-      const nameLines=wrap(name,itemNameWidth);
+      const nameLines=wrap(name,itemNameWidth).filter(function(nm){ return String(nm).trim()!=='0'; });
       nameLines.forEach(function(nm,idx){
         out.push(idx===nameLines.length-1 ? padRight(nm,itemNameWidth)+' '+right+'\n' : padRight(nm,itemNameWidth)+'\n');
       });
-      const mrp=String(i.mrpNote||i.mrp||i.MRP||'').trim();
-      if(mrp) out.push('  MRP : '+escPosText(mrp)+'\n');
+      /* Do not print MRP on the tax invoice. The approved physical format has
+         only ITEM / QTY / RATE / AMT; this also eliminates legacy zero lines. */
       const note=String(i.note||i.notes||i.remark||i.remarks||i.instruction||'').trim();
-      if(note) wrap('Note: '+note,width-2).forEach(function(n){out.push('  '+n+'\n');});
+      if(note && !/^0(?:\.0+)?$/.test(note)) wrap('Note: '+note,width-2).forEach(function(n){out.push('  '+n+'\n');});
     });
     out.push(line('-',width)+'\n');
 
