@@ -12324,5 +12324,155 @@ html:not([data-color-mode="dark"]) .kot-card{background:#fff!important;color:#17
 .menu-list .ml-item[onclick^="doLogout"]{display:none!important}
 .hero{position:relative}
 </style>
+<!-- BNX FINAL PASS 2026-10-02 — TABLE VIEW / REPEAT / TRANSFER REPAIR
+     Root cause: the table-popup "View Order" used only the local KOT cache.
+     On a table owned by another steward that cache can be empty or filtered,
+     so the popup showed no order even though GET_TABLE_FLOOR had live rounds.
+     This final controller reads the authoritative live floor first and keeps
+     View Order read-only for another steward while exposing Repeat/Transfer
+     for the owner/captain only. -->
+<style id="bnx-final-table-view-repair-css">
+  #sw-tbl-order-body .bnx-live-round{border:1px solid var(--border,#e5e7eb);border-radius:11px;padding:9px 10px;margin-bottom:8px;background:var(--surface,#fff)}
+  #sw-tbl-order-body .bnx-live-round-h{display:flex;justify-content:space-between;gap:8px;font-size:11px;font-weight:900}
+  #sw-tbl-order-body .bnx-live-round-s{font-size:10px;color:var(--text3,#6b7280);margin:3px 0 5px}
+  #sw-tbl-order-body .bnx-live-line{display:flex;justify-content:space-between;gap:8px;font-size:11px;padding:3px 0}
+  #sw-tbl-order-body .bnx-live-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+  #sw-tbl-order-body .bnx-live-actions button{min-height:40px;border-radius:9px;font-weight:800;cursor:pointer}
+</style>
+<script id="bnx-final-table-view-repair-js">
+(function(){
+  'use strict';
+  const esc = function(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});};
+  const money = function(v){return '₹'+(Number(v)||0).toLocaleString('en-IN',{maximumFractionDigits:2});};
+  const norm = function(v){return String(v==null?'':v).trim().toLowerCase();};
+  const isRunning = function(t){return !!t && ['OCCUPIED','RUNNING'].includes(String(t.status||'').toUpperCase());};
+  const me = function(){try{return typeof getCurrentStaffIdentity==='function'?getCurrentStaffIdentity():{};}catch(e){return {};}};
+  const owner = function(t){
+    try{
+      if(typeof window.liveTableOwner==='function' && window.liveTableOwner(t)) return true;
+      const i=me(), vals=[t&&t.steward,t&&t.captain,t&&t.waiter,t&&t.stewardLogin,t&&t.captainLogin,t&&t.waiterLogin];
+      return vals.some(function(v){return v && ((i.fullName&&norm(v)===norm(i.fullName))||(i.loginId&&norm(v)===norm(i.loginId))||(i.userId&&norm(v)===norm(i.userId)));});
+    }catch(e){return false;}
+  };
+  const elevated = function(){try{return /CAPTAIN|MANAGER|ADMIN|OWNER|SUPERVISOR|DEVELOPER|MD|CEO/.test(String(me().role||'').toUpperCase());}catch(e){return false;}};
+  const getTable = function(data,t){
+    const arr=data&&Array.isArray(data.tables)?data.tables:[];
+    const tid=norm(t&&t.id), tno=norm(t&&t.no);
+    return arr.find(function(f){return norm(f.tableId)===tid||norm(f.tableNo)===tid||norm(f.tableNo)===tno||norm(f.tableId)===tno;})||null;
+  };
+  const itemName=function(i){return i&& (i.name||i.ITEM_NAME||i.itemName||i.ITEM||i.item) || '-';};
+  const itemQty=function(i){return Number(i&& (i.qty||i.QUANTITY||i.quantity))||1;};
+  const itemRate=function(i){return Number(i&& (i.price||i.rate||i.RATE||i.RATE_AMOUNT))||0;};
+  const lineItems=function(line){return Array.isArray(line&&line.items)?line.items:[];};
+
+  window.swViewTableOrders=async function(){
+    const t=window.selTable||(typeof selTable!=='undefined'?selTable:null);
+    if(!t) return;
+    let m=document.getElementById('sw-tbl-order-modal');
+    if(!m){
+      m=document.createElement('div'); m.id='sw-tbl-order-modal'; m.className='modal-overlay';
+      m.innerHTML='<div class="sw-sheet"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><b id="sw-tbl-order-title" style="font-size:14px">Orders</b><button type="button" id="bnx-swv-close" style="border:0;background:#f3f5f8;border-radius:8px;padding:6px 12px;font-weight:800">Close</button></div><div id="sw-tbl-order-body"></div></div>';
+      document.body.appendChild(m);
+      m.addEventListener('click',function(e){if(e.target===m)m.classList.remove('open');});
+      document.getElementById('bnx-swv-close').onclick=function(){m.classList.remove('open');};
+    }
+    const body=document.getElementById('sw-tbl-order-body');
+    document.getElementById('sw-tbl-order-title').textContent='Table '+String(t.no||t.id)+' — View Order';
+    body.innerHTML='<div style="padding:18px;text-align:center;color:#6b7280;font-size:12px">Loading live order…</div>';
+    m.classList.add('open');
+
+    let floor=null, serverOk=false;
+    try{
+      if(typeof gasApi==='function'){
+        const r=await gasApi('GET_TABLE_FLOOR',{includeItems:true},'V2_CORE');
+        if(r&&r.success&&r.data){floor=getTable(r.data,t);serverOk=!!floor;}
+      }
+    }catch(e){console.warn('[BNX TABLE VIEW] GET_TABLE_FLOOR',e);}
+
+    /* Fallback to the existing KOT cache only when the authoritative floor is unavailable. */
+    let kots=[];
+    try{
+      if(typeof loadKOTFromServer==='function') await loadKOTFromServer();
+      if(typeof bnxLoadOpenKots==='function') bnxLoadOpenKots();
+      const tid=norm(t.id),tno=norm(t.no);
+      kots=(typeof KOT!=='undefined'&&Array.isArray(KOT)?KOT:[]).filter(function(k){
+        const kt=norm(k.table||k.TABLE_ID);
+        return (kt===tid||kt===tno)&&!['CANCELLED','BILLED'].includes(String(k.status||'').toUpperCase());
+      });
+    }catch(e){}
+
+    const rounds=serverOk && Array.isArray(floor.lines) ? floor.lines : [];
+    let grand=0;
+    let html='';
+
+    if(rounds.length){
+      html += '<div style="font-size:10px;font-weight:900;color:#6b7280;margin:0 0 7px">LIVE SERVER ORDER · '+rounds.length+' ROUND'+(rounds.length===1?'':'S')+'</div>';
+      rounds.forEach(function(line,idx){
+        const items=lineItems(line);
+        const total=items.reduce(function(a,i){return a+itemQty(i)*itemRate(i);},0); grand+=total;
+        const orderNo=line.orderNo||line.ORDER_NO||line.orderNumber||line.ORDER_NUMBER||line.orderId||line.ORDER_ID||'';
+        const kotNo=line.kotNo||line.KOT_NO||line.kotNumber||'';
+        html += '<div class="bnx-live-round">'+
+          '<div class="bnx-live-round-h"><span>Round '+(idx+1)+(orderNo?' · Order '+esc(orderNo):'')+'</span><span>'+money(total)+'</span></div>'+
+          '<div class="bnx-live-round-s">'+esc(line.time||line.createdAt||line.CREATED_AT||'')+(kotNo?' · KOT '+esc(kotNo):'')+'</div>'+
+          (items.length?items.map(function(i){const q=itemQty(i),r=itemRate(i),amt=q*r;return '<div class="bnx-live-line"><span>'+q+' × '+esc(itemName(i))+'</span><span>'+money(amt)+'</span></div>';}).join(''):'<div style="font-size:11px;color:#6b7280">Items not included in this floor row.</div>')+
+          '</div>';
+      });
+    } else if(kots.length){
+      html += '<div style="font-size:10px;font-weight:900;color:#6b7280;margin:0 0 7px">ACTIVE KOT ORDER'+(kots.length===1?'':'S')+'</div>';
+      kots.forEach(function(k){
+        const items=Array.isArray(k.items)?k.items:[];
+        const total=items.reduce(function(a,i){return a+itemQty(i)*itemRate(i);},0); grand+=total;
+        html += '<div class="bnx-live-round"><div class="bnx-live-round-h"><span>Order '+esc(k.orderNo||k.kotNo||'-')+'</span><span>'+money(total)+'</span></div><div class="bnx-live-round-s">'+esc(k.status||'OPEN')+' · '+esc(k.waiter||k.steward||'-')+'</div>'+
+          items.map(function(i){const q=itemQty(i),r=itemRate(i);return '<div class="bnx-live-line"><span>'+q+' × '+esc(itemName(i))+'</span><span>'+money(q*r)+'</span></div>';}).join('')+'</div>';
+      });
+    } else {
+      html='<div style="padding:18px;text-align:center;color:#6b7280;font-size:12px">No item lines returned for this table.<br>'+(Number(t.bill)>0?'Running bill: <b>'+money(t.bill)+'</b>':'')+'</div>';
+    }
+
+    const canChange=owner(t), canMove=canChange||elevated();
+    html += '<div style="display:flex;justify-content:space-between;font-weight:900;font-size:15px;padding:8px 2px;border-top:1px solid #e5e7eb;margin-top:6px"><span>Running Total</span><span>'+money(grand||t.bill||0)+'</span></div>';
+    html += '<div style="font-size:10px;color:#6b7280;margin-top:4px">'+(canChange?'✓ Your table — order actions are enabled.':'🔒 View only — this table belongs to another steward.')+'</div>';
+    html += '<div class="bnx-live-actions">';
+    if(canChange && isRunning(t)) html += '<button type="button" style="border:0;background:#f57c00;color:#fff" id="bnx-swv-repeat">🔁 Repeat Last Round</button>';
+    if(canChange && isRunning(t)) html += '<button type="button" style="border:1px solid #ddd;background:#fff" id="bnx-swv-transfer">🔀 Transfer Table</button>';
+    if(canMove && isRunning(t)) html += '<button type="button" style="border:1px solid #ddd;background:#fff" id="bnx-swv-merge">🔗 Merge Table</button>';
+    if(!canChange && isRunning(t)) html += '<div style="grid-column:1/-1;padding:10px;border-radius:9px;background:#fff3cd;color:#7a5b00;font-size:11px;font-weight:800">Owner/captain access is required to repeat, modify, transfer or merge this table.</div>';
+    html += '</div>';
+    body.innerHTML=html;
+
+    const repeat=document.getElementById('bnx-swv-repeat');
+    if(repeat) repeat.onclick=function(){m.classList.remove('open'); if(typeof bnx73RepeatOrder==='function') bnx73RepeatOrder();};
+    const transfer=document.getElementById('bnx-swv-transfer');
+    if(transfer) transfer.onclick=function(){m.classList.remove('open'); if(typeof bnx73MoveDlg==='function') bnx73MoveDlg('transfer',t.id);};
+    const merge=document.getElementById('bnx-swv-merge');
+    if(merge) merge.onclick=function(){m.classList.remove('open'); if(typeof bnx73MoveDlg==='function') bnx73MoveDlg('merge',t.id);};
+  };
+
+  /* Repair the table popup button wiring after the original openTable wrapper runs. */
+  const origOpen=window.openTable;
+  if(typeof origOpen==='function'){
+    window.openTable=function(id){
+      const r=origOpen.apply(this,arguments);
+      setTimeout(function(){
+        try{
+          const t=(typeof selTable!=='undefined')?selTable:null;
+          const row=document.querySelector('#table-modal .modal > div[style*="margin-top:14px"]');
+          if(!row)return;
+          let btn=document.getElementById('sw-tbl-order-btn');
+          if(!btn){
+            btn=document.createElement('button');btn.type='button';btn.id='sw-tbl-order-btn';btn.textContent='👁 View Order';
+            btn.onclick=function(e){e.preventDefault();e.stopPropagation();window.swViewTableOrders();return false;};
+            row.insertBefore(btn,row.children[1]||null);
+          }
+          btn.style.display=(t&&String(t.status||'').toUpperCase()!=='AVAILABLE')?'':'none';
+        }catch(e){console.debug('[BNX TABLE VIEW BUTTON]',e);}
+      },0);
+      return r;
+    };
+  }
+})();
+</script>
+
 </body>
 </html>
