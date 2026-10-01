@@ -6933,7 +6933,7 @@ function bnxKOTGroupLabel_(name){
   return s ? s : 'General';
 }
 
-function printKOTTicket(kotNo, partType){
+async function printKOTTicket(kotNo, partType){
   bnxLoadOpenKots();
   const k = KOT.find(x=>String(x.kotNo)===String(kotNo));
   if(!k){ toast('KOT not found','error'); return; }
@@ -6941,7 +6941,7 @@ function printKOTTicket(kotNo, partType){
   if(!parts.length){ toast('No KOT items to print','error'); return; }
   const part=partType ? parts.find(p=>String(p.type)===String(partType)) : (parts.length===1?parts[0]:null);
   if(!part){
-    parts.forEach(p=>{ try{ printKOTTicket(kotNo,p.type); }catch(e){ console.error('[KOT PRINT]',e); } });
+    for(const p of parts){ try{ await printKOTTicket(kotNo,p.type); }catch(e){ console.error('[KOT PRINT]',e); } }
     return;
   }
   const groups=bnxKOTGroups_({items:part.items});
@@ -6962,6 +6962,17 @@ function printKOTTicket(kotNo, partType){
   const html=`<html><head><title>KOT ${orderNo} - ${bnxEscapeHtml_(part.type)}</title><style>body{font-family:monospace;width:280px;margin:0 auto;padding:8px;color:#000}.kot-sheet{page-break-after:auto}h2{text-align:center;margin:0 0 4px;font-size:22px}.type{font-weight:900;font-size:16px;border:2px solid #000;padding:5px;margin:4px 0 8px;text-align:center}.group{font-weight:900;font-size:15px;border:2px solid #000;padding:5px;margin:8px 0 5px;text-align:center;text-transform:uppercase}.meta{font-size:12px;line-height:1.45;margin-bottom:8px}.group-block{break-inside:avoid;page-break-inside:avoid}table{width:100%;border-collapse:collapse;font-size:13px}hr{border:none;border-top:1px dashed #000;margin:8px 0}.foot{text-align:center;font-size:10px;margin-top:10px}</style></head><body><section class="kot-sheet"><h2>KOT</h2><div class="type">${bnxEscapeHtml_(part.type)} KITCHEN ORDER</div><div class="meta"><b>Order No:</b> ${orderNo}<br>Table: ${bnxEscapeHtml_(k.table||'-')}<br>Waiter: ${bnxEscapeHtml_(k.waiter||'-')} &nbsp; Covers: ${bnxEscapeHtml_(k.covers||'-')}<br>${custLine}Time: ${bnxEscapeHtml_(bnxKotTimeLabel(k.time))}</div><hr>${groupBlocks}<hr><div style="text-align:center;font-size:11px;font-weight:700;">ORDER ${bnxEscapeHtml_(k.orderNo||k.kotNo)} · ${bnxEscapeHtml_(part.type)} KOT</div><div class="foot">Balaji NextGen ERP · HAPPYSERVE</div></section>
 <!-- old unified nav controller removed -->
 </body></html>`;
+  // DIRECT LAN KOT: send the same ticket directly to the configured
+  // station printer through QZ Tray. If direct printing is unavailable,
+  // retain the existing browser-print ticket as the safe fallback.
+  try{
+    const directOk=await bnxDirectKOTPrint_(part.type,{
+      title:part.type+' KOT', table:k.table, waiter:k.waiter||k.steward, covers:k.covers,
+      items:part.items, kotNo:k.kotNumber||k.kotNo||'', orderNo:k.orderNo||k.kotNo||'',
+      customerName:k.customerName||'Default Customer', remarks:k.remarks||''
+    });
+    if(directOk) return;
+  }catch(e){ console.warn('[STEWARD KOT IP] direct print failed; browser fallback:',e); }
   bnxPrintHtml(html);
 }
 /* STAFF LIVE HUB: moved out of print-ticket HTML template; it was accidentally embedded inside a template literal. */
@@ -7459,6 +7470,173 @@ function printKOTTicket(kotNo, partType){
 // close + print()+close() sequence already working everywhere in
 // restaurant-dashboard.html, so KOT tickets and receipts print the
 // same reliable way the rest of the suite already does.
+/* ========================================================================
+   STEWARD DIRECT LAN KOT PRINTING — same Client 10 printer map/format as
+   restaurant-dashboard.html. QZ Tray -> TCP 9100 -> station printer.
+   BILL  : 192.168.0.210
+   KITCHEN: 192.168.0.192
+   HUKKA : 192.168.0.195
+   BAR   : 192.168.0.151
+   ======================================================================== */
+(function(){
+  if(window.__bnxStewardDirectKotV1) return;
+  window.__bnxStewardDirectKotV1=true;
+
+  const QZ_SRC='https://cdn.jsdelivr.net/npm/qz-tray@2.3.0/qz-tray.js';
+  let qzLoadPromise=null, qzConnectPromise=null;
+  const DEFAULT_IPS={BILL:'192.168.0.210',KITCHEN:'192.168.0.192',HUKKA:'192.168.0.195',BAR:'192.168.0.151'};
+
+  function stewardPrinterKey_(){
+    try{
+      const cid=(typeof CLIENT_ID!=='undefined'&&CLIENT_ID) || getCurrentStaffIdentity().clientId || 'default';
+      return 'bnx_printer_settings_'+cid;
+    }catch(e){ return 'bnx_printer_settings_default'; }
+  }
+  function ipSettings_(){
+    let cfg={};
+    try{ cfg=JSON.parse(localStorage.getItem(stewardPrinterKey_())||'{}')||{}; }catch(e){}
+    const re=/\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/;
+    function pick(p,id,def){
+      const live=document.getElementById(id)?.value||'';
+      const m=live.match(re);
+      return (m?m[0]:String((p&&p.ip)||def)).trim();
+    }
+    return {
+      BILL:pick(cfg.pr1,'pr1-name',DEFAULT_IPS.BILL),
+      KITCHEN:pick(cfg.pr2,'pr2-name',DEFAULT_IPS.KITCHEN),
+      HUKKA:pick(cfg.pr3,'pr3-name',DEFAULT_IPS.HUKKA),
+      BAR:pick(cfg.pr4,'pr4-name',DEFAULT_IPS.BAR)
+    };
+  }
+  function role_(type){
+    const t=String(type||'').toUpperCase();
+    if(t.includes('HUKKA')||t.includes('HOOKAH')||t.includes('SHEESHA')) return 'HUKKA';
+    if(t.includes('BAR')) return 'BAR';
+    return 'KITCHEN';
+  }
+  function text_(v){
+    return String(v==null?'':v).replace(/₹/g,'Rs ').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g,'');
+  }
+  function line_(ch,n){return new Array(n+1).join(ch);}
+  function padRight_(s,n){s=text_(s);return s.length>=n?s.slice(0,n):s+new Array(n-s.length+1).join(' ');}
+  function padLeft_(s,n){s=text_(s);return s.length>=n?s.slice(-n):new Array(n-s.length+1).join(' ')+s;}
+  function cols_(width,a,b){
+    a=text_(a); b=text_(b);
+    if(a.length+b.length<=width) return padRight_(a,width-b.length)+b;
+    const maxA=Math.max(4,width-b.length-1);
+    return padRight_(a.slice(0,maxA),width-b.length)+b;
+  }
+  function qzError_(e){
+    const m=String(e&&e.message||e||'').replace(/\s+/g,' ').trim();
+    if(/ERR_CONNECTION_REFUSED|connection refused|failed to connect/i.test(m)) return 'QZ Tray is not running';
+    if(/permission|access.*denied|blocked|local network|ERR_FAILED|private network/i.test(m)) return 'Edge blocked local QZ Tray access';
+    return m||'QZ Tray connection failed';
+  }
+  function loadQz_(){
+    if(window.qz) return Promise.resolve(window.qz);
+    if(qzLoadPromise) return qzLoadPromise;
+    qzLoadPromise=new Promise((resolve,reject)=>{
+      const sc=document.createElement('script'); sc.src=QZ_SRC; sc.async=true;
+      sc.onload=()=>window.qz?resolve(window.qz):reject(new Error('QZ Tray library loaded but qz is unavailable'));
+      sc.onerror=()=>reject(new Error('Could not load QZ Tray library'));
+      document.head.appendChild(sc);
+    });
+    return qzLoadPromise;
+  }
+  function connectQz_(){
+    if(!window.qz) return loadQz_().then(connectQz_);
+    try{ if(qz.websocket.isActive()) return Promise.resolve(); }catch(e){}
+    if(qzConnectPromise) return qzConnectPromise;
+    qzConnectPromise=(async()=>{
+      let secureErr=null;
+      try{
+        return await qz.websocket.connect({retries:3,delay:1,host:['localhost','localhost.qz.io'],usingSecure:true});
+      }catch(e){secureErr=e;}
+      try{
+        return await qz.websocket.connect({retries:2,delay:1,host:['localhost','localhost.qz.io'],usingSecure:false});
+      }catch(e){
+        const a=qzError_(secureErr), b=qzError_(e);
+        throw new Error(a+' | '+b);
+      }
+    })().finally(()=>{qzConnectPromise=null;});
+    return qzConnectPromise;
+  }
+  function outlet_(){
+    try{
+      const k=document.getElementById('hero-client-name')?.textContent || document.getElementById('tables-client-name')?.textContent || '';
+      if(k.trim()) return k.trim();
+    }catch(e){}
+    try{
+      const u=JSON.parse(sessionStorage.getItem('ERP_USER')||localStorage.getItem('ERP_USER')||'{}');
+      return String(u.COMPANY_NAME||u.CLIENT_NAME||u.RESTAURANT_NAME||u.BUSINESS_NAME||'').trim();
+    }catch(e){return '';}
+  }
+  function kotRaw_(d){
+    d=d||{};
+    const width=48;
+    const role=role_(d.type||d.title);
+    const now=new Date();
+    const out=['\x1B@','\x1Ba1','\x1BE1','******** KOT ********\r\n','\x1BE0'];
+    out.push('PRINTER : '+text_(role)+'\r\n');
+    out.push('DATE    : '+text_(now.toLocaleString('en-IN'))+'\r\n');
+    const outlet=outlet_(); if(outlet) out.push('Outlet  : '+text_(outlet)+'\r\n');
+    if(d.orderNo) out.push('Order No: '+text_(d.orderNo)+'\r\n');
+    out.push('Table   : '+text_(d.table||'-')+'\r\n');
+    out.push('KOT No  : '+text_(d.kotNo||'-')+'\r\n');
+    out.push('Customer: '+text_(d.customerName||'Default Customer')+'\r\n');
+    out.push(line_('-',width)+'\r\n');
+    out.push(cols_(width,'ITEM','SIZE     QTY')+'\r\n');
+    out.push(line_('-',width)+'\r\n');
+    (Array.isArray(d.items)?d.items:[]).forEach(i=>{
+      const qty=Number(i.qty||i.QUANTITY||1);
+      const name=String(i.name||i.n||i.ITEM_NAME||'Item');
+      const size=String(i.size||i.SIZE||i.package||i.PACKAGE||i.unit||'');
+      out.push(cols_(width,name,padLeft_(size,8)+' '+padLeft_(String(qty),5))+'\r\n');
+      const note=String(i.note||i.notes||i.remark||i.remarks||i.instruction||i.SPECIAL_INSTRUCTIONS||i.itemRemark||i.ITEM_REMARKS||'').trim();
+      if(note) out.push('  NOTE: '+text_(note)+'\r\n');
+    });
+    out.push(line_('-',width)+'\r\n');
+    out.push('OrderTaker: '+text_(d.waiter||d.steward||'-')+'\r\n');
+    if(d.remarks) out.push('Remarks: '+text_(d.remarks)+'\r\n');
+    out.push('\r\n\r\n\r\n','\x1DVA0');
+    return out.join('');
+  }
+  async function direct_(role,data,jobName){
+    const ip=ipSettings_()[role];
+    if(!ip) throw new Error('No '+role+' printer IP configured');
+    await connectQz_();
+    const config=qz.configs.create({host:ip,port:9100},{jobName:jobName||('BNX '+role+' KOT')});
+    const raw=Array.isArray(data)?data.join(''):String(data||'');
+    // Explicit QZ raw command object: avoids the browser/HTML print path.
+    return qz.print(config,[{type:'raw',format:'command',flavor:'plain',data:raw}]);
+  }
+  window.bnxStewardTestKOTPrinter=async function(role){
+    role=role_(role);
+    try{
+      await direct_(role,['\x1B@','\x1Ba1','\x1BE1','******** KOT TEST ********\r\n','PRINTER : '+role+'\r\n','IP : '+ipSettings_()[role]+'\r\n','PRINT OK\r\n','\r\n\r\n\r\n','\x1DVA0'],'BNX '+role+' KOT Test');
+      toast('✅ '+role+' KOT printer test sent to '+ipSettings_()[role],'success');
+      return true;
+    }catch(e){
+      console.warn('[STEWARD KOT IP TEST]',qzError_(e),e);
+      toast('⚠️ '+role+' direct printer failed: '+qzError_(e),'error');
+      return false;
+    }
+  };
+  window.bnxDirectKOTPrint_=async function(type,d){
+    try{
+      const role=role_(type);
+      const ip=ipSettings_()[role];
+      await direct_(role,kotRaw_(Object.assign({},d,{type})), 'BNX '+role+' KOT '+String(d&&d.kotNo||''));
+      console.info('[BNX STEWARD KOT IP] sent',{role,ip,kotNo:d&&d.kotNo,orderNo:d&&d.orderNo,table:d&&d.table,items:Array.isArray(d&&d.items)?d.items.length:0});
+      return true;
+    }catch(e){
+      console.warn('[BNX STEWARD KOT IP] failed',qzError_(e),e);
+      return false;
+    }
+  };
+  try{ localStorage.setItem('bnx_direct_ip_print','1'); }catch(e){}
+})();
+
 function bnxPrintHtml(html){
   const w = window.open('', '_blank', 'width=380,height=600');
   if (!w){ toast('Print blocked — allow pop-ups for this site and try again','error'); return; }
