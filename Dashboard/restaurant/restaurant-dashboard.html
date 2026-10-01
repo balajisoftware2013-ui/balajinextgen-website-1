@@ -9427,7 +9427,10 @@ async function bnxPullBillsFromServer(from, to){
           items: sb.items ?? (Array.isArray(sb.itemsDetail)?sb.itemsDetail.length:0),
           itemsDetail: sb.itemsDetail || (Array.isArray(sb.items)?sb.items:[]),
           sub: sb.sub ?? sb.subtotal ?? sb.SUBTOTAL ?? 0,
+          disc: sb.disc ?? sb.discount ?? sb.DISCOUNT ?? 0,
+          sc: sb.sc ?? sb.serviceCharge ?? sb.SERVICE_CHARGE ?? 0,
           gst: sb.gst ?? sb.tax ?? sb.TAX_AMOUNT ?? 0,
+          roundOff: sb.roundOff ?? sb.ROUND_OFF ?? sb.roff ?? 0,
           total: sb.total ?? sb.grand ?? sb.GRAND_TOTAL ?? 0,
           pay: mode, payBreakdown, isSplitPayment: !!sb.isSplitPayment,
           // Preserve the real accounting state. NOT_REQUIRED is not Pending.
@@ -14368,28 +14371,15 @@ function bnxItemGroupType_(item){
   }catch(e){return '';}
 }
 function bnxKotStation(itemOrCategory){
-  // AUTHORITATIVE routing order: explicit GROUP_TYPE -> HUKKA/HOOKAH
-  // category/name -> BAR category/name -> KITCHEN fallback. Every item is
-  // assigned to exactly one physical station, so mixed orders always split
-  // into independent tickets.
+  // AUTHORITATIVE: ITEM_GROUP_MASTER.GROUP_TYPE. Multiple item groups of the
+  // same station are merged into ONE station KOT.
   const gt=bnxItemGroupType_(itemOrCategory);
-  if(gt==='HUKKA' || gt==='HOOKAH' || gt==='SHEESHA') return 'HUKKA';
+  if(gt==='HUKKA' || gt==='HOOKAH') return 'HUKKA';
   if(gt==='BAR') return 'BAR';
   if(gt) return 'KITCHEN';
-
-  const x=typeof itemOrCategory==='string' ? {category:itemOrCategory} : (itemOrCategory||{});
-  const vals=[x.category,x.c,x.itemGroupName,x.ITEM_GROUP_NAME,x.GROUP_NAME,x.name,x.n,x.ITEM_NAME]
-    .map(v=>String(v==null?'':v).trim().toUpperCase()).filter(Boolean);
-  const text=vals.join(' | ');
-
-  // HUKKA gets first priority so an item which also has a beverage-like
-  // name cannot accidentally go to BAR.
-  if(/(?:^|[ _-])(HUKKA|HOOKAH|SHEESHA)(?:$|[ _-])/.test(text) || /HUKKA|HOOKAH|SHEESHA/.test(text)) return 'HUKKA';
-
-  if(BAR_STATION_CATEGORIES.has(String(x.category||x.c||x.itemGroupName||'').trim().toUpperCase()) ||
-     /(?:^|[ _-])(BAR|LIQUOR|SPIRITS|WHISKY|WHISKEY|BEER|WINE|COCKTAIL|MOCKTAIL|JUICE|BEVERAGE)(?:$|[ _-])/.test(text)){
-    return 'BAR';
-  }
+  const c=String(typeof itemOrCategory==='string'?itemOrCategory:(itemOrCategory?.category||itemOrCategory?.c||itemOrCategory?.itemGroupName||itemOrCategory?.GROUP_NAME||'')).trim().toUpperCase();
+  if(/^(HUKKA|HOOKAH|SHEESHA)(\b|[ _-])/.test(c) || c.includes('HUKKA') || c.includes('HOOKAH') || c.includes('SHEESHA')) return 'HUKKA';
+  if (BAR_STATION_CATEGORIES.has(c)) return 'BAR';
   return 'KITCHEN';
 }
 const BAR_CATEGORIES = BAR_STATION_CATEGORIES;
@@ -14613,52 +14603,45 @@ function bnxRecordKOT(table, type, waiter, covers, items, orderNo, orderSyncItem
    #ORD-1040). Now the real order number is threaded through from
    sendKOT() so every split is recorded against the SAME order. */
 function printKOTSplit(table, waiter, covers, items, orderNo){
-  const allItems=Array.isArray(items)?items.filter(Boolean):[];
-  if(!allItems.length) return;
-  const customerName=String(document.getElementById('custNameInput')?.value||'Default Customer').trim()||'Default Customer';
-  const remarks=String(document.getElementById('remarksInput')?.value||'').trim();
+  // One POS order can create multiple station tickets. The order reference
+  // MUST stay identical on every split; only the KOT number/station changes.
+  const customerName = String(document.getElementById('custNameInput')?.value || 'Default Customer').trim() || 'Default Customer';
+  const remarks = String(document.getElementById('remarksInput')?.value || '').trim();
 
-  // Build station buckets once. Do not re-use the whole cart for each printer.
-  const route={KITCHEN:[],HUKKA:[],BAR:[]};
-  allItems.forEach(item=>{
-    let live=null;
-    try{
-      live=menuData.find(m=>{
-        const a=String(m?.n||m?.name||m?.ITEM_NAME||'').trim().toLowerCase();
-        const b=String(item?.name||item?.n||item?.ITEM_NAME||'').trim().toLowerCase();
-        return a===b;
-      });
-    }catch(e){}
-    const merged=Object.assign({},live||{},item||{});
-    const station=bnxKotStation(merged);
-    route[station].push(item);
+  const route = {KITCHEN:[], HUKKA:[], BAR:[]};
+  items.forEach(i=>{
+    const liveMenuItem=menuData.find(m=>String(m.n||'').toLowerCase()===String(i.name||'').toLowerCase());
+    const routeItem=Object.assign({}, liveMenuItem||{}, i, {GROUP_TYPE:i.GROUP_TYPE||liveMenuItem?.GROUP_TYPE||''});
+    const station=bnxKotStation(routeItem);
+    (route[station] || route.KITCHEN).push(i);
   });
 
-  // Fixed physical order: KITCHEN -> BAR -> HUKKA. This is only the queue
-  // order; each ticket still goes to its own IP from the printer settings.
-  const stations=['KITCHEN','BAR','HUKKA'].filter(st=>route[st].length);
-  const splitTotal=stations.length;
+  const activeStations = ['KITCHEN','HUKKA','BAR'].filter(st=>route[st].length);
+  const splitTotal = activeStations.length;
   const jobs=[];
-  let orderSynced=false;
+  let orderAlreadySynced=false;
+  const syncItemsFor=()=>{
+    if(orderAlreadySynced) return false;
+    orderAlreadySynced=true;
+    return items;
+  };
 
-  stations.forEach((station,idx)=>{
-    const stationItems=route[station];
-    const no=bnxRecordKOT(
-      table,station,waiter,covers,stationItems,orderNo,
-      orderSynced ? false : allItems,
-      {splitIndex:idx+1,splitTotal,customerName,remarks}
+  activeStations.forEach((station, idx)=>{
+    const stationItems = route[station];
+    const no = bnxRecordKOT(
+      table, station, waiter, covers, stationItems, orderNo,
+      syncItemsFor(),
+      {splitIndex:idx+1, splitTotal, customerName, remarks}
     );
-    orderSynced=true;
-    const title=station==='HUKKA'?'HUKKA KOT':station==='BAR'?'BAR KOT':'KITCHEN KOT';
-    console.info('[BNX KOT SPLIT]',{station,splitIndex:idx+1,splitTotal,kotNo:no,orderNo,items:stationItems.length});
+    const title = station==='HUKKA' ? 'HUKKA KOT' : station==='BAR' ? 'BAR KOT' : 'KITCHEN KOT';
+    // Pass the real order number + split position through to BOTH browser
+    // and direct-IP printers. This keeps every physical ticket tied to the
+    // same POS order while showing only that station's own items.
     jobs.push(()=>window.printOneKOT(title,table,waiter,covers,stationItems,no,orderNo,idx+1,splitTotal,customerName,remarks));
   });
 
-  // One awaited queue prevents cross-printer overlap. Each printOneKOT
-  // resolves only after qz.print accepts that station's raw ESC/POS job.
   bnxPrintKotQueue_(jobs);
 }
-
 
 /* FIX ("icon add with order placement, logo also add small"): KOT tickets
    and the printed bill/receipt only ever showed the restaurant NAME as
@@ -19471,16 +19454,27 @@ function blRenderTable(data){
   window._blLastRendered = capped;
   const sC={'Paid':'p-g','Pending':'p-o','Draft':'p-b','Complimentary':'p-gray'};
   const pC={'CASH':'p-g','UPI':'p-b','CARD':'p-gold','ZOMATO':'p-o','SWIGGY':'p-o','DUE':'p-r','COMPLIMENTARY':'p-gray'};
-  tbody.innerHTML=(data.length > BL_RENDER_CAP ? `<tr><td colspan="11" style="text-align:center;padding:12px;font-size:11px;color:var(--text3);background:var(--gold-bg);">⚠️ Showing the most recent ${BL_RENDER_CAP} of ${data.length} bills in this range — narrow the date range or search to see the rest.</td></tr>` : '') + capped.map(b=>`
+  tbody.innerHTML=(data.length > BL_RENDER_CAP ? `<tr><td colspan="11" style="text-align:center;padding:12px;font-size:11px;color:var(--text3);background:var(--gold-bg);">⚠️ Showing the most recent ${BL_RENDER_CAP} of ${data.length} bills in this range — narrow the date range or search to see the rest.</td></tr>` : '') + capped.map(b=>{
+    /* DISPLAY-ONLY TOTAL SAFETY: if a legacy BILL_MASTER row contains a
+       corrupted large negative round-off (e.g. Sub 3155 + GST 149.86 but
+       Total 3147), show the arithmetic total instead of reproducing the
+       corrupt total on the live Bills List. Legitimate discount/service
+       charge and <=Rs 1 rounding remain respected. */
+    const subN=Number(b.sub)||0, discN=Number(b.disc)||0, scN=Number(b.sc)||0, gstN=Number(b.gst)||0;
+    const roN=Number(b.roundOff)||0, safeRo=Math.abs(roN)<=1.01?roN:0;
+    const expectedN=(subN-discN)+scN+gstN+safeRo;
+    const rawTotalN=Number(b.total)||0;
+    const displayTotalN=Math.abs(rawTotalN-expectedN)>1.01 ? Math.round(expectedN) : rawTotalN;
+    return `
     <tr>
       <td class="mono" style="font-weight:700;color:var(--gold);white-space:nowrap;">${b.no}</td>
-      <td style="font-size:11px;white-space:nowrap;">${b.dt} <span style="color:var(--text3);">${b.tm}</span></td>
+      <td style="font-size:11px;white-space:nowrap;">${bnxDisplayBillDate_(b.dt,b.tm)}</td>
       <td style="white-space:nowrap;"><span class="mono">${b.table||'—'}</span></td>
       <td style="white-space:nowrap;"><span style="font-size:12px;font-weight:600;">${b.customer||'—'}</span>${b.mob?` <span style="font-size:10px;color:var(--text3);">${b.mob}</span>`:''}</td>
       <td style="text-align:center;white-space:nowrap;">${b.items}</td>
       <td class="mono" style="white-space:nowrap;">\u20b9${b.sub.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
       <td class="mono" style="color:var(--text3);white-space:nowrap;">\u20b9${b.gst.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
-      <td class="mono" style="font-weight:700;color:var(--gold);white-space:nowrap;">\u20b9${b.total.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
+      <td class="mono" style="font-weight:700;color:var(--gold);white-space:nowrap;">\u20b9${displayTotalN.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
       <td style="white-space:nowrap;"><span class="pill ${pC[b.pay]||'p-gray'}">${b.pay||'—'}</span></td>
       <td style="white-space:nowrap;"><span class="pill ${sC[b.status]||'p-gray'}">${b.status}</span></td>
       <td class="bl-actions-cell"><div class="bl-actions">
@@ -19490,7 +19484,7 @@ function blRenderTable(data){
         ${b.status==='Pending'?`<button class="btn btn-sm bl-settle-btn" onclick="blSettle('${b.no}')">Settle</button>`:''}
         ${b.status!=='Cancelled'&&b.status!=='Not Required'?`<button class="btn btn-sm bl-cancel-btn" onclick="blCancelBill('${b.no}')">Cancel</button>`:''}
       </div></td>
-    </tr>`).join('');
+    </tr>`; }).join('');
   const sc=document.getElementById('blCount');if(sc)sc.textContent='Showing '+capped.length+' of '+data.length+' filtered ('+blGetAllBills().length+' total) bills';
   const paid=data.filter(b=>b.status==='Paid').length;
   const pending=data.filter(b=>b.status==='Pending').length;
@@ -19654,7 +19648,7 @@ function blViewBill(no){
     </div>` : '';
   document.getElementById('detailModalBody').innerHTML = `
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
-      <div><div style="font-weight:800;font-size:16px;">${b.no}</div><div style="font-size:12px;color:#888;">${b.dt} · ${b.tm} · Table ${b.table}</div></div>
+      <div><div style="font-weight:800;font-size:16px;">${b.no}</div><div style="font-size:12px;color:#888;">${bnxDisplayBillDate_(b.dt,b.tm)} · Table ${b.table}</div></div>
       <button onclick="closeDetailModal()" style="border:none;background:#f2ede5;width:28px;height:28px;border-radius:8px;font-size:14px;cursor:pointer;">✕</button>
     </div>
     ${navHtml}
@@ -38048,21 +38042,8 @@ function bnxOpenImportHub(){
       '.hd .n{flex:1}';
     printDoc(title+(kotNo?' '+kotNo:''),css,body);
   };
-  /* DIRECT KOT QUEUE — station tickets must print one-by-one.
-     Do not fire Kitchen/Bar/Hukka jobs on independent timers: network
-     printers can receive overlapping jobs and the second ticket may be
-     delayed, merged, or appear on the wrong physical queue. Each printOneKOT
-     returns a Promise for direct QZ printing, so await it before the next
-     station. A short 80ms gap lets the printer socket flush without making
-     split printing feel slow. */
-  window.bnxPrintKotQueue_=async function(fns){
-    const jobs=Array.isArray(fns)?fns:[];
-    for(let i=0;i<jobs.length;i++){
-      try{ await Promise.resolve(jobs[i]()); }
-      catch(e){ console.warn('[BNX KOT QUEUE] job '+(i+1)+' failed',e); }
-      if(i<jobs.length-1) await new Promise(r=>setTimeout(r,80));
-    }
-  };
+  /* iframe printing is not popup-blocked, so tickets can follow each other quickly */
+  window.bnxPrintKotQueue_=function(fns){ fns.forEach(function(fn,i){ setTimeout(fn,i*350); }); };
 
   /* FIX 2026-10-01 — SPLIT ORDER PRINT: every station ticket keeps the same POS Order No;
    KITCHEN/HUKKA/BAR print only their own item subset, with Split X/Y, KOT No,
@@ -38297,6 +38278,33 @@ function bnxOpenImportHub(){
     ];
   }
 
+  /* DISPLAY DATE FIX — keep stored/server dates untouched, but print and show
+     Bills List dates in unambiguous Indian DD-MM-YYYY format. Handles
+     YYYY-MM-DD, YYYY-MM-DDTHH:mm:ss, DD-MM-YYYY, DD/MM/YYYY and timestamps
+     without UTC day-shift surprises. */
+  function bnxDisplayBillDate_(dateValue,timeValue){
+    let s=String(dateValue==null?'':dateValue).trim();
+    let t=String(timeValue==null?'':timeValue).trim();
+    if(!s) return '';
+    const iso=s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?/);
+    if(iso){
+      const dd=iso[3], mm=iso[2], yy=iso[1];
+      if(!t && iso[4]) t=iso[4]+':'+iso[5]+(iso[6]?':'+iso[6]:'');
+      return dd+'-'+mm+'-'+yy+(t?' '+t:'');
+    }
+    const dmy=s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})(?:[ T](.*))?$/);
+    if(dmy){
+      const dd=String(dmy[1]).padStart(2,'0'), mm=String(dmy[2]).padStart(2,'0'), yy=dmy[3];
+      if(!t && dmy[4]) t=dmy[4].trim();
+      return dd+'-'+mm+'-'+yy+(t?' '+t:'');
+    }
+    if(/^\d{10,13}$/.test(s)){
+      const n=Number(s.length===10?s*1000:s); const d=new Date(n);
+      if(!isNaN(d.getTime())) return String(d.getDate()).padStart(2,'0')+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+d.getFullYear()+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0');
+    }
+    return s+(t?' '+t:'');
+  }
+
   function billRaw(d){
     d=d||{};
     /* DIRECT ESC/POS RECEIPT — kept aligned with the approved Hashtag physical
@@ -38324,10 +38332,12 @@ function bnxOpenImportHub(){
     const money0=function(v){return 'Rs '+(Number(v)||0).toFixed(2);};
     /* FIX: keep QTY and AMOUNT in dedicated fixed columns so neither can
        disappear or wrap into a second line on thermal paper. */
-    const qtyW=4, rateW=8, amtW=10;
-    /* Keep ITEM wide enough for normal restaurant names while reserving fixed
-       columns for QTY/RATE/AMOUNT.  80mm = 42 chars, 58mm = 32 chars. */
-    const itemNameWidth=Math.max(12,width-qtyW-rateW-amtW-3);
+    /* FINAL THERMAL COLUMN FIX:
+       80mm = ITEM 20 | QTY 3 | RATE 7 | AMOUNT 9.
+       This keeps long names such as "Ginger & Pineapple Frappe Frozen"
+       inside ITEM while QTY/RATE/AMOUNT stay on the same physical line. */
+    const qtyW=3, rateW=7, amtW=9;
+    const itemNameWidth = width===42 ? 20 : 10;
     const fmtQty=function(v){
       const n=Number(v);
       if(!Number.isFinite(n)) return '0';
@@ -38357,7 +38367,7 @@ function bnxOpenImportHub(){
     out.push(line('-',width)+'\n');
 
     if(d.billNo||d.billno) out.push(cols(width,'Bill No',String(d.billNo||d.billno))+'\n');
-    if(d.date) out.push(cols(width,'Date',String(d.date)+(d.time?' '+String(d.time):''))+'\n');
+    if(d.date) out.push(cols(width,'Date',bnxDisplayBillDate_(d.date,d.time))+'\n');
     if(d.table!=null && String(d.table).trim() && String(d.table)!=='-') out.push(cols(width,'Table',String(d.table))+'\n');
     if(d.pax!=null && String(d.pax).trim()) out.push(cols(width,'Pax',String(d.pax))+'\n');
     const cust=d.customer||d.cname||'GENERAL CUSTOMER';
@@ -38397,7 +38407,15 @@ function bnxOpenImportHub(){
 
     const sub=Number(d.sub)||0, disc=Number(d.disc)||0, sc=Number(d.sc)||0;
     const cgst=Number(d.cgst)||0, sgst=Number(d.sgst)||0, igst=Number(d.igst)||0;
-    const taxAmt=(Number(d.tax)!=null && Number(d.tax)!==0) ? Number(d.tax) : cgst+sgst+igst;
+    const taxRowsInput=Array.isArray(d.taxRows)?d.taxRows:[];
+    const taxRowsTotal=taxRowsInput.reduce(function(sum,r){ return sum+(Number(r&&r.taxAmt)||0); },0);
+    /* Older BILL_MASTER rows can have TAX=0 while TAX_ROWS contains the real
+       GST amount. Prefer explicit tax/cgst/sgst when present; otherwise use
+       the tax-row total so the printed Tax and Grand Total cannot disagree
+       with the Tax Breakup section. */
+    const explicitTax=Number(d.tax)||0;
+    const componentTax=cgst+sgst+igst;
+    const taxAmt=explicitTax!==0 ? explicitTax : (componentTax!==0 ? componentTax : taxRowsTotal);
     const discPct=d.discPct!=null?Number(d.discPct):0;
     const scPct=d.scPct!=null?Number(d.scPct):0;
     if(d.sub!=null) out.push(cols(width,'Sub Total',money0(sub))+'\n');
@@ -38417,38 +38435,44 @@ function bnxOpenImportHub(){
     const componentTotal=(sub-disc)+sc+taxAmt;
     let total=d.total!=null?Number(d.total):componentTotal;
     const suppliedRound=(d.roff!=null?Number(d.roff):(d.roundOff!=null?Number(d.roundOff):NaN));
-    const totalDiff=Math.abs(total-(componentTotal+(Number.isFinite(suppliedRound)?suppliedRound:0)));
+    /* Never trust a corrupted large round-off merely because it mathematically
+       reconciles a bad stored total. Valid restaurant round-off is at most
+       +/- Rs 1.00. Rebuild the payable amount from subtotal + SC + GST when
+       the saved total only reconciles through a bogus large adjustment. */
+    const safeRound=Number.isFinite(suppliedRound)&&Math.abs(suppliedRound)<=1.01?suppliedRound:0;
+    const totalDiff=Math.abs(total-(componentTotal+safeRound));
     if(!Number.isFinite(total) || totalDiff>1.01){
-      total=componentTotal+(Number.isFinite(suppliedRound)&&Math.abs(suppliedRound)<=1.01?suppliedRound:0);
+      total=componentTotal+safeRound;
     }
     const rounded=Math.round(total);
     out.push(cols(width,'Items '+items.length+'  Qty '+fmtQty(itemQty),'TOTAL  '+money0(rounded))+'\n');
     out.push(line('-',width)+'\n');
 
-    /* Tax breakup: use the exact item/category tax rows from New Bill when
-       available. Reprint records from older BILL_MASTER may only contain a
-       combined GST amount, so retain that information rather than inventing
-       HSN/rates. */
+    /* Tax breakup — FINAL FIX: fixed-width four-column layout. Values never
+       wrap into the next column, even on 80mm printers. If an older saved row
+       is malformed, use the reliable bill-level HSN/tax information instead. */
     out.push('\x1BE1','Tax Break up\n','\x1BE0');
-    out.push(padRight('HSN',Math.max(5,Math.floor(width*0.20)))+' '+
-             padRight('TaxName',Math.max(7,Math.floor(width*0.24)))+' '+
-             padLeft('OnAmt',Math.max(7,Math.floor(width*0.22)))+' '+
-             padLeft('TaxAmt',Math.max(7,width-Math.floor(width*0.20)-Math.floor(width*0.24)-2-Math.max(7,Math.floor(width*0.22))) )+'\n');
-    const rows=Array.isArray(d.taxRows)&&d.taxRows.length ? d.taxRows :
-      (taxAmt ? [{hsn:d.hsn||'—',taxName:igst?'IGST':(cgst||sgst?'GST':'GST'),onAmt:(sub-disc),taxAmt:taxAmt}] : []);
+    const taxH = width===42 ? {h:6,n:7,on:13,ta:13} : {h:5,n:5,on:10,ta:9};
+    out.push(padRight('HSN',taxH.h)+' '+padRight('Tax',taxH.n)+' '+padLeft('Taxable',taxH.on)+' '+padLeft('TaxAmt',taxH.ta)+'\n');
+    let rows=taxRowsInput.filter(function(r){
+      return r && (Number(r.taxAmt)||0)!==0;
+    }).map(function(r){
+      return {hsn:String(r.hsn||r.HSN||d.hsn||'—').replace(/[^A-Za-z0-9./-]/g,'').slice(0,taxH.h),
+              taxName:String(r.taxName||r.TAX_NAME||'GST').replace(/\s+/g,' ').trim(),
+              onAmt:Number(r.onAmt!=null?r.onAmt:(r.taxable!=null?r.taxable:0))||0,
+              taxAmt:Number(r.taxAmt)||0};
+    });
+    if(!rows.length && taxAmt){
+      rows=[{hsn:String(d.hsn||'996331'),taxName:(igst?'IGST':'GST'),onAmt:(sub-disc),taxAmt:taxAmt}];
+    }
     rows.forEach(function(r){
-      const h=String(r.hsn||'—'), n=String(r.taxName||'GST');
+      let h=String(r.hsn||'—').slice(0,taxH.h);
+      let n=String(r.taxName||'GST').replace(/\s+/g,' ').trim();
+      /* Keep the printed tax name short; the rate remains available in the
+         tax configuration/details, while the receipt stays physically aligned. */
+      n=n.replace(/^GST\s*@\s*/i,'GST ').slice(0,taxH.n);
       const on=money0(r.onAmt), ta=money0(r.taxAmt);
-      /* Tax breakup is deliberately compact but fixed.  Do not let the
-         currency value wrap underneath a different column. */
-      const hW=Math.max(5,Math.min(8,Math.floor(width*0.19)));
-      const nW=Math.max(7,Math.min(10,Math.floor(width*0.22)));
-      const rightW=Math.max(14,width-hW-nW-2);
-      const onW=Math.max(7,Math.floor(rightW/2));
-      const taW=Math.max(7,rightW-onW-1);
-      const hv=padRight(h,hW).slice(0,hW);
-      const nv=padRight(n,nW).slice(0,nW);
-      out.push(hv+' '+nv+' '+padLeft(on,onW)+' '+padLeft(ta,taW)+'\n');
+      out.push(padRight(h,taxH.h)+' '+padRight(n,taxH.n)+' '+padLeft(on,taxH.on)+' '+padLeft(ta,taxH.ta)+'\n');
     });
     out.push(line('-',width)+'\n');
 
@@ -38653,26 +38677,14 @@ function bnxOpenImportHub(){
     }
   };
 
-  // Diagnostic helper: returns the station/IP assignment without printing.
-  window.bnxPreviewKOTSplit=function(items){
-    const arr=Array.isArray(items)?items:[];
-    const out={KITCHEN:[],BAR:[],HUKKA:[]};
-    arr.forEach(i=>{ out[bnxKotStation(i)].push(String(i?.name||i?.n||i?.ITEM_NAME||'Item')); });
-    const ips=ipSettings();
-    return {KITCHEN:{ip:ips.KITCHEN,items:out.KITCHEN},BAR:{ip:ips.BAR,items:out.BAR},HUKKA:{ip:ips.HUKKA,items:out.HUKKA}};
-  };
-
   const originalKot=window.printOneKOT;
   window.printOneKOT=async function(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks){
     const role=roleForKOT(title);
     try{
       const enabled=localStorage.getItem('bnx_direct_ip_print')!=='0';
       if(!enabled) return originalKot(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks);
-      const ips=ipSettings();
-      const targetIp=String(ips[role]||'').trim();
-      if(!targetIp) throw new Error('No '+role+' printer IP configured');
       const kotData=kotRaw(title,table,waiter,covers,items,kotNo,orderNo,splitIndex,splitTotal,customerName,remarks);
-      console.info('[BNX KOT IP] sending', {role,ip:targetIp,kotNo,orderNo,splitIndex,splitTotal,lines:kotData.length,itemCount:Array.isArray(items)?items.length:0});
+      console.info('[BNX KOT IP] sending', {role, ip:ipSettings()[role], kotNo, orderNo, splitIndex, splitTotal, lines:kotData.length});
       await directPrintRaw(role,kotData,(title||role)+' '+String(kotNo||''));
       if(typeof showNotif==='function') showNotif('🖨️ '+role+' KOT sent to '+ipSettings()[role],'success');
     }catch(e){
