@@ -7904,7 +7904,7 @@ async function printKOTTicket(kotNo, partType){
    BAR   : 192.168.0.151
    ======================================================================== */
 (function(){
-  if(window.__bnxStewardDirectKotV1) return;
+  if(window.__bnxStewardDirectKotV2) return;
   window.__bnxStewardDirectKotV2=true;
 
   const QZ_SRC='https://cdn.jsdelivr.net/npm/qz-tray@2.3.0/qz-tray.js';
@@ -7994,7 +7994,14 @@ async function printKOTTicket(kotNo, partType){
     }catch(e){ return prefix+'default'; }
   }
   function relayUrl_(){
-    try{ return String(localStorage.getItem(cidKey_('bnx_print_relay_'))||window.BNX_PRINT_RELAY_URL||'').trim(); }catch(e){ return ''; }
+    try{
+      var u=String(localStorage.getItem(cidKey_('bnx_print_relay_'))||window.BNX_PRINT_RELAY_URL||'').trim().replace(/\/+$/,'');
+      if(u && !/^https?:\/\//i.test(u)) u=(location.protocol==='https:'?'https://':'http://')+u;
+      /* An https page (balajinextgen.in) is NOT allowed to call an http:// relay (mixed content).
+         Always use the relay's https address when the app itself is on https. */
+      if(location.protocol==='https:' && /^http:\/\//i.test(u)) u=u.replace(/^http:/i,'https:');
+      return u;
+    }catch(e){ return ''; }
   }
   function relayKey_(){
     try{ return String(localStorage.getItem(cidKey_('bnx_print_relay_key_'))||'').trim(); }catch(e){ return ''; }
@@ -8005,19 +8012,27 @@ async function printKOTTicket(kotNo, partType){
     return btoa(bin);
   }
   async function viaRelay_(base,ip,raw,job){
-    const ctl=new AbortController(); const timer=setTimeout(()=>ctl.abort(),7000);
-    try{
-      const headers={'Content-Type':'application/json'}; const key=relayKey_(); if(key) headers['X-BNX-Key']=key;
-      const r=await fetch(String(base).replace(/\/+$/,'')+'/print',{method:'POST',headers,cache:'no-store',signal:ctl.signal,
-        body:JSON.stringify({host:ip,port:9100,job:job||'BNX KOT',data:b64Raw_(raw)})});
-      let j=null; try{ j=await r.json(); }catch(_){}
-      if(!r.ok||!j||j.ok!==true) throw new Error((j&&j.error)||('Print relay answered HTTP '+r.status));
-      return true;
-    }catch(e){
-      if(e&&e.name==='AbortError') throw new Error('Print relay did not answer (timeout)');
-      if(e instanceof TypeError) throw new Error('Cannot reach the print relay — check Wi-Fi, the address and that its HTTPS certificate was accepted');
-      throw e;
-    }finally{ clearTimeout(timer); }
+    var lastErr=null;
+    for(var attempt=1;attempt<=2;attempt++){
+      const ctl=new AbortController(); const timer=setTimeout(()=>ctl.abort(),12000);
+      try{
+        const headers={'Content-Type':'application/json'}; const key=relayKey_(); if(key) headers['X-BNX-Key']=key;
+        const r=await fetch(String(base).replace(/\/+$/,'')+'/print',{method:'POST',headers,cache:'no-store',signal:ctl.signal,
+          body:JSON.stringify({host:ip,port:9100,job:job||'BNX KOT',data:b64Raw_(raw)})});
+        let j=null; try{ j=await r.json(); }catch(_){}
+        if(!r.ok||!j||j.ok!==true){
+          const er=new Error((j&&j.error)||('Print relay answered HTTP '+r.status)); er.noRetry=(r.status===401||r.status===400); throw er;
+        }
+        return true;
+      }catch(e){
+        if(e&&e.name==='AbortError') lastErr=new Error('Print relay did not answer (timeout)');
+        else if(e instanceof TypeError) lastErr=new Error('Cannot reach the print relay '+base+' — relay PC must be ON, same Wi-Fi, and open '+base+'/health once in this browser and accept the certificate');
+        else lastErr=e;
+        if(e&&e.noRetry) break;
+        if(attempt<2) await new Promise(r=>setTimeout(r,700));
+      }finally{ clearTimeout(timer); }
+    }
+    throw lastErr;
   }
   function qzError_(e){
     const m=String(e&&e.message||e||'').replace(/\s+/g,' ').trim();
@@ -9609,6 +9624,31 @@ function bnxDupCheck_(fp){
   if(a && a.done && Date.now()-(a.doneAt||0)<30000) return 'RECENT';   // identical order confirmed <30s ago
   return 'OK';
 }
+/* KOT PRINT (3 station printers via the Print Relay).
+   Called from BOTH the "server confirmed" path and the "server unreachable / pending sync"
+   path of placeOrder(): the kitchen must get its ticket even when the cloud save is slow or
+   queued. Never awaited by the caller (a dead printer must not freeze the steward's screen);
+   bnxDirectKOTPrint_ serialises jobs and the Printers module keeps failed ones in a retry queue. */
+function bnxFireKOTPrint_(entry, orderRef){
+  try{
+    const parts=bnxKOTParts_(entry);
+    if(!parts.length){ toast('⚠️ No items to print on KOT','error'); return; }
+    parts.forEach(function(p,idx){
+      Promise.resolve(bnxDirectKOTPrint_(p.type,{
+        title:String(p.type||'KITCHEN')+' KOT',
+        table:entry.table||'', waiter:entry.waiter||entry.steward||'', covers:entry.covers||'',
+        items:p.items||[],
+        kotNo:entry.kotNumber||entry.kotNo||'', orderNo:entry.orderNo||orderRef||'',
+        splitIndex:idx+1, splitTotal:parts.length,
+        customerName:entry.customerName||'Default Customer', remarks:entry.remarks||''
+      })).then(function(ok){ if(!ok) console.warn('[KOT PRINT PART] not printed',p.type); })
+        .catch(function(e){ console.error('[KOT PRINT PART]',p.type,e); });
+    });
+  }catch(e){
+    console.error('[KOT PRINT]',e);
+    toast('⚠️ KOT printer failed — check Profile → Printer Setup','error');
+  }
+}
 async function placeOrder(){
   // FINAL ANTI-DUPLICATE GUARD: two fast taps on a phone can enter an
   // async handler before the first fetch disables the button. Keep ONE
@@ -9739,6 +9779,7 @@ async function bnxPlaceOrderImpl_(){
     const localTag = { kotNo:'PENDING-'+requestId.slice(0,8), orderNo:'', orderId:'', table:selTable.id, type:'KITCHEN', time:new Date().toISOString(),
       waiter:stewardName, steward:stewardName, covers:customerFields.covers||'', COVERS:customerFields.covers||'', guestNo:customerFields.guestNo||'', guestCount:customerFields.guestCount||'', guests:customerFields.guests||'', GUEST_NO:customerFields.guestNo||'', GUEST_COUNT:customerFields.guestCount||'', items, amount, customerName:customerFields.customerName, CUSTOMER_NAME:customerFields.customerName, customerMobile:customerFields.customerMobile, CUSTOMER_MOBILE:customerFields.customerMobile, mobile:customerFields.customerMobile, orderTime, status:'PENDING_SYNC', userId:identity.userId, USER_ID:identity.userId, createdById:identity.userId, CREATED_BY_ID:identity.userId, loginId:identity.loginId, LOGIN_ID:identity.loginId, createdByLogin:identity.loginId, CREATED_BY_LOGIN:identity.loginId, createdByName:stewardName, CREATED_BY_NAME:stewardName };
     bnxLoadOpenKots(); KOT.unshift(localTag); bnxSetOpenKotsRaw(JSON.stringify(KOT));
+    bnxFireKOTPrint_(localTag, localTag.kotNo);   /* print even though server sync is pending */
     order={}; orderItemRemarks={};
     try{ updateOrderBadge(); refreshCurrentMenuView_(); bnxToggleOrderDrawer_(false); }catch(e){}
     setTimeout(() => showScreen('s-home'), 1200);
@@ -9817,35 +9858,7 @@ async function bnxPlaceOrderImpl_(){
   // server, so "Send to KDS" also sends straight to the KOT printer.
   // Wrapped so a print failure (no printer connected, popup blocked)
   // never breaks the order that has already been successfully placed.
-  try{
-    /* DIRECT PRINT FIX: do NOT call printKOTTicket(orderId, ... ) here.
-       orderId is the ORDER_MASTER id, while printKOTTicket() searches the
-       local KOT list by KOT number. Those identifiers are different, so the
-       automatic print could say KOT not found even though SAVE_ORDER/SAVE_KOT
-       succeeded. Print the exact already-confirmed entry/part directly to
-       its physical station printer instead. */
-    const printParts=bnxKOTParts_(entry);
-    for(const p of printParts){
-      try{
-        const ok=await bnxDirectKOTPrint_(p.type,{
-          title:String(p.type||'KITCHEN')+' KOT',
-          table:entry.table||'',
-          waiter:entry.waiter||entry.steward||'',
-          covers:entry.covers||'',
-          items:p.items||[],
-          kotNo:entry.kotNumber||entry.kotNo||'',
-          orderNo:entry.orderNo||orderId||'',
-          splitIndex:p.splitIndex||p.index||1, splitTotal:printParts.length,
-          customerName:entry.customerName||'Default Customer',
-          remarks:entry.remarks||''
-        });
-        if(!ok) console.warn('[KOT PRINT PART] direct printer unavailable',p.type);
-      }catch(e){ console.error('[KOT PRINT PART]',p.type,e); }
-    }
-  }catch(e){
-    console.error('[KOT PRINT]', e);
-    toast('⚠️ Order saved, but the KOT printer failed — check Profile → Printer Setup','error');
-  }
+  bnxFireKOTPrint_(entry, orderId);
   PLACED_ORDERS[orderId] = {
     id: orderId, table: selTable.id, items: JSON.parse(JSON.stringify(items)), amount, steward: stewardName,
     status: 'PLACED', timestamp: Date.now(), originalItems: JSON.parse(JSON.stringify(items)), hasServerId: true
@@ -13585,7 +13598,9 @@ html:not([data-theme]) #s-home .hero .hs-lbl{font-size:10px!important;letter-spa
   function lsSet(k,v){try{localStorage.setItem(k,v);}catch(e){}}
   function cfg(){try{return JSON.parse(lsGet('bnx_printer_settings_'+cid(),'{}'))||{};}catch(e){return {};}}
   function ipOf(r){var c=cfg()[r.pr];return String((c&&c.ip)||r.def).trim();}
-  function relay(){return String(lsGet(K('bnx_print_relay_'),window.BNX_PRINT_RELAY_URL||'')).trim().replace(/\/+$/,'');}
+  function relay(){var u=String(lsGet(K('bnx_print_relay_'),window.BNX_PRINT_RELAY_URL||'')).trim().replace(/\/+$/,'');
+    if(u&&!/^https?:\/\//i.test(u))u=(location.protocol==='https:'?'https://':'http://')+u;
+    if(u&&location.protocol==='https:'&&/^http:\/\//i.test(u))u=u.replace(/^http:/i,'https:');return u;}
   function rkey(){return String(lsGet(K('bnx_print_relay_key_'),'')).trim();}
   function roleOf(t){t=String(t||'').toUpperCase();
     if(/HUKKA|HOOKAH|SHEESHA|SHISHA/.test(t))return 'HUKKA';
@@ -13704,6 +13719,9 @@ html:not([data-theme]) #s-home .hero .hs-lbl{font-size:10px!important;letter-spa
     var ok=false; try{ok=await window.bnxStewardTestKOTPrinter(role);}catch(e){}
     setStatus(role,!!ok,ok?'Test printed':(window.__bnxLastKotPrintError||'Test failed')); msg(ok?'✅ '+esc(r.label)+' printer OK':'⚠️ '+esc(r.label)+' test failed — check relay and IP',!!ok);
   };
+  window.hspTrust=function(){var u=String((document.getElementById('hsp-url')||{}).value||relay()).trim().replace(/\/+$/,'');
+    if(!u){msg('Type the relay address first, then tap this button.',false);return;}
+    if(!/^https?:\/\//i.test(u))u='https://'+u; u=u.replace(/^http:/i,'https:'); window.open(u+'/health','_blank');};
   window.hspRetry=async function(){msg('Printing waiting KOTs…');var n=await retryQueue(true);msg(n?'✅ '+n+' printed':'Nothing printed yet',!!n);};
   window.bnxOpenPrinterSetup=function(){
     var host=document.getElementById('bnx-printer-setup-host');
@@ -13719,6 +13737,8 @@ html:not([data-theme]) #s-home .hero .hs-lbl{font-size:10px!important;letter-spa
       +'<input class="hsp-in" id="hsp-url" value="'+esc(relay())+'" placeholder="http://192.168.0.50:9191" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false">'
       +'<input class="hsp-in" id="hsp-key" type="password" value="'+esc(rkey())+'" placeholder="Relay key (optional)" style="margin-top:8px" autocapitalize="off">'
       +'<div class="hsp-row"><button class="hsp-btn pri" onclick="hspAuto()">⚡ Auto-detect</button><button class="hsp-btn" onclick="hspFind()">🔍 Find printers</button></div>'
+      +'<div class="hsp-row"><button class="hsp-btn" onclick="hspTrust()">🔒 Trust relay certificate (do once)</button></div>'
+      +'<div class="hsp-hint">Use the <b>https://</b> address shown by the relay window (example https://192.168.0.50:9191). Tap the lock button once, press “Advanced → Proceed”, then come back and Save.</div>'
       +'<datalist id="hsp-found"></datalist>'
       +'<div class="hsp-lbl">Station printers</div>'+cards
       +'<div id="hsp-pending" class="hsp-card" style="display:none;border-color:#f3b4ae;background:#fff6f5"><b style="color:#b42318">⏳ <b>0</b> KOT waiting to print</b><div class="hsp-row"><button class="hsp-btn" onclick="hspRetry()">Print waiting KOTs now</button></div></div>'

@@ -9,8 +9,12 @@
 
    RUN:   node bnx-print-relay.js            (Node 14+, no npm install needed)
    OPT :  PORT=9191  BNX_KEY=secret  node bnx-print-relay.js
-   HTTPS: CERT_FILE=cert.pem KEY_FILE=key.pem node bnx-print-relay.js
-          (needed only if the steward app itself is opened over https://)
+   HTTPS: AUTOMATIC. The steward app runs on https://, and a browser refuses to call a plain
+          http:// relay from an https page. So on first start this relay creates its own
+          certificate (needs `openssl`, present on Linux/Mac/Raspberry Pi and Git-for-Windows)
+          and serves  https://<this-pc-ip>:9191  (plain http stays on 9192 for testing).
+          Own certificate instead:  CERT_FILE=cert.pem KEY_FILE=key.pem node bnx-print-relay.js
+          ONE TIME per phone: open  https://<this-pc-ip>:9191/health  -> Advanced -> Proceed.
 
    ENDPOINTS
      GET  /health                  -> {ok:true}
@@ -20,7 +24,7 @@
    Only private LAN addresses and port 9100 are accepted.
    ============================================================================ */
 'use strict';
-const http = require('http'), https = require('https'), net = require('net'), fs = require('fs'), os = require('os');
+const http = require('http'), https = require('https'), net = require('net'), fs = require('fs'), os = require('os'), path = require('path'), cp = require('child_process');
 const PORT = parseInt(process.env.PORT || '9191', 10);
 const KEY = process.env.BNX_KEY || '';
 const PRIVATE = /^(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})$/;
@@ -44,15 +48,31 @@ function tcpProbe(host, port, ms) {
     s.connect(port, host);
   });
 }
-function tcpPrint(host, port, buf) {
+function tcpPrintOnce(host, port, buf) {
   return new Promise((resolve, reject) => {
     const s = new net.Socket(); let done = false;
     const fin = (err) => { if (done) return; done = true; try { s.destroy(); } catch (e) {} err ? reject(err) : resolve(); };
     s.setTimeout(6000);
     s.once('timeout', () => fin(new Error('Printer ' + host + ' did not respond (timeout)')));
     s.once('error', e => fin(new Error('Printer ' + host + ': ' + (e.code || e.message))));
-    s.connect(port, host, () => { s.write(buf, () => { s.end(); setTimeout(() => fin(), 250); }); });
+    s.connect(port, host, () => { s.write(buf, () => { s.end(); setTimeout(() => fin(), 400); }); });
   });
+}
+/* A thermal printer accepts ONE connection at a time. Jobs for the same printer are queued
+   one-by-one (kitchen + bar + hukka tickets can arrive together) and each job is retried. */
+const chains = new Map();
+function tcpPrint(host, port, buf) {
+  const prev = chains.get(host) || Promise.resolve();
+  const job = prev.catch(() => {}).then(async () => {
+    let last;
+    for (let i = 1; i <= 3; i++) {
+      try { return await tcpPrintOnce(host, port, buf); }
+      catch (e) { last = e; await new Promise(r => setTimeout(r, 800 * i)); }
+    }
+    throw last;
+  });
+  chains.set(host, job.catch(() => {}));
+  return job;
 }
 function localPrefix() {
   const nets = os.networkInterfaces();
@@ -72,7 +92,7 @@ async function discover(prefix) {
 async function handler(req, res) {
   if (req.method === 'OPTIONS') return send(res, 204, {});
   const u = new URL(req.url, 'http://x');
-  if (u.pathname === '/health') return send(res, 200, { ok: true, tokenRequired: !!KEY, name: 'bnx-print-relay', prefix: localPrefix() });
+  if (u.pathname === '/health') return send(res, 200, { ok: true, tokenRequired: !!KEY, name: 'bnx-print-relay', https: !!tls, prefix: localPrefix() });
   if (KEY && req.headers['x-bnx-key'] !== KEY) return send(res, 401, { ok: false, error: 'Wrong relay key' });
   try {
     if (u.pathname === '/probe') {
@@ -101,12 +121,46 @@ async function handler(req, res) {
     send(res, 404, { ok: false, error: 'Not found' });
   } catch (e) { send(res, 500, { ok: false, error: e.message }); }
 }
-const server = (process.env.CERT_FILE && process.env.KEY_FILE)
-  ? https.createServer({ cert: fs.readFileSync(process.env.CERT_FILE), key: fs.readFileSync(process.env.KEY_FILE) }, handler)
-  : http.createServer(handler);
-server.listen(PORT, '0.0.0.0', () => {
-  const proto = (process.env.CERT_FILE ? 'https' : 'http');
-  console.log('BNX Print Relay running on ' + proto + '://<this-pc-ip>:' + PORT + '  (LAN prefix ' + localPrefix() + '.x)');
-  Object.values(os.networkInterfaces()).flat().filter(n => n && n.family === 'IPv4' && !n.internal)
-    .forEach(n => console.log('  enter in app ->  ' + proto + '://' + n.address + ':' + PORT));
-});
+/* ---------- HTTPS certificate (auto) ---------- */
+function lanIps() {
+  const out = [];
+  Object.values(os.networkInterfaces()).flat().forEach(n => { if (n && n.family === 'IPv4' && !n.internal) out.push(n.address); });
+  return out;
+}
+function loadOrMakeCert() {
+  if (process.env.CERT_FILE && process.env.KEY_FILE)
+    return { cert: fs.readFileSync(process.env.CERT_FILE), key: fs.readFileSync(process.env.KEY_FILE) };
+  const dir = path.join(__dirname, 'bnx-certs'), cf = path.join(dir, 'relay-cert.pem'), kf = path.join(dir, 'relay-key.pem'), ipf = path.join(dir, 'ips.txt');
+  const ips = lanIps().sort().join(',');
+  try {
+    if (fs.existsSync(cf) && fs.existsSync(kf) && fs.existsSync(ipf) && fs.readFileSync(ipf, 'utf8') === ips)
+      return { cert: fs.readFileSync(cf), key: fs.readFileSync(kf) };
+  } catch (e) {}
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const san = 'subjectAltName=' + lanIps().map(i => 'IP:' + i).concat(['IP:127.0.0.1', 'DNS:localhost']).join(',');
+    const base = ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', kf, '-out', cf, '-days', '3650', '-subj', '/CN=bnx-print-relay'];
+    let r = cp.spawnSync('openssl', base.concat(['-addext', san]), { stdio: 'pipe' });
+    if (r.status !== 0) r = cp.spawnSync('openssl', base, { stdio: 'pipe' });
+    if (r.status !== 0) throw new Error((r.error && r.error.message) || String(r.stderr || 'openssl failed'));
+    fs.writeFileSync(ipf, ips);
+    console.log('Created HTTPS certificate in ' + dir);
+    return { cert: fs.readFileSync(cf), key: fs.readFileSync(kf) };
+  } catch (e) {
+    console.warn('!! Could not create an HTTPS certificate (' + e.message + ').');
+    console.warn('!! Install OpenSSL (or Git for Windows) and restart. Without https the phone app CANNOT print.');
+    return null;
+  }
+}
+const tls = loadOrMakeCert();
+const started = [];
+function listen(srv, port, proto) {
+  srv.on('error', e => console.error(proto + ' port ' + port + ': ' + e.message));
+  srv.listen(port, '0.0.0.0', () => {
+    lanIps().forEach(ip => console.log('  ' + proto + '  ->  enter in app:  ' + proto + '://' + ip + ':' + port));
+  });
+}
+console.log('BNX Print Relay  (LAN prefix ' + localPrefix() + '.x)');
+if (tls) listen(https.createServer(tls, handler), PORT, 'https');
+listen(http.createServer(handler), tls ? PORT + 1 : PORT, 'http');
+if (tls) console.log('\nPhone app (https) must use the https:// address.  First time: open  https://<ip>:' + PORT + '/health  on the phone -> Advanced -> Proceed.');
