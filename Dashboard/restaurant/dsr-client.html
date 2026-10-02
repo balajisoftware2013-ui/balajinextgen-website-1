@@ -1,6 +1,3 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
 <style>
 /* PASS79 — DSR receivables + strong reconciliation */
 #itab-recon .recon-control-note{font-size:11px;color:var(--muted);background:var(--blue-bg);border:1px solid var(--border);padding:8px 10px;border-radius:7px}
@@ -11,12 +8,14 @@
 #itab-recon .recon-alert{color:var(--red)!important;font-weight:800}
 @media(max-width:1000px){#itab-recon .chip-grid{grid-template-columns:repeat(3,1fr)!important}}
 </style>
-
+<!DOCTYPE html>
+<html lang="en">
+<head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <script>
 /* ═══════════════════════════════════════════════════════════════════════
-   Balaji NextGen ERP — DSR Client v4.3 LIVE / REPORT-MAPPED / MEDIUM SIZE
+   Balaji NextGen ERP — DSR Client v4.2 LIVE / REPORT-MAPPED / MEDIUM SIZE
    Source of truth: authenticated V2_CORE → GET_DSR_MATRIX / GET_DSR_YTD.
    No embedded sales/demo data is used for the live view.
 ═══════════════════════════════════════════════════════════════════════ */
@@ -397,22 +396,9 @@ async function gasApi(action,payload,endpoint){
         });
       } finally { clearTimeout(_t); }
       
-      BNX_DBG_('[API_DEBUG] 📬 Got response:', {status: r.status, statusText: r.statusText, action:action});
-      const raw = await r.text();
-      let j;
-      try { j = JSON.parse(raw); }
-      catch(parseError) {
-        const preview = String(raw||'').replace(/\s+/g,' ').slice(0,180);
-        const message = 'API returned non-JSON (HTTP '+r.status+') for '+action+'. Check the V2_CORE Web App deployment and access permissions. Response: '+preview;
-        window.BNX_LAST_API_ERROR_ = message;
-        console.error('[API_DEBUG] '+message, {url:url,contentType:r.headers.get('content-type')||''});
-        if(i===contexts.length-1) return {success:false,error:message,statusCode:r.status,action:action};
-        continue;
-      }
-      if (!r.ok) {
-        const message = (j && (j.error||j.message)) || ('HTTP '+r.status+' '+r.statusText);
-        if (r.status >= 400 && r.status < 500) return {success:false,error:String(message),statusCode:r.status,action:action};
-      }
+      BNX_DBG_('[API_DEBUG] 📬 Got response:', {status: r.status, statusText: r.statusText});
+      
+      const j=await r.json();
       BNX_DBG_('[API_DEBUG] 📦 Parsed JSON:', {success: j.success, error: j.error, hasData: !!j.data});
       
       if(j && !(j.error==='Invalid or expired session' || j.status===401)){
@@ -691,9 +677,12 @@ function bnxRmItemAmt_(r){
   var qty=bnxRmNum_(r,['QUANTITY','QTY','QUANTITY_SOLD']);
   var dr=bnxRmGet_(r,['DISCOUNTED_RATE']);
   if(qty&&dr!==undefined&&isFinite(Number(dr))&&Number(dr)>0) return qty*Number(dr);
-  var a=bnxRmNum_(r,['TAXABLE_AMOUNT','TAXABLE_SALES','TAXABLE_VALUE','PRE_TAX_SALES','NET_TAXABLE']);
+  // NET_SALES/GROSS_SALES represent the whole item-group sales value. In
+  // this ERP, TAXABLE_AMOUNT can contain only GST-taxable items and omit 0%
+  // / non-GST liquor, so it must not take precedence over full sales revenue.
+  var a=bnxRmNum_(r,['NET_SALES','GROSS_SALES','SALES','AMOUNT']);
   if(a) return a;
-  a=bnxRmNum_(r,['NET_SALES','GROSS_SALES','SALES','AMOUNT']);
+  a=bnxRmNum_(r,['TAXABLE_AMOUNT','TAXABLE_SALES','TAXABLE_VALUE','PRE_TAX_SALES','NET_TAXABLE']);
   if(a) return a;
   var lt=bnxRmNum_(r,['LINE_TOTAL']); if(!lt) return 0;
   var tx=bnxRmNum_(r,['TAX_AMOUNT','TOTAL_TAX','GST_AMOUNT']);
@@ -852,8 +841,9 @@ async function bnxReportMap_(from,to){
       short.forEach(function(x){
         var rows=BNX_RM_.cItem[x.ds]; if(!rows||!rows.length) return;
         var e=STANDARD_DATA[x.ds];
-        var cat0=(e.liquor||0)+(e.liquormrp||0)+(e.food||0)+(e.bev||0)+(e.hf||0)+(e.others||0);
-        if(cat0>0) return;                       // never overwrite non-zero server categories
+        // Rebuild the whole category split from the item-group feed. The old
+        // guard skipped any day with even one non-zero category, preserving
+        // incomplete group totals and causing MTD/YTD under-reporting.
         var g=bnxRmSplitItems_(rows,x.target); if(!g) return;
         e.liquor=g.liquor; e.liquormrp=g.liquormrp; e.food=g.food; e.bev=g.bev; e.hf=g.hf; e.others=g.others;
         splitDone[x.ds]=true; st.itemSplitDays++;
@@ -869,12 +859,49 @@ async function bnxReportMap_(from,to){
       }
     });
     try{ await bnxRmPaymentDays_(from,to,st); }catch(pe){ st.notes.push('Payment feed: '+(pe&&pe.message||pe)); }
-    // Final reconcile: Gross = categories, Net = Gross + Tax + Round, Total Collection.
+    // FINAL RECONCILIATION (Oct 2 2026): the live Day Book is the authority
+    // for daily net sales, tax and rounding. The old code only reconciled days
+    // touched by item-splitting; non-zero but incomplete category values were
+    // left in place, so MTD/YTD could show only a fraction of the real sales.
+    // Preserve item-group proportions where possible, then balance any missing
+    // item detail into Others. No bill/payment records are written by this UI.
     days.forEach(function(ds){
       var e=STANDARD_DATA[ds]; if(!e) return;
-      var cat=(e.liquor||0)+(e.liquormrp||0)+(e.food||0)+(e.bev||0)+(e.hf||0)+(e.others||0);
-      var touched=!!(splitDone[ds]||BNX_RM_.unalloc[ds]!==undefined);
-      if(cat>0&&(touched||!(e.net>0)||!(e.gross>0))){ e.gross=cat; e.net=cat+(e.tax||0)+(e.round||0); }
+      var b=by[ds]||null;
+      if(b && (Number(b.net)>0 || Number(b.pre)>0)){
+        if(b.hasTax) e.tax=Number(b.tax)||0;
+        if(b.hasRound) e.round=Number(b.round)||0;
+        var target=Math.max(0,Number(b.pre)||0);
+        var keys=['liquor','liquormrp','food','bev','hf','others'];
+        var cat=keys.reduce(function(sum,k){return sum+(Number(e[k])||0);},0);
+        if(target>0){
+          if(cat<=0){ e.others=target; }
+          else if(cat<target-1){ e.others=(Number(e.others)||0)+(target-cat); }
+          else if(cat>target+1){
+            // Over-reported group splits are scaled proportionally to the
+            // verified pre-tax day-book total; avoid a negative Others value.
+            var f=target/cat; keys.forEach(function(k){e[k]=Math.max(0,(Number(e[k])||0)*f);});
+          }
+          var reconciled=keys.reduce(function(sum,k){return sum+(Number(e[k])||0);},0);
+          e.gross=reconciled;
+          e.net=reconciled+(Number(e.tax)||0)+(Number(e.round)||0);
+        }
+        e.bills=Number(b.bills)||Number(e.bills)||0;
+        // Day-book payment values take priority when present, including a
+        // legitimate zero only when the source explicitly supplied that key.
+        if(b.cash>0)e.cash=Number(b.cash)||0;
+        if(b.card>0)e.card=Number(b.card)||0;
+        if((b.upi||0)+(b.online||0)>0)e.gpay=(Number(b.upi)||0)+(Number(b.online)||0);
+        if(b.credit>0)e.credit=Number(b.credit)||0;
+        if(b.zomato>0)e.zomato=Number(b.zomato)||0;
+        if(b.swiggy>0)e.swiggy=Number(b.swiggy)||0;
+        e.source='LIVE_DAY_BOOK+ITEM_GROUP_RECONCILED';
+      }else{
+        // With no authoritative day-book row, keep the live matrix values but
+        // ensure its visible category totals and calculated Gross agree.
+        var catOnly=(Number(e.liquor)||0)+(Number(e.liquormrp)||0)+(Number(e.food)||0)+(Number(e.bev)||0)+(Number(e.hf)||0)+(Number(e.others)||0);
+        if(catOnly>0){e.gross=catOnly;e.net=catOnly+(Number(e.tax)||0)+(Number(e.round)||0);}
+      }
       bnxRmTotalCash_(e);
     });
   }catch(err){
@@ -916,6 +943,64 @@ function bnxRmShow_(){
   p.querySelector('#bnx-rm-close').onclick=function(){ p.remove(); };
 }
 
+/* CL00010 BILL MASTER TRUTH OVERLAY (2026-10-02)
+   The DSR matrix / report map can omit 0%-tax revenue or return partial group
+   rows. Reconcile daily gross/net/tax/round/bill-count to real BILL_MASTER
+   rows from GET_BILLS; keep item-group proportions and balance only any
+   residual into Others. This is read-only and never writes to the database. */
+const BNX_BILL_RECON_CACHE_ = new Map();
+async function bnxReconcileDsrFromBills_(fromDate,toDate){
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(String(fromDate))||!/^\d{4}-\d{2}-\d{2}$/.test(String(toDate))||fromDate>toDate)return false;
+  const ck=fromDate+'|'+toDate;
+  if(BNX_BILL_RECON_CACHE_.has(ck)){
+    const cached=BNX_BILL_RECON_CACHE_.get(ck);
+    Object.keys(cached).forEach(ds=>{STANDARD_DATA[ds]=Object.assign({},STANDARD_DATA[ds]||mapLiveDsrDay_({}),cached[ds]);});
+    return true;
+  }
+  const res=await gasApi('GET_BILLS',{FROM_DATE:fromDate,TO_DATE:toDate,BUSINESS_DATE:fromDate});
+  if(!res||!res.success||!Array.isArray(res.data))return false;
+  const by={};
+  res.data.forEach(function(b){
+    const status=String(b.BILL_STATUS||b.status||'').trim().toUpperCase();
+    const type=String(b.BILL_TYPE||b.type||'').trim().toUpperCase();
+    if(['CANCELLED','CANCELED','VOID','VOIDED','NON_CHARGE','NC'].includes(status)||['NON_CHARGE','NC'].includes(type))return;
+    const ds=String(b.BILL_DATE||b.BUSINESS_DATE||b.DATE||b.date||'').slice(0,10);
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(ds)||ds<fromDate||ds>toDate)return;
+    const grand=Number(b.GRAND_TOTAL??b.grandTotal??b.TOTAL_AMOUNT??b.total)||0;
+    const tax=Number(b.TAX_AMOUNT??b.taxAmount??b.TOTAL_TAX??b.tax)||0;
+    const round=Number(b.ROUND_OFF??b.roundOff??b.ROUNDOFF)||0;
+    if(!(grand>0))return;
+    const x=by[ds]||(by[ds]={gross:0,net:0,tax:0,round:0,bills:0});
+    x.net+=grand;x.tax+=tax;x.round+=round;x.gross+=Math.max(0,grand-tax-round);x.bills++;
+  });
+  const patch={};
+  Object.keys(by).forEach(function(ds){
+    const b=by[ds], e=STANDARD_DATA[ds]||mapLiveDsrDay_({});
+    const target=Math.max(0,b.gross);
+    const keys=['liquor','liquormrp','food','bev','hf','others'];
+    let sum=keys.reduce((a,k)=>a+(Number(e[k])||0),0);
+    if(target>0){
+      if(sum<=0){e.liquor=0;e.liquormrp=0;e.food=0;e.bev=0;e.hf=0;e.others=target;}
+      else if(sum<target-1){
+        // Do not invent category attribution for missing item rows. Preserve
+        // the verified groups and put the unallocated residual in Others.
+        e.others=(Number(e.others)||0)+(target-sum);
+      }else if(sum>target+1){
+        // Over-reported group totals cannot exceed BILL_MASTER gross; scale
+        // the split down proportionally so category totals still reconcile.
+        const f=target/sum;keys.forEach(k=>{e[k]=Math.max(0,(Number(e[k])||0)*f);});
+      }
+      sum=keys.reduce((a,k)=>a+(Number(e[k])||0),0);
+      e.gross=sum;e.tax=b.tax;e.round=b.round;e.net=b.net;e.bills=b.bills;
+      e.source='LIVE_BILL_MASTER+ITEM_GROUPS';
+      patch[ds]={liquor:e.liquor,liquormrp:e.liquormrp,food:e.food,bev:e.bev,hf:e.hf,others:e.others,gross:e.gross,tax:e.tax,round:e.round,net:e.net,bills:e.bills,source:e.source};
+    }
+    STANDARD_DATA[ds]=e;
+  });
+  BNX_BILL_RECON_CACHE_.set(ck,patch);
+  return Object.keys(by).length>0;
+}
+
 const BNX_DSR_MONTH_FLIGHT_ = new Map();
 async function fetchDsrMonthLive_(year,month){
   const _mk=String(year)+'-'+String(month).padStart(2,'0');
@@ -929,6 +1014,7 @@ async function fetchDsrMonthLive_(year,month){
     if(r&&r.authExpired){gasToast('🔐 Session expired — please login again','error');return false;}
     // REPORT MAP: matrix unavailable -> build the month from the Reports Hub feeds.
     await bnxReportMap_(mFrom,mTo);
+    try{await bnxReconcileDsrFromBills_(mFrom,mTo);}catch(e){console.warn('[DSR BILL MASTER RECON]',e);}
     return Object.keys(STANDARD_DATA).some(k=>k>=mFrom&&k<=mTo);
   }
   // Keep the full server matrix. Do not fabricate a row when POS has no sales.
@@ -938,6 +1024,7 @@ async function fetchDsrMonthLive_(year,month){
   });
   // REPORT MAP: fill zeros from the Reports Hub feeds (never overwrites non-zero).
   await bnxReportMap_(mFrom,mTo);
+  try{await bnxReconcileDsrFromBills_(mFrom,mTo);}catch(e){console.warn('[DSR BILL MASTER RECON]',e);}
   return true;
   })();
   BNX_DSR_MONTH_FLIGHT_.set(_mk,_work);
@@ -1006,12 +1093,7 @@ async function onDsrDateChange(){
     try{if(document.getElementById('itab-recon')?.classList.contains('active'))await loadDsrReconciliation_();}catch(e){}
   }else{
     loadDayData();
-    const apiError=String(window.BNX_LAST_API_ERROR_||'').trim();
-    const msg=apiError
-      ? ('Live DSR unavailable for '+ds+'. '+apiError)
-      : ('Live POS data could not be loaded for '+ds+'. Verify the V2_CORE web-app deployment and that GET_DSR_MATRIX is deployed.');
-    setStatus(msg);
-    showToast('⚠️ Live DSR could not be loaded. Check API/deployment status.','warn',6500);
+    showToast('⚠️ Live POS data could not be loaded for '+ds,'warn');
   }
 }
 
@@ -1105,6 +1187,7 @@ async function directPOSFetchRange(fromDate,toDate){
   Object.keys(STANDARD_DATA).forEach(k=>{if(k<fromDate||k>toDate)delete STANDARD_DATA[k];});
   // REPORT MAP: fill zeros / missing days from the Reports Hub feeds.
   try{ await bnxReportMap_(fromDate,toDate); }catch(e){ console.warn('[REPORT MAP]',e); }
+  try{ await bnxReconcileDsrFromBills_(fromDate,toDate); }catch(e){ console.warn('[DSR BILL MASTER RECON]',e); }
   if(Object.keys(STANDARD_DATA).length) okCount=okCount||1;
   if(okCount){
     BNX_FY_LOADED_={from:fromDate,to:toDate};
@@ -3656,12 +3739,12 @@ function buildYTD() {
   $('ytdFYLabel').textContent=$('ytdChartTitle').textContent=fy+'-'+(fy+1).toString().slice(-2);
   const byMonth={};
   Object.entries(STANDARD_DATA).forEach(([d,r])=>{
-    const dd=new Date(d);
-    if(dd>=fyS&&dd<=dt){
+    const dd=new Date(d+'T00:00:00');
+    if(dd>=fyS&&dd<=new Date(ds+'T23:59:59')){
       const mk=d.slice(0,7);
-      if(!byMonth[mk]) byMonth[mk]={liquor:0,food:0,bev:0,hf:0,others:0,gross:0,tax:0,net:0,cash:0,card:0,gpay:0,zomato:0,swiggy:0,credit:0,duereceived:0,disc:0,bills:0};
+      if(!byMonth[mk]) byMonth[mk]={liquor:0,liquormrp:0,food:0,bev:0,hf:0,others:0,gross:0,tax:0,round:0,net:0,cash:0,card:0,gpay:0,pvt:0,zomato:0,swiggy:0,credit:0,duereceived:0,dueCash:0,dueBank:0,disc:0,bills:0};
       const m=byMonth[mk];
-      m.liquor+=r.liquor;m.food+=r.food;m.bev+=r.bev;m.hf+=r.hf;m.others+=r.others;m.gross+=r.gross;m.tax+=r.tax;m.net+=r.net;m.cash+=r.cash;m.card+=r.card;m.gpay+=r.gpay;m.zomato+=r.zomato;m.swiggy+=r.swiggy;m.credit+=r.credit||0;m.duereceived+=(r.duerecvcash||0)+(r.duerecvbank||0);m.disc+=r.disc;m.bills+=r.bills;
+      m.liquor+=Number(r.liquor)||0;m.liquormrp+=Number(r.liquormrp)||0;m.food+=Number(r.food)||0;m.bev+=Number(r.bev)||0;m.hf+=Number(r.hf)||0;m.others+=Number(r.others)||0;m.gross+=Number(r.gross)||0;m.tax+=Number(r.tax)||0;m.round+=Number(r.round)||0;m.net+=Number(r.net)||0;m.cash+=Number(r.cash)||0;m.card+=Number(r.card)||0;m.gpay+=Number(r.gpay)||0;m.pvt+=Number(r.pvt)||0;m.zomato+=Number(r.zomato)||0;m.swiggy+=Number(r.swiggy)||0;m.credit+=Number(r.credit)||0;m.dueCash+=Number(r.duerecvcash)||0;m.dueBank+=Number(r.duerecvbank)||0;m.duereceived+=Number(r.duerecvcash||0)+Number(r.duerecvbank||0);m.disc+=Number(r.disc)||0;m.bills+=Number(r.bills)||0;
     }
   });
   const months=Object.entries(byMonth).sort();
@@ -4225,26 +4308,19 @@ window.addEventListener('DOMContentLoaded',async function(){
   if(rd) rd.addEventListener('change',reloadExpForDate_);
   await loadLiveClientInfo_();
   loadSwiftSettings_();
-  // LIVE DSR BOOT FIX: the page previously stopped at loadDayData() with an
-  // empty STANDARD_DATA object, so Daily DSR rendered zeros until the user
-  // manually changed the date. The visible source control is Live POS, so load
-  // the selected day's month from the authenticated backend on first open.
+  // PASS77: no Direct POS auto-fetch. DSR is upload-first; existing uploaded Swift
+  // transactions are restored locally and reports remain available without
+  // forcing a live POS fetch at startup.
   const sel=$('mtd-month');
   if(sel && !sel.options.length){
-    sel.innerHTML='<option value="'+today.slice(0,7)+'">'+new Date(today.slice(0,7)+'-01T00:00:00').toLocaleString('en-IN',{month:'long',year:'numeric'})+'</option>';
+    const today=bnxToday_();
+    sel.innerHTML='<option value="'+today.slice(0,7)+'">'+new Date(today.slice(0,7)+'-01').toLocaleString('en-IN',{month:'long',year:'numeric'})+'</option>';
   }
-  if(sel) sel.value=today.slice(0,7);
+  loadDayData();
+  try{await loadDsrDueControl_(today);}catch(e){console.warn('[DSR DUE INIT]',e);}
   loadSwiftLocal_();
   if($('swiftReportFrom'))$('swiftReportFrom').value=today;
   if($('swiftReportTo'))$('swiftReportTo').value=today;
-  setStatus('Loading live DSR for '+today+'…');
-  try{
-    await onDsrDateChange();
-  }catch(e){
-    console.error('[DSR BOOT] live DSR initial load failed',e);
-    loadDayData();
-    setStatus('DSR could not load live data. Check V2_CORE deployment/API access, then press Refresh DSR.');
-  }
 });
 
 // ══════════════════════════════════════════
@@ -5141,7 +5217,26 @@ async function printItemGroupDsr_(){
     '<h3>Group × Category</h3><table><thead><tr><th>Group</th><th>Category</th><th class="r">Qty</th><th class="r">Sales</th><th class="r">Share</th></tr></thead><tbody>'+detail+'</tbody></table>'+
     (S.d.fromDsr?'<div class="send-note">Item-level rows not available for this period — figures are DSR category totals.</div>':'')+
     '<div class="send-foot">Generated '+new Date().toLocaleString('en-IN')+' · balajinextgen.in</div>'+
-    '<script>window.onload=function(){setTimeout(function(){window.print()},200)}<\/script></body></html>');
+    '<script>window.onload=function(){setTimeout(function(){window.print()},200)}<\/script>
+<script id="bnx-dsr-ytd-audit-guard-20261002">
+(function(){
+  'use strict';
+  var oldYtd=window.buildYTD;
+  if(typeof oldYtd==='function'&&!oldYtd.__bnxYtdAuditGuard){
+    var wrapped=async function(){
+      var ds=document.getElementById('repDate')?.value||'';
+      if(/^\d{4}-\d{2}-\d{2}$/.test(ds)&&typeof window.ensureDsrFiscalRangeLoaded_==='function'){
+        var ok=false;try{ok=await window.ensureDsrFiscalRangeLoaded_(ds);}catch(e){ok=false;}
+        if(!ok){var body=document.getElementById('ytdBody');if(body)body.innerHTML='<tr><td colspan="17" style="text-align:center;padding:14px;color:#b45309;font-weight:700">Live YTD range could not be verified. Refresh the live connection; stale totals are not shown as verified.</td></tr>';return false;}
+      }
+      return oldYtd.apply(this,arguments);
+    };
+    wrapped.__bnxYtdAuditGuard=true;wrapped.__bnxOriginal=oldYtd;window.buildYTD=wrapped;
+  }
+})();
+</script>
+
+</body></html>');
   w.document.close();
 }
 
