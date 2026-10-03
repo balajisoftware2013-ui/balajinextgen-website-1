@@ -9670,13 +9670,43 @@ function showPage(id, el){
 let _bnxBillsSyncPromise=null;
 let _bnxBillsSyncDoneKey='';
 let _bnxBillsSyncDoneAt=0;
+const _bnxBillsInflight=new Map();      // key -> promise (parallel range pulls never clobber each other)
+const _bnxBillsCovered=[];              // [{f,t,at}] ranges already pulled from the server
+function bnxBillsCovered_(f,t){
+  const today=(typeof getBusinessDate==='function')?getBusinessDate():'';
+  for(const c of _bnxBillsCovered){
+    if(c.f<=f && c.t>=t){
+      // history never changes much -> 10 min; a range that includes today -> 20 s
+      const ttl=(t<today)?600000:20000;
+      if(Date.now()-c.at<ttl) return true;
+    }
+  }
+  return false;
+}
+/* SPEED: a wide period (Quarter / Year / Month) = ONE cached pull for the past days + ONE tiny pull for today,
+   so switching periods or coming back to the page no longer re-downloads the whole quarter every time. */
 async function bnxPullBillsFromServer(from, to){
+  const f=String(from||'').slice(0,10), t=String(to||from||'').slice(0,10);
+  const today=(typeof getBusinessDate==='function')?getBusinessDate():'';
+  if(f&&t&&/^\d{4}-\d{2}-\d{2}$/.test(f)&&/^\d{4}-\d{2}-\d{2}$/.test(t)&&today&&f<today&&t>=today){
+    const yday=(typeof bnxBusinessDateOffset_==='function')?bnxBusinessDateOffset_(today,-1):'';
+    if(yday&&f<=yday){
+      const rs=await Promise.allSettled([bnxPullBillsRange_(f,yday),bnxPullBillsRange_(today,today)]);
+      if(rs.every(r=>r.status==='rejected')) throw rs[0].reason;
+      return {success:true,split:true};
+    }
+  }
+  return bnxPullBillsRange_(from,to);
+}
+async function bnxPullBillsRange_(from, to){
   // Range-aware authoritative sync. For an explicitly selected range,
   // replace the cached bills inside that range with the server result.
   // This prevents stale local bills from surviving when the server now
   // correctly reports zero bills for that period.
   const syncKey = String(from||'')+'|'+String(to||'');
-  if(_bnxBillsSyncPromise && window._bnxBillsSyncKey===syncKey) return _bnxBillsSyncPromise;
+  if(_bnxBillsInflight.has(syncKey)) return _bnxBillsInflight.get(syncKey);
+  { const ff=String(from||to||'').slice(0,10), tt=String(to||from||'').slice(0,10);
+    if(ff&&tt&&bnxBillsCovered_(ff,tt)) return {success:true,cached:true}; }
   // FIX ("report click slow" — Sep 2026): every click on Cancelled
   // Bills / TimeWise / Customer / User-Table / Parcel called this
   // BEFORE rendering — a real LIST_BILLS network round trip, every
@@ -9687,9 +9717,7 @@ async function bnxPullBillsFromServer(from, to){
   // the last one that actually finished, reuses that result instead
   // of hitting the network again — a genuinely new period, or enough
   // time passing, still syncs fresh as before.
-  if(_bnxBillsSyncDoneKey===syncKey && (Date.now()-_bnxBillsSyncDoneAt)<10000) return {success:true,cached:true};
-  window._bnxBillsSyncKey=syncKey;
-  _bnxBillsSyncPromise=(async()=>{
+  const _p=(async()=>{
     try{
       const params = { clientId: (typeof CLIENT_ID!=='undefined'?CLIENT_ID:undefined) };
       const hasRange = !!(from || to);
@@ -9764,13 +9792,15 @@ async function bnxPullBillsFromServer(from, to){
       local.forEach(b=>dedup.set(String(b.no),b));
       bnxSaveBillRegister(Array.from(dedup.values()));
       _bnxBillsSyncDoneKey=syncKey; _bnxBillsSyncDoneAt=Date.now();
+      if(hasRange){ const cf=String(from||to||'').slice(0,10), ct=String(to||from||'').slice(0,10); if(cf&&ct){ _bnxBillsCovered.push({f:cf,t:ct,at:Date.now()}); if(_bnxBillsCovered.length>40)_bnxBillsCovered.shift(); } }
       return {success:true,count:serverBills.length};
     }catch(e){
       console.warn('[bnxPullBillsFromServer] failed:', e.message);
       throw e;
     }
-  })().finally(()=>{_bnxBillsSyncPromise=null;});
-  return _bnxBillsSyncPromise;
+  })().finally(()=>{_bnxBillsInflight.delete(syncKey);});
+  _bnxBillsInflight.set(syncKey,_p);
+  return _p;
 }
 function toggleSidebar(){
   if (window.innerWidth <= 768){
@@ -20725,11 +20755,14 @@ function blFilterBills(q){
   const qRaw=String(q||'').trim().toLowerCase();
   const qNum=qRaw.replace(/[,₹\s]/g,'');                       // "9,239" / "₹9239" -> "9239"
   const terms=qRaw.split(/\s+/).filter(Boolean);
+  const _hc=window.__blHayCache||(window.__blHayCache=new WeakMap());
   const hay=b=>{
+    let c=_hc.get(b); if(c!==undefined&&c.k===b.status+'|'+b.total) return c.h;
     const t=Number(b.total)||0;
     const items=Array.isArray(b.itemsDetail)?b.itemsDetail.map(i=>i.name||i.itemName||'').join(' '):'';
-    return [b.no,b.table,b.customer,b.mob,b.waiter,b.pay,b.status,items,
+    const h=[b.no,b.table,b.customer,b.mob,b.waiter,b.pay,b.status,items,
             String(b.total??''),t.toFixed(2),Math.round(t),t.toLocaleString('en-IN')].join(' ').toLowerCase();
+    _hc.set(b,{k:b.status+'|'+b.total,h:h}); return h;
   };
   blRenderTable(blGetAllBills().filter(b=>{
     let mQ=true;
@@ -20834,10 +20867,43 @@ async function blBuildBillPdf_(b){
     return pdf;
   } finally { host.remove(); }
 }
-/* BILLS LIST → WHATSAPP (one click): builds this bill's PDF and sends it.
-   • Phone/tablet: opens the WhatsApp share sheet with the PDF already attached.
-   • Desktop: a web page cannot attach a file through wa.me, so the PDF is saved and WhatsApp opens on the
-     customer's number — drag the saved PDF in (or Ctrl+V after opening the Downloads file). */
+/* BILLS LIST → WHATSAPP: builds this bill's PDF, then
+   1) Share sheet with the PDF attached (Windows/Android/iPhone — pick WhatsApp, pick the customer, send), or
+   2) if the browser can't share files: a small panel — open the customer's chat in the WhatsApp desktop app
+      (no web QR login) + the PDF saved so it can be dropped into the chat. */
+function blWaOpenChat_(ph,text){
+  const app='whatsapp://send?phone='+ph+'&text='+encodeURIComponent(text);
+  const web='https://web.whatsapp.com/send?phone='+ph+'&text='+encodeURIComponent(text);
+  let left=false; const onBlur=()=>{left=true;};
+  window.addEventListener('blur',onBlur,{once:true});
+  const a=document.createElement('a'); a.href=app; a.style.display='none'; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>{ window.removeEventListener('blur',onBlur); if(!left) window.open(web,'_blank'); },1400);  // desktop app not installed -> WhatsApp Web
+}
+function blWaPanel_(pdf,file,b,ph,canFiles){
+  const old=document.getElementById('blWaPanel'); if(old) old.remove();
+  const title='Bill '+b.no, text='🧾 Bill '+b.no+' — ₹'+Number(b.total||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})+'\nThank you for visiting! 🙏';
+  const o=document.createElement('div'); o.id='blWaPanel';
+  o.style.cssText='position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;padding:16px';
+  o.innerHTML='<div style="background:var(--surface,#fff);border-radius:16px;max-width:380px;width:100%;padding:18px;box-shadow:0 20px 60px rgba(0,0,0,.35)">'
+    +'<div style="font-weight:800;font-size:15px;margin-bottom:2px">📄 Bill PDF ready</div>'
+    +'<div style="font-size:12px;color:#888;margin-bottom:14px"></div>'
+    +(canFiles?'<button type="button" data-a="share" class="btn btn-sm bl-wa-btn" style="width:100%;padding:11px;margin-bottom:8px;display:flex;justify-content:center">📤 Send PDF on WhatsApp</button>':'')
+    +'<button type="button" data-a="chat" class="btn btn-sm '+(canFiles?'btn-ghost':'bl-wa-btn')+'" style="width:100%;padding:11px;margin-bottom:8px;display:flex;justify-content:center">💬 Open chat +'+ph+' (WhatsApp app)</button>'
+    +'<button type="button" data-a="dl" class="btn btn-sm btn-ghost" style="width:100%;padding:11px;margin-bottom:8px;display:flex;justify-content:center">⬇ Save PDF</button>'
+    +'<div id="blWaHint" style="font-size:11px;color:#888;min-height:15px;text-align:center"></div>'
+    +'<button type="button" data-a="x" class="btn btn-sm btn-ghost" style="width:100%;margin-top:6px">Close</button></div>';
+  o.firstChild.children[1].textContent=file.name+' · '+(b.customer&&b.customer!=='—'?b.customer:'')+' '+(b.mob||'');
+  document.body.appendChild(o);
+  const hint=m=>{const h=o.querySelector('#blWaHint'); if(h) h.textContent=m;};
+  o.addEventListener('click',async e=>{
+    if(e.target===o){ o.remove(); return; }
+    const a=e.target.closest('[data-a]')?.getAttribute('data-a'); if(!a) return;
+    if(a==='x') o.remove();
+    else if(a==='dl'){ pdf.save(file.name); hint('✅ PDF saved to Downloads'); }
+    else if(a==='chat'){ pdf.save(file.name); blWaOpenChat_(ph,text); hint('✅ PDF saved — drag it from Downloads into the chat'); }
+    else if(a==='share'){ try{ await navigator.share({files:[file],title:title,text:text}); o.remove(); }catch(err){ if(err&&err.name!=='AbortError') hint('⚠️ Share failed — use Open chat / Save PDF'); } }
+  });
+}
 async function blSendWhatsApp(no,btn){
   const b=blGetAllBills().find(x=>String(x.no)===String(no));
   if(!b){ if(typeof showNotif==='function') showNotif('Bill not found','error'); return; }
@@ -20854,16 +20920,13 @@ async function blSendWhatsApp(no,btn){
     if(typeof showNotif==='function') showNotif('📄 Preparing bill PDF…','success');
     const pdf=await blBuildBillPdf_(b);
     const fname='Bill_'+String(b.no).replace(/[^a-z0-9]+/gi,'_').replace(/^_+|_+$/g,'')+'.pdf';
-    const blob=pdf.output('blob');
-    const file=new File([blob],fname,{type:'application/pdf'});
-    const isMobile=/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)||(navigator.maxTouchPoints>1&&/Mac/.test(navigator.platform));
-    if(isMobile&&navigator.canShare&&navigator.share&&navigator.canShare({files:[file]})){
+    const file=new File([pdf.output('blob')],fname,{type:'application/pdf'});
+    let canFiles=false; try{ canFiles=!!(navigator.canShare&&navigator.share&&navigator.canShare({files:[file]})); }catch(e){}
+    if(canFiles){
       try{ await navigator.share({files:[file],title:'Bill '+b.no,text:blBuildWaText_(b)}); return; }
-      catch(e){ if(e&&e.name==='AbortError') return; }
+      catch(e){ if(e&&e.name==='AbortError') return; /* gesture expired / blocked -> panel below */ }
     }
-    pdf.save(fname);
-    if(typeof showNotif==='function') showNotif('✅ PDF saved — attach it in WhatsApp ('+(b.customer&&b.customer!=='—'?b.customer:'+'+ph)+')','success');
-    setTimeout(()=>window.open('https://wa.me/'+ph+'?text='+encodeURIComponent('🧾 Bill '+b.no+' — ₹'+Number(b.total||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})+'\nThank you for visiting! 🙏'),'_blank'),600);
+    blWaPanel_(pdf,file,b,ph,canFiles);
   }catch(e){
     console.error('[Bill WhatsApp PDF]',e);
     if(typeof showNotif==='function') showNotif('⚠️ PDF failed: '+(e&&e.message||e),'error');
@@ -35757,8 +35820,23 @@ mo.observe(document.body,{subtree:true,childList:true});
 #bnxGlobalPeriodBar .bnx-gp-pick[data-kind="today"] #bnxGpDay,
 #bnxGlobalPeriodBar .bnx-gp-pick[data-kind="week"] #bnxGpWeek,
 #bnxGlobalPeriodBar .bnx-gp-pick[data-kind="month"] #bnxGpMonth,
-#bnxGlobalPeriodBar .bnx-gp-pick[data-kind="year"] #bnxGpYear,
-#bnxGlobalPeriodBar .bnx-gp-pick[data-kind="quarter"] #bnxGpQuarter{display:inline-block;}
+#bnxGlobalPeriodBar .bnx-gp-pick[data-kind="year"] #bnxGpYear{display:inline-block;}
+#bnxGlobalPeriodBar .bnx-gp-pick #bnxGpQuarter{display:none!important;}
+#bnxGlobalPeriodBar .bnx-gp-qbtn{display:none;flex:0 0 auto;border:1px solid var(--gold,#d88a00);background:var(--gold-bg,#fff6ea);color:var(--gold,#b8690e);font-weight:800;font-size:11px;border-radius:999px;padding:6px 11px;cursor:pointer;white-space:nowrap}
+#bnxGlobalPeriodBar .bnx-gp-qbtn.show{display:inline-flex;align-items:center;gap:5px}
+#bnxQPop{position:fixed;z-index:99999;width:268px;background:var(--surface,#fff);border:1px solid var(--border2,#ddd);border-radius:14px;box-shadow:0 14px 40px rgba(0,0,0,.22);padding:12px;display:none}
+#bnxQPop.show{display:block}
+#bnxQPop .qp-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+#bnxQPop .qp-h b{font-size:13px}
+#bnxQPop .qp-h button{border:1px solid var(--border2,#ddd);background:var(--surface2,#f7f5f0);border-radius:8px;width:28px;height:28px;cursor:pointer;font-size:14px}
+#bnxQPop .qp-h button:disabled{opacity:.35;cursor:default}
+#bnxQPop .qp-g{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+#bnxQPop .qp-t{border:1px solid var(--border2,#ddd);background:var(--surface2,#f7f5f0);border-radius:11px;padding:10px 6px;cursor:pointer;text-align:center;line-height:1.25}
+#bnxQPop .qp-t b{display:block;font-size:14px}
+#bnxQPop .qp-t span{font-size:10.5px;color:var(--text3,#8c725e)}
+#bnxQPop .qp-t.on{background:var(--gold,#b8690e);border-color:var(--gold,#b8690e);color:#fff}
+#bnxQPop .qp-t.on span{color:#fff}
+#bnxQPop .qp-t:disabled{opacity:.35;cursor:not-allowed}
 #bnxGlobalPeriodBar .bnx-gp-pick .bnx-gp-date{border-color:var(--gold,#d88a00);}
 @media(max-width:900px){
   #bnxGlobalPeriodBar{padding:5px 8px;min-height:40px;}
@@ -35862,8 +35940,9 @@ mo.observe(document.body,{subtree:true,childList:true});
   var monthNative=(function(){try{var i=document.createElement('input');i.setAttribute('type','month');return i.type==='month';}catch(e){return false;}})();
   function fyStartOf(isoStr){var p=String(isoStr||iso(bizNow())).split('-').map(Number);return p[1]>=4?p[0]:p[0]-1;}
   function syncPickers(){
+    try{syncQBtn();}catch(e){}
     var box=document.getElementById('bnxGpPick');if(!box)return;
-    var k=current.kind||current.range, show=(k==='today'||k==='week'||k==='month'||k==='quarter'||k==='year');
+    var k=current.kind||current.range, show=(k==='today'||k==='week'||k==='month'||k==='year');
     box.classList.toggle('show',show);box.setAttribute('data-kind',show?k:'');
     var tk=iso(bizNow());
     var d=document.getElementById('bnxGpDay'),w=document.getElementById('bnxGpWeek'),m=document.getElementById('bnxGpMonth'),y=document.getElementById('bnxGpYear');
@@ -35894,6 +35973,41 @@ mo.observe(document.body,{subtree:true,childList:true});
       y.value=String(fyStartOf(k==='year'?current.from:tk));
     }
   }
+  /* Quarter calendar: FY header (< >) + Q1..Q4 tiles, opens under the quarter button */
+  var qpFy=null, MN3=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  function qStart(fy,q){return new Date(fy,3+q*3,1);}
+  function qLabel(fy,q){var a=qStart(fy,q),e=new Date(a.getFullYear(),a.getMonth()+2,1);return 'Q'+(q+1)+' FY'+String(fy).slice(2)+'-'+String((fy+1)%100).padStart(2,'0')+' ('+MN3[a.getMonth()]+'\u2013'+MN3[e.getMonth()]+' '+e.getFullYear()+')';}
+  function qCurrent(){var k=current.kind||current.range;var a=String((k==='quarter'?current.from:iso(bizNow()))).split('-').map(Number);var d=new Date(a[0],a[1]-1,a[2]);var fy=d.getMonth()>=3?d.getFullYear():d.getFullYear()-1;return {fy:fy,q:Math.floor(((d.getMonth()-3+12)%12)/3)};}
+  function syncQBtn(){
+    var b=document.getElementById('bnxGpQBtn');if(!b)return;
+    var k=current.kind||current.range;b.classList.toggle('show',k==='quarter');
+    if(k==='quarter'){var c=qCurrent();b.textContent='\uD83D\uDCC5 '+qLabel(c.fy,c.q).replace(/ \(.*\)/,'')+' \u25BE';}
+  }
+  function closeQPop(){var p=document.getElementById('bnxQPop');if(p)p.classList.remove('show');}
+  function renderQPop(){
+    var p=document.getElementById('bnxQPop');if(!p)return;
+    var cur=qCurrent(),tk=iso(bizNow()),nowFy=fyStartOf(tk);
+    if(qpFy===null)qpFy=cur.fy;
+    var h='<div class="qp-h"><button type="button" data-d="-1">\u2039</button><b>FY '+qpFy+'-'+String((qpFy+1)%100).padStart(2,'0')+'</b><button type="button" data-d="1"'+(qpFy>=nowFy?' disabled':'')+'>\u203A</button></div><div class="qp-g">';
+    var QN=['Apr\u2013Jun','Jul\u2013Sep','Oct\u2013Dec','Jan\u2013Mar'];
+    for(var q=0;q<4;q++){
+      var st=qStart(qpFy,q),fut=iso(st)>tk,on=(qpFy===cur.fy&&q===cur.q&&(current.kind||current.range)==='quarter');
+      h+='<button type="button" class="qp-t'+(on?' on':'')+'" data-q="'+q+'"'+(fut?' disabled':'')+'><b>Q'+(q+1)+'</b><span>'+QN[q]+' '+(q===3?qpFy+1:qpFy)+'</span></button>';
+    }
+    p.innerHTML=h+'</div>';
+    p.querySelectorAll('[data-d]').forEach(function(b){b.addEventListener('click',function(e){e.stopPropagation();qpFy+=Number(b.getAttribute('data-d'));renderQPop();});});
+    p.querySelectorAll('[data-q]').forEach(function(b){b.addEventListener('click',function(e){e.stopPropagation();var q=Number(b.getAttribute('data-q'));closeQPop();setRange('quarter',null,iso(qStart(qpFy,q)));});});
+  }
+  function toggleQPop(){
+    var p=document.getElementById('bnxQPop');
+    if(!p){p=document.createElement('div');p.id='bnxQPop';document.body.appendChild(p);p.addEventListener('click',function(e){e.stopPropagation();});document.addEventListener('click',closeQPop);}
+    if(p.classList.contains('show')){closeQPop();return;}
+    qpFy=qCurrent().fy;renderQPop();
+    var anchor=document.getElementById('bnxGpQBtn');var ab=document.querySelector('#bnxGlobalPeriodBar [data-range="quarter"]');
+    var r=(anchor&&anchor.classList.contains('show')?anchor:ab).getBoundingClientRect();
+    p.style.top=(r.bottom+6)+'px';p.style.left=Math.max(8,Math.min(r.left,window.innerWidth-280))+'px';
+    p.classList.add('show');
+  }
   function setRange(kind,btn,anchor){
     current.kind=kind;
     if(kind==='custom'){
@@ -35918,14 +36032,15 @@ mo.observe(document.body,{subtree:true,childList:true});
     var bar=document.createElement('div');bar.id='bnxGlobalPeriodBar';
     var labels=[['today','Today'],['yesterday','Yesterday'],['week','This Week'],['month','This Month'],['quarter','This Quarter'],['year','This Year'],['custom','Custom']];
     var html='<span class="bnx-gp-label">DATE / PERIOD</span>';
-    labels.forEach(function(x){html+='<button type="button" class="bnx-gp-btn" data-range="'+x[0]+'">'+x[1]+'</button>';});
+    labels.forEach(function(x){html+='<button type="button" class="bnx-gp-btn" data-range="'+x[0]+'">'+x[1]+'</button>';if(x[0]==='quarter')html+='<button type="button" class="bnx-gp-qbtn" id="bnxGpQBtn" title="Pick a quarter"></button>';});
     html+='<span class="bnx-gp-custom" id="bnxGpCustom"><input class="bnx-gp-date" id="bnxGpFrom" type="date"><span class="bnx-gp-note">to</span><input class="bnx-gp-date" id="bnxGpTo" type="date"></span>';
     html+='<span class="bnx-gp-pick" id="bnxGpPick"><input class="bnx-gp-date" id="bnxGpDay" type="date" title="Pick a date"><input class="bnx-gp-date" id="bnxGpWeek" type="date" title="Pick any day - that whole week (Mon-Sun) is shown"><input class="bnx-gp-date" id="bnxGpMonth" type="'+(monthNative?'month':'date')+'" title="Pick a month"><select class="bnx-gp-date" id="bnxGpQuarter" title="Pick a financial quarter"></select><select class="bnx-gp-date" id="bnxGpYear" title="Pick a financial year (Apr-Mar)"></select></span>';
     html+='<span class="bnx-gp-note" id="bnxGpLabel"></span>';
     bar.innerHTML=html;
     var top=document.querySelector('.topbar');
     if(top&&top.parentNode)top.parentNode.insertBefore(bar,top.nextSibling);
-    labels.forEach(function(x){var b=bar.querySelector('[data-range="'+x[0]+'"]');if(b)b.addEventListener('click',function(){setRange(x[0],b);});});
+    labels.forEach(function(x){var b=bar.querySelector('[data-range="'+x[0]+'"]');if(b)b.addEventListener('click',function(e){var was=b.classList.contains('active');setRange(x[0],b);if(x[0]==='quarter'){e.stopPropagation();if(was||true)toggleQPop();}});});
+    var qb=bar.querySelector('#bnxGpQBtn');if(qb)qb.addEventListener('click',function(e){e.stopPropagation();toggleQPop();});
     var pd=bar.querySelector('#bnxGpDay'),pw=bar.querySelector('#bnxGpWeek'),pm=bar.querySelector('#bnxGpMonth'),py=bar.querySelector('#bnxGpYear');
     if(pd)pd.addEventListener('change',function(){if(pd.value)setRange('today',null,pd.value);});
     if(pw)pw.addEventListener('change',function(){if(pw.value)setRange('week',null,pw.value);});
@@ -43253,8 +43368,12 @@ window.blDateInRange=function(dt){
   if(!d) return true;
   var k=key(d); return k>=r.from && k<=r.to;
 };
+var _lastReload={k:'',t:0};
 function reload(){
   var r=g();
+  var _k=r.from+'|'+r.to, _n=Date.now();
+  if(_lastReload.k===_k && _n-_lastReload.t<600) return;   /* period change + page-open + setter all fire together -> run once */
+  _lastReload={k:_k,t:_n};
   var q0=document.getElementById('blSearch'); if(typeof blFilterBills==='function') blFilterBills(q0?q0.value:'');  /* instant paint */
   var p=(typeof bnxPullBillsFromServer==='function')?bnxPullBillsFromServer(r.from,r.to):Promise.resolve();
   Promise.resolve(p).catch(function(){}).then(function(){
