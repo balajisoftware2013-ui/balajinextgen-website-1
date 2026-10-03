@@ -6290,7 +6290,7 @@ document.addEventListener('DOMContentLoaded', function(){
       <!-- UPI QR ON INVOICE (2026-10-03): upload bank QR once → auto-saved per client → every bill prints a dynamic QR with the exact bill amount -->
       <div id="bnxUpiQrBox" style="background:var(--surface2);border:1.5px solid rgba(37,99,214,.28);border-radius:11px;padding:14px;margin:0 0 14px;">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px;">
-          <div style="font-size:13px;font-weight:700;">📱 UPI QR on Invoice <span style="font-size:9px;font-weight:600;color:var(--text3);">build UPI-r5</span></div>
+          <div style="font-size:13px;font-weight:700;">📱 UPI QR on Invoice <span style="font-size:9px;font-weight:600;color:var(--text3);">build UPI-r6</span></div>
           <span class="pill p-b">Client <span id="bnxUpiClientLbl">—</span></span>
         </div>
         <div style="font-size:10.5px;color:var(--text3);margin-bottom:12px;line-height:1.5;">Upload your bank's UPI QR (photo or screenshot). It is read and saved automatically. Every printed bill then carries a QR with that bill's amount already filled in — the customer just scans and pays.</div>
@@ -28073,6 +28073,12 @@ function bnxClearAllLocalAppData(opts){
       continue;
     }
     if (keepBrand && k.startsWith('erp_restaurant_brand_')) continue; /* logo/name cache is per-client; a logout must not delete it */
+    /* ROOT CAUSE ("QR upload + print OK but not stored permanently"): every
+       logout ran this purge, and the UPI QR setting (bnx_upi_qr_<client>) and
+       its Google-Sheet sync stamp start with bnx_, so the QR vanished at each
+       logout. They are per-client device settings exactly like the brand
+       cache (keyed by CLIENT_ID, no cross-tenant leak) — keep them too. */
+    if (keepBrand && (k.startsWith('bnx_upi_qr_') || k.startsWith('bnx_assets_sync_'))) continue;
     if (k.startsWith('bnx_') || k.startsWith('bnErp') ||
         k.startsWith('erp_restaurant_brand_') || k.startsWith('erp_petty_accounts_master_')) {
       keysToRemove.push(k);
@@ -42926,6 +42932,39 @@ window.bnxQrGen=qrcode;
   function toast(m,t){ try{ if(typeof showNotif==='function') return showNotif(m,t||'success'); }catch(e){} }
   const VPA_RE=/^[A-Za-z0-9.\-_]{2,256}@[A-Za-z][A-Za-z0-9.\-_]{1,64}$/;
 
+  /* IndexedDB mirror — survives logout purges / "Reset All Data" / a cleared
+     localStorage; localStorage is restored from it automatically. */
+  function idb(mode,fn){
+    return new Promise(function(res){
+      try{
+        const rq=indexedDB.open('bnx_upi_mirror',1);
+        rq.onupgradeneeded=function(){ rq.result.createObjectStore('cfg'); };
+        rq.onerror=function(){ res(null); };
+        rq.onsuccess=function(){ try{ const tx=rq.result.transaction('cfg',mode), r=fn(tx.objectStore('cfg'));
+          tx.oncomplete=function(){ res(r&&r.result!==undefined?r.result:true); }; tx.onerror=function(){ res(null); }; }catch(e){ res(null); } };
+      }catch(e){ res(null); }
+    });
+  }
+  function mirrorPut(k,json){ idb('readwrite',function(s){ return s.put(json,k); }); }
+  function mirrorDel(k){ idb('readwrite',function(s){ return s.delete(k); }); }
+  const restoring={};
+  function restoreFromMirror(k){
+    if(restoring[k]) return restoring[k];
+    restoring[k]=idb('readonly',function(s){ return s.get(k); }).then(function(raw){
+      try{
+        if(raw&&typeof raw==='string'&&!localStorage.getItem(k)){
+          localStorage.setItem(k,raw);
+          console.info('[BNX UPI] QR restored from device backup for',k);
+          try{ render(); }catch(e){}
+          return true;
+        }
+      }catch(e){}
+      return false;
+    }).finally(function(){ setTimeout(function(){ delete restoring[k]; },5000); });
+    return restoring[k];
+  }
+  window.bnxUpiRestore_=function(){ return restoreFromMirror(key()); };
+
   function liveUpi(){
     const L=(window.BNX_LIVE_CLIENT_INFO&&typeof window.BNX_LIVE_CLIENT_INFO==='object')?window.BNX_LIVE_CLIENT_INFO:{};
     const vpa=String(L.upiId||L.UPI_ID||L.upi_id||'').trim();
@@ -42935,6 +42974,7 @@ window.bnxQrGen=qrcode;
   function get(){
     let c={};
     try{ c=JSON.parse(localStorage.getItem(key())||'{}')||{}; }catch(e){ c={}; }
+    if(!c.vpa&&!c.img) restoreFromMirror(key());   /* async; re-renders when found */
     /* uploaded before CLIENT_ID finished bootstrapping → saved under 'default' */
     if(!c.vpa&&cid()!=='default'){ try{ const dflt=JSON.parse(localStorage.getItem('bnx_upi_qr_default')||'{}')||{}; if(dflt.vpa){ c=dflt; localStorage.setItem(key(),JSON.stringify(dflt)); } }catch(e){} }
     if(!c.vpa){ const l=liveUpi(); if(l) c=Object.assign({},l,{source:'server'}); }
@@ -42946,7 +42986,8 @@ window.bnxQrGen=qrcode;
   function put(c){
     c=Object.assign({},c,{updatedAt:new Date().toISOString(),clientId:cid()});
     try{ localStorage.setItem(key(),JSON.stringify(c)); }
-    catch(e){ /* quota: drop the preview image, keep the payment data */ try{ delete c.img; localStorage.setItem(key(),JSON.stringify(c)); }catch(e2){} }
+    catch(e){ /* quota: drop the preview image, keep the payment data */ try{ const d=Object.assign({},c); delete d.img; localStorage.setItem(key(),JSON.stringify(d)); }catch(e2){} }
+    mirrorPut(key(),JSON.stringify(c));
     return c;
   }
 
@@ -42960,7 +43001,8 @@ window.bnxQrGen=qrcode;
   /* called by asset-sync when the sheet has a newer QR than this PC */
   window.bnxUpiApplyServer_=function(meta,img,updatedAt){
     const c=Object.assign({},meta||{},{img:img||'',updatedAt:updatedAt||new Date().toISOString(),clientId:cid(),source:'sheet'});
-    try{ localStorage.setItem(key(),JSON.stringify(c)); }catch(e){ try{ delete c.img; localStorage.setItem(key(),JSON.stringify(c)); }catch(e2){} }
+    try{ localStorage.setItem(key(),JSON.stringify(c)); }catch(e){ try{ const d=Object.assign({},c); delete d.img; localStorage.setItem(key(),JSON.stringify(d)); }catch(e2){} }
+    mirrorPut(key(),JSON.stringify(c));
     try{ render(); }catch(e){}
   };
 
@@ -43273,6 +43315,7 @@ window.bnxQrGen=qrcode;
   window.bnxUpiClear=async function(){
     if(!confirm('Remove the saved UPI QR for client '+cid()+'? Bills will print without a QR.')) return;
     try{ localStorage.removeItem(key()); }catch(e){}
+    mirrorDel(key()); try{ localStorage.removeItem('bnx_upi_qr_default'); }catch(e){}
     window.BNX_LIVE_CLIENT_INFO=Object.assign({},window.BNX_LIVE_CLIENT_INFO||{},{upiId:'',upiName:'',upiTr:'',upiMc:'',UPI_ID:''});
     syncServer({vpa:'',pn:'',tr:'',mc:'',img:''});
     render(); toast('UPI QR removed','success');
@@ -43317,7 +43360,7 @@ window.bnxQrGen=qrcode;
   },false);
   window.bnxUpiRender=render;
 
-  function boot(){ render(); }
+  function boot(){ restoreFromMirror(key()).then(function(){ render(); }); }
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',function(){ setTimeout(boot,200); });
   else setTimeout(boot,200);
   /* re-render when Settings → Payment is opened (server info may arrive late) */
