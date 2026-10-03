@@ -1,51 +1,15 @@
-/* HAPPYSERVE steward service worker.
-   - App shell cached for offline open.
-   - HTML: network-first (so fixes reach stewards), cache fallback offline.
-   - Google Apps Script / any cross-origin / non-GET request is NEVER cached
-     (orders, KOTs and transfers must always hit the live server). */
-const VERSION = 'happyserve-steward-v4';
-const SHELL = ['./steward-mobile.html', './manifest.json', './icon-192.png', './icon-512.png', './icon-180.png', './icon-180.png'];
-
-self.addEventListener('install', e => {
-  e.waitUntil((async () => {
-    const c = await caches.open(VERSION);
-    await Promise.all(SHELL.map(u => c.add(u).catch(() => {}))); // one missing file must not break install
-    self.skipWaiting();
-  })());
-});
-
+/* HAPPYSERVE service worker — app shell only. Live data (API calls) is never cached. */
+const CACHE = 'happyserve-shell-v1';
+self.addEventListener('install', e => { self.skipWaiting(); });
 self.addEventListener('activate', e => {
-  e.waitUntil((async () => {
-    const keys = await caches.keys();
-    await Promise.all(keys.filter(k => k.startsWith('happyserve-steward-') && k !== VERSION).map(k => caches.delete(k)));
-    await self.clients.claim();
-  })());
+  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim()));
 });
-
-self.addEventListener('message', e => { if (e.data === 'SKIP_WAITING') self.skipWaiting(); });
-
 self.addEventListener('fetch', e => {
-  const req = e.request, url = new URL(req.url);
-  if (req.method !== 'GET' || url.origin !== self.location.origin) return; // API calls go straight to network
-  if (req.mode === 'navigate' || (req.headers.get('accept') || '').includes('text/html')) {
-    e.respondWith((async () => {
-      try {
-        const fresh = await fetch(req);
-        const c = await caches.open(VERSION); c.put('./steward-mobile.html', fresh.clone()).catch(() => {});
-        return fresh;
-      } catch (err) {
-        return (await caches.match(req)) || (await caches.match('./steward-mobile.html')) || Response.error();
-      }
-    })());
-    return;
-  }
-  e.respondWith((async () => {
-    const hit = await caches.match(req);
-    if (hit) return hit;
-    try {
-      const res = await fetch(req);
-      if (res && res.ok) { const c = await caches.open(VERSION); c.put(req, res.clone()).catch(() => {}); }
-      return res;
-    } catch (err) { return Response.error(); }
-  })());
+  const r = e.request;
+  if (r.method !== 'GET' || new URL(r.url).origin !== location.origin) return;
+  if (r.mode !== 'navigate') return;               // only the HTML page itself
+  e.respondWith(fetch(r).then(res => {
+    const copy = res.clone(); caches.open(CACHE).then(c => c.put(r, copy)).catch(() => {});
+    return res;
+  }).catch(() => caches.match(r).then(m => m || caches.match('./'))));
 });
