@@ -18424,9 +18424,10 @@ async function bmDoPrint(){
           return;
         }
         if(!isA4){
-          if(typeof showNotif==='function') showNotif('❌ Direct BILL printer did not accept the invoice. Check QZ Tray and BILL printer 192.168.0.210, then retry.','error');
-          console.warn('[BNX INVOICE DIRECT] thermal direct print failed — browser preview suppressed');
-          return;
+          let billIp=''; try{ billIp=(window.bnxIpSettings_&&window.bnxIpSettings_().BILL)||''; }catch(ig){}
+          if(typeof showNotif==='function') showNotif('⚠️ BILL printer '+billIp+' not reachable (printer off or different Wi-Fi). Opening normal print so the bill is not lost.','error');
+          console.warn('[BNX INVOICE DIRECT] thermal direct print failed — falling back to browser print');
+          /* continue below: invoice is rendered and printed via browser (hidden iframe, no popup needed) */
         }
       }catch(e){ console.warn('[PRINT] direct BILL route failed; using browser invoice print:',e); }
     }
@@ -18483,6 +18484,14 @@ async function bmDoPrint(){
     '.a4-tax-tbl td{padding:3px 6px;border:1px solid #ddd}.r{text-align:right;}' +
     '@media print{body{margin:0;}}';
 
+  /* Direct print failed (thermal mode, no popup window): print via hidden iframe. */
+  if(!w){
+    bnxPrintHtmlViaIframe_('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Invoice '+String(saved.billno).replace(/[<>&"]/g,'')+'</title><style>'+css+'</style></head><body>'+content+'</body></html>');
+    if(!saved.isEditingExisting && typeof bmResetBillForm==='function'){ try{ bmResetBillForm(); }catch(e){} }
+    if (typeof bmClosePrintModal === 'function') bmClosePrintModal();
+    return;
+  }
+
   // No external font dependency: invoice print starts faster and ₹ remains UTF-8.
   w.document.open();
   w.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Invoice '+String(saved.billno).replace(/[<>&"]/g,'')+'</title><style>'+css+'</style></head><body>'+content+'</body></html>');
@@ -18508,6 +18517,16 @@ async function bmDoPrint(){
   setTimeout(doPrint, 180);
 
   if (typeof bmClosePrintModal === 'function') bmClosePrintModal();
+}
+function bnxPrintHtmlViaIframe_(html){
+  const f=document.createElement('iframe');
+  f.style.cssText='position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden;';
+  document.body.appendChild(f);
+  const d=f.contentWindow.document; d.open(); d.write(html); d.close();
+  setTimeout(function(){
+    try{ f.contentWindow.focus(); f.contentWindow.print(); }catch(e){ console.error('[PRINT] iframe print failed:',e); }
+    setTimeout(function(){ try{ f.remove(); }catch(e){} },60000);
+  },250);
 }
 function bmOpenKOTPrint(){bmRenderKOT('bmModalKOT');document.getElementById('bmKOTModal').classList.add('open');}
 function bmCloseKOTModal(){document.getElementById('bmKOTModal').classList.remove('open');}
@@ -39071,6 +39090,8 @@ function bnxOpenImportHub(){
       return 'Edge blocked local QZ Tray access. Choose Allow for Local Network Access, then reload and Retry.';
     if(/certificate|ssl|wss|secure/i.test(m) && /qz|localhost/i.test(m))
       return 'QZ Tray secure connection was rejected. QZ Tray must be running; reload once and allow Local Network Access.';
+    if(/Connection timed out|ConnectException|No route to host|not reachable/i.test(m))
+      return /not reachable/i.test(m) ? m : 'Printer not reachable. Check that the printer is on and this PC is on the restaurant Wi-Fi.';
     return m || 'QZ Tray connection failed.';
   }
 
@@ -39619,6 +39640,11 @@ function bnxOpenImportHub(){
   async function directPrintRaw(role,data,jobName){
     const ips=ipSettings(), ip=ips[role];
     if(!ip) throw new Error('No IP configured for '+role);
+    /* FAST FAIL: if this printer just timed out, fail instantly for 15s instead of
+       making every click wait again. Test buttons clear this via __bnxPrinterDown={}. */
+    window.__bnxPrinterDown=window.__bnxPrinterDown||{};
+    const downKey=role+'|'+ip, down=window.__bnxPrinterDown[downKey];
+    if(down && Date.now()-down.at<15000) throw down.err;
     await connectQz();
 
     /* FAST PATH: reuse the already-open QZ WebSocket and the already-created
@@ -39633,7 +39659,23 @@ function bnxOpenImportHub(){
     let payload=data;
     if(!Array.isArray(payload)) payload=[{type:'raw',format:'command',flavor:'plain',data:String(payload||'')}];
     else if(payload.length && payload.every(x=>typeof x==='string')) payload=[{type:'raw',format:'command',flavor:'plain',data:payload.join('')}];
-    return qz.print(config,payload);
+    /* TIMEOUT: Java waits ~20s for an unreachable LAN printer. Give up after 6s so the
+       cashier gets the message/fallback quickly. */
+    const TMO=6000; let timer;
+    const printP=qz.print(config,payload); printP.catch(function(){});
+    const tmoP=new Promise(function(_,rej){ timer=setTimeout(function(){
+      const er=new Error('Printer '+ip+' not reachable (no response in '+(TMO/1000)+'s). Check that the printer is on and this PC is on the restaurant Wi-Fi.');
+      er.bnxUnreachable=true; rej(er); },TMO); });
+    try{
+      return await Promise.race([printP,tmoP]);
+    }catch(e){
+      if((e&&e.bnxUnreachable) || /timed out|ConnectException|No route to host|unreachable/i.test(String(e&&e.message||e))){
+        const er=(e&&e.bnxUnreachable)?e:Object.assign(new Error('Printer '+ip+' not reachable. Check that the printer is on and this PC is on the restaurant Wi-Fi.'),{bnxUnreachable:true});
+        window.__bnxPrinterDown[downKey]={at:Date.now(),err:er};
+        throw er;
+      }
+      throw e;
+    }finally{ clearTimeout(timer); }
   }
 
   window.bnxConnectIpPrinters=async function(){
@@ -39686,6 +39728,7 @@ function bnxOpenImportHub(){
   window.bnxTestPrint=async function(label){
     const role=String(label||'').toUpperCase().includes('KITCHEN')?'KITCHEN':String(label||'').toUpperCase().includes('HUKKA')?'HUKKA':String(label||'').toUpperCase().includes('BAR')?'BAR':'BILL';
     try{
+      window.__bnxPrinterDown={};
       const width=Number((typeof bnxPaperSize==='function'?bnxPaperSize():80))===58?32:42;
       const data=['\x1B@','\x1Ba1','\x1BE1',escPosText(label||role)+'\n','\x1BE0',line('-',width)+'\n','Balaji NextGen ERP\n','DIRECT IP / ESC-POS TEST\n','Printer: '+ipSettings()[role]+'\n',new Date().toLocaleString('en-IN')+'\n',line('-',width)+'\n','PRINT OK\n','\n\n\n','\x1DVA0'];
       await directPrintRaw(role,data,'BNX '+role+' Test');
