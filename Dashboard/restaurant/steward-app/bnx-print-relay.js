@@ -51,8 +51,17 @@ const TLS_AUTO = String(process.env.BNX_TLS_AUTO || '1') !== '0';
 const MAX_BODY = 512 * 1024;
 const PRINTER_PORT = 9100;
 
-const PRINTER_PREFIXES = String(process.env.BNX_PRINTER_SUBNETS || '192.168.0.')
-  .split(',').map(s => s.trim()).filter(Boolean);
+/* Allowed printer prefixes. Default = every /24 this PC is on (so 192.168.1.x, 10.0.0.x ... just work)
+   plus 192.168.0.  Override with BNX_PRINTER_SUBNETS=192.168.1.,10.0.0.  */
+const PRINTER_PREFIXES = (function () {
+  const fromEnv = String(process.env.BNX_PRINTER_SUBNETS || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (fromEnv.length) return fromEnv;
+  const set = new Set(['192.168.0.']);
+  Object.values(os.networkInterfaces()).forEach(list => (list || []).forEach(n => {
+    if (n.family === 'IPv4' && !n.internal) set.add(n.address.split('.').slice(0, 3).join('.') + '.');
+  }));
+  return Array.from(set);
+})();
 
 const ALLOWED_ORIGINS = new Set(['https://balajinextgen.in', 'https://www.balajinextgen.in']);
 let ALLOW_ANY_ORIGIN = false;
@@ -187,7 +196,7 @@ function writeRawToPrinter(host, port, bytes) {
     socket.setNoDelay(true);
     let settled = false;
     let wrote = false;
-    const hard = setTimeout(() => finish(new Error('Printer TCP job timed out')), 15000);
+    const hard = setTimeout(() => finish(new Error('Printer TCP job timed out')), 20000);
     function finish(err) {
       if (settled) return;
       settled = true;
@@ -195,7 +204,7 @@ function writeRawToPrinter(host, port, bytes) {
       try { socket.destroy(); } catch (_) {}
       err ? reject(err) : resolve();
     }
-    socket.setTimeout(8000, () => finish(Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })));
+    socket.setTimeout(10000, () => finish(Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })));
     socket.once('error', finish);
     socket.once('connect', () => {
       socket.write(bytes, err => {
@@ -257,12 +266,23 @@ async function discoverPrinters() {
 /* ───────────────────────── request handler ───────────────────────── */
 
 async function handler(req, res) {
+  try { await handleRequest(req, res); }
+  catch (e) {
+    console.error(new Date().toISOString(), 'UNEXPECTED', e && e.stack || e);
+    try { if (!res.headersSent) sendJson(req, res, 500, { ok: false, error: 'Relay internal error: ' + (e && e.message) }, String(req.headers.origin || '')); else res.end(); } catch (_) {}
+  }
+}
+process.on('unhandledRejection', e => console.error('unhandledRejection', e && e.stack || e));
+process.on('uncaughtException', e => console.error('uncaughtException', e && e.stack || e));
+
+async function handleRequest(req, res) {
   const origin = String(req.headers.origin || '');
   const url = new URL(req.url, 'http://relay.local');
 
   if (req.method === 'OPTIONS') {
     if (origin && !originAllowed(origin)) {
-      return sendJson(req, res, 403, { ok: false, error: 'Origin not allowed' }, '');
+      console.warn('Blocked origin (add it with BNX_ALLOWED_ORIGINS=' + origin + '):', origin);
+      return sendJson(req, res, 403, { ok: false, error: 'Origin not allowed: ' + origin }, '');
     }
     res.writeHead(204, corsHeaders(req, origin));
     return res.end();
@@ -283,7 +303,8 @@ async function handler(req, res) {
   }
 
   if (origin && !originAllowed(origin)) {
-    return sendJson(req, res, 403, { ok: false, error: 'Origin not allowed' }, '');
+    console.warn('Blocked origin (add it with BNX_ALLOWED_ORIGINS=' + origin + '):', origin);
+    return sendJson(req, res, 403, { ok: false, error: 'Origin not allowed: ' + origin }, '');
   }
 
   if (req.method === 'GET' && url.pathname === '/probe') {
