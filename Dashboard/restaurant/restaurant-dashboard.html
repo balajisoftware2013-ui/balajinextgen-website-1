@@ -12312,7 +12312,7 @@ function openActiveOrderDetail(idx){
     <div style="display:flex;justify-content:space-between;padding:9px 0;border-top:1px solid #eee;font-size:12.5px;"><span>Status</span><span>${o.st}</span></div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:16px;">
       <button class="btn btn-sm btn-ghost" onclick="closeDetailModal();showPage('tables',document.querySelector('[onclick*=&quot;tables&quot;]'))">🗺️ View on Floor Map</button>
-      <button class="btn btn-sm btn-primary" onclick="closeDetailModal();showPage('billing',document.querySelector('[onclick*=&quot;billing&quot;]'))">🧾 Open Bill</button>
+      <button class="btn btn-sm btn-primary" onclick="closeDetailModal();bnxLoadTableIntoBill('${String(o.tbl||'').replace(/'/g,"\\'")}')">🧾 Open Bill</button>
     </div>
   `;
   document.getElementById('detailModal').style.display = 'flex';
@@ -13011,7 +13011,7 @@ function renderTableGallery(){
 
   const list = tblGalleryList();
   const t = list[window._tgalIndex]; if (!t) return;
-  const kots = (typeof bnxGetKotStore==='function' ? bnxGetKotStore() : []).filter(k=>(k.table||'').toUpperCase()===t.id.toUpperCase());
+  const kots = (typeof bnxGetKotStore==='function' ? bnxGetKotStore() : []).filter(k=>String(k.table||'').toUpperCase().replace(/^T-?/,'')===String(t.id).toUpperCase().replace(/^T-?/,''));
   const openOrders = bnxOrdersForTable(t.id);
   const orderTotal = openOrders.reduce((s,o)=>s+(o.items||[]).reduce((a,i)=>a+Number(i.amount||i.qty*i.rate||0),0),0);
   const acts=t.actions.map(a=>{
@@ -13023,7 +13023,7 @@ function renderTableGallery(){
     // table before switching pages, for every action that opens POS
     // or Billing from here.
     const setTableJs = `document.getElementById('posTable') && (document.getElementById('posTable').textContent='${t.id}'); document.getElementById('cartTable') && (document.getElementById('cartTable').textContent='${t.id}');`;
-    const fn=a.p?`closeTableGallery();${setTableJs}showPage('${a.p}',document.querySelector('[onclick*=${a.p}]'))`:a.fn||'';
+    const fn=(a.p==='billing')?`closeTableGallery();bnxLoadTableIntoBill('${t.id}');`:(a.p?`closeTableGallery();${setTableJs}showPage('${a.p}',document.querySelector('[onclick*=${a.p}]'))`:a.fn||'');
     return `<button class="btn btn-sm btn-primary" style="flex:1;min-width:110px;" onclick="${fn}">${a.l}</button>`;
   }).join('');
   tblGalleryBoxEl.innerHTML = `
@@ -16039,6 +16039,7 @@ function buildKOT(){
         <button class="btn btn-sm btn-ghost" style="font-size:10px;" onclick="kotReprint('${k.kotNo}')">🖨 Print</button>
       </div>
       <div class="kot-foot" style="margin-top:5px;">
+        <button class="btn btn-sm btn-primary" style="font-size:10px;flex:1;" onclick="bnxLoadTableIntoBill('${String(k.table||'').replace(/'/g,"\\'")}')">🧾 Bill</button>
         <button class="btn btn-sm" style="font-size:10px;flex:1;background:var(--gold);color:#fff;" onclick="quickBillFromKOT('${k.kotNo}')">⚡ Quick Bill</button>
       </div>
     </div>`;
@@ -16311,7 +16312,7 @@ function quickBillFromKOT(kotNo){
         let open = [];
         try{ open = JSON.parse(bnxGetOpenKotsRaw()||'[]'); }catch(e){}
         let changed = false;
-        open.forEach(o=>{ if (o.kotNo===kotNo && !o.billed){ o.billed = true; changed = true; } });
+        open.forEach(o=>{ if (o.kotNo===kotNo && (!o.billed || !o.billNo)){ o.billed = true; o.billNo = saved.billno||'saved'; changed = true; } });
         if (changed) bnxSetOpenKotsRaw(JSON.stringify(open));
       }catch(e){}
       if (typeof buildKOT === 'function') buildKOT();
@@ -40701,7 +40702,9 @@ function bnxOpenImportHub(){
       var safeCode=code.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
       var acts=(t.actions||[]).map(function(a){
         var fn='';
-        if(a.p){
+        if(a.p && String(a.p)==='billing'){
+          fn="bnxLoadTableIntoBill('"+safeCode+"');";
+        }else if(a.p){
           fn="document.getElementById('posTable')&&(document.getElementById('posTable').textContent='"+safeCode+"');"+
              "document.getElementById('cartTable')&&(document.getElementById('cartTable').textContent='"+safeCode+"');"+
              "showPage('"+String(a.p).replace(/'/g,"\\'")+"',document.querySelector('[onclick*=\\\"'"+String(a.p).replace(/'/g,"\\'")+"'\\\"]'));"+
@@ -41780,4 +41783,119 @@ setInterval(kotSub,1200);
 #page-pos #discInput{width:64px!important;height:30px!important;font-size:12px!important}
 #page-pos #discScope{height:30px;font-size:12px;font-weight:700;border:1px solid var(--border2);border-radius:6px;background:var(--surface);color:var(--text);padding:0 4px;max-width:78px}
 </style>
+<!-- ═══ TABLE / KOT → BILL LOADER (audit fix) ═══
+     Fixes: READY KOTs were skipped; leftover KOT ref from the previous table blocked loading; previous table's
+     items stayed in the draft; gallery "Bill" button opened an empty bill; KOT page had no direct Bill button;
+     KOTs were permanently tagged "billed" the moment they were merely loaded into an unsaved draft. -->
+<script id="bnx-table-bill-loader">
+(function(){
+'use strict';
+var W=window,D=document;
+function $(id){return D.getElementById(id);}
+function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
+function withTimeout(p,ms){return Promise.race([p,sleep(ms)]);}
+function normTbl(v){return String(v==null?'':v).toUpperCase().replace(/[\s\-_]/g,'').replace(/^T(?=\d)/,'').replace(/^0+(?=\d)/,'');}
+function sameTable(a,b){var x=normTbl(a),y=normTbl(b);return !!x&&x===y;}
+var DEAD=/^(CANCEL|VOID|BILLED|SETTLED|PAID|COMPLETED|CLOSED|REJECT)/i;
+function note(m,t){try{if(typeof W.showNotif==='function')W.showNotif(m,t||'');}catch(e){}}
+function rateOf(it){
+  var v=it.rate!=null&&it.rate!==''?it.rate:(it.RATE!=null?it.RATE:(it.price!=null?it.price:(it.PRICE!=null?it.PRICE:null)));
+  if(v!=null&&isFinite(Number(v)))return Number(v);
+  var q=Number(it.qty||it.QTY||it.QUANTITY||1),a=it.amount!=null?it.amount:it.AMOUNT;
+  return a!=null&&q?Number(a)/q:0;
+}
+function ticketsFor(tbl,includeBilled){
+  var open=[];try{open=JSON.parse(W.bnxGetOpenKotsRaw()||'[]');}catch(e){}
+  var orders=(typeof W.orderRegData!=='undefined'&&Array.isArray(W.orderRegData)?W.orderRegData:[]).filter(function(o){
+    return !DEAD.test(String(o.ORDER_STATUS||o.status||''))&&sameTable(o.TABLE_ID||o.table,tbl);});
+  var withItems={};orders.forEach(function(o){if(Array.isArray(o.items)&&o.items.length){[o.ORDER_NO,o.ORDER_ID].forEach(function(x){if(x)withItems[String(x).trim()]=1;});}});
+  var cutoff=Date.now()-36*3600*1000, flaggedBilled=0;
+  var kots=open.filter(function(k){
+    if(!sameTable(k.table,tbl))return false;
+    if(DEAD.test(String(k.status||'')))return false;               /* READY / SERVED are still unbilled */
+    var t=Date.parse(k.time);if(Number.isFinite(t)&&t<cutoff&&!k.syncPending)return false;
+    if(k.orderNo&&withItems[String(k.orderNo).trim()])return false; /* parent order already carries these items */
+    if(k.billed&&k.billNo)return false;                              /* really billed on a saved invoice */
+    if(k.billed&&!includeBilled){flaggedBilled++;return false;}   /* only loaded into an unsaved draft earlier */
+    return true;});
+  return {kots:kots,orders:orders,flaggedBilled:flaggedBilled};
+}
+function resetDraft(){
+  var rows=$('bmItemRows');if(rows)rows.innerHTML='';
+  ['bm-bf-kot','bm-bf-advresid'].forEach(function(id){var e=$(id);if(e)e.value='';});
+  var d=$('bm-bf-disc');if(d)d.value='0';var s=$('bm-bf-discscope');if(s)s.value='ALL';
+  try{W.__bnxNC=false;}catch(e){}
+}
+var busy=false;
+W.bnxLoadTableIntoBill=async function(tbl,opts){
+  opts=opts||{};tbl=String(tbl==null?'':tbl).trim();
+  if(!tbl){note('No table on this ticket','error');return false;}
+  if(busy)return false;busy=true;
+  try{
+    try{W.showPage('billing',D.querySelector('[onclick*="billing"]'));}catch(e){}
+    var pg=$('page-billing');
+    if(!pg||!pg.classList.contains('active')){return false;}       /* role lock blocked it - showPage already told the user */
+    await sleep(140);
+    resetDraft();
+    var tEl=$('bm-bf-table');if(tEl)tEl.value=tbl;
+    note('⏳ Loading '+tbl+' items…','');
+    try{await withTimeout(Promise.all([
+      typeof W.bnxPullKotsFromServer==='function'?W.bnxPullKotsFromServer().catch(function(){}):0,
+      typeof W.loadOrderRegister==='function'?W.loadOrderRegister().catch(function(){}):0]),7000);}catch(e){}
+    var T=ticketsFor(tbl,false);
+    if(!T.kots.length&&!T.orders.length&&T.flaggedBilled){
+      if(W.confirm(T.flaggedBilled+' ticket(s) of '+tbl+' were loaded into an earlier bill that was never saved.\n\nLoad them again?'))T=ticketsFor(tbl,true);
+    }
+    var raw=[],refs=[],waiter='',cust='',pax='';
+    T.orders.forEach(function(o){
+      refs.push(o.ORDER_NO||o.ORDER_ID);
+      waiter=waiter||o.WAITER||o.STEWARD||o.waiter||'';cust=cust||o.CUSTOMER_NAME||'';pax=pax||o.COVERS||o.PAX||'';
+      (o.items||[]).forEach(function(it){raw.push({name:it.itemName||it.name||it.ITEM_NAME,qty:Number(it.qty||it.QTY||it.QUANTITY||1),rate:rateOf(it)});});
+    });
+    T.kots.forEach(function(k){
+      refs.push(k.kotNo);waiter=waiter||k.waiter||k.steward||'';
+      (k.items||[]).forEach(function(it){raw.push({name:it.name||it.n||it.itemName,qty:Number(it.qty||it.QUANTITY||1),rate:rateOf(it)});});
+    });
+    var merged=typeof W.bmMergeItemsByName_==='function'?W.bmMergeItemsByName_(raw):raw;
+    var n=0;merged.forEach(function(it){if(it&&it.name){W.bmAddOrIncreaseItemRow_(it.name,it.qty,it.rate);n++;}});
+    if(!n&&typeof W.bmAddItemRow==='function')W.bmAddItemRow('',1,0);
+    var kEl=$('bm-bf-kot');if(kEl)kEl.value=refs.filter(function(v,i,a){return v&&a.indexOf(v)===i;}).join(' + ');
+    var on=T.orders[0]&&(T.orders[0].ORDER_NO||T.orders[0].ORDER_ID);
+    if(on){try{W.posOrderNo=on;var oe=$('posOrderNo');if(oe)oe.textContent=on;}catch(e){}}
+    var cn=$('bm-bf-cname');if(cn&&cust&&!/default/i.test(cust))cn.value=cust;
+    var px=$('bm-bf-pax');if(px&&pax&&!px.value)px.value=pax;
+    var wt=$('bm-bf-waiter');
+    if(wt&&waiter){try{if(wt.tagName==='SELECT'){var m=[].slice.call(wt.options).find(function(o){return String(o.value||o.text).trim().toLowerCase()===String(waiter).trim().toLowerCase();});if(m)wt.value=m.value;}else wt.value=waiter;}catch(e){}}
+    try{if(typeof W.bmRecalc==='function')W.bmRecalc();}catch(e){}
+    try{if(typeof W.bmRenderBillPreview==='function')W.bmRenderBillPreview();}catch(e){}
+    note(n?('✅ '+tbl+': '+n+' item(s) from '+refs.length+' ticket(s) loaded into the bill'):('No open KOT/order found for '+tbl+' — add items manually'),n?'success':'error');
+    return n>0;
+  }catch(e){console.error('[TABLE→BILL]',e);note('Could not load '+tbl+' into the bill: '+e.message,'error');return false;}
+  finally{busy=false;}
+};
+/* a KOT is "billed" only once the bill is really saved */
+if(typeof W.bnxRecordBill==='function'&&!W.bnxRecordBill.__tb){
+  var orig=W.bnxRecordBill;
+  var wrapped=function(d){
+    var r=orig.apply(this,arguments);
+    try{var refs=String((d&&(d.kot||d.kotRef))||'').split('+').map(function(x){return x.trim();}).filter(Boolean);
+      if(refs.length){var open=JSON.parse(W.bnxGetOpenKotsRaw()||'[]'),ch=false;
+        open.forEach(function(k){if(refs.indexOf(String(k.kotNo))>-1&&(!k.billed||!k.billNo)){k.billed=true;k.billNo=d.no||'saved';ch=true;}});
+        if(ch)W.bnxSetOpenKotsRaw(JSON.stringify(open));}}catch(e){}
+    return r;};
+  wrapped.__tb=true;W.bnxRecordBill=wrapped;try{bnxRecordBill=wrapped;}catch(e){}
+}
+/* typing/picking a table inside the bill: if the draft is empty, load that table's tickets too */
+if(typeof W.bmHandleTableChange==='function'&&!W.bmHandleTableChange.__tb){
+  var origChange=W.bmHandleTableChange;
+  var ch=async function(){
+    var rows=$('bmItemRows');var has=rows&&[].slice.call(rows.querySelectorAll('[id^="bm-iname-"]')).some(function(e){return String(e.value||'').trim()&&!/^open food$/i.test(e.value.trim());});
+    var kot=$('bm-bf-kot');
+    if(!has&&kot&&kot.value.trim()){kot.value='';}                 /* stale reference from a previous table must not block loading */
+    return origChange.apply(this,arguments);};
+  ch.__tb=true;W.bmHandleTableChange=ch;try{bmHandleTableChange=ch;}catch(e){}
+}
+})();
+</script>
+
 </body></html>
