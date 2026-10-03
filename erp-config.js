@@ -465,7 +465,7 @@ const ERP = {
     try{ localStorage.setItem('erp_target_dashboard', target); }catch(e){}
     const skip = localStorage.getItem('erp_skip_selector') === 'true';
     // STORE_HELPER opens Inventory directly after login; bypass welcome/selector.
-    if (skip || this.getRole() === 'STORE_HELPER') { _safeNavigate(target); return; }
+    if (skip || ['STORE_HELPER','ASSISTANT_CHEF'].includes(this.getRole())) { _safeNavigate(target); return; }
     // Show welcome screen first — guard against redirect loops
     var _cur = window.location.pathname.toLowerCase();
     if (!_cur.includes('welcome')) { _safeNavigate('welcome.html'); }
