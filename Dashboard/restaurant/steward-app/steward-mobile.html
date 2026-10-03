@@ -5970,6 +5970,30 @@ function renderHomeOnline(){
    Login ID the steward actually typed (doLogin stores it onto the
    session below) in case the LOGIN response itself doesn't echo a
    LOGIN_ID field. */
+/* FIX (LOCATION_ID blank in ATTENDANCE_MASTER): the location was read from ONE login field only. If the login
+   reply uses another name (or none), every record saved without a location. Now searches every common field,
+   the saved keys, the live table list and the first location in the user record, and remembers what it finds. */
+function bnxFindLocationId_(u){
+  u=u||{};
+  var v='';
+  try{
+    v=u.LOCATION_ID||u.locationId||u.location_id||u.LOCATION||u.location||u.OUTLET_ID||u.outletId||u.BRANCH_ID||u.branchId||
+      u.DEFAULT_LOCATION_ID||u.defaultLocationId||u.ASSIGNED_LOCATION_ID||u.assignedLocationId||'';
+    if(v&&typeof v==='object') v=v.LOCATION_ID||v.id||v.locationId||'';
+    if(!v){ var arr=u.LOCATIONS||u.locations||u.LOCATION_IDS||u.locationIds; if(Array.isArray(arr)&&arr.length){ var f=arr[0]; v=(f&&typeof f==='object')?(f.LOCATION_ID||f.locationId||f.id||''):f; } }
+    if(!v&&typeof String(u.LOCATION_IDS||'')==='string'&&/,/.test(String(u.LOCATION_IDS||''))) v=String(u.LOCATION_IDS).split(',')[0];
+  }catch(e){}
+  if(!v){ try{ v=localStorage.getItem('ERP_LOCATION')||localStorage.getItem('bnx_location_id')||sessionStorage.getItem('ERP_LOCATION')||''; }catch(e){} }
+  if(!v){ try{ v=window.BNX_LOCATION_ID||window.LOCATION_ID||''; }catch(e){} }
+  if(!v){ try{
+    if(typeof TABLES!=='undefined'&&Array.isArray(TABLES)){
+      for(var k=0;k<TABLES.length;k++){ var t=TABLES[k]||{}; var x=t.locationId||t.LOCATION_ID||t.location_id||t.location||''; if(x){ v=x; break; } }
+    }
+  }catch(e){} }
+  v=String(v||'').trim();
+  if(v){ try{ localStorage.setItem('bnx_location_id',v); }catch(e){} }
+  return v;
+}
 function getCurrentStaffIdentity(){
   try{
     var u = JSON.parse(sessionStorage.getItem('ERP_USER')||localStorage.getItem('ERP_USER')||'{}');
@@ -5990,7 +6014,8 @@ function getCurrentStaffIdentity(){
       // for client id, so a location chosen once (e.g. at login, if this
       // client has more than one LOCATION_MASTER row) sticks across
       // sessions the same way the client id already does.
-      locationId: String(u.LOCATION_ID || u.locationId || u.location_id || localStorage.getItem('ERP_LOCATION') || localStorage.getItem('bnx_location_id') || '').trim(),
+      locationId: bnxFindLocationId_(u),
+      employeeId: String(u.EMPLOYEE_ID || u.employeeId || u.EMP_ID || u.empId || u.STAFF_ID || u.staffId || u.USER_ID || u.userId || '').trim(),
       locationName: String(u.LOCATION_NAME || u.locationName || u.location_name || u.OUTLET_NAME || u.outletName || localStorage.getItem('ERP_LOCATION_NAME') || localStorage.getItem('bnx_location_name') || '').trim()
     };
   }catch(e){
@@ -7698,7 +7723,7 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
     const acc=r?.GPS_ACCURACY??r?.accuracy??r?.GPSAccuracy??'';
     const url=r?.GOOGLE_MAPS_URL||r?.googleMapsUrl||r?.MAPS_URL||(lat!==''&&lng!==''?`https://www.google.com/maps?q=${lat},${lng}`:'');
     if(lat===''||lng==='') return '<span style="color:var(--text3)">📍 Location not captured</span>';
-    const accTxt=Number(acc)>0?` · ±${Math.round(Number(acc))}m`:'';
+    const accTxt=(Number(acc)>0?` · ±${Math.round(Number(acc))}m`:'')+(r?.GPS_CAPTURED_TIME||r?.gpsCapturedTime?` · ${timeText(r.GPS_CAPTURED_TIME||r.gpsCapturedTime)}`:'');
     return `<a href="${String(url||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;')}" target="_blank" rel="noopener" style="color:var(--blue);font-weight:800;text-decoration:none">📍 GPS ${Number(lat).toFixed(6)}, ${Number(lng).toFixed(6)}${accTxt} · Map</a>`;
   }
 
@@ -7727,6 +7752,10 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
   function bnxAttendanceShiftIdForOpen_(open){
     const r=open?.row||{}; return String(r.ATTENDANCE_SHIFT_ID||r.SHIFT_ID||r.attendanceShiftId||r.shiftId||'').trim();
   }
+  /* FIX (GPS timing not saved): the GPS time was only sent as ISO/UTC text ("2026-10-03T11:03:40Z") which Sheets
+     reformats or drops, and a single 15 s high-accuracy request made the whole attendance fail on a weak signal.
+     Now: (1) high-accuracy try, (2) fallback to network/last-known position, (3) the GPS time is also sent as
+     plain "YYYY-MM-DD", "HH:MM:SS" and "YYYY-MM-DD HH:MM:SS" values the sheet keeps as written. */
   function bnxGetAttendancePosition_(){
     return new Promise((resolve,reject)=>{
       if(!window.isSecureContext && location.protocol !== 'file:'){
@@ -7735,21 +7764,34 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
       if(!navigator.geolocation){
         reject(new Error('GPS location is not available on this device/browser.')); return;
       }
-      navigator.geolocation.getCurrentPosition(pos=>{
+      const done=(pos,approx)=>{
         const lat=Number(pos.coords.latitude), lng=Number(pos.coords.longitude);
-        if(!Number.isFinite(lat)||!Number.isFinite(lng)){
-          reject(new Error('GPS returned an invalid location.')); return;
-        }
+        if(!Number.isFinite(lat)||!Number.isFinite(lng)){ reject(new Error('GPS returned an invalid location.')); return; }
         const gpsNow=new Date();
-        const capturedAt=new Date().toISOString();
-        const localCapturedAt=bnxAttendanceLocalTimestamp_(gpsNow);
-        const data={latitude:Number(lat.toFixed(6)),longitude:Number(lng.toFixed(6)),accuracy:Number(pos.coords.accuracy||0),capturedAt,localCapturedAt,mapsUrl:`https://www.google.com/maps?q=${lat},${lng}`};
+        const ld=bnxAttendanceLocalDate_(gpsNow), lt=bnxAttendanceLocalTime_(gpsNow);
+        const data={latitude:Number(lat.toFixed(6)),longitude:Number(lng.toFixed(6)),accuracy:Number(pos.coords.accuracy||0),
+          capturedAt:gpsNow.toISOString(),localCapturedAt:ld+'T'+lt,capturedDate:ld,capturedTime:lt,capturedText:ld+' '+lt,
+          fixAt:pos.timestamp?new Date(pos.timestamp).toISOString():'',approx:!!approx,
+          mapsUrl:'https://www.google.com/maps?q='+lat+','+lng};
         try{ localStorage.setItem('bnx_last_attendance_gps',JSON.stringify(data)); }catch(e){}
         resolve(data);
-      },err=>{
-        const msg=err&&err.code===1?'GPS permission denied. Allow Location for HappyServe and press Mark IN/OUT again.':err&&err.code===2?'GPS position unavailable. On a local file, open the deployed HTTPS HappyServe; then allow Location and try again.':err&&err.code===3?'GPS timed out. Move to an open area and try Mark IN/OUT again.':'GPS location could not be captured. Please allow Location and try again.';
+      };
+      const fail=err=>{
+        /* last saved fix from this phone (max 10 min old) is better than losing the attendance */
+        try{
+          const old=JSON.parse(localStorage.getItem('bnx_last_attendance_gps')||'null');
+          if(old && old.latitude && Date.now()-new Date(old.capturedAt).getTime()<600000){
+            const gpsNow=new Date(), ld=bnxAttendanceLocalDate_(gpsNow), lt=bnxAttendanceLocalTime_(gpsNow);
+            resolve(Object.assign({},old,{capturedAt:gpsNow.toISOString(),localCapturedAt:ld+'T'+lt,capturedDate:ld,capturedTime:lt,capturedText:ld+' '+lt,approx:true,lastKnown:true})); return;
+          }
+        }catch(e){}
+        const msg=err&&err.code===1?'GPS permission denied. Allow Location for HappyServe and press Mark IN/OUT again.':err&&err.code===2?'GPS position unavailable. Turn ON phone Location (GPS), then try again.':err&&err.code===3?'GPS timed out. Move near a window / open area and try again.':'GPS location could not be captured. Please allow Location and try again.';
         reject(new Error(msg));
-      },{enableHighAccuracy:true,timeout:15000,maximumAge:0});
+      };
+      navigator.geolocation.getCurrentPosition(p=>done(p,false),err=>{
+        if(err && err.code===1){ fail(err); return; }        // permission denied: no point retrying
+        navigator.geolocation.getCurrentPosition(p=>done(p,true),fail,{enableHighAccuracy:false,timeout:12000,maximumAge:120000});
+      },{enableHighAccuracy:true,timeout:10000,maximumAge:0});
     });
   }
   async function bnxRefreshAttendanceBeforeAction_(){
@@ -7845,6 +7887,7 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
         attendanceDate:actualBusinessDate,
         ATTENDANCE_DATE:actualBusinessDate,
         userId:i.userId,loginId:i.loginId,fullName:i.fullName,role:i.role,locationId:i.locationId,
+        employeeId:i.employeeId||i.userId||'',EMPLOYEE_ID:i.employeeId||i.userId||'',EMP_ID:i.employeeId||i.userId||'',USER_ID:i.userId||'',USER_CODE:i.loginId||'',FULL_NAME:i.fullName||'',ROLE:i.role||'',CLIENT_ID:i.clientId||'',
         attendanceShiftId:shiftId,ATTENDANCE_SHIFT_ID:shiftId,shiftId:shiftId,
         // Explicit actual local clock values for backend storage.
         time:actualClockTime,
@@ -7865,7 +7908,11 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
         LATITUDE:pos.latitude||'',LONGITUDE:pos.longitude||'',GPS_ACCURACY:pos.accuracy||'',
         GPS_LATITUDE:pos.latitude||'',GPS_LONGITUDE:pos.longitude||'',GPS_LOCATION:`${pos.latitude},${pos.longitude}`,
         gpsCapturedAt:pos.capturedAt||'',gpsCapturedLocalAt:pos.localCapturedAt||'',googleMapsUrl:pos.mapsUrl||'',
-        GPS_CAPTURED_AT:pos.capturedAt||'',GPS_CAPTURED_LOCAL_AT:pos.localCapturedAt||'',GOOGLE_MAPS_URL:pos.mapsUrl||'',MAPS_URL:pos.mapsUrl||'',
+        GPS_CAPTURED_AT:pos.capturedAt||'',GPS_CAPTURED_LOCAL_AT:pos.capturedText||pos.localCapturedAt||'',GOOGLE_MAPS_URL:pos.mapsUrl||'',MAPS_URL:pos.mapsUrl||'',
+        gpsCapturedDate:pos.capturedDate||'',gpsCapturedTime:pos.capturedTime||'',gpsCapturedText:pos.capturedText||'',
+        GPS_CAPTURED_DATE:pos.capturedDate||'',GPS_CAPTURED_TIME:pos.capturedTime||'',GPS_TIME:pos.capturedTime||'',GPS_TIMESTAMP:pos.capturedText||'',GPS_DATETIME:pos.capturedText||'',
+        gpsApproximate:pos.approx?'YES':'NO',GPS_SOURCE:pos.lastKnown?'LAST_KNOWN':(pos.approx?'NETWORK':'GPS'),
+        [kind==='OUT'?'OUT_GPS_TIME':'IN_GPS_TIME']:pos.capturedTime||'',[kind==='OUT'?'OUT_LATITUDE':'IN_LATITUDE']:pos.latitude||'',[kind==='OUT'?'OUT_LONGITUDE':'IN_LONGITUDE']:pos.longitude||'',
         LOCATION_ID:i.locationId||'',CLIENT_LOCATION_ID:i.locationId||'',LOCATION:i.locationId||'',LOCATION_NAME:i.locationName||'',ATTENDANCE_LOCATION:i.locationName||i.locationId||'',
       };
       if(kind==='OUT'){
@@ -7893,7 +7940,7 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
         let idx=sid ? arr.findIndex(x=>String(x?.ATTENDANCE_SHIFT_ID||x?.SHIFT_ID||x?.attendanceShiftId||x?.shiftId||'').trim()===sid) : -1;
         if(idx<0 && kind==='OUT' && openShift?.row){ idx=arr.indexOf(openShift.row); }
         if(kind==='IN'){
-          const rec={CLIENT_ID:i.clientId||'',LOCATION_ID:i.locationId||'',USER_ID:i.userId||'',USER_CODE:i.loginId||'',FULL_NAME:i.fullName||'',ROLE:i.role||'',ATTENDANCE_DATE:d.date||actualBusinessDate,ATTENDANCE_SHIFT_ID:sid,IN_TIME:actualClockTime,OUT_TIME:'',STATUS:'PRESENT',LATITUDE:d.latitude||pos.latitude||'',LONGITUDE:d.longitude||pos.longitude||'',GPS_ACCURACY:d.accuracy||pos.accuracy||'',GPS_CAPTURED_AT:d.gpsCapturedAt||pos.capturedAt||'',GPS_CAPTURED_LOCAL_AT:d.gpsCapturedLocalAt||pos.localCapturedAt||'',GOOGLE_MAPS_URL:d.googleMapsUrl||pos.mapsUrl||''};
+          const rec={CLIENT_ID:i.clientId||'',LOCATION_ID:i.locationId||'',EMPLOYEE_ID:i.employeeId||i.userId||'',USER_ID:i.userId||'',USER_CODE:i.loginId||'',FULL_NAME:i.fullName||'',ROLE:i.role||'',ATTENDANCE_DATE:d.date||actualBusinessDate,ATTENDANCE_SHIFT_ID:sid,IN_TIME:actualClockTime,OUT_TIME:'',STATUS:'PRESENT',LATITUDE:d.latitude||pos.latitude||'',LONGITUDE:d.longitude||pos.longitude||'',GPS_ACCURACY:d.accuracy||pos.accuracy||'',GPS_CAPTURED_AT:d.gpsCapturedAt||pos.capturedAt||'',GPS_CAPTURED_TIME:pos.capturedTime||'',GPS_CAPTURED_LOCAL_AT:pos.capturedText||d.gpsCapturedLocalAt||pos.localCapturedAt||'',GOOGLE_MAPS_URL:d.googleMapsUrl||pos.mapsUrl||''};
           if(idx>=0) arr[idx]=Object.assign({},arr[idx],rec); else arr.unshift(rec);
         }else if(idx>=0){
           arr[idx]=Object.assign({},arr[idx],{OUT_TIME:actualClockTime,WORK_HOURS:d.workHours??workHours,OVERTIME_HOURS:d.overtimeHours??overtimeHours,TOTAL_WORK_HOURS:d.totalHours??'',STATUS:'PRESENT',ATTENDANCE_SHIFT_ID:sid||arr[idx].ATTENDANCE_SHIFT_ID,LATITUDE:(d.latitude ?? arr[idx].LATITUDE ?? ''),LONGITUDE:(d.longitude ?? arr[idx].LONGITUDE ?? ''),GPS_ACCURACY:(d.accuracy ?? arr[idx].GPS_ACCURACY ?? ''),GPS_CAPTURED_AT:(d.gpsCapturedAt ?? arr[idx].GPS_CAPTURED_AT ?? ''),GPS_CAPTURED_LOCAL_AT:(d.gpsCapturedLocalAt ?? arr[idx].GPS_CAPTURED_LOCAL_AT ?? ''),GOOGLE_MAPS_URL:(d.googleMapsUrl ?? arr[idx].GOOGLE_MAPS_URL ?? '')});
