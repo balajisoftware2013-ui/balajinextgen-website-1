@@ -12158,7 +12158,7 @@ async function loadDashboard(){
       // implicit default range — now shares the same rangeParams this
       // function already built for GET_DASHBOARD_SUMMARY above, so Total
       // Outstanding / Today's Due Received track the selected range too.
-      erpApi(Object.assign({action:'GET_DUE_COLLECTION'}, rangeParams), 'V2_CORE').then(dueRes=>{
+      erpApi(Object.assign({action:'GET_DUE_COLLECTION'}, rangeParams, (function(){ try{ if(rangeParams && rangeParams.range!=='today' && !(rangeParams.from&&rangeParams.to) && typeof bnxDashDatesForRange_==='function'){ const r=bnxDashDatesForRange_(rangeParams); return {from:r.from,to:r.to}; } }catch(e){} return {}; })()), 'V2_CORE').then(dueRes=>{
         if (!dueRes || !dueRes.success) return;
         const dc = document.getElementById('d-credit');
         if (dc) dc.textContent = '₹'+Number(dueRes.data.totalOutstanding||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
@@ -37642,8 +37642,17 @@ body:not(.pos-machine) #bmProductGrid,
   function pendAdd(p){ const a = pendGet(); if (!a.some(x => x.requestId === p.requestId)) a.push(p); pendSet(a); }
   function pendDel(id){ pendSet(pendGet().filter(x => x.requestId !== id)); }
   /* total still unconfirmed by the server — dashboard adds this to its server figure so it never shows ₹0 while syncing */
-  W.bnxPendingReceiptsTotal_ = function(){ return pendGet().reduce((t, x) => t + (Number(x.amount) || 0), 0); };
-  W.bnxPendingReceiptsCash_ = function(){ return pendGet().filter(x => /^cash$/i.test(x.paymentMode)).reduce((t, x) => t + (Number(x.amount) || 0), 0); };
+  /* FIX (Due Received wrong for Month/Quarter/Year): every unsynced receipt used to be added to whatever period was on screen,
+     regardless of its own date. Now a pending receipt only counts if its date falls inside the dashboard's selected period. */
+  function inDashRange_(x){
+    try{
+      if(typeof bnxDashRangeParams_!=='function'||typeof bnxDashDatesForRange_!=='function') return true;
+      const r=bnxDashDatesForRange_(bnxDashRangeParams_()); const d=String(x&&x.date||'').slice(0,10)||((typeof getBusinessDate==='function')?getBusinessDate():'');
+      return !(r&&r.from&&r.to&&d) || (d>=r.from && d<=r.to);
+    }catch(e){ return true; }
+  }
+  W.bnxPendingReceiptsTotal_ = function(){ return pendGet().filter(inDashRange_).reduce((t, x) => t + (Number(x.amount) || 0), 0); };
+  W.bnxPendingReceiptsCash_ = function(){ return pendGet().filter(x => /^cash$/i.test(x.paymentMode) && inDashRange_(x)).reduce((t, x) => t + (Number(x.amount) || 0), 0); };
   const numOf = id => Number(String(document.getElementById(id)?.textContent || '').replace(/[^0-9.\-]/g, '')) || 0;
   const setMoney = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = '₹' + v.toLocaleString('en-IN', { minimumFractionDigits:2, maximumFractionDigits:2 }); };
   /* instant local update of the customer row, Due Collection KPI and dashboard tiles (dir=+1 apply, -1 undo) */
@@ -37653,8 +37662,8 @@ body:not(.pos-machine) #bmProductGrid,
       if (cr) { const cu = cr.find(x => String(x.customerId) === String(p.customerId)); if (cu) { cu.outstanding = r2((cu.outstanding || 0) - dir * a); if (cu.openingRemaining > 0) cu.openingRemaining = r2(Math.max(0, cu.openingRemaining - (dir > 0 ? Math.min(a, cu.openingRemaining) : -a))); } }
       try { renderParty(); } catch(e){}
       if (document.getElementById('d-credit')) setMoney('d-credit', numOf('d-credit') - dir * a);
-      if (document.getElementById('d-due-rcvd')) setMoney('d-due-rcvd', numOf('d-due-rcvd') + dir * a);
-      if (/^cash$/i.test(p.paymentMode)) {
+      if (document.getElementById('d-due-rcvd') && inDashRange_(p)) setMoney('d-due-rcvd', numOf('d-due-rcvd') + dir * a);
+      if (/^cash$/i.test(p.paymentMode) && inDashRange_(p)) {
         if (document.getElementById('d-cp-duercvd')) setMoney('d-cp-duercvd', numOf('d-cp-duercvd') + dir * a);
         if (document.getElementById('d-cp-totalinflow')) setMoney('d-cp-totalinflow', numOf('d-cp-totalinflow') + dir * a);
       }
@@ -45483,4 +45492,47 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 #page-bills-list #blTable .bl-actions{display:flex!important;flex-wrap:nowrap!important;gap:4px}
 #page-bills-list #blTable .bl-actions .btn{display:inline-flex!important;visibility:visible!important;opacity:1!important}
 </style>
+
+<style id="bnx-dash-instant-refresh-css">
+/* while a new period loads, old numbers are dimmed + pulsing so nothing stale looks final */
+#page-dashboard.bnx-dash-loading [id^="d-"],#page-dashboard.bnx-dash-loading #bnxHeroTargetStrip{opacity:.4;transition:opacity .08s;animation:bnxDashPulse 1s ease-in-out infinite}
+@keyframes bnxDashPulse{50%{opacity:.22}}
+</style>
+<script id="bnx-dash-instant-refresh-js">
+(function(){
+'use strict';
+var W=window, T=null;
+var LBL={today:'today',yesterday:'yesterday',week:'this week',month:'this month',quarter:'this quarter',year:'this year',custom:'this period'};
+function pg(){return document.getElementById('page-dashboard');}
+function busy(on){var p=pg(); if(!p) return; p.classList.toggle('bnx-dash-loading',!!on); clearTimeout(T); if(on) T=setTimeout(function(){busy(false);},8000);}
+/* 1) Period click -> captions + target strip + pickers change THIS instant; numbers dim until fresh ones land */
+var os=W.setDashRange;
+if(typeof os==='function' && !os.__bnxInstant){
+  W.setDashRange=function(range){
+    var r=os.apply(this,arguments);
+    try{
+      busy(true);
+      var l=LBL[range]; if(l && range!=='today') ['d-revchg','d-ordchg','d-covchg'].forEach(function(id){var e=document.getElementById(id); if(e){e.textContent='Totals for '+l;e.className='stat-chg';}});
+      if(typeof W.bnxRenderPeriodTarget==='function') W.bnxRenderPeriodTarget();
+    }catch(e){}
+    return r;
+  };
+  W.setDashRange.__bnxInstant=1;
+}
+/* 2) Undim as soon as the dashboard load finishes (or fails) */
+var ol=W.loadDashboard;
+if(typeof ol==='function' && !ol.__bnxInstant){
+  W.loadDashboard=function(){
+    var p; try{p=ol.apply(this,arguments);}catch(e){busy(false);throw e;}
+    Promise.resolve(p).then(function(){busy(false);},function(){busy(false);});
+    return p;
+  };
+  W.loadDashboard.__bnxInstant=1;
+}
+/* 3) Pickers (month / quarter / FY / week) also refresh instantly */
+['dashMonthPicker','dashWeekPicker','dashQtrPicker','dashQtrFyPicker','dashFyPicker','dashFrom','dashTo'].forEach(function(id){
+  var e=document.getElementById(id); if(e) e.addEventListener('change',function(){busy(true);if(typeof W.bnxRenderPeriodTarget==='function')W.bnxRenderPeriodTarget();},true);
+});
+})();
+</script>
 </body></html>
