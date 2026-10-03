@@ -5748,7 +5748,7 @@ document.addEventListener('DOMContentLoaded', function(){
     <input type="date" class="fi" id="blTo" style="font-size:11px;padding:5px 8px;" onchange="blFilterBills(document.getElementById('blSearch').value)">
   </div>
   <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center;">
-    <div class="search" style="flex:1;min-width:200px;"><span>🔍</span><input placeholder="Search bill no, table, customer, amount…" id="blSearch" oninput="blFilterBills(this.value)"></div>
+    <div class="search" style="flex:1;min-width:200px;"><span>🔍</span><input placeholder="Search bill no, table, customer, amount…" id="blSearch" oninput="blFilterDeb(this.value)"></div>
     <select class="fsel" id="blStatusFilter" onchange="blFilterBills(document.getElementById('blSearch').value)">
       <option value="All">All Status</option>
       <option value="Paid">Paid</option>
@@ -9602,8 +9602,7 @@ function showPage(id, el){
   // in that behaves like real" rule already applied everywhere else.
   if(id==='bills-list'){
     const bd = (typeof getBusinessDate==='function') ? getBusinessDate() : new Date().toISOString().slice(0,10);
-    blRenderTable();
-    bnxPullBillsFromServer(bd, bd).then(()=>blRenderTable());
+    blRenderTable();   // instant paint from in-memory register; server refresh is started once by the period script
   }
   if(id==='due-collection' || id==='customer-credit'){ bnxLoadDueCollection(); }
   if(id==='aggregator-settlement' && typeof bnxLoadAggregatorSettlement==='function'){ bnxLoadAggregatorSettlement(); }
@@ -13312,7 +13311,16 @@ function renderTableGallery(){
 async function bnxPopulateCaptainSelect(tableId, currentCaptain){
   const sel = document.getElementById('tgalCaptainSel');
   if (!sel) return; // modal was closed/changed before this resolved
-  const staff = await bnxFetchStaffList(['CAPTAIN','STEWARD','WAITER']);
+  const roles=['CAPTAIN','STEWARD','WAITER'];
+  // paint immediately from cache / local employees so the dropdown is usable at once
+  let first = bnxStaffCached_(roles) || (typeof bnxGetEmployees==='function' ? bnxGetEmployees() : []) || [];
+  bnxFillCaptainSel_(sel, first, currentCaptain);
+  const staff = await bnxFetchStaffList(roles);
+  const sel2 = document.getElementById('tgalCaptainSel');
+  if (!sel2 || (sel2.value && sel2.value!==(currentCaptain||''))) return;  // user already picked one
+  if (staff && staff.length) bnxFillCaptainSel_(sel2, staff, currentCaptain);
+}
+function bnxFillCaptainSel_(sel, staff, currentCaptain){
   const optsHtml = staff.map(s=>{
     const val = s.USER_CODE || s.FULL_NAME;
     return `<option value="${val}" data-name="${s.FULL_NAME}">${s.FULL_NAME}${s.ROLE?' ('+s.ROLE+')':''}</option>`;
@@ -19468,15 +19476,31 @@ const BL_DATA=[]; // PRODUCTION: no hardcoded/demo bills
    Reprint / Edit / Cancel — not just View. */
 function bnxBillRegKey(){ return 'bnx_bill_register_' + (CLIENT_ID || 'default'); }
 window.__bnxBillRegMem = window.__bnxBillRegMem || {};
+window.__bnxBillRegParsed = window.__bnxBillRegParsed || {};
+window.addEventListener('storage', function(){ window.__bnxBillRegParsed = {}; });
 function bnxGetBillRegister(){
-  try{ const raw=localStorage.getItem(bnxBillRegKey()); if(raw) return JSON.parse(raw); }catch(e){}
-  return window.__bnxBillRegMem[bnxBillRegKey()] || [];
+  const key=bnxBillRegKey();
+  const hit=window.__bnxBillRegParsed[key];
+  if(hit) return hit;               // SPEED: parse the big JSON once, not on every call
+  let out=null;
+  try{ const raw=localStorage.getItem(key); if(raw) out=JSON.parse(raw); }catch(e){}
+  if(!out) out=window.__bnxBillRegMem[key] || [];
+  window.__bnxBillRegParsed[key]=out;
+  return out;
 }
 /* Quota-safe save: full list always kept in memory for this session; localStorage
    gets progressively trimmed (stale caches evicted, then oldest bills dropped) so
    QuotaExceededError never breaks bill sync. Server remains source of truth. */
 function bnxSaveBillRegister(list){
-  const key=bnxBillRegKey();
+  // SPEED: update memory instantly, write the (large) JSON to localStorage a moment later
+  const k=bnxBillRegKey();
+  window.__bnxBillRegMem[k]=list; window.__bnxBillRegParsed[k]=list;
+  clearTimeout(window.__bnxBillSaveT);
+  window.__bnxBillSaveT=setTimeout(function(){ bnxPersistBillRegister_(k,list); },700);
+  return true;
+}
+window.addEventListener('pagehide',function(){ if(window.__bnxBillSaveT){ clearTimeout(window.__bnxBillSaveT); window.__bnxBillSaveT=0; try{ const k=bnxBillRegKey(); bnxPersistBillRegister_(k,window.__bnxBillRegMem[k]||[]); }catch(e){} } });
+function bnxPersistBillRegister_(key,list){
   window.__bnxBillRegMem[key]=list;
   const tryset=v=>{ try{ localStorage.setItem(key, JSON.stringify(v)); return true; }catch(e){ return false; } };
   if(tryset(list)) return true;
@@ -20373,7 +20397,30 @@ function bnxBillPayLabel_(b){
   }
   return bnxPaymentModeName_(raw);
 }
+function blPayCell_(b,pC){
+  let label=bnxBillPayLabel_(b), key=String(b.pay||'').toUpperCase();
+  if(!label||label==='\u2014'){
+    const pb=b.payBreakdown||{}, nm={CASH:'Cash',UPI:'UPI',CARD:'Card',OTHER:'Other'};
+    const used=['CASH','UPI','CARD','OTHER'].filter(k=>Number(pb[k])>0);
+    if(used.length===1){key=used[0];label=nm[key];}
+    else if(used.length>1){key='';label='Split: '+used.map(k=>nm[k]+' \u20b9'+Number(pb[k]).toFixed(2)).join(' + ');}
+  }
+  if(!label||label==='\u2014'){
+    if(b.status==='Paid') return '<td style="white-space:nowrap;"><span class="pill p-o" title="Bill is Paid but no payment mode was saved on it">Mode missing</span></td>';
+    return '<td style="white-space:nowrap;color:var(--text3);">\u2014</td>';
+  }
+  return '<td style="white-space:nowrap;"><span class="pill '+(pC[key]||'p-gray')+'">'+label+'</span></td>';
+}
+function blShowMore(all){
+  window._blKeepCap=true;
+  window._blRenderCap=all?1e9:(window._blRenderCap||150)+300;
+  blRenderTable(window._blLastData);
+  window._blKeepCap=false;
+}
+const BL_NF_ = new Intl.NumberFormat('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
 function blRenderTable(data){
+  // No-arg calls (after settle/cancel/etc.) used to draw EVERY bill ignoring filters. Route through the filter.
+  if(data===undefined && typeof blFilterBills==='function'){ return blFilterBills(document.getElementById('blSearch')?.value||''); }
   data=data||blGetAllBills();
   const tbody=document.getElementById('blTableBody');if(!tbody)return;
   // SPEED AUDIT FIX ("need 3000 bill daily"): even with "Today" as the new
@@ -20383,15 +20430,16 @@ function blRenderTable(data){
   // bug on a modest POS PC. Cap what actually gets painted, keep the
   // newest bills, and tell the person plainly to narrow the range instead
   // of silently hanging the page.
-  const BL_RENDER_CAP = 500;
+  let BL_RENDER_CAP = 150;
   // Bills List is always newest-first. Historical imports are stored before
   // current bills, so relying on sheet order made a Year view open on April
   // history even when September bills existed.
-  const sortedData = (Array.isArray(data) ? data.slice() : []).sort((a,b)=>{
-    const ad=String(a?.dt||'')+' '+String(a?.tm||'');
-    const bd=String(b?.dt||'')+' '+String(b?.tm||'');
-    return bd.localeCompare(ad);
-  });
+  const _bk=new Map(); const _kf=x=>{ let k=_bk.get(x); if(k===undefined){ k=String(x?.dt||'')+' '+String(x?.tm||''); _bk.set(x,k);} return k; };
+  const sortedData = (Array.isArray(data) ? data.slice() : []).sort((a,b)=>{ const ad=_kf(a), bd=_kf(b); return ad<bd?1:ad>bd?-1:0; });
+  window._blLastData = data;
+  const _blKey = sortedData.length+'|'+(sortedData[0]&&sortedData[0].no);
+  if(window._blCapKey!==_blKey){ window._blCapKey=_blKey; if(!window._blKeepCap) window._blRenderCap=150; }
+  BL_RENDER_CAP = window._blRenderCap || 150;
   const capped = sortedData.length > BL_RENDER_CAP ? sortedData.slice(0, BL_RENDER_CAP) : sortedData;
   // FIX ("next bill prev bill fix"): the bill-detail view had no way to
   // step to the next/previous bill without closing it and re-clicking a
@@ -20400,9 +20448,9 @@ function blRenderTable(data){
   // some separate unfiltered list — so every render of the visible rows
   // is captured here for blViewBill()/blViewAdjacent() to walk.
   window._blLastRendered = capped;
-  const sC={'Paid':'p-g','Pending':'p-o','Draft':'p-b','Complimentary':'p-gray'};
+  const sC={'Paid':'p-g','Pending':'p-o','Draft':'p-b','Complimentary':'p-gray','Cancelled':'p-r','Not Required':'p-gray'};
   const pC={'CASH':'p-g','UPI':'p-b','CARD':'p-gold','ZOMATO':'p-o','SWIGGY':'p-o','DUE':'p-r','COMPLIMENTARY':'p-gray'};
-  tbody.innerHTML=(data.length > BL_RENDER_CAP ? `<tr><td colspan="11" style="text-align:center;padding:12px;font-size:11px;color:var(--text3);background:var(--gold-bg);">⚠️ Showing the most recent ${BL_RENDER_CAP} of ${data.length} bills in this range — narrow the date range or search to see the rest.</td></tr>` : '') + capped.map(b=>{
+  tbody.innerHTML=(data.length > BL_RENDER_CAP ? `<tr class="bl-more-row"><td colspan="11" style="text-align:center;padding:12px;font-size:12px;color:var(--text2);background:var(--gold-bg);">Showing ${capped.length} of ${data.length} bills in this range &nbsp; <button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();blShowMore(false)">Show 300 more</button> <button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();blShowMore(true)">Show all ${data.length}</button></td></tr>` : '') + capped.map(b=>{
     /* DISPLAY-ONLY TOTAL SAFETY: if a legacy BILL_MASTER row contains a
        corrupted large negative round-off (e.g. Sub 3155 + GST 149.86 but
        Total 3147), show the arithmetic total instead of reproducing the
@@ -20420,10 +20468,10 @@ function blRenderTable(data){
       <td style="white-space:nowrap;"><span class="mono">${b.table||'—'}</span></td>
       <td style="white-space:nowrap;"><span style="font-size:12px;font-weight:600;">${b.customer||'—'}</span>${b.mob?` <span style="font-size:10px;color:var(--text3);">${b.mob}</span>`:''}</td>
       <td style="text-align:center;white-space:nowrap;">${b.items}</td>
-      <td class="mono" style="white-space:nowrap;">\u20b9${b.sub.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
-      <td class="mono" style="color:var(--text3);white-space:nowrap;">\u20b9${b.gst.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
-      <td class="mono" style="font-weight:700;color:var(--gold);white-space:nowrap;">\u20b9${displayTotalN.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
-      <td style="white-space:nowrap;"><span class="pill ${pC[String(b.pay||'').toUpperCase()]||'p-gray'}">${bnxBillPayLabel_(b)}</span></td>
+      <td class="mono" style="white-space:nowrap;">\u20b9${BL_NF_.format(Number(b.sub)||0)}</td>
+      <td class="mono" style="color:var(--text3);white-space:nowrap;">\u20b9${BL_NF_.format(Number(b.gst)||0)}</td>
+      <td class="mono" style="font-weight:700;color:var(--gold);white-space:nowrap;">\u20b9${BL_NF_.format(displayTotalN)}</td>
+      ${blPayCell_(b,pC)}
       <td style="white-space:nowrap;"><span class="pill ${sC[b.status]||'p-gray'}">${b.status}</span></td>
       <td class="bl-actions-cell"><div class="bl-actions">
         <button class="btn btn-sm btn-ghost" onclick="blViewBill('${b.no}')">View</button>
@@ -20437,10 +20485,13 @@ function blRenderTable(data){
   const paid=data.filter(b=>b.status==='Paid').length;
   const pending=data.filter(b=>b.status==='Pending').length;
   const rev=data.filter(b=>b.status==='Paid').reduce((a,b)=>a+(Number(b.total)||0),0);
-  const e1=document.getElementById('bl-total-rev');if(e1)e1.textContent='\u20b9'+rev.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const e1=document.getElementById('bl-total-rev');if(e1)e1.textContent='\u20b9'+BL_NF_.format(rev);
   const e2=document.getElementById('bl-paid-count');if(e2)e2.textContent=paid;
   const e3=document.getElementById('bl-pending-count');if(e3)e3.textContent=pending;
   const e4=document.getElementById('bl-total-count');if(e4)e4.textContent=data.length;
+  if(e1&&e1.parentElement){const l=e1.parentElement.querySelector('.stat-lbl');
+    if(l){const r=(window.BNX_GLOBAL_DATE_RANGE||{}).range||'today';
+      l.textContent={today:"Today's Revenue",yesterday:"Yesterday's Revenue",week:'This Week Revenue',month:'This Month Revenue',quarter:'This Quarter Revenue',year:'This Year Revenue',custom:'Revenue (Selected Period)'}[r]||'Revenue';}}
 }
 // SPEED AUDIT FIX ("need 3000 bill daily"): Bills List used to default to
 // "All Time" — at high daily volume that means every single bill your
@@ -20546,6 +20597,7 @@ function blDateInRange(dt){
    view showed every bill ever created, all mixed together. Adds the same
    Today/Week/Month/Year/Custom pattern already used on the Dashboard,
    wired into the actual filter so it really narrows the list. */
+function blFilterDeb(v){ clearTimeout(window._blDebT); window._blDebT=setTimeout(function(){ blFilterBills(v); },180); }
 function blFilterBills(q){
   const status=document.getElementById('blStatusFilter')?.value||'All';
   const pay=document.getElementById('blPayFilter')?.value||'All';
@@ -20553,7 +20605,7 @@ function blFilterBills(q){
   blRenderTable(blGetAllBills().filter(b=>{
     const mQ=!q||(String(b.no||'').toLowerCase().includes(q)||String(b.table||'').toLowerCase().includes(q)||String(b.customer||'').toLowerCase().includes(q)||String(b.total??'').includes(q));
     const mS=status==='All'||b.status===status;
-    const mP=pay==='All'||b.pay.includes(pay);
+    const mP=pay==='All'||String(b.pay||'').includes(pay);
     const mD=blDateInRange(b.dt);
     return mQ&&mS&&mP&&mD;
   }));
@@ -27727,7 +27779,21 @@ function bnxSaveEmployees(list){ localStorage.setItem(bnxEmpKey(), JSON.stringif
    bnxPopulateCaptainSelect() below) reads from the EXACT SAME live
    USER_MASTER source — no separate/duplicated staff list to drift out
    of sync with the Steward dropdown. */
+window.__bnxStaffCache = window.__bnxStaffCache || {};
+function bnxStaffCached_(roles){ const c=window.__bnxStaffCache[(roles||['STEWARD','WAITER','CAPTAIN']).join(',')]; return c?c.staff:null; }
 async function bnxFetchStaffList(roles){
+  const ck=(roles||['STEWARD','WAITER','CAPTAIN']).join(',');
+  const hit=window.__bnxStaffCache[ck];
+  if(hit && hit.staff.length && (Date.now()-hit.t)<300000) return hit.staff;   // fresh for 5 min
+  if(hit && hit.pending) return hit.pending;                                  // share in-flight request
+  const pending=_bnxFetchStaffListNet(roles).then(function(st){
+    if(st && st.length) window.__bnxStaffCache[ck]={t:Date.now(),staff:st}; else if(window.__bnxStaffCache[ck]) delete window.__bnxStaffCache[ck].pending;
+    return st;
+  });
+  window.__bnxStaffCache[ck]=Object.assign({t:0,staff:(hit&&hit.staff)||[]},{pending:pending});
+  return pending;
+}
+async function _bnxFetchStaffListNet(roles){
   let staff = [];
   const wantedRoles = roles || ['STEWARD','WAITER','CAPTAIN'];
   // Use the same V2_CORE/gasApi path as the rest of POS so clientId and
@@ -27735,7 +27801,7 @@ async function bnxFetchStaffList(roles){
   try{
     const res = await Promise.race([
       gasApi('GET_STAFF_LIST', { roles: wantedRoles }, 'V2_CORE'),
-      new Promise(resolve=>setTimeout(()=>resolve({success:false,error:'staff timeout'}),7000))
+      new Promise(resolve=>setTimeout(()=>resolve({success:false,error:'staff timeout'}),4000))
     ]);
     if (res && res.success){
       const d = res.data || {};
@@ -27747,7 +27813,7 @@ async function bnxFetchStaffList(roles){
     try{
       const res = await Promise.race([
         erpApi({action:'GET_STAFF_LIST', roles: wantedRoles}, 'V2_CORE'),
-        new Promise(resolve=>setTimeout(()=>resolve({success:false,error:'staff fallback timeout'}),5000))
+        new Promise(resolve=>setTimeout(()=>resolve({success:false,error:'staff fallback timeout'}),3000))
       ]);
       if (res && res.success){
         const d=res.data||{};
@@ -28549,7 +28615,16 @@ const ORDER_TYPE_LIST = ['DINEIN','TAKEAWAY','DELIVERY'];
 const ORDER_REG_SCHEMA_DEFAULTS = { ORDER_DATE:'—', INVOICE_NO:'', TEMP_ORDER_ID:'—', SCAN_KEY:'', END_TIME:'', MOBILE_NO:'—', NOTES:'', CREATED_BY:'—' };
 
 async function loadOrderRegister(){
-  document.getElementById('orderRegList').innerHTML = '<div style="text-align:center;padding:30px;color:var(--text3);">Loading…</div>';
+  // SPEED: if we already have orders in memory, paint them NOW and refresh quietly in the background.
+  if(Array.isArray(window.orderRegData) && window.orderRegData.length){
+    try{ renderOrderRegFilters(); renderOrderRegList(); }catch(e){}
+  } else {
+    document.getElementById('orderRegList').innerHTML = '<div style="text-align:center;padding:30px;color:var(--text3);">Loading…</div>';
+  }
+  if(window._orLoading) return window._orLoading;
+  return window._orLoading=_loadOrderRegisterNet().finally(function(){ window._orLoading=null; });
+}
+async function _loadOrderRegisterNet(){
   // FIX (same bug class as the dashboard's Active Orders/Hourly Chart):
   // this used to treat "API call succeeded but there are genuinely zero
   // orders right now" the SAME as "the API call failed" — both fell
@@ -28840,7 +28915,11 @@ function ordRegDateInRange(dt){
 
 function renderOrderRegList(){
   const el = document.getElementById('orderRegList');
-  const filtered = orderRegData.filter(o=>ordRegDateInRange(o.ORDER_DATE) && (!orderRegActiveStatus || o.ORDER_STATUS===orderRegActiveStatus));
+  const _okey={}; const _inR=(dt)=>{ const k=String(dt); if(k in _okey) return _okey[k]; return _okey[k]=ordRegDateInRange(dt); };
+  let filtered = orderRegData.filter(o=>_inR(o.ORDER_DATE) && (!orderRegActiveStatus || o.ORDER_STATUS===orderRegActiveStatus));
+  const _orTotal=filtered.length, _orCap=window._orRenderCap||120;
+  const _orMore = _orTotal>_orCap ? '<div style="text-align:center;padding:12px;font-size:12px;color:var(--text2);">Showing '+_orCap+' of '+_orTotal+' orders &nbsp; <button class="btn btn-sm btn-ghost" onclick="window._orRenderCap=(window._orRenderCap||120)+300;renderOrderRegList()">Show 300 more</button> <button class="btn btn-sm btn-ghost" onclick="window._orRenderCap=1e9;renderOrderRegList()">Show all</button></div>' : '';
+  if(_orTotal>_orCap && orderRegViewMode!=='table') filtered = filtered.slice(0,_orCap);
   // P0 FIX (audit #2): unmissable banner whenever ANY row currently on
   // screen is demo fallback data (isDemo:true, set only in
   // loadOrderRegister's catch block above) — not just a one-time
@@ -28850,8 +28929,8 @@ function renderOrderRegList(){
     ? '<div style="background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;border-radius:8px;padding:8px 12px;margin-bottom:10px;font-size:12px;font-weight:700;text-align:center;">⚠️ DEMO DATA — server unreachable, these are NOT real orders</div>'
     : '';
   if (!filtered.length){ el.innerHTML = demoBanner + '<div style="text-align:center;padding:40px;color:var(--text3);">No orders in this range</div>'; return; }
-  if (orderRegViewMode === 'excel'){ el.innerHTML = demoBanner + renderOrderRegExcelTable(filtered); return; }
-  if (orderRegViewMode !== 'table'){ el.innerHTML = demoBanner + filtered.map(orderRegCardHtml).join(''); return; }
+  if (orderRegViewMode === 'excel'){ el.innerHTML = demoBanner + renderOrderRegExcelTable(filtered) + _orMore; return; }
+  if (orderRegViewMode !== 'table'){ el.innerHTML = demoBanner + filtered.map(orderRegCardHtml).join('') + _orMore; return; }
 
   const byTable = {};
   filtered.forEach(o=>{
@@ -29234,6 +29313,9 @@ showPage = function(id, navEl){
   window._navSkipHistory = false;
   window._navCurrentPage = id;
   _navOrigShowPage(id, navEl);
+  // The single-page guard hides inactive pages with inline !important styles and only
+  // cleared them on its next tick (up to 15s) -> opened page looked blank. Clear now.
+  try{ if(typeof window.bnxEnforceSinglePage_==='function') window.bnxEnforceSinglePage_(); else ['display','visibility','pointer-events'].forEach(function(k){ target.style.removeProperty(k); }); }catch(e){}
   bnxUpdateBackBtn();
   // Re-clicking the same page must still return to its top; otherwise the
   // legacy fast-navigation return keeps the previous scroll position.
@@ -35376,7 +35458,7 @@ mo.observe(document.body,{subtree:true,childList:true});
       if(id==='dashboard'){
         syncExistingFilters();
       }else if(id==='bills-list' && typeof bnxPullBillsFromServer==='function'){
-        bnxPullBillsFromServer(current.from,current.to).then(function(){if(typeof blRenderTable==='function')blRenderTable();});
+        /* period script (bnx-bl-single-period-js) paints from memory then refreshes once */
       }else if(id==='online-orders' && typeof loadOnlineOrders==='function')loadOnlineOrders();
       else if(id==='reports'){
         if(typeof resetReportsHub==='function')resetReportsHub();
@@ -42705,12 +42787,14 @@ function key(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'
 /* the list now filters on the global From/To (inclusive) instead of its own hidden row */
 window.blDateInRange=function(dt){
   var r=g(); if(!r.from||!r.to) return true;
+  if(typeof dt==='string' && /^\d{4}-\d{2}-\d{2}/.test(dt)){ var k0=dt.slice(0,10); return k0>=r.from && k0<=r.to; }
   var d=(typeof bnxParseFlexDt==='function')?bnxParseFlexDt(dt):null;
   if(!d) return true;
   var k=key(d); return k>=r.from && k<=r.to;
 };
 function reload(){
   var r=g();
+  var q0=document.getElementById('blSearch'); if(typeof blFilterBills==='function') blFilterBills(q0?q0.value:'');  /* instant paint */
   var p=(typeof bnxPullBillsFromServer==='function')?bnxPullBillsFromServer(r.from,r.to):Promise.resolve();
   Promise.resolve(p).catch(function(){}).then(function(){
     var q=document.getElementById('blSearch'); if(typeof blFilterBills==='function') blFilterBills(q?q.value:'');
@@ -45271,4 +45355,25 @@ function init(){
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);else init();
 })();
 </script>
+
+<style id="bnx-bills-list-fix-20261004">
+/* Bills List: fit table, always-visible Actions, theme header colour */
+#page-bills-list .card:has(#blTable){overflow-x:auto}
+#page-bills-list #blTable{min-width:0!important;width:100%}
+#page-bills-list #blTable thead th{background:#4a2c12!important;color:#fff4e0!important;padding:10px 8px!important}
+#page-bills-list #blTable thead th .sort-arrow{color:#f5c26b;opacity:.8}
+#page-bills-list #blTable tbody td{padding:8px!important}
+#page-bills-list #blTable tbody td:nth-child(6),#page-bills-list #blTable tbody td:nth-child(7),#page-bills-list #blTable tbody td:nth-child(8){min-width:80px}
+#page-bills-list #blTable thead th:nth-child(9),#page-bills-list #blTable tbody td:nth-child(9){min-width:0;max-width:170px;white-space:normal}
+#page-bills-list #blTable .bl-actions-cell{width:1%;min-width:0;padding:6px!important}
+#page-bills-list #blTable .bl-actions{gap:4px}
+#page-bills-list #blTable .bl-actions .btn,#page-bills-list #blTable tbody td:last-child .btn{padding:4px 8px;font-size:11px;margin-right:0!important}
+#page-bills-list #blTable thead th:last-child,#page-bills-list #blTable tbody td:last-child{position:sticky!important;right:0;z-index:2;box-shadow:-6px 0 8px -6px rgba(0,0,0,.2)!important}
+#page-bills-list #blTable tbody td:last-child{background:var(--surface,#fff)!important}
+#page-bills-list #blTable thead th:last-child{background:#4a2c12!important}
+#page-bills-list #blTable tbody tr:hover td:last-child{background:#eff6ff!important}
+#page-bills-list #blTable .bl-more-row td{position:static!important;box-shadow:none!important}
+/* Dashboard amounts (Online Business etc.): DM Mono has no rupee glyph and draws slashed zeros -> mismatched look */
+.agg-row-val{font-family:'DM Sans',system-ui,'Segoe UI',sans-serif!important;font-variant-numeric:lining-nums tabular-nums;font-feature-settings:'zero' 0,'tnum' 1;letter-spacing:0;font-weight:700}
+</style>
 </body></html>
