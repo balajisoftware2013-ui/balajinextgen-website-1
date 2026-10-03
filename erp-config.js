@@ -80,7 +80,7 @@ const ROLE_DASHBOARD = {
      captain-dashboard.html). Both now point at the same real,
      fully-audited restaurant-dashboard.html instead. */
   STEWARD      : 'Dashboard/restaurant/restaurant-dashboard.html',
-  CHEF         : 'Dashboard/restaurant/restaurant-dashboard.html',
+  CHEF         : 'Dashboard/restaurant/chef-dashboard.html',
   /* NEW ("when login then direct open chef dashboard if assistant chef"):
      kept SEPARATE from CHEF above on purpose — CHEF still shares
      restaurant-dashboard.html with the rest of floor/kitchen staff, but
