@@ -12497,6 +12497,12 @@ function openKotDetail(idx){
    the same gasApi('fetchSheet', {tab:...}) read path already proven
    for the Bar Module's BAR_B12_DAYWISE_SALES_ML sheet. */
 let tableData=[];
+/* ROOT FIX: `let tableData` lives in the global LEXICAL scope, so it is NOT
+   window.tableData. Older code (04_TABLE_MASTER reader, status changes) wrote
+   the lexical one; newer layers (Table Management UI, floor plan, KPIs) read
+   window.tableData — after a fallback sync the UI saw 0 tables. One storage,
+   two names: */
+try{Object.defineProperty(window,'tableData',{configurable:true,enumerable:true,get:function(){return tableData;},set:function(v){tableData=Array.isArray(v)?v:[];}});}catch(e){}
 // LIVE-ONLY: tables are loaded from TABLE_MASTER + TABLE_LIVE_STATE.
 // No hardcoded/legacy sample tables are used in production.
 
@@ -41525,12 +41531,53 @@ function bnxOpenImportHub(){
   /* Correct live floor sync. The previous GET_TABLE_FLOOR mapper only knew
      OCCUPIED/RESERVED/CLEANING; RUNNING/BILLED could therefore become
      AVAILABLE before the filter engine even saw the row. */
-  W.bnxSyncTableMasterFromBackend=async function(silent){
-    if(typeof W.gasApi!=='function' || !W.CLIENT_ID) return false;
+  /* ROOT FIX ("Table Management shows 0 tables"): this override replaced the
+     whole sync chain. When GET_TABLE_FLOOR failed or answered without a
+     tables[] array it simply returned false — the older 04_TABLE_MASTER
+     reader (RD_FETCH_SHEET) and the live-layout/name hydration wrapped
+     around it were never reached, nothing retried, and the page said "No
+     tables match this filter". Now: previous chain is the fallback, the
+     outcome is recorded in W.__bnxTblSync for the UI, and failures retry
+     with backoff while the page is open. */
+  const prevSync=W.bnxSyncTableMasterFromBackend;
+  const SYNC=W.__bnxTblSync=W.__bnxTblSync||{state:'loading',error:'',fails:0,at:0};
+  let inflight=null, retryT=0;
+  function redraw(){ try{ if(typeof W.bnxApplyTableFilters_==='function') W.bnxApplyTableFilters_(); else if(typeof W.buildRichTbls==='function') W.buildRichTbls(); }catch(e){} }
+  function scheduleRetry(){
+    clearTimeout(retryT);
+    const wait=Math.min(60000,10000*Math.pow(2,Math.max(0,SYNC.fails-1)));
+    SYNC.next=Date.now()+wait;
+    retryT=setTimeout(function(){ if(!document.hidden) W.bnxSyncTableMasterFromBackend(true); else scheduleRetry(); },wait);
+  }
+  W.bnxTmRetrySync=function(){ SYNC.state='loading'; SYNC.fails=0; redraw(); return W.bnxSyncTableMasterFromBackend(false); };
+  function errText(r,e){ if(e) return String(e&&e.message||e); if(!r) return 'No response from server'; if(r.success===false) return String(r.error||r.message||'Server returned an error'); return 'Response had no tables list'; }
+  async function settle(ok,why,silent,emptyAnswer){
+    if(ok){ SYNC.state='ok'; SYNC.error=''; SYNC.fails=0; SYNC.at=Date.now(); clearTimeout(retryT); return true; }
+    /* primary failed — try the older chain (04_TABLE_MASTER via RD_FETCH_SHEET + layout hydration) */
+    let fb=false;
+    if(typeof prevSync==='function'){ try{ fb=!!(await prevSync.call(W,true)); }catch(e){ fb=false; } }
+    const have=Array.isArray(W.tableData)&&W.tableData.length>0;
+    if(fb&&have){ SYNC.state='ok'; SYNC.error=''; SYNC.fails=0; SYNC.at=Date.now(); clearTimeout(retryT); redraw(); return true; }
+    if(emptyAnswer&&!have){ W.tableData=[]; try{tableData=[];}catch(e){} SYNC.state='ok'; SYNC.error=''; SYNC.fails=0; SYNC.at=Date.now(); clearTimeout(retryT); redraw(); return true; } /* server answered: outlet genuinely has no tables */
+    SYNC.fails++; SYNC.error=why; SYNC.state=have?'ok':'error';
+    console.warn('[TABLE MANAGEMENT] table sync failed:',why);
+    if(!silent&&typeof W.showNotif==='function') W.showNotif('⚠️ Tables could not be refreshed: '+why,'error');
+    scheduleRetry(); redraw();
+    return false;
+  }
+  W.bnxSyncTableMasterFromBackend=function(silent){
+    if(inflight) return inflight;               /* collapse overlapping callers (load, POS, picker, timers) */
+    inflight=(async function(){ try{ return await syncOnce(silent); } finally{ inflight=null; } })();
+    return inflight;
+  };
+  async function syncOnce(silent){
+    if(typeof W.gasApi!=='function' || !W.CLIENT_ID){ SYNC.state='error'; SYNC.error='No client session'; redraw(); return false; }
+    let r=null, got=false;
+    try{ r=await W.gasApi('GET_TABLE_FLOOR',{},'V2_CORE'); }catch(e){ return settle(false,errText(null,e),silent); }
     try{
-      const r=await W.gasApi('GET_TABLE_FLOOR',{},'V2_CORE');
       const src=r&&r.success&&r.data&&Array.isArray(r.data.tables)?r.data.tables:null;
-      if(!src) return false;
+      if(!src) return settle(false,errText(r),silent);
+      if(!src.length) return settle(false,'GET_TABLE_FLOOR returned 0 tables',silent,true);
       const rows=src.map(t=>{
         const rawStatus=t.status||t.STATUS||t.tableStatus||t.TABLE_STATUS||'';
         const s=mapLiveStatus(rawStatus,t);
@@ -41564,17 +41611,18 @@ function bnxOpenImportHub(){
       }).filter(t=>t.n);
       W.tableData=rows;
       try{tableData=rows;}catch(e){}
+      got=true;
       if(typeof W.bnxTableMasterLastSync!=='undefined') W.bnxTableMasterLastSync=Date.now();
       if(typeof W.buildFloor==='function') W.buildFloor('floorMap');
       W.bnxRefreshLiveTableFilters();
       W.bnxApplyTableFilters_();
       if(!silent && typeof W.showNotif==='function') W.showNotif('✅ '+rows.length+' tables synced live','success');
-      return true;
+      return settle(true,'',silent);
     }catch(e){
-      console.warn('[TABLE MANAGEMENT] live floor sync failed:',e);
-      return false;
+      if(got){ console.warn('[TABLE MANAGEMENT] tables loaded, render step failed:',e); return settle(true,'',silent); }
+      return settle(false,errText(null,e),silent);
     }
-  };
+  }
 
   /* Make the existing rich-card builder expose SECTION so filters and search
      do not depend on the display label alone. */
@@ -42872,21 +42920,22 @@ W.addEventListener('load',function(){setTimeout(W.bnxRefreshTargetAchievement,40
 #page-tables>.section-h p{margin:2px 0 0;font-size:12px;color:var(--tm-mute)}
 #page-tables>.section-h>div:last-child{display:none!important}
 /* KPI row */
-#page-tables .kpi-row-6col{display:grid!important;grid-template-columns:repeat(6,minmax(0,1fr))!important;gap:10px!important;margin-bottom:12px!important}
+#page-tables .kpi-row-6col{display:grid!important;grid-template-columns:repeat(6,minmax(0,1fr))!important;gap:10px!important;margin-bottom:10px!important}
+.tm-kpi>span:last-child{min-width:0}
 #page-tables .kpi-row-6col>.stat{display:none!important}
-.tm-kpi{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:16px;border:1px solid transparent;cursor:pointer;text-align:left;font-family:inherit;min-width:0;transition:transform .12s,box-shadow .12s;background:#fff}
+.tm-kpi{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:12px;border:1px solid transparent;cursor:pointer;text-align:left;font-family:inherit;min-width:0;transition:transform .12s,box-shadow .12s;background:#fff}
 .tm-kpi:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(20,30,50,.09)}
 .tm-kpi.on{box-shadow:0 0 0 2px var(--c) inset}
-.tm-kpi .ic{flex:0 0 46px;height:46px;border-radius:13px;display:flex;align-items:center;justify-content:center;background:var(--c);color:#fff}
-.tm-kpi .ic svg{width:26px;height:26px}
-.tm-kpi .n{font-size:clamp(22px,1.9vw,29px);font-weight:900;line-height:1;color:var(--c);font-family:'DM Sans',system-ui,sans-serif;letter-spacing:-.5px}
-.tm-kpi .l{font-size:12px;color:var(--tm-ink);margin-top:3px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.tm-kpi .p{font-size:11px;color:var(--c);font-weight:800;margin-top:1px}
+.tm-kpi .ic{flex:0 0 34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;background:var(--c);color:#fff}
+.tm-kpi .ic svg{width:19px;height:19px}
+.tm-kpi .n{font-size:clamp(18px,1.4vw,21px);font-weight:900;line-height:1;color:var(--c);font-family:'DM Sans',system-ui,sans-serif;letter-spacing:-.5px}
+.tm-kpi .l{font-size:12.5px;color:var(--tm-ink);margin-top:3px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tm-kpi .p{font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--c);font-weight:800;margin-top:1px}
 .tm-kpi.g{--c:#12a150;background:#eaf9f0;border-color:#cfeedd}.tm-kpi.a{--c:#d98a0b;background:#fff6e3;border-color:#f5e3b8}.tm-kpi.r{--c:#d93a3a;background:#fdeeee;border-color:#f6d3d3}
 .tm-kpi.b{--c:#2563d6;background:#eaf1ff;border-color:#d1def8}.tm-kpi.p{--c:#6d3fc0;background:#f2ecfd;border-color:#e0d4f6}.tm-kpi.c{--c:#0b8fb3;background:#e6f6fb;border-color:#c8e8f2}
 /* Filter bar */
-#page-tables .fbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#fff;border:1px solid var(--tm-line);border-radius:16px;padding:10px 12px;margin-bottom:12px;box-shadow:none}
-#page-tables .fbar .search{flex:0 1 300px;min-width:200px;display:flex;align-items:center;gap:8px;background:#f4f6f9;border:1px solid var(--tm-line);border-radius:11px;padding:8px 11px}
+#page-tables .fbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#fff;border:1px solid var(--tm-line);border-radius:14px;padding:8px 10px;margin-bottom:10px;box-shadow:none}
+#page-tables .fbar .search{flex:0 1 260px;min-width:180px;display:flex;align-items:center;gap:8px;background:#f4f6f9;border:1px solid var(--tm-line);border-radius:11px;padding:8px 11px}
 #page-tables .fbar .search input{border:0;background:transparent;outline:0;flex:1;min-width:0;font-size:13px;font-family:inherit}
 #page-tables #tableStatusFilters{display:none!important}
 #page-tables #tableZoneFilters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;flex:1 1 auto;min-width:0}
@@ -42905,27 +42954,28 @@ W.addEventListener('load',function(){setTimeout(W.bnxRefreshTargetAchievement,40
 /* Zone sections — PRO v2: one authoritative card system.
    Cards size from the CONTAINER (auto-fill), not fixed 6 columns keyed to
    the viewport; the S/M/L control in the toolbar sets --tm-min/--tm-k. */
-#page-tables{--tm-min:212px;--tm-gap:14px;--tm-k:1}
-#page-tables[data-tm-size="s"]{--tm-min:168px;--tm-gap:10px;--tm-k:.9}
-#page-tables[data-tm-size="l"]{--tm-min:262px;--tm-gap:16px;--tm-k:1.12}
+/* compact by default: M fits ~7-8 tables per row on a laptop, S ~9-10 */
+#page-tables{--tm-min:164px;--tm-gap:10px;--tm-k:.88}
+#page-tables[data-tm-size="s"]{--tm-min:132px;--tm-gap:8px;--tm-k:.78}
+#page-tables[data-tm-size="l"]{--tm-min:220px;--tm-gap:14px;--tm-k:1}
 #page-tables #richTblGrid{display:block!important}
-.tm-zone{background:#fff;border:1px solid var(--tm-line);border-radius:14px;margin-bottom:14px;overflow:visible}
-.tm-zh{display:flex;align-items:center;gap:12px;padding:14px 18px;flex-wrap:wrap;border-bottom:1px solid var(--tm-line)}
+.tm-zone{background:#fff;border:1px solid var(--tm-line);border-radius:12px;margin-bottom:10px;overflow:visible}
+.tm-zh{display:flex;align-items:center;gap:10px;padding:8px 12px;flex-wrap:wrap;border-bottom:1px solid var(--tm-line)}
 .tm-zone.collapsed .tm-zh{border-bottom-color:transparent}
-.tm-zh .zi{width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;background:var(--z,#e0457b)}.tm-zh .zi svg{width:16px;height:16px}
-.tm-zh .zn{font-size:17px;font-weight:800;letter-spacing:.1px;color:var(--tm-ink)}
-.tm-zh .zs{font-size:13px;color:var(--tm-mute)}
+.tm-zh .zi{width:24px;height:24px;border-radius:7px;display:flex;align-items:center;justify-content:center;color:#fff;background:var(--z,#e0457b)}.tm-zh .zi svg{width:16px;height:16px}
+.tm-zh .zn{font-size:15px;font-weight:800;letter-spacing:.1px;color:var(--tm-ink)}
+.tm-zh .zs{font-size:12px;color:var(--tm-mute)}
 .tm-zh .zc{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.tm-pill{display:inline-flex;gap:10px;align-items:center;padding:5px 12px;border-radius:999px;font-size:12.5px;font-weight:600;border:1px solid transparent}.tm-pill b{font-size:13.5px;font-weight:800;font-variant-numeric:tabular-nums}
+.tm-pill{display:inline-flex;gap:8px;align-items:center;padding:3px 10px;border-radius:999px;font-size:11.5px;font-weight:600;border:1px solid transparent}.tm-pill b{font-size:12px;font-weight:800;font-variant-numeric:tabular-nums}
 .tm-pill.g{background:#eaf9f0;color:#0d8a42;border-color:#cfeedd}.tm-pill.r{background:#fdeeee;color:#c62d2d;border-color:#f6d3d3}.tm-pill.b{background:#eaf1ff;color:#1f55bd;border-color:#d1def8}
-.tm-chev{width:36px;height:32px;border:1px solid var(--tm-line);background:#fff;border-radius:9px;cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--tm-ink)}
+.tm-chev{width:30px;height:26px;border:1px solid var(--tm-line);background:#fff;border-radius:9px;cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--tm-ink)}
 .tm-chev svg{width:16px;height:16px;transition:transform .15s}.tm-zone.collapsed .tm-chev svg{transform:rotate(180deg)}
 .tm-zone.collapsed .tm-cards{display:none}
-.tm-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--tm-min),1fr));gap:var(--tm-gap);padding:16px 18px 18px}
+.tm-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--tm-min),1fr));gap:var(--tm-gap);padding:10px 12px 12px}
 /* Table card */
-.tm-card{--s:#12a150;--sd:#0f8a45;--sb:#e8f8ef;position:relative;display:grid;grid-template-rows:auto 1fr auto auto;gap:calc(10px*var(--tm-k));min-width:0;
-  padding:calc(12px*var(--tm-k)) calc(12px*var(--tm-k)) calc(12px*var(--tm-k)) calc(16px*var(--tm-k));
-  background:#fff;border:1px solid var(--tm-line);border-radius:12px;cursor:pointer;transition:border-color .12s,box-shadow .12s}
+.tm-card{--s:#12a150;--sd:#0f8a45;--sb:#e8f8ef;position:relative;display:grid;grid-template-rows:auto 1fr auto auto;gap:calc(7px*var(--tm-k));min-width:0;
+  padding:calc(10px*var(--tm-k)) calc(10px*var(--tm-k)) calc(10px*var(--tm-k)) calc(14px*var(--tm-k));
+  background:#fff;border:1px solid var(--tm-line);border-radius:10px;cursor:pointer;transition:border-color .12s,box-shadow .12s}
 .tm-card::before{content:"";position:absolute;left:0;top:12px;bottom:12px;width:4px;border-radius:0 4px 4px 0;background:var(--s)}
 .tm-card:hover{border-color:var(--s);box-shadow:0 4px 14px rgba(20,30,50,.08);z-index:2}
 .tm-card:focus-visible{outline:2px solid var(--sd);outline-offset:2px}
@@ -42947,10 +42997,10 @@ W.addEventListener('load',function(){setTimeout(W.bnxRefreshTargetAchievement,40
 .tm-dots{flex:0 0 auto;width:28px;height:28px;margin:-4px -6px -4px 0;border:0;background:transparent;border-radius:8px;cursor:pointer;color:#5b6477;display:flex;align-items:center;justify-content:center}
 .tm-dots:hover{background:rgba(20,30,50,.07);color:var(--tm-ink)}.tm-dots svg{width:18px;height:18px}
 /* seating plan: the table drawn to its real capacity */
-.tm-plan{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:calc(4px*var(--tm-k));min-height:calc(56px*var(--tm-k))}
+.tm-plan{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:calc(3px*var(--tm-k));min-height:calc(46px*var(--tm-k))}
 .tm-seats{display:flex;justify-content:center;gap:calc(6px*var(--tm-k));height:calc(6px*var(--tm-k))}
-.tm-seats span{width:calc(14px*var(--tm-k));height:100%;border-radius:3px;background:var(--s);opacity:.35}
-.tm-tbl{display:flex;align-items:center;justify-content:center;height:calc(28px*var(--tm-k));width:calc(var(--n,2)*20px*var(--tm-k) + 18px);min-width:calc(46px*var(--tm-k));
+.tm-seats span{width:calc(12px*var(--tm-k));height:100%;border-radius:3px;background:var(--s);opacity:.35}
+.tm-tbl{display:flex;align-items:center;justify-content:center;height:calc(24px*var(--tm-k));width:calc(var(--n,2)*17px*var(--tm-k) + 14px);min-width:calc(46px*var(--tm-k));
   border-radius:7px;background:var(--sb);border:1.5px solid var(--s);color:var(--sd);font-size:calc(12px*var(--tm-k));font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
 .tm-info{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;min-height:calc(18px*var(--tm-k));font-size:calc(12.5px*var(--tm-k));color:var(--tm-mute)}
 .tm-info>span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -42960,7 +43010,7 @@ W.addEventListener('load',function(){setTimeout(W.bnxRefreshTargetAchievement,40
 .tm-amt{font-weight:800;color:var(--tm-ink);font-variant-numeric:tabular-nums}
 .tm-btns{display:grid;grid-template-columns:1fr auto;gap:6px}
 .tm-btns.one{grid-template-columns:1fr}
-.tm-btns button{min-width:0;padding:calc(8px*var(--tm-k)) 12px;border-radius:8px;font-size:calc(12.5px*var(--tm-k));font-weight:700;cursor:pointer;font-family:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border:1px solid var(--tm-line);background:#fff;color:var(--tm-ink)}
+.tm-btns button{min-width:0;padding:calc(7px*var(--tm-k)) 10px;border-radius:8px;font-size:calc(12.5px*var(--tm-k));font-weight:700;cursor:pointer;font-family:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border:1px solid var(--tm-line);background:#fff;color:var(--tm-ink)}
 .tm-btns .pri{background:var(--sd);border-color:var(--sd);color:#fff}
 .tm-btns .pri:hover{filter:brightness(.93)}
 .tm-btns .sec:hover{background:#f4f6f9}
@@ -42969,10 +43019,21 @@ W.addEventListener('load',function(){setTimeout(W.bnxRefreshTargetAchievement,40
 .tm-cmenu{position:absolute;top:40px;right:8px;z-index:55;min-width:190px;background:#fff;border:1px solid var(--tm-line);border-radius:11px;box-shadow:0 14px 30px rgba(20,30,50,.2);padding:5px;display:none}.tm-cmenu.open{display:block}.tm-cmenu.up{top:auto;bottom:40px}
 .tm-cmenu button{display:block;width:100%;text-align:left;border:0;background:transparent;padding:9px 10px;border-radius:7px;font-size:13px;font-weight:600;cursor:pointer;color:var(--tm-ink);font-family:inherit}.tm-cmenu button:hover{background:#f4f6f9}.tm-cmenu .danger{color:#c62828}
 .tm-empty{text-align:center;padding:36px;color:var(--tm-mute);font-size:13px;background:#fff;border:1px dashed var(--tm-line);border-radius:14px}
+.tm-state{display:flex;flex-direction:column;align-items:center;gap:8px;text-align:center;padding:40px 20px;background:#fff;border:1px solid var(--tm-line);border-radius:14px;color:var(--tm-mute);font-size:13.5px}
+.tm-state h4{margin:0;font-size:16px;font-weight:800;color:var(--tm-ink)}
+.tm-state p{margin:0;max-width:540px;line-height:1.5}
+.tm-state code{font-size:12px;background:#f4f6f9;border:1px solid var(--tm-line);border-radius:6px;padding:2px 6px;color:#9b2c2c;word-break:break-word}
+.tm-state .ico{width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;background:#f4f6f9;color:var(--tm-mute)}.tm-state .ico svg{width:24px;height:24px}
+.tm-state.err .ico{background:#fdeeee;color:#c02a2a}
+.tm-state .row{display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;justify-content:center}
+.tm-state button{height:36px;padding:0 16px;border-radius:9px;border:1px solid var(--tm-line);background:#fff;color:var(--tm-ink);font-weight:700;font-size:13px;font-family:inherit;cursor:pointer}
+.tm-state button.pri{background:#b8680a;border-color:#b8680a;color:#fff}
+.tm-spin{width:22px;height:22px;border-radius:50%;border:3px solid #e6e9ef;border-top-color:#b8680a;animation:tmSpin .8s linear infinite}
+@keyframes tmSpin{to{transform:rotate(360deg)}}
 /* card size control */
 .tm-size button{min-width:34px;justify-content:center;padding:7px 10px}
 .tm-btns .sh{display:none}
-#page-tables[data-tm-size="s"] .tm-btns .lf{display:none}#page-tables[data-tm-size="s"] .tm-btns .sh{display:inline}
+#page-tables:not([data-tm-size="l"]) .tm-btns .lf{display:none}#page-tables:not([data-tm-size="l"]) .tm-btns .sh{display:inline}
 /* list density */
 #page-tables.tm-list .tm-cards{grid-template-columns:1fr;gap:6px;padding:10px 14px 14px}
 #page-tables.tm-list .tm-card{grid-template-rows:none;grid-template-columns:minmax(150px,1.3fr) 110px minmax(180px,2fr) minmax(230px,260px);align-items:center;gap:14px;padding:8px 12px 8px 16px}
@@ -43087,9 +43148,9 @@ W.addEventListener('load',function(){setTimeout(W.bnxRefreshTargetAchievement,40
 .fp-empty{padding:28px 16px;text-align:center;font-size:13px;color:var(--tm-mute)}
 @media(max-width:700px){.fp-card{grid-template-columns:96px minmax(0,1fr)}.fp-hero{height:92px}.fp-head .fp-chips{margin-left:0;width:100%}.fp-tools{grid-template-columns:repeat(2,1fr)}}
 /* legend bar */
-#tmFootBar{position:sticky;bottom:0;z-index:20;display:flex;align-items:center;gap:18px;flex-wrap:wrap;background:#fff;border-top:1px solid var(--tm-line);padding:9px 14px;margin:12px -4px -4px;font-size:12px;color:var(--tm-ink);box-shadow:0 -4px 14px rgba(20,30,50,.05)}
-#tmFootBar .li{display:inline-flex;align-items:center;gap:7px}#tmFootBar .sw{width:20px;height:20px;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;color:#fff}.tm-live{display:inline-flex;align-items:center;gap:6px;font-weight:700}.tm-live i{width:9px;height:9px;border-radius:50%;background:#12a150;box-shadow:0 0 0 3px #12a15033}
-#tmFootBar .r{margin-left:auto;display:flex;gap:14px;align-items:center;color:var(--tm-mute);padding-right:96px}#tmFootBar .r b{color:var(--tm-ink)}
+#tmFootBar{position:sticky;bottom:0;z-index:20;display:flex;align-items:center;gap:8px 16px;flex-wrap:wrap;background:#fff;border-top:1px solid var(--tm-line);padding:8px 14px;margin:12px -4px -4px;font-size:12px;color:var(--tm-ink);box-shadow:0 -4px 14px rgba(20,30,50,.05)}
+#tmFootBar .li{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}#tmFootBar .sw{width:18px;height:18px;border-radius:5px;display:inline-flex;align-items:center;justify-content:center;color:#fff}.tm-live{display:inline-flex;align-items:center;gap:6px;font-weight:700}.tm-live i{width:9px;height:9px;border-radius:50%;background:#12a150;box-shadow:0 0 0 3px #12a15033}
+#tmFootBar .r{margin-left:auto;display:flex;gap:14px;align-items:center;color:var(--tm-mute);padding-right:64px;white-space:nowrap}#tmFootBar .r b{color:var(--tm-ink)}
 @media(max-width:1280px){#page-tables .kpi-row-6col{grid-template-columns:repeat(3,minmax(0,1fr))!important}}
 @media(max-width:980px){.tm-tools{margin-left:0}#page-tables.tm-list .tm-card{grid-template-columns:1fr auto;grid-template-areas:none}#page-tables.tm-list .tm-plan{display:none}#page-tables.tm-list .tm-btns{grid-column:1/-1}}
 @media(max-width:700px){#page-tables{--tm-min:150px;--tm-gap:8px}#page-tables[data-tm-size="l"]{--tm-min:100%}.tm-cards{padding:12px 10px 12px}#page-tables .kpi-row-6col{grid-template-columns:repeat(2,minmax(0,1fr))!important}.tm-zh{padding:12px 12px}.tm-zh .zc{margin-left:0;width:100%}#tmFootBar .r{margin-left:0}#tmFootBar{position:static;font-size:12px!important;gap:10px 14px!important}#tmFootBar .r{padding-right:0}}
@@ -43141,7 +43202,7 @@ if(!W.__bnxTmTick){W.__bnxTmTick=setInterval(function(){
   var pg=$('page-tables'); if(!pg||!pg.classList.contains('active')) return;
   document.querySelectorAll('#page-tables [data-tm-start]').forEach(function(e){var d=Date.now()-Number(e.getAttribute('data-tm-start'));e.textContent=fmtClock(d);var m=d/60000;e.classList.toggle('warn',m>=60&&m<90);e.classList.toggle('late',m>=90);});
   document.querySelectorAll('#page-tables [data-tm-min]').forEach(function(e){e.textContent=fmtMin(Date.now()-Number(e.getAttribute('data-tm-min')));});
-  var lu=$('tmLastUpd'); if(lu&&W.bnxTableMasterLastSync){lu.textContent=new Date(W.bnxTableMasterLastSync).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});}
+  var lu=$('tmLastUpd'), at=(W.__bnxTblSync&&W.__bnxTblSync.at)||0; if(!at){try{at=bnxTableMasterLastSync||0;}catch(e){}} if(lu&&at){lu.textContent=new Date(at).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});}
 },1000);}
 
 /* ---- derived state for one card ---- */
@@ -43230,9 +43291,20 @@ function cardHtml(t){
     '<div class="tm-info">'+left+right+'</div>'+
     '<div class="tm-btns'+(one?' one':'')+'">'+btns+'</div>'+menu+'</div>';
 }
+/* What to show when there are no cards. "No tables match this filter" is
+   only true when tables exist; with zero tables loaded it hid the real
+   reason (server not answering / nothing configured yet). */
+function stateHtml(){
+  var all=Array.isArray(W.tableData)?W.tableData:[], st=W.__bnxTblSync||{};
+  var ic=function(svg){return '<span class="ico">'+svg+'</span>';};
+  if(all.length) return '<div class="tm-state">'+ic(IC.search)+'<h4>No tables match this filter</h4><p>Try another zone or status, or clear the search.</p><div class="row"><button type="button" class="pri" onclick="if(typeof bnxClearTableFilters_===\'function\')bnxClearTableFilters_()">Clear filters</button></div></div>';
+  if(st.state==='error') return '<div class="tm-state err">'+ic(IC.ban)+'<h4>Tables could not be loaded</h4><p>The server did not return the table list for this outlet'+(st.error?': <code>'+esc(st.error)+'</code>':'.')+'</p><p>Retrying automatically. If it keeps failing, check the Core service for GET_TABLE_FLOOR and the 04_TABLE_MASTER sheet.</p><div class="row"><button type="button" class="pri" onclick="bnxTmRetrySync()">Retry now</button></div></div>';
+  if(st.state==='ok') return '<div class="tm-state">'+ic(IC.table)+'<h4>No tables set up yet</h4><p>Add your first table to start taking orders from the floor.</p><div class="row"><button type="button" class="pri" onclick="if(typeof addTableDlg===\'function\')addTableDlg()">Add table</button></div></div>';
+  return '<div class="tm-state"><span class="tm-spin" aria-hidden="true"></span><h4>Loading tables…</h4><p>Fetching the live floor from the server.</p></div>';
+}
 W.renderRTC=function(grid,cards){
   if(!grid)return;
-  if(!Array.isArray(cards)||!cards.length){grid.innerHTML='<div class="tm-empty">No tables match this filter.</div>';W._rtcLastCards=[];W.bnxTmRenderFloor();return;}
+  if(!Array.isArray(cards)||!cards.length){grid.innerHTML=stateHtml();W._rtcLastCards=[];W.bnxTmRenderFloor();return;}
   W._rtcLastCards=cards;
   var groups=new Map();
   cards.forEach(function(t){var z=String(t.zone||t.section||'Other').trim()||'Other';if(!groups.has(z))groups.set(z,[]);groups.get(z).push(t);});
@@ -43425,7 +43497,7 @@ function ensureKpis(){
   var row=document.querySelector('#page-tables .kpi-row-6col'); if(!row) return;
   if($('tmKpis')) return;
   var box=document.createElement('div'); box.id='tmKpis'; box.style.cssText='display:contents';
-  var defs=[['g','tm-a','Available Tables',IC.table,'available'],['a','tm-r','Running Orders',IC.hour,'running'],['r','tm-o','Occupied Tables',IC.users,'occupied'],['b','tm-rv','Reserved Tables',IC.doc,'reserved'],['p','tm-total','Total Tables',IC.grid,''],['c','tm-pax','Total Pax',IC.seat,'']];
+  var defs=[['g','tm-a','Available',IC.table,'available'],['a','tm-r','Running',IC.hour,'running'],['r','tm-o','Occupied',IC.users,'occupied'],['b','tm-rv','Reserved',IC.doc,'reserved'],['p','tm-total','Total tables',IC.grid,''],['c','tm-pax','Seats',IC.seat,'']];
   box.innerHTML=defs.map(function(d){
     return '<button type="button" class="tm-kpi '+d[0]+'" data-st="'+d[4]+'" '+(d[4]?'onclick="bnxTmKpi(\''+d[4]+'\')"':'onclick="bnxTmKpi(\'\')"')+'><span class="ic">'+d[3]+'</span><span><div class="n" id="'+d[1]+'">00</div><div class="l">'+d[2]+'</div><div class="p" id="'+d[1]+'-p">&nbsp;</div></span></button>';
   }).join('');
@@ -43451,8 +43523,8 @@ W.bnxUpdateTableStats=function(){
   });
   var tot=rows.length||0, pct=function(n){return tot?(n/tot*100).toFixed(1)+'%':'0.0%';};
   var set=function(id,v,p){var e=$(id);if(e)e.textContent=v;var q=$(id+'-p');if(q&&p!==undefined)q.textContent=p;};
-  set('tm-a',pad2(c.a),pct(c.a)+' · '+c.a+' of '+tot);set('tm-r',pad2(c.r),pct(c.r));set('tm-o',pad2(c.o),pct(c.o));set('tm-rv',pad2(c.rv),pct(c.rv));
-  set('tm-total',String(tot),c.x?('100% · '+c.x+' cleaning/blocked'):'100%');set('tm-pax',String(pax),'Seating Capacity');
+  set('tm-a',pad2(c.a),pct(c.a)+' of '+tot);set('tm-r',pad2(c.r),pct(c.r));set('tm-o',pad2(c.o),pct(c.o));set('tm-rv',pad2(c.rv),pct(c.rv));
+  set('tm-total',String(tot),!tot?'—':c.x?(c.x+' cleaning/blocked'):'All zones');set('tm-pax',String(pax),'Total capacity');
   var tl=$('tmTotTables'),tp=$('tmTotPax');if(tl)tl.textContent=tot;if(tp)tp.textContent=pax;
   var cnt=$('floorMapTableCount'); if(cnt) cnt.textContent=tot;
   markKpi();
@@ -44690,36 +44762,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{ou
 .topbar .btn,.topbar button.logout,.topbar [onclick*="ogout"]{font-size:14px!important;padding:9px 18px!important}
 .topbar-right{gap:10px!important}
 
-/* 3. Table Management: KPI tiles — bigger, labels never spill out of the tile */
-#page-tables>.section-h h2{font-size:clamp(24px,2vw,30px)!important}
-#page-tables>.section-h p{font-size:14px!important}
-#page-tables .kpi-row-6col{grid-template-columns:repeat(auto-fit,minmax(215px,1fr))!important;gap:14px!important;margin-bottom:16px!important}
-.tm-kpi{padding:16px 18px!important;gap:14px!important;border-radius:18px!important}
-.tm-kpi .ic{flex:0 0 56px!important;height:56px!important;border-radius:15px!important}
-.tm-kpi .ic svg{width:30px!important;height:30px!important}
-.tm-kpi .n{font-size:clamp(28px,2.4vw,36px)!important}
-.tm-kpi .l{font-size:14px!important;white-space:normal!important;overflow:visible!important;text-overflow:clip!important;line-height:1.25!important}
-.tm-kpi .p{font-size:12.5px!important}
-
-/* filter bar: search, zone chips, view switch */
-#page-tables .fbar{padding:14px 16px!important;gap:12px!important;border-radius:18px!important}
-#page-tables .fbar .search{flex:0 1 340px!important;padding:11px 14px!important}
-#page-tables .fbar .search input{font-size:15px!important}
-.tm-chip{padding:10px 18px!important;font-size:14px!important}
-.tm-chip .d{width:11px!important;height:11px!important}
-.tm-seg button{padding:10px 16px!important;font-size:14px!important}
-.tm-seg svg,.tm-ib svg{width:19px!important;height:19px!important}
-.tm-ib{width:44px!important;height:44px!important}
-.tm-menu{min-width:220px!important;top:50px!important}
-.tm-menu button{font-size:15px!important;padding:11px 14px!important}
-
-/* zone headers + table cards: owned by #bnx-tm-ref-css (PRO v2) — overrides removed here */
-
-/* legend / footer line */
-#tmFootBar{font-size:14px!important;padding:12px 18px!important;gap:22px!important}
-#tmFootBar .sw{width:26px!important;height:26px!important;border-radius:8px!important}
-#tmFootBar .sw svg{width:16px!important;height:16px!important}
-#tmFootBar .r{gap:20px!important}
+/* 3. Table Management (KPI, filter bar, cards, legend): owned by #bnx-tm-ref-css — no overrides here */
 
 @media(max-width:700px){
   .page-title{font-size:18px!important}
