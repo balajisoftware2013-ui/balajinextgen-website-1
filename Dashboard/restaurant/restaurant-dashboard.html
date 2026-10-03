@@ -706,6 +706,36 @@ function bnxCurrentClient_(){
   }catch(e){}
 })();
 
+/* Guards the dashboard / Due Collection / Customer Credit against corrupt server totals
+   (seen: Total Outstanding ₹-66,27,39,55,84,510 and Due Received ₹66,27,39,84,15,000 — a text value
+   in the payments sheet makes the server SUM join digits instead of adding). Absurd numbers are replaced
+   by figures recomputed from the customer rows, and the problem is flagged instead of shown as real money. */
+function bnxSanitizeDue_(action, res){
+  try{
+    if(String(action||'')!=='GET_DUE_COLLECTION' || !res || !res.success || !res.data) return res;
+    const d=res.data, LIM=1e9, bad=[];
+    ['receivedToday','receivedInPeriod','receivedCash','receivedBank','totalOutstanding','netOutstanding','overdue30Plus'].forEach(function(f){
+      if(d[f]!=null){ const v=Number(d[f]); if(!isFinite(v) || Math.abs(v)>LIM) bad.push(f); }
+    });
+    if(!bad.length) return res;
+    const custs=Array.isArray(d.customers)?d.customers:[];
+    const ok=function(v){ v=Number(v); return isFinite(v)&&Math.abs(v)<LIM ? v : 0; };
+    const r2=function(v){ return Math.round(v*100)/100; };
+    const outSum=r2(custs.reduce(function(t,c){ return t+ok(c.outstanding); },0));
+    const today=(typeof getBusinessDate==='function')?getBusinessDate():new Date().toISOString().slice(0,10);
+    const rcvEst=r2(custs.reduce(function(t,c){ return t+(String(c.lastPaymentDate||'').slice(0,10)===today ? ok(c.lastPaymentAmount) : 0); },0));
+    bad.forEach(function(f){
+      if(f==='totalOutstanding'||f==='netOutstanding') d[f]=outSum;
+      else if(f==='overdue30Plus') d[f]=r2(custs.reduce(function(t,c){ return t+(Number(c.overdueDays)>30?Math.max(0,ok(c.outstanding)):0); },0));
+      else if(f==='receivedCash'||f==='receivedBank') delete d[f];
+      else d[f]=rcvEst;
+    });
+    d.__sanitized=bad; window.__bnxDueDataBad=bad;
+    console.error('[DATA] GET_DUE_COLLECTION returned impossible amounts for '+bad.join(', ')+' — replaced by customer-row figures. Check the payments sheet: an Amount cell is probably text, or a receipt row was saved twice.');
+    if(!window.__bnxDueBadWarned){ window.__bnxDueBadWarned=1; setTimeout(function(){ try{ if(typeof showNotif==='function') showNotif('⚠️ Server sent an invalid Due Received total — showing corrected figures. Please check the receipts sheet for text/duplicate amounts.','error'); }catch(e){} },800); }
+  }catch(e){ console.warn('[DATA] due sanitizer failed',e); }
+  return res;
+}
 let _bnxWarnedNoSession = false;
 async function gasApi(action, payload, endpoint) {
   payload = payload || {};
@@ -733,14 +763,14 @@ async function gasApi(action, payload, endpoint) {
       try {
         let attempt = 0;
         const isCriticalWrite = /^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(String(action||''));
-        const maxAttempts = /^(UPLOAD_|SAVE_MENU_ITEM_IMAGE)/i.test(String(action||'')) ? 1 : API_RETRY_CONFIG.maxAttempts; /* uploads: never auto-retry (avoids duplicate Drive files) */
+        const maxAttempts = /^(UPLOAD_|SAVE_MENU_ITEM_IMAGE|SAVE_DUES_RECEIPT)/i.test(String(action||'')) ? 1 : API_RETRY_CONFIG.maxAttempts; /* receipts: never blind-retry (a timed-out call may already be saved -> duplicate money entry) */ /* uploads: never auto-retry (avoids duplicate Drive files) */
         while (attempt < maxAttempts) {
           try {
             const session = bnxCurrentSession_();
             const body = JSON.stringify(Object.assign({action:action, clientId:bnxCurrentClient_(), sessionToken:session}, payload));
             const data = await bnxFetchJson_(ep, {body:body});
             bnxCheckAuthFailure_(data);
-            resolve(data);
+            resolve(bnxSanitizeDue_(action,data));
             return;
           } catch(err) {
             /* Permanent 4xx errors are never retried. Network/5xx errors get
@@ -9255,7 +9285,7 @@ async function erpApi(payload, type='V2_AUTH'){
       if(!data.data && data.todaySales!==undefined) data.data=data;
     }
     if(typeof bnxCheckAuthFailure_==='function') bnxCheckAuthFailure_(data);
-    return data;
+    return bnxSanitizeDue_(payload&&payload.action,data);
   }catch(e){
     const aborted=!!(e && (e.name==='AbortError' || /aborted|abort/i.test(String(e.message||''))));
     if (!aborted && (!e || !e.circuitOpen)) console.warn('[ERP API '+type+']',e.message);
@@ -12051,7 +12081,8 @@ async function loadDashboard(){
         const ddr = document.getElementById('d-due-rcvd');
         /* PASS #84: receivedInPeriod = the selected range, from the same engine as the DSR.
            Falls back to receivedToday only for an older backend that does not send it. */
-        const periodDue = (dueRes.data.receivedInPeriod != null) ? Number(dueRes.data.receivedInPeriod) : Number(dueRes.data.receivedToday||0);
+        const __pendRc = (typeof window.bnxPendingReceiptsTotal_==='function' && dashActiveRange!=='yesterday' && dashActiveRange!=='custom') ? window.bnxPendingReceiptsTotal_() : 0;
+        const periodDue = ((dueRes.data.receivedInPeriod != null) ? Number(dueRes.data.receivedInPeriod) : Number(dueRes.data.receivedToday||0)) + __pendRc;
         if (ddr) {
           ddr.textContent = '₹'+periodDue.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
           const cashPart = Number(dueRes.data.receivedCash||0), bankPart = Number(dueRes.data.receivedBank||0);
@@ -12090,7 +12121,8 @@ async function loadDashboard(){
         const cpDue = document.getElementById('d-cp-duercvd');
         if (cpDue && cpDue.dataset.bnxManual !== '1') {
           const hasSplit = dueRes.data.receivedCash != null;
-          const liveDue = hasSplit ? Number(dueRes.data.receivedCash || 0) : Number(dueRes.data.receivedInPeriod != null ? dueRes.data.receivedInPeriod : (dueRes.data.receivedToday || 0));
+          const liveDue = (hasSplit ? Number(dueRes.data.receivedCash || 0) : Number(dueRes.data.receivedInPeriod != null ? dueRes.data.receivedInPeriod : (dueRes.data.receivedToday || 0)))
+            + ((typeof window.bnxPendingReceiptsCash_==='function' && dashActiveRange!=='yesterday' && dashActiveRange!=='custom') ? window.bnxPendingReceiptsCash_() : 0);
           cpDue.textContent = '₹' + liveDue.toLocaleString('en-IN', {minimumFractionDigits:2,maximumFractionDigits:2});
           cpDue.title = hasSplit ? ('Cash only · bank/UPI/card due receipts (₹' + Number(dueRes.data.receivedBank||0).toLocaleString('en-IN') + ') are not cash in hand.')
             : 'All payment modes (this backend does not split cash vs bank).';
@@ -37256,23 +37288,106 @@ body:not(.pos-machine) #bmProductGrid,
       if (r2(alloc.reduce((s, a) => s + a.amount, 0)) > amt + 0.01) { notify('⚠️ Bill amounts are more than the amount received', 'error'); return; }
     }
     const btn = document.getElementById('rv79Save'); if (btn.disabled) return; btn.disabled = true; btn.innerHTML = I('refresh', 16) + ' Saving…';
-    const r = await api('SAVE_DUES_RECEIPT', { requestId: rid(), customerId: c.customerId, customerName: c.customer, amount: amt, allocations: alloc, paymentMode: RV.pay,
-      date: document.getElementById('rv79Date').value || '', reference: document.getElementById('rv79Ref').value || '', narration: document.getElementById('rv79Narr').value || '' });
-    if (!r || !r.success) { btn.disabled = false; btn.innerHTML = I('save', 16) + ' Save Receipt Voucher'; notify('❌ Receipt not saved: ' + (r?.error || 'server error'), 'error'); return; }
-    const d = r.data; W.__bnx72LastRcpt = d;
+    /* FAST SAVE (Oct 2026): the server (Apps Script) takes 10-30 s per call. The cashier no longer waits:
+       the receipt is shown as saved at once, dashboard/ledger figures update locally, and the real save
+       runs in the background with the SAME requestId (safe to retry), kept in a durable pending queue
+       until the server confirms. A failed network call keeps retrying; a real rejection is reported. */
+    const reqId = rid(), tag = 'RQ' + String(reqId).replace(/[^A-Za-z0-9]/g, '').slice(0, 8).toUpperCase();
+    const payload = { requestId: reqId, tag: tag, customerId: c.customerId, customerName: c.customer, amount: amt, allocations: alloc, paymentMode: RV.pay,
+      date: document.getElementById('rv79Date').value || '', reference: document.getElementById('rv79Ref').value || '',
+      narration: ((document.getElementById('rv79Narr').value || '').trim() || 'Payment against outstanding') + ' [' + tag + ']' };
+    pendAdd(payload);
+    applyLocal(payload, +1);
     modalOpen(`<div class="rv79" style="text-align:center;padding:6px">
       <div style="width:54px;height:54px;border-radius:50%;background:#e8f5e9;color:#2e7d32;display:flex;align-items:center;justify-content:center;margin:0 auto 8px">${I('wallet', 26)}</div>
-      <div style="font-size:17px;font-weight:800">Receipt ${esc(d.voucherNo)} saved</div>
-      <div style="font-size:13px;margin:4px 0 10px">${inr(d.amount)} from <b>${esc(d.customer)}</b> · ${esc(d.mode)} · ${fmtDate(d.date)}</div>
-      <div class="rv79-sum" style="text-align:left"><div><span>Against bills</span><b>${inr(d.allocated)}</b></div><div><span>Against old balance</span><b>${inr(d.openingApplied)}</b></div><div><span>Advance</span><b>${inr(d.advance)}</b></div></div>
-      ${d.allocations.length ? `<div class="rv79-bills" style="margin-top:10px;text-align:left"><table><thead><tr><th>Bill</th><th>Date</th><th class="n">Received</th><th class="n">Balance</th></tr></thead><tbody>${d.allocations.map(a => `<tr><td style="font-family:'DM Mono',monospace">${esc(a.billNo)}</td><td>${fmtDate(a.billDate)}</td><td class="n">${inr(a.paid)}</td><td class="n">${inr(a.balance)}</td></tr>`).join('')}</tbody></table></div>` : ''}
-      <div style="display:flex;gap:8px;justify-content:center;margin-top:12px"><button class="btn btn-primary bnx79-btn" onclick="bnx72PrintReceipt()">${I('printer', 15)} Print receipt</button>
-        <button class="btn btn-ghost bnx79-btn" onclick="bnx72OpenStatement('${jsq(d.customerId)}')">${I('book', 15)} Ledger</button><button class="btn btn-ghost" onclick="closeDetailModal()">Close</button></div></div>`);
-    notify('✅ Receipt ' + d.voucherNo + ' saved — ' + inr(d.amount), 'success');
+      <div style="font-size:17px;font-weight:800">Receipt <span id="rv79Vno">saving…</span> ${'' }</div>
+      <div style="font-size:13px;margin:4px 0 10px">${inr(amt)} from <b>${esc(c.customer)}</b> · ${esc(payload.paymentMode)} · ${fmtDate(payload.date || today())}</div>
+      <div id="rv79SyncNote" style="font-size:12px;color:#a15c00;background:#fff4e0;border-radius:8px;padding:7px 10px;margin:0 auto 10px;max-width:420px">⏳ Syncing with server in the background — you can keep working. Voucher number appears here when confirmed.</div>
+      <div style="display:flex;gap:8px;justify-content:center;margin-top:12px"><button class="btn btn-primary bnx79-btn" id="rv79PrintBtn" disabled style="opacity:.5" onclick="bnx72PrintReceipt()">${I('printer', 15)} Print receipt</button>
+        <button class="btn btn-ghost bnx79-btn" onclick="bnx72OpenStatement('${jsq(c.customerId)}')">${I('book', 15)} Ledger</button><button class="btn btn-ghost" onclick="closeDetailModal()">Close</button></div></div>`);
+    notify('✅ Receipt of ' + inr(amt) + ' recorded — syncing…', 'success');
     rvReset();
     if (typeof W.bnxCcClearFilters === 'function') W.bnxCcClearFilters(true);
-    if (typeof W.bnxLoadDueCollection === 'function') W.bnxLoadDueCollection();
+    syncOne(payload, true);
   };
+
+  /* ---- durable pending-receipt queue + background sync ---- */
+  const PKEY = () => 'bnx_pending_receipts_' + (W.CLIENT_ID || (typeof CLIENT_ID !== 'undefined' ? CLIENT_ID : '') || 'default');
+  function pendGet(){ try { return JSON.parse(localStorage.getItem(PKEY()) || '[]') || []; } catch(e){ return []; } }
+  function pendSet(a){ try { localStorage.setItem(PKEY(), JSON.stringify(a)); } catch(e){} }
+  function pendAdd(p){ const a = pendGet(); if (!a.some(x => x.requestId === p.requestId)) a.push(p); pendSet(a); }
+  function pendDel(id){ pendSet(pendGet().filter(x => x.requestId !== id)); }
+  /* total still unconfirmed by the server — dashboard adds this to its server figure so it never shows ₹0 while syncing */
+  W.bnxPendingReceiptsTotal_ = function(){ return pendGet().reduce((t, x) => t + (Number(x.amount) || 0), 0); };
+  W.bnxPendingReceiptsCash_ = function(){ return pendGet().filter(x => /^cash$/i.test(x.paymentMode)).reduce((t, x) => t + (Number(x.amount) || 0), 0); };
+  const numOf = id => Number(String(document.getElementById(id)?.textContent || '').replace(/[^0-9.\-]/g, '')) || 0;
+  const setMoney = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = '₹' + v.toLocaleString('en-IN', { minimumFractionDigits:2, maximumFractionDigits:2 }); };
+  /* instant local update of the customer row, Due Collection KPI and dashboard tiles (dir=+1 apply, -1 undo) */
+  function applyLocal(p, dir){
+    try {
+      const a = Number(p.amount) || 0, cr = W.__bnx72CR && W.__bnx72CR.data && W.__bnx72CR.data.customers;
+      if (cr) { const cu = cr.find(x => String(x.customerId) === String(p.customerId)); if (cu) { cu.outstanding = r2((cu.outstanding || 0) - dir * a); if (cu.openingRemaining > 0) cu.openingRemaining = r2(Math.max(0, cu.openingRemaining - (dir > 0 ? Math.min(a, cu.openingRemaining) : -a))); } }
+      try { renderParty(); } catch(e){}
+      if (document.getElementById('d-credit')) setMoney('d-credit', numOf('d-credit') - dir * a);
+      if (document.getElementById('d-due-rcvd')) setMoney('d-due-rcvd', numOf('d-due-rcvd') + dir * a);
+      if (/^cash$/i.test(p.paymentMode)) {
+        if (document.getElementById('d-cp-duercvd')) setMoney('d-cp-duercvd', numOf('d-cp-duercvd') + dir * a);
+        if (document.getElementById('d-cp-totalinflow')) setMoney('d-cp-totalinflow', numOf('d-cp-totalinflow') + dir * a);
+      }
+    } catch(e){ console.warn('[RECEIPT] local update failed', e); }
+  }
+  const syncing = {};
+  async function syncOne(p, fromUser){
+    if (syncing[p.requestId]) return; syncing[p.requestId] = true;
+    let r = null;
+    /* a previous attempt may have reached the server even though the reply timed out -> look for our tag first, never post twice */
+    if (p.tries > 0) {
+      try {
+        const q = await api('GET_CUSTOMER_LEDGER', { customerId: p.customerId, from: '', to: '' });
+        const rows = (q && q.success && q.data && q.data.rows) || [];
+        const hit = rows.find(x => String(x.note || '').indexOf('[' + p.tag + ']') > -1);
+        if (hit) r = { success:true, data:{ voucherNo: hit.ref, amount: p.amount, customer: p.customerName, customerId: p.customerId, mode: p.paymentMode, date: p.date, allocations: [], allocated: null } };
+        else if (!(q && q.success)) { syncing[p.requestId] = false; setTimeout(retryPending, 20000); return; }   /* cannot verify yet -> wait, do not risk a duplicate */
+      } catch(e){ syncing[p.requestId] = false; setTimeout(retryPending, 20000); return; }
+    }
+    if (!r) {
+      p.tries = (p.tries || 0) + 1; pendSet(pendGet().map(x => x.requestId === p.requestId ? Object.assign(x, { tries: p.tries }) : x));
+      try { r = await api('SAVE_DUES_RECEIPT', p); } catch(e){ r = { success:false, error:String(e && e.message || e), statusCode:0 }; }
+    }
+    syncing[p.requestId] = false;
+    if (r && r.success) {
+      pendDel(p.requestId);
+      const d = r.data || {}; W.__bnx72LastRcpt = d;
+      const v = document.getElementById('rv79Vno'); if (v && fromUser) {
+        v.textContent = (d.voucherNo || '') + ' saved';
+        const n = document.getElementById('rv79SyncNote');
+        if (n) { n.style.background = '#e8f5e9'; n.style.color = '#2e7d32'; n.innerHTML = '✔ Confirmed' + (d.allocated != null ? ' · Against bills ' + inr(d.allocated) + ' · Old balance ' + inr(d.openingApplied || 0) + ' · Advance ' + inr(d.advance || 0) : ''); }
+        const pb = document.getElementById('rv79PrintBtn'); if (pb) { pb.disabled = false; pb.style.opacity = ''; }
+      }
+      notify('✅ Receipt ' + (d.voucherNo || '') + ' confirmed — ' + inr(d.amount != null ? d.amount : p.amount), 'success');
+      if (typeof W.bnxLoadDueCollection === 'function') W.bnxLoadDueCollection();
+      if (typeof W.loadDashboard === 'function') { try { W.loadDashboard(); } catch(e){} }
+      return;
+    }
+    const code = Number(r && r.statusCode) || 0;
+    const rejected = r && (code >= 400 && code < 500 && code !== 408 && code !== 429);
+    if (rejected || (r && r.error && !code && !/timeout|network|fetch|failed|abort|offline|connection/i.test(String(r.error)))) {
+      /* the server really refused it — undo the local change and tell the cashier */
+      pendDel(p.requestId); applyLocal(p, -1);
+      const v = document.getElementById('rv79Vno'); if (v) v.textContent = 'NOT saved';
+      const n = document.getElementById('rv79SyncNote'); if (n) { n.style.background = '#fdecea'; n.style.color = '#c62828'; n.textContent = '❌ Server rejected this receipt: ' + (r.error || 'error') + '. Please receive it again.'; }
+      notify('❌ Receipt not saved: ' + (r.error || 'server error'), 'error');
+      if (typeof W.bnxLoadDueCollection === 'function') W.bnxLoadDueCollection();
+      return;
+    }
+    /* network / timeout: keep it queued and retry — nothing is lost */
+    const n = document.getElementById('rv79SyncNote'); if (n && fromUser) { n.style.background = '#fff4e0'; n.style.color = '#a15c00'; n.textContent = '⏳ Server is slow — receipt is stored safely on this PC and will keep retrying automatically.'; }
+    setTimeout(retryPending, 15000);
+  }
+  function retryPending(){ pendGet().forEach(p => syncOne(p, false)); }
+  W.bnxRetryPendingReceipts = retryPending;
+  setTimeout(retryPending, 4000);
+  setInterval(function(){ if (pendGet().length) retryPending(); }, 30000);
 
   /* ------------------------------------------------------------ swap emoji for SVG icons */
   const EMO = [[/^\s*(➕|\+)\s*/, 'plus'], [/^\s*(⬇️|⬇)\s*/, 'download'], [/^\s*(⬆️|⬆|📤)\s*(?=Upload)/, 'upload'], [/^\s*💰\s*/, 'wallet'], [/^\s*🖨\s*/, 'printer'],
@@ -38576,7 +38691,7 @@ function bnxOpenImportHub(){
     if(c.openBills)sub.push(c.openBills+' open bill'+(c.openBills===1?'':'s'));
     return '<tr class="bnxp-r" onclick="bnx72OpenStatement(\''+id+'\')">'+
       '<td data-l="#" class="c" style="color:#999">'+(i+1)+'</td>'+
-      '<td data-l="Customer" class="bnxp-cust"><div class="bnxp-name">'+esc(c.customer)+' <span class="bnxp-tag'+(corp?' corp':'')+'">'+esc(c.type||'Individual')+'</span></div><div class="bnxp-sub">'+sub.join(' · ').replace(/<\/span> · /,'</span>')+'</div></td>'+
+      '<td data-l="Customer" class="bnxp-cust"><div class="bnxp-name"><span class="bnxp-nm" title="'+esc(c.customer)+'">'+esc(c.customer)+'</span><span class="bnxp-tag'+(corp?' corp':'')+'">'+esc(c.type||'Individual')+'</span></div><div class="bnxp-sub">'+sub.join(' · ').replace(/<\/span> · /,'</span>')+'</div></td>'+
       '<td data-l="Old Balance" class="n">'+(c.openingRemaining>0.01?inr(c.openingRemaining):'—')+'</td>'+
       '<td data-l="Bills Due" class="n">'+(c.billsDue>0.01?inr(c.billsDue):'—')+'</td>'+
       '<td data-l="Total Due" class="n" style="font-weight:800;color:'+(c.outstanding<0?'#1565c0':c.overdueDays>30?'#c62828':'#a15c00')+'">'+inr(c.outstanding)+'</td>'+
@@ -43930,4 +44045,53 @@ window.bnxFindNetPrinters=async function(){
   document.addEventListener('click',function(ev){ var t=ev.target&&ev.target.closest&&ev.target.closest('[onclick]'); if(t&&/s-voucher/.test(t.getAttribute('onclick')||'')) setTimeout(W.bnxPullInvoiceSettings_,150); },true);
 })();
 </script>
+
+<style id="bnx-final-layout-20261004">
+/* ═══ FINAL FIX (Oct 4 2026): customer name on ONE line · compact top icons · uniform KPI cards ═══ */
+
+/* ---- 1) Customer Credit party table: single-line cells, name never wraps ---- */
+@media(min-width:701px){
+  #page-customer-credit .bnxp-scroll{overflow-x:auto;max-width:100%}
+  #page-customer-credit #bnx79Party{table-layout:auto!important;width:100%!important;min-width:1120px!important}
+  #page-customer-credit #bnx79Party th,
+  #page-customer-credit #bnx79Party td{white-space:nowrap!important;word-break:normal!important;overflow:visible!important;text-overflow:clip!important;width:auto!important;padding:10px 12px!important;vertical-align:middle}
+  #page-customer-credit #bnx79Party td:nth-child(2),
+  #page-customer-credit #bnx79Party th:nth-child(2),
+  #page-customer-credit #bnx79Party td.bnxp-cust{min-width:260px!important;max-width:380px!important;width:30%!important}
+  #page-customer-credit #bnx79Party td:nth-child(1),#page-customer-credit #bnx79Party th:nth-child(1){width:44px!important;min-width:44px!important;text-align:center!important}
+  #page-customer-credit #bnx79Party td.bnxp-act,#page-customer-credit #bnx79Party th:last-child{width:1%!important;min-width:210px}
+}
+#page-customer-credit #bnx79Party .bnxp-name{display:flex!important;flex-wrap:nowrap!important;align-items:center;gap:8px;white-space:nowrap!important;min-width:0;line-height:1.3;word-break:normal!important}
+#page-customer-credit #bnx79Party .bnxp-nm{min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700;font-size:13.5px;text-transform:uppercase}
+#page-customer-credit #bnx79Party .bnxp-name .bnxp-tag{flex:0 0 auto;white-space:nowrap}
+#page-customer-credit #bnx79Party .bnxp-sub{white-space:nowrap!important;overflow:hidden;text-overflow:ellipsis;max-width:100%;margin-top:3px;line-height:1.3;font-size:11.5px}
+#page-customer-credit #bnx79Party .bnxp-sub .bnxp-grp{margin-right:6px}
+#page-customer-credit #bnx79Party .bnxp-lr{white-space:nowrap!important}
+#page-customer-credit #bnx79Party .n,#page-customer-credit #bnx79Party th.n{text-align:right!important;white-space:nowrap!important}
+#page-customer-credit #bnx79Party .bnxp-act{flex-wrap:nowrap!important}
+
+/* ---- 2) Top bar icons: compact, equal size, one baseline ---- */
+.topbar{min-height:54px}
+.topbar-right{gap:6px!important;align-items:center}
+.topbar .t-btn,.topbar .collapse-btn{width:32px!important;height:32px!important;min-width:32px!important;padding:0!important;font-size:14px!important;line-height:1!important;border-radius:9px!important;display:inline-flex!important;align-items:center;justify-content:center;position:relative}
+.topbar .t-btn .t-dot{top:5px;right:5px}
+.topbar .live-clock{height:32px;padding:0 10px!important;font-size:12px!important;display:inline-flex;align-items:center;border-radius:9px}
+.topbar .sf-avatar,.topbar #topAvatar{width:30px!important;height:30px!important;min-width:30px;font-size:11px!important;flex:0 0 30px}
+.topbar .logout-btn{height:32px!important;padding:0 12px!important;font-size:12px!important;border-radius:9px!important;display:inline-flex;align-items:center;gap:6px;white-space:nowrap;line-height:1}
+.topbar .page-title{font-size:clamp(16px,1.5vw,20px)!important;line-height:1.2}
+.topbar .page-sub{font-size:11px!important;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ---- 3) KPI cards: same size, same fonts, one row ---- */
+#page-customer-credit .credit-summary-grid{display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;gap:12px!important;margin-bottom:14px}
+#page-customer-credit .credit-stat{box-sizing:border-box;height:78px;min-height:78px!important;padding:12px 16px!important;border-radius:12px!important;display:flex!important;flex-direction:column-reverse;justify-content:center;align-items:flex-start;gap:4px;text-align:left!important;min-width:0}
+#page-customer-credit .credit-stat-val{font-family:'DM Mono',monospace!important;font-size:clamp(17px,1.5vw,21px)!important;font-weight:800!important;line-height:1.15!important;margin:0!important;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#page-customer-credit .credit-stat-lbl{font-size:10.5px!important;font-weight:800!important;letter-spacing:.5px!important;line-height:1.2;text-transform:uppercase;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+#page-customer-credit #bnx72Aging,#page-customer-credit .bnx72-aging{display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;gap:12px!important;margin:0 0 14px}
+#page-customer-credit #bnx72Aging>div,#page-customer-credit .bnx72-aging>div{box-sizing:border-box;height:64px;min-height:64px!important;padding:10px 16px!important;border-radius:12px!important;display:flex;flex-direction:column;justify-content:center;align-items:flex-start;gap:3px;min-width:0}
+#page-customer-credit #bnx72Aging>div>span,#page-customer-credit .bnx72-aging>div>span{font-size:10.5px!important;font-weight:800;letter-spacing:.5px;white-space:nowrap}
+#page-customer-credit #bnx72Aging>div>b,#page-customer-credit .bnx72-aging>div>b{font-family:'DM Mono',monospace!important;font-size:clamp(16px,1.4vw,19px)!important;line-height:1.1;white-space:nowrap}
+@media(max-width:900px){
+  #page-customer-credit .credit-summary-grid,#page-customer-credit #bnx72Aging,#page-customer-credit .bnx72-aging{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+}
+</style>
 </body></html>
