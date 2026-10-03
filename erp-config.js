@@ -91,6 +91,7 @@ const ROLE_DASHBOARD = {
   ASSISTANT_CHEF: 'Dashboard/restaurant/chef-dashboard.html',
   WAITER       : 'Dashboard/employee-dashboard.html',
   STORE_MANAGER: 'Dashboard/inventory/inventory.html',
+  STORE_HELPER : 'Dashboard/inventory/inventory.html',
   CEO          : 'Dashboard/Ceo-dashboard.html',
   MD           : 'Dashboard/owner-dashboard.html',
   CLIENT       : 'welcome.html',
@@ -175,7 +176,7 @@ const FIXED_ROLE_DASHBOARDS = [
      chef"): same one-layer-deeper requirement as STEWARD/MANAGER/CAPTAIN
      above — without this, ASSISTANT_CHEF's industry would resolve first
      and the ROLE_DASHBOARD entry above would never be consulted. */
-  'ASSISTANT_CHEF'
+  'ASSISTANT_CHEF','STORE_HELPER'
 ];
 
 /* Map raw CLIENT_MASTER / USER.INDUSTRY strings → INDUSTRY_DASHBOARD keys.
@@ -463,10 +464,7 @@ const ERP = {
     // Always persist so welcome.html can read it without re-computing
     try{ localStorage.setItem('erp_target_dashboard', target); }catch(e){}
     const skip = localStorage.getItem('erp_skip_selector') === 'true';
-    // Role-specific direct routing: Assistant Chef must open the Chef Dashboard
-    // immediately instead of being redirected through welcome/industry selection.
-    const role = this.getRole();
-    if (skip || role === 'ASSISTANT_CHEF') { _safeNavigate(target); return; }
+    if (skip || ['ASSISTANT_CHEF','STORE_HELPER'].includes(this.getRole())) { _safeNavigate(target); return; }
     // Show welcome screen first — guard against redirect loops
     var _cur = window.location.pathname.toLowerCase();
     if (!_cur.includes('welcome')) { _safeNavigate('welcome.html'); }
