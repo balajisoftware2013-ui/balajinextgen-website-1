@@ -10618,6 +10618,15 @@ function bnxApplyDashboardSnapshot_(d, source){
   const orders=d.orders!==undefined?d.orders:d.todayOrders;
   const covers=d.covers!==undefined?d.covers:d.todayGuests;
   const money=(n)=>bnxDashMoney_(n);
+  try{
+    const cmS=d.collectionsByMode||d.paymentModes||d.paymentBreakdown;
+    if(cmS && typeof cmS==='object'){
+      [['d-cash',cmS.cash],['d-upi',cmS.upi],['d-bank',cmS.bank]].forEach(function(p){
+        const e=document.getElementById(p[0]);
+        if(e && p[1]!==undefined){ e.textContent='₹'+Math.max(Number(p[1])||0,0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}); e.dataset.bnxLive='1'; }
+      });
+    }
+  }catch(_e){}
   if(orders!==undefined){ ['d-ord','h-ord','rpt-bills'].forEach(id=>{const e=document.getElementById(id);if(e){e.textContent=String(orders);e.dataset.bnxLive='1';e.dataset.bnxSnapshot=source||'cache';}}); }
   if(covers!==undefined){ ['d-cov','h-cov'].forEach(id=>{const e=document.getElementById(id);if(e){e.textContent=String(covers);e.dataset.bnxLive='1';e.dataset.bnxSnapshot=source||'cache';}}); }
   if(d.totalSales!==undefined){
@@ -11806,13 +11815,14 @@ async function loadDashboard(){
   // 04_TABLE_MASTER state. This is intentionally independent of the
   // selected sales-report period: a Year/Quarter report must not turn
   // today's live table occupancy into historical/demo status.
-  try{ if(typeof bnxSyncTableMasterFromBackend==='function') await bnxSyncTableMasterFromBackend(true); }catch(e){}
-  // Explicit user refresh bypasses the in-memory request cache, but the last
-  // confirmed same-business-date snapshot is painted first so the dashboard
-  // never sits at blank/₹0 while Apps Script is waking up.
+  // SPEED FIX: the table-master sync used to be AWAITED here, so the cached
+  // numbers and the dashboard summary request both waited behind an extra
+  // network round trip. Paint the cache and start the summary first; the table
+  // sync now runs in the background and redraws the floor map when it finishes.
   bnxClearDashboardSummaryCache_();
   const rangeParams = bnxDashRangeParams_();
   bnxLoadDashboardSnapshot_(rangeParams);
+  try{ if(typeof bnxSyncTableMasterFromBackend==='function') Promise.resolve(bnxSyncTableMasterFromBackend(true)).catch(function(){}); }catch(e){}
   try{
     bnxResetApiCircuit_('V2_CORE');
     const r=await bnxGetDashboardSummaryShared_(rangeParams);
@@ -16094,12 +16104,19 @@ setInterval(()=>{ if (document.getElementById('page-kot')?.classList.contains('a
 /* Periodically pull live orders (steward app, other terminals) into the
    local KOT store — see bnxSyncLiveKots() comment above — then refresh
    whichever KOT view is currently visible. */
+let __bnxKotPollBusy=false, __bnxKotPollLast=0;
 setInterval(()=>{
   if (typeof bnxSyncLiveKots !== 'function') return;
-  bnxSyncLiveKots().then(()=>{
+  // SPEED FIX: never stack a new request on an unfinished one, pause while the
+  // tab is hidden, and back off to once a minute while the server is slow.
+  if (document.hidden || __bnxKotPollBusy) return;
+  const slow = (typeof PERF_METRICS!=='undefined' && PERF_METRICS.avgResponseTime>10000);
+  if (slow && Date.now()-__bnxKotPollLast < 60000) return;
+  __bnxKotPollBusy=true; __bnxKotPollLast=Date.now();
+  Promise.resolve(bnxSyncLiveKots()).then(()=>{
     if (document.getElementById('page-kot')?.classList.contains('active') && typeof buildKOT==='function') buildKOT();
     if (document.getElementById('page-dashboard')?.classList.contains('active') && typeof buildDashKotList==='function') buildDashKotList();
-  });
+  }).catch(()=>{}).finally(()=>{ __bnxKotPollBusy=false; });
 }, 20000);
 /* FIX ("dashboard till show wrong data not live"): the KOT list above
    already refreshed itself every 20s, but the actual dashboard numbers —
@@ -16113,14 +16130,25 @@ setInterval(()=>{
    loadDashboard() used everywhere else, so it goes through the exact same
    real-data-or-honest-empty-state logic fixed above, never fake numbers. */
 setInterval(()=>{
+  // SPEED FIX: refresh no more often than every 45s AND no more often than 3x
+  // the time the last refresh took (a 30s server must not be hit every 45s),
+  // and never while the tab is hidden.
+  if (document.hidden) return;
+  const gap = Math.max(45000, 3*(window.__bnxDashLastMs||0));
+  if (Date.now() - (window.__bnxDashLastEnd||0) < gap) return;
   if (document.getElementById('page-dashboard')?.classList.contains('active') &&
       typeof loadDashboard==='function' &&
       !bnxApiCircuitOpen_('V2_CORE') &&
       !window.__bnxDashboardPollBusy) {
     window.__bnxDashboardPollBusy = true;
-    Promise.resolve(loadDashboard()).finally(()=>{ window.__bnxDashboardPollBusy=false; });
+    const t0 = Date.now();
+    Promise.resolve(loadDashboard()).finally(()=>{
+      window.__bnxDashboardPollBusy=false;
+      window.__bnxDashLastMs = Date.now()-t0;
+      window.__bnxDashLastEnd = Date.now();
+    });
   }
-}, 45000);
+}, 15000);
 /* Marks a ticket Ready and persists it — refreshing the page or
    coming back to this tab won't lose the update (previously the
    Ready button only changed its own label in memory and forgot
@@ -40407,7 +40435,7 @@ function bnxOpenImportHub(){
   ------------------------------------------------------------------ */
   let healthBusy=false;
   async function runHealth_(){
-    if(healthBusy)return;
+    if(healthBusy || document.hidden)return;
     healthBusy=true;
     const sync=document.getElementById('dbSync');
     if(sync)sync.textContent='Checking connections…';
