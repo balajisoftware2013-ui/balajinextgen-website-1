@@ -91,6 +91,7 @@ const ROLE_DASHBOARD = {
   ASSISTANT_CHEF: 'Dashboard/restaurant/chef-dashboard.html',
   WAITER       : 'Dashboard/employee-dashboard.html',
   STORE_MANAGER: 'Dashboard/inventory/inventory.html',
+  STORE_HELPER : 'Dashboard/inventory/inventory.html',
   CEO          : 'Dashboard/Ceo-dashboard.html',
   MD           : 'Dashboard/owner-dashboard.html',
   CLIENT       : 'welcome.html',
@@ -153,7 +154,7 @@ const INDUSTRY_DASHBOARD = {
 /* Roles that ALWAYS use ROLE_DASHBOARD (ignore industry) */
 const FIXED_ROLE_DASHBOARDS = [
   'CASHIER','CHEF','WAITER','STAFF','PARTTIME','ACCOUNTANT',
-  'ACCT','STORE_MANAGER','SUPER_ADMIN','DEVELOPER',
+  'ACCT','STORE_MANAGER','STORE_HELPER','SUPER_ADMIN','DEVELOPER',
   /* PASS #28 FIX ("Captain Report Dashboard not show"): adding CAPTAIN
      to ROLE_DASHBOARD alone was NOT enough -- getTargetDashboard() does
      `industryDash || ROLE_DASHBOARD[role]`, and _erpResolveIndustryDashboard
@@ -463,7 +464,8 @@ const ERP = {
     // Always persist so welcome.html can read it without re-computing
     try{ localStorage.setItem('erp_target_dashboard', target); }catch(e){}
     const skip = localStorage.getItem('erp_skip_selector') === 'true';
-    if (skip) { _safeNavigate(target); return; }
+    // STORE_HELPER opens Inventory directly after login; bypass welcome/selector.
+    if (skip || this.getRole() === 'STORE_HELPER') { _safeNavigate(target); return; }
     // Show welcome screen first — guard against redirect loops
     var _cur = window.location.pathname.toLowerCase();
     if (!_cur.includes('welcome')) { _safeNavigate('welcome.html'); }
