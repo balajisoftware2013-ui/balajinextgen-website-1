@@ -6442,6 +6442,10 @@ document.addEventListener('DOMContentLoaded', function(){
       </div>
       <div style="font-size:10.5px;color:var(--text3);margin:0 0 14px;">Current next voucher will be <b id="vnPettyPreview">—</b> (format: PREFIX-YY-YY-###)</div>
 
+      <div style="font-weight:700;font-size:12.5px;color:var(--text2);margin:4px 0 8px;">📝 Invoice Footer</div>
+      <textarea class="fi" id="vnFooter" rows="2" placeholder="We Support Round Table&#10;THANK YOU, VISIT AGAIN" style="font-size:12px;width:100%;margin-bottom:6px;"></textarea>
+      <div style="font-size:10.5px;color:var(--text3);margin:0 0 14px;">Printed at the bottom of every bill (max 2 lines). <span id="vnSheetStatus" style="font-weight:700;"></span></div>
+
       <div style="display:flex;gap:8px;">
         <button class="btn-full prim" style="max-width:200px;font-size:12px;" onclick="saveVoucherNumbering()">💾 Save Numbering</button>
         <button class="btn btn-sm btn-ghost" onclick="resetVoucherNumbering()">↺ Reset to Default</button>
@@ -15522,7 +15526,7 @@ function buildThermalBodyHTML(d){
       <div class="bnx-note bnx-meta-wrap">Remarks : ${esc(d.remarks||'-')}</div>
       ${typeof bnxUpiReceiptBlock_==='function' ? bnxUpiReceiptBlock_(d,totalRounded) : ''}
       <hr class="bnx-footer-rule">
-      <div class="bnx-footer">We Support Round Table<br>THANK YOU, VISIT AGAIN</div>
+      <div class="bnx-footer">${bnxInvoiceFooterLines_().map(bnxEscapeHtml_).join('<br>')}</div>
     </div>`;
 }
 
@@ -17397,7 +17401,8 @@ window.addEventListener('DOMContentLoaded',function(){
    Prefix + starting number are configurable in Settings → Voucher
    Numbering; both the prefix and the seed for the sequence live in
    localStorage so they persist and can be changed by the owner. */
-function bmGetBillPrefix(){ return localStorage.getItem('bnx_billno_prefix') || 'BN/'; }
+function bnxDefaultBillPrefix_(){ try{ return ({CL00010:'HT/2627/'})[CLIENT_ID] || 'BN/'; }catch(e){ return 'BN/'; } }
+function bmGetBillPrefix(){ return localStorage.getItem('bnx_billno_prefix') || bnxDefaultBillPrefix_(); }
 function bmPeekBillNo(){
   // UI-only fallback; real invoice numbers are server-authoritative.
   const seq = parseInt(bnxGetBillSeq()||'6423', 10) + 1;
@@ -17481,16 +17486,17 @@ function loadVoucherNumberingUI(){
   const pp = document.getElementById('vnPettyPrefix'); if (pp) pp.value = localStorage.getItem('bnx_pettyno_prefix') || 'PC';
   const ps = document.getElementById('vnPettyStart'); if (ps) ps.value = parseInt(localStorage.getItem('bnx_petty_seq')||'6',10)+1;
   const bprev = document.getElementById('vnBillPreview'); if (bprev) bprev.textContent = bmPeekBillNo();
+  const vf = document.getElementById('vnFooter'); if (vf) vf.value = bnxInvoiceFooterText_();
   const pprev = document.getElementById('vnPettyPreview');
   if (pprev){
-    const fy = new Date().getFullYear().toString().slice(-2);
+    const _n = new Date(), fyFull = _n.getMonth()>=3 ? _n.getFullYear() : _n.getFullYear()-1;
     const prefix = localStorage.getItem('bnx_pettyno_prefix') || 'PC';
     const nextNum = parseInt(localStorage.getItem('bnx_petty_seq')||'6',10)+1;
-    pprev.textContent = prefix+'-'+fy+'-'+(Number(fy)+1)+'-'+String(nextNum).padStart(3,'0');
+    pprev.textContent = prefix+'-'+String(fyFull).slice(-2)+'-'+String(fyFull+1).slice(-2)+'-'+String(nextNum).padStart(3,'0');
   }
 }
 async function saveVoucherNumbering(){
-  const billPrefix = (document.getElementById('vnBillPrefix').value||'').trim() || 'BN/';
+  const billPrefix = (document.getElementById('vnBillPrefix').value||'').trim() || bnxDefaultBillPrefix_();
   const billStart = parseInt(document.getElementById('vnBillStart').value, 10);
   const pettyPrefix = (document.getElementById('vnPettyPrefix').value||'').trim() || 'PC';
   const pettyStart = parseInt(document.getElementById('vnPettyStart').value, 10);
@@ -17505,7 +17511,11 @@ async function saveVoucherNumbering(){
     localStorage.setItem('bnx_petty_seq', String(pettyStart-1));
     if (typeof pettyVoucherCount !== 'undefined') pettyVoucherCount = pettyStart-1;
   }
+  const _vf = document.getElementById('vnFooter');
+  if (_vf) localStorage.setItem('bnx_invoice_footer', (_vf.value||'').trim());
+  const sheetOk = await bnxPushInvoiceSettings_();
   loadVoucherNumberingUI();
+  if (typeof showNotif === 'function') showNotif((sheetOk?'☁ Prefix, series & footer saved in Google Sheet · ':'⚠ Google Sheet not updated (kept on this PC) · ')+'applies from the next voucher','success');
   if (typeof showNotif === 'function') showNotif('✅ Voucher numbering saved '+(billServerSaved?'to server — all POS terminals use the same next number':'locally — server numbering could not be updated')+' · applies from the next voucher onward', billServerSaved?'success':'error');
   bnxRefreshNextBillNo();
 }
@@ -19321,8 +19331,37 @@ const BL_DATA=[]; // PRODUCTION: no hardcoded/demo bills
    drop-in change), and appears immediately in Bills List with working
    Reprint / Edit / Cancel — not just View. */
 function bnxBillRegKey(){ return 'bnx_bill_register_' + (CLIENT_ID || 'default'); }
-function bnxGetBillRegister(){ try{ return JSON.parse(localStorage.getItem(bnxBillRegKey())||'[]'); }catch(e){ return []; } }
-function bnxSaveBillRegister(list){ localStorage.setItem(bnxBillRegKey(), JSON.stringify(list)); }
+window.__bnxBillRegMem = window.__bnxBillRegMem || {};
+function bnxGetBillRegister(){
+  try{ const raw=localStorage.getItem(bnxBillRegKey()); if(raw) return JSON.parse(raw); }catch(e){}
+  return window.__bnxBillRegMem[bnxBillRegKey()] || [];
+}
+/* Quota-safe save: full list always kept in memory for this session; localStorage
+   gets progressively trimmed (stale caches evicted, then oldest bills dropped) so
+   QuotaExceededError never breaks bill sync. Server remains source of truth. */
+function bnxSaveBillRegister(list){
+  const key=bnxBillRegKey();
+  window.__bnxBillRegMem[key]=list;
+  const tryset=v=>{ try{ localStorage.setItem(key, JSON.stringify(v)); return true; }catch(e){ return false; } };
+  if(tryset(list)) return true;
+  // 1) evict regenerable caches
+  try{
+    Object.keys(localStorage).forEach(k=>{
+      if(k!==key && /^(bnx_(report|cache|dsr|tmp|log)|erp_.*_cache|bnx_health|bnx_api_log)/i.test(k)) localStorage.removeItem(k);
+    });
+  }catch(e){}
+  if(tryset(list)) return true;
+  // 2) keep newest bills only, shrinking until it fits
+  const dk=b=>String((b&&(b.date||b.bill_date||b.created_at||b.ts))||'');
+  const sorted=list.slice().sort((a,b)=>dk(b).localeCompare(dk(a)));
+  for(const n of [3000,2000,1200,800,500,300,150,60]){
+    if(sorted.length<=n) continue;
+    if(tryset(sorted.slice(0,n))){ console.warn('[bnxSaveBillRegister] storage full — kept newest',n,'of',list.length,'bills locally'); return true; }
+  }
+  console.warn('[bnxSaveBillRegister] localStorage full — using in-memory register for this session');
+  try{ localStorage.removeItem(key); }catch(e){}
+  return false;
+}
 
 // v29 FIX (flagged in AUDIT NOTE below, now fixed): bnx_bill_seq,
 // bnx_kot_seq, bnx_open_kots, bnx_restaurant_info, bnx_user_mode, and
@@ -21189,7 +21228,13 @@ function bnxItemGroupOptionsHtml_(category, selectedId){
     add(bnxItemGroupKey_(i),bnxItemGroupName_(i));
   });
   if(selectedId&&!seen.has(bnxNormKey_(selectedId))){const gm=window.__BNX_LIVE_GROUP_MASTER[bnxNormKey_(selectedId)];if(gm)add(gm.id,gm.name);}
-  const groups=[...seen.values()].sort((a,b)=>a.name.localeCompare(b.name));
+  /* FIX ("item create — item group dropdown list not showing"): the list used to be built only from
+     groups that existing items in the chosen category already use, so a new/empty category showed
+     almost nothing. Now this category's own groups come first, followed by EVERY active group
+     from ITEM_GROUP_MASTER, so any group can be picked. */
+  const own=new Set(seen.keys());
+  Object.keys(window.__BNX_LIVE_GROUP_MASTER||{}).forEach(k=>{const g=window.__BNX_LIVE_GROUP_MASTER[k];add(g&&g.id,g&&g.name);});
+  const groups=[...seen.entries()].map(e=>Object.assign({own:own.has(e[0])},e[1])).sort((a,b)=>(b.own-a.own)||a.name.localeCompare(b.name));
   return '<option value="">— No Item Group —</option>'+groups.map(g=>`<option value="${bnxEscapeHtml_(g.id||g.name)}"${bnxNormKey_(g.id||g.name)===bnxNormKey_(selectedId||'')?' selected':''}>${bnxEscapeHtml_(g.name)}</option>`).join('');
 }
 function bnxRefreshNiItemGroups(){
@@ -21198,6 +21243,13 @@ function bnxRefreshNiItemGroups(){
   const cur=sel.value||'';
   sel.innerHTML=bnxItemGroupOptionsHtml_(cat.value,cur);
   if(cur) sel.value=cur;
+  /* group master not loaded yet -> load it once, then redraw the list */
+  if(!Object.keys(window.__BNX_LIVE_GROUP_MASTER||{}).length && !window.__bnxNiGroupLoading){
+    window.__bnxNiGroupLoading=true;
+    bnxEnsureCategoryGroupMap_().then(()=>{ const c2=document.getElementById('ni-cat'), s2=document.getElementById('ni-group');
+      if(c2&&s2){ const v=s2.value||''; s2.innerHTML=bnxItemGroupOptionsHtml_(c2.value,v); if(v) s2.value=v; } })
+      .finally(()=>{ window.__bnxNiGroupLoading=false; });
+  }
 }
 function bnxUpdateNiVegVisibility(){
   const catEl = document.getElementById('ni-cat');
@@ -39451,7 +39503,7 @@ function bnxOpenImportHub(){
       out.push('\x1Ba1','\x1BE1',(upiQr.amount>0?'SCAN & PAY Rs '+upiQr.amount.toFixed(2):'SCAN & PAY (UPI)')+'\n','\x1BE0',BNX_UPI_QR_MARK,escPosText('UPI: '+upiQr.vpa)+'\n',(upiQr.amount>0?'Amount auto-filled in UPI app\n':''));
       out.push(line('-',width)+'\n');
     }
-    out.push('\x1Ba1','We Support round table\n','THANK YOU, VISIT AGAIN\n','\n\n','\x1DVA0');
+    out.push('\x1Ba1',...bnxInvoiceFooterLines_().map(l=>escPosText(l)+'\n'),'\n\n','\x1DVA0');
     return out;
   }
 
@@ -43795,6 +43847,44 @@ window.bnxFindNetPrinters=async function(){
   }
   render();
 };
+})();
+</script>
+<script id="bnx-invoice-settings-sync">
+/* Invoice footer + Petty voucher series (+ bill prefix mirror) -> Google Sheet (CLIENT_SETTINGS).
+   Bill number series itself is already server-authoritative via SET_BILL_NUMBERING / NEXT_BILL_NO.
+   Logo + UPI QR are synced by the CLIENT_ASSETS block (SAVE_CLIENT_ASSETS). */
+(function(){
+  var W=window, DEF='We Support Round Table\nTHANK YOU, VISIT AGAIN';
+  W.bnxInvoiceFooterText_=function(){ try{ var v=localStorage.getItem('bnx_invoice_footer'); return (v===null||v==='')?DEF:v; }catch(e){ return DEF; } };
+  W.bnxInvoiceFooterLines_=function(){ return String(W.bnxInvoiceFooterText_()).split(/\r?\n/).map(function(x){return x.trim();}).filter(Boolean).slice(0,2); };
+  function st(msg,ok){ var e=document.getElementById('vnSheetStatus'); if(e){ e.textContent=msg; e.style.color=ok?'var(--green,#1a9456)':'var(--red,#c0392b)'; } }
+  function api(a,p){ return typeof W.gasApi==='function'?W.gasApi(a,p||{},'V2_CORE'):Promise.resolve({success:false,error:'gasApi unavailable'}); }
+  W.bnxPushInvoiceSettings_=async function(){
+    try{
+      var r=await api('SAVE_INVOICE_SETTINGS',{
+        billPrefix:localStorage.getItem('bnx_billno_prefix')||(typeof bnxDefaultBillPrefix_==='function'?bnxDefaultBillPrefix_():'BN/'),
+        pettyPrefix:localStorage.getItem('bnx_pettyno_prefix')||'PC',
+        pettyNext:parseInt(localStorage.getItem('bnx_petty_seq')||'6',10)+1,
+        footer:W.bnxInvoiceFooterText_()
+      });
+      if(r&&r.success){ st('☁ Saved in Google Sheet',true); return true; }
+      st('⚠ Server not updated — deploy BNX_InvoiceSettings.gs ('+((r&&r.error)||'no response')+')',false); return false;
+    }catch(e){ st('⚠ '+(e.message||e),false); return false; }
+  };
+  W.bnxPullInvoiceSettings_=async function(){
+    try{
+      var r=await api('GET_INVOICE_SETTINGS',{}); if(!r||!r.success||!r.data) return false;
+      var d=r.data;
+      if(d.pettyPrefix) localStorage.setItem('bnx_pettyno_prefix',d.pettyPrefix);
+      if(d.pettyNext>0){ var cur=parseInt(localStorage.getItem('bnx_petty_seq')||'0',10); if(d.pettyNext-1>cur) localStorage.setItem('bnx_petty_seq',String(d.pettyNext-1)); }
+      if(typeof d.footer==='string' && d.footer.trim()) localStorage.setItem('bnx_invoice_footer',d.footer);
+      if(d.billPrefix && !localStorage.getItem('bnx_billno_prefix')) localStorage.setItem('bnx_billno_prefix',d.billPrefix);
+      if(typeof W.loadVoucherNumberingUI==='function') W.loadVoucherNumberingUI();
+      st('☁ Loaded from Google Sheet',true); return true;
+    }catch(e){ return false; }
+  };
+  setTimeout(function(){ W.bnxPullInvoiceSettings_(); },2500);
+  document.addEventListener('click',function(ev){ var t=ev.target&&ev.target.closest&&ev.target.closest('[onclick]'); if(t&&/s-voucher/.test(t.getAttribute('onclick')||'')) setTimeout(W.bnxPullInvoiceSettings_,150); },true);
 })();
 </script>
 </body></html>
