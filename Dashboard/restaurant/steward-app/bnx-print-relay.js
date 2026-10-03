@@ -2,7 +2,7 @@
 'use strict';
 
 /*
- * Balaji NextGen — RAW ESC/POS Print Relay  (v3)
+ * Balaji NextGen — RAW ESC/POS Print Relay  (v3.1)
  *
  * A phone browser can never open a raw TCP socket to a thermal printer.
  * This relay runs on any always-on PC / Raspberry Pi on the same Wi-Fi/LAN.
@@ -81,6 +81,12 @@ function originAllowed(origin) {
 
 if (!PRINT_KEY || PRINT_KEY.length < 16) {
   console.error('ERROR: Set BNX_PRINT_KEY to a secret of at least 16 characters.');
+  process.exit(1);
+}
+/* v3.1: the relay must never listen on a raw printer port — a browser pointed at it
+   would then be "talking HTTPS" exactly where printers expect ESC/POS. */
+if ([PORT, HTTP_PORT].some(p => p === PRINTER_PORT || p === 9101 || p === 9102 || p === 515)) {
+  console.error('ERROR: PORT / BNX_HTTP_PORT must not be a printer port (9100/9101/9102/515). Use the defaults 9191 / 9192.');
   process.exit(1);
 }
 if (Boolean(CERT_PATH) !== Boolean(KEY_PATH)) {
@@ -166,6 +172,7 @@ function allowedPrinterIp(ip) {
   const parts = s.split('.').map(Number);
   if (parts.some(n => n > 255)) return false;
   if (parts[3] === 0 || parts[3] === 255) return false;
+  if (lanAddresses().indexOf(s) >= 0) return false;   // never "print" to the relay PC itself
   return PRINTER_PREFIXES.some(p => s.startsWith(p));
 }
 
@@ -292,7 +299,7 @@ async function handleRequest(req, res) {
     return sendJson(req, res, 200, {
       ok: true,
       service: 'BNX RAW ESC/POS Relay',
-      version: 3,
+      version: 3.1,
       protocol: req.socket.encrypted ? 'https' : 'http',
       tcpPort: PRINTER_PORT,
       tokenRequired: true,

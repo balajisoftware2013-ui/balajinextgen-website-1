@@ -37,6 +37,143 @@
   });
 })();
 </script>
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   BNX PRINTER-PORT FIREWALL (2026-10-03)
+   Bug: KOT did not print, but the printer kept spewing pages of junk
+   ("h2 http/1.1 …"). That junk is a browser TLS/HTTPS handshake. It
+   happens when the "Print Relay address" is set to a PRINTER (e.g.
+   192.168.0.192 or https://192.168.0.192:9100) instead of the relay PC
+   (…:9191 / :9192). Every relay call — /health, /probe, /print, the
+   25-second pending-KOT retry, and "Trust relay certificate" — then
+   opened an HTTPS connection to the printer's raw port 9100, and the
+   printer prints every byte it receives. Real KOTs never arrive
+   because the "relay" is not a relay.
+   Fix: nothing in this app may ever open an HTTP/HTTPS/WebSocket
+   connection to a printer IP or a raw printer port. Bad saved relay
+   addresses are removed, saving one is refused with a clear message,
+   and fetch / XHR / WebSocket / EventSource / window.open are guarded.
+   Printing still goes ONLY through the real relay (POST /print with
+   ESC/POS) or RawBT.
+   ═══════════════════════════════════════════════════════════════════ */
+(function(){
+  if(window.__bnxPrinterFirewall) return; window.__bnxPrinterFirewall=true;
+  var PRINTER_PORTS={'9100':1,'9101':1,'9102':1,'9103':1,'515':1,'4000':0};
+  var DEFAULT_IPS=['192.168.0.192','192.168.0.151','192.168.0.195','192.168.0.210'];
+  var IP_RE=/\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
+  var cache=null, cacheAt=0;
+  function ls(){ try{ return window.localStorage; }catch(e){ return null; } }
+  function printerIps(){
+    if(cache&&Date.now()-cacheAt<4000) return cache;
+    var set={}; DEFAULT_IPS.forEach(function(i){set[i]=1;});
+    var L=ls();
+    try{
+      if(L) for(var i=0;i<L.length;i++){
+        var k=L.key(i);
+        if(!/^(bnx_printer_settings_|bnx_printer_profile|bnx_kot_printers|bnx_printers_)/i.test(k)) continue;
+        String(L.getItem(k)||'').replace(IP_RE,function(ip){set[ip]=1;return ip;});
+      }
+    }catch(e){}
+    try{ if(typeof window.bnxClient10KOTPrinters==='function'){ var m=window.bnxClient10KOTPrinters()||{}; Object.keys(m).forEach(function(r){ String(m[r]||'').replace(IP_RE,function(ip){set[ip]=1;return ip;}); }); } }catch(e){}
+    cache=Object.keys(set); cacheAt=Date.now();
+    return cache;
+  }
+  function toUrl(u){
+    u=String(u==null?'':(u.url||u)).trim();
+    if(!u) return null;
+    if(!/^[a-z][a-z0-9+.\-]*:\/\//i.test(u)){
+      if(/^(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?:[\/?#]|$)/.test(u)) u=(location.protocol==='https:'?'https://':'http://')+u;
+      else return null;                      /* relative app URL — never a printer */
+    }
+    try{ return new URL(u); }catch(e){ return null; }
+  }
+  /* '' = fine, otherwise the reason it would hit a printer */
+  function problem(u){
+    var x=toUrl(u); if(!x) return '';
+    if(!/^(https?|wss?):$/i.test(x.protocol)) return '';
+    var port=x.port||(/^(https|wss):$/i.test(x.protocol)?'443':'80');
+    if(PRINTER_PORTS[port]) return 'port '+port+' is a printer data port, not a web address';
+    if(printerIps().indexOf(x.hostname)>=0) return x.hostname+' is a PRINTER, not the Print Relay PC';
+    return '';
+  }
+  window.bnxPrinterUrlProblem_=problem;
+  window.bnxPrinterFirewallIps_=function(){ cache=null; return printerIps(); };
+
+  var warned={};
+  function report(why,u){
+    var key=why+'|'+u;
+    if(!warned[key]){ warned[key]=1; console.error('[BNX FIREWALL] blocked a web request to a printer ('+why+'): '+u); }
+    window.__bnxRelayRejected=why;
+    try{ if(typeof window.toast==='function') window.toast('⛔ Blocked junk print: '+why+'. Set the Print Relay PC address (…:9191) in Printer Setup.','error'); }catch(e){}
+  }
+  function blockedErr(why){ var e=new TypeError('Blocked: '+why+' (prevents junk printing)'); e.bnxPrinterBlocked=true; return e; }
+
+  /* 1) remove an already-saved bad relay address (stops the 25 s retry flood at once) */
+  function cleanStored(){
+    var L=ls(); if(!L) return;
+    try{
+      var bad=[];
+      for(var i=0;i<L.length;i++){ var k=L.key(i); if(/^bnx_print_relay_/.test(k)&&!/^bnx_print_relay_key_/.test(k)){ var why=problem(L.getItem(k)); if(why) bad.push([k,L.getItem(k),why]); } }
+      bad.forEach(function(b){ L.removeItem(b[0]); try{ L.setItem('bnx_print_relay_rejected',JSON.stringify({value:b[1],why:b[2],at:Date.now()})); }catch(e){} console.warn('[BNX FIREWALL] removed saved relay address "'+b[1]+'" — '+b[2]); window.__bnxRelayRejected=b[2]; });
+    }catch(e){}
+    try{ if(window.BNX_PRINT_RELAY_URL&&problem(window.BNX_PRINT_RELAY_URL)) window.BNX_PRINT_RELAY_URL=''; }catch(e){}
+  }
+  cleanStored();
+
+  /* 2) refuse to save one again (covers every setup screen + ?relay= link) */
+  try{
+    var S=Storage.prototype, oSet=S.setItem;
+    S.setItem=function(k,v){
+      if(/^bnx_print_relay_/.test(String(k))&&!/^bnx_print_relay_key_/.test(String(k))){
+        var why=problem(v);
+        if(why){ report(why,String(v)); try{ oSet.call(this,'bnx_print_relay_rejected',JSON.stringify({value:String(v),why:why,at:Date.now()})); }catch(e){} return; }
+      }
+      return oSet.apply(this,arguments);
+    };
+  }catch(e){}
+
+  /* 3) network guards */
+  try{
+    var oFetch=window.fetch;
+    if(typeof oFetch==='function') window.fetch=function(input,init){
+      var u=typeof input==='string'?input:(input&&input.url)||String(input||'');
+      var why=problem(u); if(why){ report(why,u); return Promise.reject(blockedErr(why)); }
+      return oFetch.apply(this,arguments);
+    };
+  }catch(e){}
+  try{
+    var oOpen=XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open=function(m,u){ var why=problem(u); if(why){ report(why,u); throw blockedErr(why); } return oOpen.apply(this,arguments); };
+  }catch(e){}
+  ['WebSocket','EventSource'].forEach(function(n){
+    try{
+      var C=window[n]; if(typeof C!=='function') return;
+      var W=function(u){ var why=problem(u); if(why){ report(why,u); throw blockedErr(why); } return new (Function.prototype.bind.apply(C,[null].concat([].slice.call(arguments))))(); };
+      W.prototype=C.prototype; Object.keys(C).forEach(function(k){ try{ W[k]=C[k]; }catch(e){} });
+      ['CONNECTING','OPEN','CLOSING','CLOSED'].forEach(function(k){ if(k in C) W[k]=C[k]; });
+      window[n]=W;
+    }catch(e){}
+  });
+  /* tell the staff once the app is up, if a bad address was removed */
+  window.addEventListener('load',function(){ setTimeout(function(){
+    if(!window.__bnxRelayRejected) return;
+    try{ if(typeof window.toast==='function') window.toast('⛔ Printer Setup: the Print Relay address pointed at a printer ('+window.__bnxRelayRejected+') — it was removed. Enter the relay PC address (…:9191).','error'); }catch(e){}
+  },2500); });
+  /* the in-memory iOS storage shim is not a Storage instance — guard it too */
+  try{
+    var L0=window.localStorage;
+    if(L0&&!(typeof Storage!=='undefined'&&L0 instanceof Storage)){
+      var sSet=L0.setItem;
+      L0.setItem=function(k,v){ if(/^bnx_print_relay_/.test(String(k))&&!/^bnx_print_relay_key_/.test(String(k))){ var why=problem(v); if(why){ report(why,String(v)); return; } } return sSet.apply(this,arguments); };
+    }
+  }catch(e){}
+  try{
+    var oWin=window.open;
+    window.open=function(u){ var why=problem(u); if(why){ report(why,u); return null; } return oWin.apply(window,arguments); };
+  }catch(e){}
+})();
+
+</script>
 
 <!-- BNX PASS42 — OP2 order placement + print relay v3 route. -->
 
@@ -8226,6 +8363,7 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
         return true;
       }catch(e){
         if(e&&e.name==='AbortError') lastErr=new Error('Print relay did not answer (timeout)');
+        else if(e&&e.bnxPrinterBlocked){ lastErr=new Error('Print Relay address is a printer ('+base+') — open Printer Setup and enter the relay PC address (…:9191)'); lastErr.noRetry=true; e.noRetry=true; }
         else if(e instanceof TypeError) lastErr=new Error('Cannot reach the Print Relay ('+base+'). Check: relay PC is ON, phone is on the same Wi-Fi, and the relay https address was opened once in this browser (Printer Setup → Trust certificate)');
         else lastErr=e;
         if(e&&e.noRetry) break;
@@ -8510,6 +8648,8 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
   function setupSave_(){
     const u=String((document.getElementById('bnx-pr-url')||{}).value||'').trim().replace(/\/+$/,'');
     const k=String((document.getElementById('bnx-pr-key')||{}).value||'').trim();
+    const why=(u&&typeof window.bnxPrinterUrlProblem_==='function')?window.bnxPrinterUrlProblem_(u):'';
+    if(why){ setupResult_('⛔ That address is a <b>printer</b> ('+why+'). Do NOT put the printer IP here — the printer would print junk. Enter the <b>Print Relay PC</b> address shown in the relay window, e.g. <b>https://192.168.0.50:9191</b>. Printer IPs go in the Kitchen / Bar / Hukka boxes.',false); return ''; }
     try{
       localStorage.setItem(cidKey_('bnx_print_relay_'),u);
       localStorage.setItem(cidKey_('bnx_print_relay_key_'),k);
@@ -14046,6 +14186,8 @@ html:not([data-theme]) #s-home .hero .hs-lbl{font-size:10px!important;letter-spa
     lsSet('bnx_printer_settings_'+cid(),JSON.stringify(c));
     ROLES.forEach(function(r){var pe=document.getElementById('hsp-paper-'+r.k),ce=document.getElementById('hsp-cut-'+r.k);if(pe&&ce&&window.bnxSetPrinterProfile)window.bnxSetPrinterProfile(r.k,pe.value,ce.value);});
     var u=String((document.getElementById('hsp-url')||{}).value||'').trim().replace(/\/+$/,''),k=String((document.getElementById('hsp-key')||{}).value||'').trim();
+    var why=(u&&typeof window.bnxPrinterUrlProblem_==='function')?window.bnxPrinterUrlProblem_(u):'';
+    if(why){ msg('⛔ That address is a <b>printer</b> ('+why+'). Do NOT put the printer IP here — the printer would print junk. Enter the <b>Print Relay PC</b> address shown in the relay window, e.g. <b>https://192.168.0.50:9191</b>. Printer IPs go in the Kitchen / Bar / Hukka boxes.',false); return false; }
     lsSet(K('bnx_print_relay_'),u);lsSet(K('bnx_print_relay_key_'),k);return true;
   }
   window.hspClose=function(e){if(e&&e.target!==e.currentTarget)return;var h=document.getElementById('bnx-printer-setup-host');if(h)h.innerHTML='';};
@@ -14074,7 +14216,9 @@ html:not([data-theme]) #s-home .hero .hs-lbl{font-size:10px!important;letter-spa
   };
   window.hspTrust=function(){var u=String((document.getElementById('hsp-url')||{}).value||relay()).trim().replace(/\/+$/,'');
     if(!u){msg('Type the relay address first, then tap this button.',false);return;}
-    if(!/^https?:\/\//i.test(u))u='https://'+u; u=u.replace(/^http:/i,'https:'); window.open(u+'/health','_blank');};
+    if(!/^https?:\/\//i.test(u))u='https://'+u; u=u.replace(/^http:/i,'https:');
+    var why=(typeof window.bnxPrinterUrlProblem_==='function')?window.bnxPrinterUrlProblem_(u):''; if(why){ msg('⛔ That address is a <b>printer</b> ('+why+'). Do NOT put the printer IP here — the printer would print junk. Enter the <b>Print Relay PC</b> address shown in the relay window, e.g. <b>https://192.168.0.50:9191</b>. Printer IPs go in the Kitchen / Bar / Hukka boxes.',false); return; }
+    window.open(u+'/health','_blank');};
   window.hspRetry=async function(){msg('Printing waiting KOTs…');var n=await retryQueue(true);msg(n?'✅ '+n+' printed':'Nothing printed yet',!!n);};
   var PAPERS=[['80','80 mm · 48 col'],['80c','80 mm compact · 42 col'],['58','58 mm · 32 col']];
   var CUTS=[['partial','Auto-cut (partial)'],['full','Auto-cut (full)'],['feedcut','Cut after feed'],['none','No cutter (tear)']];
