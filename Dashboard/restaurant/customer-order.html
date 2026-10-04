@@ -371,7 +371,7 @@ async function gasApi(action,payload,endpoint){
        to bolt on here. */
     const ctl = new AbortController(); const tm = setTimeout(()=>ctl.abort(), 20000);   // never hang forever on a slow/blocked backend
     try{
-      const r=await fetch(url,{method:'POST',signal:ctl.signal,body:JSON.stringify(Object.assign({action:action,clientId:STATE.clientId,sessionToken:bnxGuestSessionToken()},payload))});
+      const r=await fetch(url,{method:'POST',signal:ctl.signal,body:JSON.stringify(Object.assign({action:action,clientId:STATE.clientId,sessionToken:bnxGuestSessionToken(),guest:true,source:'CUSTOMER_QR',tableId:STATE.tableId||''},payload))});
       return await r.json();
     } finally { clearTimeout(tm); }
   }catch(e){ return {success:false,offline:true,error:e.message}; }
@@ -442,6 +442,25 @@ const STATE = {
   canCall:  /^(1|true|yes|on)$/i.test(qs.get('call')||''),
   notifyOptIn: true, // WhatsApp (falls back to SMS) opt-in — mirrors #ph-consent
 };
+/* FIX ("client name and logo not show after scan") — 2026-10-04
+   Root cause: name + logo came ONLY from GET_CLIENT_INFO, and the live
+   backend now answers every call from this guest page with
+   "Invalid or expired session" (the random guest UUID is no longer
+   accepted), so the page fell back to "Menu" + 🍽 and the localStorage
+   copy (bnx_ci_) was never written because no call ever succeeded.
+   Fix (frontend half): the Table QR now carries the restaurant name (n=)
+   and, when it is a hosted image, the logo (lg=), so the brand shows the
+   instant the QR is scanned, with no server call. Server info still
+   overrides it when GET_CLIENT_INFO succeeds. Every call is also flagged
+   guest:true + source:CUSTOMER_QR so the backend can allow the guest
+   actions (backend half — see bnxVerifySession patch). */
+(function(){
+  const n=String(qs.get('n')||qs.get('name')||'').trim().slice(0,60);
+  const lg=String(qs.get('lg')||qs.get('logo')||'').trim();
+  if(n) STATE.restaurantName=n;
+  if(lg && (/^https:\/\//i.test(lg) || /^[\w-]{20,}$/.test(lg))) STATE.logoUrl=lg;
+  STATE.brandFromQr=!!(n||lg);
+})();
 
 
 /* Fallback menu — used only if the server can't be reached yet, so the
@@ -484,12 +503,16 @@ document.getElementById('lg-retry').onclick = ()=>{
      is awaited here, capped at 4 s, so the guest always sees the Welcome screen quickly. */
   window.__menuReady = Promise.all([ loadMenuFromServer().catch(()=>{}), loadActiveMenuCard().catch(()=>{}) ]);
   /* show the last-known name/logo of THIS restaurant instantly (saved from a previous scan) */
-  try{ const ci=JSON.parse(localStorage.getItem('bnx_ci_'+STATE.clientId)||'null'); if(ci){ if(ci.name) STATE.restaurantName=ci.name; if(ci.logoUrl) STATE.logoUrl=ci.logoUrl; applyBrandLogo(); } }catch(e){}
+  try{ const ci=JSON.parse(localStorage.getItem('bnx_ci_'+STATE.clientId)||'null');
+    if(ci){ if(ci.name && !qs.get('n')) STATE.restaurantName=ci.name; if(ci.logoUrl && !qs.get('lg')) STATE.logoUrl=ci.logoUrl; } }catch(e){}
+  if (STATE.brandFromQr) bnxSaveInfoCache({name:STATE.restaurantName, logoUrl:STATE.logoUrl});
+  bnxPaintBrandText(); applyBrandLogo();
   const infoP = gasApi('GET_CLIENT_INFO', {}, 'V2_CORE').catch(()=>null);
   const infoRes = await Promise.race([ infoP, new Promise(r=>setTimeout(()=>r(null), 5000)) ]);
-  if (!infoRes) infoP.then(r=>{ if (r && r.success && r.data) bnxLateInfo(r.data); });   /* slow server: still apply logo + name when it arrives */
+  if (!infoRes) infoP.then(r=>{ if (r && r.success && r.data) bnxLateInfo(r.data); else bnxInfoFail(r); });
+  else if (!(infoRes.success && infoRes.data)) bnxInfoFail(infoRes);   /* slow server: still apply logo + name when it arrives */
   if (infoRes && infoRes.success && infoRes.data){
-    STATE.restaurantName = infoRes.data.name || infoRes.data.RESTAURANT_NAME || STATE.restaurantName;
+    STATE.restaurantName = infoRes.data.name || infoRes.data.RESTAURANT_NAME || infoRes.data.clientName || STATE.restaurantName;
     // FIX ("logo"): this checked infoRes.data.icon, a field that doesn't
     // exist anywhere in the real GET_CLIENT_INFO response -- the actual
     // field the backend returns (and that Settings → Restaurant Info's
@@ -512,8 +535,7 @@ document.getElementById('lg-retry').onclick = ()=>{
     if (!favicon){ favicon = document.createElement('link'); favicon.rel = 'icon'; document.head.appendChild(favicon); }
     favicon.href = STATE.logoUrl;
   }
-  document.title = STATE.restaurantName + ' — Order';
-  document.getElementById('lg-name').textContent = STATE.restaurantName;
+  bnxPaintBrandText();
   document.getElementById('ph-table-sub').textContent = STATE.tableId ? ('Table '+STATE.tableId) : 'Takeaway / Counter';
   document.getElementById('mn-sub').textContent = STATE.tableId ? ('Table '+STATE.tableId) : 'Takeaway / Counter';
 
@@ -576,20 +598,41 @@ function bnxPickLogo(d){
 function bnxLogoCandidates(u){
   u=String(u||'').trim(); if(!u) return [];
   if (/^data:image\//i.test(u)) return [u];
+  if (/^[\w-]{20,}$/.test(u)) u='https://drive.google.com/file/d/'+u+'/view';   /* bare Drive id from the QR link */
   const m = u.match(/drive\.google\.com\/(?:file\/d\/|open\?id=|uc\?(?:export=\w+&)?id=|thumbnail\?id=)([\w-]+)/) || u.match(/lh3\.googleusercontent\.com\/d\/([\w-]+)/);
   if (m) return ['https://drive.google.com/thumbnail?id='+m[1]+'&sz=w400','https://lh3.googleusercontent.com/d/'+m[1]+'=w400','https://drive.google.com/uc?export=view&id='+m[1]];
   return [u.replace(/^http:\/\//i,'https://')];
 }
 function bnxSaveInfoCache(d){
-  try{ localStorage.setItem('bnx_ci_'+STATE.clientId, JSON.stringify({name:d.name||d.RESTAURANT_NAME||'', logoUrl:bnxPickLogo(d)})); }catch(e){}
+  try{
+    const old=JSON.parse(localStorage.getItem('bnx_ci_'+STATE.clientId)||'null')||{};
+    const name=d.name||d.RESTAURANT_NAME||d.clientName||old.name||'', logoUrl=bnxPickLogo(d)||old.logoUrl||'';
+    if(/^data:/i.test(logoUrl) && logoUrl.length>400000) return;   /* never fill localStorage with a huge data URL */
+    localStorage.setItem('bnx_ci_'+STATE.clientId, JSON.stringify({name:name, logoUrl:logoUrl}));
+  }catch(e){}
+}
+/* restaurant name in every text slot: landing title, menu top bar, brand strip, tab title */
+function bnxPaintBrandText(){
+  const real = STATE.restaurantName && STATE.restaurantName!=='Our Restaurant';
+  document.title = (real?STATE.restaurantName:'Menu') + ' — Order';
+  const ln=document.getElementById('lg-name'); if(ln) ln.textContent = real?STATE.restaurantName:'Welcome';
+  const mt=document.getElementById('mn-title'); if(mt) mt.textContent = real?STATE.restaurantName:'Menu';
+  const bn=document.getElementById('brandStripName'); if(bn && real) bn.textContent = STATE.restaurantName;
+  const sp=document.getElementById('mn-brand-strip'); if(sp && real && document.getElementById('s-menu').classList.contains('active')) sp.style.display='flex';
+  if (STATE.logoUrl && !/^data:/i.test(STATE.logoUrl)){
+    let fav=document.querySelector('link[rel="icon"]'); if(!fav){ fav=document.createElement('link'); fav.rel='icon'; document.head.appendChild(fav); }
+    const c=bnxLogoCandidates(STATE.logoUrl); if(c[0]) fav.href=c[0];
+  }
+}
+function bnxInfoFail(r){
+  const why=(r&&(r.error||r.message))||'no response';
+  console.warn('[QR] GET_CLIENT_INFO failed: '+why+(/session/i.test(why)?' — backend must allow guest (source CUSTOMER_QR) actions; see bnxVerifySession patch':''));
 }
 function bnxLateInfo(d){
-  STATE.restaurantName = d.name || d.RESTAURANT_NAME || STATE.restaurantName;
+  STATE.restaurantName = d.name || d.RESTAURANT_NAME || d.clientName || STATE.restaurantName;
   STATE.logoUrl = bnxPickLogo(d) || STATE.logoUrl;
   bnxSaveInfoCache(d);
-  document.title = STATE.restaurantName + ' — Order';
-  const ln=document.getElementById('lg-name'); if(ln) ln.textContent = STATE.restaurantName;
-  const bn=document.getElementById('brandStripName'); if(bn) bn.textContent = STATE.restaurantName;
+  bnxPaintBrandText();
   const flag=(v)=> v===true || /^(1|true|yes|on)$/i.test(String(v==null?'':v));
   const bo=d.customerOrderEnabled ?? d.CUSTOMER_ORDER_ENABLED, bc=d.customerCallEnabled ?? d.CUSTOMER_CALL_ENABLED;
   if (bo!==undefined && bo!==null && bo!=='') STATE.canOrder=flag(bo);
@@ -864,6 +907,7 @@ async function enterMenu(){
     if (hasRealName) document.getElementById('brandStripName').textContent = STATE.restaurantName;
     applyBrandLogo();
   }
+  bnxPaintBrandText();
   applyOrderMode();
   if (STATE.activeMenuCard){
     document.getElementById('mn-view-card-btn').style.display = 'block';
