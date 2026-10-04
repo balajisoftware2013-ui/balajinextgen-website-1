@@ -71,8 +71,10 @@ window.BNX_STEWARD_BUILD='PRN-FW2';
     try{
       if(L) for(var i=0;i<L.length;i++){
         var k=L.key(i);
-        if(!/^(bnx_printer_settings_|bnx_printer_profile|bnx_kot_printers|bnx_printers_)/i.test(k)) continue;
+        if(!/^(bnx_printer_settings_|bnx_printer_profile|bnx_kot_printers|bnx_printers_|bnx_printer_master_)/i.test(k)) continue;
         String(L.getItem(k)||'').replace(IP_RE,function(ip){set[ip]=1;return ip;});
+        /* printer ports from the server printer master are raw-print ports too (never web ports) */
+        if(/^bnx_printer_master_/i.test(k)){ try{ var pm=JSON.parse(L.getItem(k)||'{}')||{}; Object.keys(pm).forEach(function(r){ var pt=String(pm[r]&&pm[r].port||'').trim(); if(/^\d{2,5}$/.test(pt)&&!/^(80|443|8080|8443|9191|9192)$/.test(pt)) PRINTER_PORTS[pt]=1; }); }catch(e){} }
       }
     }catch(e){}
     try{ if(typeof window.bnxClient10KOTPrinters==='function'){ var m=window.bnxClient10KOTPrinters()||{}; Object.keys(m).forEach(function(r){ String(m[r]||'').replace(IP_RE,function(ip){set[ip]=1;return ip;}); }); } }catch(e){}
@@ -5941,7 +5943,8 @@ function openTable(id){
   if(!selTable)return;
   const sc={AVAILABLE:'var(--green)',OCCUPIED:'var(--red)',RUNNING:'#d98f00',BILLED:'var(--blue)',RESERVED:'#f97316',VIP:'var(--purple)'};
   const mine=liveTableOwner(selTable);
-  const lockedRunning=(selTable.status==='OCCUPIED'||selTable.status==='RUNNING') && !mine;
+  const lockedRunning=false; /* SHARED TABLE: another steward may add his own order on a running table */
+  const sharedNotMine=(selTable.status==='OCCUPIED'||selTable.status==='RUNNING') && !mine;
   const tableTitle=document.getElementById('mob-table-title'), tableBody=document.getElementById('mob-table-body');
   if(tableTitle) tableTitle.textContent=`Table ${id} — ${bnxTblCls_(selTable)}`;
   if(!tableBody) return;
@@ -5968,10 +5971,11 @@ function openTable(id){
   if(settleBtn) settleBtn.style.display = (selTable.status==='OCCUPIED'||selTable.status==='RUNNING') && mine ? '' : 'none';
   const newBtn=document.querySelector('#table-modal button[onclick="openOrderForTable()"]');
   if(newBtn){
-    const allowNew=selTable.status==='AVAILABLE' || mine;
-    newBtn.style.display=allowNew?'':'none';
-    newBtn.disabled=!allowNew;
-    newBtn.title=allowNew?'':'This running table belongs to another steward';
+    const allowNew=true;
+    newBtn.style.display='';
+    newBtn.disabled=false;
+    newBtn.title='';
+    if(sharedNotMine) newBtn.textContent='➕ Add My Order';
   }
   document.getElementById('table-modal').classList.add('open');
 }
@@ -6147,7 +6151,7 @@ function openOrderForTable(){
   const t=selTable;
   if(!t)return;
   const mine=liveTableOwner(t);
-  if((t.status==='OCCUPIED'||t.status==='RUNNING') && !mine){ toast('🔒 This running table belongs to another steward. New order is not allowed.','error'); return; }
+  /* SHARED TABLE: any steward may place his own order on a running table; his KOTs stay his, the first steward's stay his. */
   closeModal();
   document.getElementById('no-title').textContent=`Order — Table ${t.id}`;
   order={};
@@ -8574,7 +8578,7 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
         }
         return true;
       }catch(e){
-        if(e&&e.name==='AbortError') lastErr=new Error('Print relay did not answer (timeout)');
+        if(e&&e.name==='AbortError'){ lastErr=new Error('Print relay did not answer (timeout)'); lastErr.noRetry=true; e.noRetry=true; /* it may have printed - a 2nd send would waste paper / duplicate the KOT */ }
         else if(e&&e.bnxPrinterBlocked){ lastErr=new Error('Print Relay address is a printer ('+base+') — open Printer Setup and enter the relay PC address (…:9191)'); lastErr.noRetry=true; e.noRetry=true; }
         else if(e instanceof TypeError) lastErr=new Error('Cannot reach the Print Relay ('+base+'). Check: relay PC is ON, phone is on the same Wi-Fi, and the relay https address was opened once in this browser (Printer Setup → Trust certificate)');
         else lastErr=e;
@@ -8778,7 +8782,7 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
       'IP      : '+ipSettings_()[role]+NL,'Paper   : '+({'58':'58 mm','80':'80 mm','80c':'80 mm compact'}[pr.paper])+' ('+W+' cols)'+NL,'Cutter  : '+pr.cut+NL,
       line_('-',W)+NL,'1234567890'.repeat(5).slice(0,W)+NL,line_('-',W)+NL,'If this line is complete and the',NL,'paper was cut, the printer is OK.',NL,CENTER,'PRINT OK'+NL,LEFT,NL,cutCmd_(pr.cut)].join('');
   }
-  async function direct_(role,data,jobName){
+  async function directRaw_(role,data,jobName){
     const ip=ipSettings_()[role];
     if(!ip) throw new Error('No '+role+' printer IP set for this restaurant — Profile → Printer Setup');
     const port=portFor_(role);
@@ -8813,6 +8817,62 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
       console.warn('[STEWARD PRINT] QZ Tray failed, using print relay:',qzError_(e));
       return viaRelay_(relay,ip,raw,job,port);
     }
+  }
+
+  /* ════════════ PAPER SAVER (added after the junk-print / wasted-paper tests) ════════════
+     1) TEST MODE  - the ticket is shown on screen, nothing goes to any printer.
+        Switch on in Printer Setup; it switches itself off after 4 hours so a live shift is never left silent.
+     2) DUPLICATE GUARD - the same ticket / same test to the same printer within 15 s is not sent twice.
+     3) RUNAWAY LIMIT - at most 8 tickets per printer per minute from one phone.      */
+  function dryKey_(){ return cidKey_('bnx_print_dry_'); }
+  function dryOn_(){ try{ const v=Number(localStorage.getItem(dryKey_())||0); return v>Date.now(); }catch(e){ return false; } }
+  window.bnxPrintDryOn=dryOn_;
+  window.bnxSetPrintDry=function(on){
+    try{ if(on) localStorage.setItem(dryKey_(),String(Date.now()+4*3600*1000)); else localStorage.removeItem(dryKey_()); }catch(e){}
+    try{ if(typeof window.__hspPaint==='function') window.__hspPaint(); }catch(e){}
+    try{ toast(on?'🧪 Test mode ON for 4 h — tickets show on screen, NO paper used':'🖨️ Test mode OFF — tickets will print on paper',on?'info':'success'); }catch(e){}
+  };
+  function rawToText_(raw){
+    return String(raw)
+      .replace(/\x1DV\x42[\s\S]/g,'').replace(/\x1DV[\s\S]/g,'').replace(/\x1D![\s\S]/g,'')
+      .replace(/\x1B@/g,'').replace(/\x1B[taEMd][\s\S]/g,'').replace(/\x1B[\s\S]/g,'')
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g,'').replace(/\r\n/g,'\n').replace(/\n{3,}/g,'\n\n');
+  }
+  function showPreview_(role,raw,job){
+    let host=document.getElementById('bnx-print-preview-host');
+    if(!host){ host=document.createElement('div'); host.id='bnx-print-preview-host'; document.body.appendChild(host); }
+    if(!host.firstChild){
+      host.innerHTML='<div style="position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.55);display:flex;align-items:flex-end;justify-content:center">'
+        +'<div style="width:min(430px,100%);max-height:88vh;overflow:auto;background:#fff;border-radius:18px 18px 0 0;padding:14px">'
+        +'<div style="font-weight:900;font-size:14px;margin-bottom:4px">🧪 Test mode — nothing was printed</div>'
+        +'<div style="font-size:11px;color:#6b7280;margin-bottom:10px">This is what the printer would have received. Turn test mode off in Printer Setup to print on paper.</div>'
+        +'<div id="bnx-print-preview-list"></div>'
+        +'<button type="button" onclick="document.getElementById(\'bnx-print-preview-host\').innerHTML=\'\'" style="width:100%;margin-top:10px;padding:12px;border:0;border-radius:10px;background:#4a1d06;color:#fff;font-weight:800">Close</button>'
+        +'</div></div>';
+    }
+    const list=document.getElementById('bnx-print-preview-list');
+    const card=document.createElement('div');
+    card.style.cssText='border:1px dashed #bbb;border-radius:10px;padding:8px;margin-bottom:8px;background:#fafafa';
+    const h=document.createElement('div'); h.style.cssText='font-size:11px;font-weight:900;color:#b45309;margin-bottom:4px'; h.textContent=role+' · '+String(job||'');
+    const pre=document.createElement('pre'); pre.style.cssText='margin:0;font:11px/1.35 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word'; pre.textContent=rawToText_(raw);
+    card.appendChild(h); card.appendChild(pre); list.appendChild(card);
+  }
+  async function direct_(role,data,jobName){
+    const raw=Array.isArray(data)?data.join(''):String(data||'');
+    const job=jobName||('BNX '+role+' KOT');
+    if(dryOn_()){ showPreview_(role,raw,job); return true; }
+    const M=window.__bnxRecentPrints=window.__bnxRecentPrints||{};
+    const T=window.__bnxPrintTimes=window.__bnxPrintTimes||{};
+    const key=role+'|'+job, now=Date.now();
+    if(M[key] && now-M[key]<15000){
+      if(/Test/i.test(job)) throw new Error('Test was just sent — wait 15 seconds (saves paper)');
+      console.info('[BNX PRINT] same ticket sent <15 s ago — skipped',key); return true;
+    }
+    T[role]=(T[role]||[]).filter(function(t){ return now-t<60000; });
+    if(T[role].length>=8) throw new Error('Too many tickets for the '+role+' printer in 1 minute — paused to save paper. Wait a minute.');
+    M[key]=now;
+    try{ const res=await directRaw_(role,data,jobName); T[role].push(Date.now()); return res; }
+    catch(e){ delete M[key]; throw e; }
   }
   window.bnxBuildKotRaw_=kotRaw_;
   window.bnxPrinterIps_=ipSettings_;
@@ -10386,9 +10446,8 @@ async function bnxPlaceOrderImpl_(){
   if(!tot){ toast('No items in order','error'); return; }
   if(!selTable){ toast('No table selected','error'); return; }
   const currentTableOwner=liveTableOwner(selTable);
-  if((selTable.status==='OCCUPIED'||selTable.status==='RUNNING') && !currentTableOwner){
-    toast('🔒 This running table belongs to another steward. Order changes are not allowed.','error'); return;
-  }
+  /* SHARED TABLE: placing a NEW order on a running table is allowed for every steward (it is saved under the
+     placing steward's own name). Editing / cancelling another steward's KOT is still blocked elsewhere. */
   // FIX ("add to order" problem — the actual KOT sent to kitchen/billing
   // was corrupted): same string-vs-number id mismatch as updateOrderBadge
   // above, but here the consequence was worse than a wrong badge total —
@@ -12749,9 +12808,9 @@ button,.menu-view-toggle,.menu-type-btn,.menu-quick-btn,.cat-tab{touch-action:ma
       const body = document.getElementById('mob-table-body');
       const newBtn = document.querySelector('#table-modal button[onclick="openOrderForTable()"]');
       if (newBtn) {
-        const allow = t.status === 'AVAILABLE' || mine;
-        newBtn.style.display = allow ? '' : 'none'; newBtn.disabled = !allow;
-        newBtn.textContent = running(t) ? '➕ Add Order' : '+ New Order';
+        const allow = true; /* shared table */
+        newBtn.style.display = ''; newBtn.disabled = false;
+        newBtn.textContent = running(t) ? (mine ? '➕ Add Order' : '➕ Add My Order') : '+ New Order';
       }
       if (running(t) && mine && body) {
         const f = FLOOR.byId[String(t.id).toUpperCase()];
@@ -13912,8 +13971,8 @@ html:not([data-color-mode="dark"]) .kot-card{background:#fff!important;color:#17
         box.id='bnx-pass75-actions';
         box.style.cssText='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px;';
         box.innerHTML=`
-          <button type="button" ${mine?'':'disabled'} onclick="openOrderForTable()"
-            style="padding:11px 8px;border:0;border-radius:10px;background:${mine?'var(--gold)':'var(--surface3,#e8ebef)'};color:${mine?'#fff':'var(--text3)'};font-weight:800;cursor:${mine?'pointer':'not-allowed'};">
+          <button type="button" onclick="openOrderForTable()"
+            style="padding:11px 8px;border:0;border-radius:10px;background:var(--gold);color:#fff;font-weight:800;cursor:pointer;">
             ➕ Add More
           </button>
           <button type="button" ${move?'':'disabled'} onclick="bnx73MoveDlg('transfer',${JSON.stringify(String(t.id))})"
@@ -14031,7 +14090,7 @@ html:not([data-color-mode="dark"]) .kot-card{background:#fff!important;color:#17
     const box=document.createElement('div'); box.id='bnx-pass77-actions';
     box.innerHTML=''+
       '<button type="button" class="bnx-p77-reorder" '+(can?'':'disabled style="opacity:.45;cursor:not-allowed"')+'>🔁 Repeat Last Round</button>'+
-      '<button type="button" class="bnx-p77-add" '+(can?'':'disabled style="opacity:.45;cursor:not-allowed"')+'>➕ Add More Items</button>'+
+      '<button type="button" class="bnx-p77-add">➕ Add More Items</button>'+
       '<button type="button" class="bnx-p77-transfer" '+(can?'':'disabled style="opacity:.45;cursor:not-allowed"')+'>🔀 Transfer Table</button>'+
       '<button type="button" class="bnx-p77-merge" '+(can?'':'disabled style="opacity:.45;cursor:not-allowed"')+'>🔗 Merge Table</button>';
     body.appendChild(box);
@@ -14644,9 +14703,12 @@ html:not([data-theme]) #s-home .hero .hs-lbl{font-size:10px!important;letter-spa
       setStatus(role,!!ok,ok?'Printed':(window.__bnxLastKotPrintError||'Print failed'));
       /* only the automatic "send order" path (it passes splitTotal) is queued — manual reprints keep their own browser fallback */
       if(!ok && d && d.splitTotal!=null && !d.__retry){
-        var q=qGet(),key=qKey(role,d||{});
-        if(!q.some(function(x){return x.key===key;})){q.push({key:key,type:type,role:role,d:d,t:Date.now()});qSet(q);}
-        try{toast('🖨️ '+role+' KOT saved — will print automatically when the printer is back','info');}catch(e){}
+        var q=qGet(),key=qKey(role,d||{}),err=String(window.__bnxLastKotPrintError||'');
+        /* auto-retry ONLY when the relay was never reached (nothing can have printed). Timeouts and setup errors
+           are kept for a manual tap, so a ticket is never printed twice or retried forever. */
+        var safeAuto=/Cannot reach|Failed to fetch|NetworkError|Load failed/i.test(err)&&!/timeout|did not answer|printer \(|No print route|printer IP|Blocked|not raw ESC|Too many/i.test(err);
+        if(!q.some(function(x){return x.key===key;})){q.push({key:key,type:type,role:role,d:d,t:Date.now(),n:0,manual:!safeAuto});qSet(q);}
+        try{toast(safeAuto?'🖨️ '+role+' KOT saved — will retry when the printer is reachable':'🖨️ '+role+' KOT NOT printed — fix Printer Setup, then tap “Print waiting KOTs”','info');}catch(e){}
       }
       return ok;
     };
@@ -14656,9 +14718,13 @@ html:not([data-theme]) #s-home .hero .hs-lbl{font-size:10px!important;letter-spa
     if(retrying)return 0; var q=qGet(); if(!q.length)return 0; retrying=true; var done=0,left=[];
     try{
       for(var i=0;i<q.length;i++){
-        var it=q[i]; if(Date.now()-it.t>12*3600*1000)continue;
+        var it=q[i], now=Date.now(); if(now-it.t>12*3600*1000)continue;
+        /* automatic retries: only items marked safe, 30 s -> 2 min -> 10 min, max 3, and only within 30 min of the order */
+        var due=manual||(!it.manual&&(!it.next||now>=it.next)&&now-it.t<=30*60*1000);
+        if(!due){left.push(it);continue;}
         var ok=false; try{ok=await orig.call(window,it.type,Object.assign({},it.d,{__retry:true}));}catch(e){}
-        if(ok){done++;setStatus(it.role,true,'Printed');}else left.push(it);
+        if(ok){done++;setStatus(it.role,true,'Printed');}
+        else{ it.n=(it.n||0)+1; if(!manual){ it.next=Date.now()+([30000,120000,600000][it.n-1]||600000); if(it.n>=3) it.manual=true; } left.push(it); }
       }
     }finally{retrying=false;}
     qSet(left);
@@ -14679,7 +14745,7 @@ html:not([data-theme]) #s-home .hero .hs-lbl{font-size:10px!important;letter-spa
   function paint(){
     var el=ensureStrip();
     if(el){var n=qGet().length;
-      el.innerHTML='<b>🖨️ PRINTERS</b>'+ROLES.map(function(r){return '<span class="hsp-pill">'+dot(r.k)+r.label+'</span>';}).join('')+(n?'<span class="hsp-pill" style="background:#fff1f0;border-color:#f3b4ae;color:#b42318">'+n+' waiting</span>':'');}
+      el.innerHTML='<b>🖨️ PRINTERS</b>'+((window.bnxPrintDryOn&&window.bnxPrintDryOn())?'<span class="hsp-pill" style="background:#fff7e0;border-color:#f0c36a;color:#92400e">🧪 TEST MODE</span>':'')+ROLES.map(function(r){return '<span class="hsp-pill">'+dot(r.k)+r.label+'</span>';}).join('')+(n?'<span class="hsp-pill" style="background:#fff1f0;border-color:#f3b4ae;color:#b42318">'+n+' waiting</span>':'');}
     ROLES.forEach(function(r){var d=document.getElementById('hsp-dot-'+r.k),m=document.getElementById('hsp-msg-'+r.k),s=status[r.k];
       if(d)d.className='hsp-dot '+(s?(s.ok?'ok':'bad'):''); if(m)m.textContent=s?(s.msg||'')+(s.at?' · '+new Date(s.at).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}):''):'Not tested yet';});
     var pq=document.getElementById('hsp-pending'); if(pq){var n2=qGet().length;pq.style.display=n2?'':'none';pq.querySelector('b').textContent=n2;}
@@ -14750,6 +14816,7 @@ html:not([data-theme]) #s-home .hero .hs-lbl{font-size:10px!important;letter-spa
       +'<div class="hsp-row"><button class="hsp-btn" onclick="hspTrust()">🔒 Trust relay certificate (do once)</button></div>'
       +'<div class="hsp-hint">Use the <b>https://</b> address shown by the relay window (example https://192.168.0.50:9191). Tap the lock button once, press “Advanced → Proceed”, then come back and Save.</div>'
       +'<datalist id="hsp-found"></datalist>'
+      +'<label class="hsp-card" style="display:flex;gap:10px;align-items:flex-start;border-color:#f0c36a;background:#fffbef;cursor:pointer"><input type="checkbox" id="hsp-dry" '+((window.bnxPrintDryOn&&window.bnxPrintDryOn())?'checked':'')+' onchange="bnxSetPrintDry(this.checked)" style="margin-top:3px;width:18px;height:18px"><span><b>🧪 Test mode — no paper</b><br><span class="hsp-hint" style="margin:0">Tickets appear on screen instead of printing. Use this for testing. Switches off by itself after 4 hours.</span></span></label>'
       +'<div class="hsp-lbl">Station printers</div>'+cards
       +'<div id="hsp-pending" class="hsp-card" style="display:none;border-color:#f3b4ae;background:#fff6f5"><b style="color:#b42318">⏳ <b>0</b> KOT waiting to print</b><div class="hsp-row"><button class="hsp-btn" onclick="hspRetry()">Print waiting KOTs now</button></div></div>'
       +'<div id="hsp-result" class="hsp-msg"></div>'
@@ -16888,16 +16955,27 @@ function ensureViewModal(){
   return m;
 }
 var viewToken=0;
+/* who placed a round: the round itself, else the matching KOT, else the table's first steward */
+function roundSteward(line,t){
+  var v=line&&(line.waiter||line.WAITER||line.steward||line.STEWARD||line.stewardName||line.ownerName||line.createdByName||line.CREATED_BY_NAME||line.createdBy||line.CREATED_BY||line.STARTED_BY||line.captain);
+  if(v) return String(v);
+  var no=norm(line&&(line.orderNo||line.ORDER_NO||line.orderNumber||line.orderId||line.ORDER_ID)), kn=norm(line&&(line.kotNo||line.KOT_NO||line.kotNumber));
+  var ks=(typeof KOT!=='undefined'&&Array.isArray(KOT))?KOT:[];
+  for(var q=0;q<ks.length;q++){ var k=ks[q]; if((no&&(norm(k.orderNo)===no||norm(k.kotNo)===no||norm(k.orderId)===no))||(kn&&norm(k.kotNo)===kn)) return String(k.waiter||k.steward||k.createdByName||''); }
+  return '';
+}
+function isMeName(n){ var i=ident(); return !!n&&((i.fullName&&norm(n)===norm(i.fullName))||(i.loginId&&norm(n)===norm(i.loginId))); }
 function drawView(t,rounds,kots,status){
   var body=$('sw-tbl-order-body'); if(!body) return;
-  var html='',grand=0;
+  var html='',grand=0,swTot={};
   if(rounds&&rounds.length){
     html+='<div style="font-size:10px;font-weight:900;color:#6b7280;margin:0 0 7px">'+(status==='live'?'LIVE ORDER':'ORDER')+' \u00B7 '+rounds.length+' ROUND'+(rounds.length===1?'':'S')+'</div>';
     rounds.forEach(function(line,idx){
       var items=Array.isArray(line.items)?line.items:[];
       var tot=items.reduce(function(a,i){return a+iQty(i)*iRate(i);},0);grand+=tot;
       var no=line.orderNo||line.ORDER_NO||line.orderNumber||line.orderId||'',kn=line.kotNo||line.KOT_NO||line.kotNumber||'';
-      html+='<div class="bnx-live-round"><div class="bnx-live-round-h"><span>Round '+(idx+1)+(no?' \u00B7 Order '+esc(no):'')+'</span><span>'+money(tot)+'</span></div><div class="bnx-live-round-s">'+esc(line.time||line.createdAt||'')+(kn?' \u00B7 KOT '+esc(kn):'')+'</div>'+
+      var sw=roundSteward(line,t); if(sw){ swTot[sw]=(swTot[sw]||0)+tot; }
+      html+='<div class="bnx-live-round"><div class="bnx-live-round-h"><span>Round '+(idx+1)+(no?' \u00B7 Order '+esc(no):'')+'</span><span>'+money(tot)+'</span></div><div class="bnx-live-round-s">'+(sw?'\uD83D\uDC64 '+esc(sw)+(isMeName(sw)?' (you)':'')+' \u00B7 ':'')+esc(line.time||line.createdAt||'')+(kn?' \u00B7 KOT '+esc(kn):'')+'</div>'+
         items.map(function(i){var q=iQty(i);return '<div class="bnx-live-line"><span>'+q+' \u00D7 '+esc(iName(i))+'</span><span>'+money(q*iRate(i))+'</span></div>';}).join('')+'</div>';
     });
   }else if(kots&&kots.length){
@@ -16905,7 +16983,8 @@ function drawView(t,rounds,kots,status){
     kots.forEach(function(k){
       var items=Array.isArray(k.items)?k.items:[];
       var tot=items.reduce(function(a,i){return a+iQty(i)*iRate(i);},0);grand+=tot;
-      html+='<div class="bnx-live-round"><div class="bnx-live-round-h"><span>Order '+esc(k.orderNo||k.kotNo||'-')+'</span><span>'+money(tot)+'</span></div><div class="bnx-live-round-s">'+esc(k.status||'OPEN')+' \u00B7 '+esc(k.waiter||k.steward||'-')+'</div>'+
+      var kw=String(k.waiter||k.steward||''); if(kw) swTot[kw]=(swTot[kw]||0)+tot;
+      html+='<div class="bnx-live-round"><div class="bnx-live-round-h"><span>Order '+esc(k.orderNo||k.kotNo||'-')+'</span><span>'+money(tot)+'</span></div><div class="bnx-live-round-s">'+esc(k.status||'OPEN')+' \u00B7 \uD83D\uDC64 '+esc(k.waiter||k.steward||'-')+(isMeName(kw)?' (you)':'')+'</div>'+
         items.map(function(i){var q=iQty(i);return '<div class="bnx-live-line"><span>'+q+' \u00D7 '+esc(iName(i))+'</span><span>'+money(q*iRate(i))+'</span></div>';}).join('')+'</div>';
     });
   }else if(status==='loading'){
@@ -16915,14 +16994,19 @@ function drawView(t,rounds,kots,status){
   }
   if(status!=='loading'||grand){
     var canChange=isOwner(t),canMove=canChange||elevated(),run=isRunning(t);
+    var swKeys=Object.keys(swTot);
+    if(swKeys.length>1){
+      html+='<div style="margin-top:8px;padding:8px 10px;border-radius:9px;background:#f4f1ec;font-size:11px;font-weight:800;color:#4a1d06"><div style="font-size:10px;color:#6b7280;margin-bottom:3px">STEWARD-WISE ON THIS TABLE</div>'+
+        swKeys.map(function(n){return '<div style="display:flex;justify-content:space-between"><span>\uD83D\uDC64 '+esc(n)+(isMeName(n)?' (you)':'')+'</span><span>'+money(swTot[n])+'</span></div>';}).join('')+'</div>';
+    }
     html+='<div style="display:flex;justify-content:space-between;font-weight:900;font-size:15px;padding:8px 2px;border-top:1px solid #e5e7eb;margin-top:6px"><span>Running Total</span><span>'+money(grand||t.bill||0)+'</span></div>';
     html+='<div style="font-size:10px;color:#6b7280;margin-top:4px">'+(canChange?'\u2713 Your table \u2014 order actions are enabled.':(canMove?'Admin/Captain access \u2014 you can transfer or merge.':'\uD83D\uDD12 View only \u2014 this table belongs to another steward.'))+(status==='refreshing'?' \u00B7 updating\u2026':'')+'</div>';
     html+='<div class="bnx-live-actions">';
     if(run&&canMove) html+='<button type="button" style="border:0;background:#f57c00;color:#fff" id="bnx-swv-repeat">\uD83D\uDD01 Repeat Last Round</button>';
-    if(run&&canMove) html+='<button type="button" style="border:0;background:#d58b00;color:#fff" id="bnx-swv-add">\u2795 Add More Items</button>';
+    if(run) html+='<button type="button" style="border:0;background:#d58b00;color:#fff" id="bnx-swv-add">\u2795 '+(canChange?'Add More Items':'Add My Order')+'</button>';
     if(run&&canMove) html+='<button type="button" style="border:1px solid #ddd;background:#fff" id="bnx-swv-transfer">\uD83D\uDD00 Transfer Table</button>';
     if(run&&canMove) html+='<button type="button" style="border:1px solid #ddd;background:#fff" id="bnx-swv-merge">\uD83D\uDD17 Merge Table</button>';
-    if(run&&!canMove) html+='<div style="grid-column:1/-1;padding:10px;border-radius:9px;background:#fff3cd;color:#7a5b00;font-size:11px;font-weight:800">Owner/captain access is required to repeat, modify, transfer or merge this table.</div>';
+    if(run&&!canMove) html+='<div style="grid-column:1/-1;padding:10px;border-radius:9px;background:#eef6ff;color:#1456a0;font-size:11px;font-weight:800">Shared table \u2014 you can add your own order. Repeat / transfer / merge stay with the steward who opened the table or a captain.</div>';
     html+='</div>';
   }
   body.innerHTML=html;
