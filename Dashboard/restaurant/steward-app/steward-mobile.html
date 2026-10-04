@@ -16843,7 +16843,9 @@ function allRows(){
     });
   }catch(e){ console.warn('[ORDERS] KOT merge failed',e); }
   var billed=new Set(billRows.map(function(x){return String(x.id||'').trim();}).filter(Boolean));
-  return billRows.concat(orderRows.filter(function(x){return !billed.has(String(x.id||'').trim());}));
+  var __merged=billRows.concat(orderRows.filter(function(x){return !billed.has(String(x.id||'').trim());}));
+  try{ if(typeof W.bnxSplitSharedOrderRows_==='function') __merged=W.bnxSplitSharedOrderRows_(__merged); }catch(e){ console.warn('[SHARED TABLE] split failed',e); }
+  return __merged;
 }
 W.bnxAllOrderRows_=allRows;
 /* an unsettled order from today / the previous business day still counts as current work */
@@ -17630,6 +17632,153 @@ if(typeof prevShow==='function'){
   };
 }
 setTimeout(function(){ try{ hydrate(); }catch(e){} },1200);
+})();
+</script>
+
+<script id="shared-table-multi-steward-fix">
+/* SHARED TABLE — MULTI-STEWARD FIX
+   Problem: one table could only ever "belong" to ONE steward (the first one, or the last one to send a KOT
+   because bnxUpdateTableOverlay overwrote the table's steward). When steward 2 sent an order on a table that
+   steward 1 had already opened, it did not appear in steward 2's My Tables / My Orders / Reports, and when the
+   server folded both KOTs into one order, every rupee was credited to steward 1 only.
+   Fix: (1) every steward who sends a KOT on a running table is remembered for that table and counts as
+   "mine"; (2) the table's first steward is no longer overwritten; (3) an order carrying KOTs from several
+   stewards is split in My Orders / Reports / Home cards so each steward sees (and is credited with) only his
+   own KOTs. */
+(function(){
+  var W=window;
+  function norm(v){ return String(v==null?'':v).trim().toLowerCase(); }
+  function cid(){ try{ return (typeof CLIENT_ID!=='undefined'&&CLIENT_ID)||''; }catch(e){ return ''; } }
+  function regKey(){ return 'bnx_table_stewards_'+cid(); }
+  function loadReg(){ try{ var r=JSON.parse(localStorage.getItem(regKey())||'{}'); return (r&&typeof r==='object')?r:{}; }catch(e){ return {}; } }
+  function saveReg(r){ try{ localStorage.setItem(regKey(),JSON.stringify(r)); }catch(e){} }
+  function me(){ return (typeof getCurrentStaffIdentity==='function')?getCurrentStaffIdentity():{}; }
+  function sameMe(rec,i){
+    if(!rec||!i) return false;
+    if(i.userId&&rec.userId&&norm(rec.userId)===norm(i.userId)) return true;
+    if(i.loginId&&rec.loginId&&norm(rec.loginId)===norm(i.loginId)) return true;
+    if(i.fullName&&rec.name&&norm(rec.name)===norm(i.fullName)) return true;
+    return false;
+  }
+  function tableKey(t){ return norm(t&&(t.id||t.no||t.TABLE_ID||t.TABLE_NO)); }
+  function isActiveTable(t){ var s=String(t&&t.status||'').toUpperCase(); return s==='RUNNING'||s==='OCCUPIED'||s==='BILLED'; }
+
+  /* (1) registry of every steward who placed a KOT on a table */
+  W.bnxRememberTableSteward_=function(tableId){
+    try{
+      var i=me(), k=norm(tableId); if(!k) return;
+      var reg=loadReg(), list=reg[k]||[];
+      var now=Date.now();
+      list=list.filter(function(r){ return now-(r.at||0)<18*3600*1000; });
+      var ex=list.find(function(r){ return sameMe(r,i); });
+      if(ex) ex.at=now; else list.push({userId:i.userId||'',loginId:i.loginId||'',name:i.fullName||'',at:now});
+      reg[k]=list; saveReg(reg);
+    }catch(e){}
+  };
+  function registryHasMe(t){
+    try{
+      var k=tableKey(t); if(!k) return false;
+      var reg=loadReg(), list=reg[k]; if(!list||!list.length) return false;
+      if(!isActiveTable(t)){ delete reg[k]; saveReg(reg); return false; }   /* table closed -> forget */
+      var i=me(), now=Date.now();
+      return list.some(function(r){ return now-(r.at||0)<18*3600*1000 && sameMe(r,i); });
+    }catch(e){ return false; }
+  }
+  /* any live KOT / order of mine on this table (covers orders placed on this phone AND pulled from server) */
+  function myLiveOrderOnTable(t){
+    try{
+      var k=tableKey(t); if(!k) return false;
+      var i=me();
+      var done=['CANCELLED','BILLED','SERVED','SETTLED','CLOSED'];
+      var inKot=(typeof KOT!=='undefined'&&Array.isArray(KOT))&&KOT.some(function(x){
+        return norm(x.table||x.TABLE_ID||x.tableId)===k && done.indexOf(String(x.status||'').toUpperCase())<0 && isMyOrder(x,i);
+      });
+      if(inKot) return true;
+      return (typeof ORDER_REGISTER!=='undefined'&&Array.isArray(ORDER_REGISTER))&&ORDER_REGISTER.some(function(o){
+        if(norm(o.TABLE_ID||o.tableId||o.TABLE||o.table)!==k) return false;
+        if(done.indexOf(String(o.ORDER_STATUS||o.status||'').toUpperCase())>=0) return false;
+        return isMyOrder(o,i);
+      });
+    }catch(e){ return false; }
+  }
+
+  /* make "My Tables" / owner checks understand co-stewards */
+  var origIsMyTable=W.isMyTable;
+  W.isMyTable=function(table,identity){
+    if(typeof origIsMyTable==='function' && origIsMyTable(table,identity)) return true;
+    if(!table||!isActiveTable(table)) return false;
+    return registryHasMe(table)||myLiveOrderOnTable(table);
+  };
+  try{ isMyTable=W.isMyTable; }catch(e){}
+
+  /* (2) never overwrite the table's first steward when a second steward sends a KOT */
+  var origOverlay=W.bnxUpdateTableOverlay;
+  if(typeof origOverlay==='function'){
+    W.bnxUpdateTableOverlay=function(tableId,patch){
+      try{
+        patch=patch||{};
+        if(patch.steward||patch.stewardId||patch.stewardLogin){
+          var t=(typeof TABLES!=='undefined'&&Array.isArray(TABLES))?TABLES.find(function(x){return String(x.id)===String(tableId);}):null;
+          var i=me();
+          W.bnxRememberTableSteward_(tableId);
+          var hasOther=t && isActiveTable(t) && (t.steward||t.stewardId||t.stewardLogin) && !sameMe({userId:t.stewardId,loginId:t.stewardLogin,name:t.steward},i);
+          if(hasOther){
+            patch=Object.assign({},patch);
+            delete patch.steward; delete patch.stewardId; delete patch.stewardLogin;
+          }
+        }
+      }catch(e){}
+      return origOverlay.call(this,tableId,patch);
+    };
+    try{ bnxUpdateTableOverlay=W.bnxUpdateTableOverlay; }catch(e){}
+  }
+
+  /* (3) split an order that holds KOTs from several stewards, one row per steward */
+  function kotOwnerKey(k){
+    return norm(k.createdById||k.CREATED_BY_ID||k.userId||k.USER_ID)||norm(k.createdByLogin||k.CREATED_BY_LOGIN||k.loginId||k.LOGIN_ID)||norm(k.createdByName||k.CREATED_BY_NAME||k.waiter||k.steward||k.createdBy);
+  }
+  function kotOrderNo(k){ return String(k.orderNo||k.ORDER_NUMBER||k.orderId||k.ORDER_ID||'').trim(); }
+  W.bnxSplitSharedOrderRows_=function(rows){
+    try{
+      if(typeof bnxLoadOpenKots==='function') bnxLoadOpenKots();
+      var KL=(typeof KOT!=='undefined'&&Array.isArray(KOT))?KOT:[];
+      var byOrder={};
+      KL.forEach(function(k){
+        var no=kotOrderNo(k); if(!no) return;
+        if(['CANCELLED'].indexOf(String(k.status||'').toUpperCase())>=0) return;
+        (byOrder[no]=byOrder[no]||[]).push(k);
+      });
+      var out=[];
+      rows.forEach(function(r){
+        var no=String(r.orderNo||r.id||'').trim();
+        var ks=byOrder[no];
+        if(!ks||ks.length<2||r.billNo||!r.isActive){ out.push(r); return; }   /* only live (unbilled) shared orders */
+        var owners={}, order=[];
+        ks.forEach(function(k){ var key=kotOwnerKey(k); if(!key) return; if(!owners[key]){ owners[key]=[]; order.push(key);} owners[key].push(k); });
+        if(order.length<2){ out.push(r); return; }
+        order.forEach(function(key){
+          var list=owners[key], f=list[0], items=[];
+          list.forEach(function(k){ (Array.isArray(k.items)?k.items:[]).forEach(function(i){
+            items.push({name:i.name||i.itemName||'Item',qty:Number(i.qty)||0,rate:Number(i.price!=null?i.price:i.rate)||0,group:i.itemGroup||i.group||'',category:i.category||i.cat||''});
+          }); });
+          var nm=f.createdByName||f.CREATED_BY_NAME||f.waiter||f.steward||'';
+          var row=Object.assign({},r,{
+            items:items, total:items.reduce(function(a,i){return a+i.qty*i.rate;},0),
+            createdBy:nm, waiter:nm, steward:nm, createdByName:nm,
+            createdById:f.createdById||f.CREATED_BY_ID||f.userId||'', CREATED_BY_ID:f.createdById||f.CREATED_BY_ID||f.userId||'', userId:f.createdById||f.CREATED_BY_ID||f.userId||'',
+            createdByLogin:f.createdByLogin||f.CREATED_BY_LOGIN||f.loginId||'', CREATED_BY_LOGIN:f.createdByLogin||f.CREATED_BY_LOGIN||f.loginId||'', loginId:f.createdByLogin||f.CREATED_BY_LOGIN||f.loginId||'',
+            kotNo:list.map(function(k){return k.kotNumber||k.kotNo;}).filter(Boolean).join(', ')||r.kotNo,
+            isSharedSplit:true
+          });
+          out.push(row);
+        });
+      });
+      return out;
+    }catch(e){ console.warn('[SHARED TABLE] split error',e); return rows; }
+  };
+
+  /* repaint My Tables once KOTs/tables refresh */
+  setTimeout(function(){ try{ if(typeof renderMyTables==='function'&&document.getElementById('s-home')?.classList.contains('active')) renderMyTables(); }catch(e){} },1500);
 })();
 </script>
 </body>
