@@ -9,7 +9,9 @@
  *     - Name arrives -> saved in the record, and the welcome SMS/WhatsApp is sent ONCE.
  *     - Returning   -> returns saved name, points, visit count (+1 per scan).
  *  2. Welcome message is sent automatically (SMS and/or WhatsApp) and logged in WELCOME_LOG.
- *  3. bnxCrmRecordOrder_() — optional hook to keep total orders / spend per customer.
+ *  3. TRANSACTIONS (optional, default ON): every visit and every order is also written to
+ *     CUSTOMER_TRANSACTIONS, linked to the customer by mobile. Turn off with CRM_TXN_LOG = NO.
+ *     Master (CUSTOMER_MASTER) = one row per customer; Transactions = one row per visit/order.
  *
  * INSTALL (3 steps)
  *  A) In your existing doPost(e), AFTER the sessionToken/clientId check and BEFORE the
@@ -18,6 +20,8 @@
  *         if (crm) return ContentService.createTextOutput(JSON.stringify(crm))
  *                          .setMimeType(ContentService.MimeType.JSON);
  *  B) Project Settings > Script properties — add (see CONFIG below).
+ *  B2) To log orders: in your SAVE_ORDER case, after a successful save, add
+ *         bnxCrmAfterOrder_(req, result);   // req = request body, result = your SAVE_ORDER response
  *  C) Deploy > Manage deployments > Edit > New version > Deploy.
  *
  * CONFIG (Script properties)
@@ -29,6 +33,7 @@
  *  MSG91_SENDER      6-letter DLT sender id
  *  TWILIO_SID / TWILIO_TOKEN / TWILIO_FROM_SMS / TWILIO_FROM_WA  (e.g. whatsapp:+14155238886)
  *  RESTAURANT_NAME   shown in the message (falls back to the spreadsheet name)
+ *  CRM_TXN_LOG       YES (default) | NO — write the CUSTOMER_TRANSACTIONS log
  *  CRM_SHEET_ID      optional — spreadsheet id of the client DB (default: this script's spreadsheet)
  *  WELCOME_TEXT      optional template, e.g. "Hi {name}, welcome to {restaurant}! Enjoy your meal."
  *
@@ -38,13 +43,32 @@
 
 var CRM_SHEET = 'CUSTOMER_MASTER';
 var CRM_LOG   = 'WELCOME_LOG';
+var CRM_TXN   = 'CUSTOMER_TRANSACTIONS';
+var CRM_TXN_HEAD = ['TXN_ID','DATE_TIME','MOBILE','NAME','TYPE','ORDER_NO','TABLE','ITEMS','AMOUNT','DISCOUNT',
+                    'POINTS_EARNED','POINTS_REDEEMED','POINTS_BALANCE','SOURCE','CLIENT_ID'];
 var CRM_HEAD  = ['MOBILE','NAME','FIRST_VISIT','LAST_VISIT','VISIT_COUNT','POINTS','TOTAL_ORDERS','TOTAL_SPEND',
                  'WELCOME_SENT','OPT_IN','LAST_TABLE','SOURCE','LAST_SCAN_KEY','CLIENT_ID'];
 
 /* ───────────── router ───────────── */
 function bnxCrmRoute_(action, req) {
   if (action === 'CUSTOMER_CHECKIN') return bnxCustomerCheckin_(req);
+  if (action === 'GET_CRM_CUSTOMERS') return bnxCrmList_(CRM_SHEET, CRM_HEAD, req, 2000);
+  if (action === 'GET_CRM_TRANSACTIONS') return bnxCrmList_(CRM_TXN, CRM_TXN_HEAD, req, 3000);
   return null; // not ours — let the existing switch handle it
+}
+
+/* Read-only lists for the dashboard (Settings > Customer Records). Optional req.mobile filters rows. */
+function bnxCrmList_(name, head, req, max) {
+  var sh = bnxCrmSheet_(name, head), last = sh.getLastRow();
+  if (last < 2) return { success: true, data: [] };
+  var tz = Session.getScriptTimeZone();
+  var rows = sh.getRange(2, 1, last - 1, head.length).getValues().map(function (r) {
+    var o = {};
+    head.forEach(function (h, i) { o[h] = r[i] instanceof Date ? Utilities.formatDate(r[i], tz, 'yyyy-MM-dd HH:mm') : r[i]; });
+    return o;
+  });
+  if (req.mobile) { var m = String(req.mobile).replace(/\D/g, '').slice(-10); rows = rows.filter(function (o) { return String(o.MOBILE).slice(-10) === m; }); }
+  return { success: true, data: rows.reverse().slice(0, max) };   // newest first
 }
 
 /* ───────────── sheet helpers ───────────── */
@@ -68,7 +92,8 @@ function bnxCrmFind_(sh, mobile) {
   return 0;
 }
 function bnxCrmClean_(n) {
-  return String(n || '').replace(/[^\p{L}\s.'-]/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
+  return String(n || '').replace(/[^\p{L}\s.'-]/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 60)
+    .split(' ').map(function (w) { return w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : ''; }).join(' ');
 }
 
 /* ───────────── CUSTOMER_CHECKIN ───────────── */
@@ -87,7 +112,7 @@ function bnxCustomerCheckin_(req) {
     var name = bnxCrmClean_(req.customerName);
     var now = new Date();
     var row = bnxCrmFind_(sh, mobile);
-    var out;
+    var out, newScanFlag_ = false;
 
     if (!row) {                                   // ── brand-new guest
       var rec = [mobile, name, now, now, 1, 0, 0, 0, '', req.notifyOptIn === false ? 'NO' : 'YES',
@@ -101,7 +126,7 @@ function bnxCustomerCheckin_(req) {
       var visits = Number(cur[bnxCrmCol_('VISIT_COUNT') - 1] || 0);
       var newScan = req.scanKey && req.scanKey !== cur[bnxCrmCol_('LAST_SCAN_KEY') - 1] && !req.customerName;
       if (name && name !== savedName) sh.getRange(row, bnxCrmCol_('NAME')).setValue(name);   // name saved in record
-      if (newScan) { visits++; sh.getRange(row, bnxCrmCol_('VISIT_COUNT')).setValue(visits); }
+      if (newScan) { newScanFlag_ = true; visits++; sh.getRange(row, bnxCrmCol_('VISIT_COUNT')).setValue(visits); }
       sh.getRange(row, bnxCrmCol_('LAST_VISIT')).setValue(now);
       if (req.tableId) sh.getRange(row, bnxCrmCol_('LAST_TABLE')).setValue(req.tableId);
       if (req.scanKey) sh.getRange(row, bnxCrmCol_('LAST_SCAN_KEY')).setValue(req.scanKey);
@@ -109,6 +134,12 @@ function bnxCustomerCheckin_(req) {
       var finalName = name || savedName;
       out = { success: true, isNewCustomer: !finalName, customerName: finalName,
               points: Number(cur[bnxCrmCol_('POINTS') - 1] || 0), visitCount: visits };
+    }
+
+    // ── visit transaction (new guest, or a fresh scan by a returning guest)
+    if (!req.customerName && (out.visitCount === 1 && !sh.getRange(row, bnxCrmCol_('WELCOME_SENT')).getValue() || newScanFlag_)) {
+      bnxCrmLogTxn_({ mobile: mobile, name: out.customerName, type: 'VISIT', table: req.tableId, source: req.source || 'QR_SCAN',
+                      balance: out.points, clientId: req.clientId, key: 'visit-' + (req.scanKey || req.requestId) });
     }
 
     // ── AUTOMATIC WELCOME: once per customer, as soon as we know the name
@@ -147,6 +178,7 @@ function bnxSendWelcome_(mobile, name) {
     } catch (e) { results.push(['SMS', 'ERR ' + e.message]); }
   }
   var ok = results.some(function (x) { return String(x[1]).indexOf('ERR') !== 0; });
+  if (!results.length) Logger.log('Welcome not sent: set SMS_PROVIDER / WA_PROVIDER in Script properties');
   try {
     bnxCrmSheet_(CRM_LOG, ['TIME', 'MOBILE', 'CHANNEL', 'RESULT', 'TEXT'])
       .appendRow([new Date(), mobile, results.map(function (x) { return x[0]; }).join('+') || 'NONE', JSON.stringify(results).slice(0, 300), text]);
@@ -186,14 +218,49 @@ function twilio_(P, to, from, text) {
   return 'OK';
 }
 
-/* ───────────── optional: call from your SAVE_ORDER after a successful save ───────────── */
-function bnxCrmRecordOrder_(mobile, billAmount, pointsEarned) {
-  mobile = String(mobile || '').replace(/\D/g, '').slice(-10);
-  if (mobile.length !== 10) return;
-  var sh = bnxCrmSheet_(CRM_SHEET, CRM_HEAD), row = bnxCrmFind_(sh, mobile);
-  if (!row) return;
-  var add = function (col, v) { var c = sh.getRange(row, bnxCrmCol_(col)); c.setValue(Number(c.getValue() || 0) + Number(v || 0)); };
-  add('TOTAL_ORDERS', 1); add('TOTAL_SPEND', billAmount); add('POINTS', pointsEarned);
+/* ───────────── transactions ───────────── */
+function bnxCrmLogTxn_(t) {
+  var P = PropertiesService.getScriptProperties();
+  if ((P.getProperty('CRM_TXN_LOG') || 'YES').toUpperCase() === 'NO') return;
+  var cache = CacheService.getScriptCache(), k = 'txn_' + (t.key || '');
+  if (t.key) { if (cache.get(k)) return; cache.put(k, '1', 21600); }            // never log the same event twice
+  var sh = bnxCrmSheet_(CRM_TXN, CRM_TXN_HEAD);
+  sh.appendRow(['TX' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyMMddHHmmss') + Math.floor(Math.random() * 90 + 10),
+    new Date(), t.mobile, t.name || '', t.type, t.orderNo || '', t.table || '', t.items || '', Number(t.amount || 0),
+    Number(t.discount || 0), Number(t.earned || 0), Number(t.redeemed || 0), t.balance == null ? '' : t.balance,
+    t.source || '', t.clientId || '']);
+}
+
+/* Call after a successful SAVE_ORDER. Updates the customer master (orders, spend, points)
+   and writes one ORDER row in CUSTOMER_TRANSACTIONS. Safe to call twice for the same order. */
+function bnxCrmAfterOrder_(req, result) {
+  try {
+    var mobile = String(req.mobileNo || '').replace(/\D/g, '').slice(-10);
+    if (mobile.length !== 10 || (result && result.success === false)) return;
+    var orderNo = (result && (result.orderNo || (result.data && result.data.ORDER_NO))) || '';
+    var key = 'order-' + (orderNo || req.requestId || '');
+    var cache = CacheService.getScriptCache();
+    if (cache.get('txn_' + key)) return;                                        // already processed
+
+    var lock = LockService.getScriptLock(); lock.waitLock(20000);
+    try {
+      var sh = bnxCrmSheet_(CRM_SHEET, CRM_HEAD), row = bnxCrmFind_(sh, mobile);
+      var amount = Number(req.billAmount || 0), earned = Number((result && result.earned) || 0), redeemed = Number(req.redeemedPoints || 0);
+      var name = bnxCrmClean_(req.customerName);
+      if (!row) {                                                               // order without check-in: still create the master row
+        sh.appendRow([mobile, name === 'Guest' ? '' : name, new Date(), new Date(), 1, 0, 0, 0, '', 'YES', req.tableId || '', req.orderSource || 'ORDER', req.scanKey || '', req.clientId || '']);
+        row = sh.getLastRow();
+      }
+      var add = function (col, v) { var c = sh.getRange(row, bnxCrmCol_(col)); c.setValue(Number(c.getValue() || 0) + Number(v || 0)); };
+      add('TOTAL_ORDERS', 1); add('TOTAL_SPEND', amount); add('POINTS', earned - redeemed);
+      sh.getRange(row, bnxCrmCol_('LAST_VISIT')).setValue(new Date());
+      if (name && name !== 'Guest' && !sh.getRange(row, bnxCrmCol_('NAME')).getValue()) sh.getRange(row, bnxCrmCol_('NAME')).setValue(name);
+      var items = (req.items || []).map(function (i) { return (i.qty || 1) + 'x ' + (i.itemName || ''); }).join(', ').slice(0, 400);
+      bnxCrmLogTxn_({ mobile: mobile, name: sh.getRange(row, bnxCrmCol_('NAME')).getValue(), type: 'ORDER', orderNo: orderNo,
+        table: req.tableId, items: items, amount: amount, discount: req.redeemedDiscount, earned: earned, redeemed: redeemed,
+        balance: sh.getRange(row, bnxCrmCol_('POINTS')).getValue(), source: req.orderSource || 'CUSTOMER', clientId: req.clientId, key: key });
+    } finally { lock.releaseLock(); }
+  } catch (e) { Logger.log('bnxCrmAfterOrder_ ' + e.message); }                // CRM problems must never block an order
 }
 
 /* ───────────── run once from the editor to authorise + test ───────────── */
