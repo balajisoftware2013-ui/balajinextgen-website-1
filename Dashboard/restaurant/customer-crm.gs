@@ -52,6 +52,9 @@ var CRM_HEAD  = ['MOBILE','NAME','FIRST_VISIT','LAST_VISIT','VISIT_COUNT','POINT
 /* ───────────── router ───────────── */
 function bnxCrmRoute_(action, req) {
   if (action === 'CUSTOMER_CHECKIN') return bnxCustomerCheckin_(req);
+  var isGuest = req && (req.guest === true || req.source === 'CUSTOMER_QR');
+  if (isGuest && (action === 'GET_CRM_CUSTOMERS' || action === 'GET_CRM_TRANSACTIONS'))
+    return { success: false, error: 'Not allowed' };   // guest QR page can never read customer phone numbers
   if (action === 'GET_CRM_CUSTOMERS') return bnxCrmList_(CRM_SHEET, CRM_HEAD, req, 2000);
   if (action === 'GET_CRM_TRANSACTIONS') return bnxCrmList_(CRM_TXN, CRM_TXN_HEAD, req, 3000);
   return null; // not ours — let the existing switch handle it
@@ -67,6 +70,7 @@ function bnxCrmList_(name, head, req, max) {
     head.forEach(function (h, i) { o[h] = r[i] instanceof Date ? Utilities.formatDate(r[i], tz, 'yyyy-MM-dd HH:mm') : r[i]; });
     return o;
   });
+  if (req.clientId) rows = rows.filter(function (o) { return !o.CLIENT_ID || o.CLIENT_ID === req.clientId; });
   if (req.mobile) { var m = String(req.mobile).replace(/\D/g, '').slice(-10); rows = rows.filter(function (o) { return String(o.MOBILE).slice(-10) === m; }); }
   return { success: true, data: rows.reverse().slice(0, max) };   // newest first
 }
@@ -162,7 +166,14 @@ function bnxSendWelcome_(mobile, name) {
   var P = PropertiesService.getScriptProperties();
   var restaurant = P.getProperty('RESTAURANT_NAME') || SpreadsheetApp.getActiveSpreadsheet().getName();
   var tpl = P.getProperty('WELCOME_TEXT') || 'Hi {name}, welcome to {restaurant}! Thank you for visiting us. Enjoy your meal.';
-  var text = tpl.replace('{name}', name.split(' ')[0]).replace('{restaurant}', restaurant);
+  var text = tpl.replace(/\{name\}/g, name.split(' ')[0]).replace(/\{restaurant\}/g, restaurant);
+  return bnxSendText_(mobile, text, 'WELCOME', P.getProperty('MSG91_TEMPLATE_ID'),
+                      { name: name.split(' ')[0], restaurant: restaurant });
+}
+
+/* Shared sender: WhatsApp first, SMS fallback, always logged in WELCOME_LOG. */
+function bnxSendText_(mobile, text, kind, msg91Template, msg91Vars) {
+  var P = PropertiesService.getScriptProperties();
   var results = [];
   var sms = (P.getProperty('SMS_PROVIDER') || 'NONE').toUpperCase();
   var wa  = (P.getProperty('WA_PROVIDER')  || 'NONE').toUpperCase();
@@ -173,7 +184,7 @@ function bnxSendWelcome_(mobile, name) {
   if (!waOk) {                                    // SMS is sent if WhatsApp is off or failed
     try {
       if (sms === 'FAST2SMS') results.push(['SMS', fast2sms_(P, mobile, text)]);
-      else if (sms === 'MSG91') results.push(['SMS', msg91_(P, mobile, name.split(' ')[0], restaurant)]);
+      else if (sms === 'MSG91') { if (msg91Template) results.push(['SMS', msg91_(P, mobile, msg91Template, msg91Vars)]); }
       else if (sms === 'TWILIO') results.push(['SMS', twilio_(P, '+91' + mobile, P.getProperty('TWILIO_FROM_SMS'), text)]);
     } catch (e) { results.push(['SMS', 'ERR ' + e.message]); }
   }
@@ -181,7 +192,7 @@ function bnxSendWelcome_(mobile, name) {
   if (!results.length) Logger.log('Welcome not sent: set SMS_PROVIDER / WA_PROVIDER in Script properties');
   try {
     bnxCrmSheet_(CRM_LOG, ['TIME', 'MOBILE', 'CHANNEL', 'RESULT', 'TEXT'])
-      .appendRow([new Date(), mobile, results.map(function (x) { return x[0]; }).join('+') || 'NONE', JSON.stringify(results).slice(0, 300), text]);
+      .appendRow([new Date(), mobile, kind + ':' + results.map(function (x) { return x[0]; }).join('+') || 'NONE', JSON.stringify(results).slice(0, 300), text]);
   } catch (e) {}
   return { ok: ok };
 }
@@ -195,12 +206,12 @@ function fast2sms_(P, mobile, text) {
   if (!j.return) throw new Error(j.message || 'Fast2SMS failed');
   return 'OK';
 }
-function msg91_(P, mobile, name, restaurant) {
+function msg91_(P, mobile, templateId, vars) {
   var res = UrlFetchApp.fetch('https://control.msg91.com/api/v5/flow/', {
     method: 'post', muteHttpExceptions: true, contentType: 'application/json',
     headers: { authkey: P.getProperty('MSG91_AUTHKEY') },
-    payload: JSON.stringify({ template_id: P.getProperty('MSG91_TEMPLATE_ID'), sender: P.getProperty('MSG91_SENDER'),
-      short_url: '0', recipients: [{ mobiles: '91' + mobile, name: name, restaurant: restaurant }] })
+    payload: JSON.stringify({ template_id: templateId, sender: P.getProperty('MSG91_SENDER'),
+      short_url: '0', recipients: [Object.assign({ mobiles: '91' + mobile }, vars || {})] })
   });
   var j = JSON.parse(res.getContentText());
   if (j.type !== 'success') throw new Error(j.message || 'MSG91 failed');
@@ -259,8 +270,28 @@ function bnxCrmAfterOrder_(req, result) {
       bnxCrmLogTxn_({ mobile: mobile, name: sh.getRange(row, bnxCrmCol_('NAME')).getValue(), type: 'ORDER', orderNo: orderNo,
         table: req.tableId, items: items, amount: amount, discount: req.redeemedDiscount, earned: earned, redeemed: redeemed,
         balance: sh.getRange(row, bnxCrmCol_('POINTS')).getValue(), source: req.orderSource || 'CUSTOMER', clientId: req.clientId, key: key });
+      bnxSendOrderMsg_(mobile, sh.getRange(row, bnxCrmCol_('NAME')).getValue(), orderNo, earned,
+                       sh.getRange(row, bnxCrmCol_('POINTS')).getValue(), req, sh.getRange(row, bnxCrmCol_('OPT_IN')).getValue());
     } finally { lock.releaseLock(); }
   } catch (e) { Logger.log('bnxCrmAfterOrder_ ' + e.message); }                // CRM problems must never block an order
+}
+
+/* Order confirmation + points balance. Only if ORDER_MSG=YES, guest opted in, and not already sent.
+   Optional properties: ORDER_TEXT ("Hi {name}, order {order} at {restaurant} is confirmed.{points} Thank you!"),
+   MSG91_ORDER_TEMPLATE_ID (DLT template with variables name, restaurant, order, points). */
+function bnxSendOrderMsg_(mobile, name, orderNo, earned, balance, req, optInCell) {
+  try {
+    var P = PropertiesService.getScriptProperties();
+    if ((P.getProperty('ORDER_MSG') || 'NO').toUpperCase() !== 'YES') return;
+    if (optInCell === 'NO' || req.notifyOptIn === false) return;
+    var restaurant = P.getProperty('RESTAURANT_NAME') || SpreadsheetApp.getActiveSpreadsheet().getName();
+    var first = String(name || 'there').split(' ')[0] || 'there';
+    var pts = Number(earned) > 0 ? ' You earned ' + earned + ' points (balance ' + balance + ').' : '';
+    var tpl = P.getProperty('ORDER_TEXT') || 'Hi {name}, your order {order} at {restaurant} is confirmed.{points} Thank you!';
+    var text = tpl.replace(/\{name\}/g, first).replace(/\{order\}/g, orderNo || '').replace(/\{restaurant\}/g, restaurant).replace(/\{points\}/g, pts);
+    bnxSendText_(mobile, text, 'ORDER', P.getProperty('MSG91_ORDER_TEMPLATE_ID'),
+                 { name: first, restaurant: restaurant, order: orderNo || '', points: pts.trim() });
+  } catch (e) { Logger.log('bnxSendOrderMsg_ ' + e.message); }
 }
 
 /* ───────────── run once from the editor to authorise + test ───────────── */
