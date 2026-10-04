@@ -231,7 +231,9 @@ window.BNX_STEWARD_BUILD='PRN-FW2';
     var theme = localStorage.getItem('bnx_sw_theme_' + cid) || localStorage.getItem('bnx_sw_theme_local') || 'brand';
     var mode = localStorage.getItem('bnx_sw_mode_' + cid) || localStorage.getItem('bnx_sw_mode_local') || 'light';
     if (theme && theme !== 'brand') document.documentElement.setAttribute('data-theme', theme);
-    document.documentElement.setAttribute('data-color-mode', 'light'); document.documentElement.setAttribute('data-brand','happyserve');
+    var rm = mode==='dark' ? 'dark' : (mode==='system' && window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    document.documentElement.setAttribute('data-color-mode', rm); document.documentElement.setAttribute('data-brand','happyserve');
+    var cm=document.querySelector('meta[name="color-scheme"]'); if(cm) cm.setAttribute('content', rm);
   }catch(e){}
 })();
 </script>
@@ -484,7 +486,8 @@ function bnxKotElapsedMin_(order){
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="HAPPYSERVE">
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=DM+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700;9..40,800;9..40,900&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root{
   color-scheme:light; /* pairs with the <meta name="color-scheme"> above */
@@ -3748,10 +3751,49 @@ let IS_DEMO_MODE = false;
   if (el) el.textContent = lines[Math.floor(Math.random()*lines.length)];
 })();
 function getSessionToken(){ return localStorage.getItem('ERP_SESSION')||''; }
+/* FAST LOAD ("load table and order fast") — ROOT CAUSE: the same read was
+   fired several times at once. Opening Home ran loadTablesLive() twice plus
+   loadKOTFromServer(), so GET_ACTIVE_ORDERS alone hit Apps Script 3x in
+   parallel, and every 20 s / 30 s poll repeated it. Apps Script queues
+   concurrent executions per user, so each extra copy slowed every other call
+   (including SAVE_ORDER). Now: identical in-flight READS share one request,
+   a successful read is reused for 4 s, and any WRITE clears the cache so the
+   refresh after an order always reads fresh server data. */
+const __bnxReadCache=new Map(), __bnxReadInflight=new Map();
+window.__bnxWriteGen=0;
+function bnxIsReadAction_(a){ return /^(GET_|LIST_|CHECK_|FETCH_|LOAD_|READ_|RD_FETCH)/i.test(String(a||'')); }
+function bnxApiCacheClear_(){ __bnxReadCache.clear(); __bnxReadInflight.clear(); window.__bnxWriteGen++; }
+function bnxClone_(v){ try{ return typeof structuredClone==='function'?structuredClone(v):JSON.parse(JSON.stringify(v)); }catch(e){ return v; } }
 async function gasApi(action,payload,endpoint){
+  if(!bnxIsReadAction_(action)){
+    bnxApiCacheClear_();
+    try{ return await bnxGasApiNet_(action,payload,endpoint); }
+    finally{ bnxApiCacheClear_(); }
+  }
+  let key;
+  try{ key=(endpoint||'V2_CORE')+'|'+action+'|'+JSON.stringify(payload||{})+'|'+getClientId()+'|'+getSessionToken(); }
+  catch(e){ return bnxGasApiNet_(action,payload,endpoint); }
+  const hit=__bnxReadCache.get(key);
+  if(hit && Date.now()-hit.at<4000) return bnxClone_(hit.res);
+  let p=__bnxReadInflight.get(key);
+  if(!p){
+    const gen=window.__bnxWriteGen;
+    p=bnxGasApiNet_(action,payload,endpoint).then(function(res){
+      if(res && res.success && gen===window.__bnxWriteGen) __bnxReadCache.set(key,{at:Date.now(),res:res});
+      return res;
+    }).finally(function(){ if(__bnxReadInflight.get(key)===p) __bnxReadInflight.delete(key); });
+    __bnxReadInflight.set(key,p);
+  }
+  return bnxClone_(await p);
+}
+async function bnxGasApiNet_(action,payload,endpoint){
   payload=payload||{};
   const ep=endpoint||'V2_CORE';
-  if(ep==='V2_CORE' && __bnxConfigReady){
+  /* only the very first run (no cached deployment id yet) waits for GET_CONFIG;
+     with a cached id every call goes out immediately (404 recovery below still
+     fixes a retired id) — this removed up to 1.5 s from each first load */
+  let __hasCachedCore=false; try{ __hasCachedCore=!!localStorage.getItem('bnx_api_core'); }catch(e){}
+  if(ep==='V2_CORE' && __bnxConfigReady && !__hasCachedCore){
     try{ await Promise.race([__bnxConfigReady,new Promise(r=>setTimeout(r,1500))]); }catch(e){}
   }
 
@@ -4631,6 +4673,26 @@ function bnxSetBillStage_(id,on){
 }
 /* Display state of a table: RUNNING/OCCUPIED tables whose bill has been raised show as BILLED
    (own colour) until settled. t.status is NOT changed, so owner/lock logic keeps working. */
+/* Business date of an ORDER/BILL row. Apps Script sends a date-only sheet cell
+   as ISO-UTC midnight ("2026-10-02T18:30:00.000Z" = 03-Oct IST), and the old
+   .slice(0,10) read that as the PREVIOUS day, so today's open orders were
+   treated as yesterday's (and vice versa). */
+function bnxOrderBizDate_(o){
+  o=o||{};
+  const ex=String(o.BUSINESS_DATE||o.businessDate||'').trim();
+  if(/^\d{4}-\d{2}-\d{2}$/.test(ex)) return ex;
+  const raw=o.ORDER_DATE||o.orderDate||o.BILL_DATE||o.billDate||o.DATE||o.date||'';
+  const r=String(raw||'').trim();
+  if(/^\d{4}-\d{2}-\d{2}$/.test(r)) return r;
+  if(r){
+    const d=new Date(r);
+    if(!isNaN(d.getTime()) && d.getHours()===0 && d.getMinutes()===0 && d.getSeconds()===0){
+      const p=v=>String(v).padStart(2,'0'); return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());
+    }
+  }
+  const created=o.CREATED_AT||o.createdAt||o.CREATED_ON||'';
+  return (typeof bnxBusinessDateKey_==='function') ? (bnxBusinessDateKey_(r||created, o.ORDER_TIME||o.BILL_TIME||'')||bnxBusinessDateKey_(created,'')) : r.slice(0,10);
+}
 function bnxTblCls_(t){
   const st=String((t&&t.status)||'').toUpperCase()||'AVAILABLE';
   if(st!=='RUNNING' && st!=='OCCUPIED') return st;
@@ -4654,6 +4716,11 @@ async function loadTablesLive(){
   // TABLES stayed permanently empty (IS_DEMO_MODE false → TABLES starts
   // as []) — this screen never showed a single real table, ever.
   try {
+    /* FAST LOAD: TABLE_MASTER, reservations and active orders used to be
+       fetched one after another (3 full Apps Script round trips in series).
+       All three now start together; total wait = the slowest one. */
+    const __resvP = gasApi('LIST_RESERVATIONS', {}, 'V2_CORE').catch(e=>({success:false,error:String(e&&e.message||e)}));
+    const __activeP = gasApi('GET_ACTIVE_ORDERS', {}, 'V2_CORE').catch(e=>({success:false,error:String(e&&e.message||e)}));
     const res = await gasApi('RD_FETCH_SHEET', { tab: '04_TABLE_MASTER' });
     if(!res || !res.success || !Array.isArray(res.data) || !res.data.length){
       // IMPORTANT: an unsuccessful/empty response is a completed attempt,
@@ -4727,13 +4794,22 @@ async function loadTablesLive(){
     let extra=[]; try{ extra=JSON.parse(localStorage.getItem(bnxTableMasterKey())||'[]'); }catch(e){}
     const known=new Set(fromSheet.map(t=>t.id));
     extra = extra.filter(t=>t.id && !known.has(t.id)).map(t=>({id:t.id||t.n,no:String(t.id||t.n),section:t.section||t.zone||'',name:t.name||'',status:bnxMapSheetStatusToTcard(t.s),pax:Number(t.pax)||4,covers:Number(t.covers||t.guests)||0,bill:Number(t.billAmount||t.bill)||0,steward:t.captain||t.steward||'',stewardId:t.captainId||t.stewardId||'',stewardLogin:t.captainLogin||t.stewardLogin||'',kotCount:Number(t.kotCount)||0,startTime:t.startTime||''}));
-    TABLES = fromSheet.concat(extra);
+    /* TABLE FIX ("table show wrong"): every table this device or the dashboard
+       ever touched is kept in bnx_table_master_extra_<client> as a STATUS
+       OVERLAY (bnxUpdateTableOverlay writes it on each KOT). Any entry whose id
+       was not in today's TABLE_MASTER (old layout tables like RDL3, old sections
+       like HOOKAH STATION / BREW PUB) was added back as a real table with its
+       last saved RUNNING status and bill: phantom tables, an "OTHER" group and a
+       wrong Running count. TABLE_MASTER is the only source of which tables
+       exist; local extras are used only if the server list is empty. */
+    if(extra.length && fromSheet.length) console.info('[TABLE_LOAD] ignored '+extra.length+' local-only table record(s) not in TABLE_MASTER');
+    TABLES = fromSheet.length ? fromSheet : fromSheet.concat(extra);
     // Live reservations: reservation date/time/customer must come from the
     // transaction database, not only from the last local booking action.
     // A reservation for the current calendar date marks an otherwise-free
     // table RESERVED and remains visible with its date/time on every refresh.
     try{
-      const rr = await gasApi('LIST_RESERVATIONS', {}, 'V2_CORE');
+      const rr = await __resvP;
       const reservations = rr && rr.success && Array.isArray(rr.reservations) ? rr.reservations : (rr && rr.success && Array.isArray(rr.data) ? rr.data : []);
       const _now = new Date();
       const today = `${_now.getFullYear()}-${String(_now.getMonth()+1).padStart(2,'0')}-${String(_now.getDate()).padStart(2,'0')}`;
@@ -4761,7 +4837,7 @@ async function loadTablesLive(){
     // has not refreshed yet on the steward device. Active orders are server
     // truth for a table currently in service.
     try{
-      const ao = await gasApi('GET_ACTIVE_ORDERS', {}, 'V2_CORE');
+      const ao = await __activeP;
       const rawActiveOrders = ao && ao.success && Array.isArray(ao.data?.orders) ? ao.data.orders : [];
       /* FINAL TABLE STATUS FIX — never let stale/closed orders turn free tables
          into RUNNING during the 20-second refresh. Some deployments return
@@ -4781,11 +4857,20 @@ async function loadTablesLive(){
         o=o||{};
         const st=String(o.ORDER_STATUS||o.orderStatus||o.STATUS||o.status||'').trim().toUpperCase();
         if(st && !ACTIVE_ORDER_STATUS.has(st)) return false;
-        const rawDate=o.ORDER_DATE||o.orderDate||o.BUSINESS_DATE||o.businessDate||o.CREATED_AT||o.CREATED_ON||'';
-        if(!rawDate) return true; // older backend: status is the only live signal available
-        const ds=String(rawDate).slice(0,10);
-        return !/^\d{4}-\d{2}-\d{2}$/.test(ds) || ds===bd;
+        const ds=bnxOrderBizDate_(o);
+        if(!ds) return true; // older backend: status is the only live signal available
+        return ds===bd;
       });
+      /* carry-over: an order still open from an EARLIER business date keeps its
+         table RUNNING (it really is unbilled) but is flagged "open since <date>"
+         so it is not mistaken for today's service. */
+      const __openSince={};
+      rawActiveOrders.forEach(o=>{ o=o||{};
+        const st=String(o.ORDER_STATUS||o.orderStatus||o.STATUS||o.status||'').trim().toUpperCase();
+        if(st && !ACTIVE_ORDER_STATUS.has(st)) return;
+        const tid=String(o.TABLE_ID||o.TABLE_NO||o.tableId||o.table||'').trim(); const ds=bnxOrderBizDate_(o);
+        if(tid && ds && (!__openSince[tid] || ds<__openSince[tid])) __openSince[tid]=ds; });
+      window.__bnxTableOpenSince=__openSince;
       const byTable={};
       activeOrders.forEach(o=>{ const tid=String(o.TABLE_ID||o.TABLE_NO||o.tableId||o.table||'').trim(); if(!tid) return; const oid=String(o.ORDER_ID||o.ORDER_NUMBER||o.ORDER_NO||'').trim(); const amt=bnxActiveOrderValue_(o); const ownerName=o.CREATED_BY||o.STARTED_BY||o.WAITER||o.STEWARD||o.CAPTAIN||o.createdBy||o.waiter||o.steward||''; const ownerId=o.CREATED_BY_ID||o.STARTED_BY_ID||o.USER_ID||o.userId||o.createdById||''; const ownerLogin=o.CREATED_BY_LOGIN||o.STARTED_BY_LOGIN||o.USER_CODE||o.LOGIN_ID||o.loginId||o.createdByLogin||''; if(!byTable[tid]) byTable[tid]={amount:0,pax:0,kot:0,orders:[],steward:ownerName,started:o.START_TIME||o.ORDER_TIME||o.startTime||'',stewardId:ownerId,stewardLogin:ownerLogin}; byTable[tid].amount+=amt; byTable[tid].pax=Math.max(byTable[tid].pax,Number(o.PAX)||Number(o.COVERS)||0); byTable[tid].kot+=1; if(oid) byTable[tid].orders.push(oid); });
       TABLES=TABLES.map(t=>{ const a=byTable[String(t.id).trim()]; if(!a) return t; return Object.assign({},t,{status:'RUNNING',bill:Math.max(Number(t.bill)||0,Number(a.amount)||0),covers:Math.max(Number(t.covers)||0,Number(a.pax)||0),kotCount:Math.max(Number(t.kotCount)||0,Number(a.kot)||0),steward:t.steward||a.steward,stewardId:t.stewardId||a.stewardId,stewardLogin:t.stewardLogin||a.stewardLogin,startTime:t.startTime||a.started,activeOrderIds:a.orders||[]}); });
@@ -4890,6 +4975,9 @@ function showScreen(id,navEl){
     // Table Management always opens on the current business date.
     mobTableDateFilter=businessDate(); const dateEl=document.getElementById('mob-table-date'); if(dateEl) dateEl.value=mobTableDateFilter;
     renderMobTables();
+    /* FAST LOAD: opening Tables now pulls the live floor immediately instead of
+       waiting for the next 20 s poll (shared/deduped, so taps never stack up) */
+    if(typeof loadTablesLive==='function') loadTablesLive().catch(()=>{});
   }
   if(id==='s-online'){ renderMobOnline(); loadOnlineOrdersLive(false); }
   if(id==='s-kot'){ renderKOT(); loadKOTFromServer(); }
@@ -4997,7 +5085,7 @@ function bnxApplySwTheme(key){
 
   if (key && key !== 'brand') root.setAttribute('data-theme', key);
   else root.removeAttribute('data-theme');
-  root.setAttribute('data-color-mode', bnxGetSwMode());
+  bnxPaintSwMode_();
 
   document.querySelectorAll('.sw-theme-swatch').forEach(el=>{
     el.classList.toggle('active', el.dataset.key === key);
@@ -5007,21 +5095,39 @@ function bnxApplySwTheme(key){
   });
 }
 function bnxSwModeKey(){ return 'bnx_sw_mode_' + bnxResolvedClientId_(); }
+/* THEME FIX: the CSS only has html[data-color-mode="light"|"dark"]. "system"
+   was written into the attribute as-is, so System mode matched neither rule set.
+   The saved preference stays light/dark/system; the attribute is always resolved. */
+function bnxResolvedSwMode_(pref){
+  pref = pref || bnxGetSwMode();
+  if(pref==='dark') return 'dark';
+  if(pref==='system'){ try{ return matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; }catch(e){ return 'light'; } }
+  return 'light';
+}
+function bnxPaintSwMode_(){
+  const rm = bnxResolvedSwMode_();
+  const root = document.documentElement;
+  if(root.getAttribute('data-color-mode')!==rm) root.setAttribute('data-color-mode', rm);
+  const cm = document.querySelector('meta[name="color-scheme"]'); if(cm && cm.getAttribute('content')!==rm) cm.setAttribute('content', rm);
+  document.querySelectorAll('meta[name="theme-color"]').forEach(m=>m.setAttribute('content', rm==='dark' ? '#0b0f13' : '#4a1d06'));
+  return rm;
+}
 function bnxGetSwMode(){
   let mode='light';
   try{ mode=localStorage.getItem(bnxSwModeKey()) || 'light'; }catch(e){}
   return mode==='light'||mode==='dark' ? mode : 'system';
 }
-function bnxSetSwMode(mode){
+function bnxSetSwMode(mode, silent){
   mode = (mode==='light'||mode==='dark') ? mode : 'system';
   try{ localStorage.setItem(bnxSwModeKey(), mode); }catch(e){}
-  document.documentElement.setAttribute('data-color-mode', mode);
+  bnxPaintSwMode_();
   const key = (()=>{ try{return localStorage.getItem(bnxSwThemeKey())||'brand';}catch(e){return 'brand';} })();
   bnxApplySwTheme(key);
   bnxRenderSwThemeSwatches();
   const row=document.getElementById('sw-mode-row');
   if(row) row.style.display='flex';
-  if(typeof toast==='function') toast(mode==='light'?'☀️ Light mode enabled':mode==='dark'?'🌙 Dark mode enabled':'⚙️ System mode enabled','success');
+  /* toast only for a real tap — startup restore used to toast "Light mode enabled" on every app open */
+  if(!silent && typeof toast==='function') toast(mode==='light'?'☀️ Light mode enabled':mode==='dark'?'🌙 Dark mode enabled':'⚙️ System mode enabled','success');
 }
 function bnxRenderSwThemeSwatches(){
   const row = document.getElementById('sw-theme-row');
@@ -5286,7 +5392,15 @@ async function doLogin(){
   document.getElementById('prof-avatar').textContent=name[0];
   document.getElementById('prof-role').textContent=(result.ROLE||'')+' • Morning Shift';
   /* Hold the Home screen back (max 2.5 s) until the real client name/logo/banner are in, so nothing swaps after the steward sees it. */
-  await Promise.allSettled([loadBootstrapOrFallback(), loadKOTFromServer(), Promise.race([Promise.allSettled([bnxBrandP_,bnxNameP_]), new Promise(r=>setTimeout(r,2500))])]);
+  /* FAST LOAD: Home used to wait for GET_BOOTSTRAP (the full menu) before it
+     could appear. Home needs tables + KOT + brand only; the menu keeps loading
+     in the background and is ready long before the steward opens New Order. */
+  const __bootP = loadBootstrapOrFallback().catch(e=>console.error('[BOOT] bootstrap rejected:', e));
+  await Promise.race([
+    Promise.allSettled([loadTablesLive(), loadKOTFromServer(), Promise.race([Promise.allSettled([bnxBrandP_,bnxNameP_]), new Promise(r=>setTimeout(r,2500))])]),
+    new Promise(r=>setTimeout(r,6000))
+  ]);
+  void __bootP;
   try{ bnxUpdateGreetingAndShift(new Date().getHours()); if(window.bnxRefreshHomeBrand) window.bnxRefreshHomeBrand(true); }catch(_){}
   bnxLoginInFlight=false;
   bnxClosePreLoginInstall();
@@ -5406,6 +5520,9 @@ function bnxMapMenuRow_(m,isBarDefault){
 }
 
 async function loadBootstrapOrFallback(){
+  /* FAST LOAD: tables never depend on the menu — start them now instead of
+     after the (large) GET_BOOTSTRAP menu download finishes. */
+  try{ loadTablesLive().catch(()=>{}); }catch(e){}
   const res = await gasApi('GET_BOOTSTRAP', {}, 'V2_CORE');
   if(res && res.success && res.data){
     if(Array.isArray(res.data.menu) && res.data.menu.length){
@@ -5430,12 +5547,10 @@ async function loadBootstrapOrFallback(){
        the real live merge (status/covers/bill), which only
        loadTablesLive()'s RD_FETCH_SHEET call provides, so bootstrap is
        now used for the menu only and tables always come from there. */
-    loadTablesLive();
     return;
   }
-  // Bootstrap not available/failed — original individual calls
+  // Bootstrap not available/failed — original individual call (tables already started above)
   loadMenuFromServer();
-  loadTablesLive();
 }
 
 /* ── TABLES ── */
@@ -11872,7 +11987,7 @@ if(getClientId() && getSessionToken()){
       var mode=localStorage.getItem('bnx_sw_mode_'+cid)||'light';
       if(theme!=='brand') root.setAttribute('data-theme',theme);
       else root.removeAttribute('data-theme');
-      root.setAttribute('data-color-mode',(mode==='light'||mode==='dark')?mode:'system');
+      root.setAttribute('data-color-mode',mode==='dark'?'dark':(mode==='system'&&window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'));
 
       var t=(window.SW_THEMES&&window.SW_THEMES[theme])||DEFAULTS;
       Object.keys(DEFAULTS).forEach(function(k){
@@ -11881,7 +11996,7 @@ if(getClientId() && getSessionToken()){
         else setVar('--'+k,DEFAULTS[k]);
       });
       if(typeof window.bnxApplySwTheme==='function') window.bnxApplySwTheme(theme);
-      if(typeof window.bnxSetSwMode==='function') window.bnxSetSwMode(mode);
+      if(typeof window.bnxSetSwMode==='function') window.bnxSetSwMode(mode, true);
     }catch(e){
       Object.keys(DEFAULTS).forEach(function(k){setVar('--'+k,DEFAULTS[k]);});
     }
@@ -12483,13 +12598,28 @@ button,.menu-view-toggle,.menu-type-btn,.menu-quick-btn,.cat-tab{touch-action:ma
   };
 
   /* ---------- live floor merge ---------- */
-  async function mergeFloor(){
-    const r = await call('GET_TABLE_FLOOR', { includeItems:true });
+  /* TABLE STATUS FIX: the floor projection also counts imported/historical
+     BILLED orders (e.g. RD1/RD2/B2 from April-May) as "open". Only let it turn
+     a table RUNNING when TABLE_LIVE_STATE already says so, or the open order
+     belongs to today's business date (or started < 16 h ago if undated). */
+  function floorIsLive(t, f){
+    try {
+      if (['RUNNING','OCCUPIED'].includes(String(t.status || '').toUpperCase())) return true;
+      const bd = (typeof businessDate === 'function') ? businessDate() : '';
+      const st = f.startTime || f.START_TIME || f.orderDate || f.ORDER_DATE || f.createdAt || '';
+      if (st) { const d = bnxOrderBizDate_({ ORDER_DATE: st, CREATED_AT: st }); if (d) return d === bd; }
+      if (f.elapsedMin != null && isFinite(Number(f.elapsedMin))) return Number(f.elapsedMin) <= 16 * 60;
+      return false;
+    } catch (e) { return false; }
+  }
+  async function mergeFloor(pre){
+    const r = await (pre || call('GET_TABLE_FLOOR', { includeItems:true }));
     if (!r || !r.success || !r.data || !Array.isArray(r.data.tables)) return false;
     FLOOR.byId = {}; FLOOR.at = Date.now();
     r.data.tables.forEach(f => { FLOOR.byId[String(f.tableNo).toUpperCase()] = f; if (f.tableId) FLOOR.byId[String(f.tableId).toUpperCase()] = f; });
     TABLES = TABLES.map(t => {
       const f = FLOOR.byId[String(t.id).trim().toUpperCase()]; if (!f) return t;
+      if (f.status === 'OCCUPIED' && !floorIsLive(t, f)) return t;
       if (f.status === 'OCCUPIED') {
         return Object.assign({}, t, { status:'RUNNING', bill:f.amount, covers:Math.max(Number(t.covers) || 0, f.guests || 0), kotCount:f.kotCount,
           steward:t.steward || f.ownerName || f.captain || '', stewardId:t.stewardId || f.ownerId || '', stewardLogin:t.stewardLogin || f.ownerLogin || '',
@@ -12504,9 +12634,10 @@ button,.menu-view-toggle,.menu-type-btn,.menu-quick-btn,.cat-tab{touch-action:ma
   const origLoad = W.loadTablesLive;
   if (typeof origLoad === 'function') {
     W.loadTablesLive = async function(){
+      const floorP = Promise.resolve().then(() => call('GET_TABLE_FLOOR', { includeItems:true })).catch(() => null);
       const ok = await origLoad.apply(this, arguments);
       try {
-        if (await mergeFloor()) {
+        if (await mergeFloor(floorP)) {
           if (document.getElementById('s-tables')?.classList.contains('active') && typeof renderMobTables === 'function') renderMobTables();
           if (document.getElementById('s-home')?.classList.contains('active') && typeof renderMyTables === 'function') renderMyTables();
         }
@@ -13398,7 +13529,8 @@ html:not([data-color-mode="dark"]) .kot-card{background:#fff!important;color:#17
   // keep light mode as the default for every device
   try{
     var k='bnx_sw_mode_'+(typeof CLIENT_ID!=='undefined'&&CLIENT_ID?CLIENT_ID:'local');
-    if(localStorage.getItem(k)!=='dark'){ localStorage.setItem(k,'light'); document.documentElement.setAttribute('data-color-mode','light'); }
+    if(!localStorage.getItem(k)){ localStorage.setItem(k,'light'); } /* default only — never override a saved Dark/System choice */
+    if(typeof bnxPaintSwMode_==='function') bnxPaintSwMode_();
   }catch(e){}
 })();
 </script>
@@ -13967,7 +14099,7 @@ input,select,textarea{font-family:inherit}
 <script id="hs-pro-fix">
 (function(){
   /* force HAPPYSERVE brand as default; stop any auto theme/dark flip */
-  try{var r=document.documentElement;r.setAttribute('data-color-mode','light');r.setAttribute('data-brand','happyserve');
+  try{var r=document.documentElement;if(typeof bnxPaintSwMode_==='function')bnxPaintSwMode_();r.setAttribute('data-brand','happyserve');
     var cid=(JSON.parse(localStorage.getItem('ERP_USER')||'{}').CLIENT_ID)||'local';
     if(!localStorage.getItem('bnx_sw_theme_'+cid)) r.removeAttribute('data-theme');}catch(e){}
   function tag(){
@@ -14021,6 +14153,257 @@ input,select,textarea{font-family:inherit}
   try{var hh=new Date().getHours();
     var g=hh<12?'☀️ Good Morning':hh<17?'👋 Good Afternoon':hh<21?'🌇 Good Evening':'🌙 Good Night';
     var el=document.getElementById('hsWelcomeGreet'); if(el) el.textContent=g;}catch(e){}
+})();
+</script>
+
+<style id="hs-welcome-v3-style">
+/* ══ WELCOME BANNER v3 — auto-rotating messages + occasion themes (Google-Doodle style) ══ */
+.hs-welcome{transition:background .6s ease,border-color .6s ease}
+.hs-welcome .hsw-fx{position:absolute;inset:0;border-radius:inherit;overflow:hidden;pointer-events:none;z-index:0}
+.hs-welcome-copy{transition:opacity .35s ease,transform .35s ease}
+.hs-welcome-copy.hsw-out{opacity:0;transform:translateY(6px)}
+.hs-welcome-title{word-break:normal;overflow-wrap:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.hs-welcome-sub{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.hsw-dots{position:absolute;left:18px;bottom:7px;display:flex;gap:5px;z-index:2}
+.hsw-dots i{width:6px;height:6px;border-radius:3px;background:rgba(128,128,128,.38);transition:width .3s,background .3s}
+.hsw-dots i.on{width:16px;background:var(--hsw-accent,#d98a00)}
+.hsw-art{width:108px;height:108px;flex-shrink:0;position:relative;z-index:1;display:none;align-items:center;justify-content:center}
+.hs-welcome.hsw-occ .hsw-art{display:flex}
+.hs-welcome.hsw-occ .hs-welcome-art{display:none}
+.hsw-art .m{font-size:62px;line-height:1;filter:drop-shadow(0 6px 10px rgba(0,0,0,.18));animation:hswBob 3.2s ease-in-out infinite}
+.hsw-art .s{position:absolute;font-size:22px;line-height:1;animation:hswTw 2.6s ease-in-out infinite}
+.hsw-art .s1{top:6px;left:8px}.hsw-art .s2{top:12px;right:2px;animation-delay:.8s}.hsw-art .s3{bottom:10px;right:10px;animation-delay:1.5s;font-size:18px}
+.hsw-art .glow{position:absolute;inset:8px;border-radius:50%;background:radial-gradient(circle,var(--hsw-glow,rgba(255,212,103,.55)),transparent 70%)}
+@keyframes hswBob{0%,100%{transform:translateY(0) rotate(-3deg)}50%{transform:translateY(-6px) rotate(3deg)}}
+@keyframes hswTw{0%,100%{transform:scale(.8);opacity:.55}50%{transform:scale(1.15);opacity:1}}
+.hsw-p{position:absolute;top:-14px;font-size:14px;line-height:1;opacity:.85;animation:hswFall linear infinite}
+.hsw-p.dot{width:7px;height:7px;border-radius:50%}
+@keyframes hswFall{0%{transform:translateY(-10px) rotate(0)}100%{transform:translateY(240px) rotate(300deg)}}
+.hsw-p.up{top:auto;bottom:-14px;animation-name:hswRise}
+@keyframes hswRise{0%{transform:translateY(0) scale(.8);opacity:0}15%{opacity:.9}100%{transform:translateY(-230px) scale(1.1);opacity:0}}
+.hsw-home-pill{display:inline-flex;align-items:center;gap:6px;margin-top:6px;padding:4px 10px;border-radius:999px;background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.28);color:#fff;font-size:11px;font-weight:800;letter-spacing:.02em}
+@media (prefers-reduced-motion:reduce){.hsw-p{display:none}.hsw-art .m,.hsw-art .s{animation:none}.hs-welcome-copy{transition:none}}
+</style>
+<script id="hs-welcome-v3-js">
+/* WELCOME BANNER v3
+   1. Auto-rotating welcome messages (every 5 s, fade). Tap / swipe = next.
+      Pauses while the tab is hidden. Height is locked to the tallest message
+      so the login form below never jumps.
+   2. Occasion mode (Google-Doodle style): on festival / special days the
+      banner re-themes itself — colours, festival art, falling/rising
+      particles, festival greetings — and a small festival pill appears on
+      the Home hero. Normal welcome messages keep rotating in between.
+   Dates: fixed-date days are computed for every year; lunar festivals are
+   listed for 2026 and 2027 (Islamic dates can move by 1 day with the moon).
+   Add your own (restaurant anniversary, offers…):
+     localStorage.setItem('bnx_occasions_custom', JSON.stringify([
+       {key:'anniv',from:'2026-12-05',to:'2026-12-05',chip:'🎂 Anniversary',
+        title:'Happy 5th Anniversary!',sub:'Thank every guest today.',art:'🎂',fx:'confetti'}]))
+   Preview any occasion: steward-mobile.html?occasion=diwali  (off: ?occasion=none) */
+(function(){
+  'use strict';
+  var W=document.getElementById('hsWelcome'); if(!W) return;
+  var chip=document.getElementById('hsWelcomeGreet'), copy=W.querySelector('.hs-welcome-copy'),
+      title=W.querySelector('.hs-welcome-title'), sub=W.querySelector('.hs-welcome-sub');
+  if(!chip||!copy||!title||!sub) return;
+
+  /* ---------- themes ---------- */
+  var T={
+    diwali:{bg:'linear-gradient(135deg,#2b0f3a 0%,#5a1a4a 55%,#b4580a 100%)',bd:'#f5b942',tc:'#ffe08a',sc:'rgba(255,240,210,.9)',ac:'#ffbf2e',glow:'rgba(255,190,60,.6)',art:'🪔',s:['✨','🎆','✨'],fx:'sparkle'},
+    durga:{bg:'linear-gradient(135deg,#fff7e8 0%,#ffe0c2 55%,#ffc9a3 100%)',bd:'#e46b2c',tc:'#9b1c1c',sc:'#7a3b1b',ac:'#d9480f',glow:'rgba(255,140,60,.45)',art:'🌺',s:['🥁','🪔','🌼'],fx:'petals'},
+    bijoya:{bg:'linear-gradient(135deg,#fff3f0 0%,#ffd6d0 60%,#ffb4a8 100%)',bd:'#d6336c',tc:'#9b1c1c',sc:'#7a3b1b',ac:'#d6336c',glow:'rgba(255,120,120,.4)',art:'🙏',s:['🌺','🍬','🪔'],fx:'petals'},
+    holi:{bg:'linear-gradient(135deg,#fff 0%,#ffe3f4 35%,#e3f2ff 70%,#e8ffe3 100%)',bd:'#e64980',tc:'#6b21a8',sc:'#4c1d95',ac:'#e64980',glow:'rgba(240,100,200,.35)',art:'🎨',s:['💜','💛','💚'],fx:'colors'},
+    christmas:{bg:'linear-gradient(135deg,#0f3d2e 0%,#14532d 55%,#7f1d1d 100%)',bd:'#86efac',tc:'#fff',sc:'rgba(255,255,255,.88)',ac:'#ef4444',glow:'rgba(255,255,255,.35)',art:'🎄',s:['⭐','🎁','🔔'],fx:'snow'},
+    newyear:{bg:'linear-gradient(135deg,#111827 0%,#312e81 55%,#7c3aed 100%)',bd:'#c4b5fd',tc:'#fde68a',sc:'rgba(255,255,255,.88)',ac:'#fbbf24',glow:'rgba(251,191,36,.45)',art:'🎉',s:['🥂','✨','🎆'],fx:'confetti'},
+    india:{bg:'linear-gradient(180deg,#fff1e0 0%,#ffffff 50%,#e6f7e6 100%)',bd:'#ff9933',tc:'#000080',sc:'#1f3a1f',ac:'#ff9933',glow:'rgba(255,153,51,.35)',art:'🇮🇳',s:['🧡','🤍','💚'],fx:'tricolor'},
+    eid:{bg:'linear-gradient(135deg,#052e2b 0%,#0f5c4f 60%,#1b7a63 100%)',bd:'#fcd34d',tc:'#fde68a',sc:'rgba(255,255,255,.88)',ac:'#fcd34d',glow:'rgba(252,211,77,.45)',art:'🌙',s:['⭐','✨','🕌'],fx:'stars'},
+    love:{bg:'linear-gradient(135deg,#fff0f3 0%,#ffd6e0 60%,#ffb3c6 100%)',bd:'#f06595',tc:'#a61e4d',sc:'#7a2140',ac:'#e64980',glow:'rgba(255,120,160,.4)',art:'💝',s:['❤️','🌹','💕'],fx:'hearts'},
+    flowers:{bg:'linear-gradient(135deg,#fdf4ff 0%,#fae8ff 60%,#f5d0fe 100%)',bd:'#c026d3',tc:'#86198f',sc:'#6b2170',ac:'#c026d3',glow:'rgba(217,70,239,.3)',art:'💐',s:['🌷','🌸','💖'],fx:'petals'},
+    kite:{bg:'linear-gradient(135deg,#e0f2fe 0%,#bae6fd 60%,#fef3c7 100%)',bd:'#0ea5e9',tc:'#075985',sc:'#0c4a6e',ac:'#f59e0b',glow:'rgba(250,204,21,.45)',art:'🪁',s:['☀️','🪁','🌾'],fx:'sparkle'},
+    fire:{bg:'linear-gradient(135deg,#2b1204 0%,#7c2d12 60%,#ea580c 100%)',bd:'#fdba74',tc:'#fed7aa',sc:'rgba(255,255,255,.88)',ac:'#fb923c',glow:'rgba(251,146,60,.55)',art:'🔥',s:['🌽','🥜','✨'],fx:'embers'},
+    sun:{bg:'linear-gradient(180deg,#fff7ed 0%,#fed7aa 60%,#fdba74 100%)',bd:'#ea580c',tc:'#9a3412',sc:'#7c2d12',ac:'#ea580c',glow:'rgba(251,146,60,.5)',art:'🌅',s:['🪔','🍌','🙏'],fx:'sparkle'},
+    devotion:{bg:'linear-gradient(135deg,#fffbeb 0%,#fef3c7 60%,#fde68a 100%)',bd:'#d97706',tc:'#92400e',sc:'#78350f',ac:'#d97706',glow:'rgba(252,211,77,.55)',art:'🙏',s:['🪔','🌼','✨'],fx:'petals'},
+    krishna:{bg:'linear-gradient(135deg,#eef2ff 0%,#e0e7ff 55%,#c7d2fe 100%)',bd:'#4f46e5',tc:'#312e81',sc:'#3730a3',ac:'#4f46e5',glow:'rgba(99,102,241,.35)',art:'🦚',s:['🪈','🧈','✨'],fx:'sparkle'},
+    rakhi:{bg:'linear-gradient(135deg,#fff7ed 0%,#ffedd5 55%,#fecdd3 100%)',bd:'#f97316',tc:'#9a3412',sc:'#7c2d12',ac:'#f43f5e',glow:'rgba(251,113,133,.35)',art:'🎀',s:['🍬','💛','✨'],fx:'sparkle'},
+    party:{bg:'linear-gradient(135deg,#fffbeb 0%,#fef3c7 50%,#dbeafe 100%)',bd:'#f59e0b',tc:'#1e3a8a',sc:'#334155',ac:'#f59e0b',glow:'rgba(251,191,36,.45)',art:'🎈',s:['🎊','🍭','✨'],fx:'confetti'},
+    food:{bg:'linear-gradient(135deg,#fffdf7 0%,#fff3d1 60%,#ffe2a8 100%)',bd:'#f59e0b',tc:'#7c2d12',sc:'#6b5a48',ac:'#d97706',glow:'rgba(251,191,36,.5)',art:'🍲',s:['🌶️','🥘','✨'],fx:'sparkle'},
+    noboborsho:{bg:'linear-gradient(135deg,#fff 0%,#fee2e2 55%,#fecaca 100%)',bd:'#dc2626',tc:'#991b1b',sc:'#7f1d1d',ac:'#dc2626',glow:'rgba(248,113,113,.35)',art:'🌸',s:['🪷','🥭','✨'],fx:'petals'}
+  };
+  /* key, theme, chip, title, [subs] */
+  var O={
+    diwali:['diwali','🪔 Shubho Deepaboli','Happy Diwali & Kali Puja!',['May every table glow with light and laughter.','Festival rush ahead — serve with a smile!']],
+    bhaidooj:['diwali','🪔 Bhai Phonta','Happy Bhai Dooj!',['Sweet wishes for every family at your tables.']],
+    durga:['durga','🌺 Shubho Pujo','Shubho Durga Pujo!',['Pandal-hopping guests are coming hungry — let’s serve joy!','Maa Durga’s blessings on every order today.']],
+    navratri:['durga','🪔 Navratri','Happy Navratri!',['Nine nights of devotion — and great food.','Check the vrat/falahar items before taking orders.']],
+    bijoya:['bijoya','🙏 Shubho Bijoya','Shubho Bijoya Dashami!',['Victory of good over evil — sweets on every table!','Greet guests with Shubho Bijoya today.']],
+    holi:['holi','🎨 Holi Hai!','Happy Holi!',['Colours outside, great food inside!','Thandai and gujiya orders incoming — be ready!']],
+    christmas:['christmas','🎄 Merry Christmas','Merry Christmas!',['Jingle all the way to happy tables.','Plum cake season — recommend the specials!']],
+    newyear:['newyear','🎉 Happy New Year','Happy New Year!',['A fresh year of happy guests starts with you.','New year, new records — let’s go!']],
+    nye:['newyear','🥂 New Year’s Eve','Biggest night of the year!',['Full house tonight — keep KOTs fast.','Count down to midnight with happy tables.']],
+    republic:['india','🇮🇳 Republic Day','Happy Republic Day!',['Proud to serve — Jai Hind!']],
+    independence:['india','🇮🇳 Independence Day','Happy Independence Day!',['Freedom tastes better together — Jai Hind!']],
+    eidfitr:['eid','🌙 Eid Mubarak','Eid Mubarak!',['Biryani, sewai and smiles — serve with love.','Wishing every guest peace and joy.']],
+    eidadha:['eid','🌙 Eid al-Adha','Eid Mubarak!',['Wishing every guest peace and plenty.']],
+    valentine:['love','💝 Valentine’s Day','Happy Valentine’s Day!',['Couples night — candles, desserts and quick service.','Suggest the special dessert for two!']],
+    womens:['flowers','🌷 Women’s Day','Happy Women’s Day!',['Celebrating every woman we serve and work with.']],
+    mothers:['flowers','💐 Mother’s Day','Happy Mother’s Day!',['Family tables today — make every mom feel special.']],
+    fathers:['party','👔 Father’s Day','Happy Father’s Day!',['Family lunches incoming — serve with a smile.']],
+    friendship:['party','🤝 Friendship Day','Happy Friendship Day!',['Big groups today — split bills ready!']],
+    childrens:['party','🎈 Children’s Day','Happy Children’s Day!',['Little guests, big smiles — kids’ menu ready?']],
+    sankranti:['kite','🪁 Makar Sankranti','Happy Makar Sankranti!',['Til-gur sweets and soaring kites — enjoy the day.']],
+    lohri:['fire','🔥 Lohri','Happy Lohri!',['Warm fires, warm food, warm welcomes.']],
+    noboborsho:['noboborsho','🌸 Shubho Noboborsho','Shubho Noboborsho!',['A fresh Bengali new year — new beginnings, happy guests.']],
+    shivratri:['devotion','🔱 Maha Shivratri','Har Har Mahadev!',['Keep the fasting-friendly items ready today.']],
+    janmashtami:['krishna','🦚 Janmashtami','Happy Janmashtami!',['Makhan-mishri wishes to every guest.']],
+    rakhi:['rakhi','🎀 Raksha Bandhan','Happy Raksha Bandhan!',['Family celebrations today — sweets on the side!']],
+    chhath:['sun','🌅 Chhath Puja','Happy Chhath Puja!',['Blessings of Surya Dev to all.']],
+    gurpurab:['devotion','🙏 Guru Nanak Jayanti','Happy Gurpurab!',['Seva with a smile — Waheguru ji ka Khalsa.']],
+    rathyatra:['devotion','🛕 Rath Yatra','Happy Rath Yatra!',['Jai Jagannath — festive crowds expected.']],
+    ramnavami:['devotion','🏹 Ram Navami','Happy Ram Navami!',['Jai Shri Ram — serve with devotion.']],
+    worldfood:['food','🍲 World Food Day','Happy World Food Day!',['Every plate you serve matters — zero waste today!']]
+  };
+  function pad(n){return (n<10?'0':'')+n;}
+  function ymd(d){return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());}
+  function nthSunday(y,m,n){var d=new Date(y,m-1,1);var first=(7-d.getDay())%7+1;return y+'-'+pad(m)+'-'+pad(first+7*(n-1));}
+  function fixed(y){var f=function(m,d){return y+'-'+m+'-'+d;};
+    return [['newyear',f('01','01'),f('01','02')],['lohri',f('01','13'),f('01','13')],['sankranti',f('01','14'),f('01','15')],
+      ['republic',f('01','26'),f('01','26')],['valentine',f('02','14'),f('02','14')],['womens',f('03','08'),f('03','08')],
+      ['noboborsho',f('04','14'),f('04','15')],['mothers',nthSunday(y,5,2),nthSunday(y,5,2)],['fathers',nthSunday(y,6,3),nthSunday(y,6,3)],
+      ['friendship',nthSunday(y,8,1),nthSunday(y,8,1)],['independence',f('08','15'),f('08','15')],['worldfood',f('10','16'),f('10','16')],
+      ['childrens',f('11','14'),f('11','14')],['christmas',f('12','24'),f('12','25')],['nye',f('12','31'),f('12','31')]];}
+  var LUNAR={
+    2026:[['shivratri','2026-02-15','2026-02-15'],['holi','2026-03-03','2026-03-04'],['eidfitr','2026-03-20','2026-03-21'],['ramnavami','2026-03-26','2026-03-26'],
+      ['eidadha','2026-05-27','2026-05-28'],['rathyatra','2026-07-16','2026-07-16'],['rakhi','2026-08-28','2026-08-28'],['janmashtami','2026-09-04','2026-09-04'],
+      ['navratri','2026-10-11','2026-10-16'],['durga','2026-10-17','2026-10-19'],['bijoya','2026-10-20','2026-10-21'],
+      ['diwali','2026-11-06','2026-11-09'],['bhaidooj','2026-11-10','2026-11-11'],['chhath','2026-11-14','2026-11-15'],['gurpurab','2026-11-24','2026-11-24']],
+    2027:[['shivratri','2027-03-06','2027-03-06'],['eidfitr','2027-03-09','2027-03-10'],['holi','2027-03-21','2027-03-22'],['eidadha','2027-05-16','2027-05-17'],
+      ['durga','2027-10-04','2027-10-08'],['bijoya','2027-10-09','2027-10-10'],['diwali','2027-10-27','2027-10-30'],['bhaidooj','2027-10-31','2027-10-31'],
+      ['chhath','2027-11-03','2027-11-04']]
+  };
+  function custom(){try{var a=JSON.parse(localStorage.getItem('bnx_occasions_custom')||'[]');return Array.isArray(a)?a:[];}catch(e){return [];}}
+  function build(key,c){ /* c = custom record (optional) */
+    var o=O[key], th;
+    if(c){ th=Object.assign({},T[c.theme]||T.party,{art:c.art||(T[c.theme]||T.party).art,fx:c.fx||(T[c.theme]||T.party).fx});
+      return {key:c.key||key,th:th,chip:c.chip||'🎉 Special Day',title:c.title||'Special Day!',subs:[].concat(c.sub||'Make every guest smile today.')}; }
+    if(!o) return null;
+    return {key:key,th:T[o[0]],chip:o[1],title:o[2],subs:o[3]};
+  }
+  function current(){
+    try{var q=new URLSearchParams(location.search).get('occasion');
+      if(q){ if(q==='none') return null; if(O[q]) return build(q); }}catch(e){}
+    var today=ymd(new Date()), y=new Date().getFullYear();
+    var cs=custom();
+    for(var i=0;i<cs.length;i++){ var c=cs[i]; if(c&&c.from&&today>=c.from&&today<=(c.to||c.from)) return build(c.key||'custom',c); }
+    var list=(LUNAR[y]||[]).concat(fixed(y));
+    for(var j=0;j<list.length;j++){ if(today>=list[j][1]&&today<=list[j][2]) return build(list[j][0]); }
+    return null;
+  }
+
+  /* ---------- normal welcome messages ---------- */
+  function greet(){var h=new Date().getHours();return h<12?'☀️ Good Morning':h<17?'👋 Good Afternoon':h<21?'🌇 Good Evening':'🌙 Good Night';}
+  function base(){
+    var d=new Date().getDay(), h=new Date().getHours();
+    var s=[{c:greet(),t:'Welcome Back',s:'Sign in to start serving. Great food, happy guests — let’s make today shine.'},
+           {c:greet(),t:'Ready for your shift?',s:'Every happy guest starts with you. Fast KOTs, hot food, happy tables.'},
+           {c:'⭐ Tip of the shift',t:'Smile first, order next',s:'Greet within 2 minutes, repeat the order back, and suggest today’s special.'}];
+    if(d===5||d===6||d===0) s.push({c:'🔥 Weekend rush',t:'Big day ahead!',s:'Full tables expected — keep KOTs quick and check table status often.'});
+    else if(h>=11&&h<15) s.push({c:'🍛 Lunch hour',t:'Lunch rush is on',s:'Quick service wins repeat guests — keep the kitchen updated.'});
+    else if(h>=18) s.push({c:'🌆 Dinner service',t:'Dinner time!',s:'Suggest desserts and drinks — small adds, big smiles.'});
+    return s;
+  }
+
+  /* ---------- render ---------- */
+  var fx=D('div','hsw-fx'), art=D('div','hsw-art'), dots=D('div','hsw-dots');
+  function D(tag,cls){var e=document.createElement(tag);e.className=cls;return e;}
+  W.insertBefore(fx,W.firstChild); W.appendChild(art); W.appendChild(dots);
+  var orig={bg:W.style.background,bd:W.style.borderColor};
+  var occ=null, slides=[], idx=0, timer=null;
+
+  function particles(kind){
+    fx.innerHTML='';
+    if(window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    var set={sparkle:['✨','⭐'],snow:['❄️','❅','•'],confetti:['dot'],colors:['dot'],petals:['🌸','🌼','🏵️'],hearts:['❤️','💕'],stars:['✨','⭐'],tricolor:['dot'],embers:['dot']}[kind]||['✨'];
+    var col={confetti:['#f59e0b','#ec4899','#3b82f6','#10b981','#a855f7'],colors:['#ec4899','#a855f7','#22c55e','#facc15','#3b82f6','#f97316'],tricolor:['#ff9933','#ffffff','#138808','#000080'],embers:['#fdba74','#fb923c','#fde68a']}[kind];
+    var up=(kind==='embers');
+    for(var i=0;i<14;i++){
+      var p=D('span','hsw-p'+(set[0]==='dot'?' dot':'')+(up?' up':''));
+      p.style.left=(Math.random()*96)+'%';
+      p.style.animationDuration=(5+Math.random()*6).toFixed(1)+'s';
+      p.style.animationDelay=(-Math.random()*8).toFixed(1)+'s';
+      if(set[0]==='dot'){ p.style.background=col[i%col.length]; if(kind==='tricolor') p.style.boxShadow='0 0 0 1px rgba(0,0,0,.08)'; }
+      else { p.textContent=set[i%set.length]; p.style.fontSize=(10+Math.random()*8).toFixed(0)+'px'; }
+      fx.appendChild(p);
+    }
+  }
+  function applyTheme(){
+    if(occ){
+      var t=occ.th;
+      W.classList.add('hsw-occ'); W.setAttribute('data-occasion',occ.key);
+      W.style.background=t.bg; W.style.borderColor=t.bd; W.style.setProperty('--hsw-accent',t.ac); W.style.setProperty('--hsw-glow',t.glow);
+      title.style.color=t.tc; sub.style.color=t.sc; chip.style.color=t.ac; chip.style.borderColor=t.bd;
+      art.innerHTML='<div class="glow"></div><div class="m">'+t.art+'</div><div class="s s1">'+t.s[0]+'</div><div class="s s2">'+t.s[1]+'</div><div class="s s3">'+t.s[2]+'</div>';
+      particles(t.fx);
+    }else{
+      W.classList.remove('hsw-occ'); W.removeAttribute('data-occasion');
+      W.style.background=orig.bg; W.style.borderColor=orig.bd; W.style.removeProperty('--hsw-accent');
+      title.style.color=''; sub.style.color=''; chip.style.color=''; chip.style.borderColor='';
+      art.innerHTML=''; fx.innerHTML='';
+    }
+  }
+  function makeSlides(){
+    var b=base(); slides=[];
+    if(occ){ occ.subs.forEach(function(s){slides.push({c:occ.chip,t:occ.title,s:s});}); slides.push(b[0]); slides.push(b[1]); if(b[3]) slides.push(b[3]); }
+    else slides=b;
+    dots.innerHTML=slides.map(function(){return '<i></i>';}).join('');
+  }
+  function paint(i){
+    var s=slides[i]; chip.textContent=s.c; title.textContent=s.t; sub.textContent=s.s; fitTitle();
+    [].forEach.call(dots.children,function(d,k){d.classList.toggle('on',k===i);});
+  }
+  function fitTitle(){ /* shrink long festival titles until no word is cut */
+    title.style.fontSize=''; var fs=parseFloat(getComputedStyle(title).fontSize)||27, n=0;
+    while(n++<12 && fs>16 && (title.scrollHeight>title.clientHeight+2 || title.scrollWidth>title.clientWidth+1)){ fs-=1; title.style.fontSize=fs+'px'; }
+  }
+  function lockHeight(){
+    copy.style.minHeight='';
+    var max=0; for(var i=0;i<slides.length;i++){ paint(i); max=Math.max(max,copy.offsetHeight); }
+    if(max) copy.style.minHeight=(max+10)+'px';   /* +10 = room for the dots */
+    paint(idx);
+  }
+  function go(n){
+    if(slides.length<2) return;
+    copy.classList.add('hsw-out');
+    setTimeout(function(){ idx=(n+slides.length)%slides.length; paint(idx); copy.classList.remove('hsw-out'); },300);
+  }
+  function start(){ stop(); if(slides.length>1) timer=setInterval(function(){ if(!document.hidden) go(idx+1); },5000); }
+  function stop(){ if(timer) clearInterval(timer); timer=null; }
+  function refresh(){
+    var n=current(), was=occ?occ.key:'';
+    occ=n; if((n?n.key:'')!==was||!slides.length){ applyTheme(); }
+    makeSlides(); idx=0; lockHeight(); start(); homePill();
+  }
+  function homePill(){
+    var hn=document.getElementById('hero-name'); if(!hn) return;
+    var p=document.getElementById('hsw-home-pill');
+    if(!occ){ if(p) p.remove(); return; }
+    if(!p){ p=D('div','hsw-home-pill'); p.id='hsw-home-pill'; hn.parentNode.insertBefore(p,hn.nextSibling); }
+    p.textContent=occ.chip;
+  }
+
+  /* tap / swipe = next message */
+  var sx=null;
+  W.addEventListener('touchstart',function(e){sx=e.touches[0].clientX;},{passive:true});
+  W.addEventListener('touchend',function(e){ if(sx===null) return; var dx=e.changedTouches[0].clientX-sx; sx=null; if(Math.abs(dx)>30){ go(idx+(dx<0?1:-1)); start(); } },{passive:true});
+  W.addEventListener('click',function(){ go(idx+1); start(); });
+  document.addEventListener('visibilitychange',function(){ if(!document.hidden) refresh(); });
+  window.addEventListener('resize',function(){ clearTimeout(window.__hswR); window.__hswR=setTimeout(lockHeight,200); });
+  /* re-check at midnight / greeting changes */
+  setInterval(function(){ if(!document.hidden) { var k=current(); if((k?k.key:'')!==(occ?occ.key:'')) refresh(); } },10*60*1000);
+
+  window.bnxOccasion=function(){ return occ?{key:occ.key,chip:occ.chip,title:occ.title}:null; };
+  window.bnxWelcomeRefresh=refresh;
+  if(document.fonts&&document.fonts.ready) document.fonts.ready.then(function(){ lockHeight(); });
+  refresh();
 })();
 </script>
 
@@ -14304,6 +14687,121 @@ body:has(#s-new-order.active) .hs-status-wrap{
 body:has(#s-new-order.active) .hs-status-wrap>div{font-size:9px!important;padding:2px 7px!important;box-shadow:none!important;opacity:.92}
 </style>
 <style id="hs-printers-css2">body:has(#bnx-printer-setup-host .modal-overlay) .hs-status-wrap{display:none!important}</style>
+<script id="bnx-resume-last-view">
+/* REOPEN SAME PAGE
+   ROOT CAUSE: when the phone closes the app in the background (or it is
+   reopened from the home-screen icon) the page reloads, and the session
+   resume always called showScreen('s-home') — twice — so the steward lost the
+   screen, the table and the unsent cart every time.
+   Now the current view is saved on every screen change, cart change and when
+   the app goes to the background: screen, selected table, open table popup,
+   cart + item remarks, Tables date, scroll position. On reopen (same login,
+   same business day, within 12 h) that exact view comes back. Login/logout and
+   a new business day still start fresh. */
+(function(){
+  'use strict';
+  var W=window, D=document;
+  var OK_SCREENS={'s-home':1,'s-tables':1,'s-online':1,'s-kot':1,'s-history':1,'s-staff-hub':1,'s-reports':1,'s-profile':1,'s-new-order':1,'s-earnings':1};
+  var MAX_AGE=12*3600*1000;
+  function cid(){ try{ var u=JSON.parse(localStorage.getItem('ERP_USER')||'{}'); return u.CLIENT_ID||u.clientId||localStorage.getItem('bnx_client_id')||'local'; }catch(e){ return 'local'; } }
+  function key(){ return 'bnx_last_view_'+cid(); }
+  function tok(){ try{ return String(localStorage.getItem('ERP_SESSION')||'').slice(-12); }catch(e){ return ''; } }
+  function bdate(){ try{ return businessDate(); }catch(e){ return new Date().toISOString().slice(0,10); } }
+  function active(){ var s=D.querySelector('.screen.active'); return s?s.id:''; }
+  var restoring=false, lastKey='';
+
+  function snapshot(){
+    if(restoring) return;
+    try{
+      var id=active();
+      if(!id) return;
+      if(id==='s-login'){ if(!localStorage.getItem('ERP_SESSION') && lastKey) localStorage.removeItem(lastKey); return; }
+      if(!OK_SCREENS[id]) return;
+      var st=null; try{ st=selTable; }catch(e){}
+      var cart={}, rem={}; try{ cart=order||{}; rem=orderItemRemarks||{}; }catch(e){}
+      var modal=D.getElementById('table-modal');
+      var sc=D.querySelector('.screen.active .scroll');
+      var v={v:1,screen:id,at:Date.now(),bd:bdate(),tok:tok(),
+        tableId: st&&st.id!=null?String(st.id):'',
+        table: st?{id:st.id,no:st.no,section:st.section,status:st.status,pax:st.pax,covers:st.covers,bill:st.bill,steward:st.steward,stewardId:st.stewardId,stewardLogin:st.stewardLogin}:null,
+        order: id==='s-new-order'?cart:{}, remarks: id==='s-new-order'?rem:{},
+        modalTable: (modal&&modal.classList.contains('open')&&st)?String(st.id):'',
+        tablesDate: (function(){ try{ return mobTableDateFilter||''; }catch(e){ return ''; } })(),
+        scroll: sc?Math.round(sc.scrollTop):0,
+        title: id==='s-new-order'?((D.getElementById('no-title')||{}).textContent||''):''};
+      lastKey=key(); localStorage.setItem(lastKey,JSON.stringify(v));
+    }catch(e){}
+  }
+  W.bnxSaveLastView_=snapshot;
+
+  function read(){
+    try{
+      var v=JSON.parse(localStorage.getItem(key())||'null');
+      if(!v||v.v!==1||!OK_SCREENS[v.screen]) return null;
+      if(v.bd!==bdate()||Date.now()-v.at>MAX_AGE||v.tok!==tok()) return null;
+      return v;
+    }catch(e){ return null; }
+  }
+  function findTable(id){ try{ return (Array.isArray(TABLES)?TABLES:[]).find(function(t){return String(t.id)===String(id);})||null; }catch(e){ return null; } }
+  function setScroll(y){ if(!y) return; [60,400,1200].forEach(function(ms){ setTimeout(function(){ var sc=D.querySelector('.screen.active .scroll'); if(sc&&sc.scrollTop<5) sc.scrollTop=y; },ms); }); }
+
+  var target=null;
+  /* phase 'first' = right after session resume (data still loading);
+     phase 'final' = after tables/KOT/menu arrived */
+  W.bnxRestoreLastView_=function(phase){
+    if(phase==='first'){
+      target=read();
+      if(!target){ showScreen('s-home'); return 's-home'; }
+      restoring=true;
+      try{
+        if(target.screen==='s-new-order'){
+          try{ selTable=findTable(target.tableId)||target.table; }catch(e){}
+          try{ order=target.order||{}; orderItemRemarks=target.remarks||{}; }catch(e){}
+          showScreen('s-new-order');
+          var tt=D.getElementById('no-title'); if(tt&&target.title) tt.textContent=target.title;
+          try{ updateOrderBadge(); refreshCurrentMenuView_(); }catch(e){}
+        }else{
+          showScreen(target.screen);
+          if(target.screen==='s-tables' && target.tablesDate && target.tablesDate!==bdate()){ try{ setMobTableDateFilter(target.tablesDate); }catch(e){} }
+        }
+      }finally{ restoring=false; }
+      setScroll(target.scroll);
+      return target.screen;
+    }
+    /* final */
+    if(!target){ if(active()==='s-home'||!active()) showScreen('s-home'); return; }
+    if(active()!==target.screen) return;            /* steward already moved on — don't jump */
+    restoring=true;
+    try{
+      if(target.screen==='s-new-order'){
+        var t=findTable(target.tableId); if(t){ try{ selTable=t; }catch(e){} }
+        try{ updateOrderBadge(); refreshCurrentMenuView_(); }catch(e){}
+      }else if(target.screen==='s-home'){ showScreen('s-home'); }
+      if(target.modalTable && typeof openTable==='function' && findTable(target.modalTable)){ try{ openTable(target.modalTable); }catch(e){} }
+    }finally{ restoring=false; }
+    setScroll(target.scroll);
+    var done=target; target=null; snapshot(); return done.screen;
+  };
+
+  /* save triggers */
+  function hook(name,after){ var o=W[name]; if(typeof o!=='function'||o.__bnxLV) return; var f=function(){ var r=o.apply(this,arguments); try{ after.apply(this,arguments); }catch(e){} return r; }; f.__bnxLV=true; W[name]=f; }
+  function hookAll(){
+    hook('showScreen',function(){ setTimeout(snapshot,0); });
+    hook('updateOrderBadge',function(){ if(!restoring) snapshot(); });
+    hook('openTable',function(){ setTimeout(snapshot,50); });
+    hook('closeModal',function(){ setTimeout(snapshot,50); });
+    hook('setMobTableDateFilter',function(){ setTimeout(snapshot,0); });
+    hook('doLogout',function(){ setTimeout(function(){ try{ if(!localStorage.getItem('ERP_SESSION') && lastKey) localStorage.removeItem(lastKey); }catch(e){} },300); });
+  }
+  hookAll();
+  if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',hookAll); else setTimeout(hookAll,0);
+  W.addEventListener('load',function(){ setTimeout(hookAll,0); });
+  D.addEventListener('visibilitychange',function(){ if(D.hidden) snapshot(); });
+  W.addEventListener('pagehide',snapshot);
+  var st=0; D.addEventListener('scroll',function(){ clearTimeout(st); st=setTimeout(snapshot,400); },true);
+})();
+</script>
+
 <script id="hs-final-session-star">
 /* FINAL PASS — (1) stay logged in for the whole business day, (2) star icon on the left category rail */
 (function(){
@@ -14345,7 +14843,8 @@ body:has(#s-new-order.active) .hs-status-wrap>div{font-size:9px!important;paddin
       set('hero-name',name); set('prof-name',name); set('prof-avatar',(name||'?')[0]);
       set('prof-role',(r.ROLE||'')+' • On duty');
       var lg=document.getElementById('s-login'); if(lg){ lg.classList.remove('active'); }
-      showScreen('s-home'); hideSplash();
+      if(typeof W.bnxRestoreLastView_==='function') W.bnxRestoreLastView_('first'); else showScreen('s-home');
+      hideSplash();
       await Promise.allSettled([
         (typeof loadBootstrapOrFallback==='function'?loadBootstrapOrFallback():null),
         (typeof loadKOTFromServer==='function'?loadKOTFromServer():null)
@@ -14353,7 +14852,7 @@ body:has(#s-new-order.active) .hs-status-wrap>div{font-size:9px!important;paddin
       try{ bnxUpdateGreetingAndShift(new Date().getHours()); }catch(e){}
       try{ if(W.bnxRefreshHomeBrand) W.bnxRefreshHomeBrand(true); }catch(e){}
       try{ if(typeof flushOutbox==='function') flushOutbox(); }catch(e){}
-      showScreen('s-home');
+      if(typeof W.bnxRestoreLastView_==='function') W.bnxRestoreLastView_('final'); else showScreen('s-home');
     }catch(e){
       console.warn('[RESUME] failed, showing login',e);
       W.__bnxResumed=false;
@@ -15521,6 +16020,239 @@ html body #s-tables #mob-table-map{display:none!important}
 html body #s-tables .tcard .tc-bill{font-size:9.5px!important;line-height:1.2!important;margin-top:2px!important;white-space:nowrap!important;max-width:100%;overflow:hidden;text-overflow:ellipsis}
 html body #s-tables .tcard .tc-kot{display:inline-block;font-size:8px!important;font-weight:800!important;line-height:1.3!important;margin-top:2px;padding:1px 7px;border-radius:8px;background:rgba(0,0,0,.16);white-space:nowrap}
 </style>
+<script id="bnx-fast-load">
+/* FAST LOAD — single-flight for the two live loaders.
+   loadTablesLive() / loadKOTFromServer() are called from ~15 places (3 polls,
+   every screen open, after every order, table actions). Each call used to start
+   its own full chain of Apps Script requests even while an identical chain was
+   still running. Now:
+   - a call made while one is running joins that run (no second chain);
+   - a successful run is reused for 5 s, unless a WRITE (order, KOT, table
+     action) happened since — then the next call always fetches fresh data;
+   - polls do nothing while the app is in the background, and the visible
+     screen refreshes immediately when the steward comes back to the app. */
+(function(){
+  'use strict';
+  var W=window, FRESH_MS=5000;
+  function wrap(name){
+    var orig=W[name]; if(typeof orig!=='function'||orig.__bnxSingle) return;
+    var inflight=null, inflightGen=-1, lastAt=0, lastGen=-1, lastVal;
+    var f=function(){
+      var gen=W.__bnxWriteGen||0;
+      if(inflight && inflightGen===gen) return inflight;
+      if(lastAt && gen===lastGen && Date.now()-lastAt<FRESH_MS) return Promise.resolve(lastVal);
+      if(document.hidden && lastAt) return Promise.resolve(lastVal);   /* background: skip network */
+      var self=this, args=arguments, p;
+      p=Promise.resolve().then(function(){ return orig.apply(self,args); }).then(function(v){
+        if(v!==false){ lastAt=Date.now(); lastGen=gen; lastVal=v; }
+        return v;
+      }).finally(function(){ if(inflight===p) inflight=null; });
+      inflight=p; inflightGen=gen;
+      return p;
+    };
+    f.__bnxSingle=true;
+    W[name]=f;
+  }
+  wrap('loadTablesLive');
+  wrap('loadKOTFromServer');
+
+  /* come back to the app → refresh what is on screen right away */
+  document.addEventListener('visibilitychange',function(){
+    if(document.hidden) return;
+    try{
+      var id=(document.querySelector('.screen.active')||{}).id||'';
+      if(id==='s-tables'||id==='s-home') W.loadTablesLive().then(function(){ try{ if(id==='s-tables')renderMobTables(); else { renderMyTables(); bnxRenderMyStats(); } }catch(e){} }).catch(function(){});
+      if(id==='s-home'||id==='s-kot') W.loadKOTFromServer().then(function(){ try{ if(id==='s-kot')renderKOT(); }catch(e){} }).catch(function(){});
+    }catch(e){}
+  });
+})();
+</script>
+
+<style id="bnx-table-date-style">
+/* date control (old native input overflowed: "04/10/:" + white box) */
+#s-tables .tb-calendar-control{display:none!important}
+#bnx-tdate{margin-left:auto;display:flex;align-items:center;gap:5px;flex-shrink:0}
+#s-tables #bnx-tdate .chip{display:inline-flex!important;align-items:center;gap:5px;height:34px!important;padding:0 10px!important;border-radius:10px!important;border:1px solid rgba(255,255,255,.35)!important;background:rgba(255,255,255,.16)!important;color:#fff!important;font:800 12px/1 system-ui,-apple-system,sans-serif!important;white-space:nowrap;cursor:pointer;box-shadow:none!important;min-width:0!important;width:auto!important}
+#s-tables #bnx-tdate .chip small{font-weight:600;opacity:.85;font-size:10px;color:#ffe7bd}
+#s-tables #bnx-tdate .today{height:34px!important;padding:0 9px!important;border-radius:10px!important;border:0!important;background:#ffd467!important;color:#2b1204!important;font:900 11px/1 system-ui,sans-serif!important;cursor:pointer;box-shadow:none!important;min-width:0!important;width:auto!important}
+#bnx-tdate input{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;border:0;padding:0}
+/* day view */
+#bnx-day-banner{margin:0 0 10px;padding:10px 12px;border-radius:12px;background:#eff6ff;border:1px solid #bfdbfe;color:#1e3a8a;font-size:12px;line-height:1.45}
+#bnx-day-banner b{color:#1e40af}
+#s-tables #mob-table-grid .tcard.bnx-day-none{background:var(--surface2,#f4f4f5)!important;border-color:var(--border,#e4e4e7)!important;color:var(--text3,#71717a)!important;opacity:.85}
+#s-tables #mob-table-grid .tcard.bnx-day-none .tc-no,#s-tables #mob-table-grid .tcard.bnx-day-none .tc-status{color:var(--text3,#71717a)!important}
+#s-tables #mob-table-grid .tcard.bnx-day-used{background:#1d4ed8!important;border-color:#1e40af!important;color:#fff!important}
+#s-tables #mob-table-grid .tcard.bnx-day-used *{color:#fff!important}
+#s-tables #mob-table-grid .tcard.bnx-day-resv{background:#f97316!important;border-color:#ea580c!important;color:#fff!important}
+#s-tables #mob-table-grid .tcard.bnx-day-resv *{color:#fff!important}
+.bnx-carry{display:inline-block;margin-top:4px;padding:2px 7px;border-radius:999px;background:#7f1d1d;color:#fff;font-size:9.5px;font-weight:800;letter-spacing:.02em}
+</style>
+<script id="bnx-table-date-view">
+/* TABLES BY DATE
+   - Today (business date) = live floor: real status from TABLE_LIVE_STATE +
+     today's open orders. A table still open from an earlier day shows a red
+     "Open since dd Mon" tag.
+   - Past date = that day's real usage from BILL_MASTER / ORDER_MASTER: each
+     table shows bills and sales of that date (blue = used, grey = no sale);
+     the counters show tables used / orders / bills / sales of that date.
+   - Future date = reservations for that date (orange = reserved).
+   - New date control: tap the date chip to pick, "Today" jumps back. */
+(function(){
+  'use strict';
+  var W=window, D=document;
+  function $(id){return D.getElementById(id);}
+  function bd(){ try{return businessDate();}catch(e){var d=new Date();return d.toISOString().slice(0,10);} }
+  function fmt(ymd){ try{var p=ymd.split('-');var d=new Date(+p[0],+p[1]-1,+p[2]);return d.toLocaleDateString('en-IN',{day:'2-digit',month:'short'});}catch(e){return ymd;} }
+  function money(n){ return '₹'+Math.round(Number(n)||0).toLocaleString('en-IN'); }
+  function esc(v){ return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+  function curDate(){ try{ return (typeof mobTableDateFilter!=='undefined' && mobTableDateFilter) ? mobTableDateFilter : bd(); }catch(e){ return bd(); } }
+
+  /* ---- date control ---- */
+  function buildControl(){
+    var old=D.querySelector('#s-tables .tb-calendar-control'); if(!old||$('bnx-tdate')) return;
+    var w=D.createElement('div'); w.id='bnx-tdate';
+    w.innerHTML='<button type="button" class="chip" id="bnx-tdate-chip">📅 <span id="bnx-tdate-txt">Today</span></button>'+
+      '<button type="button" class="today" id="bnx-tdate-today" style="display:none">Today</button>'+
+      '<input type="date" id="bnx-tdate-in" aria-label="Choose date">';
+    old.parentNode.insertBefore(w,old);
+    var inp=$('bnx-tdate-in');
+    $('bnx-tdate-chip').onclick=function(){ inp.value=curDate(); try{ if(inp.showPicker){ inp.showPicker(); return; } }catch(e){} inp.style.pointerEvents='auto'; inp.focus(); inp.click(); };
+    inp.onchange=function(){ if(inp.value) setMobTableDateFilter(inp.value); };
+    $('bnx-tdate-today').onclick=function(){ setMobTableDateFilter(bd()); };
+  }
+  function paintControl(){
+    var d=curDate(), t=bd(), txt=$('bnx-tdate-txt'), tb=$('bnx-tdate-today'); if(!txt) return;
+    txt.innerHTML = d===t ? 'Today <small>'+fmt(d)+'</small>' : fmt(d);
+    if(tb) tb.style.display = d===t ? 'none' : '';
+  }
+
+  /* ---- day data (past dates) ---- */
+  var dayCache={};
+  function rowsOf(res){
+    if(!res||!res.success) return [];
+    var c=[res.bills,res.orders,res.data,res.rows];
+    for(var i=0;i<c.length;i++){ var x=c[i]; if(Array.isArray(x)) return x; if(x&&Array.isArray(x.orders)) return x.orders; if(x&&Array.isArray(x.bills)) return x.bills; }
+    return [];
+  }
+  function loadDay(date){
+    if(dayCache[date] && (dayCache[date].done||dayCache[date].p)) return dayCache[date].p;
+    var rec={done:false}; dayCache[date]=rec;
+    rec.p=Promise.all([gasApi('LIST_BILLS',{fromDate:date,toDate:date,FROM_DATE:date,TO_DATE:date,BILL_DATE:date},'V2_CORE'),
+                       gasApi('GET_ORDERS',{fromDate:date,toDate:date,FROM_DATE:date,TO_DATE:date,ORDER_DATE:date},'V2_CORE')])
+    .then(function(r){
+      var ok=(r[0]&&r[0].success)||(r[1]&&r[1].success);
+      var by={}, tot={bills:0,orders:0,sales:0};
+      rowsOf(r[0]).forEach(function(b){
+        if(bnxOrderBizDate_({BILL_DATE:b.BILL_DATE||b.billDate||b.date,CREATED_AT:b.CREATED_AT,BILL_TIME:b.BILL_TIME})!==date) return;
+        var st=String(b.BILL_STATUS||b.billStatus||b.status||'').toUpperCase(); if(/CANCEL|VOID/.test(st)) return;
+        var tid=String(b.TABLE_ID||b.tableId||b.table||'').trim(); var amt=Number(b.GRAND_TOTAL||b.grandTotal||b.total||0)||0;
+        tot.bills++; tot.sales+=amt; if(!tid) return;
+        var x=by[tid]||(by[tid]={bills:0,orders:0,sales:0}); x.bills++; x.sales+=amt;
+      });
+      rowsOf(r[1]).forEach(function(o){
+        if(bnxOrderBizDate_(o)!==date) return;
+        var st=String(o.ORDER_STATUS||o.status||'').toUpperCase(); if(/CANCEL/.test(st)) return;
+        var tid=String(o.TABLE_ID||o.tableId||o.table||'').trim(); tot.orders++; if(!tid) return;
+        var x=by[tid]||(by[tid]={bills:0,orders:0,sales:0}); x.orders++;
+      });
+      rec.done=true; rec.ok=!!ok; rec.by=by; rec.tot=tot; rec.at=Date.now();
+      if(!ok){ delete dayCache[date]; }
+      return rec;
+    }).catch(function(){ delete dayCache[date]; return {ok:false}; });
+    return rec.p;
+  }
+
+  /* ---- render ---- */
+  var LBL=null;
+  function setLabels(arr){
+    var ids=['ts-free','ts-busy','ts-running','ts-billed','ts-reserved'];
+    if(!LBL) LBL=ids.map(function(id){ var v=$(id); var l=v&&v.parentNode.querySelector('.ts-mini-lbl'); return l?l.textContent:''; });
+    ids.forEach(function(id,i){ var v=$(id); var l=v&&v.parentNode.querySelector('.ts-mini-lbl'); if(l) l.textContent=arr?arr[i]:LBL[i]; });
+  }
+  function sec(t){ return String(t.section||t.zone||t.area||'').trim()||'OTHER'; }
+  function renderDay(date){
+    var g=$('mob-table-grid'); if(!g) return;
+    var future=date>bd();
+    var banner=$('bnx-day-banner');
+    if(!banner){ banner=D.createElement('div'); banner.id='bnx-day-banner'; g.parentNode.insertBefore(banner,g); }
+    banner.style.display='';
+    var fc=$('mob-table-filters'); if(fc) fc.style.display='none';
+    var rec=dayCache[date];
+    if(!future && !(rec&&rec.done)){
+      banner.innerHTML='📅 <b>'+fmt(date)+' '+date.slice(0,4)+'</b> — loading that day’s bills and orders…';
+      g.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:30px 10px;color:var(--text3);font-size:12.5px;">⏳ Loading '+esc(fmt(date))+'…</div>';
+      setLabels(['Tables used','Orders','Bills','Sales','No sale']);
+      ['ts-free','ts-busy','ts-running','ts-billed','ts-reserved'].forEach(function(id){var e=$(id); if(e) e.textContent='…';});
+      loadDay(date).then(function(r){ if(curDate()===date){ if(r&&r.ok) W.renderMobTables(); else { banner.innerHTML='🔴 Could not load data for '+esc(fmt(date))+'. <button type="button" onclick="renderMobTables()" style="margin-left:6px;border:0;border-radius:7px;padding:4px 9px;background:#1d4ed8;color:#fff;font-weight:800">Retry</button>'; g.innerHTML=''; } } });
+      return;
+    }
+    var q=String((typeof mobTableSearchQuery!=='undefined'&&mobTableSearchQuery)||'').toLowerCase();
+    var list=(Array.isArray(TABLES)?TABLES:[]).filter(function(t){ return !q || String(t.id).toLowerCase().indexOf(q)>-1 || sec(t).toLowerCase().indexOf(q)>-1; });
+    var groups={}, used=0, resv=0;
+    list.slice().sort(function(a,b){ return sec(a).localeCompare(sec(b)) || String(a.id).localeCompare(String(b.id),undefined,{numeric:true}); })
+      .forEach(function(t){ (groups[sec(t)]=groups[sec(t)]||[]).push(t); });
+    var card=function(t){
+      var id=String(t.id).trim(), cls, st, info='';
+      if(future){
+        var r=String(t.reservationDate||'').slice(0,10)===date;
+        if(r){ resv++; cls='bnx-day-resv'; st='RESERVED'; info=(t.reservationTime?esc(t.reservationTime)+' · ':'')+esc(t.reservationCustomer||'')+(t.reservationPax?' · '+Number(t.reservationPax)+' pax':''); }
+        else { cls='bnx-day-none'; st='FREE'; }
+      }else{
+        var x=rec.by[id];
+        if(x&&(x.bills||x.orders)){ used++; cls='bnx-day-used'; if(x.bills){ st=x.bills+(x.bills===1?' bill':' bills'); info=money(x.sales); } else { st=x.orders+(x.orders===1?' order':' orders'); info='Not billed'; } }
+        else { cls='bnx-day-none'; st='NO SALE'; }
+      }
+      return '<div class="tcard '+cls+'" onclick="openTable('+esc(JSON.stringify(id))+')"><div class="tc-type">'+(typeof bnxTableTypeIcon_==='function'?bnxTableTypeIcon_(t.section):'🪑')+'</div>'+
+        '<div class="tc-no">'+esc(t.no||id)+'</div><div class="tc-status">'+st+'</div>'+(info?'<div class="tc-info">'+info+'</div>':'<div class="tc-pax">🪑 '+(Number(t.pax)||4)+' seats</div>')+'</div>';
+    };
+    g.innerHTML=Object.keys(groups).map(function(k){ return '<div class="tmap-group"><div class="tmap-head"><span>'+esc(k)+'</span><span>'+groups[k].length+' tables</span></div><div class="tmap-grid">'+groups[k].map(card).join('')+'</div></div>'; }).join('')
+      || '<div style="grid-column:1/-1;text-align:center;padding:30px 10px;color:var(--text3)">No tables</div>';
+    if(future){
+      setLabels(['Reserved','Free','—','—','Tables']);
+      var put=function(id,v){var e=$(id); if(e) e.textContent=v;};
+      put('ts-free',resv); put('ts-busy',list.length-resv); put('ts-running','—'); put('ts-billed','—'); put('ts-reserved',list.length);
+      banner.innerHTML='📅 <b>'+fmt(date)+' '+date.slice(0,4)+'</b> — upcoming date: reservations only. Live status is shown for <b>Today</b>.';
+    }else{
+      setLabels(['Tables used','Orders','Bills','Sales','No sale']);
+      var put2=function(id,v){var e=$(id); if(e) e.textContent=v;};
+      put2('ts-free',used); put2('ts-busy',rec.tot.orders); put2('ts-running',rec.tot.bills); put2('ts-billed',money(rec.tot.sales)); put2('ts-reserved',list.length-used);
+      banner.innerHTML='📅 <b>'+fmt(date)+' '+date.slice(0,4)+'</b> — closed day: bills &amp; sales per table from the register (not live status). Tap <b>Today</b> for the live floor.';
+    }
+  }
+
+  /* carry-over tag on today's live view */
+  function tagCarry(){
+    var m=W.__bnxTableOpenSince||{}, today=bd();
+    D.querySelectorAll('#mob-table-grid .tcard').forEach(function(c){
+      var oc=c.getAttribute('onclick')||''; var mm=oc.match(/openTable\((["'])(.*?)\1\)/) || oc.match(/openTable\(&quot;(.*?)&quot;\)/);
+      var id=mm?(mm[2]||mm[1]):''; if(!id) return;
+      var since=m[id]; if(!since||since>=today||c.querySelector('.bnx-carry')) return;
+      if(!/RUNNING|OCCUPIED|BILLED/.test(c.className)) return;
+      var tag=D.createElement('div'); tag.className='bnx-carry'; tag.textContent='⚠ Open since '+fmt(since); c.appendChild(tag);
+    });
+  }
+
+  var orig=W.renderMobTables;
+  if(typeof orig==='function'){
+    W.renderMobTables=function(){
+      buildControl(); paintControl();
+      var d=curDate();
+      if(d!==bd()){ return renderDay(d); }
+      var b=$('bnx-day-banner'); if(b) b.style.display='none';
+      var fc=$('mob-table-filters'); if(fc) fc.style.display='';
+      setLabels(null);
+      var r=orig.apply(this,arguments);
+      try{ tagCarry(); }catch(e){}
+      return r;
+    };
+  }
+  /* switching date → if past date with no cached data the render triggers the load */
+  var origSet=W.setMobTableDateFilter;
+  if(typeof origSet==='function') W.setMobTableDateFilter=function(v){ var x=String(v||'').trim()||bd(); return origSet.call(this,x); };
+  if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',buildControl); else buildControl();
+})();
+</script>
+
 <script id="bnx-install-on-open">
 /* BNX INSTALL-ON-OPEN \u2014 shared helper for every app page.
    The Mobile Apps gallery opens an app with ?install=1. This shows a bottom
@@ -15572,5 +16304,80 @@ html body #s-tables .tcard .tc-kot{display:inline-block;font-size:8px!important;
   }catch(e){}
 })();
 </script>
+<style id="bnx-theme-final-audit">
+/* ══ THEME / FONT / CONTRAST FINAL (light + dark audited) ══ */
+/* fonts: form controls do not inherit the page font by default */
+button,input,select,textarea{font-family:inherit}
+#bnx-tdate .chip,#bnx-tdate .today,.hs-welcome,.hsw-home-pill{font-family:'DM Sans',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif!important}
+
+/* LIGHT — text that failed 3:1 contrast */
+html[data-color-mode="light"] .bn-item.active .bn-label{color:#a85f00!important}
+html[data-color-mode="light"] #s-home button[onclick="showScreen('s-tables')"] div:nth-child(2){color:#15803d!important}
+html[data-color-mode="light"] #s-home button[onclick="showScreen('s-kot')"] div:nth-child(2){color:#a85f00!important}
+html[data-color-mode="light"] #ts-free{color:#15803d!important}
+html[data-color-mode="light"] #ts-running{color:#b45309!important}
+html[data-color-mode="light"] #ts-reserved{color:#c2410c!important}
+html[data-color-mode="light"] #s-login a[onclick*="openForgotModal"]{color:#a85f00!important}
+html[data-color-mode] body .sw-mode-btn.active,html[data-theme][data-color-mode] body .sw-mode-btn.active{color:#2b1204!important}
+#s-tables #mob-table-grid .tcard .bnx-carry{color:#fff!important;background:#991b1b!important}
+
+/* DARK — light-only surfaces that kept light text on light backgrounds */
+html[data-color-mode="dark"] .hsp-pill{background:#2a2016!important;border-color:#5a4320!important;color:#ffd99a!important}
+html[data-color-mode="dark"] .op2-banner.none{background:rgba(220,38,38,.16)!important;color:#fecaca!important;border-color:rgba(248,113,113,.45)!important}
+html[data-color-mode="dark"] .op2-banner.cache{background:rgba(245,158,11,.14)!important;color:#fde68a!important;border-color:rgba(251,191,36,.4)!important}
+html[data-color-mode="dark"] .op2-banner span{color:inherit!important}
+html[data-color-mode="dark"] .hs-client-banner:not(.has-image){background:linear-gradient(135deg,#2a1608,#3a1d08)!important;border-color:rgba(245,163,0,.3)!important}
+html[data-color-mode="dark"] .hs-client-banner-title{color:#ffe7bd!important}
+html[data-color-mode="dark"] .hs-client-banner-sub{color:#d9c3a3!important}
+html[data-color-mode="dark"] .hs-client-banner-tag{background:rgba(245,163,0,.18)!important;color:#ffd467!important}
+html[data-color-mode="dark"] #bnx-day-banner{background:#0f1d33!important;border-color:#1e3a8a!important;color:#bfdbfe!important}
+html[data-color-mode="dark"] #bnx-day-banner b{color:#93c5fd!important}
+html[data-color-mode="dark"] #s-tables #mob-table-grid .tcard.bnx-day-none{background:#1c242c!important;border-color:rgba(255,255,255,.12)!important}
+html[data-color-mode="dark"] #s-tables #mob-table-grid .tcard.bnx-day-none *{color:#aeb8c2!important}
+html[data-color-mode="dark"] #s-home button[onclick="showScreen('s-tables')"] div:nth-child(2){color:#4ade80!important}
+html[data-color-mode="dark"] #s-home button[onclick="showScreen('s-kot')"] div:nth-child(2){color:#fbbf24!important}
+html[data-color-mode="dark"] #s-home button[onclick="openNewOrder()"] div:nth-child(2){color:#93c5fd!important}
+html[data-color-mode="dark"] .bn-item.active .bn-label{color:#fbbf24!important}
+
+/* LOGIN keeps the brand (light) design in both modes — it is shown before a
+   steward's own mode is known, and its cream cards had dark-mode text on them */
+html[data-color-mode="dark"] #s-login{--bnx-bg:#f7f8fa;--bnx-surface:#fff;--bnx-surface2:#f1f4f7;--bnx-surface3:#e7ebf0;--bnx-border:rgba(15,23,42,.12);--bnx-border2:rgba(15,23,42,.2);--bnx-text:#17202a;--bnx-text2:#4b5563;--bnx-text3:#6b7280;color-scheme:light}
+html[data-color-mode="dark"] #s-login #swMotivation,html[data-color-mode="dark"] #s-login #swMotivationText{color:#4a1d06!important}
+html[data-color-mode="dark"] #s-login a[onclick*="openForgotModal"]{color:#a85f00!important}
+html[data-color-mode="dark"] #s-login input{background:#fff!important;color:#17202a!important}
+
+/* LOGOUT — clear red action on Home hero and Profile header */
+.sw-top-logout,.sw-top-logout-home,.sw-top-logout-profile,
+html:not([data-theme]) #s-home .hero .sw-top-logout,
+html[data-color-mode] .sw-top-logout{
+  background:#dc2626!important;border:1.5px solid rgba(255,255,255,.55)!important;color:#fff!important;
+  box-shadow:0 4px 12px rgba(220,38,38,.35)!important;border-radius:12px!important;width:38px!important;height:38px!important;
+  display:inline-flex!important;align-items:center!important;justify-content:center!important;padding:0!important}
+.sw-top-logout svg,html:not([data-theme]) #s-home .hero .sw-top-logout svg,html[data-color-mode] .sw-top-logout svg{stroke:#fff!important;color:#fff!important;fill:none!important;width:20px!important;height:20px!important}
+.sw-top-logout:active{background:#b91c1c!important;transform:scale(.94)}
+.menu-list .ml-item[onclick^="doLogout"] .ml-icon,.menu-list .ml-item[onclick^="doLogout"] .ml-text{color:#dc2626!important}
+html[data-color-mode] body #s-profile button.sw-top-logout.sw-top-logout-profile,
+html[data-color-mode] body #s-home button.sw-top-logout.sw-top-logout-home,
+html[data-theme][data-color-mode] body #s-profile button.sw-top-logout,
+html[data-theme][data-color-mode] body #s-home button.sw-top-logout{background:#dc2626!important;border:1.5px solid rgba(255,255,255,.55)!important;color:#fff!important;box-shadow:0 4px 12px rgba(220,38,38,.35)!important}
+html[data-color-mode] body #s-profile button.sw-top-logout svg,html[data-color-mode] body #s-home button.sw-top-logout svg{stroke:#fff!important}
+html[data-color-mode="dark"] .hsp-strip{background:#141a20!important;border-color:rgba(255,255,255,.14)!important;color:#d7dde3!important}
+html[data-color-mode="dark"] .hsp-strip b{color:#d7dde3!important}
+</style>
+<script id="bnx-theme-final-guard">
+/* Any older patch that still writes data-color-mode (several forced "light")
+   is corrected back to the steward's saved choice; System follows the phone. */
+(function(){
+  'use strict';
+  if(typeof window.bnxPaintSwMode_!=='function') return;
+  var busy=false;
+  try{ new MutationObserver(function(){ if(busy) return; busy=true; try{ window.bnxPaintSwMode_(); }finally{ busy=false; } })
+    .observe(document.documentElement,{attributes:true,attributeFilter:['data-color-mode']}); }catch(e){}
+  try{ var mq=matchMedia('(prefers-color-scheme: dark)'); var on=function(){ window.bnxPaintSwMode_(); };
+    if(mq.addEventListener) mq.addEventListener('change',on); else if(mq.addListener) mq.addListener(on); }catch(e){}
+  window.bnxPaintSwMode_();
+})();
+</script>
+
 </body>
 </html>
