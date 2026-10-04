@@ -308,6 +308,7 @@ async function bnxFetchJson_(endpoint, options){
         const parsedAction = (()=>{ try{return JSON.parse(fetchOpts.body||'{}').action||'';}catch(e){return '';} })();
         const timeoutMs = Number(fetchOpts.timeoutMs) ||
           (/^(UPLOAD_|SAVE_MENU_ITEM_IMAGE|SAVE_[A-Z_]*(IMAGE|LOGO|FILE|DRIVE))/i.test(parsedAction) ? 90000 :
+           /^(SAVE_BILL|SETTLE_|SAVE_ORDER|SAVE_KOT|CREATE_ORDER)/i.test(parsedAction) ? BNX_BILL_WRITE_TIMEOUT_MS :
            /^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? BNX_WRITE_TIMEOUT_MS :
            /^GET_DASHBOARD_SUMMARY$/i.test(parsedAction) ? BNX_DASHBOARD_TIMEOUT_MS : (/^(GET_|LIST_|RD_)/i.test(parsedAction) ? BNX_REPORT_TIMEOUT_MS : BNX_READ_TIMEOUT_MS));
         delete fetchOpts.timeoutMs;
@@ -577,6 +578,11 @@ const REQUEST_QUEUE = { pending: [], active: 0, maxConcurrent: 5 };
 const API_RETRY_CONFIG = { maxAttempts: 3, baseDelay: 250, maxDelay: 2500 };
 const BNX_READ_TIMEOUT_MS = 8000;
 const BNX_WRITE_TIMEOUT_MS = 12000;
+/* PRINT SPEED FIX 2026-10-05: SAVE_BILL was aborted after 12 s, but this client's Apps Script
+   answers in ~18-30 s on a busy day (BN_HEALTH avg_response). Every attempt was cut off just before
+   the server finished, then retried 3x inside gasApi x 4x in bmSaveBill = up to 12 tries (~2.5 min)
+   before the invoice printed. Bill/settle writes now get one long wait instead of many short ones. */
+const BNX_BILL_WRITE_TIMEOUT_MS = 45000;
 // Heavy Tally-style reports may scan BILL/PAYMENT/BILL_ITEMS/MASTER sheets.
 // Give report reads enough time to complete instead of falsely presenting
 // a timeout as an empty/demo report.
@@ -763,7 +769,7 @@ async function gasApi(action, payload, endpoint) {
       try {
         let attempt = 0;
         const isCriticalWrite = /^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(String(action||''));
-        const maxAttempts = /^(UPLOAD_|SAVE_MENU_ITEM_IMAGE|SAVE_DUES_RECEIPT)/i.test(String(action||'')) ? 1 : API_RETRY_CONFIG.maxAttempts; /* receipts: never blind-retry (a timed-out call may already be saved -> duplicate money entry) */ /* uploads: never auto-retry (avoids duplicate Drive files) */
+        const maxAttempts = /^(UPLOAD_|SAVE_MENU_ITEM_IMAGE|SAVE_DUES_RECEIPT|SAVE_BILL|SETTLE_)/i.test(String(action||'')) ? 1 : API_RETRY_CONFIG.maxAttempts; /* SAVE_BILL: the caller retries with the SAME requestId (idempotent) — no hidden inner retries */ /* receipts: never blind-retry (a timed-out call may already be saved -> duplicate money entry) */ /* uploads: never auto-retry (avoids duplicate Drive files) */
         while (attempt < maxAttempts) {
           try {
             const session = bnxCurrentSession_();
@@ -802,19 +808,26 @@ async function gasApi(action, payload, endpoint) {
   }
   return promise;
 }
-async function processRequestQueue() {
-  while ((REQUEST_QUEUE.active < REQUEST_QUEUE.maxConcurrent || (REQUEST_QUEUE.pending[0] && REQUEST_QUEUE.pending[0].__crit && REQUEST_QUEUE.active < REQUEST_QUEUE.maxConcurrent + 3)) && REQUEST_QUEUE.pending.length > 0) {
-    REQUEST_QUEUE.active++;
-    const task = REQUEST_QUEUE.pending.shift();
-    
-    try {
-      await task();
-    } catch (e) {
-      console.warn('Queue task error:', e);
-    } finally {
-      REQUEST_QUEUE.active--;
+/* PRINT SPEED FIX 2026-10-05: the old loop `await`ed every task inside the while(), and a SAVE_/SETTLE_
+   call could still wait behind 8 slow report GETs (GAS often 20-30 s each) — so Save & Print Invoice sat
+   in the browser queue before it even reached the server. Now:
+   - critical writes (SAVE_/SETTLE_/POST_/CREATE_/UPDATE_) start IMMEDIATELY, never queued;
+   - while a critical write is running, background reads wait (the server answers the invoice first);
+   - reads keep max 5 in parallel; tasks are started, not awaited, so the queue never serialises. */
+REQUEST_QUEUE.critActive = 0;
+function processRequestQueue() {
+  const P = REQUEST_QUEUE.pending;
+  for (let i = 0; i < P.length; ) {
+    const task = P[i];
+    const crit = !!task.__crit;
+    const critHold = REQUEST_QUEUE.critActive > 0 && (Date.now() - (REQUEST_QUEUE.critSince||0)) < 10000;   // reads yield to a write for max 10 s
+    if (!crit && (critHold || REQUEST_QUEUE.active >= REQUEST_QUEUE.maxConcurrent)) { i++; continue; }
+    P.splice(i, 1);
+    REQUEST_QUEUE.active++; if (crit) { if (!REQUEST_QUEUE.critActive) { REQUEST_QUEUE.critSince = Date.now(); clearTimeout(REQUEST_QUEUE.__holdT); REQUEST_QUEUE.__holdT = setTimeout(processRequestQueue, 10050); } REQUEST_QUEUE.critActive++; }
+    Promise.resolve().then(task).catch(function(e){ console.warn('Queue task error:', e); }).finally(function(){
+      REQUEST_QUEUE.active--; if (crit) REQUEST_QUEUE.critActive--;
       processRequestQueue();
-    }
+    });
   }
 }
 
@@ -18886,6 +18899,8 @@ async function bmDoPrint(){
 
   let saved = null;
   if(typeof showNotif==='function') showNotif('⏳ Saving invoice & sending to printer…','success');
+  /* SPEED: open the QZ Tray link and decode the logo WHILE the server saves the bill */
+  if(!isA4){ try{ window.bnxConnectQz_ && window.bnxConnectQz_().catch(function(){}); }catch(e){} }
   try {
     saved = await bmSaveBill(true);
   } catch(e) {
@@ -19186,7 +19201,7 @@ async function bmSaveBill(reprintAfter){
        The SAME requestId is reused for every attempt, so the backend can
        de-duplicate and the bill is never intentionally duplicated. */
     let res = null, lastSaveError = null;
-    const maxSaveAttempts = 4;
+    const maxSaveAttempts = 2;   // each attempt now waits up to 45 s (was 4 x 3 x 12 s)
     for (let attempt = 1; attempt <= maxSaveAttempts; attempt++) {
       try {
         if (typeof bnxResetApiCircuit_ === 'function') bnxResetApiCircuit_('V2_CORE');
@@ -21131,6 +21146,45 @@ function blWaMapped_(b){
   };
 }
 /* Render the bill receipt off-screen -> PDF (page sized to the receipt, so it is one clean page). */
+/* LOGO FIX 2026-10-05 ("logo not show" on the bill PDF / WhatsApp bill):
+   html2canvas took the snapshot the instant the receipt was inserted — the <img> logo had not
+   loaded/decoded yet, and a hosted logo URL (Drive / site) has no CORS header, so html2canvas
+   skipped it and left a blank 40px gap at the top. The logo is now turned into an embedded
+   data: image first (cached), decoded, and only then captured. */
+let __bnxLogoDataP=null;
+function bnxLogoDataUrl_(){
+  if(__bnxLogoDataP) return __bnxLogoDataP;
+  __bnxLogoDataP=(async function(){
+    const toData=blob=>new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=rej;r.readAsDataURL(blob);});
+    const viaCanvas=src=>new Promise((res,rej)=>{const im=new Image();im.crossOrigin='anonymous';im.onload=()=>{try{const c=document.createElement('canvas');c.width=im.naturalWidth||160;c.height=im.naturalHeight||160;c.getContext('2d').drawImage(im,0,0);res(c.toDataURL('image/png'));}catch(e){rej(e);}};im.onerror=rej;im.src=src;setTimeout(()=>rej(new Error('logo timeout')),4000);});
+    const cands=[];
+    try{ const v=bnxResolvePrintLogo_(); if(v) cands.push(v); }catch(e){}
+    try{ document.querySelectorAll('#sidebarLogo img,#heroLogo img,#logoPreview img,[data-brand-logo] img,.brand-logo img').forEach(el=>{const v=el.currentSrc||el.src; if(v&&!cands.includes(v)) cands.push(v);}); }catch(e){}
+    const bundled=(typeof BNX_PRINT_LOGO_DATA_URI!=='undefined'?BNX_PRINT_LOGO_DATA_URI:'');
+    const clientCands=cands.filter(v=>v&&v!==bundled);
+    for(const src of clientCands){
+      if(/^data:image\//i.test(src)) return src;
+      try{ const r=await fetch(src,{mode:'cors',cache:'force-cache'}); if(r.ok){ const bl=await r.blob(); if(/^image\//.test(bl.type)) return await toData(bl); } }catch(e){}
+      try{ return await viaCanvas(src); }catch(e){ console.warn('[BILL PDF LOGO] hosted logo blocked (no CORS):',src); }
+    }
+    /* a client logo exists but could not be embedded -> print no logo rather than the software vendor's */
+    return clientCands.length ? '' : bundled;
+  })().catch(()=> (typeof BNX_PRINT_LOGO_DATA_URI!=='undefined'?BNX_PRINT_LOGO_DATA_URI:''));
+  __bnxLogoDataP.then(v=>{ if(!v) __bnxLogoDataP=null; });
+  return __bnxLogoDataP;
+}
+window.bnxLogoDataUrl_=bnxLogoDataUrl_;
+async function bnxPdfReadyImages_(el){
+  const logo=await bnxLogoDataUrl_();
+  const imgs=[...el.querySelectorAll('img')];
+  imgs.forEach(im=>{ if(im.closest('.bnx-logo')){ if(logo) im.src=logo; else im.closest('.bnx-logo').style.display='none'; } });
+  await Promise.all(imgs.map(im=>{
+    if(im.complete && im.naturalWidth) return im.decode?im.decode().catch(()=>{}):null;
+    return new Promise(r=>{ im.onload=im.onerror=r; setTimeout(r,3000); }).then(()=>im.decode?im.decode().catch(()=>{}):null);
+  }));
+  /* a logo that still failed must not leave an empty gap */
+  imgs.forEach(im=>{ if(!im.naturalWidth && im.closest('.bnx-logo')) im.closest('.bnx-logo').style.display='none'; });
+}
 async function blBuildBillPdf_(b){
   if(typeof html2canvas==='undefined'||!window.jspdf) throw new Error('PDF libraries not loaded — check connection and retry');
   const pw=(typeof bnxPaperWidthPx==='function'?bnxPaperWidthPx():302);
@@ -21141,7 +21195,8 @@ async function blBuildBillPdf_(b){
   try{
     if(document.fonts&&document.fonts.ready) await document.fonts.ready;
     const el=host.firstChild;
-    const canvas=await html2canvas(el,{scale:3,backgroundColor:'#ffffff',letterRendering:true});
+    await bnxPdfReadyImages_(el);
+    const canvas=await html2canvas(el,{scale:3,backgroundColor:'#ffffff',letterRendering:true,useCORS:true,imageTimeout:4000});
     const wmm=(typeof bnxPaperSize==='function'&&bnxPaperSize()==='58')?58:80;
     const hmm=Math.max(40,canvas.height*wmm/canvas.width);
     const {jsPDF}=window.jspdf;
