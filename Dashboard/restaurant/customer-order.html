@@ -237,6 +237,7 @@ html,body{height:100%;background:var(--bg);font-family:'DM Sans',sans-serif;colo
       <button id="mn-view-card-btn" onclick="openActiveMenuCard()" style="display:none;flex-shrink:0;background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.3);color:#fff;font-size:11px;font-weight:700;padding:7px 11px;border-radius:9px;cursor:pointer;">📋 Today's Menu</button>
     </div>
     <div class="station-row" id="mn-stations" style="display:none;"></div>
+    <div style="padding:8px 14px 0;"><input class="field" id="mn-search" type="search" placeholder="🔍 Search dishes…" autocomplete="off" style="padding:10px 14px;font-size:14px;"><div style="display:flex;gap:8px;margin-top:8px;" id="mn-veg"><div class="cat-chip veg-chip active" data-v="ALL" onclick="setVeg('ALL')">All</div><div class="cat-chip veg-chip" data-v="V" onclick="setVeg('V')">🟢 Veg</div><div class="cat-chip veg-chip" data-v="NV" onclick="setVeg('NV')">🔴 Non-Veg</div></div></div>
     <div class="cat-row" id="mn-cats"></div>
     <div class="menu-scroll" id="mn-list"></div>
     <div class="cart-bar" id="mn-cartbar" onclick="goCart()">
@@ -465,6 +466,7 @@ document.getElementById('lg-retry').onclick = ()=>{
     // generic 🍽️ placeholder on every single customer's phone. Falls
     // back to the emoji only when no real logo has been uploaded yet.
     STATE.logoUrl = infoRes.data.logoUrl || infoRes.data.LOGO_URL || '';
+    STATE.restType = String(infoRes.data.restaurantType||infoRes.data.RESTAURANT_TYPE||infoRes.data.businessType||'').toUpperCase().replace(/[\s-]+/g,'_');
   }
   if (STATE.logoUrl){
     const logoImg = `<img src="${STATE.logoUrl}" alt="${STATE.restaurantName}" onerror="this.parentElement.textContent='🍽️'">`;
@@ -592,6 +594,8 @@ document.getElementById('ph-continue').onclick = async ()=>{
     tableId: STATE.tableId,
     scanKey: STATE.scanKey,
     notifyOptIn: STATE.notifyOptIn,
+    source: 'QR_SCAN',
+    deferWelcome: true,   // welcome message is sent once the name is saved (see nm-continue)
   }, 'V2_CORE');
 
   btn.disabled = false; btn.textContent = 'Continue';
@@ -618,20 +622,56 @@ document.getElementById('ph-continue').onclick = async ()=>{
   }
 };
 
+/* Save the guest's name into the customer record (CUSTOMER_CHECKIN) and trigger the
+   automatic welcome SMS/WhatsApp. Retries 3x; if the network is down the record is
+   queued on this phone and re-sent on the next page load, so the name is never lost. */
+function bnxTidyName_(v){
+  return String(v||'').replace(/[^\p{L}\s.'-]/gu,' ').replace(/\s+/g,' ').trim()
+    .split(' ').map(w=>w? w.charAt(0).toUpperCase()+w.slice(1).toLowerCase() : '').join(' ');
+}
+async function bnxSaveCustomerRecord_(rec){
+  for (let i=0;i<3;i++){
+    const r = await gasApi('CUSTOMER_CHECKIN', rec, 'V2_CORE');
+    if (r && r.success !== false) return true;
+    await new Promise(res=>setTimeout(res, 700*(i+1)));
+  }
+  return false;
+}
+function bnxQueueCheckin_(rec){
+  try{ const q=JSON.parse(localStorage.getItem('bnx_pending_checkin')||'[]'); q.push(rec); localStorage.setItem('bnx_pending_checkin',JSON.stringify(q.slice(-10))); }catch(e){}
+}
+async function bnxFlushPendingCheckins_(){
+  try{
+    const q=JSON.parse(localStorage.getItem('bnx_pending_checkin')||'[]'); if(!q.length) return;
+    const left=[]; for (const rec of q){ if(rec.clientId && STATE.clientId && rec.clientId!==STATE.clientId){ left.push(rec); continue; } if(!(await bnxSaveCustomerRecord_(rec))) left.push(rec); }
+    localStorage.setItem('bnx_pending_checkin',JSON.stringify(left));
+  }catch(e){}
+}
+setTimeout(bnxFlushPendingCheckins_, 2500);
+
 document.getElementById('nm-continue').onclick = async ()=>{
-  const name = document.getElementById('nm-input').value.trim();
-  if (!name){ document.getElementById('nm-err').textContent = 'Please enter your name.'; return; }
+  const name = bnxTidyName_(document.getElementById('nm-input').value);
+  if (name.length < 2){ document.getElementById('nm-err').textContent = 'Please enter your name.'; return; }
+  const btn = document.getElementById('nm-continue');
+  btn.disabled = true; btn.textContent = 'Saving…';
   STATE.customerName = name;
-  // Save the name against the phone number we already checked in, and let the
-  // backend fire the welcome WhatsApp message now that we have a name to personalise it with.
-  gasApi('CUSTOMER_CHECKIN', {
+  const rec = {
     requestId: 'chkin-name-' + STATE.scanKey + '-' + Date.now().toString(36),
-    mobileNo: STATE.customerPhone, tableId: STATE.tableId, scanKey: STATE.scanKey, customerName: name,
+    clientId: STATE.clientId,
+    mobileNo: STATE.customerPhone, tableId: STATE.tableId, scanKey: STATE.scanKey,
+    customerName: name,            // saved in the restaurant's customer record
+    isNewCustomer: true,
+    welcomeSms: true,              // send the automatic welcome message, personalised with the name
+    source: 'QR_SCAN',
     notifyOptIn: STATE.notifyOptIn,
-  }, 'V2_CORE').catch(()=>{});
+  };
+  const ok = await bnxSaveCustomerRecord_(rec);
+  if (!ok) bnxQueueCheckin_(rec);  // retried automatically next time the page opens
+  btn.disabled = false; btn.textContent = 'View menu';
   enterMenu();
 };
 document.getElementById('wb-continue').onclick = enterMenu;
+document.getElementById('mn-search').addEventListener('input', e=>{ MENU_QUERY = e.target.value; renderCats(); renderMenu(); });
 
 function enterMenu(){
   document.getElementById('mn-name-pill').textContent = (STATE.customerName||'Guest').split(' ')[0];
@@ -650,6 +690,7 @@ function enterMenu(){
   if (STATE.activeMenuCard){
     document.getElementById('mn-view-card-btn').style.display = 'block';
   }
+  const vg=document.getElementById('mn-veg'); if(vg) vg.style.display=isPureVeg()?'none':'flex';
   renderStations();
   renderCats();
   renderMenu();
@@ -664,7 +705,7 @@ function enterMenu(){
 // bar items (a client with no bar license just sees Food, no dead tab).
 function renderStations(){
   const wrap = document.getElementById('mn-stations');
-  const hasBar = MENU.some(m=>m.isBar);
+  const hasBar = MENU.some(m=>m.isBar) && !isPureVeg();
   if (!hasBar){ wrap.style.display='none'; activeStation='FOOD'; return; }
   wrap.style.display='flex';
   wrap.innerHTML = `
@@ -672,12 +713,26 @@ function renderStations(){
     <button class="station-btn ${activeStation==='BAR'?'active':''}" onclick="setStation('BAR')">🍸 Bar</button>`;
 }
 function setStation(s){ activeStation = s; activeCat = 'All'; renderStations(); renderCats(); renderMenu(); }
-function stationMenu(){ return MENU.filter(m => !!m.isBar === (activeStation==='BAR')); }
+let MENU_QUERY = '', VEG_FILTER = 'ALL';
+const escH = v => String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+/* Restaurant type: PURE_VEG → veg dishes only, no bar. Others show everything the menu has. */
+const isPureVeg = () => /PURE_?VEG|^VEG(ETARIAN)?$/.test(STATE.restType||'');
+/* Customer view: only available, priced items; best sellers first; searchable; Veg/Non-Veg filter. */
+function stationMenu(){
+  const q = MENU_QUERY.trim().toLowerCase();
+  const wantBar = activeStation==='BAR' && !isPureVeg();
+  return MENU.filter(m => m.avail && m.price > 0 && !!m.isBar === wantBar
+                       && (!isPureVeg() || m.isBar===false && m.veg!=='NV')
+                       && (VEG_FILTER==='ALL' || (VEG_FILTER==='V' ? m.veg==='V' : m.veg==='NV'))
+                       && (!q || (m.name+' '+m.cat).toLowerCase().includes(q)))
+             .sort((a,b)=> (b.popular?1:0)-(a.popular?1:0));
+}
+function setVeg(v){ VEG_FILTER=v; document.querySelectorAll('.veg-chip').forEach(c=>c.classList.toggle('active',c.dataset.v===v)); renderCats(); renderMenu(); }
 
 function renderCats(){
   const cats = ['All', ...new Set(stationMenu().map(m=>m.cat))];
   document.getElementById('mn-cats').innerHTML = cats.map(c=>
-    `<div class="cat-chip ${c===activeCat?'active':''}" onclick="setCat('${c.replace(/'/g,"\\'")}')">${c}</div>`
+    `<div class="cat-chip ${c===activeCat?'active':''}" onclick="setCat(this.dataset.c)" data-c="${escH(c)}">${escH(c)}</div>`
   ).join('');
 }
 function setCat(c){ activeCat = c; renderCats(); renderMenu(); }
@@ -694,7 +749,7 @@ function renderMenu(){
     const lovedBadge = m.popular ? '<span class="loved-badge">❤️ Loved by regulars</span>' : '';
     return `<div class="mi-row" id="mi-${m.id}">
       <div class="mi-icon">${m.icon}</div>
-      <div class="mi-info"><div class="mi-name-row">${vegDot}<div class="mi-name">${m.name}</div></div>${lovedBadge}<div class="mi-price">₹${m.price}</div></div>
+      <div class="mi-info"><div class="mi-name-row">${vegDot}<div class="mi-name">${escH(m.name)}</div></div>${lovedBadge}<div class="mi-price">₹${m.price}</div></div>
       <div class="mi-ctrl">${
         qty>0
         ? `<div class="qty-step"><button onclick="changeQty('${m.id}',-1)">−</button><span>${qty}</span><button onclick="changeQty('${m.id}',1)">+</button></div>`
@@ -757,7 +812,7 @@ function renderCart(){
     const m = MENU.find(x=>x.id===id); if(!m) return '';
     return `<div class="ci-row">
       <div class="mi-icon" style="width:38px;height:38px;font-size:17px;">${m.icon}</div>
-      <div class="ci-name">${m.name}</div>
+      <div class="ci-name">${escH(m.name)}</div>
       <div class="qty-step"><button onclick="changeQty('${id}',-1);renderCart();">−</button><span>${qty}</span><button onclick="changeQty('${id}',1);renderCart();">+</button></div>
       <div class="ci-amt">₹${(qty*m.price).toLocaleString('en-IN')}</div>
     </div>`;
