@@ -199,6 +199,7 @@ body{font-family:'Sora',sans-serif;background:var(--bg);color:var(--text);min-he
         <label>File (PDF, JPG or PNG) *</label>
         <div class="drop-zone" onclick="document.getElementById('umFile').click()" id="umDropZone">📎 Click to choose a file</div>
         <input type="file" id="umFile" accept=".pdf,.jpg,.jpeg,.png" style="display:none" onchange="onUmFileChange(this.files[0])">
+        <div id="umFileNote" style="font-size:10.5px;color:var(--muted);margin-top:5px;line-height:1.4;">Large files are optimised automatically before upload (big PDFs are re-built page by page as a light PDF).</div>
       </div>
       <div class="chk-row">
         <input type="checkbox" id="umAutoSet" checked>
@@ -301,12 +302,118 @@ function mcClientId(){
 function MC_HAS_CLIENT(){ return !!mcClientId(); }
 function mcUploadsKey(){ return MC_UPLOADS_KEY_BASE+'_'+(mcClientId()||'default'); }
 
+/* FIX (2026-10-04 "Saving… stuck" on a 10.8 MB PDF): the whole file was
+   kept as a base64 string inside localStorage (≈5 MB per site), so any real
+   designed menu overflowed it. File data now lives in IndexedDB (hundreds of
+   MB allowed); localStorage keeps only the small list (name, date, active). */
+const MC_IDB = { db:null };
+function mcIdb(){
+  if (MC_IDB.db) return Promise.resolve(MC_IDB.db);
+  return new Promise((res,rej)=>{
+    try{
+      const r = indexedDB.open('bnx_menu_card_files', 1);
+      r.onupgradeneeded = ()=>{ r.result.createObjectStore('files'); };
+      r.onsuccess = ()=>{ MC_IDB.db = r.result; res(r.result); };
+      r.onerror = ()=>rej(r.error);
+    }catch(e){ rej(e); }
+  });
+}
+async function mcFilePut(id, dataUrl){
+  try{ const db=await mcIdb(); await new Promise((res,rej)=>{ const t=db.transaction('files','readwrite'); t.objectStore('files').put(dataUrl, mcUploadsKey()+'::'+id); t.oncomplete=res; t.onerror=()=>rej(t.error); }); return true; }
+  catch(e){ console.warn('[MenuCard] IndexedDB save failed',e); return false; }
+}
+async function mcFileGet(id){
+  try{ const db=await mcIdb(); return await new Promise((res)=>{ const g=db.transaction('files','readonly').objectStore('files').get(mcUploadsKey()+'::'+id); g.onsuccess=()=>res(g.result||''); g.onerror=()=>res(''); }); }
+  catch(e){ return ''; }
+}
+async function mcFileDel(id){
+  try{ const db=await mcIdb(); db.transaction('files','readwrite').objectStore('files').delete(mcUploadsKey()+'::'+id); }catch(e){}
+}
 function loadUploads(){
   try{ return JSON.parse(localStorage.getItem(mcUploadsKey())||'[]'); }catch(e){ return []; }
 }
 function saveUploads(arr){
-  try{ localStorage.setItem(mcUploadsKey(), JSON.stringify(arr)); return true; }
-  catch(e){ toast('⚠️ This browser has no room to keep the file locally (too large). Use a smaller PDF/image.','error'); return false; }
+  const slim = arr.map(u=>{ const c=Object.assign({},u); delete c.dataUrl; return c; });
+  try{ localStorage.setItem(mcUploadsKey(), JSON.stringify(slim)); return true; }
+  catch(e){ toast('⚠️ Could not update the menu card list on this device.','error'); return false; }
+}
+/* one-time move of old entries that still carry dataUrl inside localStorage */
+(async function mcMigrate(){
+  const list=loadUploads(); if(!list.some(u=>u.dataUrl)) return;
+  for (const u of list){ if(u.dataUrl){ await mcFilePut(u.id,u.dataUrl); } }
+  saveUploads(list);
+})();
+
+/* ---------- file optimisation before upload ---------- */
+const MC_TARGET_BYTES = 3.5*1024*1024;      /* what we send to the server */
+const MC_HARD_MAX_BYTES = 8*1024*1024;      /* refuse above this even after optimising */
+function mcDataUrlBytes(u){ const i=String(u||'').indexOf(','); return i<0?0:Math.floor((u.length-i-1)*3/4); }
+function mcLoadScript(src){
+  return new Promise((res,rej)=>{ const sc=document.createElement('script'); sc.src=src; sc.onload=res; sc.onerror=()=>rej(new Error('could not load '+src)); document.head.appendChild(sc); });
+}
+function mcReadAsDataUrl(file){ return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=()=>rej(r.error); r.readAsDataURL(file); }); }
+function mcStatus(t){ const b=document.getElementById('umSaveBtn'); if(b) b.textContent=t; }
+async function mcOptimiseImage(file){
+  const url = await mcReadAsDataUrl(file);
+  if (file.size <= MC_TARGET_BYTES) return { dataUrl:url, mime:file.type||'image/jpeg', fileName:file.name };
+  const img = await new Promise((res,rej)=>{ const i=new Image(); i.onload=()=>res(i); i.onerror=()=>rej(new Error('image could not be read')); i.src=url; });
+  let maxW = 2200, q = 0.85, out = url;
+  for (let pass=0; pass<5; pass++){
+    const sc = Math.min(1, maxW/Math.max(img.width,img.height));
+    const c = document.createElement('canvas'); c.width=Math.round(img.width*sc); c.height=Math.round(img.height*sc);
+    const x = c.getContext('2d'); x.fillStyle='#fff'; x.fillRect(0,0,c.width,c.height); x.drawImage(img,0,0,c.width,c.height);
+    out = c.toDataURL('image/jpeg', q);
+    if (mcDataUrlBytes(out) <= MC_TARGET_BYTES) break;
+    maxW = Math.round(maxW*0.8); q = Math.max(0.6, q-0.07);
+  }
+  return { dataUrl:out, mime:'image/jpeg', fileName:file.name.replace(/\.\w+$/,'')+'.jpg' };
+}
+async function mcOptimisePdf(file){
+  const orig = await mcReadAsDataUrl(file);
+  if (file.size <= MC_TARGET_BYTES) return { dataUrl:orig, mime:'application/pdf', fileName:file.name };
+  /* re-build the PDF page by page as JPEG pages: designed menus are image-heavy,
+     a 10 MB print file usually becomes 1–3 MB with no visible loss on a phone */
+  mcStatus('Optimising PDF…');
+  if (!window.pdfjsLib) await mcLoadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js');
+  if (!(window.jspdf && window.jspdf.jsPDF)) await mcLoadScript('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js');
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  const buf = await file.arrayBuffer();
+  const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
+  const n = pdf.numPages;
+  let scale = 2, q = 0.8, best = null;
+  for (let pass=0; pass<4; pass++){
+    let doc = null;
+    for (let i=1;i<=n;i++){
+      mcStatus('Optimising page '+i+'/'+n+'…');
+      const page = await pdf.getPage(i);
+      const vp1 = page.getViewport({ scale:1 });
+      const s = Math.min(scale, 2400/Math.max(vp1.width,vp1.height));
+      const vp = page.getViewport({ scale:s });
+      const c = document.createElement('canvas'); c.width=Math.round(vp.width); c.height=Math.round(vp.height);
+      const x = c.getContext('2d'); x.fillStyle='#fff'; x.fillRect(0,0,c.width,c.height);
+      await page.render({ canvasContext:x, viewport:vp }).promise;
+      const jpg = c.toDataURL('image/jpeg', q);
+      const w = vp1.width, h = vp1.height, orient = w>h?'l':'p';
+      if (!doc) doc = new window.jspdf.jsPDF({ orientation:orient, unit:'pt', format:[w,h], compress:true });
+      else doc.addPage([w,h], orient);
+      doc.addImage(jpg, 'JPEG', 0, 0, w, h, undefined, 'FAST');
+      c.width = c.height = 0;
+    }
+    best = doc.output('datauristring').replace(/^data:application\/pdf;[^,]*,/,'data:application/pdf;base64,');
+    if (mcDataUrlBytes(best) <= MC_TARGET_BYTES) break;
+    scale *= 0.8; q = Math.max(0.55, q-0.08);
+  }
+  if (mcDataUrlBytes(best) >= mcDataUrlBytes(orig)) best = orig;
+  return { dataUrl:best, mime:'application/pdf', fileName:file.name };
+}
+async function mcPrepareFile(file){
+  const isPdf = /pdf/i.test(file.type) || /\.pdf$/i.test(file.name);
+  try{
+    return isPdf ? await mcOptimisePdf(file) : await mcOptimiseImage(file);
+  }catch(e){
+    console.warn('[MenuCard] optimise failed, using original', e);
+    return { dataUrl: await mcReadAsDataUrl(file), mime: file.type||'application/octet-stream', fileName:file.name };
+  }
 }
 
 let currentCat='All', searchQ='', liveMenuItems=[], usingSeedMenu=true, currentStation='FOOD';
@@ -345,47 +452,60 @@ let umPendingFile=null, umPendingDataUrl=null;
 function onUmFileChange(file){
   if(!file) return;
   umPendingFile=file;
+  umPendingDataUrl=null;
   document.getElementById('umDropZone').textContent='📄 '+file.name+' ('+Math.round(file.size/1024)+' KB)';
-  const reader=new FileReader();
-  reader.onload=()=>{ umPendingDataUrl=reader.result; };
-  reader.readAsDataURL(file);
+  const nt=document.getElementById('umFileNote');
+  if(nt) nt.textContent = file.size > MC_TARGET_BYTES
+    ? '⚙ '+(file.size/1048576).toFixed(1)+' MB — will be optimised to about '+(MC_TARGET_BYTES/1048576).toFixed(1)+' MB before upload (takes a few seconds).'
+    : 'Ready to upload.';
 }
 async function saveUpload(){
   const name=document.getElementById('umName').value.trim();
   if(!name){ alert('Enter an occasion/menu name.'); return; }
   if(!umPendingFile){ alert('Choose a file to upload.'); return; }
   const autoSet=document.getElementById('umAutoSet').checked;
-  const btn=document.getElementById('umSaveBtn'); btn.disabled=true; btn.textContent='Saving…';
-  // wait for FileReader if it hasn't finished yet
-  let tries=0;
-  while(!umPendingDataUrl && tries<50){ await new Promise(r=>setTimeout(r,100)); tries++; }
-  const record={
-    id: 'MC'+Date.now(), name, fileName: umPendingFile.name, mime: umPendingFile.type||'application/octet-stream',
-    dataUrl: umPendingDataUrl, uploadedAt: new Date().toISOString(), active: !!autoSet
-  };
-  const uploads=loadUploads();
-  if(autoSet) uploads.forEach(u=>u.active=false);
-  uploads.unshift(record);
-  const savedLocal = saveUploads(uploads);
-
-  // Real backend wire-up, same honest-fallback convention as menu-availability.html's
-  // SAVE_MENU_AVAILABILITY — saved locally regardless; backend sync is best-effort.
+  const btn=document.getElementById('umSaveBtn'); btn.disabled=true; btn.textContent='Preparing…';
+  /* ROOT FIX ("Saving…" forever): no step here can hang any more — the file is
+     optimised first, the server call has a hard timeout, and the button is
+     always given back in finally{}. */
   try{
-    if (typeof gasApi === 'function'){
-      if(!MC_CLIENT_ID){ toast('⚠️ No client session found — log in again so this saves for your restaurant.','error'); }
-      const r = await gasApi('SAVE_MENU_CARD_UPLOAD', { name, fileName: record.fileName, mime: record.mime, dataUrl: record.dataUrl, active: record.active });
-      if (r && r.success){ toast('✅ Menu card saved & synced'+(autoSet?' — now active':''),'success'); }
-      else { toast(savedLocal ? '💾 Saved on this device only — customers will not see it until backend sync works.' : '❌ Could not save this menu card.','info'); }
-    } else {
-      toast('💾 Saved on this device. Backend sync not deployed yet.','info');
+    const prep = await mcPrepareFile(umPendingFile);
+    const bytes = mcDataUrlBytes(prep.dataUrl);
+    if (bytes > MC_HARD_MAX_BYTES){
+      toast('❌ File is still '+(bytes/1048576).toFixed(1)+' MB after optimising — export the menu as a smaller PDF / JPG (under 8 MB).','error');
+      return;
     }
-  }catch(e){ toast('💾 Saved on this device. Backend sync not deployed yet.','info'); }
+    const record={
+      id: 'MC'+Date.now(), name, fileName: prep.fileName, mime: prep.mime,
+      uploadedAt: new Date().toISOString(), active: !!autoSet, sizeKB: Math.round(bytes/1024), synced:false
+    };
+    btn.textContent='Saving…';
+    const storedLocal = await mcFilePut(record.id, prep.dataUrl);
+    const uploads=loadUploads();
+    if(autoSet) uploads.forEach(u=>u.active=false);
+    uploads.unshift(record);
+    saveUploads(uploads);
 
-  btn.disabled=false; btn.textContent='💾 Save';
-  umPendingFile=null; umPendingDataUrl=null;
-  closeUploadModal();
-  renderUploadView();
-  if(autoSet) setView('upload');
+    btn.textContent='Uploading '+Math.round(bytes/1024)+' KB…';
+    const r = await gasApi('SAVE_MENU_CARD_UPLOAD', { name, fileName: record.fileName, mime: record.mime, dataUrl: prep.dataUrl, active: record.active }, 180000);
+    if (r && r.success){
+      record.synced = true; saveUploads(uploads.map(u=>u.id===record.id?record:u));
+      toast('✅ Menu card saved & synced'+(autoSet?' — customers now see it':'')+(bytes<umPendingFile.size?' (optimised '+Math.round(umPendingFile.size/1024)+' → '+Math.round(bytes/1024)+' KB)':''),'success');
+    } else {
+      const why = (r && (r.error||r.message)) || 'no response';
+      console.warn('[MenuCard] SAVE_MENU_CARD_UPLOAD failed:', why);
+      toast((storedLocal?'💾 Saved on this device only — ':'❌ ')+'server did not accept it: '+why+'. Customers will not see it yet.','error');
+    }
+    umPendingFile=null; umPendingDataUrl=null;
+    closeUploadModal();
+    renderUploadView();
+    if(autoSet) setView('upload');
+  }catch(e){
+    console.error('[MenuCard] save failed', e);
+    toast('❌ Could not save this menu card: '+(e && e.message || e),'error');
+  }finally{
+    btn.disabled=false; btn.textContent='💾 Save';
+  }
 }
 
 // ═══ BULK IMPORT FROM EXCEL ═══
@@ -472,6 +592,7 @@ function activateUpload(id){
 function deleteUpload(id){
   if(!confirm('Remove this uploaded menu card?')) return;
   saveUploads(loadUploads().filter(u=>u.id!==id));
+  mcFileDel(id);
   renderUploadView();
 }
 function renderUploadView(){
@@ -491,6 +612,29 @@ function renderUploadView(){
       <div style="flex:1;min-width:200px;"><strong>${esc(active.name)}</strong><div class="ab-meta">Uploaded ${new Date(active.uploadedAt).toLocaleString('en-IN')} · ${esc(active.fileName)}</div></div>
       <button class="tb-btn" onclick="setView('live')">📋 Show Live Item Menu instead</button>
     </div>`;
+    previewWrap.innerHTML = '<div class="empty-note">Loading preview…</div>';
+    const activeId = active.id;
+    mcFileGet(active.id).then(dataUrl=>{
+      const cur = loadUploads().find(u=>u.active);
+      if (!cur || cur.id !== activeId) return;
+      if (!dataUrl){ previewWrap.innerHTML = '<div class="empty-note">Preview not stored on this device'+(active.synced?' — it is saved on the server, customers can see it.':'.')+'</div>'; return; }
+      mcRenderPreview(previewWrap, Object.assign({}, active, { dataUrl }));
+    });
+  }
+  mcRenderHistory(uploads, historyWrap);
+}
+/* data: URLs of multi-MB PDFs are blocked as top-level tabs in Chrome/Edge
+   ("Open PDF in new tab" did nothing) — use a blob: URL for preview/open/download */
+let MC_BLOB_URL='';
+function mcRenderPreview(previewWrap, active){
+  try{
+    const i=active.dataUrl.indexOf(','), meta=active.dataUrl.slice(5,i), bin=atob(active.dataUrl.slice(i+1)), a=new Uint8Array(bin.length);
+    for(let k=0;k<bin.length;k++) a[k]=bin.charCodeAt(k);
+    if(MC_BLOB_URL) URL.revokeObjectURL(MC_BLOB_URL);
+    MC_BLOB_URL=URL.createObjectURL(new Blob([a],{type:meta.split(';')[0]||active.mime}));
+    active=Object.assign({},active,{dataUrl:MC_BLOB_URL});
+  }catch(e){}
+  {
     if(active.mime && active.mime.indexOf('pdf')>-1){
       // FIX ("pdf copy also check fix"): <embed type="application/pdf">
       // silently renders nothing on iOS Safari and most mobile in-app
@@ -515,13 +659,14 @@ function renderUploadView(){
     }
   }
 
-  const others = uploads.filter(u=>!u.active);
+}
+function mcRenderHistory(uploads, historyWrap){
   if(!uploads.length){
     historyWrap.innerHTML = '';
   } else {
     historyWrap.innerHTML = `<div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px;">Menu Card History</div>` +
       uploads.map(u=>`<div class="history-item">
-        <div><div class="hi-name">${u.active?'⭐ ':''}${esc(u.name)}</div><div class="hi-meta">${new Date(u.uploadedAt).toLocaleDateString('en-IN')} · ${esc(u.fileName)}</div></div>
+        <div><div class="hi-name">${u.active?'⭐ ':''}${esc(u.name)}</div><div class="hi-meta">${new Date(u.uploadedAt).toLocaleDateString('en-IN')} · ${esc(u.fileName)}${u.sizeKB?' · '+u.sizeKB+' KB':''}${u.synced===false?' · <span style="color:var(--red)">not synced</span>':''}</div></div>
         <div style="display:flex;gap:6px;">
           ${u.active?'':`<button class="tb-btn success" style="padding:4px 10px;font-size:10.5px;" onclick="activateUpload('${u.id}')">Set Active</button>`}
           <button class="tb-btn" style="padding:4px 10px;font-size:10.5px;" onclick="deleteUpload('${u.id}')">🗑</button>
@@ -676,22 +821,52 @@ function toast(msg, type){
   setView(startView);
 })();
 </script>
-<script src="../erp-config.js"></script>
 <script>
-const MC_CLIENT_ID = mcClientId();
-const MC_API_URL = 'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec';
-async function gasApi(action, payload){
+/* ROOT FIX ("ERP config not loaded — check erp-config.js path/deployment"):
+   this page is at /Dashboard/restaurant/menu-card.html and loaded
+   "../erp-config.js" = /Dashboard/erp-config.js, which does not exist. The
+   file lives at the site root; the dashboard finds it with the known-roots
+   rule below — the same rule is used here so both pages always agree. */
+(function(){
+  var KNOWN_ROOTS = ['Dashboard','Balaji_staff','demo','layouts','Components'];
+  var parts = window.location.pathname.replace(/\/+$/,'').split('/').filter(Boolean), depth = 0;
+  for (var i = parts.length - 1; i >= 0; i--){ if (KNOWN_ROOTS.indexOf(parts[i]) !== -1){ depth = parts.length - i; break; } depth++; }
+  var src = depth <= 1 ? 'erp-config.js' : new Array(depth).join('../') + 'erp-config.js';
+  document.write('<script src="' + src + '" onerror="console.error(\'[ERP CONFIG] failed to load from ' + src + '\')"><\/script>');
+})();
+</script>
+<script>
+const MC_CLIENT_ID = (function(){
+  try{ if(typeof ERP!=='undefined'){ const c = (typeof ERP.getClientId==='function'&&ERP.getClientId()) || (typeof ERP.getClient==='function'&&ERP.getClient()); const v = c && typeof c==='object' ? (c.CLIENT_ID||c.clientId||c.client_id) : c; if(v) return String(v); } }catch(e){}
+  return mcClientId();
+})();
+const MC_API_URL = 'https://script.google.com/macros/s/' + (localStorage.getItem('bnx_api_core') || 'AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ') + '/exec';
+/* same token lookup order as the dashboard (bnxCurrentSession_) — the page only
+   read localStorage.ERP_SESSION, so a login stored elsewhere sent an empty token */
+function mcSessionToken(){
+  const pick = v => { if(!v) return ''; if(typeof v==='string'){ const t=v.trim(); if(t.charAt(0)==='{'){ try{ return pick(JSON.parse(t)); }catch(e){} } return t; }
+    if(typeof v==='object') return String(v.sessionToken||v.SESSION_TOKEN||v.token||v.TOKEN||v.session||v.SESSION||v.erpSession||v.ERP_SESSION||'').trim(); return ''; };
+  const c = [];
+  try{ if(typeof ERP!=='undefined' && typeof ERP.getSession==='function') c.push(ERP.getSession()); }catch(e){}
+  try{ if(typeof ERP!=='undefined' && typeof ERP.getToken==='function') c.push(ERP.getToken()); }catch(e){}
+  ['ERP_SESSION','erp_session','erp_token','ERP_USER','erpUser'].forEach(k=>{ try{ c.push(localStorage.getItem(k)); c.push(sessionStorage.getItem(k)); }catch(e){} });
+  for (const v of c){ const t = pick(v); if (t) return t; }
+  return '';
+}
+async function gasApi(action, payload, timeoutMs){
   if(!MC_CLIENT_ID){ return { success:false, message:'No client session found — please log in again before saving.' }; }
+  const ctl = new AbortController(), tm = setTimeout(()=>ctl.abort(), timeoutMs || 30000);
   try{
-    const body = Object.assign({ action: action, clientId: MC_CLIENT_ID, sessionToken: (localStorage.getItem('ERP_SESSION')||'') }, payload || {});
-    const resp = await fetch(MC_API_URL, { method:'POST', body: JSON.stringify(body) });
-    return await resp.json();
+    const body = Object.assign({ action: action, clientId: MC_CLIENT_ID, sessionToken: mcSessionToken() }, payload || {});
+    const resp = await fetch(MC_API_URL, { method:'POST', body: JSON.stringify(body), signal: ctl.signal });
+    const txt = await resp.text();
+    try{ return JSON.parse(txt); }catch(e){ return { success:false, message:'server replied with a non-JSON page (HTTP '+resp.status+')' }; }
   }catch(e){
-    return { success:false, message: e.message };
-  }
+    return { success:false, message: e && e.name==='AbortError' ? 'server took too long (timed out)' : (e && e.message || 'network error') };
+  }finally{ clearTimeout(tm); }
 }
 window.addEventListener('DOMContentLoaded', async () => {
-  if (typeof ERP === 'undefined') { console.error('ERP config not loaded — check erp-config.js path/deployment'); return; }
+  if (typeof ERP === 'undefined') { console.error('ERP config not loaded — check erp-config.js path/deployment'); loadLiveMenu(); return; }
   const user = ERP.requireLogin();
   if (!user) return;
   // Same GET_CLIENT_INFO action every other staff-facing page already
