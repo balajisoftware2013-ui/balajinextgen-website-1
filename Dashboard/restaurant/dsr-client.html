@@ -345,7 +345,34 @@ function bnxRedirectToLogin_(reason){
 }
 
 var BNX_DBG_=function(){};
+/* BNX DSR SPEED 2026-10-05: identical read calls (same action+payload) share one
+   network request while in flight, and GET_* results are reused for a short
+   time (45s when the range touches today, 10 min for closed past ranges).
+   The Daily → MTD → report-map → bill-recon chain used to fire the same
+   GET_BILLS / day-book requests several times per date change. */
+const BNX_API_FLIGHT_=new Map(), BNX_API_CACHE_=new Map();
+function bnxApiKey_(a,p,e){try{return (e||'V2_CORE')+'|'+a+'|'+JSON.stringify(p||{});}catch(x){return '';}}
+function bnxApiTtl_(p){var t=(typeof bnxToday_==='function')?bnxToday_():'';var s=JSON.stringify(p||{});var ds=s.match(/\d{4}-\d{2}-\d{2}/g)||[];var touchesToday=!ds.length||ds.some(function(d){return d>=t;});if(!touchesToday&&p&&p.year&&p.month){var n=new Date();touchesToday=(+p.year===n.getFullYear()&&+p.month===n.getMonth()+1);}return touchesToday?45000:600000;}
+function bnxApiClearCache_(){BNX_API_CACHE_.clear();}
 async function gasApi(action,payload,endpoint){
+  payload=payload||{};
+  if(/^GET_/.test(String(action))){
+    const k=bnxApiKey_(action,payload,endpoint);
+    if(k){
+      const c=BNX_API_CACHE_.get(k);
+      if(c&&Date.now()-c.t<c.ttl) return c.r;
+      if(BNX_API_FLIGHT_.has(k)) return BNX_API_FLIGHT_.get(k);
+      const p=gasApiRaw_(action,payload,endpoint).then(function(r){
+        if(r&&r.success!==false&&!r.error&&!r.authExpired) BNX_API_CACHE_.set(k,{t:Date.now(),ttl:bnxApiTtl_(payload),r:r});
+        return r;
+      }).finally(function(){BNX_API_FLIGHT_.delete(k);});
+      BNX_API_FLIGHT_.set(k,p);
+      return p;
+    }
+  }
+  return gasApiRaw_(action,payload,endpoint);
+}
+async function gasApiRaw_(action,payload,endpoint){
   payload=payload||{};
   /* FIX (Sep 2026, same audit as above): read window.GAS_APIS_DSR explicitly
      — never the bare `GAS_APIS_DSR` identifier — so this always uses the one
@@ -1031,6 +1058,12 @@ async function fetchDsrMonthLive_(year,month){
   const _mk=String(year)+'-'+String(month).padStart(2,'0');
   if(BNX_DSR_MONTH_FLIGHT_.has(_mk)) return BNX_DSR_MONTH_FLIGHT_.get(_mk);
   const _work=(async()=>{
+  { // SPEED: fire the day-book + bills reads now, in parallel with the matrix;
+    // bnxReportMap_/bnxReconcileDsrFromBills_ below pick them up from the in-flight cache.
+    const _mm=String(month).padStart(2,'0'), _f=year+'-'+_mm+'-01', _t=year+'-'+_mm+'-'+String(new Date(Number(year),Number(month),0).getDate()).padStart(2,'0');
+    try{ gasApi('GET_SALES_DAY_BOOK_REPORT',{range:'custom',from:_f,to:_t},'V2_CORE'); }catch(e){}
+    try{ gasApi('GET_BILLS',{FROM_DATE:_f,TO_DATE:_t,BUSINESS_DATE:_f}); }catch(e){}
+  }
   const r=await gasApi('GET_DSR_MATRIX',{year:Number(year),month:Number(month)});
   bnxLogShape_('GET_DSR_MATRIX '+year+'-'+month,r);
   const mm=String(month).padStart(2,'0');
@@ -1047,6 +1080,8 @@ async function fetchDsrMonthLive_(year,month){
     const d=String(day).padStart(2,'0');
     STANDARD_DATA[year+'-'+mm+'-'+d]=mapLiveDsrDay_(r.data.byDay[day]);
   });
+  // SPEED: paint Daily/MTD from the matrix right away; report-map / bill recon refine it after.
+  try{ if(typeof window.__bnxDsrEarlyPaint==='function') window.__bnxDsrEarlyPaint(mFrom,mTo); }catch(e){}
   // REPORT MAP: fill zeros from the Reports Hub feeds (never overwrites non-zero).
   await bnxReportMap_(mFrom,mTo);
   try{await bnxReconcileDsrFromBills_(mFrom,mTo);}catch(e){console.warn('[DSR BILL MASTER RECON]',e);}
@@ -1085,49 +1120,77 @@ async function ensureDsrFiscalRangeLoaded_(date){
   return await directPOSFetchRange(fyStart,ds);
 }
 
+/* BNX DSR SPEED 2026-10-05 — load order:
+   1) selected month (matrix) → Daily + MTD painted immediately;
+   2) report map + BILL_MASTER recon refine the month → repaint;
+   3) due control / live-source audit / item-group run in parallel (not one by one);
+   4) full FY range ONLY when YTD column is on or YTD / Dashboard step is opened
+      (it was loaded eagerly on every date change — the slowest call chain). */
+let BNX_DSR_SEQ_=0;
+function bnxDsrPaint_(ds){
+  try{ loadDayData(); }catch(e){}
+  try{ populateDsrMonthSelectors_(); if($('mtd-month'))$('mtd-month').value=ds.slice(0,7); }catch(e){}
+  try{ refreshHdr(); }catch(e){}
+  try{ buildMTD(); }catch(e){}
+  try{ buildDsrMonthCalendar_(); }catch(e){}
+  try{ window.bnxPpRefresh_&&window.bnxPpRefresh_(); }catch(e){}
+}
+function bnxDsrNeedsFy_(){
+  try{ if(typeof window.bnxShowYtd_==='function'&&window.bnxShowYtd_()) return true; }catch(e){}
+  return currentStep===6||currentStep===7;
+}
+let BNX_FY_BG_=null;
+async function bnxDsrLoadFyBg_(ds){
+  ds=ds||$('repDate')?.value; if(!/^\d{4}-\d{2}-\d{2}$/.test(String(ds||''))) return false;
+  if(BNX_FY_BG_&&BNX_FY_BG_.ds===ds) return BNX_FY_BG_.p;
+  const p=(async()=>{
+    let ok=false; try{ ok=await ensureDsrFiscalRangeLoaded_(ds); }catch(e){ console.warn('[DSR] FY load failed:',e); }
+    if(ok && $('repDate')?.value===ds){
+      bnxDsrPaint_(ds);
+      try{ (buildYTD.__bnxOriginal||buildYTD)(); }catch(e){}
+      try{ buildDash(); }catch(e){}
+    }
+    return ok;
+  })();
+  BNX_FY_BG_={ds:ds,p:p};
+  try{ return await p; } finally { if(BNX_FY_BG_&&BNX_FY_BG_.p===p) BNX_FY_BG_=null; }
+}
+window.bnxDsrLoadFyBg_=bnxDsrLoadFyBg_;
 async function onDsrDateChange(){
   const ds=$('repDate')?.value; if(!ds)return;
+  const my=++BNX_DSR_SEQ_;
   try{if($('itemGroupDsrFrom'))$('itemGroupDsrFrom').value=ds.slice(0,8)+'01';if($('itemGroupDsrTo'))$('itemGroupDsrTo').value=ds;}catch(e){}
-  // FINAL AUDIT: Daily/MTD no longer wait for the entire FY transaction range.
-  // Load the selected month first; YTD is fetched lazily when its step is opened.
-  ['d_gross','d_net','d_totalcash','d_tax','d_cash','d_card','d_gpay','d_duesales','d_zomato','d_swiggy','d_eazydine','d_disc'].forEach(id=>{if($(id))$(id).textContent='0';});
   refreshHdr();
   const y=Number(ds.slice(0,4)),m=Number(ds.slice(5,7));
+  const st=$('dsrSourceStatus'); if(st) st.textContent='⏳ Loading live POS · '+ds+'…';
+  window.__bnxDsrEarlyPaint=function(f,t){ if(my===BNX_DSR_SEQ_ && ds>=f && ds<=t) bnxDsrPaint_(ds); };
   let ok=false;
-  window.BNX_DSR_LOADING_=true;   // suppress the "no data" warning while the live load is still in flight
+  window.BNX_DSR_LOADING_=true;
   try{ok=await fetchDsrMonthLive_(y,m);}catch(e){console.warn('[DSR] month load failed:',e);}
-  if(!ok){   // slow/failed server call: retry once before giving up
-    try{await new Promise(r=>setTimeout(r,1500));ok=await fetchDsrMonthLive_(y,m);}catch(e){console.warn('[DSR] month retry failed:',e);}
+  if(!ok && my===BNX_DSR_SEQ_){
+    try{await new Promise(r=>setTimeout(r,1200));ok=await fetchDsrMonthLive_(y,m);}catch(e){console.warn('[DSR] month retry failed:',e);}
   }
-  if(!STANDARD_DATA[ds]){   // matrix has no row for this day -> build it straight from the live bills
+  if(!STANDARD_DATA[ds]){
     try{await bnxReconcileDsrFromBills_(ds,ds);if(STANDARD_DATA[ds])ok=true;}catch(e){console.warn('[DSR] day bill fallback failed:',e);}
   }
   window.BNX_DSR_LOADING_=false;
-  if(ok){
-    loadDayData();
-    populateDsrMonthSelectors_();
-    buildMTD();
-    buildDash();
-    buildDsrMonthCalendar_();
-    /* Full DSR: hydrate the financial year through the selected date so YTD
-       and Dashboard never calculate from only the currently loaded month. */
-    try{
-      const fyOk=await ensureDsrFiscalRangeLoaded_(ds);
-      if(fyOk){
-        populateDsrMonthSelectors_();
-        if($('mtd-month'))$('mtd-month').value=ds.slice(0,7);
-        refreshHdr(); loadDayData(); buildMTD(); buildYTD(); buildDash(); buildDsrMonthCalendar_();
-      }
-    }catch(e){console.warn('[DSR] FY as-of-date load failed:',e);}
-    try{if(document.getElementById('itab-cashbook')?.classList.contains('active'))await loadCashbookLive_();}catch(e){}
-    try{if(document.getElementById('itab-itemgroup-dsr')?.classList.contains('active'))loadItemGroupDsr_();}catch(e){}
-    try{await loadDsrDueControl_(ds);bnxDueDisplaySummary_();}catch(e){console.warn('[DSR DUE CONTROL]',e);}
-    try{await Promise.allSettled([bnxAuditLivePOSSource_(ds),bnxLoadLiveItemGroupRevenue_(ds)]);}catch(e){console.warn('[LIVE SOURCE AUDIT]',e);}
-    try{if(document.getElementById('itab-recon')?.classList.contains('active'))await loadDsrReconciliation_();}catch(e){}
-  }else{
-    loadDayData();
-    showToast('⚠️ Live POS data could not be loaded for '+ds,'warn');
-  }
+  window.__bnxDsrEarlyPaint=null;
+  if(my!==BNX_DSR_SEQ_) return ok;           // a newer date was picked meanwhile
+  bnxDsrPaint_(ds);
+  try{ buildDash(); }catch(e){}
+  if(st) st.textContent=ok?('🔴 Live POS · '+ds+' · '+new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})):('⚠️ Live POS not reachable for '+ds);
+  if(!ok){ showToast('⚠️ Live POS data could not be loaded for '+ds,'warn'); return false; }
+  const side=[
+    (async()=>{try{await loadDsrDueControl_(ds);bnxDueDisplaySummary_();}catch(e){console.warn('[DSR DUE CONTROL]',e);}})(),
+    (async()=>{try{await bnxAuditLivePOSSource_(ds);}catch(e){}})(),
+    (async()=>{try{await bnxLoadLiveItemGroupRevenue_(ds);}catch(e){}})(),
+    (async()=>{try{if(document.getElementById('itab-cashbook')?.classList.contains('active'))await loadCashbookLive_();}catch(e){}})(),
+    (async()=>{try{if(document.getElementById('itab-itemgroup-dsr')?.classList.contains('active'))loadItemGroupDsr_();}catch(e){}})(),
+    (async()=>{try{if(document.getElementById('itab-recon')?.classList.contains('active'))await loadDsrReconciliation_();}catch(e){}})()
+  ];
+  if(bnxDsrNeedsFy_()) side.push(bnxDsrLoadFyBg_(ds));
+  await Promise.allSettled(side);
+  return true;
 }
 
 function populateDsrMonthSelectors_(){
@@ -1183,10 +1246,10 @@ async function directPOSFetch(date){
 }
 
 async function directPOSFetchRange(fromDate,toDate){
-  gasToast('🔄 Loading live DSR history…','info');
   const from=new Date(fromDate+'T00:00:00'),to=new Date(toDate+'T00:00:00');
   if(isNaN(from)||isNaN(to)||from>to)return false;
-  STANDARD_DATA={};
+  // SPEED/LIVE FIX: STANDARD_DATA used to be wiped here, so Daily/MTD went blank
+  // until the whole FY came back. Range rows are merged in instead.
   let okCount=0;
   /* PASS #71: one GET_DSR_RANGE call for the whole range (was one sequential
      GET_DSR_MATRIX round-trip per month — 6-12 calls for an FY view). */
@@ -1217,14 +1280,12 @@ async function directPOSFetchRange(fromDate,toDate){
     const res=await Promise.all(months.map(p=>fetchDsrMonthLive_(p[0],p[1]).catch(()=>false)));
     okCount=res.filter(Boolean).length;
   }
-  Object.keys(STANDARD_DATA).forEach(k=>{if(k<fromDate||k>toDate)delete STANDARD_DATA[k];});
   // REPORT MAP: fill zeros / missing days from the Reports Hub feeds.
   try{ await bnxReportMap_(fromDate,toDate); }catch(e){ console.warn('[REPORT MAP]',e); }
   try{ await bnxReconcileDsrFromBills_(fromDate,toDate); }catch(e){ console.warn('[DSR BILL MASTER RECON]',e); }
   if(Object.keys(STANDARD_DATA).length) okCount=okCount||1;
   if(okCount){
     BNX_FY_LOADED_={from:fromDate,to:toDate};
-    gasToast('✅ Loaded '+Object.keys(STANDARD_DATA).length+' live days','success');
     return true;
   }
   setStatus('NO LIVE DSR HISTORY');
@@ -3023,6 +3084,7 @@ function goStep(n) {
   }
   currentStep=n;
   if(n===5) buildMTD();
+  if(n===6||n===7){ try{ bnxDsrLoadFyBg_(); }catch(e){} }
   if(n===6) buildYTD();
   if(n===7) buildDash();
   if(n===8) genWAMsg();
@@ -4384,12 +4446,23 @@ window.addEventListener('DOMContentLoaded',async function(){
     const today=bnxToday_();
     sel.innerHTML='<option value="'+today.slice(0,7)+'">'+new Date(today.slice(0,7)+'-01').toLocaleString('en-IN',{month:'long',year:'numeric'})+'</option>';
   }
-  loadDayData();
-  try{await loadDsrDueControl_(today);}catch(e){console.warn('[DSR DUE INIT]',e);}
   loadSwiftLocal_();
   if($('swiftReportFrom'))$('swiftReportFrom').value=today;
   if($('swiftReportTo'))$('swiftReportTo').value=today;
+  // LIVE FIX 2026-10-05: startup only ran loadDayData() on an empty STANDARD_DATA, so the
+  // page always opened on zeros + "NO LIVE POS DATA" until a date chip was clicked.
+  // Now the selected business day is pulled live on open (Day + MTD first; due control included).
+  goStep(4);
+  try{ await onDsrDateChange(); }catch(e){ console.warn('[DSR INIT LIVE]',e); loadDayData(); }
 });
+/* Auto-refresh while visible: today's DSR stays live (cache TTL 45s keeps it cheap). */
+setInterval(function(){
+  try{
+    if(document.hidden) return;
+    const ds=$('repDate')?.value; if(!ds||ds!==bnxToday_()||window.BNX_DSR_LOADING_) return;
+    onDsrDateChange();
+  }catch(e){}
+},120000);
 
 // ══════════════════════════════════════════
 // INNER TAB SWITCHER
@@ -5721,6 +5794,7 @@ header .logo img{width:100%;height:100%;object-fit:contain;border-radius:inherit
       var ds=document.getElementById('repDate')?.value||'';
       if(!/^\d{4}-\d{2}-\d{2}$/.test(ds))return false;
       if(typeof W.BNX_FY_LOADED_!=='undefined')W.BNX_FY_LOADED_=null;
+      try{ if(typeof W.bnxApiClearCache_==='function') W.bnxApiClearCache_(); }catch(e){}
       if(typeof W.BNX_RM_!=='undefined'&&W.BNX_RM_){W.BNX_RM_.cItem={};W.BNX_RM_.cPay={};}
       return await W.onDsrDateChange();
     }catch(e){console.error('[FINAL DSR AUDIT] reload:',e);return false;}
@@ -5752,6 +5826,7 @@ function applyYtd(){
 window.bnxSetShowYtd_=function(on){
   try{localStorage.setItem(KEY,on?'1':'0');}catch(e){}
   applyYtd();
+  if(on){ try{ window.bnxDsrLoadFyBg_&&window.bnxDsrLoadFyBg_(); }catch(e){} }
   try{if(typeof genWAMsg==='function')genWAMsg();}catch(e){}
 };
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',applyYtd,{once:true});else applyYtd();
@@ -5984,6 +6059,7 @@ window.bnxSetPeriodMode_=function(m){
   renderInputs();
   if(m!=='day')apply();else summary();
 };
+window.bnxPpRefresh_=function(){try{summary();}catch(e){}};
 window.bnxQuick_=function(w){
   var d=new Date(today()+'T00:00:00');if(w==='yesterday')d.setDate(d.getDate()-1);
   P.mode='day';renderInputs();apply({date:iso(d)});
@@ -6124,5 +6200,39 @@ html,body{max-width:100%;overflow-x:hidden;}
 /* toggle label click -> checkbox */
 document.addEventListener('click',function(e){var t=e.target.closest&&e.target.closest('.bnx-ytd-toggle');if(!t||e.target.tagName==='INPUT')return;var c=t.querySelector('input');if(c){c.checked=!c.checked;c.dispatchEvent(new Event('change',{bubbles:true}));}});
 </script>
+
+<style id="bnx-dsr-embedded-compact-20261005">
+/* SMALL SIZE inside Restaurant Dashboard (iframe) — everything fits without zooming out */
+html.bnx-embedded body{font-size:12px!important}
+html.bnx-embedded .wrap{padding:6px 8px 10px!important}
+html.bnx-embedded .pipeline{min-height:0!important;padding:2px 8px!important;margin:0!important}
+html.bnx-embedded .pip-node{padding:2px 7px!important}
+html.bnx-embedded .pip-arrow{font-size:11px!important}
+html.bnx-embedded .card{padding:6px 9px!important;margin-bottom:5px!important}
+html.bnx-embedded #dsrSourceControl{padding:4px 8px!important}
+html.bnx-embedded #dsrSourceControl .btn,html.bnx-embedded .btn{padding:3px 9px!important;font-size:11px!important;min-height:0!important}
+html.bnx-embedded .tab-bar{padding:2px!important;margin-bottom:5px!important}
+html.bnx-embedded .tab-bar .tab{padding:4px 9px!important;font-size:11.5px!important}
+html.bnx-embedded #bnxPeriodBar{padding:4px 8px!important}
+html.bnx-embedded .bnx-pp-chip{padding:2px 9px!important;font-size:11px!important}
+html.bnx-embedded #step-4 .meta-item label{font-size:8.5px!important}
+html.bnx-embedded #step-4 .meta-item input:not([type=checkbox]){height:26px!important;font-size:12px!important}
+html.bnx-embedded #step-4 .bnx-ytd-toggle{height:26px!important;font-size:11px!important}
+html.bnx-embedded #step-4 .chip-row{gap:4px!important;margin-bottom:5px!important}
+html.bnx-embedded #step-4 .chip{padding:3px 5px!important}
+html.bnx-embedded #step-4 .chip-val{font-size:14px!important}
+html.bnx-embedded #step-4 .chip-lbl{font-size:8.5px!important;margin-top:1px!important}
+html.bnx-embedded #step-4 .chip-sub{font-size:8px!important}
+html.bnx-embedded #dsr-mini-bars{display:none!important}
+html.bnx-embedded #step-4 .dsr-grid{gap:7px!important}
+html.bnx-embedded .dsr-col-hdr{padding:6px 8px!important;font-size:12px!important;min-height:0!important}
+html.bnx-embedded .dsr-col-body .sl{padding:3px 8px!important;font-size:10.5px!important;min-height:0!important}
+html.bnx-embedded #step-4 .dsr-row{padding:2px 8px!important;min-height:0!important;gap:6px!important}
+html.bnx-embedded #step-4 .dsr-row label{font-size:11.5px!important;line-height:1.2!important}
+html.bnx-embedded #step-4 .dsr-val{font-size:12px!important}
+html.bnx-embedded #step-4 .dsr-val.editable{height:22px!important;padding:1px 6px!important;width:88px!important}
+html.bnx-embedded #step-4 .dsr-row.total,html.bnx-embedded #step-4 [class*="dsr-row"][class*="tot"]{padding:3px 8px!important}
+html.bnx-embedded #step-4 .dsr-row *{font-size:inherit}
+</style>
 </body>
 </html>
