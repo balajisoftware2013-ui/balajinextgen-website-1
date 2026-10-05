@@ -2,26 +2,50 @@ package in.balajinextgen.stewardprinter;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.DownloadManager;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
 
+import androidx.core.content.FileProvider;
+
+import org.json.JSONObject;
+
+import java.io.File;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.URL;
 import java.util.Base64;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
+    private static final int APP_VERSION_CODE = 2;
+    private static final String APP_VERSION_NAME = "1.1.0";
+    /* Host this JSON on your website and change only this URL when needed. */
+    private static final String UPDATE_URL = "https://balajinextgen.in/steward/update.json";
+
     private WebView webView;
     private final ExecutorService printerPool = Executors.newCachedThreadPool();
+    private final ExecutorService updatePool = Executors.newSingleThreadExecutor();
     private final Handler main = new Handler(Looper.getMainLooper());
+    private long downloadedApkId = -1L;
+    private boolean receiverRegistered = false;
 
     @SuppressLint({"SetJavaScriptEnabled", "JavascriptInterface"})
     @Override public void onCreate(Bundle state) {
@@ -39,6 +63,8 @@ public class MainActivity extends Activity {
         webView.setWebViewClient(new WebViewClient());
         webView.addJavascriptInterface(new BNXPrinterBridge(), "BNXPrinter");
         webView.loadUrl("file:///android_asset/steward-mobile.html");
+
+        main.postDelayed(() -> checkForUpdate(false), 2500);
     }
 
     public class BNXPrinterBridge {
@@ -74,6 +100,65 @@ public class MainActivity extends Activity {
         }
     }
 
+    @JavascriptInterface
+    public void checkForUpdateFromPOS() { checkForUpdate(false); }
+
+    private void checkForUpdate(boolean manual) {
+        updatePool.execute(() -> {
+            try {
+                HttpURLConnection c = (HttpURLConnection) new URL(UPDATE_URL).openConnection();
+                c.setConnectTimeout(5000); c.setReadTimeout(7000);
+                c.setRequestMethod("GET"); c.setUseCaches(false);
+                StringBuilder b = new StringBuilder();
+                java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(c.getInputStream()));
+                String line; while ((line = r.readLine()) != null) b.append(line); r.close(); c.disconnect();
+                JSONObject j = new JSONObject(b.toString());
+                int code = j.getInt("versionCode");
+                String name = j.optString("versionName", "");
+                String apk = j.getString("apkUrl");
+                if (code <= APP_VERSION_CODE) { if(manual) toast("Steward is already up to date"); return; }
+                main.post(() -> downloadAndInstall(apk, name));
+            } catch (Exception e) {
+                if(manual) toast("Update check failed: " + e.getMessage());
+            }
+        });
+    }
+
+    private void downloadAndInstall(String apkUrl, String versionName) {
+        try {
+            toast("Steward update " + versionName + " available. Downloading…");
+            DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(apkUrl));
+            req.setTitle("Balaji NextGen Steward update");
+            req.setDescription("Downloading update " + versionName);
+            req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            req.setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, "BNXSteward-update.apk");
+            downloadedApkId = dm.enqueue(req);
+        } catch (Exception e) { toast("Update download failed: " + e.getMessage()); }
+    }
+
+    private final BroadcastReceiver downloadReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1);
+            if (id != downloadedApkId) return;
+            installDownloadedApk(id);
+        }
+    };
+
+    private void installDownloadedApk(long id) {
+        try {
+            DownloadManager dm = (DownloadManager)getSystemService(DOWNLOAD_SERVICE);
+            Uri uri = dm.getUriForDownloadedFile(id);
+            if (uri == null) { toast("Update download incomplete"); return; }
+            Intent i = new Intent(Intent.ACTION_VIEW);
+            i.setDataAndType(uri, "application/vnd.android.package-archive");
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (Exception e) { toast("Cannot open update installer: " + e.getMessage()); }
+    }
+
+    private void toast(String s) { main.post(() -> Toast.makeText(MainActivity.this, s, Toast.LENGTH_LONG).show()); }
+
     private void callback(String id, boolean ok, String msg) {
         main.post(() -> {
             String js = "window.bnxNativePrintResult(" + jsQuote(id) + "," + ok + "," + jsQuote(msg) + ")";
@@ -88,8 +173,16 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
-        printerPool.shutdownNow();
+        unregisterReceiverSafe();
+        printerPool.shutdownNow(); updatePool.shutdownNow();
         if (webView != null) webView.destroy();
         super.onDestroy();
+    }
+
+    private void unregisterReceiverSafe() { try { if(receiverRegistered){ unregisterReceiver(downloadReceiver); receiverRegistered=false; } } catch(Exception ignored){} }
+
+    @Override protected void onResume() {
+        super.onResume();
+        try { if(!receiverRegistered){ registerReceiver(downloadReceiver, new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE), Context.RECEIVER_EXPORTED); receiverRegistered=true; } } catch(Exception ignored){}
     }
 }
