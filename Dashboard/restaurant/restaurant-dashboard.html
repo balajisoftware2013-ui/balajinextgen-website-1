@@ -14773,7 +14773,98 @@ function bnxFindLiveBillItem_(name){
     return n===target;
   })||null;
 }
+/* ═══ LIVE TAX MASTER (2026-10-05 — "master db capture tax rates") ═══
+   ROOT CAUSE: every tax rate, TAX_ID and ITEM_GROUP_ID (GRP00003 = Liquor …) was
+   hardcoded from CL00010's sheet; GET_TAX_CONFIG was called on load and its result
+   thrown away; Settings → Tax saved to THIS DEVICE only. A rate change in the master
+   sheet, or any client whose IDs differ, was silently billed with the wrong rate.
+   NOW: rates come from the master DB (GET_TAX_CONFIG → GET_MASTER tax tables), the
+   item's ITEM GROUP → TAX_ID comes from ITEM_GROUP_MASTER, cached per client for
+   offline use. The hardcoded table is used ONLY if the master can't be read, and a
+   warning is shown when that happens. */
+window.BNX_LIVE_TAX = window.BNX_LIVE_TAX || {byId:{}, groupTax:{}, loaded:false, source:''};
+function bnxTaxNorm_(v){ return String(v==null?'':v).trim().toUpperCase().replace(/[\s_-]+/g,' '); }
+function bnxTaxPct_(v){ if(v==null||v==='') return NaN; const n=parseFloat(String(v).replace(/[%\s]/g,'')); if(!isFinite(n)) return NaN; return (n>0&&n<=1)?n*100:n; }
+function bnxParseTaxRow_(r){
+  if(!r||typeof r!=='object') return null;
+  const id=String(r.TAX_ID||r.taxId||r.TAX_CODE||r.taxCode||r.ID||r.id||'').trim().toUpperCase();
+  if(!id) return null;
+  const act=r.IS_ACTIVE??r.ACTIVE??r.isActive; if(act===false||/^(false|no|n|0|inactive)$/i.test(String(act??''))) return null;
+  let c=bnxTaxPct_(r.CGST??r.CGST_RATE??r.CGST_PERCENT??r.cgst), sg=bnxTaxPct_(r.SGST??r.SGST_RATE??r.SGST_PERCENT??r.sgst??r.UTGST);
+  const tot=bnxTaxPct_(r.TAX_RATE??r.RATE??r.GST_RATE??r.GST_PERCENT??r.TAX_PERCENT??r.PERCENTAGE??r.TOTAL_RATE??r.rate??r.taxRate);
+  if(!isFinite(c)&&!isFinite(sg)&&isFinite(tot)){ c=tot/2; sg=tot/2; }
+  if(!isFinite(c)&&isFinite(sg)) c=sg; if(!isFinite(sg)&&isFinite(c)) sg=c;
+  if(!isFinite(c)) return null;                       /* no usable rate in this row */
+  const pct=Math.round((c+sg)*1000)/1000;
+  const name=String(r.TAX_NAME||r.taxName||r.NAME||r.DESCRIPTION||'').trim();
+  return {taxId:id, key:id, cgst:c, sgst:sg, rate:pct/100, hsn:String(r.HSN_CODE||r.HSN||r.SAC_CODE||r.SAC||r.hsn||'').trim(),
+          label:pct>0?('GST @'+pct+'%'):'Exempted', name, live:true};
+}
+function bnxRowsOf_(r){
+  if(!r) return [];
+  const d=r.data!==undefined?r.data:r;
+  if(Array.isArray(d)) return d;
+  for(const k of ['taxes','tax','rows','items','taxMaster','TAX_MASTER','records']){ if(d&&Array.isArray(d[k])) return d[k]; }
+  if(d&&typeof d==='object'){ const vals=Object.keys(d).map(k=>Object.assign({TAX_ID:k},typeof d[k]==='object'?d[k]:{TAX_RATE:d[k]})); return vals; }
+  return [];
+}
+function bnxTaxCacheKey_(){ return 'bnx_tax_master_'+(typeof CLIENT_ID!=='undefined'&&CLIENT_ID?CLIENT_ID:'default'); }
+function bnxApplyTaxMaster_(byId,groupTax,source){
+  const T=window.BNX_LIVE_TAX; T.byId=byId||{}; T.groupTax=groupTax||{}; T.loaded=Object.keys(T.byId).length>0; T.source=source||'';
+  try{ if(typeof recalcCart==='function') recalcCart(); }catch(e){}
+  try{ if(typeof bmRecalc==='function' && document.querySelector('[id^="bm-irow-"]')) bmRecalc(); }catch(e){}
+}
+(function(){ try{ const c=JSON.parse(localStorage.getItem(bnxTaxCacheKey_())||'null'); if(c&&c.byId) bnxApplyTaxMaster_(c.byId,c.groupTax,'cache'); }catch(e){} })();
+async function bnxLoadTaxMaster_(){
+  if(typeof gasApi!=='function') return false;
+  const byId={}, groupTax={}; let source='';
+  const take=(rows,src)=>{ let n=0; rows.forEach(r=>{ const t=bnxParseTaxRow_(r); if(t){ byId[t.taxId]=t; n++; } }); if(n&&!source) source=src; return n; };
+  try{ const r=await gasApi('GET_TAX_CONFIG',{},'V2_CORE'); if(r&&r.success!==false) take(bnxRowsOf_(r),'GET_TAX_CONFIG'); }catch(e){}
+  if(!Object.keys(byId).length){
+    for(const cat of ['tax_master','taxes','tax','gst_master']){
+      try{ const r=await gasApi('GET_MASTER',{category:cat},'V2_CORE'); if(r&&r.success!==false&&take(bnxRowsOf_(r),'GET_MASTER:'+cat)) break; }catch(e){}
+    }
+  }
+  /* ITEM_GROUP_MASTER → TAX_ID (or a rate stored directly on the group) */
+  try{
+    const g=await gasApi('GET_MASTER',{category:'item_groups'},'V2_CORE');
+    bnxRowsOf_(g).forEach(row=>{
+      const gid=String(row.ITEM_GROUP_ID||row.GROUP_ID||row.itemGroupId||row.groupId||row.ID||'').trim().toUpperCase();
+      const gname=bnxTaxNorm_(row.ITEM_GROUP_NAME||row.GROUP_NAME||row.itemGroupName||row.groupName||row.NAME||'');
+      let tid=String(row.TAX_ID||row.DEFAULT_TAX_ID||row.GST_TAX_ID||row.taxId||'').trim().toUpperCase();
+      if(!tid){ const t=bnxParseTaxRow_(Object.assign({},row,{TAX_ID:'GRPTAX_'+(gid||gname)})); if(t){ byId[t.taxId]=t; tid=t.taxId; } }
+      if(tid){ if(gid) groupTax['ID:'+gid]=tid; if(gname) groupTax['NM:'+gname]=tid; }
+    });
+  }catch(e){}
+  if(Object.keys(byId).length){
+    bnxApplyTaxMaster_(byId,groupTax,source||'GET_MASTER:item_groups');
+    try{ localStorage.setItem(bnxTaxCacheKey_(),JSON.stringify({byId,groupTax,at:Date.now()})); }catch(e){}
+    console.log('[TAX MASTER] live rates loaded from',window.BNX_LIVE_TAX.source,'—',Object.keys(byId).length,'tax codes,',Object.keys(groupTax).length,'group links');
+    return true;
+  }
+  if(!window.BNX_LIVE_TAX.loaded){
+    console.warn('[TAX MASTER] master DB returned no tax rates — using built-in fallback rates');
+    if(typeof showNotif==='function') showNotif('⚠️ Tax rates not found in master DB — using built-in rates. Check TAX master sheet.','error');
+  }
+  return false;
+}
+document.addEventListener('DOMContentLoaded',function(){ setTimeout(function(){ bnxLoadTaxMaster_().catch(function(){}); },400); });
+window.bnxLoadTaxMaster_=bnxLoadTaxMaster_;
 function bnxMasterTaxMeta_(item,name){
+  const T=window.BNX_LIVE_TAX;
+  if(T&&T.loaded){
+    const x=item||{};
+    const gid=String(x.itemGroupId||x.ITEM_GROUP_ID||x.groupId||x.GROUP_ID||'').trim().toUpperCase();
+    const gnm=bnxTaxNorm_(x.itemGroupName||x.ITEM_GROUP_NAME||x.groupName||x.GROUP_NAME||'');
+    const own=String(x.taxId||x.TAX_ID||x.taxID||'').trim().toUpperCase();
+    /* ITEM GROUP is authoritative (same rule as before), then the item's own TAX_ID. */
+    const tid=(gid&&T.groupTax['ID:'+gid])||(gnm&&T.groupTax['NM:'+gnm])||(own&&T.byId[own]?own:'');
+    if(tid&&T.byId[tid]) return Object.assign({},T.byId[tid]);
+  }
+  return bnxMasterTaxMetaStatic_(item,name);
+}
+/* Built-in fallback (CL00010 IDs) — used only when the master DB has no answer. */
+function bnxMasterTaxMetaStatic_(item,name){
   const x=item||{};
   const taxId=String(x.taxId||x.TAX_ID||x.taxID||'').trim().toUpperCase();
   const groupId=String(x.itemGroupId||x.ITEM_GROUP_ID||x.groupId||x.GROUP_ID||'').trim().toUpperCase();
@@ -14799,6 +14890,13 @@ function bnxMasterTaxMeta_(item,name){
   if(taxId && BNX_MASTER_TAX_FALLBACK[taxId])
     return Object.assign({taxId},BNX_MASTER_TAX_FALLBACK[taxId]);
   return Object.assign({taxId:'TAX00001'},BNX_MASTER_TAX_FALLBACK.TAX00001);
+}
+function bnxTaxSplit_(meta,taxCfg){
+  if(meta&&meta.live) return {cgst:Number(meta.cgst)||0, sgst:Number(meta.sgst)||0, hsn:meta.hsn||''};
+  const cfg=(taxCfg||getTaxConfig())[meta&&meta.key]||TAX_CONFIG_DEFAULT.FOOD;
+  return { cgst: meta.taxId==='TAX00002'?0 : meta.taxId==='TAX00003'?20 : Number(cfg.cgst)||0,
+           sgst: meta.taxId==='TAX00002'?0 : meta.taxId==='TAX00003'?20 : Number(cfg.sgst)||0,
+           hsn: meta.hsn||cfg.hsn };
 }
 function bnxItemTaxRateFraction_(name,itemMeta){
   try{
@@ -14903,12 +15001,7 @@ function bnxPosCalc_(){
     const liveItem=bnxFindLiveBillItem_(n)||{};
     const meta=bnxMasterTaxMeta_(liveItem,n);
     const tc=meta.key||getItemTaxCat(n,catByName[n],liveItem);
-    const cfg=taxCfg[tc]||TAX_CONFIG_DEFAULT.FOOD;
-    const tr={
-      cgst: meta.taxId==='TAX00002' ? 0 : meta.taxId==='TAX00003' ? 20 : Number(cfg.cgst)||0,
-      sgst: meta.taxId==='TAX00002' ? 0 : meta.taxId==='TAX00003' ? 20 : Number(cfg.sgst)||0,
-      hsn: meta.hsn||cfg.hsn
-    };
+    const tr=bnxTaxSplit_(meta,taxCfg);   /* live master rate when loaded */
     sub+=amt; discRaw+=lineDisc; taxBase+=lineAmt;
     cgst+=lineAmt*tr.cgst/100; sgst+=lineAmt*tr.sgst/100;
     if(!taxRowsMap[tc]) taxRowsMap[tc]={hsn:tr.hsn, taxName:(tr.cgst+tr.sgst)>0?('GST @'+(tr.cgst+tr.sgst)+'%'):'Exempted', onAmt:0, taxAmt:0};
@@ -18534,12 +18627,7 @@ function bmComputeTax(items, discPct, scPct){
       const liveMeta = Object.assign({},bmItem,{taxId:i.taxId||bmItem.taxId||'',itemGroupName:i.itemGroupName||bmItem.itemGroupName||'',isBar:!!(i.isBar||bmItem.isBar)});
       const masterMeta = bnxMasterTaxMeta_(liveMeta,i.name);
       const tc = masterMeta.key || getItemTaxCat(i.name, bmItem.cat, liveMeta);
-      const configured = taxCfg[tc] || TAX_CONFIG_DEFAULT.FOOD;
-      const rate = {
-        cgst: masterMeta.taxId==='TAX00002' ? 0 : masterMeta.taxId==='TAX00003' ? 20 : configured.cgst,
-        sgst: masterMeta.taxId==='TAX00002' ? 0 : masterMeta.taxId==='TAX00003' ? 20 : configured.sgst,
-        hsn: masterMeta.hsn || configured.hsn
-      };
+      const rate = bnxTaxSplit_(masterMeta, taxCfg);   /* live master rate when loaded */
       cgst += lineAmt*rate.cgst/100; sgst += lineAmt*rate.sgst/100;
       const key = tc;
       if (!taxRowsMap[key]) taxRowsMap[key] = { hsn:rate.hsn, taxName:(rate.cgst+rate.sgst)>0?('GST @'+(rate.cgst+rate.sgst)+'%'):'Exempted', onAmt:0, taxAmt:0 };
