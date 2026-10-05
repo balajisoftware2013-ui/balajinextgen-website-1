@@ -56,7 +56,7 @@
    Printing still goes ONLY through the real relay (POST /print with
    ESC/POS) or RawBT.
    ═══════════════════════════════════════════════════════════════════ */
-window.BNX_STEWARD_BUILD='PRN-FW6-DIRECT-IP-KOT-URLFIX';
+window.BNX_STEWARD_BUILD='PRN-FW7-DIRECT-IP-KOT-FINAL';
 (function(){
   if(window.__bnxPrinterFirewall) return; window.__bnxPrinterFirewall=true;
   var PRINTER_PORTS={'9100':1,'9101':1,'9102':1,'9103':1,'515':1,'4000':0};
@@ -8541,6 +8541,8 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
   function cidNow_(){ try{ return String((typeof CLIENT_ID!=='undefined'&&CLIENT_ID) || getCurrentStaffIdentity().clientId || '').trim(); }catch(e){ return ''; } }
   function masterMap_(){ try{ return JSON.parse(localStorage.getItem('bnx_printer_master_'+cidNow_())||'{}')||{}; }catch(e){ return {}; } }
   function portFor_(role){
+    /* Native Android/iOS direct-IP bridge uses raw TCP 9100. */
+    if(window.BNXPrinter && typeof window.BNXPrinter.printRaw==='function') return 9100;
     const m=masterMap_()[role]; const p=Number(m&&m.port);
     return (p>0&&p<65536)?p:9100;
   }
@@ -8552,20 +8554,24 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
     const DEF={};
     ['BILL','KITCHEN','HUKKA','BAR'].forEach(function(r){
       const m=mm[r];
+      /* CLIENT_PRINTER_MASTER is authoritative. Local Printer Setup is only
+         a temporary fallback while the master is being loaded. */
       DEF[r]=(m&&m.ip&&m.active!==false)?m.ip:(isCL10?DEFAULT_IPS[r]:'');
     });
     const re=/\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/;
-    function pick(p,id,def){
+    function pick(p,id,def,role){
+      const master=mm[role];
+      if(master && master.ip && master.active!==false) return String(master.ip).trim();
       const live=document.getElementById(id)?.value||'';
       const m=live.match(re);
       const saved=String((p&&p.ip)||'').match(re);
       return (m?m[0]:(saved?saved[0]:String(def||''))).trim();
     }
     return {
-      BILL:pick(cfg.pr1,'pr1-name',DEF.BILL),
-      KITCHEN:pick(cfg.pr2,'pr2-name',DEF.KITCHEN),
-      HUKKA:pick(cfg.pr3,'pr3-name',DEF.HUKKA),
-      BAR:pick(cfg.pr4,'pr4-name',DEF.BAR)
+      BILL:pick(cfg.pr1,'pr1-name',DEF.BILL,'BILL'),
+      KITCHEN:pick(cfg.pr2,'pr2-name',DEF.KITCHEN,'KITCHEN'),
+      HUKKA:pick(cfg.pr3,'pr3-name',DEF.HUKKA,'HUKKA'),
+      BAR:pick(cfg.pr4,'pr4-name',DEF.BAR,'BAR')
     };
   }
   /* FINAL KOT PRINTER ROUTING
@@ -8898,6 +8904,35 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
       'IP      : '+ipSettings_()[role]+NL,'Paper   : '+({'58':'58 mm','80':'80 mm','80c':'80 mm compact'}[pr.paper])+' ('+W+' cols)'+NL,'Cutter  : '+pr.cut+NL,
       line_('-',W)+NL,'1234567890'.repeat(5).slice(0,W)+NL,line_('-',W)+NL,'If this line is complete and the',NL,'paper was cut, the printer is OK.',NL,CENTER,'PRINT OK'+NL,LEFT,NL,cutCmd_(pr.cut)].join('');
   }
+  /* ═══════════ BNX NATIVE ANDROID PRINTER BRIDGE ═══════════ */
+  const bnxNativePrintPending_ = window.__bnxNativePrintPending_ = window.__bnxNativePrintPending_ || {};
+  let bnxNativePrintSeq_ = window.__bnxNativePrintSeq_ || 0;
+  window.bnxNativePrintResult = function(id, ok, message){
+    const p=bnxNativePrintPending_[String(id)];
+    if(!p) return;
+    delete bnxNativePrintPending_[String(id)];
+    ok ? p.resolve(true) : p.reject(new Error(String(message||'Native printer failed')));
+  };
+  function bnxNativePrint_(role,ip,port,raw,job){
+    if(!window.BNXPrinter || typeof window.BNXPrinter.printRaw!=='function')
+      return Promise.reject(new Error('BNX Printer App is not connected'));
+    const id=String(++bnxNativePrintSeq_); window.__bnxNativePrintSeq_=bnxNativePrintSeq_;
+    return new Promise(function(resolve,reject){
+      bnxNativePrintPending_[id]={resolve:resolve,reject:reject};
+      try{
+        const b64=b64Raw_(raw);
+        window.BNXPrinter.printRaw(id,String(role||''),String(ip||''),String(port||9100),b64,String(job||'BNX KOT'));
+      }catch(e){
+        delete bnxNativePrintPending_[id]; reject(e);
+      }
+      setTimeout(function(){
+        const p=bnxNativePrintPending_[id];
+        if(p){ delete bnxNativePrintPending_[id]; p.reject(new Error('Printer connection timeout')); }
+      },20000);
+    });
+  }
+  window.bnxNativePrinterApp = !!(window.BNXPrinter && typeof window.BNXPrinter.printRaw==='function');
+
   async function directRaw_(role,data,jobName){
     const ip=ipSettings_()[role];
     if(!ip) throw new Error('No '+role+' printer IP set for this restaurant — Profile → Printer Setup');
@@ -8911,23 +8946,15 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
     const job=jobName||('BNX '+role+' KOT');
     const relay=relayUrl_();
     if(isMobile_()){
-      /* Phone route (a browser can never open TCP :9100 itself):
-         1) Print Relay on the Wi-Fi  2) RawBT app (Android)  3) clear message. */
-      let relayErr=null;
-      /* IMPORTANT: respect the user's explicit RawBT selection. Previously the
-         relay was always tried first whenever a relay URL was saved, even when
-         Printer Setup was set to RawBT. A misconfigured relay could therefore
-         send the encoded ESC/POS stream to the printer as printable garbage.
-         RawBT receives the original ESC/POS bytes directly on Android. */
-      /* PRN-FW4 FIX: the old line `if(isAndroid_()) return viaRawBt_()` forced EVERY Android phone
-         to RawBT and never used the Print Relay, even when Printer Setup was set to Print Relay
-         (printers showed Online because the status probe uses the relay, but KOTs went to RawBT
-         and nothing printed). Now only rawbtOn_() decides: saved choice wins; if nothing is saved,
-         Android uses RawBT only when no relay address is set. */
-      if(rawbtOn_()) return viaRawBt_(raw,job);
-      if(relay){ try{ return await viaRelay_(relay,ip,raw,job,port); }catch(e){ relayErr=e; console.warn('[STEWARD PRINT] relay failed:',e&&e.message); } }
-      throw relayErr||new Error('No print route set on this phone — open Profile → Printer Setup and select Print Relay or RawBT');
+      /* BNX NATIVE PRINTER APP: the Android host owns the TCP socket and
+         sends the already-built ESC/POS bytes directly to <printer>:9100.
+         No RawBT, QZ Tray, browser relay, HTTP, HTTPS or certificate is used. */
+      if(window.BNXPrinter && typeof window.BNXPrinter.printRaw==='function') {
+        return await bnxNativePrint_(role,ip,port,raw,job);
+      }
+      throw new Error('BNX Printer App is not connected. Install/open the Balaji NextGen Steward Printer App.');
     }
+
     try{
       await connectQz_();
       const config=qz.configs.create({host:ip,port:port},{jobName:job});
@@ -14811,9 +14838,15 @@ html:not([data-theme]) #s-home .hero .hs-lbl{font-size:10px!important;letter-spa
   function lsSet(k,v){try{localStorage.setItem(k,v);}catch(e){}}
   function cfg(){try{return JSON.parse(lsGet('bnx_printer_settings_'+cid(),'{}'))||{};}catch(e){return {};}}
   function ipOf(r){var c=cfg()[r.pr];return String((c&&c.ip)||r.def).trim();}
-  function relay(){var u=String(lsGet(K('bnx_print_relay_'),window.BNX_PRINT_RELAY_URL||'')).trim().replace(/\/+$/,'');
-    if(u&&!/^https?:\/\//i.test(u))u=(location.protocol==='https:'?'https://':'http://')+u;
-    if(u&&location.protocol==='https:'&&/^http:\/\//i.test(u))u=u.replace(/^http:/i,'https:');return u;}
+  function relay(){
+    var raw=String(lsGet(K('bnx_print_relay_'),window.BNX_PRINT_RELAY_URL||'')).trim().replace(/\/+$/,'');
+    var u=(typeof window.bnxNormalizeRelayUrl_==='function')?window.bnxNormalizeRelayUrl_(raw):raw;
+    if(raw && !u){
+      try{localStorage.removeItem(K('bnx_print_relay_'));}catch(e){}
+      return '';
+    }
+    return u;
+  }
   function rkey(){return String(lsGet(K('bnx_print_relay_key_'),'')).trim();}
   function roleOf(t){t=String(t||'').toUpperCase();
     if(/HUKKA|HOOKAH|SHEESHA|SHISHA/.test(t))return 'HUKKA';
@@ -15305,93 +15338,73 @@ button,.btn-primary,.btn-ghost{touch-action:manipulation}
 </style>
 <script id="pz-printer-ui-js">
 (function(){
+  /* DIRECT-IP AUTO SETUP — no RawBT / Relay / QZ on the native Steward app. */
   var ROLES=[
-    {k:'KITCHEN',pr:'pr2',label:'Kitchen',icon:'👨‍🍳',def:'192.168.0.192',hint:'Food · Add-ons'},
-    {k:'BAR',pr:'pr4',label:'Bar',icon:'🍹',def:'192.168.0.151',hint:'Liquor · Beverage'},
-    {k:'HUKKA',pr:'pr3',label:'Hukka',icon:'💨',def:'192.168.0.195',hint:'Hukka · Flavours · Coal · Tobacco'}
+    {k:'KITCHEN',label:'Kitchen',icon:'👨‍🍳',hint:'Food · Add-ons'},
+    {k:'BAR',label:'Bar',icon:'🍹',hint:'Liquor · Beverage'},
+    {k:'HUKKA',label:'Hukka',icon:'💨',hint:'Hukka · Flavours · Coal · Tobacco'},
+    {k:'BILL',label:'Bill',icon:'🧾',hint:'Customer invoice'}
   ];
+  var PAPERS=[['80','80 mm · 48 col'],['80c','80 mm compact · 42 col'],['58','58 mm · 32 col']];
+  var CUTS=[['partial','Auto-cut (partial)'],['full','Auto-cut (full)'],['feedcut','Cut after feed'],['none','No cutter (tear)']];
   function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
   function cid(){try{return (typeof CLIENT_ID!=='undefined'&&CLIENT_ID)||getCurrentStaffIdentity().clientId||'default';}catch(e){return 'default';}}
   function get(k,d){try{var v=localStorage.getItem(k);return v==null?d:v;}catch(e){return d;}}
   function set(k,v){try{localStorage.setItem(k,v);}catch(e){}}
-  function ipOf(r){try{ if(typeof window.bnxPrinterIps_==='function'){ var m=window.bnxPrinterIps_(); return String(m[r.k]||'').trim(); } var c=JSON.parse(get('bnx_printer_settings_'+cid(),'{}'))||{};return String((c[r.pr]&&c[r.pr].ip)||r.def).trim();}catch(e){return r.def;}}
-  function relayVal(){var u=String(get('bnx_print_relay_'+cid(),window.BNX_PRINT_RELAY_URL||'')).trim().replace(/\/+$/,'');return u;}
-  function keyVal(){return String(get('bnx_print_relay_key_'+cid(),'')).trim();}
-  function isAndroid(){return /Android/i.test(navigator.userAgent||'');}
-  function isMobile(){var ua=navigator.userAgent||'';return /Android|iPhone|iPad|iPod|Mobile|Silk/i.test(ua)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);}
-  function mode(){var v=get('bnx_rawbt_'+cid(),null);if(v==='1')return 'rawbt';if(v==='0')return 'relay';
-    return (isAndroid()&&!relayVal())?'rawbt':'relay';}
-  var PAPERS=[['80','80 mm · 48 col'],['80c','80 mm compact · 42 col'],['58','58 mm · 32 col']];
-  var CUTS=[['partial','Auto-cut (partial)'],['full','Auto-cut (full)'],['feedcut','Cut after feed'],['none','No cutter (tear)']];
-  function opt(list,cur){return list.map(function(o){return '<option value="'+o[0]+'"'+(o[0]===cur?' selected':'')+'>'+esc(o[1])+'</option>';}).join('');}
+  function native(){return !!(window.BNXPrinter&&typeof window.BNXPrinter.printRaw==='function');}
+  function ips(){try{return typeof window.bnxPrinterIps_==='function'?window.bnxPrinterIps_():{};}catch(e){return {};}}
+  function ipOf(r){var m=ips();return String(m[r.k]||'').trim();}
   function prof(role){try{return window.bnxGetPrinterProfile(role);}catch(e){return {paper:'80',cut:'partial'};}}
-
-  window.pzMode=function(m){
-    set('bnx_rawbt_'+cid(),m==='rawbt'?'1':'0');
-    var a=document.getElementById('pz-pane-relay'),b=document.getElementById('pz-pane-rawbt');
-    if(a)a.style.display=m==='relay'?'':'none'; if(b)b.style.display=m==='rawbt'?'':'none';
-    ['relay','rawbt'].forEach(function(x){var el=document.getElementById('pz-seg-'+x);if(el)el.classList.toggle('on',x===m);});
-  };
+  function opt(list,cur){return list.map(function(o){return '<option value="'+o[0]+'"'+(o[0]===cur?' selected':'')+'>'+esc(o[1])+'</option>';}).join('');}
+  function msg(h,ok){var e=document.getElementById('hsp-result');if(!e)return;e.style.color=ok===true?'#15803d':ok===false?'#b42318':'#6b5a48';e.innerHTML=h;try{e.scrollIntoView({block:'center',behavior:'smooth'});}catch(_){}try{if(typeof window.toast==='function')window.toast(String(h).replace(/<[^>]*>/g,'').slice(0,160),ok===true?'success':ok===false?'error':'info');}catch(_){} }
+  function clearOldRoutes(){
+    try{localStorage.removeItem('bnx_print_relay_'+cid());localStorage.removeItem('bnx_print_relay_key_'+cid());localStorage.removeItem('bnx_rawbt_'+cid());}catch(e){}
+  }
+  window.pzMode=function(){ clearOldRoutes(); msg('✅ Direct Wi-Fi IP printing is locked ON. No RawBT / Relay / QZ required.',true); };
   window.pzTestRaw=async function(){
-    var r=document.getElementById('hsp-result');if(r){r.style.color='';r.textContent='Sending test to RawBT…';}
-    var ok=false;
-    try{ok=await window.bnxStewardTestKOTPrinter('KITCHEN');}catch(e){}
-    if(r){r.style.color=ok?'#15803d':'#b42318';r.textContent=ok?'Test data handed to RawBT. Confirm the ticket is readable; RawBT does not provide a physical-print receipt.':'Could not hand the test to the printer. Check RawBT installation and Printer Setup.';}
+    var r=document.getElementById('hsp-result');if(r)r.textContent='Sending native direct-IP test…';
+    try{var ok=await window.bnxStewardTestKOTPrinter('KITCHEN');msg(ok?'✅ Kitchen direct-IP test sent to '+esc(ipOf({k:'KITCHEN'}))+':9100':'⚠️ Kitchen direct-IP test failed.',!!ok);}
+    catch(e){msg('⚠️ '+esc(e&&e.message||e),false);}
   };
-
+  window.hspClose=function(e){if(e&&e.target!==e.currentTarget)return;var h=document.getElementById('bnx-printer-setup-host');if(h)h.innerHTML='';};
+  window.hspAuto=function(){clearOldRoutes();try{if(typeof window.bnxPrinterIps_==='function')window.bnxPrinterIps_();}catch(e){};window.bnxOpenPrinterSetup();};
+  window.hspFind=function(){clearOldRoutes();msg('ℹ️ Printer IPs are loaded automatically from CLIENT_PRINTER_MASTER. Port is fixed at 9100.',true);};
+  window.hspTrust=function(){msg('ℹ️ Trust certificate is not required for direct TCP printing.',true);};
+  window.hspSave=function(){
+    clearOldRoutes();
+    ROLES.forEach(function(r){var pe=document.getElementById('hsp-paper-'+r.k),ce=document.getElementById('hsp-cut-'+r.k);if(pe&&ce&&window.bnxSetPrinterProfile)window.bnxSetPrinterProfile(r.k,pe.value,ce.value);});
+    msg(native()?'✅ Direct IP settings ready. Printer IPs loaded automatically; port 9100.':'⚠️ Open the BNX Steward Printer App. Native printer bridge is not detected.',native());
+  };
+  window.hspTest=async function(role){
+    var r=ROLES.filter(function(x){return x.k===role;})[0]||ROLES[0], ip=ipOf(r);
+    if(!native()){msg('⚠️ Native BNX Printer App is not connected. Open the installed Steward Printer App.',false);return;}
+    if(!ip){msg('⚠️ No '+esc(r.label)+' printer IP is available in CLIENT_PRINTER_MASTER.',false);return;}
+    msg('Sending direct test to '+esc(r.label)+' ('+esc(ip)+':9100)…');
+    try{var ok=await window.bnxStewardTestKOTPrinter(role);msg(ok?'✅ '+esc(r.label)+' printer OK — '+esc(ip)+':9100': '⚠️ '+esc(r.label)+' printer test failed.',!!ok);}catch(e){msg('⚠️ '+esc(e&&e.message||e),false);}
+  };
   window.bnxOpenPrinterSetup=function(){
     var host=document.getElementById('bnx-printer-setup-host');
     if(!host){host=document.createElement('div');host.id='bnx-printer-setup-host';document.body.appendChild(host);}
-    var m=mode();
-    var cards=ROLES.map(function(r){
-      return '<div class="pz-card">'
-        +'<div class="pz-st"><span class="pz-e">'+r.icon+'</span><div><b>'+r.label+'</b><small>'+r.hint+'</small></div><span class="hsp-dot" id="hsp-dot-'+r.k+'"></span></div>'
-        +'<div class="pz-field"><small>Printer IP address</small><input class="pz-in" id="hsp-ip-'+r.k+'" list="hsp-found" value="'+esc(ipOf(r))+'" placeholder="192.168.0.x" inputmode="decimal" autocomplete="off"></div>'
-        +'<div class="pz-row"><select class="hsp-sel" id="hsp-paper-'+r.k+'" aria-label="Paper width">'+opt(PAPERS,prof(r.k).paper)+'</select>'
-        +'<select class="hsp-sel" id="hsp-cut-'+r.k+'" aria-label="Cutter">'+opt(CUTS,prof(r.k).cut)+'</select></div>'
-        +'<div class="pz-msgline"><span id="hsp-msg-'+r.k+'">Not tested yet</span><button class="pz-btn" onclick="hspTest(\''+r.k+'\')">Test print</button></div></div>';
-    }).join('');
-
-    var mobileTip = isMobile()
-      ? '<div class="pz-note"><b>Why a relay?</b> A phone browser cannot talk to an IP printer directly. The relay is a tiny program on any always-on PC/Pi on the same Wi-Fi that forwards each KOT to the printer.</div>'
-      : '<div class="pz-note">On a PC, KOTs print through <b>QZ Tray</b>. A relay is only used as backup.</div>';
-
+    clearOldRoutes();
+    var cards=ROLES.map(function(r){var ip=ipOf(r),p=prof(r);return '<div class="pz-card">'
+      +'<div class="pz-st"><span class="pz-e">'+r.icon+'</span><div><b>'+r.label+'</b><small>'+r.hint+'</small></div><span class="hsp-dot" id="hsp-dot-'+r.k+'"></span></div>'
+      +'<div class="pz-field"><small>Printer IP · Auto loaded</small><input class="pz-in" id="hsp-ip-'+r.k+'" value="'+esc(ip)+'" readonly style="opacity:.82;background:#f5f7fa"></div>'
+      +'<div class="pz-row"><div class="pz-in" style="flex:1;padding:10px 12px">Port <b>9100</b> · Direct TCP</div>'
+      +'<select class="hsp-sel" id="hsp-paper-'+r.k+'" aria-label="Paper width">'+opt(PAPERS,p.paper)+'</select>'
+      +'<select class="hsp-sel" id="hsp-cut-'+r.k+'" aria-label="Cutter">'+opt(CUTS,p.cut)+'</select></div>'
+      +'<div class="pz-msgline"><span id="hsp-msg-'+r.k+'">'+(ip?'Ready':'No printer mapped')+'</span><button class="pz-btn" onclick="hspTest(\''+r.k+'\')">Test print</button></div></div>';}).join('');
     host.innerHTML='<div class="modal-overlay open" onclick="hspClose(event)"><div class="modal pz-sheet" onclick="event.stopPropagation()" style="max-height:92vh;overflow:auto">'
-      +'<div class="modal-handle"></div>'
-      +'<div class="pz-top"><span class="pz-ico">🖨️</span><div><h2>Printer Setup <small style="font-size:10px;font-weight:600;opacity:.6">build '+(window.BNX_STEWARD_BUILD||'old')+'</small></h2><p>KOTs split by item group and print on the right station</p></div><button class="pz-x" onclick="hspClose()" aria-label="Close">✕</button></div>'
-
-      +'<div class="pz-sec"><div class="pz-lbl">How this phone prints</div>'
-      +'<div class="pz-card">'
-      +'<div class="pz-seg"><button id="pz-seg-relay" class="'+(m==='relay'?'on':'')+'" onclick="pzMode(\'relay\')">🌐 Print Relay</button>'
-      +'<button id="pz-seg-rawbt" class="'+(m==='rawbt'?'on':'')+'" onclick="pzMode(\'rawbt\')">📲 RawBT (Android)</button></div>'
-
-      +'<div id="pz-pane-relay" style="'+(m==='relay'?'':'display:none')+'">'
-      +'<div class="pz-field"><small>Relay address</small><input class="pz-in" id="hsp-url" value="'+esc(relayVal())+'" placeholder="https://192.168.0.50:9191" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false"></div>'
-      +'<div class="pz-field"><small>Relay key (optional)</small><input class="pz-in" id="hsp-key" type="password" value="'+esc(keyVal())+'" placeholder="Leave empty if not set" autocapitalize="off"></div>'
-      +'<div class="pz-row"><button class="pz-btn pri" onclick="hspAuto()">⚡ Auto-detect</button><button class="pz-btn" onclick="hspFind()">🔍 Find printers</button></div>'
-      +'<div class="pz-row" style="margin-top:8px"><button class="pz-btn" onclick="hspTrust()">🔒 Trust relay certificate</button></div>'
-      +'<ol class="pz-steps"><li>For Android direct printing, select <b>RawBT</b> below.</li><li>Configure the printer IP and port 9100 inside RawBT.</li><li>Tap <b>Send test to RawBT</b>.</li><li>Return to the POS and print the KOT.</li></ol>'
-      +mobileTip+'</div>'
-
-      +'<div id="pz-pane-rawbt" style="'+(m==='rawbt'?'':'display:none')+'">'
-      +'<div class="pz-note" style="margin-top:0"><b>No PC needed.</b> Install the free <b>RawBT</b> app from Play Store, add your printer inside it (Network printer → printer IP, port 9100, or Bluetooth) and set it as default. Then KOTs open straight into RawBT and print.</div>'
-      +'<div class="pz-row" style="margin-top:10px"><button class="pz-btn pri" onclick="pzTestRaw()">Send test to RawBT</button>'
-      +'<button class="pz-btn" onclick="window.open(\'https://play.google.com/store/apps/details?id=ru.a402d.rawbtprinter\',\'_blank\')">Get RawBT</button></div>'
-      +'<div class="pz-note">RawBT prints on the one printer chosen inside the app. Use a Relay if Kitchen, Bar and Hukka must print on three different printers.</div>'
-      +'</div></div></div>'
-
-      +'<datalist id="hsp-found"></datalist>'
-      +'<div class="pz-sec"><div class="pz-lbl">Station printers</div>'+cards+'</div>'
-
-      +'<div id="hsp-pending" class="pz-card pz-pend"><b>⏳ <b>0</b> KOT waiting to print</b><div class="pz-row" style="margin-top:8px"><button class="pz-btn" onclick="hspRetry()">Print waiting KOTs now</button></div></div>'
+      +'<div class="modal-handle"></div><div class="pz-top"><span class="pz-ico">🖨️</span><div><h2>Printer Setup <small style="font-size:10px;font-weight:600;opacity:.6">Direct-IP Auto</small></h2><p>All station printers are loaded automatically from the client printer master.</p></div><button class="pz-x" onclick="hspClose()">✕</button></div>'
+      +'<div class="pz-sec"><div class="pz-lbl">HOW THIS PHONE PRINTS</div><div class="pz-card">'
+      +'<div style="display:flex;align-items:center;gap:12px;padding:14px;border-radius:12px;background:#eefbf3;border:1px solid #b7e4c7"><span style="font-size:28px">📱</span><div><b style="color:#137333">Direct Wi-Fi IP Printing</b><div style="font-size:12px;color:#42624d;margin-top:3px">Android app → TCP → printer IP:9100</div></div><span style="margin-left:auto;color:#16803c;font-weight:800">ON</span></div>'
+      +'<div class="pz-note" style="margin-top:10px"><b>No manual printer setup.</b> IP addresses come from <b>CLIENT_PRINTER_MASTER</b>. Port is automatically <b>9100</b>. No RawBT, Print Relay, QZ Tray or Windows PC is required.</div>'
+      +'<div class="pz-row" style="margin-top:10px"><button class="pz-btn pri" onclick="hspAuto()">↻ Refresh automatic settings</button><button class="pz-btn" onclick="hspFind()">✓ Check mapping</button></div>'
+      +'</div></div>'
+      +'<div class="pz-sec"><div class="pz-lbl">STATION PRINTERS</div>'+cards+'</div>'
       +'<div id="hsp-result" class="pz-result"></div>'
       +'<div class="pz-foot"><button class="pz-btn" onclick="hspClose()">Close</button><button class="pz-btn pri" style="flex:1.6" onclick="hspSave()">Save &amp; check</button></div>'
       +'</div></div>';
-    try{window.hsPrintersStatus&&0;}catch(e){}
-    var ev=new Event('pz-opened');document.dispatchEvent(ev);
   };
-  /* header strip + any other callers keep working */
-  document.addEventListener('pz-opened',function(){try{if(typeof window.__hspPaint==='function')window.__hspPaint();}catch(e){}});
 })();
 </script>
 
@@ -16391,7 +16404,7 @@ html body #s-tables .tcard .tc-kot{display:inline-block;font-size:8px!important;
      another, then shows ONE result line per station.
    - After "Send KOT" the result toast now also reports failures per station
      (it used to stay silent unless every station succeeded).
-   - CLIENT_PRINTER_MASTER is read from the server once a day (best effort)
+   - CLIENT_PRINTER_MASTER is read live from the server on every native-app launch
      and kept as bnx_printer_master_<client> for the IP/PORT routing. */
 (function(){
   'use strict';
@@ -16481,7 +16494,9 @@ html body #s-tables .tcard .tc-kot{display:inline-block;font-size:8px!important;
   async function syncMaster(){
     var c=cid(); if(!c||typeof gasApi!=='function') return;
     var stampKey='bnx_printer_master_at_'+c;
-    try{ if(Date.now()-Number(localStorage.getItem(stampKey)||0)<20*3600*1000 && localStorage.getItem('bnx_printer_master_'+c)) return; }catch(e){}
+    /* Native Android app: capture CLIENT_PRINTER_MASTER on every app start.
+       Never wait 20 hours for a changed printer IP/port to become live. */
+    try{ localStorage.removeItem(stampKey); }catch(e){}
     var tries=[['GET_CLIENT_PRINTERS',{}],['RD_FETCH_SHEET',{tab:'CLIENT_PRINTER_MASTER'}]];
     for(var i=0;i<tries.length;i++){
       try{
@@ -16496,7 +16511,12 @@ html body #s-tables .tcard .tc-kot{display:inline-block;font-size:8px!important;
     }
     console.info('[PRINTERS] CLIENT_PRINTER_MASTER not available from server — using Printer Setup / built-in map');
   }
-  setTimeout(function(){ try{ if(localStorage.getItem('ERP_SESSION')) syncMaster(); }catch(e){} },4000);
+  setTimeout(function(){
+    try{
+      if(localStorage.getItem('ERP_SESSION')) syncMaster();
+      else syncMaster();
+    }catch(e){}
+  },1200);
   W.bnxSyncPrinterMaster=function(){ try{ localStorage.removeItem('bnx_printer_master_at_'+cid()); }catch(e){} return syncMaster(); };
 })();
 </script>
@@ -18322,3 +18342,18 @@ html[data-color-mode="dark"] body #s-home .hx-greet .hero-greeting,html[data-col
 </script>
 </body>
 </html>
+
+<script>
+/* BNX NATIVE PRINTER APP UI — no RawBT / QZ / Relay on the installed app. */
+(function(){
+  function nativeMode(){return !!(window.BNXPrinter&&typeof window.BNXPrinter.printRaw==='function');}
+  function paint(){
+    if(!nativeMode()) return;
+    var st=document.createElement('style');
+    st.id='bnx-native-printer-ui';
+    st.textContent='.pz-seg,#pz-pane-relay,#pz-pane-rawbt{display:none!important}.bnx-native-note{display:block!important}';
+    document.head.appendChild(st);
+  }
+  window.addEventListener('load',paint); setTimeout(paint,500); setTimeout(paint,2000);
+})();
+</script>
