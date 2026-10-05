@@ -758,7 +758,10 @@ async function boot(){
   /* Menu loads in the background (enterMenu waits for it); only the small restaurant-info call
      is awaited here, capped at 4 s, so the guest always sees the Welcome screen quickly. */
   bnxPrimeFromCache();
-  window.__menuReady = Promise.all([ loadMenuFromServer().catch(()=>{}), loadActiveMenuCard().catch(()=>{}) ]).then(()=>{
+  setTimeout(()=>{ if (MENU_LOADING && !MENU.length) bnxToast('Menu is taking longer than usual \u2014 please wait a moment\u2026'); }, 8000);
+  /* the PDF menu-card lookup runs on its own: it must never hold back the dish list */
+  loadActiveMenuCard().catch(()=>{});
+  window.__menuReady = loadMenuFromServer().catch(()=>{}).then(()=>{
     MENU_LOADING=false;
     try{ if(document.getElementById('s-menu').classList.contains('active')){ applyOrderMode(); renderStations(); renderCats(); renderMenu(); } }catch(e){}
   });
@@ -940,7 +943,8 @@ function bnxMenuBanner(text, retry){
 }
 async function bnxRetryMenu(){
   const b=document.getElementById('bnx-menu-banner'); if(b) b.textContent='Loading menu\u2026';
-  window.__menuReady = Promise.all([ loadMenuFromServer().catch(()=>{}), loadActiveMenuCard().catch(()=>{}) ]);
+  loadActiveMenuCard().catch(()=>{});
+  window.__menuReady = loadMenuFromServer().catch(()=>{});
   await window.__menuReady;
   try{ renderStations(); renderCats(); renderMenu(); }catch(e){}
 }
@@ -1015,26 +1019,32 @@ async function loadMenuFromServer(){
     if (d && typeof d==='object') return {food: arr(d.food||d.FOOD||d.items||d.menu||d.menuItems||d.MENU), bar: arr(d.bar||d.BAR||d.barItems||d.barMenu)};
     return null;
   };
-  for (let attempt=0; attempt<3 && !gotAny; attempt++){
-    if (attempt) await new Promise(r=>setTimeout(r, attempt===1?1500:3500));   /* slow / cold server: try again */
-    try{
-      const pos = pick(await gasApi('GET_POS_MENU', {}, 'V2_CORE'));
-      if (pos){ food = pos.food; bar = pos.bar; gotAny = food.length>0 || bar.length>0; }
-    }catch(e){ lastErr = e.message||''; }
-    if (!gotAny){
-      const [foodRes, barRes] = await Promise.all([
-        gasApi('GET_MENU_ITEMS', {}, 'V2_CORE').catch(()=>null),
-        gasApi('GET_BAR_MENU', {}, 'V2_CORE').catch(()=>null),
-      ]);
-      const f = pick(foodRes), br = pick(barRes);
-      if (f) food = f.food.concat(f.bar); if (br) bar = br.food.concat(br.bar);
-      gotAny = food.length>0 || bar.length>0;
+  /* The no-session public route starts at once, in parallel with the normal (session) calls: whichever
+     returns a menu first wins, so a slow or refusing Apps Script no longer leaves the skeleton on screen. */
+  const pubP = bnxPublicFetch();
+  const sessionTry = (async()=>{
+    let f=[], b=[], ok=false;
+    for (let attempt=0; attempt<2 && !ok; attempt++){
+      if (attempt) await new Promise(r=>setTimeout(r, 1500));
+      try{
+        const pos = pick(await gasApi('GET_POS_MENU', {}, 'V2_CORE'));
+        if (pos){ f = pos.food; b = pos.bar; ok = f.length>0 || b.length>0; }
+      }catch(e){ lastErr = e.message||''; }
+      if (!ok){
+        const [foodRes, barRes] = await Promise.all([
+          gasApi('GET_MENU_ITEMS', {}, 'V2_CORE').catch(()=>null),
+          gasApi('GET_BAR_MENU', {}, 'V2_CORE').catch(()=>null),
+        ]);
+        const a = pick(foodRes), c = pick(barRes);
+        if (a) f = a.food.concat(a.bar); if (c) b = c.food.concat(c.bar);
+        ok = f.length>0 || b.length>0;
+      }
     }
-  }
-  if (!gotAny){
-    const pub = await bnxPublicFetch();
-    if (pub){ food = Array.isArray(pub.food)?pub.food:[]; bar = Array.isArray(pub.bar)?pub.bar:[]; gotAny = food.length>0 || bar.length>0; if (gotAny) lastErr=''; }
-  }
+    return ok ? {food:f, bar:b} : null;
+  })();
+  const pubOk = pubP.then(p=> (p && ((Array.isArray(p.food)&&p.food.length) || (Array.isArray(p.bar)&&p.bar.length))) ? {food:p.food||[], bar:p.bar||[]} : null).catch(()=>null);
+  const got = await new Promise(res=>{ let n=2; const fin=v=>{ if (v) res(v); else if (--n===0) res(null); }; sessionTry.then(fin, ()=>fin(null)); pubOk.then(fin, ()=>fin(null)); });
+  if (got){ food = got.food; bar = got.bar; gotAny = true; lastErr = ''; }
   if (gotAny){ try{ localStorage.setItem('bnx_menu_'+STATE.clientId, JSON.stringify({t:Date.now(),food:food,bar:bar})); }catch(e){} }
   else { try{ const c=JSON.parse(localStorage.getItem('bnx_menu_'+STATE.clientId)||'null'); if(c && (c.food||[]).concat(c.bar||[]).length){ food=c.food||[]; bar=c.bar||[]; gotAny=true; fromCache=true; } }catch(e){} }
   if (gotAny){
@@ -1064,7 +1074,7 @@ async function loadMenuFromServer(){
     // visibly and block the actual "Place order" button (see its
     // click handler) rather than silently letting a real order go
     // through against fake items.
-    bnxMenuBanner('\u26a0\ufe0f Menu could not load'+(lastErr && !/session/i.test(lastErr)?' ('+String(lastErr).slice(0,60)+')':'')+' \u2014 please tap Retry or ask staff.', true);
+    bnxMenuBanner('\u26a0\ufe0f Menu could not load'+(lastErr?' ('+String(lastErr).slice(0,70)+')':'')+' \u2014 please tap Retry or ask staff.', true);
     if (/session/i.test(lastErr)) console.warn('[QR] Backend rejected the guest call ("'+lastErr+'"). Install guest-qr-backend-patch.gs so CUSTOMER_QR guest calls are accepted.');
   }
 }
