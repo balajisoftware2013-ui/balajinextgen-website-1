@@ -446,7 +446,10 @@ async function gasApiRaw_(action,payload,endpoint){
       /* BNX FIX 2026-10-05: with a single stored session there was no second try, so one slow/aborted
          call returned success:false and the month fell back to payments-only (Gross/Net = 0).
          Read calls now get ONE automatic retry on the same session before giving up. */
-      if(!_bnxRetried && /^GET_/.test(String(action))){
+      /* BNX FIX 2026-10-05b: a heavy report that hit our 120 s timeout is STILL running on Apps Script;
+         re-sending it queues a second copy behind the first and slows everything further. Only retry
+         quick reads / real network drops, never a timed-out heavy report (callers split it instead). */
+      if(!_bnxRetried && /^GET_/.test(String(action)) && !(_heavy && e && e.name==='AbortError')){
         _bnxRetried=true; await new Promise(r=>setTimeout(r,2000)); i--; continue;
       }
       if(i===contexts.length-1){
@@ -670,6 +673,21 @@ function bnxRmRows_(r){
   }
   return [];
 }
+/* Item-sales for a long span in 7-day pieces, 2 at a time: one month-wide call timed out (AbortError at 120 s)
+   on this client's slow Apps Script, which threw away the whole item split. A failed piece now only
+   affects its own days (reported in .bad, not cached, retried next time). */
+function bnxRmAddDays_(ds,n){ var d=new Date(ds+'T00:00:00Z'); d.setUTCDate(d.getUTCDate()+n); return d.toISOString().slice(0,10); }
+async function bnxRmCallSplit_(action,from,to){
+  var parts=[], a=from;
+  while(a<=to){ var b=bnxRmAddDays_(a,6); if(b>to) b=to; parts.push([a,b]); a=bnxRmAddDays_(b,1); }
+  var rows=[], bad={}, anyOk=false;
+  await bnxRmPool_(parts,2,async function(pr){
+    var r=await bnxRmCall_(action,pr[0],pr[1]);
+    if(r.ok){ anyOk=true; rows=rows.concat(r.rows); }
+    else { for(var d=pr[0]; d<=pr[1]; d=bnxRmAddDays_(d,1)) bad[d]=true; }
+  });
+  return {ok:anyOk,rows:rows,bad:bad};
+}
 async function bnxRmCall_(action,from,to){
   var t0=Date.now(), r;
   try{ r=await gasApi(action,{range:'custom',from:from,to:to},'V2_CORE'); }
@@ -883,19 +901,19 @@ async function bnxReportMap_(from,to){
       var need=short.filter(function(x){ return BNX_RM_.cItem[x.ds]===undefined; });
       if(need.length){
         var lo=need[0].ds, hi=need[need.length-1].ds;
-        var probe=await bnxRmCall_('GET_ITEM_SALES_REPORT',lo,hi);
+        var probe=await bnxRmCallSplit_('GET_ITEM_SALES_REPORT',lo,hi); var pbad=probe.bad||{};
         if(probe.ok){
           var hasDate=probe.rows.length&&bnxRmGet_(probe.rows[0],['SALE_DATE','BILL_DATE','BUSINESS_DATE','DATE']);
           if(hasDate){
             var byD={}; probe.rows.forEach(function(r){ var d=bnxRmDate_(bnxRmGet_(r,['SALE_DATE','BILL_DATE','BUSINESS_DATE','DATE'])); if(d)(byD[d]=byD[d]||[]).push(r); });
-            need.forEach(function(x){ BNX_RM_.cItem[x.ds]=(byD[x.ds]||[]); });
+            need.forEach(function(x){ if(pbad[x.ds]) return; BNX_RM_.cItem[x.ds]=(byD[x.ds]||[]); });
           }else if(probe.rows.length){
             await bnxRmPool_(need.slice(-60),4,async function(x){
               var rs=await bnxRmCall_('GET_ITEM_SALES_REPORT',x.ds,x.ds);
               if(rs.ok) BNX_RM_.cItem[x.ds]=rs.rows;
             });
           }else{
-            need.forEach(function(x){ if(x.ds<todayS) BNX_RM_.cItem[x.ds]=[]; });   // nothing sold in item DB for this span
+            need.forEach(function(x){ if(x.ds<todayS && !pbad[x.ds]) BNX_RM_.cItem[x.ds]=[]; });   // nothing sold in item DB for this span
           }
         }
       }
