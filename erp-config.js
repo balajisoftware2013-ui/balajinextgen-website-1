@@ -14,12 +14,7 @@
 const ERP_REGISTRY_SHEET_ID   = '1FuNJ_XejE2ekYTnk71wXVZ79hRJgu7pmIA6fuE-Iu7I';
 const ERP_REGISTRY_SHEET_NAME = 'TEMPLATE_REGISTRY';
 
-/* ── SINGLE SOURCE OF TRUTH FOR THE BACKEND URL ──────────────────
-   Old deployment (AKfycbxYC6…) returns HTTP 404 — it was deleted/archived.
-   If this URL ever 404s again: Apps Script → Deploy → Manage deployments
-   → copy the active Web app URL → paste it HERE (only here).          */
-const ERP_ACTIVE_API   = 'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec';
-const ERP_FALLBACK_API = ERP_ACTIVE_API;
+const ERP_FALLBACK_API = 'https://script.google.com/macros/s/AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx/exec';
 
 const ERP_KEYS = {
   USER:    'ERP_USER',
@@ -544,9 +539,7 @@ let _ERP_API_URL = ERP_FALLBACK_API;
    loads first — makes inventory.html's existing fallback chain resolve
    it automatically, with no per-page hardcoding needed. Same deployment
    purchase-module.html already uses successfully (PURCHASE_GAS_URL). */
-window.INV_GAS_CORE = ERP_ACTIVE_API;
-window.ERP_API_URL  = ERP_ACTIVE_API;
-window.BNX_API_URL  = ERP_ACTIVE_API;
+window.INV_GAS_CORE = 'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec';
 
 const IS_LOCAL_FILE = (typeof location !== 'undefined' && location.protocol === 'file:');
 if (IS_LOCAL_FILE) { console.log('[ERP] Local file mode - GAS calls disabled'); }
