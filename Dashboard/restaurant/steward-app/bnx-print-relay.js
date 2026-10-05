@@ -64,7 +64,9 @@ const PRINTER_PREFIXES = (function () {
 })();
 
 const ALLOWED_ORIGINS = new Set(['https://balajinextgen.in', 'https://www.balajinextgen.in']);
-let ALLOW_ANY_ORIGIN = false;
+/* v3.2: accept the app from ANY web address (Apps Script, custom domain, PWA...). Printing is still protected by the secret key.
+   Set BNX_ALLOWED_ORIGINS=https://yoursite to restrict it again. */
+let ALLOW_ANY_ORIGIN = !String(process.env.BNX_ALLOWED_ORIGINS || '').trim();
 String(process.env.BNX_ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean)
   .forEach(o => { if (o === '*') ALLOW_ANY_ORIGIN = true; else ALLOWED_ORIGINS.add(o.replace(/\/+$/, '')); });
 
