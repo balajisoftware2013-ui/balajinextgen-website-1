@@ -675,6 +675,12 @@ async function erpAuthApi(payload)     { return erpApiRequest(payload, 'V2_AUTH'
   var WARN_MS      = 60 * 1000;         /* show warning 60 sec before logout */
   var CHECK_MS     = 10 * 1000;         /* check every 10 seconds           */
   var STORAGE_KEY  = 'erp_last_active'; /* shared across tabs               */
+  /* Snapshot taken the moment erp-config.js loads (in <head>), BEFORE the page's own
+     scripts stamp erp_last_active — the browser-close check needs the value from before
+     this page existed. */
+  var _BOOT_SEEN = (function(){ function n(k){ try { return parseInt(localStorage.getItem(k) || '0', 10) || 0; } catch (e) { return 0; } }
+    return Math.max(n('erp_last_active'), n('erp_page_alive')); })();
+  var _BOOT_TAB_ALIVE = (function(){ try { return sessionStorage.getItem('erp_tab_alive') === '1'; } catch (e) { return true; } })();
 
   var _warnShown   = false;
   var _warnEl      = null;
@@ -813,56 +819,55 @@ async function erpAuthApi(payload)     { return erpApiRequest(payload, 'V2_AUTH'
       document.addEventListener(ev, _touch, { passive: true, capture: true });
     });
 
-    /* ── Browser close/tab close → clear session ── */
-    window.addEventListener('pagehide', function(e) {
-      /* FIX ("clicking Reports Hub / Master Hub / Import Hub / Bar
-         Module silently logs the user out"): restaurant-dashboard.html
-         sets window._erpNavigating = true immediately before every one
-         of its in-app location.href navigations (openReportTile, Master
-         Hub, Import Hub, Bar Module, Daily Sales/DSR links — 9 call
-         sites, all doing the same thing) specifically so this handler
-         could tell "leaving to another page of this same app" apart
-         from "actually closing the tab/browser". This handler never
-         checked that flag -- !e.persisted alone can't tell those two
-         cases apart (pagehide fires for ordinary same-site navigation
-         too), so EVERY one of those navigations was already clearing
-         the session and sending a real LOGOUT beacon to the server
-         before the destination page even loaded. The person arrived at
-         Reports/Master Hub/Import Hub/Bar Module already logged out. */
-      if (!e.persisted && !window._erpNavigating) {
-        /* Not going into bfcache and not an in-app navigation — actual
-           close or navigation to somewhere outside this app. */
-        /* FIX ("_clearStorage is not defined" — thrown from here on
-           every navigation away from the page): this idle-timeout block
-           is its own IIFE, separate from the ERP object defined above —
-           there is no local _clearStorage() in this scope, only
-           ERP._clearStorage(). _doLogout() a few lines up already calls
-           it correctly guarded (`typeof ERP !== 'undefined' &&
-           ERP._clearStorage`); this bare call never had that. */
-        if (typeof ERP !== 'undefined' && ERP._clearStorage) ERP._clearStorage();
-        const token = localStorage.getItem(ERP_KEYS.SESSION) || '';
-        if (token) {
-          try {
-            navigator.sendBeacon(_ERP_API_URL, new Blob(
-              [JSON.stringify({ action: 'LOGOUT', token, reason: 'browser_close' })],
-              { type: 'text/plain' }
-            ));
-          } catch(ex) {}
-        }
-      }
-      /* Reset the flag either way so it doesn't leak into a genuine
-         close/navigation that happens to follow an in-app one without
-         a fresh click (e.g. the destination page itself unloading). */
-      window._erpNavigating = false;
-    });
+    /* ── Browser close → end the session (ROOT-CAUSE REWRITE 2026-10-05) ──
+       The old rule cleared the whole login on EVERY pagehide/beforeunload unless the
+       page that was being left had set window._erpNavigating=true first. pagehide
+       cannot tell "closing the browser" from "going to another page", so ANY move
+       without that flag logged the user out: the Menu Card link, a browser Back,
+       an F5 refresh, an <a href> in any page, typing a URL — the user always arrived
+       on the next page with no session and saw the login screen. (It also read the
+       token AFTER clearing it, so the LOGOUT beacon was never actually sent.)
 
-    /* Fallback for browsers that don't support pagehide well */
-    window.addEventListener('beforeunload', function() {
-      /* Same _erpNavigating check and same undefined-function fix as
-         the pagehide handler just above. */
-      if (window._erpNavigating) return;
-      if (typeof ERP !== 'undefined' && ERP._clearStorage) ERP._clearStorage();
-    });
+       New rule, based on facts that are reliable in every browser:
+         • sessionStorage survives refresh and page-to-page navigation in the same tab,
+           and is gone when the browser/tab is closed;
+         • every open ERP page stamps erp_last_active (on activity and every 60 s).
+       On page load, if this tab has no 'erp_tab_alive' marker AND no ERP page has been
+       alive for 2 minutes, the browser was closed → the session is ended (server LOGOUT
+       beacon with the real token, then storage cleared). Moving between pages,
+       refreshing, Back/Forward and new tabs while the ERP is open never log out.
+       _erpNavigating is still accepted but no longer required. */
+    var CLOSE_GRACE_MS = 2 * 60 * 1000;
+    function _num(k){ try { return parseInt(localStorage.getItem(k) || '0', 10) || 0; } catch (e) { return 0; } }
+    (function _closeCheck() {
+      var tok = '';
+      try { tok = localStorage.getItem(ERP_KEYS.SESSION) || ''; } catch (e) {}
+      if (!tok) return;                                    /* not logged in — nothing to end */
+      var alive = _BOOT_TAB_ALIVE;
+      /* a login made since the last ERP page was open is always fresh (works whatever
+         way login.html stores the session) */
+      var knownTok = '';
+      try { knownTok = localStorage.getItem('erp_alive_token') || ''; } catch (e) {}
+      if (tok !== knownTok) alive = true;
+      var lastSeen = _BOOT_SEEN;
+      if (!alive && lastSeen && (Date.now() - lastSeen) > CLOSE_GRACE_MS) {
+        try {
+          navigator.sendBeacon(_ERP_API_URL, new Blob(
+            [JSON.stringify({ action: 'LOGOUT', sessionToken: tok, token: tok, reason: 'browser_closed' })],
+            { type: 'text/plain' }));
+        } catch (ex) {}
+        if (typeof ERP !== 'undefined' && ERP._clearStorage) ERP._clearStorage();
+        try { localStorage.removeItem('erp_alive_token'); } catch (e) {}
+        _safeNavigate(_erpLoginPage());
+        return;
+      }
+      try { sessionStorage.setItem('erp_tab_alive', '1'); localStorage.setItem('erp_alive_token', tok); } catch (e) {}
+    })();
+    /* "an ERP page is open" heartbeat (also for KOT/kitchen screens nobody touches);
+       used only by the browser-close check above, never by the 15-min idle logout. */
+    function _pageAlive(){ try { localStorage.setItem('erp_page_alive', Date.now().toString()); } catch (e) {} }
+    _pageAlive(); setInterval(_pageAlive, 60000);
+    window.addEventListener('pagehide', function () { _pageAlive(); window._erpNavigating = false; });
 
     /* also reset on API calls (user is clearly active) */
     var _origErp = window.erpApiRequest;
