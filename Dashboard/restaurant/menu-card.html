@@ -938,7 +938,12 @@ const MC_CLIENT_ID = (function(){
   try{ if(typeof ERP!=='undefined'){ const c = (typeof ERP.getClientId==='function'&&ERP.getClientId()) || (typeof ERP.getClient==='function'&&ERP.getClient()); const v = c && typeof c==='object' ? (c.CLIENT_ID||c.clientId||c.client_id) : c; if(v) return String(v); } }catch(e){}
   return mcClientId();
 })();
-const MC_API_URL = 'https://script.google.com/macros/s/' + (localStorage.getItem('bnx_api_core') || 'AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ') + '/exec';
+/* FIX: a stale localStorage 'bnx_api_core' (old/deleted deployment) used to override the real URL -> 404 -> card list never restored.
+   Now: shared URL from erp-config.js first, then the known-good deployment. */
+const MC_API_URL = (typeof ERP_ACTIVE_API!=='undefined' && ERP_ACTIVE_API) ||
+                   (window.ERP_API_URL) ||
+                   'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec';
+try{ localStorage.removeItem('bnx_api_core'); }catch(e){}
 /* same token lookup order as the dashboard (bnxCurrentSession_) — the page only
    read localStorage.ERP_SESSION, so a login stored elsewhere sent an empty token */
 function mcSessionToken(){
@@ -963,6 +968,51 @@ async function gasApi(action, payload, timeoutMs){
     return { success:false, message: e && e.name==='AbortError' ? 'server took too long (timed out)' : (e && e.message || 'network error') };
   }finally{ clearTimeout(tm); }
 }
+
+/* Restore designed menu cards saved on the server so they survive a new browser / cleared storage / other device. */
+function mcDriveUrl(c){
+  if (c.fileUrl) return c.fileUrl;
+  if (c.url) return c.url;
+  if (c.link) return c.link;
+  const id = c.fileId || c.driveId || c.FILE_ID;
+  return id ? 'https://drive.google.com/file/d/'+id+'/view' : '';
+}
+async function mcRestoreFromServer(){
+  const note = document.getElementById('vbNote');
+  try{
+    let r = await gasApi('GET_MENU_CARDS', {}, 45000);
+    console.log('[MenuCard] GET_MENU_CARDS ->', r);
+    if(!(r && r.success)){
+      /* fall back to the single active card the customer page uses */
+      const a = await gasApi('GET_ACTIVE_MENU_CARD', {}, 30000);
+      console.log('[MenuCard] GET_ACTIVE_MENU_CARD ->', a);
+      if (a && a.success && a.data && (a.data.fileUrl || a.data.fileId)) r = { success:true, data:[ Object.assign({active:true}, a.data) ] };
+    }
+    if(!(r && r.success)){
+      const msg = (r && r.message) ? r.message : 'no reply';
+      if(note) note.textContent = '⚠️ Could not load saved menu cards from server: '+msg;
+      toast('⚠️ Saved menu cards could not be loaded: '+msg, 'error');
+      return;
+    }
+    const arr = Array.isArray(r.data) ? r.data : (r.data && (r.data.cards||r.data.items||r.data.rows)) || r.cards || [];
+    if(!arr.length) return;
+    const list = loadUploads(); let changed = false;
+    arr.forEach(c=>{
+      const id  = c.cardId || c.CARD_ID || c.id;
+      const url = mcDriveUrl(c);
+      const have = list.find(u=>u.id===id || (url && u.fileUrl===url));
+      const isActive = (c.active===true || String(c.active||c.ACTIVE||'').toUpperCase()==='TRUE' || c.active===1);
+      if(!have){
+        list.push({ id:id||('MC'+Date.now()+Math.random().toString(36).slice(2,6)), name:c.name||c.NAME||'Menu Card', fileName:c.fileName||'Google Drive file', mime:'link', fileUrl:url, cardType:c.cardType||'FOOD', uploadedAt:c.uploadedAt||c.createdAt||new Date().toISOString(), active:isActive, synced:true });
+        changed = true;
+      } else if (isActive && !have.active){ have.active = true; changed = true; }
+    });
+    if(changed){ saveUploads(list); renderUploadView(); }
+  }catch(e){
+    console.error('[MenuCard] restore failed', e);
+    if(note) note.textContent = '⚠️ Could not load saved menu cards: '+(e&&e.message||e);
+  }
+}
 window.addEventListener('DOMContentLoaded', async () => {
   if (typeof ERP === 'undefined') { console.error('ERP config not loaded — check erp-config.js path/deployment'); loadLiveMenu(); return; }
   /* FIX ("click Menu Card but the login page shows"): ERP.requireLogin() bounces to the login page
@@ -979,15 +1029,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   if (!user) return;
   loadLiveMenu();   /* start the menu now — branding below must never delay it */
   /* restore Drive-link cards saved on the server (GET_MENU_CARDS) so the list survives a new browser / cleared storage */
-  gasApi('GET_MENU_CARDS', {}, 30000).then(r=>{
-    if(!(r && r.success && Array.isArray(r.data) && r.data.length)) return;
-    const list = loadUploads(); let changed = false;
-    r.data.forEach(c=>{
-      const have = list.find(u=>u.id===c.cardId || (u.fileUrl && u.fileUrl===c.fileUrl));
-      if(!have){ list.push({ id:c.cardId, name:c.name, fileName:'Google Drive link', mime:'link', fileUrl:c.fileUrl, cardType:'FOOD', uploadedAt:new Date().toISOString(), active:!!c.active, synced:true }); changed = true; }
-    });
-    if(changed){ saveUploads(list); renderUploadView(); }
-  }).catch(()=>{});
+  mcRestoreFromServer();
   // Same GET_CLIENT_INFO action every other staff-facing page already
   // uses for its own name/logo — real data, not invented per-client copy.
   try {
