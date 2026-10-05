@@ -625,11 +625,24 @@ function bnxForceReauth(message){
     window.location.href = window.bnxRootPath ? window.bnxRootPath('login.html') : '../login.html';
   }, 900);
 }
+/* ROOT CAUSE ("dashboard: ~30 min after login, nothing responds" — 2026-10-05):
+   Apps Script cannot send HTTP status codes, so an expired session comes back as
+   HTTP 200 + {success:false, error:'Invalid or expired session'} with NO statusCode.
+   This check only looked at statusCode 401/403, so once the server-side session
+   lapsed every call (KOT, bills, save, reports) failed silently forever — the
+   outbox tooltip even showed "Invalid or expired session". The error TEXT is now
+   recognised too; one confirming probe avoids a false alarm, then a clear
+   "Session expired · Log in again" prompt appears (unsynced bills stay in the outbox). */
+const BNX_AUTH_TEXT_RE = /invalid or expired session|session (has )?expired|expired session|session not found|invalid session|not authenticated|login required|unauthori[sz]ed/i;
+function bnxIsAuthText_(data){
+  try{ return !!(data && data.success === false && BNX_AUTH_TEXT_RE.test(String(data.error||data.message||''))); }catch(e){ return false; }
+}
 function bnxCheckAuthFailure_(data){
   if (data && data.success === false && (data.statusCode === 401 || data.statusCode === 403)) {
     bnxForceReauth(data.statusCode === 401 ? 'Your session has expired — please log in again.' : 'This session is not authorized for this client — please log in again.');
     return true;
   }
+  if (bnxIsAuthText_(data)) { try{ if (typeof window.bnxSessionSuspect_ === 'function') window.bnxSessionSuspect_(String(data.error||data.message||'')); }catch(e){} return true; }
   return false;
 }
 
@@ -48420,6 +48433,29 @@ html body #page-customer-credit.page table [class*="pill"]{font-size:9.5px!impor
   }
   function saveImg(blob,name){ var u=URL.createObjectURL(blob), l=document.createElement('a'); l.href=u; l.download=name; document.body.appendChild(l); l.click(); l.remove(); setTimeout(function(){ URL.revokeObjectURL(u); },4000); }
   function saveFile(blob,name){ var u=URL.createObjectURL(blob), l=document.createElement('a'); l.href=u; l.download=name; document.body.appendChild(l); l.click(); l.remove(); setTimeout(function(){ URL.revokeObjectURL(u); },8000); }
+  /* DIRECT WHATSAPP PDF 2026-10-05 — "customer due PDF shows, but send direct to WhatsApp also".
+     A browser cannot attach a file into a WhatsApp chat by itself, so the PDF is uploaded once
+     (UPLOAD_SHARE_PDF → client Drive folder, view-only link) while the preview is on screen, and
+     Send opens THIS customer's chat with the statement text + the PDF link — one tap, no
+     dragging files. If the server action is missing/fails, the old share-sheet / download path runs. */
+  function b64Of(blob){ return new Promise(function(res,rej){ var r=new FileReader(); r.onload=function(){ res(String(r.result||'').split(',')[1]||''); }; r.onerror=function(){ rej(r.error); }; r.readAsDataURL(blob); }); }
+  function startUpload(P){
+    if(!P||!P.pdf) return null;
+    if(P.up) return P.up;
+    P.up=b64Of(P.pdf).then(function(b64){
+      return timed(api('UPLOAD_SHARE_PDF',{fileName:P.pdfName,mimeType:'application/pdf',fileBase64:b64,docType:'DUE_STATEMENT',customer:P.cust,amount:P.total}),90000);
+    }).then(function(r){
+      var d=(r&&r.data)||{}, url=d.url||d.fileUrl||d.link||(r&&(r.url||r.fileUrl))||'';
+      if(r&&r.success!==false&&/^https:\/\//.test(url)){ P.link=url; return url; }
+      P.upErr=(r&&r.error)||'upload failed'; return '';
+    }).catch(function(e){ P.upErr=String(e&&e.message||e); return ''; });
+    return P.up;
+  }
+  function sendLink(P){
+    openChat(P.phone, P.msg+'\n\n\uD83D\uDCC4 *Statement PDF:* '+P.link);
+    note('\u2705 '+P.cust+'\u2019s WhatsApp chat opened with the PDF link \u2014 press Send','success');
+    return 'link';
+  }
   /* must be called inside the click (user gesture) */
   function deliver(P){
     var files=[];
@@ -48459,6 +48495,7 @@ html body #page-customer-credit.page table [class*="pill"]{font-size:9.5px!impor
         : '<div style="font-weight:800;font-size:15px;margin-bottom:2px">Outstanding statement (PDF) + UPI QR</div>'
           +'<div style="font-size:12px;color:#777;margin-bottom:10px">'+esc(P.cust)+' \u00B7 '+rs(P.total)+(P.phone?' \u00B7 +'+esc(P.phone):'')+(P.pdf?' \u00B7 PDF \u00B7 '+P.billCount+' bills':'')+'</div>'
           +(url?'<img src="'+url+'" alt="Statement" style="width:100%;border:1px solid #eee;border-radius:10px;margin-bottom:12px;max-height:46vh;object-fit:contain">':'')
+          +(P.pdf?'<div data-up style="font-size:11px;color:#666;text-align:center;margin:-4px 0 8px"></div>':'')
           +'<button data-a="send" style="'+btn+'background:#25D366;color:#fff;border:0">'+(P.pdf?'Send PDF on WhatsApp':'Send on WhatsApp')+'</button>'+(P.pdf?'<button data-a="pdf" style="'+btn+'background:#fff;color:#111;border:1px solid #ccc">Download PDF</button>':'')
           +(url?'<button data-a="dl" style="'+btn+'background:#fff;color:#111;border:1px solid #ccc">Save image</button>':''))
       +'<button data-a="x" style="'+btn+'background:#f3f3f3;color:#111;border:0;margin-bottom:0">Close</button></div>';
@@ -48470,8 +48507,25 @@ html body #page-customer-credit.page table [class*="pill"]{font-size:9.5px!impor
       if(a==='x') close();
       else if(a==='dl') saveImg(P.blob,P.fileName);
       else if(a==='pdf') saveFile(P.pdf,P.pdfName);
-      else if(a==='send'){ deliver(P).then(function(r){ if(r!=='aborted') close(); }); }
+      else if(a==='send'){
+        if(P.link){ sendLink(P); close(); return; }
+        if(P.up){
+          var b=ov.querySelector('[data-a="send"]'); if(b){ b.disabled=true; b.textContent='\u27F3 Uploading PDF\u2026'; }
+          P.up.then(function(url){
+            if(url){ sendLink(P); close(); }
+            else { note('PDF link not available ('+(P.upErr||'server')+') \u2014 using share / download','info'); deliver(P).then(function(r){ if(r!=='aborted') close(); }); }
+          });
+          return;
+        }
+        deliver(P).then(function(r){ if(r!=='aborted') close(); });
+      }
     });
+    if(P&&P.pdf&&state!=='wait'){
+      var st=ov.querySelector('[data-up]');
+      var up=startUpload(P);
+      if(up&&st){ st.textContent=P.link?'\u2705 PDF link ready':'\u27F3 Preparing PDF link for WhatsApp\u2026';
+        up.then(function(url){ if(!document.body.contains(ov)) return; st.textContent=url?'\u2705 PDF link ready \u2014 Send opens the chat with the PDF':'\u26A0\uFE0F PDF link not available \u2014 Send will use share / download'; }); }
+    }
     return ov;
   }
   function prepare(c,ph,bills,fresh){
@@ -48522,7 +48576,8 @@ html body #page-customer-credit.page table [class*="pill"]{font-size:9.5px!impor
       var cb=cachedFor(id,c.customer);
       var cbSum=cb&&cb.length?sumDue(cb):0, gap=r2(c.outstanding)-cbSum;
       if(cb&&cb.length&&(Math.abs(gap)<1||(gap>0&&Math.abs(gap-r2(c.openingRemaining||0))<1))){
-        deliver(prepare(c,ph,cb,false));
+        var P0=prepare(c,ph,cb,false);
+        if(P0.pdf) sheet(P0,'ready'); else deliver(P0);
         prefetchAll();
         return;
       }
@@ -49058,6 +49113,94 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
   })();
   /* A client switch must never show another client's cached report. */
   try{ var lastC=cid(); setInterval(function(){ var c=cid(); if(c!==lastC){ lastC=c; MEM.clear(); } },5000); }catch(e){}
+})();
+</script>
+
+<script id="bnx-session-watchdog-20261005">
+/* ═══ SESSION + WAKE WATCHDOG (2026-10-05) — "login ke 30 min baad response nahi" ═══
+   1. Expired server session is no longer silent (see bnxCheckAuthFailure_): one confirming
+      probe, then a clear prompt. Transient errors never log anybody out.
+   2. After PC sleep / Edge "sleeping tab" / Wi-Fi drop, the API circuit-breaker and
+      failure counters were left over from the dead period, so the first clicks after
+      coming back were refused ("circuit open") and the screen looked frozen. On wake
+      they are reset, the session is re-checked and the connection status refreshed. */
+(function(){
+  'use strict';
+  var W=window, D=document, probing=null, shown=false, lastTick=Date.now(), hiddenAt=0;
+  function body(){ var c='',t=''; try{ c=bnxCurrentClient_(); t=bnxCurrentSession_(); }catch(e){} return JSON.stringify({action:'GET_CLIENT_INFO',clientId:c,sessionToken:t}); }
+  function probe(){
+    if(probing) return probing;
+    probing=(async function(){
+      try{
+        if(typeof bnxFetchJson_!=='function') return 'unknown';
+        var r=await bnxFetchJson_('V2_CORE',{body:body(),timeoutMs:20000});
+        if(typeof bnxIsAuthText_==='function'&&bnxIsAuthText_(r)) return 'expired';
+        if(r&&(r.statusCode===401||r.statusCode===403)) return 'expired';
+        return (r&&r.success!==false)?'ok':'unknown';
+      }catch(e){ return 'offline'; }
+      finally{ setTimeout(function(){ probing=null; },0); }
+    })();
+    return probing;
+  }
+  function showExpired(){
+    if(shown) return; shown=true;
+    var ov=D.createElement('div'); ov.id='bnxSessionExpired';
+    ov.style.cssText='position:fixed;inset:0;z-index:2147483000;background:rgba(15,10,5,.55);display:flex;align-items:center;justify-content:center;padding:16px';
+    var pend=0; try{ pend=(typeof bnxGetOutbox==='function'?bnxGetOutbox().length:0); }catch(e){}
+    ov.innerHTML='<div style="background:#fff;color:#1b1b1b;max-width:380px;width:100%;border-radius:16px;padding:18px;box-shadow:0 20px 60px rgba(0,0,0,.35);font-family:Arial,sans-serif">'
+      +'<div style="font-weight:800;font-size:16px;margin-bottom:6px">\uD83D\uDD12 Session expired</div>'
+      +'<div style="font-size:13px;line-height:1.5;color:#444;margin-bottom:14px">The login session ended on the server, so saving and live data stopped responding. '
+      +(pend?'<b>'+pend+' unsynced entr'+(pend===1?'y is':'ies are')+' kept safely</b> and will sync after you log in again.':'Nothing unsaved is lost.')+'</div>'
+      +'<button data-a="login" style="width:100%;padding:12px;border:0;border-radius:10px;background:#e8590c;color:#fff;font-weight:700;font-size:14px;cursor:pointer;margin-bottom:8px">Log in again</button>'
+      +'<button data-a="retry" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:10px;background:#fff;font-weight:600;cursor:pointer">Check again</button></div>';
+    D.body.appendChild(ov);
+    ov.addEventListener('click',function(e){
+      var a=e.target.closest&&e.target.closest('[data-a]'); if(!a) return; a=a.getAttribute('data-a');
+      if(a==='login'){ try{ bnxForceReauth('Session expired — please log in again.'); }catch(x){ location.href='/login'; } }
+      if(a==='retry'){ probe().then(function(s){ if(s==='ok'){ ov.remove(); shown=false; try{ bnxResetApiCircuit_(); }catch(x){} } else if(typeof showNotif==='function') showNotif(s==='offline'?'Still offline — check internet':'Session is still expired — please log in again','error'); }); }
+    });
+  }
+  W.bnxSessionSuspect_=function(){
+    if(shown) return;
+    setTimeout(function(){ probe().then(function(s){ if(s==='expired') showExpired(); }); },1500);
+  };
+  function wake(reason){
+    try{ if(typeof bnxResetApiCircuit_==='function') bnxResetApiCircuit_(); }catch(e){}
+    try{ if(typeof BNX_API_NETFAIL!=='undefined') BNX_API_NETFAIL.clear(); }catch(e){}
+    try{ if(typeof bnxClearDashboardSummaryCache_==='function') bnxClearDashboardSummaryCache_(); }catch(e){}
+    probe().then(function(s){
+      if(s==='expired') return showExpired();
+      if(s==='ok'){ try{ (W.bnxRunLiveHealthCheck_||function(){})(); }catch(e){} try{ if(typeof flushOutbox==='function') flushOutbox(); }catch(e){} }
+    });
+    try{ console.info('[SESSION] wake check ('+reason+')'); }catch(e){}
+  }
+  setInterval(function(){ var n=Date.now(); if(n-lastTick>120000) wake('timer gap '+Math.round((n-lastTick)/60000)+' min'); lastTick=n; },15000);
+  D.addEventListener('visibilitychange',function(){
+    if(D.hidden){ hiddenAt=Date.now(); return; }
+    if(hiddenAt && Date.now()-hiddenAt>60000) wake('tab visible again');
+    hiddenAt=0;
+  });
+  W.addEventListener('online',function(){ wake('back online'); });
+  W.addEventListener('pageshow',function(e){ if(e.persisted) wake('restored from cache'); });
+  /* 3. SLIDING LOGIN WINDOW. ERP.getUser() (erp-config.js) wipes the whole login the moment
+        localStorage ERP_EXPIRY passes — even in the middle of a shift — after which every call
+        goes out with no token and the page just stops responding. Real activity (click, key,
+        touch, scroll) now keeps the window at least 30 min ahead; a login that has already
+        expired is never revived, and the configured expiry is never shortened. */
+  var SLIDE=30*60000, lastSlide=0;
+  function expKey(){ try{ return (typeof ERP_KEYS!=='undefined'&&ERP_KEYS&&ERP_KEYS.EXPIRY)||'ERP_EXPIRY'; }catch(e){ return 'ERP_EXPIRY'; } }
+  function slide(){
+    var n=Date.now(); if(n-lastSlide<30000) return; lastSlide=n;
+    try{ var k=expKey(), e=+localStorage.getItem(k)||0; if(e>n && e<n+SLIDE) localStorage.setItem(k,String(n+SLIDE)); }catch(x){}
+  }
+  ['mousedown','keydown','touchstart','scroll','wheel'].forEach(function(ev){ D.addEventListener(ev,slide,{passive:true,capture:true}); });
+  slide();
+  /* login wiped locally (expiry / other tab logged out) → say so instead of failing silently */
+  var hadSession=false; try{ hadSession=!!bnxCurrentSession_(); }catch(e){}
+  setInterval(function(){ var has=false; try{ has=!!bnxCurrentSession_(); }catch(e){} if(hadSession && !has) showExpired(); },20000);
+  /* keep-alive: an authenticated call every 10 min while the page is open (HEARTBEAT may be
+     an unrouted action and then never refreshes the server session) */
+  setInterval(function(){ if(!D.hidden && !shown) probe().then(function(s){ if(s==='expired') showExpired(); }); },600000);
 })();
 </script>
 
