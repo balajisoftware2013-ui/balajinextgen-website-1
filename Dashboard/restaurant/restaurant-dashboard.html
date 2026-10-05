@@ -595,6 +595,17 @@ const BNX_DASHBOARD_TIMEOUT_MS = 90000;
 // GET_DASHBOARD_SUMMARY several times during startup, filling the queue when
 // /api/core was unavailable and making the screen feel frozen.
 const BNX_INFLIGHT_API = new Map();
+/* FIX 2026-10-05 (startup speed): identical read-only calls (GET_DASHBOARD_SUMMARY,
+   GET_STAFF_LIST, GET_DSR_MATRIX, GET_ROLE_ACCESS…) fired twice in a row during
+   boot from separate loaders. Successful GET_/LIST_ results are now reused for 8 s
+   (deep-cloned per caller). ANY write (SAVE_/SETTLE_/UPDATE_/…) clears the cache at
+   start and finish, so data is never stale after a save. Number allocators
+   (NEXT_*, *NUMBER*, *SEQ*) are never cached. */
+const BNX_READ_CACHE = new Map();
+const BNX_READ_CACHE_TTL = 8000;
+function bnxIsCacheableRead_(a){ a=String(a||''); return /^(GET_|LIST_)/.test(a) && !/(NUMBER|SEQ|NEXT)/.test(a); }
+/* Read-type calls that must NOT wipe the cache (anything else — unknown actions included — clears it). */
+function bnxIsReadOnlyAction_(a){ return /^(GET_|LIST_|RD_FETCH_|NEXT_)/.test(String(a||'')); }
 
 // FIX (authorization): the confirmed backend returns a real,
 // distinguishable auth failure — respondError(401, 'Invalid or expired
@@ -618,7 +629,10 @@ function bnxForceReauth(message){
   try{ if (typeof showNotif === 'function') showNotif('🔒 ' + message, 'error'); }catch(e){}
   setTimeout(function(){
     try{
-      if (typeof ERP !== 'undefined' && ERP.logout) { ERP.logout(window.bnxRootPath ? window.bnxRootPath('login.html') : '../login.html'); return; }
+      /* FIX 2026-10-05: ERP.logout() shows a "Logout?" confirm — pressing Cancel on an
+         EXPIRED session left staff on a dead screen forever (this runs only once).
+         Expiry is not optional: clear and redirect without asking. */
+      if (typeof ERP !== 'undefined' && typeof ERP.clear === 'function') ERP.clear();
     }catch(e){}
     ['ERP_USER','ERP_SESSION','ERP_ROLE','ERP_CLIENT','ERP_EXPIRY','erp_session','erp_token','erpUser','erpToken'].forEach(function(k){ try{ localStorage.removeItem(k); }catch(e){} });
     try{ sessionStorage.clear(); }catch(e){}
@@ -776,6 +790,15 @@ async function gasApi(action, payload, endpoint) {
       bnxCurrentSession_() + '|' + bnxCurrentClient_();
   } catch(e) {}
   if (inflightKey && BNX_INFLIGHT_API.has(inflightKey)) return BNX_INFLIGHT_API.get(inflightKey);
+  const _bnxCacheable = !!inflightKey && bnxIsCacheableRead_(action);
+  if (!_bnxCacheable) { if (!bnxIsReadOnlyAction_(action)) BNX_READ_CACHE.clear(); }
+  else {
+    const hit = BNX_READ_CACHE.get(inflightKey);
+    if (hit && (Date.now() - hit.t) < BNX_READ_CACHE_TTL) {
+      return Promise.resolve(hit.r).then(function(r){ try{ return structuredClone(r); }catch(e){ return JSON.parse(JSON.stringify(r)); } });
+    }
+    if (hit) BNX_READ_CACHE.delete(inflightKey);
+  }
 
   const promise = new Promise((resolve) => {
     const task = async () => {
@@ -818,6 +841,11 @@ async function gasApi(action, payload, endpoint) {
   if (inflightKey) {
     BNX_INFLIGHT_API.set(inflightKey, promise);
     promise.finally(()=>{ if(BNX_INFLIGHT_API.get(inflightKey)===promise) BNX_INFLIGHT_API.delete(inflightKey); });
+  }
+  if (_bnxCacheable) {
+    promise.then(function(r){ if (r && r.success !== false) { try{ BNX_READ_CACHE.set(inflightKey, {t:Date.now(), r:structuredClone(r)}); }catch(e){} } });
+  } else if (!bnxIsReadOnlyAction_(action)) {
+    promise.finally(function(){ BNX_READ_CACHE.clear(); });
   }
   return promise;
 }
@@ -1132,7 +1160,9 @@ setInterval(() => {
   }
   if(document.readyState==='loading'){ document.addEventListener('DOMContentLoaded',check); }
   else{ check(); }
-  setTimeout(showPage, 2000);
+  /* FIX 2026-10-05: was setTimeout(showPage,2000) — page became visible even when no
+     valid login was confirmed. Now only reveals if a real session user exists. */
+  setTimeout(function(){ try{ if(typeof ERP!=='undefined' && typeof ERP.getUser==='function' && ERP.getUser()) showPage(); }catch(e){} }, 2000);
 })();
 </script>
 <title>Balaji NextGen ERP — Restaurant Management System v3.0 BEST</title>
@@ -4546,7 +4576,7 @@ document.addEventListener('DOMContentLoaded', function(){
   <span class="db-pill ready" id="dbAuth"><span class="db-dot"></span>Auth ·</span>
   <span class="db-pill ready" id="dbCore"><span class="db-dot"></span>Core ·</span>
   <div class="db-divider"></div>
-  <span class="client-tag" id="clientTag">CLI001 · SUPER_ADMIN</span>
+  <span class="client-tag" id="clientTag">—</span>
   <span class="license-badge lic-pro" id="licBadge">ENTERPRISE</span>
   <div class="db-role-cluster" id="dbRoleCluster">
     <div class="bnx-role-view-wrap" id="bnxRoleViewWrap">
@@ -4555,8 +4585,8 @@ document.addEventListener('DOMContentLoaded', function(){
       <button type="button" class="bnx-role-access-btn" onclick="bnxOpenRoleAccessPreview()" title="See which menus this role can open">ADMIN ACCESS</button>
       <span id="bnxRoleViewLock" class="bnx-role-view-note">VIEW ONLY</span>
     </div>
-    <span class="db-date" id="dbDate">16/09/2026</span>
-    <span class="db-time" id="dbTime">11:33 am</span>
+    <span class="db-date" id="dbDate"></span>
+    <span class="db-time" id="dbTime"></span>
     <span class="db-user-dot">●</span>
   </div>
   <span class="db-sync" id="dbSync">Checking connections…</span>
@@ -4770,13 +4800,13 @@ document.addEventListener('DOMContentLoaded', function(){
         <div>
           <div class="hero-title" id="heroRestaurantName">Restaurant ERP</div>
           <div class="hero-subtitle">GST Billing · AI Analytics</div>
-          <div class="hero-badge"><span class="hero-badge-dot"></span>OPEN · Live Orders Active</div>
+          <div class="hero-badge" id="heroDayBadge"><span class="hero-badge-dot"></span><span id="heroDayBadgeTxt">Checking business day…</span></div>
         </div>
       </div>
       <div class="hero-stats-row" id="heroStatsRow">
-        <div class="hero-stat"><div class="hero-stat-val" id="h-rev">—</div><div class="hero-stat-lbl">Today Revenue</div></div>
-        <div class="hero-stat"><div class="hero-stat-val" id="h-ord">214</div><div class="hero-stat-lbl">Orders</div></div>
-        <div class="hero-stat"><div class="hero-stat-val" id="h-cov">583</div><div class="hero-stat-lbl">Covers</div></div>
+        <div class="hero-stat"><div class="hero-stat-val" id="h-rev">—</div><div class="hero-stat-lbl" id="h-rev-lbl">Today Revenue</div></div>
+        <div class="hero-stat"><div class="hero-stat-val" id="h-ord">—</div><div class="hero-stat-lbl" id="h-ord-lbl">Orders</div></div>
+        <div class="hero-stat"><div class="hero-stat-val" id="h-cov">—</div><div class="hero-stat-lbl" id="h-cov-lbl">Covers</div></div>
       </div>
     </div>
   </div>
@@ -4786,7 +4816,7 @@ document.addEventListener('DOMContentLoaded', function(){
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
       <span class="live-badge"><span class="live-dot"></span>LIVE</span>
       <button class="btn btn-sm btn-ghost" onclick="loadDashboard()">🔄 Refresh</button>
-      <span class="client-tag" id="dashClientTag">CLI001</span>
+      <span class="client-tag" id="dashClientTag">—</span>
       <span id="dayStatusBadge" style="margin-left:8px;"></span>
     </div>
   </div>
@@ -5432,7 +5462,7 @@ document.addEventListener('DOMContentLoaded', function(){
         <button class="btn-full prim" onclick="sendKOT()">🎫 Send KOT to Kitchen</button>
         <div style="display:flex;gap:6px;margin-top:6px;">
           <button class="btn-full sec" style="font-size:11px;flex:1;" onclick="holdOrder()">⏸ Hold</button>
-          <button class="btn-full sec" style="font-size:11px;flex:1;" onclick="bmDoPrint()">🧾 Save & Print Invoice</button>
+          <button class="btn-full sec" style="font-size:11px;flex:1;" onclick="settleOrder()" title="Saves THIS POS cart and prints the confirmed invoice">🧾 Save & Print Invoice</button>
           <button class="btn-full" style="font-size:11px;flex:1;background:var(--green);color:#fff;" onclick="settleOrder()">✓ Settle</button>
         </div>
       </div>
@@ -8303,7 +8333,7 @@ if(D.readyState==='loading')D.addEventListener('DOMContentLoaded',watch);else wa
         <div class="card-header"><span class="card-title">📅 Sales Day Book</span><div class="rpt-actions"><button class="btn btn-sm btn-ghost rpt-icon-btn" data-export-trigger title="Export" aria-label="Export" onclick="openExportFormatMenu(this,'day-book')">📥<span class="rpt-caret">▾</span></button><button class="btn btn-sm btn-ghost rpt-icon-btn" data-print-trigger title="Print" aria-label="Print" onclick="openPrintFormatMenu(this)">🖨<span class="rpt-caret">▾</span></button><span data-send-menu="sendMenu_day_book"></span></div></div>
         <table class="tbl"><thead><tr><th>Bill No</th><th>Time</th><th>Table</th><th>Amount</th><th>Mode</th></tr></thead>
         <tbody><tr><td colspan="5" style="text-align:center;color:var(--text3);padding:18px;">Live data will load from the transaction database.</td></tr></tbody></table>
-        <div id="rpt-daybook-static-footer" style="text-align:center;font-size:10px;color:var(--text3);margin-top:6px;">Showing 5 of 214 bills · <span onclick="loadAllDayBook()" style="color:var(--gold);cursor:pointer;">Load All →</span></div>
+        <div id="rpt-daybook-static-footer" style="text-align:center;font-size:10px;color:var(--text3);margin-top:6px;">Loading bills… · <span onclick="loadAllDayBook()" style="color:var(--gold);cursor:pointer;">Load All →</span></div>
       </div>
     </div>
     <!-- Cash Book Report — Daily / MTD / YTD -->
@@ -11737,7 +11767,20 @@ function bnxDashCurrentFromTo_(){
   }
   return { from: today, to: today };
 }
+/* FIX 2026-10-05: period bar printed the ISO date (2026-10-05) right beside the date box
+   already showing 05-10-2026. Single day -> no duplicate; ranges -> DD-MM-YYYY → DD-MM-YYYY. */
+window.bnxGpFmtLabel_=function(from,to){
+  const f=v=>{const m=String(v||'').match(/^(\d{4})-(\d{2})-(\d{2})$/);return m?(m[3]+'-'+m[2]+'-'+m[1]):String(v||'');};
+  if(!from) return ''; if(!to||from===to) return '';
+  return f(from)+' → '+f(to);
+};
+/* FIX 2026-10-05: hero labels said "Today Revenue" even with This Month / Year selected. */
+function bnxSyncHeroLabels_(range){
+  const p={today:'Today',yesterday:'Yesterday',week:'This Week',month:'This Month',quarter:'This Quarter',year:'This Year',custom:'Period'}[range]||'Period';
+  const r=document.getElementById('h-rev-lbl'); if(r) r.textContent=p+' Revenue';
+}
 function bnxUpdateDashDateLabel_(range){
+  try{ bnxSyncHeroLabels_(range); }catch(e){}
   const el = document.getElementById('dashDate');
   if (!el) return;
   const fmtLong = (d) => d.toLocaleDateString('en-IN',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
@@ -14838,48 +14881,80 @@ function renderCart(){
   }).join('');
   recalcCart();
 }
-function recalcCart(){
-  const sub=Object.keys(cart).reduce((a,n)=>a+cart[n].price*cart[n].qty,0);
-  const svcPct=parseFloat(document.getElementById('svcInput')?.value||0);
-  const discRules = bnxDiscRules_('pos');
-  const cartRows = Object.keys(cart).map(n=>{ const rule=bnxDiscMatch_(discRules,n,null,null); return {name:n, cls:bnxDiscClass_(n,null,null), amt:cart[n].price*cart[n].qty, rule, pct:rule?rule.pct:0}; });
-  const pctOf = {}; cartRows.forEach(r=>{ pctOf[r.name]=r.pct; });
-  const taxCfg = getTaxConfig();
-
-  // Real per-item GST: each cart line is taxed at ITS OWN category's rate
-  // (from Settings → Tax & GST, not a flat 5%), then summed. This is what
-  // "product-wise tax" actually means on a GST invoice.
-  const catByName = {};
-  if (typeof menuData !== 'undefined') menuData.forEach(m=>{ catByName[m.n] = m.c; });
-  let cgst = 0, sgst = 0, taxOnAmt = 0;
-  const hsnSeen = {};
+/* FIX 2026-10-05 ("POS GST overcharge / screen vs print mismatch"):
+   recalcCart() and printBill() each had their own tax math. Both rounded CGST and
+   SGST to WHOLE RUPEES (₹145 food -> CGST 4 + SGST 4 = ₹153 instead of ₹152), and
+   recalcCart ignored master tax overrides (Liquor 0% / Hookah 40%) that printBill
+   applied. ONE calculator now feeds screen, print and SAVE_BILL — same rules as
+   the New Bill screen's bmComputeTax(): tax to paise, only grand total rounded. */
+function bnxPosCalc_(){
+  const r2=v=>Math.round((Number(v)||0)*100)/100;
+  const svcPct=parseFloat(document.getElementById('svcInput')?.value||0)||0;
+  const discRules=bnxDiscRules_('pos');
+  const discScope=bnxDiscScopeCode_(discRules);
+  const catByName={}; if(typeof menuData!=='undefined') menuData.forEach(m=>{ catByName[m.n]=m.c; });
+  const taxCfg=getTaxConfig();
+  const items=[], cartRows=[], taxRowsMap={}, hsnSeen={};
+  let sub=0, discRaw=0, taxBase=0, cgst=0, sgst=0;
   Object.keys(cart).forEach(n=>{
-    const lineAmt = cart[n].price * cart[n].qty * (1 - (pctOf[n]||0)/100);
-    const tc = getItemTaxCat(n, catByName[n]);
-    const rate = taxCfg[tc] || TAX_CONFIG_DEFAULT.FOOD;
-    cgst += lineAmt * rate.cgst/100;
-    sgst += lineAmt * rate.sgst/100;
-    taxOnAmt += lineAmt;
-    hsnSeen[rate.hsn] = (hsnSeen[rate.hsn]||0) + lineAmt;
+    const v=cart[n], qty=Number(v.qty)||0, rate=Number(v.price)||0, amt=rate*qty;
+    const rule=bnxDiscMatch_(discRules,n,null,null), pct=rule?rule.pct:0;
+    const lineDisc=amt*pct/100, lineAmt=amt-lineDisc;
+    const liveItem=bnxFindLiveBillItem_(n)||{};
+    const meta=bnxMasterTaxMeta_(liveItem,n);
+    const tc=meta.key||getItemTaxCat(n,catByName[n],liveItem);
+    const cfg=taxCfg[tc]||TAX_CONFIG_DEFAULT.FOOD;
+    const tr={
+      cgst: meta.taxId==='TAX00002' ? 0 : meta.taxId==='TAX00003' ? 20 : Number(cfg.cgst)||0,
+      sgst: meta.taxId==='TAX00002' ? 0 : meta.taxId==='TAX00003' ? 20 : Number(cfg.sgst)||0,
+      hsn: meta.hsn||cfg.hsn
+    };
+    sub+=amt; discRaw+=lineDisc; taxBase+=lineAmt;
+    cgst+=lineAmt*tr.cgst/100; sgst+=lineAmt*tr.sgst/100;
+    if(!taxRowsMap[tc]) taxRowsMap[tc]={hsn:tr.hsn, taxName:(tr.cgst+tr.sgst)>0?('GST @'+(tr.cgst+tr.sgst)+'%'):'Exempted', onAmt:0, taxAmt:0};
+    taxRowsMap[tc].onAmt+=lineAmt; taxRowsMap[tc].taxAmt+=lineAmt*(tr.cgst+tr.sgst)/100;
+    hsnSeen[tr.hsn]=(hsnSeen[tr.hsn]||0)+lineAmt;
+    items.push({name:n, qty, rate, amt, discPct:pct, discAmt:r2(lineDisc), cat:catByName[n]||'', taxRate:(tr.cgst+tr.sgst)/100});
+    cartRows.push({name:n, cls:bnxDiscClass_(n,null,null), amt, rule, pct});
   });
-  cgst = Math.round(cgst); sgst = Math.round(sgst);
-  const discAmt = Math.round(cartRows.reduce((a,r)=>a+r.amt*r.pct/100,0));
-  try{ const dd=document.getElementById('cDiscDetail'); if(dd) dd.innerHTML = discRules.length ? bnxDiscDetailHtml2_(cartRows) : ''; }catch(e){}
-  const svcAmt = Math.round(taxOnAmt*svcPct/100);
-  const rawTotal = taxOnAmt + svcAmt + cgst + sgst;
-  const roundOff = Math.round(rawTotal) - rawTotal;
-  const total = Math.round(rawTotal);
-
-  document.getElementById('cSub').textContent='₹'+sub.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
-  document.getElementById('cTax').textContent='₹'+cgst.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
-  document.getElementById('cTax2').textContent='₹'+sgst.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
-  const svcEl = document.getElementById('cSvc'); if(svcEl) svcEl.textContent='₹'+svcAmt.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
-  const roEl = document.getElementById('cRound'); if(roEl) roEl.textContent='₹'+roundOff.toFixed(2);
-  const discEl = document.getElementById('cDisc'); if(discEl) discEl.textContent='−₹'+discAmt.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
-  document.getElementById('cTotal').textContent='₹'+total.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
-  window._posCartHsn = hsnSeen; // used by printBill() for the Tax Break-up section
+  cgst=r2(cgst); sgst=r2(sgst); taxBase=r2(taxBase); sub=r2(sub);
+  const disc=r2(discRaw);
+  const sc=r2(taxBase*svcPct/100);
+  const grand=r2(taxBase+sc+cgst+sgst);
+  const total=Math.round(grand);
+  const roundOff=r2(total-grand);
+  const discPct=discRules.length===1 ? discRules[0].pct : (sub>0 ? Math.round(disc/sub*10000)/100 : 0);
+  const taxRows=Object.values(taxRowsMap).map(r=>({hsn:r.hsn, taxName:r.taxName, onAmt:r2(r.onAmt), taxAmt:r2(r.taxAmt)}));
+  return {items, cartRows, discRules, discScope, discPct, svcPct, sub, disc, taxBase, sc, cgst, sgst, grand, total, roundOff, taxRows, hsnSeen};
 }
-function selPay(btn){ document.querySelectorAll('.pay-opt').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); payMethod=btn.textContent.trim(); }
+function recalcCart(){
+  const c=bnxPosCalc_();
+  const f=v=>'₹'+(Number(v)||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+  try{ const dd=document.getElementById('cDiscDetail'); if(dd) dd.innerHTML = c.discRules.length ? bnxDiscDetailHtml2_(c.cartRows) : ''; }catch(e){}
+  document.getElementById('cSub').textContent=f(c.sub);
+  document.getElementById('cTax').textContent=f(c.cgst);
+  document.getElementById('cTax2').textContent=f(c.sgst);
+  const svcEl=document.getElementById('cSvc'); if(svcEl) svcEl.textContent=f(c.sc);
+  const roEl=document.getElementById('cRound'); if(roEl) roEl.textContent='₹'+c.roundOff.toFixed(2);
+  const discEl=document.getElementById('cDisc'); if(discEl) discEl.textContent='−'+f(c.disc);
+  document.getElementById('cTotal').textContent=f(c.total);
+  window._posCartHsn=c.hsnSeen; // used by printBill() for the Tax Break-up section
+}
+/* FIX 2026-10-05: payMethod was btn.textContent -> "📱UPI" / "📒Credit" (emoji saved
+   and printed; /^(DUE|CREDIT)$/ never matched so Credit bills were saved as Paid). */
+function bnxPayOptLabel_(btn){
+  if(!btn) return '';
+  if(btn.dataset && btn.dataset.pay) return String(btn.dataset.pay).trim();
+  const em=btn.querySelector('.pay-em');
+  return String(btn.textContent||'').replace(em?em.textContent:'','').replace(/[\uD800-\uDFFF\u2600-\u27BF\uFE0F]/g,'').trim();
+}
+function selPay(btn){ (btn.parentElement||document).querySelectorAll('.pay-opt').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); payMethod=bnxPayOptLabel_(btn)||'Cash'; }
+function bnxPosPayMode_(){
+  const sel=document.getElementById('paymentMethodSelect');   /* NC wrapper injects this */
+  if(sel && sel.value) return String(sel.value).trim();
+  const act=document.querySelector('#page-pos .pay-opt.active');
+  return bnxPayOptLabel_(act) || String(payMethod||'Cash').trim();
+}
 function bnxOpenPosTablePicker(){
   let modal=document.getElementById('bnxPosTablePicker');
   if(!modal){
@@ -15740,46 +15815,13 @@ function printBill(confirmedBillNo){
   const covers = document.getElementById('coversInput')?.value || '2';
   const cname = (document.getElementById('custNameInput')?.value || 'GENERAL CUSTOMER').toUpperCase();
   const cmob = document.getElementById('custMobileInput')?.value || '';
-  const items = Object.entries(cart).map(([n,v])=>({ name:n, qty:v.qty, rate:v.price, amt:v.price*v.qty }));
-  const sub = items.reduce((a,i)=>a+i.amt,0);
-  const discRules = bnxDiscRules_('pos');
-  const discScope = bnxDiscScopeCode_(discRules);
-  items.forEach(i=>{ const rule=bnxDiscMatch_(discRules,i.name,null,null); i.discPct=rule?rule.pct:0; i.discAmt=Math.round(i.amt*i.discPct)/100; });
-  const disc = Math.round(items.reduce((a,i)=>a+i.amt*i.discPct/100,0) * 100)/100;
-  const discPct = discRules.length===1 ? discRules[0].pct : (sub>0 ? Math.round(disc/sub*10000)/100 : 0);
-  const svcPct = parseFloat(document.getElementById('svcInput')?.value||0);
+  /* FIX 2026-10-05: same calculator as the cart screen (no whole-rupee tax rounding). */
+  const _pc = bnxPosCalc_();
+  const items = _pc.items.map(i=>({ name:i.name, qty:i.qty, rate:i.rate, amt:i.amt, discPct:i.discPct, discAmt:i.discAmt }));
+  const sub = _pc.sub, disc = _pc.disc, discPct = _pc.discPct, discScope = _pc.discScope;
+  const svcPct = _pc.svcPct, sc = _pc.sc, cgst = _pc.cgst, sgst = _pc.sgst, taxRows = _pc.taxRows;
   const now = new Date();
   const billNo = isEstimate ? '' : confirmedBillNo;
-
-  // Real per-item HSN/GST breakdown — same categories Settings → Tax & GST
-  // actually controls now, not a single flat rate for the whole bill.
-  const catByName = {};
-  if (typeof menuData !== 'undefined') menuData.forEach(m=>{ catByName[m.n] = m.c; });
-  const taxCfg = getTaxConfig();
-  const taxRowsMap = {};
-  let cgst=0, sgst=0;
-  items.forEach(i=>{
-    const lineAmt = i.amt * (1 - (i.discPct||0)/100);
-    const liveItem=bnxFindLiveBillItem_(i.name)||{};
-    const masterMeta=bnxMasterTaxMeta_(liveItem,i.name);
-    const tc = masterMeta.key || getItemTaxCat(i.name, catByName[i.name], liveItem);
-    const configured=taxCfg[tc] || TAX_CONFIG_DEFAULT.FOOD;
-    const rate = {
-      cgst: masterMeta.taxId==='TAX00002' ? 0 : masterMeta.taxId==='TAX00003' ? 20 : configured.cgst,
-      sgst: masterMeta.taxId==='TAX00002' ? 0 : masterMeta.taxId==='TAX00003' ? 20 : configured.sgst,
-      hsn: masterMeta.hsn || configured.hsn
-    };
-    const rowKey = tc;
-    if (!taxRowsMap[rowKey]) taxRowsMap[rowKey] = { hsn:rate.hsn, taxName:(rate.cgst+rate.sgst)>0?('GST @'+(rate.cgst+rate.sgst)+'%'):'Exempted', onAmt:0, taxAmt:0 };
-    taxRowsMap[rowKey].onAmt += lineAmt;
-    taxRowsMap[rowKey].taxAmt += lineAmt*(rate.cgst+rate.sgst)/100;
-    cgst += lineAmt*rate.cgst/100;
-    sgst += lineAmt*rate.sgst/100;
-  });
-  const taxRows = Object.values(taxRowsMap).map(r=>({ hsn:r.hsn, taxName:r.taxName, onAmt:r.onAmt, taxAmt:r.taxAmt }));
-  cgst = Math.round(cgst); sgst = Math.round(sgst);
-  const taxOnAmt = sub-disc;
-  const sc = Math.round(taxOnAmt*svcPct/100);
 
   // FIX ("setting change not change name"): billData.entity/addr/phone/gstin
   // were hardcoded to Balaji NextGen's own company details — every client's
@@ -15797,10 +15839,10 @@ function printBill(confirmedBillNo){
     phone: ri.phone || '', gstin: ri.gst || '',
     billNo, date: now.toLocaleDateString('en-GB').replace(/\//g,'-'), time: now.toTimeString().slice(0,5),
     table: tbl, pax: covers, waiter: document.getElementById('waiterSel')?.value || '',
-    cname, cmob, items, sub, disc, discPct, discScope, sc, scPct:svcPct, cgst, sgst, igst:0, total: sub-disc+sc+cgst+sgst,
+    cname, cmob, items, sub, disc, discPct, discScope, sc, scPct:svcPct, cgst, sgst, igst:0, total: _pc.grand, taxBase: _pc.taxBase, roundOff: _pc.roundOff,
     taxRows, kot: document.getElementById('kotBadge')?.textContent ? 'KOT-'+document.getElementById('kotBadge').textContent : '',
     remarks: document.getElementById('remarksInput')?.value || '',
-    paymode: payMethod.toUpperCase(), user: 'STAFF', isEstimate,
+    paymode: bnxPosPayMode_().toUpperCase(), user: 'STAFF', isEstimate,
   };
   printThermalReceipt(billData);
 }
@@ -16204,56 +16246,24 @@ async function settleOrder(){
       else alert('Select a table first');
       return;
     }
-    const itemsStr = (document.getElementById('cartItems')?.textContent || '').trim();
-    if (!itemsStr || itemsStr === '--'){
+    /* FIX 2026-10-05 ("POS Settle always says Cart is empty"): this read
+       #cartItems / #billingCart / #cSubtotal / #paymentMethodSelect — elements from
+       an old layout that no longer exist, so every Settle stopped at "Cart is
+       empty" and SAVE_BILL was never sent. Now built from the real cart object
+       via the same calculator the screen and printed bill use. */
+    if (!Object.keys(cart).length){
       if (typeof showNotif === 'function') showNotif('⚠️ Cart is empty', 'error');
       else alert('Add items to the cart first');
       return;
     }
-    
-    const items = Array.from(document.querySelectorAll('#billingCart tr')).slice(1).map(row => ({
-      name: row.cells[0]?.textContent || '',
-      qty: parseInt(row.cells[1]?.textContent) || 1,
-      rate: parseFloat(row.cells[2]?.textContent) || 0,
-      line: parseFloat(row.cells[3]?.textContent) || 0,
-      // FIX ("liquor items non-GST 0"): same fix as sendKOT() — without
-      // this, bnxSaveBill has no per-item rate to work with either and
-      // BILL_ITEMS would inherit the same flat-18% problem ORDER_ITEMS had.
-      taxRate: bnxItemTaxRateFraction_(row.cells[0]?.textContent || ''),
-      // FIX ("check all report part table some information are missing"
-      // — ItemWise Report's CATEGORY column showing "—" for every item,
-      // not just OPEN FOOD): confirmed root cause — this array never
-      // captured a category at all, so bnxRenderItemWiseReport's
-      // `it.cat || '—'` fell back to "—" for literally every item ever
-      // billed. menuData (the same real menu list every tile on the POS
-      // grid renders from) already carries each item's category as
-      // menuData[i].c — looked up here by name, same lookup pattern
-      // bnxItemTaxRateFraction_ right above already uses for tax. A
-      // manually-typed "open item" genuinely has no menu category, so
-      // it correctly still shows "—" — that's honest, not a bug.
-      cat: (typeof menuData !== 'undefined' ? (menuData.find(m => m.n === (row.cells[0]?.textContent || ''))?.c || '') : '')
-    }));
-    
-    const payMethod = (document.getElementById('paymentMethodSelect')?.value || 'Cash').trim();
-    const sub = parseFloat((document.getElementById('cSubtotal')?.textContent||'₹0').replace(/[^\d.]/g,'')) || 0;
-    const gstTxt = (document.getElementById('cTax')?.textContent||'₹0').replace(/[^\d.]/g,'');
-    const gst2Txt = (document.getElementById('cTax2')?.textContent||'₹0').replace(/[^\d.]/g,'');
-    const gst = (parseFloat(gstTxt)||0) + (parseFloat(gst2Txt)||0);
-    const totalTxt = (document.getElementById('cTotal')?.textContent||'₹0').replace(/[^\d.]/g,'');
-    const total = window.__bnxNC ? 0 : (parseFloat(totalTxt) || sub); /* NC bill = 100% discount, payable ₹0 */
-    // PASS #51 FIX ("discount not recorded properly / round-off
-    // problem"): this screen has no discount field of its own, but if
-    // a manual price edit or promo ever lowers cTotal noticeably below
-    // sub+gst, that gap needs a real home — sending it as `disc` (not
-    // leaving it for the backend to guess) stops the backend from
-    // treating "whatever's left over" as ROUND_OFF, which is exactly
-    // what was silently swallowing real discounts into ROUND_OFF
-    // before this pass (see bnxSaveBill's own fix). A genuine
-    // sub-rupee gap (paise rounding only) is left at 0 here and still
-    // lands in ROUND_OFF, same as before — only a real, >₹0 gap counts
-    // as a discount.
-    const rawGap = (sub + gst) - total;
-    const discAmt = rawGap > 1 ? +rawGap.toFixed(2) : 0;
+    const _sc = bnxPosCalc_();
+    const items = _sc.items.map(i => ({ name:i.name, qty:i.qty, rate:i.rate, line:i.amt, taxRate:i.taxRate, cat:i.cat }));
+    const payMethod = bnxPosPayMode_();
+    const isNC = !!window.__bnxNC || /^NC$/i.test(payMethod||'');
+    const sub = _sc.sub;
+    const gst = Math.round((_sc.cgst + _sc.sgst)*100)/100;
+    const total = isNC ? 0 : _sc.total; /* NC bill = 100% discount, payable ₹0 */
+    const discAmt = isNC ? Math.round((sub + gst + _sc.sc)*100)/100 : _sc.disc;
     const now = new Date();
     const billBusinessDate = typeof getBusinessDate==='function'
       ? getBusinessDate()
@@ -16265,6 +16275,7 @@ async function settleOrder(){
       dt: billBusinessDate, tm: now.toLocaleTimeString('en-IN',{hour12:true,hour:'2-digit',minute:'2-digit'}),
       table: tbl, customer: (document.getElementById('custNameInput')?.value || 'GENERAL CUSTOMER'),
       mob: document.getElementById('custMobileInput')?.value || '', itemsDetail: items, sub, gst, total, disc: discAmt,
+      cgst: _sc.cgst, sgst: _sc.sgst, sc: _sc.sc, scPct: _sc.svcPct, taxBase: _sc.taxBase, roundOff: isNC ? 0 : _sc.roundOff,
       pay: payMethod, waiter: document.getElementById('waiterSel')?.value || '',
       status: /^(DUE|CREDIT)$/i.test(payMethod||'') ? 'Pending' : (window.__bnxNC||/^NC$/i.test(payMethod||'') ? 'Complimentary' : 'Paid'),
       /* PASS #41 NEW ("Avg Table Turn ... fix"): checked the real
@@ -16305,7 +16316,16 @@ async function settleOrder(){
     // the Steward app's addItem() and this file's bmAddProductToQuickBill().
     const billNo = String(res.serverId || res.billNo || '');
 
-    printBill(billNo);
+    /* FIX 2026-10-05 ("next bill contains previous bill's items"): cart was only
+       cleared at the very END of this function. Any error in a follow-up step
+       (print, register, credit ledger refresh…) after the server had ALREADY
+       saved the bill left the items in the cart, and the next Settle billed them
+       a second time. Snapshot the cart, print from it, then clear it at once;
+       every follow-up step is isolated so it can never block that. */
+    const _savedCart = cart;
+    try { printBill(billNo); } catch(e){ console.error('[SETTLE] print failed (bill IS saved):', e); if (typeof showNotif === 'function') showNotif('⚠️ Bill '+billNo+' saved — print failed, use Reprint Bill', 'error'); }
+    cart = {}; try { renderCart(); } catch(e){}
+    try {
     if (typeof bnxRecordBill === 'function'){
       bnxRecordBill(Object.assign({ no: billNo, items }, draftBill));
     }
@@ -16332,7 +16352,8 @@ async function settleOrder(){
     if (/^(DUE|CREDIT)$/i.test(payMethod||'') && typeof bnxPostCreditSale === 'function'){
       bnxPostCreditSale(draftBill.customer, draftBill.mob, total, draftBill.dt, billNo);
     }
-    cart={}; renderCart();
+    } catch(e){ console.error('[SETTLE] post-save step failed (bill IS saved):', e); }
+    void _savedCart;
     if (typeof showNotif === 'function') showNotif('✅ Order Settled — '+tbl+' · Bill '+billNo+' confirmed on server', 'success');
     showPage('billing',document.querySelector('[onclick*="billing"]'));
     
@@ -19416,6 +19437,10 @@ let bmProdListActiveCat='All';
    duplicating a second search implementation. */
 let bmQuickSearch='';
 let bmQuickActiveCat='All';
+/* FIX 2026-10-05: bmNormCat_() was called here but never defined anywhere ->
+   ReferenceError on EVERY call, so Bill Products grid AND the Quick Add "Select
+   Items from Menu" grid never rendered. Case/space-insensitive category key. */
+function bmNormCat_(c){ const s=String(c==null?'':c).trim().toLowerCase(); return (!s||s==='all'||s==='all items')?'all':s; }
 function bmBuildProductGrid(gridId,cat){
   const grid=document.getElementById(gridId);if(!grid)return;
   const billMenu=bnxGetBillMenu();
@@ -20645,6 +20670,9 @@ function bnxRefreshCreditGroupFilter(rows){
   sel.innerHTML='<option value="">All Groups</option>'+groups.map(g=>
     `<option value="${esc(g.name)}">${esc(g.name)} · ${g.count} customer(s)</option>`).join('');
   if(groups.some(g=>g.name===old)) sel.value=old;
+  /* FIX 2026-10-05: money() is not global here -> 'money is not defined' crashed the
+     Credit ledger refresh right after every Credit/Due settlement. */
+  const money=v=>'₹'+(Number(v)||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
   if(sum) sum.textContent=groups.length ? groups.map(g=>`${g.name}: ${money(g.outstanding)}`).join('  •  ') : '';
 }
 function bnxFilteredCreditRows(rows){
@@ -20653,6 +20681,7 @@ function bnxFilteredCreditRows(rows){
   return g ? (rows||[]).filter(c=>bnxCustomerGroup(c)===g) : (rows||[]);
 }
 function bnxRenderCreditGroupwise(rows){
+  const money=v=>'₹'+(Number(v)||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}); /* FIX 2026-10-05: was undefined here */
   const tb=document.querySelector('#creditLedgerTbl tbody');
   if(!tb) return;
   const filtered=bnxFilteredCreditRows(rows);
@@ -25118,6 +25147,15 @@ async function refreshDayBadge(){
     }
   }catch(e){}
   const v=(()=>{try{return JSON.parse(localStorage.getItem(bnxDayKey())||'null')}catch(e){return null}})();
+  /* FIX 2026-10-05: hero badge was static HTML "OPEN · Live Orders Active" — shown even
+     when the business day was NOT started (billing blocked). Now mirrors real day status. */
+  try{
+    const hb=document.getElementById('heroDayBadge'), ht=document.getElementById('heroDayBadgeTxt');
+    const open=!!(v&&v.status==='open');
+    if(ht) ht.textContent = open ? 'OPEN · Day started · Billing live' : 'DAY NOT STARTED · Tap to start';
+    if(hb){ hb.style.cursor=open?'':'pointer'; hb.onclick=open?null:function(){ if(typeof openDayOpenDlg==='function') openDayOpenDlg(); };
+      const dot=hb.querySelector('.hero-badge-dot'); if(dot) dot.style.background=open?'#4cff8a':'#ff5a5a'; }
+  }catch(e){}
   if(v&&v.status==='open'){
     el.innerHTML=`<span style="background:var(--green-bg);color:var(--green);padding:5px 10px;border-radius:20px;font-size:11px;font-weight:700;cursor:pointer;" onclick="openDayCloseDlg()">🟢 Day Open · ${bDate} · Opening ₹${Number(v.openingCash||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</span>`;
   }else{
@@ -30912,6 +30950,9 @@ function bnxRenderBillProductCategories_(){
   wrap.innerHTML='<button class="pcat active" onclick="bmFilterProducts(\'All\',this)">All Items</button>'+
     cats.map(c=>'<button class="pcat" onclick="bmFilterProducts('+bnxEscapeAttrJson_(c)+',this)">'+String(c).replace(/</g,'&lt;')+'</button>').join('');
 }
+/* FIX 2026-10-05: defined inside this IIFE, but showPage('bm-products') calls it
+   globally -> ReferenceError, product grid never built. Expose it. */
+window.bnxRenderBillProductCategories_=bnxRenderBillProductCategories_;
 function renderQuickCategories(){
     const modal=document.getElementById('bmQuickAddModal'); if(!modal) return;
     const wrap=modal.querySelector('.modal-body > div[style*="flex-wrap"]');
@@ -34238,7 +34279,8 @@ if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded'
     if(d)d.textContent=String(n.getDate()).padStart(2,'0')+'/'+String(n.getMonth()+1).padStart(2,'0')+'/'+n.getFullYear();
     if(t){var h=n.getHours(),m=n.getMinutes(),amp=h>=12?'pm':'am';h=h%12||12;t.textContent=String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+' '+amp;}
   }
-  document.addEventListener('DOMContentLoaded',function(){updateDbTopClock();setInterval(updateDbTopClock,30000);});
+  /* FIX 2026-10-05: 30 s refresh made this lag the header clock (04:26 vs 16:27:06). */
+  updateDbTopClock(); document.addEventListener('DOMContentLoaded',function(){updateDbTopClock();setInterval(updateDbTopClock,1000);});
 })();
 </script>
 
@@ -36525,7 +36567,7 @@ mo.observe(document.body,{subtree:true,childList:true});
      the old single date (e.g. 2026-10-03) instead of the quarter's real From -> To. */
   function refreshLabel(){
     var lab=document.getElementById('bnxGpLabel');
-    if(lab)lab.textContent=(current.from===current.to?current.from:(current.from+' \u2192 '+current.to))+(((current.kind||current.range)==='quarter')?'  (FY quarter)':((current.kind||current.range)==='year')?'  (FY Apr\u2013Mar)':'');
+    if(lab)lab.textContent=(window.bnxGpFmtLabel_?window.bnxGpFmtLabel_(current.from,current.to):'')+(((current.kind||current.range)==='quarter')?'  (FY quarter)':((current.kind||current.range)==='year')?'  (FY Apr\u2013Mar)':'');
     var f=document.getElementById('bnxGpFrom'),t=document.getElementById('bnxGpTo');
     if(f)f.value=current.from||'';if(t)t.value=current.to||'';
   }
@@ -36661,7 +36703,7 @@ mo.observe(document.body,{subtree:true,childList:true});
     if(kindNow==='custom')bar.querySelector('#bnxGpCustom').classList.add('show');
     bar.querySelectorAll('.bnx-gp-btn').forEach(function(x){x.classList.toggle('active',x.dataset.range===kindNow);});
     syncPickers();
-    var lab=bar.querySelector('#bnxGpLabel');if(lab)lab.textContent=(current.from===current.to?current.from:(current.from+' → '+current.to))+(((current.kind||current.range)==='quarter')?'  (FY quarter)':((current.kind||current.range)==='year')?'  (FY Apr–Mar)':'');
+    var lab=bar.querySelector('#bnxGpLabel');if(lab)lab.textContent=(window.bnxGpFmtLabel_?window.bnxGpFmtLabel_(current.from,current.to):'')+(((current.kind||current.range)==='quarter')?'  (FY quarter)':((current.kind||current.range)==='year')?'  (FY Apr–Mar)':'');
     window.BNX_GLOBAL_DATE_RANGE={range:current.range,from:current.from,to:current.to};
     var lastBiz=iso(bizNow());
     setInterval(function(){
