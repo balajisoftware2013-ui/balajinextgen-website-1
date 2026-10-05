@@ -535,8 +535,7 @@ async function saveUpload(){
     }
     const record={
       id: 'MC'+Date.now(), name, fileName: prep.fileName, mime: prep.mime,
-      uploadedAt: new Date().toISOString(), active: !!autoSet, sizeKB: Math.round(bytes/1024),
-      synced:false, fileUrl:''
+      uploadedAt: new Date().toISOString(), active: !!autoSet, sizeKB: Math.round(bytes/1024), synced:false
     };
     btn.textContent='Saving…';
     const storedLocal = await mcFilePut(record.id, prep.dataUrl);
@@ -550,17 +549,10 @@ async function saveUpload(){
     closeUploadModal();
     if(autoSet) setView('upload'); else renderUploadView();
     toast('⏳ Saved — syncing '+Math.round(bytes/1024)+' KB to the server…');
-    const r = await gasApi('SAVE_MENU_CARD_UPLOAD', { name, fileName: record.fileName, mime: record.mime, dataUrl: prep.dataUrl, active: record.active, cardId: record.id, cardType: document.getElementById('umType').value }, 180000);
+    const r = await gasApi('SAVE_MENU_CARD_UPLOAD', { name, fileName: record.fileName, mime: record.mime, dataUrl: prep.dataUrl, active: record.active, cardId: record.id }, 180000);
     if (r && r.success){
-      /* Keep every URL/Drive id returned by the server.  This is critical:
-         customers use the server copy, not this browser's IndexedDB copy. */
-      const sd = (r.data && (r.data.card || r.data.menuCard)) || r.data || {};
-      const serverUrl = sd.fileUrl || sd.url || sd.link || '';
-      const serverId = sd.fileId || sd.driveId || sd.FILE_ID || '';
-      if (serverUrl) record.fileUrl = serverUrl;
-      else if (serverId) record.fileUrl = 'https://drive.google.com/file/d/'+serverId+'/view';
       record.synced = true;
-      saveUploads(loadUploads().map(u=>u.id===record.id?Object.assign({},u,{synced:true,fileUrl:record.fileUrl}):u));
+      saveUploads(loadUploads().map(u=>u.id===record.id?Object.assign({},u,{synced:true}):u));
       toast('✅ Menu card saved & synced'+(autoSet?' — customers now see it':'')+(bytes<origSize?' (optimised '+Math.round(origSize/1024)+' → '+Math.round(bytes/1024)+' KB)':''),'success');
     } else {
       const why = (r && (r.error||r.message)) || 'no response';
@@ -948,9 +940,8 @@ const MC_CLIENT_ID = (function(){
 })();
 /* FIX: a stale localStorage 'bnx_api_core' (old/deleted deployment) used to override the real URL -> 404 -> card list never restored.
    Now: shared URL from erp-config.js first, then the known-good deployment. */
-const MC_API_URL = (typeof ERP_ACTIVE_API!=='undefined' && ERP_ACTIVE_API) ||
-                   (window.ERP_API_URL) ||
-                   'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec';
+const MC_API_URL = (window.INV_GAS_CORE) ||
+                   'https://script.google.com/macros/s/AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ/exec';   /* V2_CORE (menu cards live here) */
 try{ localStorage.removeItem('bnx_api_core'); }catch(e){}
 /* same token lookup order as the dashboard (bnxCurrentSession_) — the page only
    read localStorage.ERP_SESSION, so a login stored elsewhere sent an empty token */
@@ -988,82 +979,37 @@ function mcDriveUrl(c){
 async function mcRestoreFromServer(){
   const note = document.getElementById('vbNote');
   try{
-    let r = await gasApi('GET_MENU_CARDS', {}, 12000);
+    let r = await gasApi('GET_MENU_CARDS', {}, 45000);
     console.log('[MenuCard] GET_MENU_CARDS ->', r);
-
-    /* If the list action is unavailable/slow, the active-card action is enough
-       to restore what customers currently see. */
     if(!(r && r.success)){
-      const a = await gasApi('GET_ACTIVE_MENU_CARD', {}, 12000);
+      /* fall back to the single active card the customer page uses */
+      const a = await gasApi('GET_ACTIVE_MENU_CARD', {}, 30000);
       console.log('[MenuCard] GET_ACTIVE_MENU_CARD ->', a);
-      if(a && a.success && a.data){
-        r = {success:true, data: a.data};
-      }
+      if (a && a.success && a.data && (a.data.fileUrl || a.data.fileId)) r = { success:true, data:[ Object.assign({active:true}, a.data) ] };
     }
     if(!(r && r.success)){
-      if(note) note.textContent = '⚠️ Server menu cards unavailable — local cards are still shown.';
+      const msg = (r && r.message) ? r.message : 'no reply';
+      if(note) note.textContent = '⚠️ Could not load saved menu cards from server: '+msg;
+      toast('⚠️ Saved menu cards could not be loaded: '+msg, 'error');
       return;
     }
-
-    const root = r.data !== undefined ? r.data : r;
-    let arr = [];
-    if(Array.isArray(root)) arr = root;
-    else if(root && Array.isArray(root.cards)) arr = root.cards;
-    else if(root && Array.isArray(root.items)) arr = root.items;
-    else if(root && Array.isArray(root.rows)) arr = root.rows;
-    else if(root && (root.fileUrl || root.url || root.link || root.fileId || root.driveId)) arr = [root];
-
-    const list = loadUploads();
-    let changed = false;
-
+    const arr = Array.isArray(r.data) ? r.data : (r.data && (r.data.cards||r.data.items||r.data.rows)) || r.cards || [];
+    if(!arr.length) return;
+    const list = loadUploads(); let changed = false;
     arr.forEach(c=>{
-      if(!c) return;
-      const id = c.cardId || c.CARD_ID || c.id || '';
-      const rawUrl = c.fileUrl || c.url || c.link || c.FILE_URL || c.LINK || '';
-      const fid = c.fileId || c.driveId || c.FILE_ID || '';
-      const url = rawUrl || (fid ? 'https://drive.google.com/file/d/'+fid+'/view' : '');
-      if(!url && !id) return;
-
-      const isActive = c.active===true ||
-        String(c.active ?? c.ACTIVE ?? '').toUpperCase()==='TRUE' ||
-        c.active===1 || String(c.active)==='1';
-
-      let have = list.find(u=>(id && u.id===id) || (url && u.fileUrl===url));
+      const id  = c.cardId || c.CARD_ID || c.id;
+      const url = mcDriveUrl(c);
+      const have = list.find(u=>u.id===id || (url && u.fileUrl===url));
+      const isActive = (c.active===true || String(c.active||c.ACTIVE||'').toUpperCase()==='TRUE' || c.active===1);
       if(!have){
-        have = {
-          id:id || ('MC'+Date.now()+Math.random().toString(36).slice(2,6)),
-          name:c.name||c.NAME||'Menu Card',
-          fileName:c.fileName||c.FILE_NAME||'Google Drive file',
-          mime:c.mime||c.MIME||'link',
-          fileUrl:url,
-          cardType:c.cardType||c.type||c.CARD_TYPE||'FOOD',
-          uploadedAt:c.uploadedAt||c.createdAt||c.CREATED_AT||new Date().toISOString(),
-          active:isActive,
-          synced:true
-        };
-        list.push(have);
+        list.push({ id:id||('MC'+Date.now()+Math.random().toString(36).slice(2,6)), name:c.name||c.NAME||'Menu Card', fileName:c.fileName||'Google Drive file', mime:'link', fileUrl:url, cardType:c.cardType||'FOOD', uploadedAt:c.uploadedAt||c.createdAt||new Date().toISOString(), active:isActive, synced:true });
         changed = true;
-      }else{
-        if(url && have.fileUrl!==url){ have.fileUrl=url; changed=true; }
-        if(isActive && !have.active){ have.active=true; changed=true; }
-      }
+      } else if (isActive && !have.active){ have.active = true; changed = true; }
     });
-
-    /* Only one active card per type. */
-    const byType = {};
-    list.forEach(u=>{
-      const t=String(u.cardType||'FOOD').toUpperCase();
-      if(u.active){
-        if(byType[t]) u.active=false;
-        else byType[t]=u;
-      }
-    });
-
-    if(changed) saveUploads(list);
-    renderUploadView();
+    if(changed){ saveUploads(list); renderUploadView(); }
   }catch(e){
     console.error('[MenuCard] restore failed', e);
-    if(note) note.textContent = '⚠️ Could not load saved menu cards — local cards are still shown.';
+    if(note) note.textContent = '⚠️ Could not load saved menu cards: '+(e&&e.message||e);
   }
 }
 window.addEventListener('DOMContentLoaded', async () => {
