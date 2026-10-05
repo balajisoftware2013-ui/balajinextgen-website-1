@@ -311,7 +311,11 @@ function mcClientId(){
   }catch(e){return '';}
 }
 function MC_HAS_CLIENT(){ return !!mcClientId(); }
-function mcUploadsKey(){ return MC_UPLOADS_KEY_BASE+'_'+(mcClientId()||'default'); }
+function mcCid(){
+  try{ if(typeof ERP!=='undefined'){ const c=(typeof ERP.getClientId==='function'&&ERP.getClientId())||(typeof ERP.getClient==='function'&&ERP.getClient()); const v=c&&typeof c==='object'?(c.CLIENT_ID||c.clientId||c.client_id):c; if(v) return String(v); } }catch(e){}
+  return mcClientId();
+}
+function mcUploadsKey(){ return MC_UPLOADS_KEY_BASE+'_'+(mcCid()||'default'); }
 
 /* FIX (2026-10-04 "Saving… stuck" on a 10.8 MB PDF): the whole file was
    kept as a base64 string inside localStorage (≈5 MB per site), so any real
@@ -344,27 +348,23 @@ async function mcFileDel(id){
   try{ const db=await mcIdb(); db.transaction('files','readwrite').objectStore('files').delete(mcUploadsKey()+'::'+id); }catch(e){}
 }
 function loadUploads(){
-  /* FIX (card vanishes): the storage key depends on the client id, which is read from sessionStorage/localStorage
-     and can be empty on a reload ('default' key) -> the list looked empty. Now: read this key, and if it is empty
-     pick up lists saved under ANY bnx_menu_card_uploads_v1_* key (other client id / 'default') and adopt them. */
-  try{
-    const cur = JSON.parse(localStorage.getItem(mcUploadsKey())||'[]');
-    if (cur.length) return cur;
-    const cid = mcClientId();
-    let best = [];
-    for (let i=0;i<localStorage.length;i++){
-      const k = localStorage.key(i);
-      if (!k || k.indexOf(MC_UPLOADS_KEY_BASE)!==0 || k===mcUploadsKey()) continue;
-      if (cid && k !== MC_UPLOADS_KEY_BASE+'_default' && k !== MC_UPLOADS_KEY_BASE+'_'+cid) continue; /* never adopt another restaurant's list */
-      try{ const a = JSON.parse(localStorage.getItem(k)||'[]'); if (a.length > best.length) best = a; }catch(e){}
-    }
-    if (best.length){ try{ localStorage.setItem(mcUploadsKey(), JSON.stringify(best)); }catch(e){} }
-    return best;
-  }catch(e){ return []; }
+  /* FIX (upload vanishes after going back): the list was stored under a key that contained the client id, and the
+     id was found by different code at save-time and at load-time ('default' vs 'CL00010'). Now every list that could
+     belong to THIS restaurant (current id, mcClientId(), 'default') is merged, so nothing is hidden. */
+  const base = MC_UPLOADS_KEY_BASE+'_';
+  const keys = [mcUploadsKey(), base+(mcClientId()||'default'), base+'default'];
+  const seen = {}, out = [];
+  keys.forEach(k=>{
+    if (seen['k'+k]) return; seen['k'+k]=1;
+    let a=[]; try{ a=JSON.parse(localStorage.getItem(k)||'[]'); }catch(e){}
+    a.forEach(u=>{ if(!u||!u.id) return; const i=out.findIndex(x=>x.id===u.id); if(i<0) out.push(u); else if(u.synced&&!out[i].synced) out[i]=u; });
+  });
+  out.sort((x,y)=>String(y.uploadedAt||'').localeCompare(String(x.uploadedAt||'')));
+  return out;
 }
 function saveUploads(arr){
   const slim = arr.map(u=>{ const c=Object.assign({},u); delete c.dataUrl; return c; });
-  try{ localStorage.setItem(mcUploadsKey(), JSON.stringify(slim)); return true; }
+  try{ localStorage.setItem(mcUploadsKey(), JSON.stringify(slim)); if(mcUploadsKey()!==MC_UPLOADS_KEY_BASE+'_default') localStorage.removeItem(MC_UPLOADS_KEY_BASE+'_default'); return true; }
   catch(e){ toast('⚠️ Could not update the menu card list on this device.','error'); return false; }
 }
 /* one-time move of old entries that still carry dataUrl inside localStorage */
@@ -542,7 +542,7 @@ async function saveUpload(){
     closeUploadModal();
     if(autoSet) setView('upload'); else renderUploadView();
     toast('⏳ Saved — syncing '+Math.round(bytes/1024)+' KB to the server…');
-    const r = await gasApi('SAVE_MENU_CARD_UPLOAD', { name, fileName: record.fileName, mime: record.mime, dataUrl: prep.dataUrl, active: record.active }, 180000);
+    const r = await gasApi('SAVE_MENU_CARD_UPLOAD', { name, fileName: record.fileName, mime: record.mime, dataUrl: prep.dataUrl, active: record.active, cardId: record.id }, 180000);
     if (r && r.success){
       record.synced = true;
       saveUploads(loadUploads().map(u=>u.id===record.id?Object.assign({},u,{synced:true}):u));
@@ -650,7 +650,7 @@ async function mcSyncToServer(id, makeActive){
   const dataUrl = await mcFileGet(id);
   if(!dataUrl){ toast('⚠️ The file is not stored on this device, so it cannot be re-sent. Please upload the PDF again.','error'); return false; }
   toast('⏳ Sending to the server…');
-  const r = await gasApi('SAVE_MENU_CARD_UPLOAD', { name:rec.name, fileName:rec.fileName, mime:rec.mime, dataUrl, active:!!makeActive }, 180000);
+  const r = await gasApi('SAVE_MENU_CARD_UPLOAD', { name:rec.name, fileName:rec.fileName, mime:rec.mime, dataUrl, active:!!makeActive, cardId:rec.id }, 180000);
   if(r && r.success){
     saveUploads(loadUploads().map(u=>u.id===id?Object.assign({},u,{synced:true}):u));
     return true;
@@ -971,6 +971,16 @@ window.addEventListener('DOMContentLoaded', async () => {
   }
   if (!user) return;
   loadLiveMenu();   /* start the menu now — branding below must never delay it */
+  /* restore Drive-link cards saved on the server (GET_MENU_CARDS) so the list survives a new browser / cleared storage */
+  gasApi('GET_MENU_CARDS', {}, 30000).then(r=>{
+    if(!(r && r.success && Array.isArray(r.data) && r.data.length)) return;
+    const list = loadUploads(); let changed = false;
+    r.data.forEach(c=>{
+      const have = list.find(u=>u.id===c.cardId || (u.fileUrl && u.fileUrl===c.fileUrl));
+      if(!have){ list.push({ id:c.cardId, name:c.name, fileName:'Google Drive link', mime:'link', fileUrl:c.fileUrl, cardType:'FOOD', uploadedAt:new Date().toISOString(), active:!!c.active, synced:true }); changed = true; }
+    });
+    if(changed){ saveUploads(list); renderUploadView(); }
+  }).catch(()=>{});
   // Same GET_CLIENT_INFO action every other staff-facing page already
   // uses for its own name/logo — real data, not invented per-client copy.
   try {
