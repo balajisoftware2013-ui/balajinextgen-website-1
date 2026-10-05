@@ -538,11 +538,19 @@ function mapLiveDsrDay_(raw){
   // PASS #71: generic ONLINE / OTHER modes and paid-but-mode-unknown
   // historical bills (unallocatedPaid) are real collections — never drop them.
   const online=onlineRaw, otherPay=n(raw.other), unalloc=n(raw.unallocatedPaid);
-  const totalcash=cash+card+gpay+n(raw.pvt)+otherPay+unalloc+dueCash+dueBank; // actual receipts only; exclude credit sales and platform POS sales
+  /* BNX DSR EXCEL MATCH 2026-10-05 (reference: client monthly DSR workbook):
+       Net Sale            = Gross (pre-tax, after discount) + Tax + Round Off
+       Tender total        = Cash + Card + GPay + Pvt + Guest Due Sales + Zomato + Swiggy (+EazyDine/Other/Unallocated)
+       Diff                = Net Sale − Tender total   (must be 0 when every bill is settled to a mode)
+       Total Cash Collection = CASH Sale + Due Received Cash   (cash actually in the till)
+     The old totalcash added card/GPay/due-bank and compared it with Net, so any
+     day with a credit sale or a due receipt always showed a false Diff. */
+  const totalcash=cash+dueCash;
+  const tender=cash+card+gpay+n(raw.pvt)+credit+zomato+swiggy+eazydine+otherPay+unalloc;
   return {
     bills:n(raw.bills),liquor,liquormrp:n(raw.liquorMrp),food,bev,hf,others,
     gross,tax,round,net,cash,card,gpay,pvt:n(raw.pvt),credit,zomato,swiggy,eazydine,
-    duerecvcash:dueCash,duerecvbank:dueBank,totalcash,disc:n(raw.discount),
+    duerecvcash:dueCash,duerecvbank:dueBank,totalcash,tender,disc:n(raw.discount),
     guestcn:n(raw.guestDuesCN),online,otherpay:otherPay,unalloc,ncbills:n(raw.ncBills),covers:n(raw.covers),source:'LIVE_DSR_MATRIX'
   };
 }
@@ -741,8 +749,19 @@ async function bnxRmPool_(items,limit,fn){
   await Promise.all(ws); return out;
 }
 
+/* Sum of every tender a day's sales were settled to (DSR workbook "Diff" base). */
+function bnxDsrTender_(r){
+  r=r||{}; var n=function(k){return Number(r[k])||0;};
+  return n('cash')+n('card')+n('gpay')+n('pvt')+n('credit')+n('zomato')+n('swiggy')+n('eazydine')+n('otherpay')+n('unalloc');
+}
+/* Guest dues roll-forward (DSR workbook): Closing = Opening + Guest Due Sales − Due Received (cash+bank) − CN issued.
+   Discount is NOT a receivable movement — the old formula subtracted it. */
+function bnxDsrCloseDues_(open,credit,recvCash,recvBank,cn){
+  return (Number(open)||0)+(Number(credit)||0)-(Number(recvCash)||0)-(Number(recvBank)||0)-(Number(cn)||0);
+}
 function bnxRmTotalCash_(e){
-  e.totalcash=(e.cash||0)+(e.card||0)+(e.gpay||0)+(e.pvt||0)+(e.otherpay||0)+(e.unalloc||0)+(e.duerecvcash||0)+(e.duerecvbank||0); // exclude credit/platform sales from actual collections
+  e.totalcash=(Number(e.cash)||0)+(Number(e.duerecvcash)||0); // Total Cash Collection = Cash Sale + Due Received Cash (DSR workbook)
+  e.tender=bnxDsrTender_(e);
 }
 
 
@@ -1053,6 +1072,41 @@ async function bnxReconcileDsrFromBills_(fromDate,toDate){
   return Object.keys(by).length>0;
 }
 
+/* BNX DSR INSTANT 2026-10-05: the last good live DSR (per client) is kept in
+   localStorage and painted the moment a date is opened, marked "snapshot ·
+   refreshing". The live pull ALWAYS still runs and replaces it; snapshot days
+   of a month are purged as soon as that month's live data arrives, so a bill
+   deleted on the server can never survive from the snapshot. */
+function bnxDsrSnapKey_(){ try{ return 'bnx_dsr_snap_v1_'+String(getClientId_()||CLIENT_ID||''); }catch(e){ return ''; } }
+let BNX_DSR_SNAP_T_=null;
+function bnxDsrSnapSave_(){
+  clearTimeout(BNX_DSR_SNAP_T_);
+  BNX_DSR_SNAP_T_=setTimeout(function(){
+    try{
+      const k=bnxDsrSnapKey_(); if(!k||/_$/.test(k)) return;
+      const out={};
+      Object.keys(STANDARD_DATA||{}).forEach(function(d){ const r=STANDARD_DATA[d]; if(/^\d{4}-\d{2}-\d{2}$/.test(d)&&r&&!r._snap&&/LIVE/.test(String(r.source||''))) out[d]=r; });
+      if(!Object.keys(out).length) return;
+      localStorage.setItem(k,JSON.stringify({at:Date.now(),data:out}));
+    }catch(e){ try{ localStorage.removeItem(bnxDsrSnapKey_()); }catch(_){} }
+  },600);
+}
+function bnxDsrSnapLoad_(){
+  try{
+    const k=bnxDsrSnapKey_(); if(!k) return 0;
+    const j=JSON.parse(localStorage.getItem(k)||'null'); if(!j||!j.data) return 0;
+    let n=0;
+    Object.keys(j.data).forEach(function(d){ if(!STANDARD_DATA[d]){ STANDARD_DATA[d]=Object.assign({},j.data[d],{_snap:true}); n++; } });
+    return n;
+  }catch(e){ return 0; }
+}
+function bnxDsrSnapPurge_(from,to){
+  Object.keys(STANDARD_DATA||{}).forEach(function(d){ if(d>=from&&d<=to&&STANDARD_DATA[d]&&STANDARD_DATA[d]._snap) delete STANDARD_DATA[d]; });
+}
+function bnxDsrHasLive_(from,to){
+  return Object.keys(STANDARD_DATA||{}).some(function(d){ return d>=from&&d<=to&&STANDARD_DATA[d]&&!STANDARD_DATA[d]._snap; });
+}
+
 const BNX_DSR_MONTH_FLIGHT_ = new Map();
 async function fetchDsrMonthLive_(year,month){
   const _mk=String(year)+'-'+String(month).padStart(2,'0');
@@ -1071,10 +1125,17 @@ async function fetchDsrMonthLive_(year,month){
   if(!r || !r.success || !r.data || !r.data.byDay){
     if(r&&r.authExpired){gasToast('🔐 Session expired — please login again','error');return false;}
     // REPORT MAP: matrix unavailable -> build the month from the Reports Hub feeds.
+    // Work on a clean month so snapshot rows can't be mistaken for live rows.
+    const snapBak={}; Object.keys(STANDARD_DATA).forEach(k=>{if(k>=mFrom&&k<=mTo&&STANDARD_DATA[k]._snap)snapBak[k]=STANDARD_DATA[k];});
+    bnxDsrSnapPurge_(mFrom,mTo);
     await bnxReportMap_(mFrom,mTo);
     try{await bnxReconcileDsrFromBills_(mFrom,mTo);}catch(e){console.warn('[DSR BILL MASTER RECON]',e);}
-    return Object.keys(STANDARD_DATA).some(k=>k>=mFrom&&k<=mTo);
+    const liveOk=bnxDsrHasLive_(mFrom,mTo);
+    if(!liveOk) Object.keys(snapBak).forEach(k=>{STANDARD_DATA[k]=snapBak[k];});   // offline: keep showing the marked snapshot
+    else bnxDsrSnapSave_();
+    return liveOk;
   }
+  bnxDsrSnapPurge_(mFrom,mTo);
   // Keep the full server matrix. Do not fabricate a row when POS has no sales.
   Object.keys(r.data.byDay).forEach(day=>{
     const d=String(day).padStart(2,'0');
@@ -1085,6 +1146,7 @@ async function fetchDsrMonthLive_(year,month){
   // REPORT MAP: fill zeros from the Reports Hub feeds (never overwrites non-zero).
   await bnxReportMap_(mFrom,mTo);
   try{await bnxReconcileDsrFromBills_(mFrom,mTo);}catch(e){console.warn('[DSR BILL MASTER RECON]',e);}
+  bnxDsrSnapSave_();
   return true;
   })();
   BNX_DSR_MONTH_FLIGHT_.set(_mk,_work);
@@ -1099,7 +1161,7 @@ async function fetchDsrYtdLive_(asOfDate){
 
 async function ensureDsrMonthLoaded_(date){
   const ds=String(date||'').slice(0,10); if(!/^\d{4}-\d{2}-\d{2}$/.test(ds)) return false;
-  if(STANDARD_DATA[ds]) return true;
+  if(STANDARD_DATA[ds]&&!STANDARD_DATA[ds]._snap) return true;
   const y=Number(ds.slice(0,4)),m=Number(ds.slice(5,7));
   return await fetchDsrMonthLive_(y,m);
 }
@@ -1112,10 +1174,11 @@ async function ensureDsrFiscalRangeLoaded_(date){
   const fy=dt.getMonth()>=3?dt.getFullYear():dt.getFullYear()-1;
   const fyStart=fy+'-04-01';
   // If the selected FY start and selected date are already in memory, no reload.
-  if(STANDARD_DATA[fyStart] || ds===fyStart){
+  const _live=k=>STANDARD_DATA[k]&&!STANDARD_DATA[k]._snap;   // snapshot rows never count as loaded
+  if(_live(fyStart) || ds===fyStart){
     let hasAny=false;
-    for(const k of Object.keys(STANDARD_DATA)){ if(k>=fyStart && k<=ds){hasAny=true;break;} }
-    if(hasAny && STANDARD_DATA[ds]) return true;
+    for(const k of Object.keys(STANDARD_DATA)){ if(k>=fyStart && k<=ds && _live(k)){hasAny=true;break;} }
+    if(hasAny && _live(ds)) return true;
   }
   return await directPOSFetchRange(fyStart,ds);
 }
@@ -1163,6 +1226,14 @@ async function onDsrDateChange(){
   refreshHdr();
   const y=Number(ds.slice(0,4)),m=Number(ds.slice(5,7));
   const st=$('dsrSourceStatus'); if(st) st.textContent='⏳ Loading live POS · '+ds+'…';
+  // INSTANT: paint the last good live snapshot immediately while the live pull runs.
+  try{
+    if(!STANDARD_DATA[ds]) bnxDsrSnapLoad_();
+    if(STANDARD_DATA[ds]&&STANDARD_DATA[ds]._snap){
+      bnxDsrPaint_(ds);
+      if(st) st.textContent='⚡ Saved snapshot · '+ds+' · refreshing live POS…';
+    }
+  }catch(e){}
   window.__bnxDsrEarlyPaint=function(f,t){ if(my===BNX_DSR_SEQ_ && ds>=f && ds<=t) bnxDsrPaint_(ds); };
   let ok=false;
   window.BNX_DSR_LOADING_=true;
@@ -1266,6 +1337,7 @@ async function directPOSFetchRange(fromDate,toDate){
       }
     }
     if(dayMap){
+      bnxDsrSnapPurge_(fromDate,toDate);
       Object.keys(dayMap).forEach(k=>{STANDARD_DATA[k]=mapLiveDsrDay_(dayMap[k]);});
       okCount=1;
     }else if(r&&r.authExpired){gasToast('🔐 Session expired — please login again','error');return false;}
@@ -1286,6 +1358,7 @@ async function directPOSFetchRange(fromDate,toDate){
   if(Object.keys(STANDARD_DATA).length) okCount=okCount||1;
   if(okCount){
     BNX_FY_LOADED_={from:fromDate,to:toDate};
+    bnxDsrSnapSave_();
     return true;
   }
   setStatus('NO LIVE DSR HISTORY');
@@ -2513,14 +2586,14 @@ html,body{font-size:14px!important;}
           <div class="dsr-row"><label>EazyDine POS Bill Sales</label><input class="dsr-val editable" id="d_eazydine" title="Sales from POS bills marked EazyDine; not settlement received" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row"><label>Dues Cash</label><input class="dsr-val editable" id="d_duerecvcash" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row"><label>Dues bank</label><input class="dsr-val editable" id="d_duerecvbank" value="0" oninput="recalcAll()"/></div>
-          <div class="dsr-row total-cash"><label>Total Actual Collection</label><span class="dsr-val" id="d_totalcash">0</span></div>
+          <div class="dsr-row total-cash"><label>Total Cash Collection</label><span class="dsr-val" id="d_totalcash">0</span></div>
           <div class="sl sl-red">Other</div>
           <div class="dsr-row"><label>Discount</label><input class="dsr-val editable" id="d_disc" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row"><label>CN issued</label><input class="dsr-val editable" id="d_guestcn" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row highlight"><label>Opening Outstanding</label><input class="dsr-val editable" id="d_opengd" value="0" oninput="recalcAll()" title="Live opening customer outstanding derived from live receivable control"/></div>
           <div class="dsr-row highlight"><label>Due Received (All Modes)</label><span class="dsr-val" id="d_due_total">0</span></div>
           <div class="dsr-row highlight"><label>Closing Outstanding</label><span class="dsr-val" id="d_currgd">0</span></div>
-          <div class="dsr-row diff-row"><label>Diff (Net − Cash)</label><span class="dsr-val" id="d_diff">0</span></div>
+          <div class="dsr-row diff-row"><label>Diff (Net − Tenders)</label><span class="dsr-val" id="d_diff">0</span></div>
         </div>
       </div>
       <div class="col-mtd">
@@ -2548,13 +2621,14 @@ html,body{font-size:14px!important;}
           <div class="dsr-row"><label>EazyDine POS Bill Sales</label><input class="dsr-val editable" id="m_eazydine" title="Sales from POS bills marked EazyDine; not settlement received" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row"><label>Dues Cash</label><input class="dsr-val editable" id="m_duerecvcash" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row"><label>Dues bank</label><input class="dsr-val editable" id="m_duerecvbank" value="0" oninput="recalcAll()"/></div>
-          <div class="dsr-row total-cash"><label>Total Actual Collection</label><span class="dsr-val" id="m_totalcash">0</span></div>
+          <div class="dsr-row total-cash"><label>Total Cash Collection</label><span class="dsr-val" id="m_totalcash">0</span></div>
           <div class="sl sl-red">Other</div>
           <div class="dsr-row"><label>Discount</label><input class="dsr-val editable" id="m_disc" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row"><label>CN issued</label><input class="dsr-val editable" id="m_guestcn" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row highlight"><label>Opening Outstanding</label><input class="dsr-val editable" id="m_opengd" value="0" oninput="recalcAll()" title="Opening customer outstanding for MTD"/></div>
           <div class="dsr-row highlight"><label>Due Received (All Modes)</label><span class="dsr-val" id="m_due_total">0</span></div>
           <div class="dsr-row highlight"><label>Closing Outstanding</label><span class="dsr-val" id="m_currgd">0</span></div>
+          <div class="dsr-row diff-row"><label>Diff (Net − Tenders)</label><span class="dsr-val" id="m_diff">0</span></div>
         </div>
       </div>
       <div class="col-ytd">
@@ -2582,13 +2656,14 @@ html,body{font-size:14px!important;}
           <div class="dsr-row"><label>EazyDine POS Bill Sales</label><input class="dsr-val editable" id="y_eazydine" title="Sales from POS bills marked EazyDine; not settlement received" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row"><label>Dues Cash</label><input class="dsr-val editable" id="y_duerecvcash" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row"><label>Dues bank</label><input class="dsr-val editable" id="y_duerecvbank" value="0" oninput="recalcAll()"/></div>
-          <div class="dsr-row total-cash"><label>Total Actual Collection</label><span class="dsr-val" id="y_totalcash">0</span></div>
+          <div class="dsr-row total-cash"><label>Total Cash Collection</label><span class="dsr-val" id="y_totalcash">0</span></div>
           <div class="sl sl-red">Other</div>
           <div class="dsr-row"><label>Discount</label><input class="dsr-val editable" id="y_disc" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row"><label>CN issued</label><input class="dsr-val editable" id="y_guestcn" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row highlight"><label>Opening Outstanding</label><input class="dsr-val editable" id="y_opengd" value="0" oninput="recalcAll()" title="Opening customer outstanding for YTD"/></div>
           <div class="dsr-row highlight"><label>Due Received (All Modes)</label><span class="dsr-val" id="y_due_total">0</span></div>
           <div class="dsr-row highlight"><label>Closing Outstanding</label><span class="dsr-val" id="y_currgd">0</span></div>
+          <div class="dsr-row diff-row"><label>Diff (Net − Tenders)</label><span class="dsr-val" id="y_diff">0</span></div>
         </div>
       </div>
     </div>
@@ -3529,15 +3604,15 @@ function loadDayData() {
   Object.keys(data).forEach(k=>{
     const r=data[k];
     r.opengd = Number(r.opengd)||0;
-    r.currgd = r.opengd + (Number(r.credit)||0) - (Number(r.disc)||0) - (Number(r.guestcn)||0);
+    r.currgd = bnxDsrCloseDues_(r.opengd, r.credit, r.duerecvcash, r.duerecvbank, r.guestcn);
   });
   if(d) {
     sv('d_liquor',d.liquor);sv('d_liquormrp',d.liquormrp||0);sv('d_food',d.food);sv('d_bev',d.bev);sv('d_hf',d.hf);sv('d_others',d.others);
     sv('d_tax',d.tax);sv('d_round',d.round||0);sv('d_cash',d.cash);sv('d_card',d.card);sv('d_gpay',d.gpay);sv('d_pvt',d.pvt||0);
-    sv('d_duesales',d.credit);sv('d_zomato',d.zomato);sv('d_swiggy',d.swiggy);sv('d_eazydine',d.eazydine);sv('d_duerecvcash',d.duerecvcash);sv('d_duerecvbank',d.duerecvbank);sv('d_disc',d.disc); d.opengd=Number($('d_opengd')?.value)||0; d.guestcn=Number($('d_guestcn')?.value)||0;
-    showToast('✅ POS data loaded for '+ds,'ok');
+    sv('d_duesales',d.credit);sv('d_zomato',d.zomato);sv('d_swiggy',d.swiggy);sv('d_eazydine',d.eazydine);sv('d_duerecvcash',d.duerecvcash);sv('d_duerecvbank',d.duerecvbank);sv('d_disc',d.disc); sv('d_guestcn',d.guestcn); d.opengd=Number($('d_opengd')?.value)||0;
+    showToast(d._snap?('⚡ Snapshot for '+ds+' — refreshing live…'):('✅ POS data loaded for '+ds),'ok');
   } else {
-    ['d_liquor','d_liquormrp','d_food','d_bev','d_hf','d_others','d_tax','d_round','d_cash','d_card','d_gpay','d_pvt','d_duesales','d_zomato','d_swiggy','d_eazydine','d_duerecvcash','d_duerecvbank','d_disc'].forEach(function(id){ var e=$(id); if(e&&e.value!==undefined) e.value=0; });
+    ['d_liquor','d_liquormrp','d_food','d_bev','d_hf','d_others','d_tax','d_round','d_cash','d_card','d_gpay','d_pvt','d_duesales','d_zomato','d_swiggy','d_eazydine','d_duerecvcash','d_duerecvbank','d_disc','d_guestcn'].forEach(function(id){ var e=$(id); if(e&&e.value!==undefined) e.value=0; });
     if(!window.BNX_DSR_LOADING_ && window.__bnxLastNoDataDs!==ds){ window.__bnxLastNoDataDs=ds; setStatus('NO LIVE POS DATA FOR '+ds); }
   }
   const dt=new Date(ds),yr=dt.getFullYear(),mo=dt.getMonth()+1;
@@ -3549,17 +3624,17 @@ function loadDayData() {
   // regardless of what GET_DSR_MATRIX actually returned. Daily (d_*) read
   // the real per-day value correctly; only the MTD/YTD summary columns were
   // wiped. Same five fields, same bug, duplicated for YTD below.
-  let mL=0,mLM=0,mF=0,mB=0,mH=0,mO=0,mT=0,mR=0,mC=0,mCA=0,mG=0,mP=0,mD=0,mZ=0,mS=0,mE=0,mDC=0,mDB=0,mDi=0;
-  Object.entries(data).forEach(([k,r])=>{const dd=new Date(k);if(dd.getFullYear()===yr&&dd.getMonth()+1===mo&&dd<=dt){mL+=r.liquor;mLM+=r.liquormrp||0;mF+=r.food;mB+=r.bev;mH+=r.hf;mO+=r.others;mT+=r.tax;mR+=r.round||0;mC+=r.cash;mCA+=r.card;mG+=r.gpay;mP+=r.pvt||0;mD+=r.credit;mZ+=r.zomato;mS+=r.swiggy;mE+=(r.eazydine||0);mDC+=r.duerecvcash||0;mDB+=r.duerecvbank||0;mDi+=r.disc;}});
+  let mL=0,mLM=0,mF=0,mB=0,mH=0,mO=0,mT=0,mR=0,mC=0,mCA=0,mG=0,mP=0,mD=0,mZ=0,mS=0,mE=0,mDC=0,mDB=0,mDi=0,mCN=0;
+  Object.entries(data).forEach(([k,r])=>{const dd=new Date(k);if(dd.getFullYear()===yr&&dd.getMonth()+1===mo&&dd<=dt){mCN+=Number(r.guestcn)||0;mL+=r.liquor;mLM+=r.liquormrp||0;mF+=r.food;mB+=r.bev;mH+=r.hf;mO+=r.others;mT+=r.tax;mR+=r.round||0;mC+=r.cash;mCA+=r.card;mG+=r.gpay;mP+=r.pvt||0;mD+=r.credit;mZ+=r.zomato;mS+=r.swiggy;mE+=(r.eazydine||0);mDC+=r.duerecvcash||0;mDB+=r.duerecvbank||0;mDi+=r.disc;}});
   sv('m_liquor',mL);sv('m_liquormrp',mLM);sv('m_food',mF);sv('m_bev',mB);sv('m_hf',mH);sv('m_others',mO);sv('m_tax',mT);sv('m_round',mR);
-  sv('m_cash',mC);sv('m_card',mCA);sv('m_gpay',mG);sv('m_pvt',mP);sv('m_duesales',mD);sv('m_zomato',mZ);sv('m_swiggy',mS);sv('m_eazydine',mE);sv('m_duerecvcash',mDC);sv('m_duerecvbank',mDB);sv('m_disc',mDi);
+  sv('m_cash',mC);sv('m_card',mCA);sv('m_gpay',mG);sv('m_pvt',mP);sv('m_duesales',mD);sv('m_zomato',mZ);sv('m_swiggy',mS);sv('m_eazydine',mE);sv('m_duerecvcash',mDC);sv('m_duerecvbank',mDB);sv('m_disc',mDi);sv('m_guestcn',mCN);
   const selD=data[ds]; if(selD){selD.opengd=Number($('d_opengd')?.value)||0;selD.guestcn=Number($('d_guestcn')?.value)||0;selD.currgd=Number($('d_currgd')?.textContent?.replace(/,/g,''))||0;}
   // YTD
   const fyS=mo>=4?new Date(yr,3,1):new Date(yr-1,3,1);
-  let yL=0,yLM=0,yF=0,yB=0,yH=0,yO=0,yT=0,yR=0,yC=0,yCA=0,yG=0,yP=0,yD=0,yZ=0,yS=0,yE=0,yDC=0,yDB=0,yDi=0;
-  Object.entries(data).forEach(([k,r])=>{const dd=new Date(k);if(dd>=fyS&&dd<=dt){yL+=r.liquor;yLM+=r.liquormrp||0;yF+=r.food;yB+=r.bev;yH+=r.hf;yO+=r.others;yT+=r.tax;yR+=r.round||0;yC+=r.cash;yCA+=r.card;yG+=r.gpay;yP+=r.pvt||0;yD+=r.credit;yZ+=r.zomato;yS+=r.swiggy;yE+=(r.eazydine||0);yDC+=r.duerecvcash||0;yDB+=r.duerecvbank||0;yDi+=r.disc;}});
+  let yL=0,yLM=0,yF=0,yB=0,yH=0,yO=0,yT=0,yR=0,yC=0,yCA=0,yG=0,yP=0,yD=0,yZ=0,yS=0,yE=0,yDC=0,yDB=0,yDi=0,yCN=0;
+  Object.entries(data).forEach(([k,r])=>{const dd=new Date(k);if(dd>=fyS&&dd<=dt){yCN+=Number(r.guestcn)||0;yL+=r.liquor;yLM+=r.liquormrp||0;yF+=r.food;yB+=r.bev;yH+=r.hf;yO+=r.others;yT+=r.tax;yR+=r.round||0;yC+=r.cash;yCA+=r.card;yG+=r.gpay;yP+=r.pvt||0;yD+=r.credit;yZ+=r.zomato;yS+=r.swiggy;yE+=(r.eazydine||0);yDC+=r.duerecvcash||0;yDB+=r.duerecvbank||0;yDi+=r.disc;}});
   sv('y_liquor',yL);sv('y_liquormrp',yLM);sv('y_food',yF);sv('y_bev',yB);sv('y_hf',yH);sv('y_others',yO);sv('y_tax',yT);sv('y_round',yR);
-  sv('y_cash',yC);sv('y_card',yCA);sv('y_gpay',yG);sv('y_pvt',yP);sv('y_duesales',yD);sv('y_zomato',yZ);sv('y_swiggy',yS);sv('y_eazydine',yE);sv('y_duerecvcash',yDC);sv('y_duerecvbank',yDB);sv('y_disc',yDi);
+  sv('y_cash',yC);sv('y_card',yCA);sv('y_gpay',yG);sv('y_pvt',yP);sv('y_duesales',yD);sv('y_zomato',yZ);sv('y_swiggy',yS);sv('y_eazydine',yE);sv('y_duerecvcash',yDC);sv('y_duerecvbank',yDB);sv('y_disc',yDi);sv('y_guestcn',yCN);
   recalcAll(); refreshHdr(); buildMonthlyDsrMatrix(); markDone(4);
 }
 
@@ -3567,26 +3642,30 @@ function recalcAll() {
   const v=val;
   const dG=v('d_liquor')+v('d_liquormrp')+v('d_food')+v('d_bev')+v('d_hf')+v('d_others');
   const dN=dG+v('d_tax')+v('d_round');
-  const dTC=v('d_cash')+v('d_card')+v('d_gpay')+v('d_pvt')+v('d_duerecvcash')+v('d_duerecvbank');
+  /* Total Cash Collection = CASH Sale + Due Received Cash; Diff = Net − all sale tenders (DSR workbook). */
+  const tenderOf=p=>v(p+'_cash')+v(p+'_card')+v(p+'_gpay')+v(p+'_pvt')+v(p+'_duesales')+v(p+'_zomato')+v(p+'_swiggy')+v(p+'_eazydine');
+  const diffTo=(id,n)=>{const e=$(id);if(e){e.textContent=fmt(n);e.style.color=Math.abs(n)<2?'var(--green)':'var(--red)';}};
+  const dTC=v('d_cash')+v('d_duerecvcash');
   const dLive=$('d_currgd')?.dataset.live==='1';
-  const dCGD=dLive?(parseFloat(String($('d_currgd')?.textContent||'0').replace(/,/g,''))||0):(v('d_opengd')+v('d_duesales')-v('d_disc')-v('d_guestcn'));
+  const dCGD=dLive?(parseFloat(String($('d_currgd')?.textContent||'0').replace(/,/g,''))||0):bnxDsrCloseDues_(v('d_opengd'),v('d_duesales'),v('d_duerecvcash'),v('d_duerecvbank'),v('d_guestcn'));
   st('d_gross',dG);st('d_net',dN);st('d_totalcash',dTC);if(!dLive)st('d_currgd',dCGD);
-  const dDiff=dN-dTC; const dd=$('d_diff');
-  if(dd){dd.textContent=fmt(dDiff);dd.style.color=Math.abs(dDiff)<2?'var(--green)':'var(--red)';}
+  const dDiff=dN-tenderOf('d'); diffTo('d_diff',dDiff);
 
   const mG=v('m_liquor')+v('m_liquormrp')+v('m_food')+v('m_bev')+v('m_hf')+v('m_others');
   const mN=mG+v('m_tax')+v('m_round');
-  const mTC=v('m_cash')+v('m_card')+v('m_gpay')+v('m_pvt')+v('m_duerecvcash')+v('m_duerecvbank');
+  const mTC=v('m_cash')+v('m_duerecvcash');
   const mLive=$('m_currgd')?.dataset.live==='1';
-  const mCGD=mLive?(parseFloat(String($('m_currgd')?.textContent||'0').replace(/,/g,''))||0):(v('m_opengd')+v('m_duesales')-v('m_disc')-v('m_guestcn'));
+  const mCGD=mLive?(parseFloat(String($('m_currgd')?.textContent||'0').replace(/,/g,''))||0):bnxDsrCloseDues_(v('m_opengd'),v('m_duesales'),v('m_duerecvcash'),v('m_duerecvbank'),v('m_guestcn'));
   st('m_gross',mG);st('m_net',mN);st('m_totalcash',mTC);if(!mLive)st('m_currgd',mCGD);
+  diffTo('m_diff',mN-tenderOf('m'));
 
   const yG=v('y_liquor')+v('y_liquormrp')+v('y_food')+v('y_bev')+v('y_hf')+v('y_others');
   const yN=yG+v('y_tax')+v('y_round');
-  const yTC=v('y_cash')+v('y_card')+v('y_gpay')+v('y_pvt')+v('y_duerecvcash')+v('y_duerecvbank');
+  const yTC=v('y_cash')+v('y_duerecvcash');
   const yLive=$('y_currgd')?.dataset.live==='1';
-  const yCGD=yLive?(parseFloat(String($('y_currgd')?.textContent||'0').replace(/,/g,''))||0):(v('y_opengd')+v('y_duesales')-v('y_disc')-v('y_guestcn'));
+  const yCGD=yLive?(parseFloat(String($('y_currgd')?.textContent||'0').replace(/,/g,''))||0):bnxDsrCloseDues_(v('y_opengd'),v('y_duesales'),v('y_duerecvcash'),v('y_duerecvbank'),v('y_guestcn'));
   st('y_gross',yG);st('y_net',yN);st('y_totalcash',yTC);if(!yLive)st('y_currgd',yCGD);
+  diffTo('y_diff',yN-tenderOf('y'));
 
   st('sum_dGross',dG);st('sum_dNet',dN);st('sum_dCash',dTC);st('sum_dDisc',v('d_disc'));
   st('sum_mNet',mN);st('sum_mCash',mTC);st('sum_yNet',yN);
@@ -3735,9 +3814,16 @@ function buildMonthlyDsrMatrix(){
   today.guestcn=Number($('d_guestcn')?.value)||0;
   today.currgd=Number($('d_currgd')?.textContent?.replace(/,/g,''))||0;
   const sum=(field)=>rows.reduce((a,[,r])=>a+(Number(r[field])||0),0);
-  const fieldValue=(r,key)=>{
-    if(key==='__opening') return Number(r.opengd)||0;
-    if(key==='__current') return Number(r.currgd)||0;
+  /* Day-wise guest dues roll forward from the MTD opening (DSR workbook). */
+  const runDues={}; {
+    let bal=Number($('m_opengd')?.value)||0;
+    days.forEach(d=>{const k=month+'-'+d, r=STANDARD_DATA[k]; if(selectedDate&&month===selectedDate.slice(0,7)&&k>selectedDate) return;
+      const o=bal; bal=bnxDsrCloseDues_(o,r&&r.credit,r&&r.duerecvcash,r&&r.duerecvbank,r&&r.guestcn); runDues[k]={o:o,c:bal};});
+  }
+  const fieldValue=(r,key,k)=>{
+    if(key==='__opening') return k&&runDues[k]?runDues[k].o:(Number(r.opengd)||0);
+    if(key==='__current') return k&&runDues[k]?runDues[k].c:(Number(r.currgd)||0);
+    if(key==='totalcash') return (Number(r.cash)||0)+(Number(r.duerecvcash)||0);
     return Number(r[key])||0;
   };
   const metrics=[
@@ -3766,14 +3852,14 @@ function buildMonthlyDsrMatrix(){
     h+='<td class="today-col">'+fmtM(fieldValue(today,key))+'</td><td class="mtd-col">'+fmtM(key==='__opening' ? Number($('m_opengd')?.value)||0 :
         key==='__current' ? Number($('m_currgd')?.textContent?.replace(/,/g,''))||0 :
         rows.reduce((a,[,r])=>a+fieldValue(r,key),0))+'</td>';
-    days.forEach(d=>{const r=STANDARD_DATA[month+'-'+d]||{};h+='<td class="day-col">'+fmtM(fieldValue(r,key))+'</td>';});
+    days.forEach(d=>{const k=month+'-'+d, r=STANDARD_DATA[k]||{};h+='<td class="day-col">'+fmtM(fieldValue(r,key,k))+'</td>';});
     h+='</tr>';
   });
-  const dNet=Number(today.net)||0, dTotal=Number(today.totalcash)||0;
-  const mNet=sum('net'),mTotal=sum('totalcash');
+  const dNet=Number(today.net)||0, dTotal=bnxDsrTender_(today);
+  const mNet=sum('net'),mTotal=rows.reduce((a,[,r])=>a+bnxDsrTender_(r),0);
   const dDiff=dNet-dTotal,mDiff=mNet-mTotal;
   h+='<tr class="diff-row"><td class="metric">Diff</td><td class="today-col">'+fmtM(dDiff)+'</td><td class="mtd-col">'+fmtM(mDiff)+'</td>';
-  days.forEach(d=>{const r=STANDARD_DATA[month+'-'+d]||{};h+='<td class="day-col">'+fmtM((Number(r.net)||0)-(Number(r.totalcash)||0))+'</td>';});
+  days.forEach(d=>{const r=STANDARD_DATA[month+'-'+d]||{};h+='<td class="day-col">'+fmtM((Number(r.net)||0)-bnxDsrTender_(r))+'</td>';});
   h+='</tr></tbody></table>';
   host.innerHTML=h;
   const badge=$('dsrMatrixLiveBadge');
@@ -4083,7 +4169,7 @@ function bnxMakeDSRJPGBlob_(){
       bnxCanvasText_(ctx,date, U-22,52,12,800,'#fff','right');
 
       const revenue=[['Liquor','liquor'],['Liquor MRP','liquormrp'],['Food','food'],['Beverage','bev'],['HashFreezer','hf'],['Others','others'],['Gross Sale','gross','gross'],['Tax','tax'],['Round Off','round'],['Net Sale','net','net']];
-      const collections=[['CASH Sale','cash'],['ICICI CARD','card'],['ICICI GPAY','gpay'],['Pvt Party','pvt'],['Guest Due Sales','duesales'],['Zomato POS Bill Sales','zomato'],['Swiggy POS Bill Sales','swiggy'],['EazyDine POS Bill Sales','eazydine'],['Due Received Cash','duerecvcash'],['Due Received Bank','duerecvbank'],['Total Actual Collection','totalcash','total']];
+      const collections=[['CASH Sale','cash'],['ICICI CARD','card'],['ICICI GPAY','gpay'],['Pvt Party','pvt'],['Guest Due Sales','duesales'],['Zomato POS Bill Sales','zomato'],['Swiggy POS Bill Sales','swiggy'],['EazyDine POS Bill Sales','eazydine'],['Due Received Cash','duerecvcash'],['Due Received Bank','duerecvbank'],['Total Cash Collection','totalcash','total']];
       const other=[['Discount','disc'],['Guest Dues CN Issued','guestcn'],['Opening Guest Dues','opengd'],['Current Guest Dues','currgd','highlight']];
       function val(pre,key){return bnxJpgMoney_(pre+key);}
       function drawSection(x,y,w,title,rows,pre){
@@ -4169,7 +4255,7 @@ function genReport() {
   const v=num_,g=id=>$(id)?.textContent||'0';
   const outlet=$('outletName')?.value||'';
   const date=$('repDate')?.value||'';
-  const txt=`╔════════════════════════════════════╗\n║  ${outlet}\n║  DSR · ${date}\n║  Prepared by: ${$('preparedBy')?.value||''}\n╚════════════════════════════════════╝\n\n📊 REVENUE (TODAY)\n${'━'.repeat(36)}\nLiquor          : ₹${fmt(v('d_liquor'))}\nLiquor MRP      : ₹${fmt(v('d_liquormrp'))}\nFood            : ₹${fmt(v('d_food'))}\nBeverage        : ₹${fmt(v('d_bev'))}\nHashFreezer     : ₹${fmt(v('d_hf'))}\nOthers          : ₹${fmt(v('d_others'))}\nGross Sale      : ₹${g('d_gross')}\nTax             : ₹${fmt(v('d_tax'))}\nNet Sale        : ₹${g('d_net')}\n\n💰 COLLECTIONS (TODAY)\n${'━'.repeat(36)}\nCASH Sale       : ₹${fmt(v('d_cash'))}\nICICI CARD      : ₹${fmt(v('d_card'))}\nICICI GPAY      : ₹${fmt(v('d_gpay'))}\nPvt Party       : ₹${fmt(v('d_pvt'))}\nGuest Due Sales : ₹${fmt(v('d_duesales'))}\nZomato POS Sales: ₹${fmt(v('d_zomato'))}\nSwiggy POS Sales: ₹${fmt(v('d_swiggy'))}\nEazyDine Sales  : ₹${fmt(v('d_eazydine'))}\nDue Recv Cash   : ₹${fmt(v('d_duerecvcash'))}\nDue Recv Bank   : ₹${fmt(v('d_duerecvbank'))}\nTotal Actual Collection : ₹${g('d_totalcash')}\n\n📌 OTHER\nDiscount        : ₹${fmt(v('d_disc'))}\nCurrent GD      : ₹${g('d_currgd')}\n\n📆 MTD\nNet Sale        : ₹${g('m_net')}\nTotal Actual Collection : ₹${g('m_totalcash')}\n\n📊 YTD\nNet Sale        : ₹${g('y_net')}\n\nBalaji NextGen ERP | 9832014403`;
+  const txt=`╔════════════════════════════════════╗\n║  ${outlet}\n║  DSR · ${date}\n║  Prepared by: ${$('preparedBy')?.value||''}\n╚════════════════════════════════════╝\n\n📊 REVENUE (TODAY)\n${'━'.repeat(36)}\nLiquor          : ₹${fmt(v('d_liquor'))}\nLiquor MRP      : ₹${fmt(v('d_liquormrp'))}\nFood            : ₹${fmt(v('d_food'))}\nBeverage        : ₹${fmt(v('d_bev'))}\nHashFreezer     : ₹${fmt(v('d_hf'))}\nOthers          : ₹${fmt(v('d_others'))}\nGross Sale      : ₹${g('d_gross')}\nTax             : ₹${fmt(v('d_tax'))}\nNet Sale        : ₹${g('d_net')}\n\n💰 COLLECTIONS (TODAY)\n${'━'.repeat(36)}\nCASH Sale       : ₹${fmt(v('d_cash'))}\nICICI CARD      : ₹${fmt(v('d_card'))}\nICICI GPAY      : ₹${fmt(v('d_gpay'))}\nPvt Party       : ₹${fmt(v('d_pvt'))}\nGuest Due Sales : ₹${fmt(v('d_duesales'))}\nZomato POS Sales: ₹${fmt(v('d_zomato'))}\nSwiggy POS Sales: ₹${fmt(v('d_swiggy'))}\nEazyDine Sales  : ₹${fmt(v('d_eazydine'))}\nDue Recv Cash   : ₹${fmt(v('d_duerecvcash'))}\nDue Recv Bank   : ₹${fmt(v('d_duerecvbank'))}\nTotal Cash Collection : ₹${g('d_totalcash')}\n\n📌 OTHER\nDiscount        : ₹${fmt(v('d_disc'))}\nCurrent GD      : ₹${g('d_currgd')}\n\n📆 MTD\nNet Sale        : ₹${g('m_net')}\nTotal Cash Collection : ₹${g('m_totalcash')}\n\n📊 YTD\nNet Sale        : ₹${g('y_net')}\n\nBalaji NextGen ERP | 9832014403`;
   $('reportText').value=txt;
   if($('reportModal').parentNode!==document.body) document.body.appendChild($('reportModal'));
   $('reportModal').style.display='flex';
@@ -4219,7 +4305,7 @@ function bnxMakeDSRPdfBlob_(){
     ['Liquor','liquor'],['Liquor MRP','liquormrp'],['Food','food'],['Beverage','bev'],['HashFreezer','hf'],['Others','others'],
     ['Gross Sale','gross','gross'],['Tax','tax'],['Round Off','round'],['Net Sale','net','net'],
     ['COLLECTIONS',null,'section'],
-    ['CASH Sale','cash'],['ICICI CARD','card'],['ICICI GPAY','gpay'],['Pvt Party','pvt'],['Guest Due Sales','duesales'],['Zomato POS Bill Sales','zomato'],['Swiggy POS Bill Sales','swiggy'],['EazyDine POS Bill Sales','eazydine'],['Due Received Cash','duerecvcash'],['Due Received Bank','duerecvbank'],['Total Actual Collection','totalcash','total'],
+    ['CASH Sale','cash'],['ICICI CARD','card'],['ICICI GPAY','gpay'],['Pvt Party','pvt'],['Guest Due Sales','duesales'],['Zomato POS Bill Sales','zomato'],['Swiggy POS Bill Sales','swiggy'],['EazyDine POS Bill Sales','eazydine'],['Due Received Cash','duerecvcash'],['Due Received Bank','duerecvbank'],['Total Cash Collection','totalcash','total'],
     ['OTHER',null,'section'],
     ['Discount','disc'],['Guest Dues CN Issued','guestcn'],['Opening Guest Dues','opengd'],['Current Guest Dues','currgd','highlight']
   ];
@@ -4281,7 +4367,7 @@ function exportDSRXLSX() {
   if(typeof XLSX==='undefined'){showToast('XLSX loading','');return;}
   const date=$('repDate')?.value||'today';
   const v=val,g=id=>$(id)?.textContent||'0';
-  const rows=[[(document.getElementById('outletName')?.value||'Live Client')+' — DSR — '+date],[''],['REVENUE','TODAY','MTD','YTD'],['Liquor',v('d_liquor'),v('m_liquor'),v('y_liquor')],['Liquor MRP',v('d_liquormrp'),v('m_liquormrp'),v('y_liquormrp')],['Food',v('d_food'),v('m_food'),v('y_food')],['Beverage',v('d_bev'),v('m_bev'),v('y_bev')],['HashFreezer',v('d_hf'),v('m_hf'),v('y_hf')],['Others',v('d_others'),v('m_others'),v('y_others')],['Gross Sale',g('d_gross'),g('m_gross'),g('y_gross')],['Tax',v('d_tax'),v('m_tax'),v('y_tax')],['Net Sale',g('d_net'),g('m_net'),g('y_net')],[''],['COLLECTIONS','','',''],['CASH',v('d_cash'),v('m_cash'),v('y_cash')],['ICICI CARD',v('d_card'),v('m_card'),v('y_card')],['ICICI GPAY',v('d_gpay'),v('m_gpay'),v('y_gpay')],['Guest Due Sales',v('d_duesales'),v('m_duesales'),v('y_duesales')],['Zomato POS Bill Sales',v('d_zomato'),v('m_zomato'),v('y_zomato')],['Swiggy POS Bill Sales',v('d_swiggy'),v('m_swiggy'),v('y_swiggy')],['EazyDine POS Bill Sales',v('d_eazydine'),v('m_eazydine'),v('y_eazydine')],['Total Actual Collection',g('d_totalcash'),g('m_totalcash'),g('y_totalcash')],[''],['Discount',v('d_disc'),v('m_disc'),v('y_disc')],['Opening Outstanding',v('d_opengd'),v('m_opengd'),v('y_opengd')],['Due Received',g('d_due_total'),g('m_due_total'),g('y_due_total')],['Closing Outstanding',g('d_currgd'),g('m_currgd'),g('y_currgd')]];
+  const rows=[[(document.getElementById('outletName')?.value||'Live Client')+' — DSR — '+date],[''],['REVENUE','TODAY','MTD','YTD'],['Liquor',v('d_liquor'),v('m_liquor'),v('y_liquor')],['Liquor MRP',v('d_liquormrp'),v('m_liquormrp'),v('y_liquormrp')],['Food',v('d_food'),v('m_food'),v('y_food')],['Beverage',v('d_bev'),v('m_bev'),v('y_bev')],['HashFreezer',v('d_hf'),v('m_hf'),v('y_hf')],['Others',v('d_others'),v('m_others'),v('y_others')],['Gross Sale',g('d_gross'),g('m_gross'),g('y_gross')],['Tax',v('d_tax'),v('m_tax'),v('y_tax')],['Net Sale',g('d_net'),g('m_net'),g('y_net')],[''],['COLLECTIONS','','',''],['CASH',v('d_cash'),v('m_cash'),v('y_cash')],['ICICI CARD',v('d_card'),v('m_card'),v('y_card')],['ICICI GPAY',v('d_gpay'),v('m_gpay'),v('y_gpay')],['Guest Due Sales',v('d_duesales'),v('m_duesales'),v('y_duesales')],['Zomato POS Bill Sales',v('d_zomato'),v('m_zomato'),v('y_zomato')],['Swiggy POS Bill Sales',v('d_swiggy'),v('m_swiggy'),v('y_swiggy')],['EazyDine POS Bill Sales',v('d_eazydine'),v('m_eazydine'),v('y_eazydine')],['Total Cash Collection',g('d_totalcash'),g('m_totalcash'),g('y_totalcash')],[''],['Discount',v('d_disc'),v('m_disc'),v('y_disc')],['Opening Outstanding',v('d_opengd'),v('m_opengd'),v('y_opengd')],['Due Received',g('d_due_total'),g('m_due_total'),g('y_due_total')],['Closing Outstanding',g('d_currgd'),g('m_currgd'),g('y_currgd')]];
   const ws=XLSX.utils.aoa_to_sheet(rows);
   const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'DSR_'+date);
   XLSX.writeFile(wb,'DSR_'+date+'.xlsx');
@@ -4296,6 +4382,24 @@ let BNX_DUE_CONTROL_={date:'',daily:null,mtd:null,ytd:null,currentOutstanding:0,
 function bnxDueNum_(x){const n=Number(x);return isFinite(n)?n:0;}
 function bnxDateAdd_(ds,delta){const d=new Date(ds+'T00:00:00');d.setDate(d.getDate()+delta);return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
 function bnxRangeCredit_(from,to){let n=0;Object.entries(STANDARD_DATA||{}).forEach(([d,r])=>{if(d>=from&&d<=to)n+=bnxDueNum_(r.credit);});return +n.toFixed(2);}
+function bnxRangeCn_(from,to){let n=0;Object.entries(STANDARD_DATA||{}).forEach(([d,r])=>{if(d>=from&&d<=to)n+=bnxDueNum_(r.guestcn);});return +n.toFixed(2);}
+/* Receipt rows (if the backend sends them with GET_DUE_COLLECTION) → per-day cash/bank. */
+function bnxDueReceiptsByDay_(raw){
+  const out={}; if(!raw||typeof raw!=='object') return out;
+  const list=[raw.receipts,raw.receiptRows,raw.payments,raw.collections,raw.rows].find(a=>Array.isArray(a)&&a.length);
+  if(!list) return out;
+  list.forEach(x=>{
+    const g=k=>(typeof bnxRmGet_==='function')?bnxRmGet_(x,k):x[k[0]];
+    const ds=bnxIsoDay_(g(['RECEIPT_DATE','PAYMENT_DATE','BUSINESS_DATE','DATE','date','receiptDate']));
+    const amt=Number(String(g(['AMOUNT','RECEIVED_AMOUNT','NET_AMOUNT','amount'])||0).replace(/[₹,\s]/g,''))||0;
+    const st=String(g(['STATUS','RECEIPT_STATUS'])||'').toUpperCase();
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(ds)||!(amt>0)||/CANCEL|VOID|DELETED/.test(st)) return;
+    const mode=String(g(['PAYMENT_MODE','MODE','mode','paymentMode'])||'').toUpperCase();
+    const o=out[ds]||(out[ds]={cash:0,bank:0});
+    if(!mode||/^CASH/.test(mode)) o.cash+=amt; else o.bank+=amt;
+  });
+  return out;
+}
 function bnxRangeDueRecv_(from,to){let n=0;Object.entries(STANDARD_DATA||{}).forEach(([d,r])=>{if(d>=from&&d<=to)n+=bnxDueNum_(r.duerecvcash)+bnxDueNum_(r.duerecvbank);});return +n.toFixed(2);}
 async function bnxGetDuePeriod_(from,to){
   try{const r=await gasApi('GET_DUE_COLLECTION',{range:'custom',from:from,to:to});
@@ -4304,6 +4408,7 @@ async function bnxGetDuePeriod_(from,to){
          sum the DSR days we already hold — never reuse "received today" for a month/year range. */
       const has=r.data.receivedInPeriod!=null;
       return {received:bnxDueNum_(has?r.data.receivedInPeriod:bnxRangeDueRecv_(from,to)),cash:bnxDueNum_(r.data.receivedCash),bank:bnxDueNum_(r.data.receivedBank),
+        hasSplit:r.data.receivedCash!=null||r.data.receivedBank!=null,byDay:bnxDueReceiptsByDay_(r.data),
         payments:bnxDueNum_(r.data.paymentsInPeriod!=null?r.data.paymentsInPeriod:r.data.paymentsToday),fromServer:has,raw:r.data};
     }
   }catch(e){console.warn('[DSR DUE]',e);}
@@ -4329,14 +4434,32 @@ async function loadDsrDueControl_(asOfDate){
   const [dayP,mtdP,ytdP]=await Promise.all([
     bnxGetDuePeriod_(ds,ds),bnxGetDuePeriod_(monthStart,ds),bnxGetDuePeriod_(fyStart,ds)
   ]);
+  /* Fill per-day Due Received from the receipts ledger where the DSR matrix sent 0
+     (matrix/day-book do not always carry receipts). Only zero days are filled, never
+     overwritten; the selected day uses the server's own cash/bank split. */
+  let filled=0;
+  const byDay=Object.assign({},ytdP.byDay||{},mtdP.byDay||{},dayP.byDay||{});
+  Object.keys(byDay).forEach(d=>{
+    const e=STANDARD_DATA[d]; if(!e||d>ds) return;
+    if(!(bnxDueNum_(e.duerecvcash)+bnxDueNum_(e.duerecvbank)>0)&&(byDay[d].cash+byDay[d].bank)>0){
+      e.duerecvcash=+byDay[d].cash.toFixed(2); e.duerecvbank=+byDay[d].bank.toFixed(2); bnxRmTotalCash_(e); filled++;
+    }
+  });
+  { const e=STANDARD_DATA[ds];
+    if(e&&dayP.hasSplit&&!(bnxDueNum_(e.duerecvcash)+bnxDueNum_(e.duerecvbank)>0)&&(dayP.cash+dayP.bank)>0){
+      e.duerecvcash=dayP.cash; e.duerecvbank=dayP.bank; bnxRmTotalCash_(e); filled++;
+    }
+  }
   const calc=(from,p)=>{
     const credit=bnxRangeCredit_(from,ds);
+    const cn=bnxRangeCn_(from,ds);
     const received=bnxDueNum_(p.received);
     const closing=live.closing;
-    // Receivable control equation: Closing = Opening + Credit Sales - Due Received.
-    const opening=+(closing-credit+received).toFixed(2);
-    return {opening,credit,received,closing,overdue:live.overdue,customers:live.customers};
+    // Receivable control (DSR workbook): Closing = Opening + Guest Due Sales − Due Received − CN issued.
+    const opening=+(closing-credit+received+cn).toFixed(2);
+    return {opening,credit,received,cn,closing,overdue:live.overdue,customers:live.customers};
   };
+  if(filled){ try{ loadDayData(); }catch(e){} }
   BNX_DUE_CONTROL_={date:ds,currentOutstanding:live.closing,daily:calc(ds,dayP),mtd:calc(monthStart,mtdP),ytd:calc(fyStart,ytdP),loaded:true};
   bnxApplyDueControl_('d',BNX_DUE_CONTROL_.daily);
   bnxApplyDueControl_('m',BNX_DUE_CONTROL_.mtd);
@@ -4354,9 +4477,9 @@ function bnxDueDisplaySummary_(){
   const x=BNX_DUE_CONTROL_; if(!x.loaded)return;
   const f=v=>Number(v||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
   const parts=[
-    `Daily: Opening ₹${f(x.daily.opening)} + Credit ₹${f(x.daily.credit)} − Due Received ₹${f(x.daily.received)} = Closing ₹${f(x.daily.closing)}`,
-    `MTD: Opening ₹${f(x.mtd.opening)} + Credit ₹${f(x.mtd.credit)} − Due Received ₹${f(x.mtd.received)} = Closing ₹${f(x.mtd.closing)}`,
-    `YTD: Opening ₹${f(x.ytd.opening)} + Credit ₹${f(x.ytd.credit)} − Due Received ₹${f(x.ytd.received)} = Closing ₹${f(x.ytd.closing)}`
+    `Daily: Opening ₹${f(x.daily.opening)} + Credit ₹${f(x.daily.credit)} − Due Received ₹${f(x.daily.received)} − CN ₹${f(x.daily.cn)} = Closing ₹${f(x.daily.closing)}`,
+    `MTD: Opening ₹${f(x.mtd.opening)} + Credit ₹${f(x.mtd.credit)} − Due Received ₹${f(x.mtd.received)} − CN ₹${f(x.mtd.cn)} = Closing ₹${f(x.mtd.closing)}`,
+    `YTD: Opening ₹${f(x.ytd.opening)} + Credit ₹${f(x.ytd.credit)} − Due Received ₹${f(x.ytd.received)} − CN ₹${f(x.ytd.cn)} = Closing ₹${f(x.ytd.closing)}`
   ];
   const el=$('dsrDueControlSummary');if(el)el.textContent=parts.join('  |  ');
 }
@@ -4977,7 +5100,7 @@ function exportAllXLSX() {
     ['Guest Due Sales',v('d_duesales'),v('m_duesales'),v('y_duesales')],
     ['Zomato',v('d_zomato'),v('m_zomato'),v('y_zomato')],
     ['Swiggy',v('d_swiggy'),v('m_swiggy'),v('y_swiggy')],
-    ['Total Actual Collection',g('d_totalcash'),g('m_totalcash'),g('y_totalcash')],
+    ['Total Cash Collection',g('d_totalcash'),g('m_totalcash'),g('y_totalcash')],
     [],['OTHER'],
     ['Discount',v('d_disc'),v('m_disc'),v('y_disc')],
   ];
@@ -5839,7 +5962,7 @@ window.bnxMakeDSRJPGBlob_=function(){
       var showYtd=window.bnxShowYtd_(), NC=showYtd?3:2;
       var BOXW=580, GAP=12, PAD=18, S=2, titleH=62, top=78, headH=28, rowH=27;
       var revenue=[['Liquor','liquor'],['Liquor MRP','liquormrp'],['Food','food'],['Beverage','bev'],['HashFreezer','hf'],['Others','others'],['Gross Sale','gross','gross'],['Tax','tax'],['Round Off','round'],['Net Sale','net','net']];
-      var collections=[['CASH Sale','cash'],['ICICI CARD','card'],['ICICI GPAY','gpay'],['Pvt Party','pvt'],['Guest Due Sales','duesales'],['Zomato POS Bill Sales','zomato'],['Swiggy POS Bill Sales','swiggy'],['EazyDine POS Bill Sales','eazydine'],['Due Received Cash','duerecvcash'],['Due Received Bank','duerecvbank'],['Total Actual Collection','totalcash','total']];
+      var collections=[['CASH Sale','cash'],['ICICI CARD','card'],['ICICI GPAY','gpay'],['Pvt Party','pvt'],['Guest Due Sales','duesales'],['Zomato POS Bill Sales','zomato'],['Swiggy POS Bill Sales','swiggy'],['EazyDine POS Bill Sales','eazydine'],['Due Received Cash','duerecvcash'],['Due Received Bank','duerecvbank'],['Total Cash Collection','totalcash','total']];
       var other=[['Discount','disc'],['Guest Dues CN Issued','guestcn'],['Opening Guest Dues','opengd'],['Current Guest Dues','currgd','highlight']];
       var U=PAD*2+NC*BOXW+(NC-1)*GAP;
       var bodyH=3*headH+(revenue.length+collections.length+other.length)*rowH;
@@ -5911,7 +6034,7 @@ window.bnxMakeDSRPdfBlob_=function(){
   var rows=[
     ['REVENUE',null,'section'],['Liquor','liquor'],['Liquor MRP','liquormrp'],['Food','food'],['Beverage','bev'],['HashFreezer','hf'],['Others','others'],
     ['Gross Sale','gross','gross'],['Tax','tax'],['Round Off','round'],['Net Sale','net','net'],
-    ['COLLECTIONS',null,'section'],['CASH Sale','cash'],['ICICI CARD','card'],['ICICI GPAY','gpay'],['Pvt Party','pvt'],['Guest Due Sales','duesales'],['Zomato POS Bill Sales','zomato'],['Swiggy POS Bill Sales','swiggy'],['EazyDine POS Bill Sales','eazydine'],['Due Received Cash','duerecvcash'],['Due Received Bank','duerecvbank'],['Total Actual Collection','totalcash','total'],
+    ['COLLECTIONS',null,'section'],['CASH Sale','cash'],['ICICI CARD','card'],['ICICI GPAY','gpay'],['Pvt Party','pvt'],['Guest Due Sales','duesales'],['Zomato POS Bill Sales','zomato'],['Swiggy POS Bill Sales','swiggy'],['EazyDine POS Bill Sales','eazydine'],['Due Received Cash','duerecvcash'],['Due Received Bank','duerecvbank'],['Total Cash Collection','totalcash','total'],
     ['OTHER',null,'section'],['Discount','disc'],['Guest Dues CN Issued','guestcn'],['Opening Guest Dues','opengd'],['Current Guest Dues','currgd','highlight']
   ];
   var nSec=rows.filter(function(r){return r[2]==='section';}).length;
@@ -6102,20 +6225,11 @@ D.addEventListener('change',function(e){if(e.target&&e.target.id==='repDate'&&P.
 @media(max-width:1100px){#step-4 .dsr-grid{grid-template-columns:repeat(3,minmax(285px,1fr))!important;overflow-x:auto!important;padding-bottom:8px!important;}#step-4 .dsr-grid>.col-day,#step-4 .dsr-grid>.col-mtd,#step-4 .dsr-grid>.col-ytd{min-width:285px!important;}}
 @media(max-width:760px){#step-4 .chip-row{grid-template-columns:repeat(2,minmax(0,1fr))!important;}#step-4 .dsr-grid{grid-template-columns:1fr!important;overflow:visible!important;}#step-4 .dsr-grid>.col-day,#step-4 .dsr-grid>.col-mtd,#step-4 .dsr-grid>.col-ytd{min-width:0!important;}#step-4 .meta-item{min-width:calc(50% - 8px)!important;}#step-4 .chip-val{font-size:20px!important;}}
 </style>
-<script id="bnx-dsr-collection-reconciliation-fix-20261002">
-(function(){
-  if(window.__bnxDsrCollectionReconcileInstalled)return;window.__bnxDsrCollectionReconcileInstalled=true;
-  var original=window.recalcAll;
-  if(typeof original==='function'){
-    window.recalcAll=function(){
-      // The aggregator rows are not independent customer payment modes. Clear their displayed values,
-      // then run the existing totals so aggregator sales/settlements cannot be double-counted as collections.
-      ['d_zomato','d_swiggy','m_zomato','m_swiggy','y_zomato','y_swiggy'].forEach(function(id){var e=document.getElementById(id);if(e&&Number(e.value)!==0)e.value='0';});
-      return original.apply(this,arguments);
-    };
-  }
-})();
-</script>
+<!-- REMOVED 2026-10-05: "bnx-dsr-collection-reconciliation-fix-20261002" wrapped recalcAll()
+     and forced d/m/y Zomato + Swiggy to 0 on every recalculation. In the DSR workbook
+     Zomato/Swiggy are sale tenders (Net Sale = Σ tenders), so zeroing them broke Diff
+     on every day with aggregator orders. Total Cash Collection no longer includes
+     card/GPay/aggregators, so there is nothing left to double count. -->
 
 <style id="bnx-dsr-responsive-final-20261002">
 html,body{max-width:100%;overflow-x:hidden;}
