@@ -628,7 +628,7 @@ function bnxPrimeFromCache(){
     const c=JSON.parse(localStorage.getItem('bnx_menu_'+STATE.clientId)||'null'); if(!c) return false;
     const map=(m,isBar)=>({ id:m.id||m.ITEM_ID||m.itemId||m.name, name:m.name||m.ITEM_NAME||'Item',
       cat:m.category||m.categoryName||m.barCategory||m.CATEGORY||(isBar?'Bar':'Other'),
-      price:parseFloat(m.price??m.sellingPrice??m.PRICE)||0, icon:m.icon||(isBar?'🍸':'🍽'),
+      price:parseFloat(m.price??m.sellingPrice??m.PRICE)||0, icon:m.icon||bnxGuessIcon(m.name||m.ITEM_NAME||'',m.category||m.categoryName||m.CATEGORY||'',isBar), img:bnxItemImg(m), catId:String(m.categoryId||m.CATEGORY_ID||''),
       veg:(m.veg||m.dietaryType||'').toString().toUpperCase(), isBar:!!isBar,
       popular:m.popular===true||String(m.popular).toLowerCase()==='true',
       avail:m.avail!==false&&String(m.availability||m.avail||'available').toLowerCase()!=='unavailable' });
@@ -688,10 +688,12 @@ function bnxRenderActions(){
   if (c.review) b.push('<a class="act-btn" href="'+escH(c.review)+'" target="_blank" rel="noopener">⭐ Rate your visit</a>');
   row.innerHTML=b.join(''); row.style.display=b.length?'flex':'none';
 }
-function goScreen(id){
+function goScreen(id, noPush){
+  const cur=document.querySelector('.screen.active');
   document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
   window.scrollTo(0,0);
+  try{ if(!noPush && id!=='s-menu' && id!=='s-landing' && (!cur || cur.id!==id)) history.pushState({bnx:id},''); }catch(e){}
 }
 
 /* ═══════════════ BOOT ═══════════════ */
@@ -733,7 +735,7 @@ async function boot(){
   bnxPaintBrandText(); applyBrandLogo();
   const infoP = gasApi('GET_CLIENT_INFO', {}, 'V2_CORE').catch(()=>null);
   const infoRes = null;   /* never block the menu on the info call — bnxLateInfo applies name/logo/permissions when it arrives */
-  if (!infoRes) infoP.then(r=>{ if (r && r.success && r.data) bnxLateInfo(r.data); else bnxInfoFail(r); });
+  if (!infoRes) infoP.then(async r=>{ if (r && r.success && r.data) bnxLateInfo(r.data); else { bnxInfoFail(r); const pub=await bnxPublicFetch(); if (pub && pub.info && (pub.info.name||pub.info.logoUrl)) bnxLateInfo(pub.info); } });
   else if (!(infoRes.success && infoRes.data)) bnxInfoFail(infoRes);   /* slow server: still apply logo + name when it arrives */
   if (infoRes && infoRes.success && infoRes.data){
     STATE.restaurantName = infoRes.data.name || infoRes.data.RESTAURANT_NAME || infoRes.data.clientName || STATE.restaurantName;
@@ -943,6 +945,21 @@ function bnxImgErr(img){
   if(alt && img.dataset.n==='1'){ img.dataset.n='2'; img.src=alt; return; }
   const p=img.parentNode; if(p) p.textContent=img.dataset.emo||'🍽';
 }
+
+/* PUBLIC MENU (no session): read-only GET route on the backend (public-menu.gs). Used when the normal
+   guest calls are rejected with "Invalid or expired session". Fetched once and shared. */
+function bnxPublicFetch(){
+  if(!window.__pubP){
+    window.__pubP = (async()=>{
+      try{
+        const ctl=new AbortController(); const tm=setTimeout(()=>ctl.abort(),20000);
+        try{ const r=await fetch(GAS_APIS_DASH.V2_CORE+'?action=PUBLIC_MENU&clientId='+encodeURIComponent(STATE.clientId),{signal:ctl.signal});
+             const j=await r.json(); return (j&&j.success&&j.data)?j.data:null; } finally{ clearTimeout(tm); }
+      }catch(e){ return null; }
+    })();
+  }
+  return window.__pubP;
+}
 async function loadMenuFromServer(){
   // FIX ("digital same menu according show" / "which is bar and food"):
   // this only ever called GET_MENU_ITEMS, which is the FOOD list only —
@@ -979,6 +996,10 @@ async function loadMenuFromServer(){
       if (f) food = f.food.concat(f.bar); if (br) bar = br.food.concat(br.bar);
       gotAny = food.length>0 || bar.length>0;
     }
+  }
+  if (!gotAny){
+    const pub = await bnxPublicFetch();
+    if (pub){ food = Array.isArray(pub.food)?pub.food:[]; bar = Array.isArray(pub.bar)?pub.bar:[]; gotAny = food.length>0 || bar.length>0; if (gotAny) lastErr=''; }
   }
   if (gotAny){ try{ localStorage.setItem('bnx_menu_'+STATE.clientId, JSON.stringify({t:Date.now(),food:food,bar:bar})); }catch(e){} }
   else { try{ const c=JSON.parse(localStorage.getItem('bnx_menu_'+STATE.clientId)||'null'); if(c && (c.food||[]).concat(c.bar||[]).length){ food=c.food||[]; bar=c.bar||[]; gotAny=true; fromCache=true; } }catch(e){} }
@@ -1026,15 +1047,33 @@ async function loadMenuFromServer(){
    active, a button appears offering to view it. */
 STATE.activeMenuCard = null; STATE.menuCards = [];
 async function loadActiveMenuCard(){
-  try{
-    const res = await gasApi('GET_ACTIVE_MENU_CARD', {}, 'V2_CORE');
-    if (res && res.success && res.data && res.data.heroVideo && !qs.get('video')){ STATE.heroVideo = String(res.data.heroVideo); try{ bnxPaintHero(); }catch(e){} }
-    if (res && res.success && res.data && res.data.fileUrl){
-      STATE.activeMenuCard = res.data;
-      /* several active cards (e.g. Food + Bar) → one button each; old servers send just one */
-      STATE.menuCards = (Array.isArray(res.data.cards) && res.data.cards.length ? res.data.cards : [res.data]).filter(c=>c && c.fileUrl);
-    }
-  }catch(e){ /* optional — never blocks the live menu from loading */ }
+  const key='bnx_cards_'+STATE.clientId;
+  const apply=(d)=>{
+    STATE.activeMenuCard = d;
+    /* several active cards (e.g. Food + Bar) → one button each; old servers send just one */
+    STATE.menuCards = (Array.isArray(d.cards) && d.cards.length ? d.cards : [d]).filter(c=>c && c.fileUrl);
+    try{ bnxPaintCardButtons(); }catch(e){}     /* the menu screen is usually already open — draw the button now */
+  };
+  for (let attempt=0; attempt<3; attempt++){
+    if (attempt) await new Promise(r=>setTimeout(r, attempt*2500));
+    try{
+      const res = await gasApi('GET_ACTIVE_MENU_CARD', {}, 'V2_CORE');
+      if (res && res.success && res.data && res.data.heroVideo && !qs.get('video')){ STATE.heroVideo = String(res.data.heroVideo); try{ bnxPaintHero(); }catch(e){} }
+      if (res && res.success && res.data && res.data.fileUrl){
+        apply(res.data);
+        try{ localStorage.setItem(key, JSON.stringify(res.data)); }catch(e){}
+        return;
+      }
+      if (res && res.success) { try{ localStorage.removeItem(key); }catch(e){} return; }   /* server answered: no active card */
+    }catch(e){ /* optional — never blocks the live menu from loading */ }
+  }
+  try{ const pub=await bnxPublicFetch(); const c=pub && pub.card;
+    if (c && c.heroVideo && !qs.get('video')){ STATE.heroVideo=String(c.heroVideo); try{ bnxPaintHero(); }catch(e){} }
+    if (c && c.fileUrl){ apply(c); try{ localStorage.setItem(key, JSON.stringify(c)); }catch(e){} return; }
+    if (pub) return;
+  }catch(e){}
+  /* server unreachable: show the last card this phone saw for this restaurant */
+  try{ const c=JSON.parse(localStorage.getItem(key)||'null'); if(c && c.fileUrl) apply(c); }catch(e){}
 }
 /* View-only menu card: shown inside the page (no new tab, no download button).
    Google Drive links use Drive's embedded preview; direct PDFs hide the
@@ -1077,7 +1116,7 @@ function openLiveMenuView(){
   const box = bnxMcBox();
   document.getElementById('mc-title').textContent = name + ' — Menu';
   document.getElementById('mc-body').innerHTML = html;
-  box.classList.add('show');
+  box.classList.add('show'); bnxPushViewer();
 }
 /* printing / saving the page while a menu is open does nothing */
 window.addEventListener('keydown', e=>{
@@ -1112,10 +1151,13 @@ function openActiveMenuCard(i){
     ? '<img draggable="false" alt="Menu card">'
     : '<iframe allow="" referrerpolicy="no-referrer" title="Menu card"></iframe><div class="mc-guard"></div>';
   body.firstChild.src = m.src;
-  box.classList.add('show');
+  box.classList.add('show'); bnxPushViewer();
 }
+function bnxHideViewer(){ const box=document.getElementById('mc-modal'); if(box){ box.classList.remove('show'); const b=document.getElementById('mc-body'); if(b) b.innerHTML=''; } }
 function closeActiveMenuCard(){
-  const box=document.getElementById('mc-modal'); if(box){ box.classList.remove('show'); document.getElementById('mc-body').innerHTML=''; }
+  const box=document.getElementById('mc-modal');
+  if(box && box.classList.contains('show') && history.state && history.state.bnx==='viewer'){ history.back(); return; }   /* popstate hides it */
+  bnxHideViewer();
 }
 
 /* ═══════════════ PHONE ENTRY ═══════════════ */
@@ -1806,6 +1848,41 @@ function bnxPaintHero(){
       ...Object.keys(g).map(k=>k+' -> '+g[k])].join('\n'); };
   setInterval(draw,800); draw();
 })();
+
+/* ═══════════════ BACK BUTTON + REOPEN ═══════════════
+   • Back closes the open menu viewer / cart / phone screen and returns to the menu — it does not leave the page.
+   • On the menu itself, the first Back shows "Press back again to exit"; the second Back leaves.
+   • Reopening the link (or coming back to the tab) paints the last menu instantly from this phone and then
+     refreshes it quietly from the server; the cart and your place in the menu are kept for the visit. */
+function bnxPushViewer(){ try{ if(!(history.state && history.state.bnx==='viewer')) history.pushState({bnx:'viewer'},''); }catch(e){} }
+
+try{ history.replaceState({bnx:'menu'},''); history.pushState({bnx:'menu-guard'},''); }catch(e){}
+window.addEventListener('popstate', ()=>{
+  const box=document.getElementById('mc-modal');
+  if(box && box.classList.contains('show')){ bnxHideViewer(); return; }
+  const cur=document.querySelector('.screen.active');
+  if(cur && cur.id!=='s-menu' && cur.id!=='s-landing'){ goScreen('s-menu', true); return; }
+  /* already on the menu: Back always STAYS here (never leaves the page).
+     Quietly scroll to top and re-arm the guard entry so the next Back stays too. */
+  try{ history.pushState({bnx:'menu-guard'},''); }catch(e){}
+  if((window.scrollY||0)>40){ try{ window.scrollTo({top:0,behavior:'smooth'}); }catch(e){ window.scrollTo(0,0); } }
+  else bnxToast('You are on the menu 🍽️');
+});
+/* remember place in the menu for this visit */
+function bnxSaveView(){ try{ sessionStorage.setItem('bnx_view_'+STATE.clientId, JSON.stringify({cat:activeCat,st:activeStation,veg:VEG_FILTER,y:window.scrollY||0})); }catch(e){} }
+window.addEventListener('pagehide', bnxSaveView); document.addEventListener('visibilitychange', ()=>{ if(document.hidden) bnxSaveView(); });
+(function restoreView(){
+  try{ const v=JSON.parse(sessionStorage.getItem('bnx_view_'+STATE.clientId)||'null'); if(!v) return;
+    activeCat=v.cat||'All'; activeStation=v.st||'ALL'; VEG_FILTER=v.veg||'ALL';
+    document.querySelectorAll('.veg-chip').forEach(c=>c.classList.toggle('active',c.dataset.v===VEG_FILTER));
+    window.__bnxRestoreY=v.y||0;
+  }catch(e){}
+})();
+Promise.resolve(window.__menuReady).then(()=>setTimeout(()=>{ if(window.__bnxRestoreY){ window.scrollTo(0,window.__bnxRestoreY); window.__bnxRestoreY=0; } },200));
+/* tab restored from the browser's back/forward cache, or left idle for a while → refresh quietly */
+let __bnxHiddenAt=0;
+document.addEventListener('visibilitychange', ()=>{ if(document.hidden){ __bnxHiddenAt=Date.now(); } else if(__bnxHiddenAt && Date.now()-__bnxHiddenAt>300000){ __bnxHiddenAt=0; try{ bnxRetryMenu(); }catch(e){} } });
+window.addEventListener('pageshow', e=>{ if(e.persisted){ try{ bnxRetryMenu(); }catch(err){} } });
 </script>
 </body>
 </html>
