@@ -402,6 +402,8 @@ async function gasApiRaw_(action,payload,endpoint){
    * the session expired. This fixes reports that appear blank immediately
    * after login/client switching.
    */
+  let _bnxRetried=false;
+  const _heavy=/^(GET_DSR_MATRIX|GET_DSR_YTD|GET_BILLS|GET_SALES_DAY_BOOK_REPORT|GET_ITEM_SALES_REPORT)$/.test(String(action));
   for(let i=0;i<contexts.length;i++){
     const ctx=contexts[i];
     const body=Object.assign({
@@ -413,7 +415,7 @@ async function gasApiRaw_(action,payload,endpoint){
       BNX_DBG_('[API_DEBUG] 🔄 Fetching:', {url, attempt: i+1, totalContexts: contexts.length});
       
       /* 60s hard timeout so a slow/dead server can never freeze the report screen */
-      const _ac=new AbortController(); const _t=setTimeout(()=>{try{_ac.abort();}catch(_){}},60000);
+      const _ac=new AbortController(); const _t=setTimeout(()=>{try{_ac.abort();}catch(_){}},_heavy?120000:60000);
       let r; try{
         r=await fetch(url,{
           method:'POST',
@@ -441,6 +443,12 @@ async function gasApiRaw_(action,payload,endpoint){
         url: url,
         action: action
       });
+      /* BNX FIX 2026-10-05: with a single stored session there was no second try, so one slow/aborted
+         call returned success:false and the month fell back to payments-only (Gross/Net = 0).
+         Read calls now get ONE automatic retry on the same session before giving up. */
+      if(!_bnxRetried && /^GET_/.test(String(action))){
+        _bnxRetried=true; await new Promise(r=>setTimeout(r,2000)); i--; continue;
+      }
       if(i===contexts.length-1){
         console.error('[API_DEBUG] ❌ All attempts failed. Last error:', e.message);
         return {success:false,error:e.message};
@@ -824,6 +832,7 @@ async function bnxRmPaymentDays_(from,to,st){
 }
 
 async function bnxReportMap_(from,to){
+  try{ var _b=document.getElementById('bnx-rm-badge'); if(_b){ _b.textContent='🔎 Report Map · loading '+String(from).slice(0,7)+'…'; _b.style.borderColor='#d97706'; } }catch(_){}
   var st={from:from,to:to,bookDays:0,created:0,filledPay:0,filledTax:0,unallocDays:0,unallocAmt:0,itemSplitDays:0,notes:[]};
   try{
     var book=await bnxRmCall_('GET_SALES_DAY_BOOK_REPORT',from,to);
@@ -1085,7 +1094,7 @@ function bnxDsrSnapSave_(){
     try{
       const k=bnxDsrSnapKey_(); if(!k||/_$/.test(k)) return;
       const out={};
-      Object.keys(STANDARD_DATA||{}).forEach(function(d){ const r=STANDARD_DATA[d]; if(/^\d{4}-\d{2}-\d{2}$/.test(d)&&r&&!r._snap&&/LIVE/.test(String(r.source||''))) out[d]=r; });
+      Object.keys(STANDARD_DATA||{}).forEach(function(d){ const r=STANDARD_DATA[d]; if(/^\d{4}-\d{2}-\d{2}$/.test(d)&&r&&!r._snap&&/LIVE/.test(String(r.source||''))&&((+r.net||0)>0||(+r.gross||0)>0)) out[d]=r; });
       if(!Object.keys(out).length) return;
       localStorage.setItem(k,JSON.stringify({at:Date.now(),data:out}));
     }catch(e){ try{ localStorage.removeItem(bnxDsrSnapKey_()); }catch(_){} }
@@ -1103,6 +1112,9 @@ function bnxDsrSnapLoad_(){
 function bnxDsrSnapPurge_(from,to){
   Object.keys(STANDARD_DATA||{}).forEach(function(d){ if(d>=from&&d<=to&&STANDARD_DATA[d]&&STANDARD_DATA[d]._snap) delete STANDARD_DATA[d]; });
 }
+function bnxDsrHasSales_(from,to){
+  return Object.keys(STANDARD_DATA||{}).some(function(d){ var r=STANDARD_DATA[d]; return d>=from&&d<=to&&r&&!r._snap&&((+r.net||0)>0||(+r.gross||0)>0); });
+}
 function bnxDsrHasLive_(from,to){
   return Object.keys(STANDARD_DATA||{}).some(function(d){ return d>=from&&d<=to&&STANDARD_DATA[d]&&!STANDARD_DATA[d]._snap; });
 }
@@ -1112,12 +1124,8 @@ async function fetchDsrMonthLive_(year,month){
   const _mk=String(year)+'-'+String(month).padStart(2,'0');
   if(BNX_DSR_MONTH_FLIGHT_.has(_mk)) return BNX_DSR_MONTH_FLIGHT_.get(_mk);
   const _work=(async()=>{
-  { // SPEED: fire the day-book + bills reads now, in parallel with the matrix;
-    // bnxReportMap_/bnxReconcileDsrFromBills_ below pick them up from the in-flight cache.
-    const _mm=String(month).padStart(2,'0'), _f=year+'-'+_mm+'-01', _t=year+'-'+_mm+'-'+String(new Date(Number(year),Number(month),0).getDate()).padStart(2,'0');
-    try{ gasApi('GET_SALES_DAY_BOOK_REPORT',{range:'custom',from:_f,to:_t},'V2_CORE'); }catch(e){}
-    try{ gasApi('GET_BILLS',{FROM_DATE:_f,TO_DATE:_t,BUSINESS_DATE:_f}); }catch(e){}
-  }
+  /* BNX FIX 2026-10-05: the day-book and GET_BILLS were fired in parallel with the matrix; on the
+     shared Apps Script they slowed all three until each timed out. They now run after the matrix. */
   const r=await gasApi('GET_DSR_MATRIX',{year:Number(year),month:Number(month)});
   bnxLogShape_('GET_DSR_MATRIX '+year+'-'+month,r);
   const mm=String(month).padStart(2,'0');
@@ -1130,7 +1138,7 @@ async function fetchDsrMonthLive_(year,month){
     bnxDsrSnapPurge_(mFrom,mTo);
     await bnxReportMap_(mFrom,mTo);
     try{await bnxReconcileDsrFromBills_(mFrom,mTo);}catch(e){console.warn('[DSR BILL MASTER RECON]',e);}
-    const liveOk=bnxDsrHasLive_(mFrom,mTo);
+    const liveOk=bnxDsrHasSales_(mFrom,mTo);   // payments-only rows (Gross/Net 0) are NOT a successful load
     if(!liveOk) Object.keys(snapBak).forEach(k=>{STANDARD_DATA[k]=snapBak[k];});   // offline: keep showing the marked snapshot
     else bnxDsrSnapSave_();
     return liveOk;
@@ -1239,7 +1247,7 @@ async function onDsrDateChange(){
   window.BNX_DSR_LOADING_=true;
   try{ok=await fetchDsrMonthLive_(y,m);}catch(e){console.warn('[DSR] month load failed:',e);}
   if(!ok && my===BNX_DSR_SEQ_){
-    try{await new Promise(r=>setTimeout(r,1200));ok=await fetchDsrMonthLive_(y,m);}catch(e){console.warn('[DSR] month retry failed:',e);}
+    try{await new Promise(r=>setTimeout(r,3000));ok=await fetchDsrMonthLive_(y,m);}catch(e){console.warn('[DSR] month retry failed:',e);}
   }
   if(!STANDARD_DATA[ds]){
     try{await bnxReconcileDsrFromBills_(ds,ds);if(STANDARD_DATA[ds])ok=true;}catch(e){console.warn('[DSR] day bill fallback failed:',e);}
@@ -1249,7 +1257,7 @@ async function onDsrDateChange(){
   if(my!==BNX_DSR_SEQ_) return ok;           // a newer date was picked meanwhile
   bnxDsrPaint_(ds);
   try{ buildDash(); }catch(e){}
-  if(st) st.textContent=ok?('🔴 Live POS · '+ds+' · '+new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})):('⚠️ Live POS not reachable for '+ds);
+  if(st) st.textContent=ok?('🔴 Live POS · '+ds+' · '+new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})):('⚠️ Sales data did not load for '+ds+' — press Recalculate to retry');
   if(!ok){ showToast('⚠️ Live POS data could not be loaded for '+ds,'warn'); return false; }
   const side=[
     (async()=>{try{await loadDsrDueControl_(ds);bnxDueDisplaySummary_();}catch(e){console.warn('[DSR DUE CONTROL]',e);}})(),
@@ -6151,6 +6159,10 @@ function summary(){
   $$('bnxPpSummary').innerHTML=a.days||a.net?
    '<span>Net <b>'+money(a.net)+'</b></span><span>Gross <b>'+money(a.gross)+'</b></span><span>Cash <b>'+money(a.cash)+'</b></span><span>Card <b>'+money(a.card)+'</b></span><span>UPI <b>'+money(a.gpay)+'</b></span><span>Discount <b>'+money(a.disc)+'</b></span><span>Bills <b>'+a.bills+'</b></span><span>Trading days <b>'+a.days+'</b></span>'
    :'<span style="color:var(--muted)">No sales found for this period.</span>';
+  try{
+    var _w=$$('bnxPpSummary'); var _old=_w.querySelector('.bnx-warn'); if(_old)_old.remove();
+    if(!a.net&&!a.gross&&(a.cash+a.card+a.gpay)>0) _w.insertAdjacentHTML('beforeend','<span class="bnx-warn" style="color:#dc2626"><b>⚠ Sales (Gross/Net) did not load — only collections. Press Recalculate.</b></span>');
+  }catch(e){}
 }
 async function apply(opt){
   opt=opt||{};var my=++P.seq;
