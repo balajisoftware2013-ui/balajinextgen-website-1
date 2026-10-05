@@ -202,6 +202,11 @@ body{font-family:'Sora',sans-serif;background:var(--bg);color:var(--text);min-he
         <input type="file" id="umFile" accept=".pdf,.jpg,.jpeg,.png" style="display:none" onchange="onUmFileChange(this.files[0])">
         <div id="umFileNote" style="font-size:10.5px;color:var(--muted);margin-top:5px;line-height:1.4;">Large files are optimised automatically before upload (big PDFs are re-built page by page as a light PDF).</div>
       </div>
+      <div class="fg">
+        <label>…or paste a Google Drive link (recommended for big PDFs)</label>
+        <input type="text" id="umLink" placeholder="https://drive.google.com/file/d/…/view">
+        <div style="font-size:10.5px;color:var(--muted);margin-top:5px;line-height:1.4;">If a link is pasted, no file is uploaded — customers see the PDF straight from Drive.</div>
+      </div>
       <div class="chk-row">
         <input type="checkbox" id="umAutoSet" checked>
         <label for="umAutoSet" style="font-size:12px;font-weight:600;margin:0;">Set as the active menu card immediately (customers see this the moment it's uploaded)</label>
@@ -435,7 +440,7 @@ function setView(v){
 // ═══ DESIGNED / UPLOADED MENU CARD ═══
 function openUploadModal(){
   document.getElementById('umName').value='';
-  document.getElementById('umFile').value='';
+  document.getElementById('umFile').value=''; document.getElementById('umLink').value='';
   umPendingFile=null; umPendingDataUrl=null;
   document.getElementById('umDropZone').textContent='📎 Click to choose a file';
   document.getElementById('umAutoSet').checked=true;
@@ -466,10 +471,28 @@ function onUmFileChange(file){
     ? '⚙ '+(file.size/1048576).toFixed(1)+' MB — will be optimised to about '+(MC_TARGET_BYTES/1048576).toFixed(1)+' MB before upload (takes a few seconds).'
     : 'Ready to upload.';
 }
+/* Google Drive link flow: nothing is uploaded — only the link is saved for this client. */
+function mcDriveId(u){ const m=String(u).match(/(?:\/d\/|[?&]id=)([\w-]{20,})/); return m?m[1]:''; }
+function mcLinkPreview(u){ const id=mcDriveId(u); return id?'https://drive.google.com/file/d/'+id+'/preview':u; }
+async function saveLinkCard(name, link, autoSet){
+  if(!/^https?:\/\//i.test(link)){ alert('Paste the full Google Drive link (starts with https://).'); return; }
+  const btn=document.getElementById('umSaveBtn'); btn.disabled=true; btn.textContent='Saving…';
+  try{
+    const r = await gasApi('SAVE_MENU_CARD_LINK', { name, link, active: !!autoSet }, 60000);
+    if(!(r && r.success)){ toast('❌ Could not save the link: '+((r&&(r.error||r.message))||'no response'),'error'); return; }
+    const rec={ id:(r.data&&r.data.cardId)||('MC'+Date.now()), name, fileName:'Google Drive link', mime:'link', fileUrl:link,
+      uploadedAt:new Date().toISOString(), active:!!autoSet, synced:true };
+    const uploads=loadUploads(); if(autoSet) uploads.forEach(u=>u.active=false); uploads.unshift(rec); saveUploads(uploads);
+    closeUploadModal(); if(autoSet) setView('upload'); else renderUploadView();
+    toast('✅ Saved'+(autoSet?' — customers now see it':'')+((r.data&&r.data.warn)?' ⚠️ '+r.data.warn:''), r.data&&r.data.warn?'error':'success');
+  }finally{ btn.disabled=false; btn.textContent='💾 Save'; }
+}
 async function saveUpload(){
   const name=document.getElementById('umName').value.trim();
   if(!name){ alert('Enter an occasion/menu name.'); return; }
-  if(!umPendingFile){ alert('Choose a file to upload.'); return; }
+  const link=(document.getElementById('umLink').value||'').trim();
+  if(link){ await saveLinkCard(name, link, document.getElementById('umAutoSet').checked); return; }
+  if(!umPendingFile){ alert('Choose a file or paste a Google Drive link.'); return; }
   const autoSet=document.getElementById('umAutoSet').checked;
   const btn=document.getElementById('umSaveBtn'); btn.disabled=true; btn.textContent='Preparing…';
   /* ROOT FIX ("Saving…" forever): no step here can hang any more — the file is
@@ -591,11 +614,42 @@ async function saveExcelImport(){
   btn.disabled = false; btn.textContent = '💾 Import Items';
 }
 
-function activateUpload(id){
+/* FIX ("new PDF menu not updating for customers"): Set Active only flipped a
+   flag in this browser's localStorage, so the server (which the customer
+   page reads via GET_ACTIVE_MENU_CARD) kept serving the OLD card. Now the
+   chosen card is re-sent to the server with active:true, using the same
+   SAVE_MENU_CARD_UPLOAD action a fresh upload uses. */
+async function mcSyncToServer(id, makeActive){
+  const rec = loadUploads().find(u=>u.id===id); if(!rec) return false;
+  if(rec.fileUrl){
+    const r0 = await gasApi('SAVE_MENU_CARD_LINK', { name:rec.name, link:rec.fileUrl, active:!!makeActive }, 60000);
+    if(r0 && r0.success){ saveUploads(loadUploads().map(u=>u.id===id?Object.assign({},u,{synced:true}):u)); return true; }
+    toast('❌ Server did not accept it: '+((r0&&(r0.error||r0.message))||'no response'),'error'); return false;
+  }
+  const dataUrl = await mcFileGet(id);
+  if(!dataUrl){ toast('⚠️ The file is not stored on this device, so it cannot be re-sent. Please upload the PDF again.','error'); return false; }
+  toast('⏳ Sending to the server…');
+  const r = await gasApi('SAVE_MENU_CARD_UPLOAD', { name:rec.name, fileName:rec.fileName, mime:rec.mime, dataUrl, active:!!makeActive }, 180000);
+  if(r && r.success){
+    saveUploads(loadUploads().map(u=>u.id===id?Object.assign({},u,{synced:true}):u));
+    return true;
+  }
+  toast('❌ Server did not accept it: '+((r&&(r.error||r.message))||'no response'),'error');
+  return false;
+}
+async function activateUpload(id){
   const uploads=loadUploads();
   uploads.forEach(u=>u.active=(u.id===id));
   saveUploads(uploads);
-  toast('✅ Set as active menu card','success');
+  renderUploadView();
+  const ok = await mcSyncToServer(id, true);
+  if(ok) toast('✅ Set as active menu card — customers now see it','success');
+  renderUploadView();
+}
+async function retrySync(id){
+  const rec = loadUploads().find(u=>u.id===id);
+  const ok = await mcSyncToServer(id, !!(rec && rec.active));
+  if(ok) toast('✅ Synced to the server','success');
   renderUploadView();
 }
 function deleteUpload(id){
@@ -623,6 +677,11 @@ function renderUploadView(){
     </div>`;
     previewWrap.innerHTML = '<div class="empty-note">Loading preview…</div>';
     const activeId = active.id;
+    if(active.fileUrl){
+      previewWrap.innerHTML = `<iframe src="${esc(mcLinkPreview(active.fileUrl))}" class="card-preview" style="background:#fff;" title="${esc(active.name)}"></iframe>
+        <div style="margin-top:10px;"><a class="tb-btn primary" href="${esc(active.fileUrl)}" target="_blank" rel="noopener">📄 Open in Google Drive</a></div>`;
+      mcRenderHistory(uploads, historyWrap); return;
+    }
     mcFileGet(active.id).then(dataUrl=>{
       const cur = loadUploads().find(u=>u.active);
       if (!cur || cur.id !== activeId) return;
@@ -677,6 +736,7 @@ function mcRenderHistory(uploads, historyWrap){
       uploads.map(u=>`<div class="history-item">
         <div><div class="hi-name">${u.active?'⭐ ':''}${esc(u.name)}</div><div class="hi-meta">${new Date(u.uploadedAt).toLocaleDateString('en-IN')} · ${esc(u.fileName)}${u.sizeKB?' · '+u.sizeKB+' KB':''}${u.synced===false?' · <span style="color:var(--red)">not synced</span>':''}</div></div>
         <div style="display:flex;gap:6px;">
+          ${u.synced===false?`<button class="tb-btn" style="padding:4px 10px;font-size:10.5px;" onclick="retrySync('${u.id}')">🔄 Retry sync</button>`:''}
           ${u.active?'':`<button class="tb-btn success" style="padding:4px 10px;font-size:10.5px;" onclick="activateUpload('${u.id}')">Set Active</button>`}
           <button class="tb-btn" style="padding:4px 10px;font-size:10.5px;" onclick="deleteUpload('${u.id}')">🗑</button>
         </div>
