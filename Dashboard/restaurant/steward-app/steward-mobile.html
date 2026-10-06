@@ -137,6 +137,9 @@ window.BNX_STEWARD_BUILD='PRN-FW8-NATIVE-DETECT';
     if(!/^(https?|wss?):$/i.test(x.protocol)) return '';
     var port=x.port||(/^(https|wss):$/i.test(x.protocol)?'443':'80');
     if(PRINTER_PORTS[port]) return 'port '+port+' is a printer data port, not a web address';
+    /* 2026-10-07: the printer's own ePOS-Print web service (port 80/443, this exact path) is a
+       real print API that takes ESC/POS wrapped in XML — not junk text on a raw port. */
+    if(/^https?:$/i.test(x.protocol) && /^\/cgi-bin\/epos\/service\.cgi$/i.test(x.pathname)) return '';
     if(printerIps().indexOf(x.hostname)>=0) return x.hostname+' is a PRINTER, not the Print Relay PC';
     return '';
   }
@@ -4781,6 +4784,38 @@ function bnxMapSheetStatusToTcard(status){
   if(['VIP'].includes(s)) return 'VIP';
   return 'AVAILABLE';
 }
+/* reservation helpers (2026-10-07) */
+function bnxResvToday_(){ const n=new Date(); return n.getFullYear()+'-'+String(n.getMonth()+1).padStart(2,'0')+'-'+String(n.getDate()).padStart(2,'0'); }
+function bnxResvDate_(v){
+  if(v==null||v==='') return '';
+  if(v instanceof Date && !isNaN(v)) return v.getFullYear()+'-'+String(v.getMonth()+1).padStart(2,'0')+'-'+String(v.getDate()).padStart(2,'0');
+  const s=String(v).trim();
+  /* Sheets dates arrive as UTC ISO ("2026-10-07T18:30:00.000Z" = 8 Oct IST): use the LOCAL date */
+  if(/^\d{4}-\d{2}-\d{2}T/.test(s) && /(Z|[+-]\d{2}:?\d{2})$/.test(s)){ const d=new Date(s); if(!isNaN(d)) return bnxResvDate_(d); }
+  let m=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/); if(m) return m[1]+'-'+m[2].padStart(2,'0')+'-'+m[3].padStart(2,'0');
+  m=s.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})/); if(m) return m[3]+'-'+m[2].padStart(2,'0')+'-'+m[1].padStart(2,'0');
+  const d=new Date(s); return isNaN(d)?'':bnxResvDate_(d);
+}
+function bnxResvTime_(v){
+  if(v==null||v==='') return '';
+  const s=String(v).trim();
+  if(/^\d{4}-\d{2}-\d{2}T/.test(s)){ const d=new Date(s); if(!isNaN(d)) return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'); }
+  const m=s.match(/(\d{1,2}):(\d{2})/); return m?m[1].padStart(2,'0')+':'+m[2]:s;
+}
+/* the booking of table t on a given date (any of its upcoming bookings) */
+window.bnxResvOn_=function(t,date){
+  if(!t||!date) return null;
+  const list=Array.isArray(t.reservations)&&t.reservations.length?t.reservations:(t.reservationDate?[{id:t.reservationId,date:String(t.reservationDate).slice(0,10),time:t.reservationTime,customer:t.reservationCustomer,pax:t.reservationPax}]:[]);
+  return list.find(x=>x.date===date)||null;
+};
+/* which booking the live (today) card should show */
+window.bnxResvForCard_=function(t){
+  if(!t) return null;
+  const f=(typeof mobTableDateFilter!=='undefined'&&mobTableDateFilter)||'';
+  const bd=(typeof businessDate==='function'?businessDate():'');
+  if(f && f!==bd) return window.bnxResvOn_(t,f);
+  return t.reservationDate?{date:String(t.reservationDate).slice(0,10),time:t.reservationTime,customer:t.reservationCustomer,pax:t.reservationPax}:null;
+};
 async function loadTablesLive(){
   // FIX ("steward table floor never loads live data"): this called an
   // action named 'fetchSheet' that has never existed in the backend —
@@ -4882,28 +4917,58 @@ async function loadTablesLive(){
     // transaction database, not only from the last local booking action.
     // A reservation for the current calendar date marks an otherwise-free
     // table RESERVED and remains visible with its date/time on every refresh.
+    /* 2026-10-07 ROOT FIX ("reserve but not show reserve"): this merge copied the
+       reservation date/time/customer onto the table but NEVER set status RESERVED
+       (only a `reserved` flag nothing reads). Reserving set RESERVED locally, then
+       the reload 250 ms later rebuilt TABLES from TABLE_MASTER (still AVAILABLE)
+       and the reservation vanished from the card colour, the Reserved counter and
+       the Reserved filter. Now:
+         • a reservation for TODAY turns a free table RESERVED (running/occupied
+           tables keep their live status and just show the booking);
+         • every upcoming booking per table is kept (t.reservations), so picking a
+           future date shows the right one, not only the earliest;
+         • a booking saved on this device is kept until the server list returns it
+           (no flicker back to AVAILABLE if LIST_RESERVATIONS is a few seconds late);
+         • date/field names are read the same way the dashboard writes them. */
     try{
       const rr = await __resvP;
-      const reservations = rr && rr.success && Array.isArray(rr.reservations) ? rr.reservations : (rr && rr.success && Array.isArray(rr.data) ? rr.data : []);
-      const _now = new Date();
-      const today = `${_now.getFullYear()}-${String(_now.getMonth()+1).padStart(2,'0')}-${String(_now.getDate()).padStart(2,'0')}`;
-      const byTable={};
+      const reservations = rr && rr.success ? (Array.isArray(rr.reservations) ? rr.reservations : Array.isArray(rr.data) ? rr.data : (rr.data && Array.isArray(rr.data.reservations)) ? rr.data.reservations : (rr.data && Array.isArray(rr.data.rows)) ? rr.data.rows : []) : [];
+      const serverOk = !!(rr && rr.success);
+      const today = bnxResvToday_();
+      const byTable={}, seen={};
+      const add=(tid,x)=>{ (byTable[tid]=byTable[tid]||[]).push(x); };
       reservations.forEach(r=>{
-        const st=String(r.status||r.STATUS||'').toLowerCase();
-        const rd=String(r.date||r.RES_DATE||'').slice(0,10);
-        if(!rd || rd < today || st==='cancelled' || st==='seated') return;
-        const tid=String(r.table||r.TABLE_ID||'').trim();
+        const st=String(r.status||r.STATUS||r.RES_STATUS||'').trim().toLowerCase();
+        if(/cancel|seated|complete|no[ _-]?show|closed|expired/.test(st)) return;
+        const rd=bnxResvDate_(r.date||r.RES_DATE||r.reservationDate||r.RESERVATION_DATE||r.BOOKING_DATE);
+        if(!rd || rd < today) return;
+        const tid=String(r.table||r.TABLE_ID||r.tableId||r.TABLE_NO||r.tableNo||'').trim();
         if(!tid) return;
-        const existing=byTable[tid];
-        if(!existing || rd < existing.date || (rd===existing.date && String(r.time||r.RES_TIME||'') < String(existing.time||''))) {
-          byTable[tid]={id:r.id||r.RESERVATION_ID||'',date:rd,time:r.time||r.RES_TIME||'',customer:r.name||r.GUEST_NAME||'',pax:Number(r.covers||r.COVERS)||0};
-        }
+        const x={id:r.id||r.RESERVATION_ID||r.reservationId||'',date:rd,time:bnxResvTime_(r.time||r.RES_TIME||r.reservationTime||r.RESERVATION_TIME),customer:r.name||r.GUEST_NAME||r.customerName||r.CUSTOMER_NAME||'',pax:Number(r.covers||r.COVERS||r.pax||r.PAX||r.guests)||0};
+        add(tid,x); seen[tid+'|'+rd+'|'+x.time]=1; if(x.id) seen['id|'+x.id]=1;
       });
+      /* bookings saved here that the server list does not show yet (kept 10 min) */
+      try{
+        const pend=window.__bnxPendingResv||{}; const now=Date.now();
+        Object.keys(pend).forEach(k=>{ const p=pend[k];
+          if(!p || now-p.at>600000 || (p.id&&seen['id|'+p.id]) || seen[p.table+'|'+p.date+'|'+p.time]){ delete pend[k]; return; }
+          if(p.date>=today) add(p.table,{id:p.id,date:p.date,time:p.time,customer:p.customer,pax:p.pax,local:true});
+        });
+      }catch(_){}
       TABLES=TABLES.map(t=>{
-        const r=byTable[String(t.id).trim()];
-        if(!r) return t;
-        const active=String(t.status||'').toUpperCase()==='RUNNING'||String(t.status||'').toUpperCase()==='OCCUPIED';
-        return Object.assign({},t,{reservationId:r.id,reservationDate:r.date,reservationTime:r.time,reservationCustomer:r.customer,reservationPax:r.pax,reserved:!active});
+        const list=(byTable[String(t.id).trim()]||[]).slice().sort((a,b)=>(a.date+' '+a.time).localeCompare(b.date+' '+b.time));
+        if(!list.length){
+          /* booking gone (cancelled / seated) → clear what an earlier refresh copied on */
+          if(!serverOk) return t;
+          const st0=String(t.status||'').toUpperCase();
+          return Object.assign({},t,{reservations:[],reservationId:'',reservationDate:'',reservationTime:'',reservationCustomer:'',reservationPax:0,reserved:false});
+        }
+        const r=list.find(x=>x.date===today)||list[0];
+        const st=String(t.status||'').toUpperCase();
+        const active=st==='RUNNING'||st==='OCCUPIED';
+        const out=Object.assign({},t,{reservations:list,reservationId:r.id,reservationDate:r.date,reservationTime:r.time,reservationCustomer:r.customer,reservationPax:r.pax,reserved:!active&&r.date===today});
+        if(!active && r.date===today && (st==='AVAILABLE'||st==='RESERVED'||!st)) out.status='RESERVED';
+        return out;
       });
     }catch(resErr){ console.debug('[TABLE_LOAD] reservation sync deferred:',resErr&&resErr.message?resErr.message:resErr); }
     // Merge current active orders into the live table projection. This fixes
@@ -5885,8 +5950,7 @@ function renderMobTables(){
           <div class="tc-pax">🪑 ${Number(t.pax)||4} seats</div>
           ${t.covers?`<div class="tc-info">${Number(t.covers)} guests seated</div>`:''}
           ${['RUNNING','OCCUPIED'].includes(String(t.status||'').toUpperCase()) || Number(t.bill||0)>0 ? `<div class="tc-bill" style="color:var(--gold)">Order ₹${(Number(t.bill)||0).toLocaleString('en-IN')}</div>${Number(t.kotCount||0)>0?`<div class="tc-kot">${Number(t.kotCount)} KOT</div>`:''}` : ''}
-          ${(!mobTableDateFilter || String(t.reservationDate||'').slice(0,10)===mobTableDateFilter) && t.reservationDate?`<div class="tc-info" style="color:var(--gold);font-weight:700;">📅 ${bnxEscapeHtml_(t.reservationDate)}${t.reservationTime?' · '+bnxEscapeHtml_(t.reservationTime):''}</div>`:''}
-          ${(!mobTableDateFilter || String(t.reservationDate||'').slice(0,10)===mobTableDateFilter) && t.reservationCustomer?`<div class="tc-info" style="color:var(--text2);">👤 ${bnxEscapeHtml_(t.reservationCustomer)}${t.reservationPax?' · '+Number(t.reservationPax)+' guests':''}</div>`:''}
+          ${(function(rv){ return rv?`<div class="tc-info" style="color:var(--gold);font-weight:700;">📅 ${rv.date===bnxResvToday_()?'Today':bnxEscapeHtml_(rv.date)}${rv.time?' · '+bnxEscapeHtml_(rv.time):''}</div>${rv.customer?`<div class="tc-info" style="color:var(--text2);">👤 ${bnxEscapeHtml_(rv.customer)}${rv.pax?' · '+Number(rv.pax)+' guests':''}</div>`:''}`:''; })(window.bnxResvForCard_(t))}
         </div>`).join('')}</div>
     </div>`).join('');
   bnxRenderQuickActionCounts();
@@ -6248,8 +6312,12 @@ async function bnxSubmitReservation(){
     const res=await gasApi('SAVE_RESERVATION',payload,'V2_CORE');
     if(!res||!res.success) throw new Error((res&&res.error)||'Reservation could not be saved');
 
-    t.status='RESERVED';
     t.reservationId=res.reservationId||res.transactionId||(res.data&&res.data.RESERVATION_ID)||'';
+    /* only a booking for TODAY makes the table RESERVED now; a future booking is
+       shown on the card and on that date, the table stays usable today */
+    if(date===bnxResvToday_() && String(t.status||'').toUpperCase()==='AVAILABLE') t.status='RESERVED';
+    try{ (window.__bnxPendingResv=window.__bnxPendingResv||{})[t.id+'|'+date+'|'+time]={table:String(t.id),id:t.reservationId,date:date,time:time,customer:customerName,pax:pax,at:Date.now()}; }catch(_){}
+    t.reservations=(Array.isArray(t.reservations)?t.reservations:[]).concat([{id:t.reservationId,date:date,time:time,customer:customerName,pax:pax,local:true}]).sort((a,b)=>(a.date+' '+a.time).localeCompare(b.date+' '+b.time));
     t.reservationCustomer=customerName;
     t.reservationPax=pax;
     t.reservationDate=date;
@@ -8885,6 +8953,47 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
     }
     throw lastErr;
   }
+  /* ════════ DIRECT FROM THE PHONE BROWSER — no app, no PC (2026-10-07) ════════
+     A browser can never open raw TCP to printer-IP:9100. Printers with Epson
+     ePOS-Print (TM-m30 / m30II / m30III, TM-m50, TM-T88VI / VII and other ePOS
+     network models) also accept the SAME ESC/POS bytes over HTTP(S):
+       POST <ip>/cgi-bin/epos/service.cgi  <epos-print><command>HEX</command>
+     so the phone prints straight to the printer IP from CLIENT_PRINTER_MASTER.
+     Each printer is auto-detected on first use and remembered; a printer that
+     only speaks port 9100 is remembered as "no" (re-checked every 10 min) and
+     the other routes (Printer App / Relay / RawBT) are used for it. */
+  function eposKey_(){ return cidKey_('bnx_epos_state_'); }
+  function eposState_(){ try{ return JSON.parse(localStorage.getItem(eposKey_())||'{}')||{}; }catch(e){ return {}; } }
+  function eposMark_(ip,v){ try{ const st=eposState_(); st[ip]={v:v,at:Date.now()}; localStorage.setItem(eposKey_(),JSON.stringify(st)); }catch(e){} }
+  function eposTry_(ip){ const x=eposState_()[ip]; if(!x) return true; if(x.v==='yes') return true; return (Date.now()-x.at)>600000; }
+  window.bnxEposState_=function(ip){ const x=eposState_()[ip]; return x?x.v:''; };
+  function hex_(raw){ let h=''; for(let i=0;i<raw.length;i++){ const c=raw.charCodeAt(i)&255; h+=(c<16?'0':'')+c.toString(16); } return h; }
+  async function viaEpos_(ip,raw,job){
+    const body='<?xml version="1.0" encoding="utf-8"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>'
+      +'<epos-print xmlns="http://www.epson-pos.com/schemas/2011/03/epos-print"><command>'+hex_(raw)+'</command></epos-print></s:Body></s:Envelope>';
+    const schemes=location.protocol==='https:'?['https']:['http','https'];
+    let lastErr=null;
+    for(const sc of schemes){
+      const ctl=new AbortController(); const tm=setTimeout(function(){ try{ctl.abort();}catch(e){} },7000);
+      try{
+        const r=await fetch(sc+'://'+ip+'/cgi-bin/epos/service.cgi?devid=local_printer&timeout=10000',{method:'POST',headers:{'Content-Type':'text/xml; charset=utf-8'},body:body,signal:ctl.signal,cache:'no-store'});
+        const t=await r.text();
+        if(/success\s*=\s*"true"/i.test(t)){ eposMark_(ip,'yes'); return true; }
+        const code=(t.match(/code\s*=\s*"([^"]*)"/i)||[])[1]||('HTTP '+r.status);
+        eposMark_(ip,'yes');                      /* it IS an ePOS printer — the job itself failed */
+        const er=new Error('Printer '+ip+' refused the ticket ('+code+') — check paper / cover / power'); er.noRetry=true; throw er;
+      }catch(e){
+        if(e&&e.noRetry) throw e;
+        lastErr=e;
+      }finally{ clearTimeout(tm); }
+    }
+    eposMark_(ip,'no');
+    const er=new Error(location.protocol==='https:'
+      ? 'Printer '+ip+' did not accept direct printing from the browser. If it is an Epson ePOS printer, open https://'+ip+' once on this phone, tap Advanced → Proceed, then Test print again.'
+      : 'Printer '+ip+' does not support direct browser printing (Epson ePOS).');
+    er.eposMissing=true; throw er;
+  }
+  window.bnxEposPrint_=viaEpos_;
   /* ───────── RawBT (Android) — hands the ESC/POS bytes to the RawBT app, which prints
      to the printer chosen inside RawBT (Network printer = the IP printer). ───────── */
   function rawbtKey_(){ return cidKey_('bnx_rawbt_'); }
@@ -9156,14 +9265,18 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
       if(window.bnxHasNative_()) {
         return await bnxNativePrint_(role,ip,port,raw,job);
       }
+      /* 2026-10-07: browser only, no app, no PC → straight to the printer IP (Epson ePOS) */
+      let eposErr=null;
+      if(eposTry_(ip)){ try{ return await viaEpos_(ip,raw,job); }catch(e){ if(e&&e.noRetry) throw e; eposErr=e; } }
       /* FW8: no native bridge (page opened in Chrome / installed web app). Use the Print Relay if one is set. */
       if(relay) return viaRelay_(relay,ip,raw,job,port);
       /* FW10: Android only, and only if the owner switched it on in Printer Setup (RawBT prints to ONE printer). */
       let rbOn=false; try{ rbOn=localStorage.getItem(rawbtKey_())==='1'; }catch(e){}
       if(rbOn && isAndroid_()) return viaRawBt_(raw,job);
+      if(eposErr) throw eposErr;
       throw new Error(window.bnxInAppWebView_()
         ? 'BNX Printer App bridge (BNXPrinter.printRaw) is missing in the app. Update the Steward Printer App.'
-        : 'This page is open in a browser, not inside the BNX Steward Printer App. Open it from the Steward Printer App icon.');
+        : 'Printer '+ip+' only accepts port-9100 printing, which a browser cannot do. Use an Epson ePOS printer, the Print Relay, or the Steward Printer App.');
     }
 
     try{
@@ -15605,10 +15718,12 @@ button,.btn-primary,.btn-ghost{touch-action:manipulation}
     var box=function(bg,bd,col,ico,t,sub,tag){ return '<div style="display:flex;align-items:center;gap:12px;padding:14px;border-radius:12px;background:'+bg+';border:1px solid '+bd+'"><span style="font-size:28px">'+ico+'</span><div><b style="color:'+col+'">'+t+'</b><div style="font-size:12px;color:'+col+';opacity:.85;margin-top:3px">'+sub+'</div></div><span style="margin-left:auto;color:'+col+';font-weight:800">'+tag+'</span></div>'; };
     var note=function(h){ return '<div class="pz-note" style="margin-top:10px">'+h+'</div>'; };
     if(native()) return box('#eefbf3','#b7e4c7','#137333','📱','Direct Wi-Fi IP Printing','Steward Printer App → TCP → printer IP:9100','ON')+note('<b>No manual printer setup.</b> IP addresses come from <b>CLIENT_PRINTER_MASTER</b>. Port is automatically <b>9100</b>.');
+    var eSt=(function(){ try{ var m=ips(), y=0, n=0; Object.keys(m).forEach(function(k){ var v=window.bnxEposState_&&window.bnxEposState_(String(m[k]||'').trim()); if(v==='yes')y++; else if(v==='no')n++; }); return {y:y,n:n}; }catch(e){ return {y:0,n:0}; } })();
+    if(eSt.y&&!relayCfg()) return box('#eefbf3','#b7e4c7','#137333','📶','Direct from this phone','Browser → printer IP (Epson ePOS) · no app, no PC','ON')+note('<b>Nothing to install.</b> IPs come from <b>CLIENT_PRINTER_MASTER</b>. '+eSt.y+' printer(s) confirmed'+(eSt.n?', '+eSt.n+' printer(s) only accept port 9100 (they need the Relay or the Printer App)':'')+'.');
     if(relayCfg()) return box('#eef4ff','#b9d0f5','#1d4ed8','🔗','Print Relay (PC)','Phone → relay PC → printer IP:9100','ON')+note('Printer IPs come from <b>CLIENT_PRINTER_MASTER</b>. The relay PC must be ON and on the same Wi-Fi as the printers.');
     if(rawbtOnPz()) return box('#fff7e0','#f0c36a','#92400e','🧾','RawBT (one printer only)','Android → RawBT app → the printer chosen inside RawBT','ON')+note('<b>Warning:</b> every ticket (KOT, bar, hukka, bill) goes to the ONE printer selected in RawBT. Use the Print Relay to print to each station printer.');
     return box('#fef3f2','#f3b4ae','#b42318','⚠️','Printing is not connected','This phone has no printer app and no relay yet','OFF')
-      +note('<b>Pick one way to connect:</b><br>1. <b>Print Relay</b> (iPhone + Android) — paste the relay link &amp; key in the box below. Your admin can send them from the dashboard (Print Settings → Print Relay Link).<br>2. <b>Steward Printer App</b> — open this page from the app icon.'+(isAndroidPz()?'<br>3. <b>Android only:</b> RawBT (one printer) — button below.':''));
+      +note('<b>Try it first:</b> tap <b>Test print</b> below. If the printer is an <b>Epson ePOS</b> model it prints <b>directly from this phone — nothing to install</b>, and this box turns green.')+note('<b>Pick one way to connect:</b><br>1. <b>Print Relay</b> (iPhone + Android) — paste the relay link &amp; key in the box below. Your admin can send them from the dashboard (Print Settings → Print Relay Link).<br>2. <b>Steward Printer App</b> — open this page from the app icon.'+(isAndroidPz()?'<br>3. <b>Android only:</b> RawBT (one printer) — button below.':''));
   }
   function rawbtBtn(){
     if(native()||!isAndroidPz()) return '';
@@ -15671,7 +15786,7 @@ button,.btn-primary,.btn-ghost{touch-action:manipulation}
   window.hspTest=async function(role){
     var r=ROLES.filter(function(x){return x.k===role;})[0]||ROLES[0], ip=ipOf(r);
     if(!native()) await window.bnxWaitNative_(2500);
-    if(!native()&&!relayCfg()){msg(diag(),false);return;}
+    if(window.bnxInAppWebView_&&window.bnxInAppWebView_()&&!native()&&!relayCfg()){msg(diag(),false);return;}
     if(!ip){msg('⚠️ No '+esc(r.label)+' printer IP is available in CLIENT_PRINTER_MASTER.',false);return;}
     msg('Sending direct test to '+esc(r.label)+' ('+esc(ip)+':9100)…');
     try{var ok=await window.bnxStewardTestKOTPrinter(role);msg(ok?'✅ '+esc(r.label)+' printer OK — '+esc(ip)+':9100': '⚠️ '+esc(r.label)+' printer test failed.',!!ok);}catch(e){msg('⚠️ '+esc(e&&e.message||e),false);}
@@ -17049,8 +17164,8 @@ html body #s-tables .tcard .tc-kot{display:inline-block;font-size:8px!important;
     var card=function(t){
       var id=String(t.id).trim(), cls, st, info='';
       if(future){
-        var r=String(t.reservationDate||'').slice(0,10)===date;
-        if(r){ resv++; cls='bnx-day-resv'; st='RESERVED'; info=(t.reservationTime?esc(t.reservationTime)+' · ':'')+esc(t.reservationCustomer||'')+(t.reservationPax?' · '+Number(t.reservationPax)+' pax':''); }
+        var rv=(typeof W.bnxResvOn_==='function')?W.bnxResvOn_(t,date):(String(t.reservationDate||'').slice(0,10)===date?{time:t.reservationTime,customer:t.reservationCustomer,pax:t.reservationPax}:null);
+        if(rv){ resv++; cls='bnx-day-resv'; st='RESERVED'; info=(rv.time?esc(rv.time)+' · ':'')+esc(rv.customer||'')+(rv.pax?' · '+Number(rv.pax)+' pax':''); }
         else { cls='bnx-day-none'; st='FREE'; }
       }else{
         var x=rec.by[id];
