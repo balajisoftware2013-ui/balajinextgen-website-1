@@ -3902,9 +3902,8 @@ async function bnxGasApiNet_(action,payload,endpoint){
         },payload)),
         signal:controller.signal
       });
-      clearTimeout(timer);
-
       if(!r.ok){
+        clearTimeout(timer);
         if(r.status===404 && !deploymentRecovered){
           try{localStorage.removeItem(ep==='V2_AUTH'?'bnx_api_auth':'bnx_api_core');}catch(e){}
           deploymentRecovered=true;
@@ -3915,6 +3914,7 @@ async function bnxGasApiNet_(action,payload,endpoint){
       }
 
       const text=await r.text();
+      clearTimeout(timer);
       let parsed;
       try{parsed=JSON.parse(text);}
       catch(e){throw new Error('Invalid server response');}
@@ -5385,6 +5385,25 @@ async function bnxMaybeShowPreLoginInstall(){
   return false;
 }
 let bnxLoginInFlight=false;
+/* WARM-UP: Apps Script cold starts cost 5-20 s. Poke both deployments as soon as
+   the page opens (and again when the steward taps a login field) so they are
+   awake by the time Login is pressed. Fire-and-forget, never blocks anything. */
+(function(){
+  var last=0;
+  function warm(){
+    if(Date.now()-last<60000) return; last=Date.now();
+    try{
+      ['V2_AUTH','V2_CORE'].forEach(function(ep){
+        fetch(bnxApiUrl_(ep),{method:'GET',mode:'no-cors',cache:'no-store',credentials:'omit'}).catch(function(){});
+      });
+    }catch(e){}
+  }
+  window.bnxWarmApis_=warm;
+  setTimeout(warm,50);
+  document.addEventListener('focusin',function(e){
+    var t=e.target&&e.target.id; if(t==='login-user'||t==='login-pass') warm();
+  });
+})();
 async function bnxDoLoginInner_(){
   if(bnxLoginInFlight) return;
   bnxLoginInFlight=true;
@@ -5433,7 +5452,7 @@ async function bnxDoLoginInner_(){
   localStorage.setItem('ERP_ROLE', (result.ROLE||'').toUpperCase());
   localStorage.setItem('ERP_CLIENT', loggedClientId);
   localStorage.setItem('ERP_SESSION', result.sessionToken || result.token || '');
-  localStorage.setItem('ERP_EXPIRY', String((function(){var d=new Date();var e=new Date(d.getFullYear(),d.getMonth(),d.getDate(),6,0,0,0);if(d>=e)e.setDate(e.getDate()+1);return Math.max(e.getTime(),Date.now()+12*60*60*1000);})()));
+  localStorage.setItem('ERP_EXPIRY', String(Date.now()+24*60*60*1000));
 
   // CRITICAL: CLIENT_ID/IS_DEMO_MODE were calculated before login. Without
   // refreshing them here, a login could leave demo menu/tables/history active
@@ -5506,13 +5525,14 @@ async function bnxDoLoginInner_(){
      in the background and is ready long before the steward opens New Order. */
   const __bootP = loadBootstrapOrFallback().catch(e=>console.error('[BOOT] bootstrap rejected:', e));
   await Promise.race([
-    Promise.allSettled([loadTablesLive(), loadKOTFromServer(), Promise.race([Promise.allSettled([bnxBrandP_,bnxNameP_]), new Promise(r=>setTimeout(r,2500))])]),
-    new Promise(r=>setTimeout(r,(Array.isArray(TABLES)&&TABLES.length)?900:6000))
+    Promise.allSettled([loadTablesLive(), loadKOTFromServer(), Promise.race([Promise.allSettled([bnxBrandP_,bnxNameP_]), new Promise(r=>setTimeout(r,1200))])]),
+    new Promise(r=>setTimeout(r,(Array.isArray(TABLES)&&TABLES.length)?700:2500))
   ]);
   void __bootP;
   try{ bnxUpdateGreetingAndShift(new Date().getHours()); if(window.bnxRefreshHomeBrand) window.bnxRefreshHomeBrand(true); }catch(_){}
   bnxLoginInFlight=false;
   bnxClosePreLoginInstall();
+  try{ if(window.bnxSyncPrinterMaster) window.bnxSyncPrinterMaster(); }catch(_){}
   showScreen('s-home');
 }
 async function doLogin(){
@@ -15394,11 +15414,20 @@ body:has(#s-new-order.active) .hs-status-wrap>div{font-size:9px!important;paddin
     ['ERP_USER','ERP_SESSION','ERP_ROLE','ERP_CLIENT','ERP_EXPIRY','bnx_client_id'].forEach(function(k){try{localStorage.removeItem(k);}catch(e){}});
     try{sessionStorage.removeItem('ERP_USER');}catch(e){}
   }
-  function nextRollover(){
-    var d=new Date(), e=new Date(d.getFullYear(),d.getMonth(),d.getDate(),6,0,0,0);
-    if(d>=e) e.setDate(e.getDate()+1);
-    return e.getTime();
+  /* Session = 24 h, renewed on activity (see touch()) — a steward stays logged in all day. */
+  function nextRollover(){ return Date.now()+24*60*60*1000; }
+  function touch(){
+    try{
+      if(!localStorage.getItem('ERP_USER')) return;
+      var exp=Number(localStorage.getItem('ERP_EXPIRY')||0);
+      if(exp && Date.now()>exp) return;
+      localStorage.setItem('ERP_EXPIRY',String(nextRollover()));
+    }catch(e){}
   }
+  var __lt=0;
+  ['pointerdown','keydown','touchstart'].forEach(function(ev){
+    document.addEventListener(ev,function(){ var n=Date.now(); if(n-__lt>60000){ __lt=n; touch(); } },{passive:true,capture:true});
+  });
   function expired(){
     var exp=Number(localStorage.getItem('ERP_EXPIRY')||0);
     if(!exp){ try{localStorage.setItem('ERP_EXPIRY',String(nextRollover()));}catch(e){} return false; }
@@ -15411,8 +15440,9 @@ body:has(#s-new-order.active) .hs-status-wrap>div{font-size:9px!important;paddin
   async function resume(){
     var raw=null,tok='';
     try{ raw=localStorage.getItem('ERP_USER'); tok=localStorage.getItem('ERP_SESSION')||''; }catch(e){}
-    if(!raw||!tok) return;
+    if(!raw) return;
     if(expired()){ clearSession(); return; }
+    touch();
     var r; try{ r=JSON.parse(raw); }catch(e){ return; }
     var cid=String(localStorage.getItem('ERP_CLIENT')||r.CLIENT_ID||r.clientId||'').trim();
     if(!cid||!r.ROLE) return;
@@ -15449,7 +15479,7 @@ body:has(#s-new-order.active) .hs-status-wrap>div{font-size:9px!important;paddin
       if(localStorage.getItem('ERP_SESSION') && expired()){ clearSession(); W.__bnxResumed=false; if(typeof showScreen==='function') showScreen('s-login'); }
     }catch(e){}
   }
-  document.addEventListener('visibilitychange',function(){ if(!document.hidden) guard(); });
+  document.addEventListener('visibilitychange',function(){ if(!document.hidden){ guard(); touch(); } });
   setInterval(guard,5*60*1000);
   setTimeout(resume,0);
 
@@ -16734,6 +16764,36 @@ html body #s-tables .tcard .tc-kot{display:inline-block;font-size:8px!important;
     });
     return map;
   }
+  /* ZERO-SETUP PRINTING: the admin puts the Print Relay link/key once in the client's server settings
+     (extra columns RELAY_URL + RELAY_KEY on CLIENT_PRINTER_MASTER, or relayUrl/relayKey in the API reply).
+     Every phone then configures itself at login — stewards never paste anything. */
+  function relayFromServer(rows,top){
+    var url='',key='',hdr=null;
+    function up(o){ var n={}; Object.keys(o||{}).forEach(function(k){ n[String(k).trim().toUpperCase()]=o[k]; }); return n; }
+    function take(o){
+      if(!o||typeof o!=='object'||Array.isArray(o)) return; o=up(o);
+      var u=String(o.RELAY_URL||o.PRINT_RELAY_URL||o.PRINT_RELAY||o.RELAYURL||'').trim();
+      var k=String(o.RELAY_KEY||o.PRINT_KEY||o.BNX_PRINT_KEY||o.RELAYKEY||'').trim();
+      if(!url&&/^https?:\/\/[^\s]+$/i.test(u)&&!/:9100(\/|$)/.test(u)) url=u;
+      if(!key&&k) key=k;
+    }
+    take(top);
+    (rows||[]).forEach(function(r){
+      if(Array.isArray(r)){
+        if(!hdr&&r.some(function(c){ return /^(PRINT_)?RELAY(_URL|_KEY)?$|^PRINT_KEY$/i.test(String(c).trim()); })){ hdr=r.map(function(c){ return String(c).trim().toUpperCase(); }); return; }
+        if(!hdr) return; var o={}; hdr.forEach(function(h,i){ o[h]=r[i]; }); take(o);
+      } else take(r);
+    });
+    return url?{url:url.replace(/\/+$/,''),key:key}:null;
+  }
+  function saveRelay(rl){
+    var c=cid(); if(!rl||!c) return;
+    try{
+      localStorage.setItem('bnx_print_relay_'+c,rl.url); localStorage.setItem('bnx_print_relay_any',rl.url);
+      if(rl.key){ localStorage.setItem('bnx_print_relay_key_'+c,rl.key); localStorage.setItem('bnx_print_relay_key_any',rl.key); }
+      console.info('[PRINTERS] Print Relay auto-configured from server:',rl.url);
+    }catch(e){}
+  }
   async function syncMaster(){
     var c=cid(); if(!c||typeof gasApi!=='function') return;
     var stampKey='bnx_printer_master_at_'+c;
@@ -16745,6 +16805,7 @@ html body #s-tables .tcard .tc-kot{display:inline-block;font-size:8px!important;
       try{
         var r=await gasApi(tries[i][0],tries[i][1],'V2_CORE');
         var rows=r&&r.success?(Array.isArray(r.data)?r.data:(r.data&&Array.isArray(r.data.printers)?r.data.printers:(Array.isArray(r.printers)?r.printers:null))):null;
+        try{ var top=r&&(r.data&&!Array.isArray(r.data)&&typeof r.data==='object'?Object.assign({},r.data,r):r); var rl=relayFromServer(rows||(r&&Array.isArray(r.data)?r.data:null),top); if(rl) saveRelay(rl); }catch(e){}
         var map=rows?rowsToMap(rows):{};
         if(Object.keys(map).length){
           localStorage.setItem('bnx_printer_master_'+c,JSON.stringify(map)); localStorage.setItem(stampKey,String(Date.now()));
