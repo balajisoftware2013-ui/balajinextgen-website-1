@@ -2,7 +2,7 @@
 'use strict';
 
 /*
- * Balaji NextGen — RAW ESC/POS Print Relay  (v3.1)
+ * Balaji NextGen — RAW ESC/POS Print Relay  (v3.2)
  *
  * A phone browser can never open a raw TCP socket to a thermal printer.
  * This relay runs on any always-on PC / Raspberry Pi on the same Wi-Fi/LAN.
@@ -64,7 +64,9 @@ const PRINTER_PREFIXES = (function () {
 })();
 
 const ALLOWED_ORIGINS = new Set(['https://balajinextgen.in', 'https://www.balajinextgen.in']);
-let ALLOW_ANY_ORIGIN = false;
+/* v3.2: accept the app from ANY web address (Apps Script, custom domain, PWA...). Printing is still protected by the secret key.
+   Set BNX_ALLOWED_ORIGINS=https://yoursite to restrict it again. */
+let ALLOW_ANY_ORIGIN = !String(process.env.BNX_ALLOWED_ORIGINS || '').trim();
 String(process.env.BNX_ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean)
   .forEach(o => { if (o === '*') ALLOW_ANY_ORIGIN = true; else ALLOWED_ORIGINS.add(o.replace(/\/+$/, '')); });
 
@@ -299,8 +301,16 @@ async function handleRequest(req, res) {
     return sendJson(req, res, 200, {
       ok: true,
       service: 'BNX RAW ESC/POS Relay',
-      version: 3.1,
+      version: 3.2,
       protocol: req.socket.encrypted ? 'https' : 'http',
+      /* v3.2: the relay tells the dashboard its own LAN links, so nobody has to hunt for the IP */
+      hostname: os.hostname(),
+      links: (function () {
+        const ips = lanAddresses();
+        return CERT_PATH
+          ? { https: ips.map(ip => 'https://' + ip + ':' + PORT), http: ips.map(ip => 'http://' + ip + ':' + HTTP_PORT) }
+          : { https: [], http: ips.map(ip => 'http://' + ip + ':' + PORT) };
+      })(),
       tcpPort: PRINTER_PORT,
       tokenRequired: true,
       keyOk: req.headers['x-bnx-key'] ? keyOk(req) : null,
