@@ -9,7 +9,9 @@
 <meta name="theme-color" content="#fff7e8">
 <script>(function(){try{var q=new URLSearchParams(location.search);if(q.get('client')||q.get('clientId'))document.documentElement.classList.add('booting');}catch(e){}})();</script>
 <title>Order — Scan &amp; Order</title>
-<link rel="preconnect" href="https://script.google.com">
+<link rel="preconnect" href="https://script.google.com" crossorigin>
+<link rel="dns-prefetch" href="https://lh3.googleusercontent.com">
+<link rel="dns-prefetch" href="https://drive.google.com">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=DM+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -521,7 +523,7 @@ const GAS_APIS_DASH = {
   V2_AUTH:     'https://script.google.com/macros/s/' + (localStorage.getItem('bnx_api_auth') || 'AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx') + '/exec',
   V2_FRONTEND: 'https://script.google.com/macros/s/' + (localStorage.getItem('bnx_api_front') || 'AKfycbyiaO9zpZAQ1pTlDjz7B2yEUfjv1vrlXTYjTkIY-YwKr6ahOCV6lU_AiB4dpmnBySG1') + '/exec',
 };
-async function gasApi(action,payload,endpoint){
+async function gasApi(action,payload,endpoint,timeoutMs){
   payload=payload||{};
   const url=GAS_APIS_DASH[endpoint||'V2_CORE'];
   try{
@@ -548,7 +550,7 @@ async function gasApi(action,payload,endpoint){
        per-table token verified server-side (see the architectural
        security note above) -- that's a backend decision, not something
        to bolt on here. */
-    const ctl = new AbortController(); const tm = setTimeout(()=>ctl.abort(), 20000);   // never hang forever on a slow/blocked backend
+    const ctl = new AbortController(); const tm = setTimeout(()=>ctl.abort(), timeoutMs || (/^GET_/.test(action)?8000:25000));   // never hang forever on a slow/blocked backend
     try{
       const r=await fetch(url,{method:'POST',signal:ctl.signal,body:JSON.stringify(Object.assign({action:action,clientId:STATE.clientId,sessionToken:bnxGuestSessionToken(),guest:true,source:'CUSTOMER_QR',tableId:STATE.tableId||''},payload))});
       return await r.json();
@@ -769,7 +771,7 @@ async function boot(){
      and the item list are ready by the time the phone screen shows. */
   /* Menu loads in the background (enterMenu waits for it); only the small restaurant-info call
      is awaited here, capped at 4 s, so the guest always sees the Welcome screen quickly. */
-  bnxPrimeFromCache();
+  if (bnxPrimeFromCache()) MENU_LOADING=false;
   setTimeout(()=>{ if (MENU_LOADING && !MENU.length) bnxToast('Menu is taking longer than usual \u2014 please wait a moment\u2026'); }, 8000);
   /* the PDF menu-card lookup runs on its own: it must never hold back the dish list */
   loadActiveMenuCard().catch(()=>{});
@@ -1019,13 +1021,14 @@ function bnxImgErr(img){
    guest calls are rejected with "Invalid or expired session". Fetched once and shared. */
 function bnxPublicFetch(){
   if(!window.__pubP){
-    window.__pubP = (async()=>{
-      try{
-        const ctl=new AbortController(); const tm=setTimeout(()=>ctl.abort(),20000);
-        try{ const r=await fetch(GAS_APIS_DASH.V2_CORE+'?action=PUBLIC_MENU&clientId='+encodeURIComponent(STATE.clientId),{signal:ctl.signal});
-             const j=await r.json(); return (j&&j.success&&j.data)?j.data:null; } finally{ clearTimeout(tm); }
-      }catch(e){ return null; }
-    })();
+    const once=async(ms)=>{
+      const ctl=new AbortController(); const tm=setTimeout(()=>ctl.abort(),ms);
+      try{ const r=await fetch(GAS_APIS_DASH.V2_CORE+'?action=PUBLIC_MENU&clientId='+encodeURIComponent(STATE.clientId),{signal:ctl.signal});
+           const j=await r.json(); return (j&&j.success&&j.data)?j.data:null; }
+      catch(e){ return null; } finally{ clearTimeout(tm); }
+    };
+    /* 2 quick tries (cold-start Apps Script often answers the 2nd one in 1-2 s) */
+    window.__pubP = (async()=> (await once(7000)) || (await once(9000)))();
   }
   return window.__pubP;
 }
@@ -1055,21 +1058,18 @@ async function loadMenuFromServer(){
   const pubP = bnxPublicFetch();
   const sessionTry = (async()=>{
     let f=[], b=[], ok=false;
-    for (let attempt=0; attempt<2 && !ok; attempt++){
-      if (attempt) await new Promise(r=>setTimeout(r, 1500));
-      try{
-        const pos = pick(await gasApi('GET_POS_MENU', {}, 'V2_CORE'));
-        if (pos){ f = pos.food; b = pos.bar; ok = f.length>0 || b.length>0; }
-      }catch(e){ lastErr = e.message||''; }
-      if (!ok){
-        const [foodRes, barRes] = await Promise.all([
-          gasApi('GET_MENU_ITEMS', {}, 'V2_CORE').catch(()=>null),
-          gasApi('GET_BAR_MENU', {}, 'V2_CORE').catch(()=>null),
-        ]);
-        const a = pick(foodRes), c = pick(barRes);
-        if (a) f = a.food.concat(a.bar); if (c) b = c.food.concat(c.bar);
-        ok = f.length>0 || b.length>0;
-      }
+    try{
+      const pos = pick(await gasApi('GET_POS_MENU', {}, 'V2_CORE'));
+      if (pos){ f = pos.food; b = pos.bar; ok = f.length>0 || b.length>0; }
+    }catch(e){ lastErr = e.message||''; }
+    if (!ok){
+      const [foodRes, barRes] = await Promise.all([
+        gasApi('GET_MENU_ITEMS', {}, 'V2_CORE').catch(()=>null),
+        gasApi('GET_BAR_MENU', {}, 'V2_CORE').catch(()=>null),
+      ]);
+      const a = pick(foodRes), c2 = pick(barRes);
+      if (a) f = a.food.concat(a.bar); if (c2) b = c2.food.concat(c2.bar);
+      ok = f.length>0 || b.length>0;
     }
     return ok ? {food:f, bar:b} : null;
   })();
@@ -1187,7 +1187,7 @@ async function loadActiveMenuCard(){
 
   await Promise.race([
     activeP, publicP,
-    new Promise(r=>setTimeout(()=>r(false),7000))
+    new Promise(r=>setTimeout(()=>r(false),3500))
   ]);
   /* Do not retry 3 times here: repeated 2.5s waits were the visible menu-card delay. */
 }
