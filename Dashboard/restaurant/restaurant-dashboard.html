@@ -10166,7 +10166,9 @@ async function bnxPullBillsRange_(from, to){
           items: sb.items ?? (Array.isArray(sb.itemsDetail)?sb.itemsDetail.length:0),
           itemsDetail: sb.itemsDetail || (Array.isArray(sb.items)?sb.items:[]),
           sub: sb.sub ?? sb.subtotal ?? sb.SUBTOTAL ?? 0,
-          disc: sb.disc ?? sb.discount ?? sb.DISCOUNT ?? 0,
+          disc: sb.disc ?? sb.discount ?? sb.DISCOUNT ?? ((sb.ITEM_DISCOUNT!=null||sb.BILL_DISCOUNT!=null||sb.itemDiscount!=null||sb.billDiscount!=null)
+                ? ((Number(sb.ITEM_DISCOUNT??sb.itemDiscount)||0)+(Number(sb.BILL_DISCOUNT??sb.billDiscount)||0)) : 0),
+          discPct: Number(sb.discPct ?? sb.DISCOUNT_PCT ?? sb.discountPct ?? 0) || 0,
           sc: sb.sc ?? sb.serviceCharge ?? sb.SERVICE_CHARGE ?? 0,
           gst: sb.gst ?? sb.tax ?? sb.TAX_AMOUNT ?? 0,
           roundOff: sb.roundOff ?? sb.ROUND_OFF ?? sb.roff ?? 0,
@@ -21128,9 +21130,83 @@ function blGetAllBills(){
   const real=bnxGetBillRegister();
   // Production/live-client rule: never make sample bills look like real
   // financial records. Demo bills are available only when explicitly opted in.
-  if (real.length) return real;
+  if (real.length){ try{ real.forEach(bnxBillDiscFix_); }catch(e){} return real; }
   return [];
 }
+/* ═══ BILL DISCOUNT (Oct 2026 — "REPRINT DISCOUNT COLOUR NOT SHOW") ═══
+   ROOT CAUSE: LIST_BILLS sends the discount as ITEM_DISCOUNT / BILL_DISCOUNT, but the bill
+   register only read disc / discount / DISCOUNT, so every server bill had disc = 0. The
+   "total safety rule" (Bills List row, View, WhatsApp, ESC/POS reprint) then rebuilt the total
+   as Subtotal + GST and showed / PRINTED the bill WITHOUT its discount — e.g. HT/2627/00006913:
+   Subtotal 5,510 − Discount 551 + GST 442.58 + RO 0.42 = 5,402, but screen + reprint said 5,953
+   with Discount 0 and no discount line. Discount now comes from (1) the bill's own field,
+   (2) the item lines (gross − discounted value), (3) Subtotal + SC + GST + Round Off − saved Total. */
+function bnxBillN_(v){ v=Number(v); return isFinite(v)?v:0; }
+function bnxItemDisc_(i){
+  if(!i) return 0;
+  const q=bnxBillN_(i.qty)||1, r=bnxBillN_(i.rate??i.price), g=q*r;
+  if(!(g>0)) return 0;
+  let d=null;
+  if(i.disc!=null) d=bnxBillN_(i.disc);
+  else if(i.taxable!=null) d=g-bnxBillN_(i.taxable);
+  else if(i.discRate!=null&&bnxBillN_(i.discRate)>0) d=g-q*bnxBillN_(i.discRate);
+  else {
+    const a=bnxBillN_(i.amount??i.amt); if(!(a>0)) return 0;
+    let tr=bnxBillN_(i.taxRate); if(tr>1) tr=tr/100;
+    const pre=tr>0?a/(1+tr):a; d=g-pre;
+  }
+  d=Math.round(d*100)/100;
+  return (d>0.004&&d<g)?d:0;
+}
+function bnxBillDisc_(b){
+  if(!b) return 0;
+  const own=bnxBillN_(b.disc); if(own>0.004) return own;
+  const its=Array.isArray(b.itemsDetail)?b.itemsDetail:[];
+  let di=0; its.forEach(i=>{ di+=bnxItemDisc_(i); });
+  const sub=bnxBillN_(b.sub), sc=bnxBillN_(b.sc), gst=bnxBillN_(b.gst), tot=bnxBillN_(b.total);
+  const ro=bnxBillN_(b.roundOff), safeRo=Math.abs(ro)<=1.01?ro:0;
+  const fromTotal=(sub>0&&tot>0)?Math.round((sub+sc+gst+safeRo-tot)*100)/100:0;
+  /* item lines agree with the saved total (or the total is unknown) → use the item lines */
+  if(di>0.004&&(!(tot>0)||Math.abs(di-fromTotal)<=1.5||fromTotal<=0)) return Math.round(di*100)/100;
+  if(fromTotal>1.01&&fromTotal<sub) return fromTotal;
+  return 0;
+}
+function bnxBillDiscFix_(b){
+  if(!b||bnxBillN_(b.disc)>0.004){ if(b&&!b.discPct&&bnxBillN_(b.sub)>0&&bnxBillN_(b.disc)>0) b.discPct=Math.round(b.disc/b.sub*10000)/100; return b; }
+  const d=bnxBillDisc_(b);
+  if(d>0){ b.disc=d; b.discSrc='derived'; if(!b.discPct&&bnxBillN_(b.sub)>0) b.discPct=Math.round(d/b.sub*10000)/100; }
+  return b;
+}
+/* Saved total, or Subtotal − Discount + SC + GST + Round Off when the saved total does not agree. */
+function bnxBillTotal_(b){
+  const sub=bnxBillN_(b.sub), disc=bnxBillN_(b.disc), sc=bnxBillN_(b.sc), gst=bnxBillN_(b.gst);
+  const ro=bnxBillN_(b.roundOff), safeRo=Math.abs(ro)<=1.01?ro:0, exp=(sub-disc)+sc+gst+safeRo, raw=bnxBillN_(b.total);
+  return Math.abs(raw-exp)>1.01?Math.round(exp):raw;
+}
+/* the one mapped object every reprint / bill PDF uses: items at RATE × QTY (they add up to Sub Total),
+   then Discount, SC, Tax, Round Off — exactly like the original invoice */
+function bnxBillPrintMapped_(b){
+  bnxBillDiscFix_(b);
+  const ri=(typeof bnxGetRestaurantInfo==='function'?bnxGetRestaurantInfo():{})||{};
+  const nm=ri.name||(typeof loadBrand==='function'?((loadBrand()||{}).name||''):'')||((window.BNX_LIVE_CLIENT_INFO||{}).name||'');
+  const sub=bnxBillN_(b.sub), disc=bnxBillN_(b.disc), sc=bnxBillN_(b.sc), gst=bnxBillN_(b.gst);
+  const total=bnxBillTotal_(b), base=sub-disc;
+  const scPct=bnxBillN_(b.scPct)||(base>0&&sc>0?Math.round(sc/base*10000)/100:0);
+  return {
+    entity:nm, clientName:nm, clientId:window.CLIENT_ID||((window.BNX_LIVE_CLIENT_INFO||{}).clientId||''),
+    addr:ri.address||'', phone:ri.phone||'', gstin:ri.gst||'',
+    billNo:b.no, date:b.dt||'', time:b.tm||'', table:b.table||'-', pax:b.pax||1,
+    cname:b.customer||'GENERAL CUSTOMER', cmob:b.mob||'', waiter:b.waiter||'',
+    items:(b.itemsDetail||[]).map(it=>{ const q=bnxBillN_(it.qty)||0, r=bnxBillN_(it.rate??it.price);
+      return {name:it.name||it.itemName||'Item',qty:q,rate:r,amt:(q&&r)?Math.round(q*r*100)/100:bnxBillN_(it.amt??it.amount)}; }),
+    sub:sub, discPct:bnxBillN_(b.discPct), disc:disc, discScope:b.discScope||'ALL', scPct:scPct, sc:sc,
+    taxBase:base, taxRows:[{hsn:'—',taxName:'GST',onAmt:base,taxAmt:gst}],
+    total:total, roundOff:+(total-(base+sc+gst)).toFixed(2), roff:+(total-(base+sc+gst)).toFixed(2),
+    cgst:+(gst/2).toFixed(2), sgst:+(gst/2).toFixed(2), igst:bnxBillN_(b.igst),
+    paymode:b.pay||'', payBreakdown:b.payBreakdown, user:b.waiter||'STAFF', kot:'-', remarks:b.remarks||''
+  };
+}
+window.bnxBillDisc_=bnxBillDisc_; window.bnxBillPrintMapped_=bnxBillPrintMapped_;
 async function blCancelBill(no){
   if (!bnxRequireFullAccess('Cancelling a bill')) return;
   const reason = prompt('Reason for cancelling bill '+no+' (required):');
@@ -21498,8 +21574,9 @@ function blBuildWaText_(b){
   const rName=String(ri.name||'').toUpperCase();
   const N=v=>Number(v||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
   const items=Array.isArray(b.itemsDetail)?b.itemsDetail:[];
+  bnxBillDiscFix_(b);
   const lines=items.map((i,k)=>{
-    const q=i.qty||1, r=i.rate||i.price||0, a=i.amount!==undefined?i.amount:(q*r);
+    const q=Number(i.qty)||1, r=Number(i.rate||i.price||0), a=r?q*r:(i.amount!==undefined?i.amount:0);
     return (k+1)+'. '+(i.name||i.itemName||'Item')+' x'+q+'  ₹'+N(a);
   });
   const subN=Number(b.sub)||0, discN=Number(b.disc)||0, scN=Number(b.sc)||0, gstN=Number(b.gst)||0;
@@ -21515,7 +21592,7 @@ function blBuildWaText_(b){
     lines.length?lines.join('\n'):'(Item details not stored for this bill)',
     '━━━━━━━━━━━━',
     'Subtotal: ₹'+N(subN),
-    (discN?'Discount: -₹'+N(discN):null),
+    (discN?'Discount'+(Number(b.discPct)?' ('+Number(b.discPct)+'%)':'')+': -₹'+N(discN):null),
     (scN?'Service charge: ₹'+N(scN):null),
     'GST: ₹'+N(gstN),
     '*Total: ₹'+N(total)+'*',
@@ -21526,23 +21603,7 @@ function blBuildWaText_(b){
 }
 const BL_WA_SVG='<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true" style="display:block"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413Z"/></svg>';
 /* Build the same "mapped" object the Reprint uses, so the PDF is the identical thermal receipt. */
-function blWaMapped_(b){
-  const ri=(typeof bnxGetRestaurantInfo==='function'?bnxGetRestaurantInfo():{})||{};
-  const sub=Number(b.sub)||0, gst=Number(b.gst)||0, total=Number(b.total)||(sub+gst);
-  const nm=ri.name||(typeof loadBrand==='function'?((loadBrand()||{}).name||''):'')||((window.BNX_LIVE_CLIENT_INFO||{}).name||'');
-  return {
-    entity:nm, clientName:nm, clientId:window.CLIENT_ID||((window.BNX_LIVE_CLIENT_INFO||{}).clientId||''),
-    addr:ri.address||'', phone:ri.phone||'', gstin:ri.gst||'',
-    billNo:b.no, date:b.dt||'', time:b.tm||'', table:b.table||'-', pax:b.pax||1,
-    cname:b.customer||'GENERAL CUSTOMER', cmob:b.mob||'', waiter:b.waiter||'',
-    items:(b.itemsDetail||[]).map(it=>({name:it.name||it.itemName||'Item',qty:Number(it.qty)||0,rate:Number(it.rate??it.price)||0,
-      amt:Number(it.amt??it.amount??((Number(it.qty)||0)*(Number(it.rate??it.price)||0)))||0})),
-    sub:sub, discPct:Number(b.discPct)||0, disc:Number(b.disc)||0, scPct:Number(b.scPct)||0, sc:Number(b.sc)||0,
-    taxRows:[{hsn:'—',taxName:'GST',onAmt:sub,taxAmt:gst}],
-    total:total, roundOff:+(total-(sub+gst)).toFixed(2), cgst:+(gst/2).toFixed(2), sgst:+(gst/2).toFixed(2), igst:Number(b.igst)||0,
-    paymode:b.pay||'', user:b.waiter||'STAFF', kot:'-', remarks:b.remarks||''
-  };
-}
+function blWaMapped_(b){ return bnxBillPrintMapped_(b); }
 /* Render the bill receipt off-screen -> PDF (page sized to the receipt, so it is one clean page). */
 /* LOGO FIX 2026-10-05 ("logo not show" on the bill PDF / WhatsApp bill):
    html2canvas took the snapshot the instant the receipt was inserted — the <img> logo had not
@@ -21709,15 +21770,24 @@ function blViewBill(no){
   window._blViewIndex = idx;
   const sC={'Paid':'p-g','Pending':'p-o','Draft':'p-b','Not Required':'p-gray','Complimentary':'p-gray','Cancelled':'p-r'};
   const items = b.itemsDetail||[];
+  bnxBillDiscFix_(b);
+  const _m = v => Number(v||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const DISC_C = '#C0392B', DISC_BG = '#FDECEA';
   const itemsHtml = items.length
     ? items.map(i=>{
-        const qty=i.qty||1, rate=i.rate||i.price||0, amt=i.amount!==undefined?i.amount:(qty*rate);
-        return `<div style="display:grid;grid-template-columns:1fr 40px 70px 80px;font-size:12px;padding:5px 0;border-bottom:1px solid #f2f2f2;">
+        const qty=Number(i.qty)||1, rate=Number(i.rate||i.price||0), amt=rate?qty*rate:Number(i.amount!==undefined?i.amount:0);
+        const idisc=bnxItemDisc_(i), ipct=amt>0&&idisc>0?Math.round(idisc/amt*1000)/10:0;
+        return `<div style="display:grid;grid-template-columns:1fr 40px 70px 80px;font-size:12px;padding:5px 0;${idisc>0?'':'border-bottom:1px solid #f2f2f2;'}">
           <span>${i.name||i.itemName||'Item'}</span><span style="text-align:center;">${qty}</span>
-          <span style="text-align:right;">₹${Number(rate).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</span>
-          <span style="text-align:right;font-weight:600;">₹${Number(amt).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</span></div>`;
+          <span style="text-align:right;">₹${_m(rate)}</span>
+          <span style="text-align:right;font-weight:600;">₹${_m(amt)}</span></div>`
+          +(idisc>0?`<div style="display:grid;grid-template-columns:1fr 80px;font-size:11px;padding:0 0 5px;border-bottom:1px solid #f2f2f2;color:${DISC_C};font-weight:600;">
+          <span style="padding-left:10px;">↳ Discount${ipct?' '+ipct+'%':''}</span><span style="text-align:right;">− ₹${_m(idisc)}</span></div>`:'');
       }).join('')
     : `<div style="font-size:12px;color:#999;padding:8px 0;">Item-level detail not stored for this bill.</div>`;
+  const _disc=Number(b.disc)||0, _sc=Number(b.sc)||0, _tot=bnxBillTotal_(b);
+  const _ro=+(_tot-((Number(b.sub)||0)-_disc+_sc+(Number(b.gst)||0))).toFixed(2);
+  const _dPct=Number(b.discPct)||((Number(b.sub)||0)>0&&_disc>0?Math.round(_disc/b.sub*10000)/100:0);
   const hasPrev = idx > 0;
   const hasNext = idx > -1 && idx < list.length - 1;
   const navHtml = idx > -1 ? `
@@ -21741,8 +21811,11 @@ function blViewBill(no){
     </div>
     ${itemsHtml}
     <div style="margin-top:10px;padding-top:8px;border-top:1px solid #eee;">
-      <div style="display:flex;justify-content:space-between;font-size:12.5px;padding:3px 0;"><span>Subtotal</span><span>₹${b.sub.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</span></div>
-      <div style="display:flex;justify-content:space-between;font-size:12.5px;padding:3px 0;"><span>GST</span><span>₹${b.gst.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</span></div>
+      <div style="display:flex;justify-content:space-between;font-size:12.5px;padding:3px 0;"><span>Subtotal</span><span>₹${_m(b.sub)}</span></div>
+      ${_disc>0?`<div style="display:flex;justify-content:space-between;font-size:12.5px;padding:4px 8px;margin:2px -8px;background:${DISC_BG};color:${DISC_C};font-weight:700;border-radius:6px;"><b>Discount${_dPct?' ('+_dPct+'%)':''}</b><b>− ₹${_m(_disc)}</b></div>`:''}
+      ${_sc>0?`<div style="display:flex;justify-content:space-between;font-size:12.5px;padding:3px 0;"><b style="font-weight:400;">Service Charge</b><b style="font-weight:400;">₹${_m(_sc)}</b></div>`:''}
+      <div style="display:flex;justify-content:space-between;font-size:12.5px;padding:3px 0;"><span>GST</span><span>₹${_m(b.gst)}</span></div>
+      ${Math.abs(_ro)>=0.01&&Math.abs(_ro)<=1.01?`<div style="display:flex;justify-content:space-between;font-size:12px;padding:2px 0;color:#888;"><b style="font-weight:400;">Round Off</b><b style="font-weight:400;">${_ro>0?'+':''}₹${_m(_ro)}</b></div>`:''}
       <div style="display:flex;justify-content:space-between;font-size:14px;font-weight:800;padding:6px 0;border-top:1px solid #eee;margin-top:4px;"><span>Grand Total</span><span style="color:var(--gold);">₹${b.total.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</span></div>
     </div>
     <div style="display:flex;justify-content:space-between;font-size:11.5px;color:#666;margin-top:8px;">
@@ -21816,48 +21889,8 @@ async function blReprintBillByNo(no){
   }
 
   try{
-    const ri = (typeof bnxGetRestaurantInfo === 'function') ? bnxGetRestaurantInfo() : {};
-    const sub = Number(local.sub) || 0;
-    const gst = Number(local.gst) || 0;
-    const total = Number(local.total) || (sub + gst);
-
-    const mapped = {
-      entity: ri.name || (typeof loadBrand==='function' ? ((loadBrand()||{}).name||'') : '') || ((window.BNX_LIVE_CLIENT_INFO||{}).name||'') || '',
-      clientName: ri.name || (typeof loadBrand==='function' ? ((loadBrand()||{}).name||'') : '') || ((window.BNX_LIVE_CLIENT_INFO||{}).name||'') || '',
-      clientId: window.CLIENT_ID || ((window.BNX_LIVE_CLIENT_INFO||{}).clientId||'') || '',
-      addr: ri.address || '',
-      phone: ri.phone || '',
-      gstin: ri.gst || '',
-      billNo: local.no || no,
-      date: local.dt || '',
-      time: local.tm || '',
-      table: local.table || '-',
-      pax: local.pax || 1,
-      cname: local.customer || 'GENERAL CUSTOMER',
-      cmob: local.mob || '',
-      waiter: local.waiter || '',
-      items: (local.itemsDetail || []).map(it => ({
-        name: it.name || it.itemName || 'Item',
-        qty: Number(it.qty) || 0,
-        rate: Number(it.rate ?? it.price) || 0,
-        amt: Number(it.amt ?? it.amount ?? ((Number(it.qty)||0)*(Number(it.rate ?? it.price)||0))) || 0
-      })),
-      sub: sub,
-      discPct: Number(local.discPct)||0,
-      disc: Number(local.disc)||0,
-      scPct: Number(local.scPct)||0,
-      sc: Number(local.sc)||0,
-      taxRows: [{ hsn: '—', taxName: 'GST', onAmt: sub, taxAmt: gst }],
-      total: total,
-      roundOff: +(total - (sub + gst)).toFixed(2),
-      cgst: +(gst/2).toFixed(2),
-      sgst: +(gst/2).toFixed(2),
-      igst: Number(local.igst)||0,
-      paymode: local.pay || '',
-      user: local.waiter || 'STAFF',
-      kot: '-',
-      remarks: local.remarks || ''
-    };
+    /* discount, SC and round off now carried exactly like the original invoice (bnxBillPrintMapped_) */
+    const mapped = bnxBillPrintMapped_(local);
 
     if(typeof window.bnxDirectBillInvoice === 'function'){
       const directOk = await window.bnxDirectBillInvoice(mapped);
@@ -21907,21 +21940,7 @@ async function blReprintBill(bill){
   if (!bill) return;
   // Reprint must use the current client master identity too, not stale
   // browser-cached address/GST details.
-  const ri = bnxGetRestaurantInfo();
-  const sub = Number(bill.sub) || 0;
-  const gst = Number(bill.gst) || 0;
-  const total = Number(bill.total) || (sub + gst);
-  const mapped = {
-    entity: ri.name || (typeof loadBrand==='function' ? ((loadBrand()||{}).name||'') : '') || ((window.BNX_LIVE_CLIENT_INFO||{}).name||'') || '', clientName: ri.name || (typeof loadBrand==='function' ? ((loadBrand()||{}).name||'') : '') || ((window.BNX_LIVE_CLIENT_INFO||{}).name||'') || '', clientId: window.CLIENT_ID || ((window.BNX_LIVE_CLIENT_INFO||{}).clientId||'') || '', addr: ri.address || '', phone: ri.phone || '', gstin: ri.gst || '',
-    billNo: bill.no || '', date: bill.dt || '', time: bill.tm || '', table: bill.table || '-', pax: bill.pax || 1,
-    cname: bill.customer || 'GENERAL CUSTOMER', cmob: bill.mob || '', waiter: bill.waiter || '',
-    items: (bill.itemsDetail || []).map(it => ({ name: it.name || '', qty: Number(it.qty) || 0, rate: Number(it.rate) || 0, amt: Number(it.amt != null ? it.amt : (it.qty * it.rate)) || 0 })),
-    sub: sub, discPct: 0, disc: 0, scPct: 0, sc: 0,
-    taxRows: [{ hsn: '—', taxName: 'GST', onAmt: sub, taxAmt: gst }],
-    total: total, roundOff: +(total - (sub + gst)).toFixed(2),
-    cgst: +(gst/2).toFixed(2), sgst: +(gst/2).toFixed(2),
-    paymode: bill.pay || '', user: bill.waiter || 'STAFF', kot: '-', remarks: ''
-  };
+  const mapped = bnxBillPrintMapped_(bill);   /* real discount / SC / round off — not 0 */
 
   /* Bills List -> Reprint must use the same direct BILL printer route as
      New Bill -> Save & Print Invoice.  If QZ/IP is unavailable, preserve the
@@ -44476,8 +44495,14 @@ function normItems(raw){
     if(!q)q=1;
     if(!r&&a)r=a/q;
     if(!a)a=q*r;
-    return {name:String(pick(i,['name','itemName','ITEM_NAME','NAME','item'])||'Item'),qty:q,rate:r,amt:a,amount:a,
+    var o={name:String(pick(i,['name','itemName','ITEM_NAME','NAME','item'])||'Item'),qty:q,rate:r,amt:a,amount:a,
             cat:pick(i,['cat','category','CATEGORY'])||'',taxRate:pick(i,['taxRate','TAX_RATE'])};
+    /* keep the line discount so View / Reprint / WhatsApp can show it (Oct 2026) */
+    var dsc=pick(i,['disc','lineDisc','lineDiscount','LINE_DISCOUNT','discount','DISCOUNT','itemDiscount','ITEM_DISCOUNT']); if(dsc!=null)o.disc=num(dsc);
+    var dr=pick(i,['discRate','discountedRate','DISCOUNTED_RATE']); if(dr!=null)o.discRate=num(dr);
+    var tx=pick(i,['taxable','taxableAmount','TAXABLE_PER_ITEM','TAXABLE_AMOUNT']); if(tx!=null)o.taxable=num(tx);
+    var tpi=pick(i,['tax','taxAmt','TAX_PER_ITEM','ITEM_TAX']); if(tpi!=null)o.tax=num(tpi);
+    return o;
   });
 }
 function extractItems(res,no){
