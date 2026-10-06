@@ -622,6 +622,73 @@ function bnxIsReadOnlyAction_(a){ return /^(GET_|LIST_|RD_FETCH_|NEXT_)/.test(St
 // stale session and sends the user back to login with a clear reason,
 // instead of leaving a half-broken screen where every action quietly
 // fails forever.
+/* SESSION INACTIVITY POLICY — 5 HOURS
+   A logged-in ERP session expires after 5 continuous hours with NO user action.
+   Normal staff activity (click/tap, keyboard, touch, pointer, scroll, POS use)
+   refreshes the inactivity clock. This is client-side inactivity enforcement;
+   the server-side session remains authoritative and can still reject an expired
+   or revoked token earlier. Activity is throttled so localStorage is not written
+   on every mousemove/scroll event. */
+(function(){
+  var IDLE_LIMIT_MS = 5 * 60 * 60 * 1000;
+  var KEY = 'BNX_LAST_ACTIVITY_AT';
+  var lastWrite = 0;
+  var CHECK_MS = 60 * 1000;
+  var WRITE_GAP_MS = 30 * 1000;
+
+  function now(){ return Date.now(); }
+  function read(){
+    try{
+      var n = Number(localStorage.getItem(KEY) || 0);
+      return isFinite(n) && n > 0 ? n : 0;
+    }catch(e){ return 0; }
+  }
+  function write(force){
+    var t=now();
+    if(!force && (t-lastWrite)<WRITE_GAP_MS) return;
+    lastWrite=t;
+    try{ localStorage.setItem(KEY,String(t)); }catch(e){}
+  }
+  function clear(){ try{ localStorage.removeItem(KEY); }catch(e){} }
+  function expired(){
+    var t=read();
+    return t > 0 && (now()-t) >= IDLE_LIMIT_MS;
+  }
+  function enforce(){
+    if(expired()){
+      clear();
+      try{ bnxForceReauth('Session expired after 5 hours of inactivity — please log in again.'); }
+      catch(e){
+        try{ localStorage.removeItem('ERP_SESSION'); }catch(x){}
+        try{ window.location.href = window.bnxRootPath ? window.bnxRootPath('login.html') : '../login.html'; }catch(x){}
+      }
+      return true;
+    }
+    return false;
+  }
+  function activity(){
+    if(window._bnxReauthTriggered) return;
+    if(!read()) write(true);
+    else write(false);
+  }
+
+  /* Do not count page loading itself as staff activity when an old timestamp
+     exists — otherwise closing a tab overnight would silently reset the clock. */
+  try{
+    if(!read()) write(true);
+    else enforce();
+  }catch(e){}
+
+  ['click','keydown','pointerdown','touchstart','scroll'].forEach(function(ev){
+    window.addEventListener(ev, activity, {passive:true, capture:true});
+  });
+  window.addEventListener('focus', function(){ enforce(); if(!expired()) activity(); });
+  window.setInterval(enforce, CHECK_MS);
+
+  window.BNX_SESSION_IDLE_LIMIT_MS = IDLE_LIMIT_MS;
+  window.BNX_SESSION_IDLE_LIMIT_HOURS = 5;
+})();
+
 let _bnxReauthTriggered = false;
 function bnxForceReauth(message){
   if (_bnxReauthTriggered) return;
@@ -5416,7 +5483,7 @@ document.addEventListener('DOMContentLoaded', function(){
       <span class="card-title">📍 Quick Floor Map — All <span id="floorMapTableCount">58</span> Tables</span>
       <div style="display:flex;gap:10px;font-size:10px;align-items:center;flex-wrap:wrap;">
         <span style="color:var(--red)">● Occupied</span><span style="color:var(--green)">● Available</span>
-        <span style="color:var(--gold)">● Reserved</span><span style="color:var(--blue)">● Cleaning</span>
+        <span style="color:var(--gold)">● Reserved</span><span style="color:var(--blue)">● Cleaning</span><span style="color:#6b7487">● Blocked</span>
       </div>
     </div>
     <div class="fmap" id="floorMap" style="grid-template-columns:repeat(auto-fill,minmax(80px,1fr));gap:8px;"></div>
@@ -7038,7 +7105,7 @@ document.addEventListener('DOMContentLoaded', function(){
     <div class="stg-panel" id="s-security" style="display:none;">
       <div class="stg-panel-title">Security Settings</div>
       <div class="stg-row"><div><div class="stg-label">Two-Factor (OTP) Login</div><div class="stg-desc">Require OTP for all manager logins</div></div><button class="toggle on" onclick="this.classList.toggle('on')"></button></div>
-      <div class="stg-row"><div><div class="stg-label">Auto-lock on inactivity</div><div class="stg-desc">Lock after 10 min idle</div></div><button class="toggle on" onclick="this.classList.toggle('on')"></button></div>
+      <div class="stg-row"><div><div class="stg-label">Auto-lock on inactivity</div><div class="stg-desc">Session expires after 5 hours with no action</div></div><button class="toggle on" onclick="this.classList.toggle('on')"></button></div>
       <div class="stg-row"><div><div class="stg-label">Login IP Tracking</div><div class="stg-desc">Log all login attempts with IP</div></div><button class="toggle on" onclick="this.classList.toggle('on')"></button></div>
       <!-- FIX ("change form username and password and mobile no and
            email id"): this panel previously had a Change Password block
@@ -13321,6 +13388,7 @@ function bnxMapSheetStatusToFloor(status){
   if (s==='OCCUPIED' || s==='RUNNING') return 'occupied';
   if (s==='RESERVED') return 'reserved';
   if (s==='CLEANING') return 'cleaning';
+  if (s==='BLOCKED' || s==='NOT_IN_SERVICE' || s==='OUT_OF_SERVICE') return 'blocked';
   return 'available'; // AVAILABLE, READY, blank, or anything unrecognised
 }
 function bnxElapsedMinFromStart(startTime){
@@ -13479,7 +13547,7 @@ document.addEventListener('DOMContentLoaded', async function(){
   try{ await window.__bnxConfigReady; }catch(e){}
   bnxSyncTableMasterFromBackend(true);
 });
-const FI={occupied:'🔴',available:'🟢',reserved:'🟡',cleaning:'🔵'};
+const FI={occupied:'🔴',available:'🟢',reserved:'🟡',cleaning:'🔵',blocked:'⛔'};
 /* ── SPATIAL FLOOR MAP ──
    FIX ("table maps give according propers"): the floor map was just
    a flat 6-column grid in tableData order — it didn't look like the
@@ -13585,7 +13653,7 @@ function buildFloor(gid){
     g.innerHTML=tableData.map(t=>bnxFloorCardHtml(t)).join('');
   }
   // update counts
-  const cnt={occupied:0,available:0,reserved:0,cleaning:0};
+  const cnt={occupied:0,available:0,reserved:0,cleaning:0,blocked:0};
   tableData.forEach(t=>cnt[t.s]=(cnt[t.s]||0)+1);
   const oc=document.getElementById('occ-c'); if(oc) oc.textContent=cnt.occupied;
   const ac=document.getElementById('avl-c'); if(ac) ac.textContent=cnt.available;
@@ -13836,7 +13904,7 @@ function bnxApplyTableFilters_(){
 window.filterRTC = function filterRTC(val, btn){
   const text=String(val??'');
   const normalized=text.trim().toLowerCase();
-  const statusValues=new Set(['','available','running','occupied','reserved','cleaning']);
+  const statusValues=new Set(['','available','running','occupied','reserved','cleaning','blocked']);
   const kind=String(btn?.dataset?.tableFilterKind||'').toLowerCase();
   const isZone=kind==='zone' || (!!btn && btn.dataset && btn.dataset.tableZone!==undefined);
   if(!window._rtcFilterState) window._rtcFilterState={search:'',status:'',zone:''};
@@ -37486,19 +37554,20 @@ mo.observe(document.body,{subtree:true,childList:true});
 #bnxGlobalPeriodBar .bnx-gp-pick #bnxGpQuarter{display:none!important;}
 #bnxGlobalPeriodBar .bnx-gp-qbtn{display:none;flex:0 0 auto;border:1px solid var(--gold,#d88a00);background:var(--gold-bg,#fff6ea);color:var(--gold,#b8690e);font-weight:800;font-size:11px;border-radius:999px;padding:6px 11px;cursor:pointer;white-space:nowrap}
 #bnxGlobalPeriodBar .bnx-gp-qbtn.show{display:inline-flex;align-items:center;gap:5px}
-#bnxQPop{position:fixed;z-index:99999;width:268px;background:var(--surface,#fff);border:1px solid var(--border2,#ddd);border-radius:14px;box-shadow:0 14px 40px rgba(0,0,0,.22);padding:12px;display:none}
+#bnxQPop{position:fixed;z-index:99999;width:375px;max-width:calc(100vw - 24px);background:var(--surface,#fff);border:1px solid var(--border2,#ddd);border-radius:16px;box-shadow:0 14px 40px rgba(0,0,0,.22);padding:16px;display:none;box-sizing:border-box}
 #bnxQPop.show{display:block}
-#bnxQPop .qp-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
-#bnxQPop .qp-h b{font-size:13px}
-#bnxQPop .qp-h button{border:1px solid var(--border2,#ddd);background:var(--surface2,#f7f5f0);border-radius:8px;width:28px;height:28px;cursor:pointer;font-size:14px}
+#bnxQPop .qp-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;min-height:40px}
+#bnxQPop .qp-h b{font-size:17px;font-weight:800;letter-spacing:.1px}
+#bnxQPop .qp-h button{border:1px solid var(--border2,#ddd);background:var(--surface2,#f7f5f0);border-radius:10px;width:38px;height:38px;cursor:pointer;font-size:20px;line-height:1}
 #bnxQPop .qp-h button:disabled{opacity:.35;cursor:default}
-#bnxQPop .qp-g{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-#bnxQPop .qp-t{border:1px solid var(--border2,#ddd);background:var(--surface2,#f7f5f0);border-radius:11px;padding:10px 6px;cursor:pointer;text-align:center;line-height:1.25}
-#bnxQPop .qp-t b{display:block;font-size:14px}
-#bnxQPop .qp-t span{font-size:10.5px;color:var(--text3,#8c725e)}
+#bnxQPop .qp-g{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+#bnxQPop .qp-t{border:1px solid var(--border2,#ddd);background:var(--surface2,#f7f5f0);border-radius:12px;padding:15px 8px;cursor:pointer;text-align:center;line-height:1.3;min-height:78px;box-sizing:border-box}
+#bnxQPop .qp-t b{display:block;font-size:18px;font-weight:800;margin-bottom:4px}
+#bnxQPop .qp-t span{font-size:13px;color:var(--text3,#8c725e)}
 #bnxQPop .qp-t.on{background:var(--gold,#b8690e);border-color:var(--gold,#b8690e);color:#fff}
 #bnxQPop .qp-t.on span{color:#fff}
 #bnxQPop .qp-t:disabled{opacity:.35;cursor:not-allowed}
+@media(max-width:480px){#bnxQPop{width:calc(100vw - 20px);padding:14px;border-radius:14px}#bnxQPop .qp-h b{font-size:16px}#bnxQPop .qp-t{min-height:72px;padding:13px 6px}}
 #bnxGlobalPeriodBar .bnx-gp-pick .bnx-gp-date{border-color:var(--gold,#d88a00);}
 @media(max-width:900px){
   #bnxGlobalPeriodBar{padding:5px 8px;min-height:40px;}
@@ -45820,6 +45889,18 @@ W.bnxTmCancelRes=function(code){
   if(typeof W.bnxMarkTableAvailable==='function')W.bnxMarkTableAvailable(code);
 };
 W.bnxTmDelete=function(code){if(typeof W.bnxDeleteTableLive_==='function')W.bnxDeleteTableLive_(code);};
+W.bnxTmBlock=function(code){
+  var t=Array.isArray(W.tableData)?W.tableData.filter(function(x){return String(x.n)===String(code);})[0]:null;
+  if(!t)return;
+  var st=String(t.s||'').toLowerCase();
+  if(['occupied','reserved','running','billed'].indexOf(st)>=0){if(typeof W.showNotif==='function')W.showNotif('⚠️ '+code+' is active/reserved. Settle or cancel it before blocking.','error');else alert(code+' is active/reserved. Settle or cancel it before blocking.');return;}
+  var reason=prompt('Block '+code+'?\n\nOptional reason:',t.blockReason||'');if(reason===null)return;
+  t.s='blocked';t.c='';t.t='';t.blockReason=String(reason||'').trim();
+  if(typeof W.bnxSaveTableStatus==='function')W.bnxSaveTableStatus(code,{s:'blocked',c:'',t:''}).catch(function(){});
+  if(typeof W.bnxApplyTableFilters_==='function')W.bnxApplyTableFilters_();
+  else if(typeof W.buildRichTbls==='function')W.buildRichTbls();
+  if(typeof W.buildFloor==='function'){W.buildFloor('floorMap');W.buildFloor('dashMap');}
+};
 W.bnxTmFree=function(code){if(confirm('Mark '+code+' as available?')&&typeof W.bnxMarkTableAvailable==='function')W.bnxMarkTableAvailable(code);};
 W.bnxTmCard=function(ev,code){ev.stopPropagation();var m=document.getElementById('tmcm-'+code);var was=m&&m.classList.contains('open');W.bnxTmCloseMenus();
   if(m&&!was){m.classList.remove('up');m.classList.add('open');var card=m.closest('.tm-card');if(card)card.classList.add('mo');
@@ -45865,6 +45946,7 @@ function cardHtml(t){
   else btns=B('pri','Settle','bnxTmSettle')+B('sec','View','bnxTmView');
   var menu='<div class="tm-cmenu" id="tmcm-'+esc(code)+'" onclick="event.stopPropagation()">';
   if(k==='av') menu+='<button onclick="bnxTmStart(\''+safe+'\')">Start order</button><button onclick="bnxTmReserve(\''+safe+'\')">Reserve table</button>';
+  if(k==='av') menu+='<button onclick="bnxTmBlock(\''+safe+'\')">Block table</button>';
   else if(k==='res') menu+='<button onclick="bnxTmStart(\''+safe+'\')">Seat guest and start order</button><button onclick="bnxTmCancelRes(\''+safe+'\')">Cancel reservation</button>';
   else if(LIVE[k]) menu+='<button onclick="bnxTmView(\''+safe+'\')">View order</button><button onclick="bnxTmStart(\''+safe+'\')">Add items</button><button onclick="bnxTmSettle(\''+safe+'\')">Settle bill</button>';
   menu+='<button onclick="bnxTmView(\''+safe+'\')">Table details</button><button onclick="bnxTmMove(\''+safe+'\',\'transfer\')">Change / move table</button><button onclick="bnxTmMove(\''+safe+'\',\'merge\')">Merge tables</button>';
@@ -46117,13 +46199,13 @@ W.bnxTmRenderFloor=function(){
   if(!list.some(function(c){return fpCodeOf(c)===FP.sel;})){
     var pick=list.filter(function(c){return LIVE[kind(c)];})[0]||list[0];FP.sel=pick?fpCodeOf(pick):null;
   }
-  var n={av:0,occ:0,res:0,run:0};
-  list.forEach(function(c){var k=kind(c);if(k==='av')n.av++;else if(k==='res')n.res++;else if(k==='run')n.run++;else if(k==='occ'||k==='bil')n.occ++;});
+  var n={av:0,occ:0,res:0,run:0,blk:0};
+  list.forEach(function(c){var k=kind(c);if(k==='av')n.av++;else if(k==='res')n.res++;else if(k==='run')n.run++;else if(k==='occ'||k==='bil')n.occ++;else if(k==='blk')n.blk++;});
   var chip=function(cls,label,v){var m={g:['#e8f8ef','#0f8a45'],r:['#fdeeee','#c02a2a'],b:['#e8f0ff','#1f55bd'],a:['#fff3d9','#a86400']}[cls];return '<span class="fp-chip" style="--b:'+m[0]+';--c:'+m[1]+'"><i></i>'+label+' <b>'+v+'</b></span>';};
   var sel=floors.length>1?'<select class="fp-floorsel" aria-label="Floor" onchange="bnxFpFloor(this.value)"><option value="">All floors</option>'+floors.map(function(f){return '<option'+(f===FP.floor?' selected':'')+' value="'+esc(f)+'">'+esc(f)+'</option>';}).join('')+'</select>':'';
   var edit='<button type="button" class="fp-edit" onclick="bnxTmEditLayout()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>Edit layout</button>';
   host.innerHTML='<div class="fp-wrap"><div class="fp-main"><div class="fp-head"><div><h3>Floor plan</h3><p>'+list.length+(list.length!==all.length?' of '+all.length:'')+' tables · tap to select, double-tap to open</p></div>'+
-    '<div class="fp-chips">'+chip('g','Available',n.av)+chip('r','Occupied',n.occ)+chip('b','Reserved',n.res)+chip('a','Running',n.run)+'</div>'+sel+edit+'</div>'+
+    '<div class="fp-chips">'+chip('g','Available',n.av)+chip('r','Occupied',n.occ)+chip('b','Reserved',n.res)+chip('a','Running',n.run)+(n.blk?'<span class="fp-chip" style="--b:#eef0f4;--c:#4b5263"><i></i>Blocked <b>'+n.blk+'</b></span>':'')+'</div>'+sel+edit+'</div>'+
     '<div class="fp-body"><div class="fp-canvas">'+fpCanvas(list)+'</div></div></div><aside class="fp-side" id="fpSide" aria-live="polite"></aside></div>';
   fpRenderPanel();
 };
