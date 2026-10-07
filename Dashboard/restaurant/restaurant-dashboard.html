@@ -25565,7 +25565,74 @@ async function bnxDsrFetchMonth_(y, m, force){
 }
 function bnxDsrDueNet_(d){ return d ? (d.guestDueSales - d.dueReceivedCash - d.dueReceivedIcici - d.guestDuesCN) : 0; }
 /* Opening / closing guest dues for one business date, rolled back from the live balance. */
+/* ── DUES OPENING / CLOSING FROM CUSTOMER LEDGERS (Oct 2026) ──
+   The old roll-back (live balance minus later days' DSR credit/receipts) gave impossible figures
+   (e.g. Opening Due -17,59,959) because DSR receipt columns do not equal what really moved the
+   dues (opening-balance receipts, adjustments, other banks). The customers' own ledgers
+   (GET_CUSTOMER_LEDGER - same data as Due Collection / Customer Credit) are the actual books, so
+   Opening(D) = sum of Dr-Cr dated before D, Closing(D) = sum dated up to D, per customer.
+   Ledgers are cached for 10 minutes; if the ledger total disagrees with the live total the cache is dropped. */
+window.__bnxLedgerAll = window.__bnxLedgerAll || { t:0, rows:null, p:null };
+function bnxDsrLedgerLoad_(customers){
+  const c = window.__bnxLedgerAll;
+  if (c.rows && Date.now() - c.t < 600000) return Promise.resolve(c.rows);
+  if (c.p) return c.p;
+  c.p = (async () => {
+    const ids = [...new Set((customers||[]).map(x => String(x.customerId || x.id || '')).filter(Boolean))];
+    if (!ids.length) throw new Error('no customers');
+    const out = {}; let i = 0, fail = 0;
+    async function worker(){
+      while (i < ids.length){
+        const id = ids[i++];
+        try{
+          const r = await erpApi({ action:'GET_CUSTOMER_LEDGER', customerId:id, from:'', to:'' }, 'V2_CORE');
+          if (r && r.success && r.data && Array.isArray(r.data.rows))
+            out[id] = r.data.rows.map(x => ({ d:(String(x.date||'').slice(0,10) || '0000-00-00'), dr:Number(x.dr)||0, cr:Number(x.cr)||0 }));
+          else fail++;
+        }catch(e){ fail++; }
+      }
+    }
+    await Promise.all([worker(), worker(), worker(), worker()]);
+    if (fail) throw new Error('ledger incomplete (' + fail + ' of ' + ids.length + ' failed)');
+    c.rows = out; c.t = Date.now();
+    return out;
+  })().finally(() => { c.p = null; });
+  return c.p;
+}
+function bnxDsrLedgerSum_(L, upTo, inclusive){
+  let t = 0;
+  for (const id in L){ const rows = L[id]; for (let i = 0; i < rows.length; i++){ const d = rows[i].d; if (inclusive ? d <= upTo : d < upTo) t += rows[i].dr - rows[i].cr; } }
+  return Math.round(t * 100) / 100;
+}
 async function bnxDsrDuesAsOf_(dateKey){
+  const bd = bnxReportBusinessDate_();
+  const target = dateKey > bd ? bd : dateKey;
+  let live = NaN, customers = [];
+  try{
+    const r = await erpApi({ action:'GET_DUE_COLLECTION', asOfDate: target }, 'V2_CORE');
+    if (r && r.success && r.data){
+      live = Number(r.data.totalOutstanding);
+      if (Array.isArray(r.data.customers)) customers = r.data.customers;
+    }
+  }catch(e){}
+  if (!customers.length) customers = (window.__bnxDueLive && window.__bnxDueLive.customers) || [];
+  if (customers.length){
+    const pr = bnxDsrLedgerLoad_(customers);
+    try{
+      const L = await Promise.race([pr, new Promise((_, rej) => setTimeout(() => rej(new Error('ledger slow')), 30000))]);
+      const opening = bnxDsrLedgerSum_(L, target, false), closing = bnxDsrLedgerSum_(L, target, true);
+      const todayTotal = bnxDsrLedgerSum_(L, '9999-12-31', true);
+      const diff = isFinite(live) ? Math.round((todayTotal - live) * 100) / 100 : 0;
+      if (Math.abs(diff) > 1){ console.warn('[Dues] ledger total ' + todayTotal + ' differs from live ' + live + ' by ' + diff); window.__bnxLedgerAll.t = 0; }
+      return { ok:true, live: isFinite(live) ? live : todayTotal, opening, closing, exact: Math.abs(diff) <= 1, source:'ledger', ledgerDiff: diff };
+    }catch(e){
+      console.warn('[Dues] ledger method unavailable, using roll-back:', e && e.message);
+      pr.then(() => { try{ if (typeof window.bnxDashFixPaint_ === 'function') window.bnxDashFixPaint_(); }catch(_){} }).catch(() => {});
+    }
+  }
+  return bnxDsrDuesAsOfRollback_(dateKey);
+}
+async function bnxDsrDuesAsOfRollback_(dateKey){
   const bd = bnxReportBusinessDate_();
   const target = dateKey > bd ? bd : dateKey;
   let live, asOfServer = null;
@@ -54811,6 +54878,165 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',init,{once:tr
   document.addEventListener('click',function(){ setTimeout(schedule,150); },true);
   setInterval(schedule,1200);
   window.bnxStickyHeadRefresh=schedule;
+})();
+</script>
+
+<script>
+/* ── BACK / LEAVE AUTO-CLEAR FILTERS (all pages) + TABLE MANAGEMENT CALENDAR (Oct 2026) ──
+   1) Whenever a page is left (Back button, Backspace / Alt+←, browser back, Home, sidebar) or
+      Back is used inside a page (Reports "← All Reports", Accounts gallery) every filter on that
+      page is reset: search boxes, filter dropdowns, Table Management status/zone/date.
+      Date-range pickers are NOT touched - they are scope, not filters.
+   2) Table Management gets a calendar: pick a date to see which tables are reserved that day. */
+(function BNX_BACK_AUTOCLEAR_AND_TABLE_DATE(){
+  'use strict';
+  var W=window, D=document;
+  function pad(n){ return String(n).padStart(2,'0'); }
+  function todayIso(){
+    try{ if(typeof getBusinessDate==='function'){ var b=getBusinessDate(); if(b) return b; } }catch(e){}
+    var t=new Date(); return t.getFullYear()+'-'+pad(t.getMonth()+1)+'-'+pad(t.getDate());
+  }
+  function tbl(){ try{ return (typeof tableData!=='undefined' && Array.isArray(tableData)) ? tableData : []; }catch(e){ return []; } }
+
+  /* ---------- generic filter reset ---------- */
+  var SKIP_TYPES=/^(hidden|password|checkbox|radio|button|submit|reset|file|date|time|datetime-local|month|week|range|color|image)$/i;
+  var FILT=/(search|filter|fltr)/i;
+  function looksLikeFilter(el){
+    var t=(el.type||'').toLowerCase();
+    if(SKIP_TYPES.test(t)) return false;
+    if(el.closest && el.closest('[data-bnx-keep-filter]')) return false;
+    if(t==='search') return true;
+    var s=(el.id||'')+' '+(el.name||'')+' '+(typeof el.className==='string'?el.className:'')+' '+(el.getAttribute('placeholder')||'')+' '+(el.getAttribute('data-filter')||'');
+    if(FILT.test(s)) return true;
+    return !!(el.closest && el.closest('.fbar,[id*="Filter"],[id*="filter"]'));
+  }
+  function fire(el,type){ try{ el.dispatchEvent(new Event(type,{bubbles:true})); }catch(e){} }
+  function resetControl(el){
+    if(el.tagName==='SELECT'){
+      var idx=0; for(var i=0;i<el.options.length;i++){ if(el.options[i].defaultSelected){ idx=i; break; } }
+      if(el.selectedIndex!==idx){ el.selectedIndex=idx; fire(el,'change'); return true; }
+      return false;
+    }
+    if(el.value!==''){ el.value=''; fire(el,'input'); fire(el,'change'); return true; }
+    return false;
+  }
+  function clearPage(pg){
+    if(!pg || W.__bnxAutoClearing) return;
+    W.__bnxAutoClearing=true;
+    try{
+      var id=(pg.id||'').replace(/^page-/,'');
+      if(id==='tables' && typeof W.bnxClearTableFilters_==='function') W.bnxClearTableFilters_();
+      if(pg.querySelector('#blSearch') && typeof W.blClearFilters==='function') W.blClearFilters();
+      if(pg.querySelector('#bnxDcQ') && typeof W.bnxDcClearFilters==='function') W.bnxDcClearFilters();
+      if(pg.querySelector('#bnxCcSearch') && typeof W.bnxCcClearFilters==='function') W.bnxCcClearFilters(true);
+      pg.querySelectorAll('input,select').forEach(function(el){ try{ if(looksLikeFilter(el)) resetControl(el); }catch(e){} });
+      pg.querySelectorAll('.fcat.active[data-filter-default]').forEach(function(b){ /* optional hook */ });
+    }catch(e){ console.warn('[auto-clear filters]',e); }
+    finally{ W.__bnxAutoClearing=false; }
+  }
+  W.bnxClearPageFilters=clearPage;
+
+  /* leaving any page -> clear its filters */
+  function watch(pg){
+    if(pg.__bnxLeaveWatch) return; pg.__bnxLeaveWatch=true;
+    var was=pg.classList.contains('active');
+    new MutationObserver(function(){
+      var now=pg.classList.contains('active');
+      if(was && !now) clearPage(pg);
+      was=now;
+    }).observe(pg,{attributes:true,attributeFilter:['class']});
+  }
+  function watchAll(){ D.querySelectorAll('.page').forEach(watch); }
+
+  /* Back button / Backspace / Alt+← : clear the page the user is on, then go back */
+  function wrapBack(){
+    if(typeof W.bnxGoBack!=='function' || W.bnxGoBack.__clr) return;
+    var og=W.bnxGoBack;
+    W.bnxGoBack=function(){
+      var cur=D.querySelector('.page.active');
+      try{ return og.apply(this,arguments); } finally{ clearPage(cur); }
+    };
+    W.bnxGoBack.__clr=true;
+  }
+  /* in-page "back" bars */
+  function wrapInPageBack(name,pageId){
+    var o=W[name]; if(typeof o!=='function' || o.__clr) return;
+    W[name]=function(){ var r=o.apply(this,arguments); clearPage(D.getElementById(pageId)); return r; };
+    W[name].__clr=true;
+  }
+
+  /* ---------- Table Management calendar ---------- */
+  W._rtcDate=W._rtcDate||'';
+  function dayStatusMap(date){
+    var res=[]; try{ res=(typeof bnxGetReservations==='function'?bnxGetReservations():[]).filter(function(r){
+      return r && r.date===date && !/cancel|seated|done|no.?show/i.test(String(r.status||''));
+    }); }catch(e){}
+    return res;
+  }
+  function installTableDate(){
+    var bar=D.getElementById('tableFilterBar'); if(!bar || D.getElementById('tableMgmtDate')) return;
+    var w=D.createElement('div'); w.id='tableDateWrap';
+    w.style.cssText='display:flex;gap:6px;align-items:center;';
+    w.innerHTML='<span title="Reservation date" style="font-size:15px;">📅</span>'+
+      '<input type="date" id="tableMgmtDate" style="padding:7px 9px;border:1px solid var(--border,#d9dde6);border-radius:8px;background:var(--surface,#fff);color:var(--text,#222);font-size:12.5px;" aria-label="Table date">'+
+      '<button type="button" id="tableMgmtDateToday" class="btn btn-sm btn-ghost">Today</button>';
+    var search=bar.querySelector('.search'); if(search&&search.nextSibling) bar.insertBefore(w,search.nextSibling); else bar.appendChild(w);
+    var inp=D.getElementById('tableMgmtDate'); inp.value=todayIso();
+    inp.addEventListener('change',function(){
+      var v=inp.value||todayIso(); if(!inp.value) inp.value=v;
+      W._rtcDate=(v===todayIso())?'':v; applyDate();
+    });
+    D.getElementById('tableMgmtDateToday').addEventListener('click',function(){ inp.value=todayIso(); W._rtcDate=''; applyDate(); });
+  }
+  function applyDate(){ if(typeof W.bnxApplyTableFilters_==='function') W.bnxApplyTableFilters_(); note(); }
+  function note(){
+    var inp=D.getElementById('tableMgmtDate'); if(!inp) return;
+    var n=D.getElementById('tableDateNote');
+    if(!W._rtcDate){ if(n) n.remove(); return; }
+    if(!n){ n=D.createElement('div'); n.id='tableDateNote'; n.style.cssText='width:100%;font-size:11.5px;color:var(--text3,#6b7487);'; D.getElementById('tableFilterBar').appendChild(n); }
+    n.textContent='Showing reservations for '+W._rtcDate+' · live running/occupied status applies to today only';
+  }
+  function wrapTableFns(){
+    if(typeof W.bnxApplyTableFilters_==='function' && !W.bnxApplyTableFilters_.__d){
+      var oa=W.bnxApplyTableFilters_;
+      W.bnxApplyTableFilters_=function(){
+        var date=W._rtcDate;
+        if(!date || date===todayIso()) return oa.apply(this,arguments);
+        var rows=tbl(), saved=rows.map(function(t){ return {s:t.s,c:t.c,t:t.t}; }), res=dayStatusMap(date);
+        try{
+          rows.forEach(function(t){
+            var m=res.filter(function(r){ return String(r.table).toLowerCase()===String(t.n).toLowerCase() || String(r.tableName||'').toLowerCase()===String(t.n).toLowerCase(); })[0];
+            if(m){ t.s='reserved'; t.c=m.name||''; t.t=(m.time||'')+(m.covers?' · '+m.covers+' pax':''); }
+            else { t.s='available'; t.c=''; t.t=''; }
+          });
+          return oa.apply(this,arguments);
+        } finally { rows.forEach(function(t,i){ t.s=saved[i].s; t.c=saved[i].c; t.t=saved[i].t; }); }
+      };
+      W.bnxApplyTableFilters_.__d=true;
+    }
+    if(typeof W.buildRichTbls==='function' && !W.buildRichTbls.__d){
+      var ob=W.buildRichTbls;
+      W.buildRichTbls=function(){ if(W._rtcDate && W._rtcDate!==todayIso()) return W.bnxApplyTableFilters_(); return ob.apply(this,arguments); };
+      W.buildRichTbls.__d=true;
+    }
+    if(typeof W.bnxClearTableFilters_==='function' && !W.bnxClearTableFilters_.__d){
+      var oc=W.bnxClearTableFilters_;
+      W.bnxClearTableFilters_=function(){
+        W._rtcDate=''; var i=D.getElementById('tableMgmtDate'); if(i) i.value=todayIso(); note();
+        return oc.apply(this,arguments);
+      };
+      W.bnxClearTableFilters_.__d=true;
+    }
+  }
+
+  function init(){
+    watchAll(); wrapBack(); wrapTableFns(); installTableDate();
+    wrapInPageBack('backToReportsGallery','page-reports');
+    wrapInPageBack('backToAcctGallery','page-accounts-ledger');
+  }
+  if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',init); else init();
+  /* late-bound pages/functions (other scripts re-define these after load) */
+  [800,2500,6000].forEach(function(ms){ setTimeout(init,ms); });
 })();
 </script>
 
