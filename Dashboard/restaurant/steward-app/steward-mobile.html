@@ -144,6 +144,38 @@ window.BNX_STEWARD_BUILD='PRN-FW8-NATIVE-DETECT';
     return '';
   }
   window.bnxPrinterUrlProblem_=problem;
+  /* ═══ RELAY ADDRESS NORMALIZER (Oct 2026) — the ONE place a Print Relay address is checked.
+     ROOT CAUSE of "Print Relay: https://http:9191:/192.168.0.151:9100":
+       • a strict normalizer already existed (PRN-FW6) but it was a private function inside the setup
+         screen and was never put on window — so pzSaveRelay()/relay() fell back to saving the RAW text;
+       • relayUrl_() / relayUrl() then only glued "https://" in front of whatever was saved;
+       • the firewall could not parse "http:9191:/…" (no "://"), so it let it through.
+     Result: a garbled value pointing at the BAR printer (.151:9100) was saved and every KOT failed.
+     Rules here: http(s)://<IPv4 | host.name | localhost>:<9191|9192>, no path, never a printer IP/port.
+     Returns the clean address, or '' when the text is not a usable relay address. ═══ */
+  function normRelay(value){
+    var u=String(value==null?'':value).trim().replace(/\s+/g,'').replace(/\/+$/,'');
+    if(!u) return '';
+    u=u.replace(/\/(?:health|print|probe)(?:[?#].*)?$/i,'').replace(/\/+$/,'');   /* pasted ".../health" link */
+    u=u.replace(/^(?:https?:\/\/)+(?=https?:)/i,'');                 /* "https://http:9191…" -> "http:9191…"   */
+    u=u.replace(/^(https?:\/\/)(?:https?:\/\/)+/i,'$1');              /* "https://http://x"   -> "https://x"     */
+    var g=u.match(/^(https?):\/*(\d{2,5}):?\/+((?:\d{1,3}\.){3}\d{1,3})(?::(\d{2,5}))?\/?$/i); /* "http:9191:/IP[:port]" */
+    if(g){ if(g[4]&&g[4]!==g[2]) return ''; u=g[1]+'://'+g[3]+':'+g[2]; } /* two different ports (e.g. printer :9100) = not a relay */
+    if(!/^https?:\/\//i.test(u)) u=(location.protocol==='https:'?'https://':'http://')+u;
+    var x; try{ x=new URL(u); }catch(e){ return ''; }
+    if(!/^https?:$/i.test(x.protocol)) return '';
+    if(!/^(?:(?:\d{1,3}\.){3}\d{1,3}|localhost|[a-z0-9-]+(?:\.[a-z0-9-]+)+)$/i.test(x.hostname)) return ''; /* host "http" etc. */
+    if(x.pathname&&x.pathname!=='/') return '';                       /* a relay address never has a path */
+    if(x.search||x.hash) return '';
+    var port=x.port||'9191';
+    if(port!=='9191'&&port!=='9192') return '';                       /* 9100 = printer data port */
+    var proto=location.protocol==='https:'?'https:':x.protocol;       /* https page may not call http:// (mixed content) */
+    var out=proto+'//'+x.hostname+':'+port;
+    return problem(out)?'':out;                                        /* printer IP typed as relay */
+  }
+  window.bnxNormalizeRelayUrl_=normRelay;
+  /* keys holding a relay ADDRESS (not the key/secret, not the rejection note) */
+  function isRelayAddrKey(k){ k=String(k||''); return /^bnx_print_relay_/.test(k)&&!/^bnx_print_relay_(key_|rejected)/.test(k); }
   window.bnxPrinterFirewallIps_=function(){ cache=null; return printerIps(); };
 
   var warned={};
@@ -151,7 +183,7 @@ window.BNX_STEWARD_BUILD='PRN-FW8-NATIVE-DETECT';
     var key=why+'|'+u;
     if(!warned[key]){ warned[key]=1; console.error('[BNX FIREWALL] blocked a web request to a printer ('+why+'): '+u); }
     window.__bnxRelayRejected=why;
-    try{ if(typeof window.toast==='function') window.toast('⛔ Blocked junk print: '+why+'. Set the Print Relay PC address (…:9191) in Printer Setup.','error'); }catch(e){}
+    try{ if(typeof window.toast==='function') window.toast(/not a valid/.test(why)?('⛔ Print Relay address refused: '+why+'.'):('⛔ Blocked junk print: '+why+'. Set the Print Relay PC address (…:9191) in Printer Setup.'),'error'); }catch(e){}
   }
   function blockedErr(why){ var e=new TypeError('Blocked: '+why+' (prevents junk printing)'); e.bnxPrinterBlocked=true; return e; }
 
@@ -160,7 +192,12 @@ window.BNX_STEWARD_BUILD='PRN-FW8-NATIVE-DETECT';
     var L=ls(); if(!L) return;
     try{
       var bad=[];
-      for(var i=0;i<L.length;i++){ var k=L.key(i); if(/^bnx_print_relay_/.test(k)&&!/^bnx_print_relay_key_/.test(k)){ var why=problem(L.getItem(k)); if(why) bad.push([k,L.getItem(k),why]); } }
+      var fix=[];
+      for(var i=0;i<L.length;i++){ var k=L.key(i); if(isRelayAddrKey(k)){ var v=L.getItem(k), why=problem(v), n=normRelay(v);
+        if(why) bad.push([k,v,why]);
+        else if(v&&!n) bad.push([k,v,'not a valid Print Relay address (expected e.g. https://192.168.0.50:9191)']);
+        else if(n&&n!==v) fix.push([k,n]); } }
+      fix.forEach(function(f){ try{ Storage.prototype.setItem.call(L,f[0],f[1]); }catch(e){} });
       bad.forEach(function(b){ L.removeItem(b[0]); try{ L.setItem('bnx_print_relay_rejected',JSON.stringify({value:b[1],why:b[2],at:Date.now()})); }catch(e){} console.warn('[BNX FIREWALL] removed saved relay address "'+b[1]+'" — '+b[2]); window.__bnxRelayRejected=b[2]; });
     }catch(e){}
     try{ if(window.BNX_PRINT_RELAY_URL&&problem(window.BNX_PRINT_RELAY_URL)) window.BNX_PRINT_RELAY_URL=''; }catch(e){}
@@ -171,9 +208,11 @@ window.BNX_STEWARD_BUILD='PRN-FW8-NATIVE-DETECT';
   try{
     var S=Storage.prototype, oSet=S.setItem;
     S.setItem=function(k,v){
-      if(/^bnx_print_relay_/.test(String(k))&&!/^bnx_print_relay_key_/.test(String(k))){
-        var why=problem(v);
+      if(isRelayAddrKey(k)&&String(v||'')!==''){
+        var why=problem(v), n=normRelay(v);
+        if(!why&&!n) why='not a valid Print Relay address (expected e.g. https://192.168.0.50:9191)';
         if(why){ report(why,String(v)); try{ oSet.call(this,'bnx_print_relay_rejected',JSON.stringify({value:String(v),why:why,at:Date.now()})); }catch(e){} return; }
+        return oSet.call(this,k,n);                                   /* always saved in clean form */
       }
       return oSet.apply(this,arguments);
     };
@@ -211,7 +250,7 @@ window.BNX_STEWARD_BUILD='PRN-FW8-NATIVE-DETECT';
     var L0=window.localStorage;
     if(L0&&!(typeof Storage!=='undefined'&&L0 instanceof Storage)){
       var sSet=L0.setItem;
-      L0.setItem=function(k,v){ if(/^bnx_print_relay_/.test(String(k))&&!/^bnx_print_relay_key_/.test(String(k))){ var why=problem(v); if(why){ report(why,String(v)); return; } } return sSet.apply(this,arguments); };
+      L0.setItem=function(k,v){ if(isRelayAddrKey(k)&&String(v||'')!==''){ var why=problem(v), n=normRelay(v); if(!why&&!n) why='not a valid Print Relay address'; if(why){ report(why,String(v)); return; } return sSet.call(this,k,n); } return sSet.apply(this,arguments); };
     }
   }catch(e){}
   try{
@@ -9037,12 +9076,9 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
   }
   function relayUrl_(){
     try{
-      var u=String(localStorage.getItem(cidKey_('bnx_print_relay_'))||localStorage.getItem('bnx_print_relay_any')||window.BNX_PRINT_RELAY_URL||'').trim().replace(/\/+$/,'');
-      if(u && !/^https?:\/\//i.test(u)) u=(location.protocol==='https:'?'https://':'http://')+u;
-      /* An https page (balajinextgen.in) is NOT allowed to call an http:// relay (mixed content).
-         Always use the relay's https address when the app itself is on https. */
-      if(location.protocol==='https:' && /^http:\/\//i.test(u)) u=u.replace(/^http:/i,'https:');
-      return u;
+      var u=String(localStorage.getItem(cidKey_('bnx_print_relay_'))||localStorage.getItem('bnx_print_relay_any')||window.BNX_PRINT_RELAY_URL||'').trim();
+      /* strict normalizer (firewall): clean https://IP:9191 or '' — never a glued "https://http:9191:/…" */
+      return typeof window.bnxNormalizeRelayUrl_==='function'?window.bnxNormalizeRelayUrl_(u):'';
     }catch(e){ return ''; }
   }
   function relayKey_(){
@@ -15669,6 +15705,7 @@ html:not([data-theme]) #s-home .hero .hs-lbl{font-size:10px!important;letter-spa
   };
   /* PRN-FW6 URL FIX: never construct or open malformed relay URLs. */
   function bnxNormalizeRelayUrl_(value){
+    if(typeof window.bnxNormalizeRelayUrl_==='function'&&window.bnxNormalizeRelayUrl_!==bnxNormalizeRelayUrl_) return window.bnxNormalizeRelayUrl_(value);
     var u=String(value==null?'':value).trim().replace(/\s+/g,'');
     if(!u) return '';
     u=u.replace(/^https?:\/\/https?:\/\//i,'http://');
@@ -19650,10 +19687,8 @@ window.bnxSubmitChangePassword_=async function(){
   function ls(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
   function isMobile(){ try{ var ua=navigator.userAgent||''; return /Android|iPhone|iPad|iPod|Mobile|Silk/i.test(ua)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1); }catch(e){ return false; } }
   function relayUrl(){
-    var u=String(ls('bnx_print_relay_'+cid())||ls('bnx_print_relay_any')||W.BNX_PRINT_RELAY_URL||'').trim().replace(/\/+$/,'');
-    if(u&&!/^https?:\/\//i.test(u)) u=(location.protocol==='https:'?'https://':'http://')+u;
-    if(location.protocol==='https:'&&/^http:\/\//i.test(u)) u=u.replace(/^http:/i,'https:');
-    return u;
+    var u=String(ls('bnx_print_relay_'+cid())||ls('bnx_print_relay_any')||W.BNX_PRINT_RELAY_URL||'').trim();
+    return typeof W.bnxNormalizeRelayUrl_==='function'?W.bnxNormalizeRelayUrl_(u):'';   /* same strict rule everywhere */
   }
   function relayKey(){ return String(ls('bnx_print_relay_key_'+cid())||ls('bnx_print_relay_key_any')||'').trim(); }
   /* the same order directRaw_() uses on a phone */
@@ -19730,6 +19765,8 @@ window.bnxSubmitChangePassword_=async function(){
       catch(e){ why=(e&&e.name==='AbortError')?'No answer in 4 s — relay PC off or not on this Wi-Fi.':'Cannot reach it — relay PC off, phone on a different Wi-Fi / mobile data, or its https certificate not trusted yet (open '+esc(ru)+'/health once and tap Advanced → Proceed).'; }
       out.push(row(okR,'Print Relay: '+esc(ru),okR?'Reachable — KOTs will print through it.':why));
     } else if(!nat){
+      var rej=null; try{ rej=JSON.parse(ls('bnx_print_relay_rejected')||'null'); }catch(e){}
+      if(rej&&rej.value) out.push(row(false,'Print Relay address removed: '+esc(rej.value),esc(rej.why||'not a relay address')+'. That text is not the relay PC — '+(/:9100|192\.168\.\d+\.\d+:9100/.test(rej.value)?'it contains a <b>printer</b> IP:9100. ':'')+'Enter the address shown in the relay window on the PC, e.g. <b>https://192.168.0.50:9191</b>.'));
       out.push(row(null,'Print Relay: not set','Ask the admin for the Print Relay link (Dashboard → Print Settings → Print Relay Link) and paste it in this screen, or open the page from the Steward Printer App.'));
     }
     var ips={}; try{ ips=W.bnxPrinterIps_?W.bnxPrinterIps_():{}; }catch(e){}
