@@ -25573,29 +25573,44 @@ function bnxDsrDueNet_(d){ return d ? (d.guestDueSales - d.dueReceivedCash - d.d
    Opening(D) = sum of Dr-Cr dated before D, Closing(D) = sum dated up to D, per customer.
    Ledgers are cached for 10 minutes; if the ledger total disagrees with the live total the cache is dropped. */
 window.__bnxLedgerAll = window.__bnxLedgerAll || { t:0, rows:null, p:null };
+window.__bnxLedgerAll.part = window.__bnxLedgerAll.part || {};   /* ledgers already fetched - kept across failed attempts */
+window.__bnxLedgerAll.failT = window.__bnxLedgerAll.failT || 0;   /* last failure time -> cooldown, no retry storm */
+window.__bnxLedgerAll.failMsg = window.__bnxLedgerAll.failMsg || '';
+window.__bnxLedgerAll.warnT = window.__bnxLedgerAll.warnT || 0;
 function bnxDsrLedgerLoad_(customers){
   const c = window.__bnxLedgerAll;
   if (c.rows && Date.now() - c.t < 600000) return Promise.resolve(c.rows);
   if (c.p) return c.p;
+  /* cooldown: after a failed load do not hammer the slow server again for 2 minutes */
+  if (c.failT && Date.now() - c.failT < 120000) return Promise.reject(new Error(c.failMsg || 'ledger recently failed'));
+  if (c.rows){ c.rows = null; c.part = {}; }   /* expired / invalidated cache -> reload everything */
   c.p = (async () => {
     const ids = [...new Set((customers||[]).map(x => String(x.customerId || x.id || '')).filter(Boolean))];
     if (!ids.length) throw new Error('no customers');
-    const out = {}; let i = 0, fail = 0;
-    async function worker(){
-      while (i < ids.length){
-        const id = ids[i++];
+    const out = c.part; let i = 0, fail = 0;
+    const todo = ids.filter(id => !out[id]);          /* resume: only fetch what is still missing */
+    async function one(id){
+      for (let a = 0; a < 2; a++){                    /* one retry per customer */
         try{
           const r = await erpApi({ action:'GET_CUSTOMER_LEDGER', customerId:id, from:'', to:'' }, 'V2_CORE');
-          if (r && r.success && r.data && Array.isArray(r.data.rows))
+          if (r && r.success && r.data && Array.isArray(r.data.rows)){
             out[id] = r.data.rows.map(x => ({ d:(String(x.date||'').slice(0,10) || '0000-00-00'), dr:Number(x.dr)||0, cr:Number(x.cr)||0 }));
-          else fail++;
-        }catch(e){ fail++; }
+            return true;
+          }
+        }catch(e){}
+      }
+      return false;
+    }
+    async function worker(){
+      while (i < todo.length){
+        if (!(await one(todo[i++]))) fail++;
       }
     }
     await Promise.all([worker(), worker(), worker(), worker()]);
-    if (fail) throw new Error('ledger incomplete (' + fail + ' of ' + ids.length + ' failed)');
-    c.rows = out; c.t = Date.now();
-    return out;
+    if (fail){ c.failT = Date.now(); c.failMsg = 'ledger incomplete (' + fail + ' of ' + todo.length + ' failed)'; throw new Error(c.failMsg); }
+    const all = {}; ids.forEach(id => { all[id] = out[id]; });
+    c.rows = all; c.t = Date.now(); c.failT = 0; c.part = {};
+    return all;
   })().finally(() => { c.p = null; });
   return c.p;
 }
@@ -25604,7 +25619,14 @@ function bnxDsrLedgerSum_(L, upTo, inclusive){
   for (const id in L){ const rows = L[id]; for (let i = 0; i < rows.length; i++){ const d = rows[i].d; if (inclusive ? d <= upTo : d < upTo) t += rows[i].dr - rows[i].cr; } }
   return Math.round(t * 100) / 100;
 }
-async function bnxDsrDuesAsOf_(dateKey){
+window.__bnxDuesInflight = window.__bnxDuesInflight || {};
+function bnxDsrDuesAsOf_(dateKey){
+  const k = String(dateKey);
+  const m = window.__bnxDuesInflight;
+  if (m[k]) return m[k];
+  return (m[k] = bnxDsrDuesAsOfRun_(dateKey).finally(() => { delete m[k]; }));
+}
+async function bnxDsrDuesAsOfRun_(dateKey){
   const bd = bnxReportBusinessDate_();
   const target = dateKey > bd ? bd : dateKey;
   let live = NaN, customers = [];
@@ -25626,7 +25648,8 @@ async function bnxDsrDuesAsOf_(dateKey){
       if (Math.abs(diff) > 1){ console.warn('[Dues] ledger total ' + todayTotal + ' differs from live ' + live + ' by ' + diff); window.__bnxLedgerAll.t = 0; }
       return { ok:true, live: isFinite(live) ? live : todayTotal, opening, closing, exact: Math.abs(diff) <= 1, source:'ledger', ledgerDiff: diff };
     }catch(e){
-      console.warn('[Dues] ledger method unavailable, using roll-back:', e && e.message);
+      const lc = window.__bnxLedgerAll;
+      if (Date.now() - lc.warnT > 60000){ lc.warnT = Date.now(); console.warn('[Dues] ledger method unavailable, using roll-back:', e && e.message); }   /* log once a minute, not per call */
       pr.then(() => { try{ if (typeof window.bnxDashFixPaint_ === 'function') window.bnxDashFixPaint_(); }catch(_){} }).catch(() => {});
     }
   }
