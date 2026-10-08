@@ -8161,6 +8161,30 @@ if(D.readyState==='loading')D.addEventListener('DOMContentLoaded',watch);else wa
     <div class="credit-stat" style="border-top:3px solid var(--gold);"><div class="credit-stat-val" style="color:var(--gold);" id="ccReceivedToday">₹0</div><div class="credit-stat-lbl">Received Today</div></div>
   </div>
 
+  <!-- DATE FILTER + CUSTOMER DATE REPORT (Oct 2026) -->
+  <div class="card" id="ccDateBar" style="margin-bottom:12px;">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+      <div><label class="bnx72-lbl" for="ccDfFrom">From</label><input type="date" class="fi" id="ccDfFrom" style="padding:5px 8px;font-size:12px;"></div>
+      <div><label class="bnx72-lbl" for="ccDfTo">To</label><input type="date" class="fi" id="ccDfTo" style="padding:5px 8px;font-size:12px;"></div>
+      <div id="ccDfChips" style="display:flex;gap:5px;flex-wrap:wrap;">
+        <button class="btn btn-sm btn-ghost" data-p="today">Today</button>
+        <button class="btn btn-sm btn-ghost" data-p="yesterday">Yesterday</button>
+        <button class="btn btn-sm btn-ghost" data-p="week">This Week</button>
+        <button class="btn btn-sm btn-ghost" data-p="month">This Month</button>
+        <button class="btn btn-sm btn-ghost" data-p="lastmonth">Last Month</button>
+        <button class="btn btn-sm btn-ghost" data-p="fy">This FY</button>
+        <button class="btn btn-sm btn-ghost" data-p="all">All</button>
+      </div>
+      <button class="btn btn-sm btn-primary" id="ccDfRun">📊 Customer Date Report</button>
+      <button class="btn btn-sm btn-ghost" id="ccDfCsv" style="display:none">📥 CSV</button>
+      <button class="btn btn-sm btn-ghost" id="ccDfPrint" style="display:none">🖨 Print</button>
+      <button class="btn btn-sm btn-ghost" id="ccDfClear" style="display:none">✕ Clear</button>
+    </div>
+    <label id="ccDfActiveWrap" style="display:none;margin-top:8px;font-size:11.5px;font-weight:600;cursor:pointer;"><input type="checkbox" id="ccDfActive"> Show only customers with bills / receipts in this period in the ledger below</label>
+    <div id="ccDfStatus" style="font-size:11px;color:var(--text3);margin-top:6px;"></div>
+    <div id="ccDateReport" style="margin-top:8px;overflow-x:auto;"></div>
+  </div>
+
   <!-- Bill Type Filter -->
   <div class="credit-type-tabs">
     <button class="ct-tab active" onclick="filterCreditType('all',this)">All Customers</button>
@@ -40221,6 +40245,7 @@ body:not(.pos-machine) #bmProductGrid,
       if (t === 'overdue' && !(c.outstanding > 0.01 && c.overdueDays > 30)) return false;
       if (t === 'corporate' && !/corporate|aggregator|company/i.test(c.type)) return false;
       if (t === 'individual' && /corporate|aggregator|company/i.test(c.type)) return false;
+      if (W.__bnxCcActive && !W.__bnxCcActive.has(String(c.customerId))) return false;
       return !q || (c.customer + ' ' + (c.phone || '') + ' ' + (c.gstin || '')).toLowerCase().includes(q);
     });
   }
@@ -55149,6 +55174,170 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',init,{once:tr
   }
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',init); else init();
   window.bnxFitAmounts=run;
+})();
+</script>
+
+<script id="bnx-cc-date-report">
+/* CUSTOMER CREDIT - DATE FILTER + CUSTOMER DATE REPORT (Oct 2026)
+   One row per credit customer for the chosen dates: Opening (as at From) + Credit sales - Receipts/Adj = Closing (as at To).
+   Every figure comes from the server's own GET_CUSTOMER_LEDGER (same numbers as the customer statement), so
+   nothing is re-derived in the browser. The server is slow, so customers load 4 at a time, rows appear as they
+   arrive, results are cached per date range, and failed customers can be retried without restarting. */
+(function(){
+  'use strict';
+  const W = window, D = document;
+  const $ = id => D.getElementById(id);
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+  const num = v => { const n = Number(v); return isFinite(n) ? n : 0; };
+  const r2 = v => Math.round(v * 100) / 100;
+  const inr = v => { const n = r2(num(v)); return (n < 0 ? '−' : '') + '₹' + Math.abs(n).toLocaleString('en-IN', { minimumFractionDigits:2, maximumFractionDigits:2 }); };
+  const pad = n => String(n).padStart(2, '0');
+  const iso = d => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  const todayISO = () => (typeof W.bnxReportBusinessDate_ === 'function' ? W.bnxReportBusinessDate_() : iso(new Date()));
+  const parse = s => new Date(s + 'T00:00:00');
+  const addDays = (s, n) => { const d = parse(s); d.setDate(d.getDate() + n); return iso(d); };
+  const fmtD = s => (s && /^\d{4}-\d{2}-\d{2}/.test(s)) ? s.slice(8, 10) + '-' + s.slice(5, 7) + '-' + s.slice(0, 4) : (s || '—');
+  const S = { run:0, rows:[], cache:{}, from:'', to:'', total:0, done:0, failed:[], busy:false, hideZero:true, sort:'closing' };
+  W.__bnxCcDate = S;
+
+  function presetRange(p){
+    const t = todayISO(), d = parse(t);
+    if (p === 'today') return [t, t];
+    if (p === 'yesterday') { const y = addDays(t, -1); return [y, y]; }
+    if (p === 'week') { const dow = (d.getDay() + 6) % 7; return [addDays(t, -dow), t]; }
+    if (p === 'month') return [t.slice(0, 8) + '01', t];
+    if (p === 'lastmonth') { const f = new Date(d.getFullYear(), d.getMonth() - 1, 1), l = new Date(d.getFullYear(), d.getMonth(), 0); return [iso(f), iso(l)]; }
+    if (p === 'fy') { const y = d.getMonth() >= 3 ? d.getFullYear() : d.getFullYear() - 1; return [y + '-04-01', t]; }
+    return ['', t];
+  }
+  function setRange(from, to){ if ($('ccDfFrom')) $('ccDfFrom').value = from || ''; if ($('ccDfTo')) $('ccDfTo').value = to || ''; }
+  function status(msg){ const el = $('ccDfStatus'); if (el) el.innerHTML = msg || ''; }
+  function customers(){ const CR = W.__bnx72CR; return (CR && CR.data && CR.data.customers) || []; }
+  function api(p){
+    if (typeof W.gasApi !== 'function') return Promise.reject(new Error('gasApi unavailable'));
+    return Promise.race([W.gasApi('GET_CUSTOMER_LEDGER', p, 'V2_CORE'), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 90000))]);
+  }
+  function fromServer(d, from, to){
+    /* server gives opening / periodDr / periodCr / closing for from..to; fall back to summing rows only if absent */
+    let dr = d.periodDr, cr = d.periodCr;
+    if (dr == null || cr == null) {
+      dr = 0; cr = 0;
+      (d.rows || []).forEach(x => { const k = String(x.date || '').slice(0, 10); if ((!from || k >= from) && (!to || k <= to)) { dr += num(x.dr); cr += num(x.cr); } });
+    }
+    const opening = num(d.opening), closing = d.closing != null ? num(d.closing) : opening + num(dr) - num(cr);
+    return { opening: r2(opening), dr: r2(num(dr)), cr: r2(num(cr)), closing: r2(closing) };
+  }
+  async function loadOne(c, from, to){
+    const key = c.customerId + '|' + from + '|' + to;
+    if (S.cache[key]) return S.cache[key];
+    const r = await api({ customerId: c.customerId, from: from || '', to: to || '' });
+    if (!r || !r.success || !r.data) throw new Error((r && r.error) || 'no data');
+    return (S.cache[key] = fromServer(r.data, from, to));
+  }
+  function candidates(from){
+    return customers().filter(c => {
+      if (!c.customerId) return false;
+      if (!from) return true;
+      const quiet = (!c.lastBillDate || c.lastBillDate < from) && (!c.lastPaymentDate || c.lastPaymentDate < from);
+      return !(quiet && Math.abs(num(c.outstanding)) < 0.01 && !(num(c.opening) > 0.01));
+    });
+  }
+  function sorted(rows){
+    const k = S.sort, f = { name:(a, b) => a.name.localeCompare(b.name), opening:(a, b) => b.opening - a.opening, dr:(a, b) => b.dr - a.dr, cr:(a, b) => b.cr - a.cr, closing:(a, b) => b.closing - a.closing }[k] || ((a, b) => b.closing - a.closing);
+    return rows.slice().sort(f);
+  }
+  function render(){
+    const box = $('ccDateReport'); if (!box) return;
+    let rows = S.rows;
+    if (S.hideZero) rows = rows.filter(r => Math.abs(r.opening) > 0.004 || r.dr > 0.004 || r.cr > 0.004 || Math.abs(r.closing) > 0.004);
+    rows = sorted(rows);
+    const t = rows.reduce((a, r) => ({ o:a.o + r.opening, d:a.d + r.dr, c:a.c + r.cr, z:a.z + r.closing }), { o:0, d:0, c:0, z:0 });
+    const th = (k, l, n) => `<th class="${n ? 'n' : ''}" style="cursor:pointer" data-sort="${k}">${l}${S.sort === k ? ' ▾' : ''}</th>`;
+    const body = rows.map((r, i) => {
+      const ok = Math.abs(r2(r.opening + r.dr - r.cr) - r.closing) <= 1;
+      return `<tr style="cursor:pointer" data-id="${esc(r.id)}"><td>${i + 1}</td><td style="font-weight:600">${esc(r.name)}</td>
+        <td class="n">${inr(r.opening)}</td><td class="n">${r.dr ? inr(r.dr) : '—'}</td><td class="n" style="color:var(--green)">${r.cr ? inr(r.cr) : '—'}</td>
+        <td class="n" style="font-weight:800;color:${r.closing > 0.004 ? 'var(--red)' : r.closing < -0.004 ? 'var(--blue)' : 'inherit'}">${inr(r.closing)}</td>
+        <td title="${ok ? 'Opening + Credit − Receipts = Closing' : 'Server closing differs from Opening + Credit − Receipts'}">${ok ? '✓' : '⚠'}</td></tr>`;
+    }).join('');
+    box.innerHTML = `<table class="bnx72-mt" id="ccDateTbl"><thead><tr><th>#</th>${th('name', 'Customer')}${th('opening', 'Opening (' + esc(fmtD(S.from) || 'start') + ')', 1)}${th('dr', 'Credit Sales', 1)}${th('cr', 'Receipts / Adj.', 1)}${th('closing', 'Closing (' + esc(fmtD(S.to)) + ')', 1)}<th></th></tr></thead>
+      <tbody>${body || '<tr><td colspan="7" style="text-align:center;color:var(--text3);padding:14px">No customers with a balance or activity in this period.</td></tr>'}</tbody>
+      <tfoot><tr style="font-weight:800;background:var(--surface2,#f6f3ee)"><td></td><td>TOTAL (${rows.length} customers)</td><td class="n">${inr(t.o)}</td><td class="n">${inr(t.d)}</td><td class="n">${inr(t.c)}</td><td class="n">${inr(t.z)}</td><td></td></tr></tfoot></table>
+      <label style="font-size:11px;display:inline-block;margin-top:6px;cursor:pointer"><input type="checkbox" id="ccDfHideZero" ${S.hideZero ? 'checked' : ''}> Hide customers with no balance and no activity</label>`;
+    box.querySelectorAll('th[data-sort]').forEach(h => h.onclick = () => { S.sort = h.dataset.sort; render(); });
+    box.querySelectorAll('tbody tr[data-id]').forEach(tr => tr.onclick = () => { if (typeof W.bnx72OpenStatement === 'function') W.bnx72OpenStatement(tr.dataset.id, S.from, S.to, 'custom'); });
+    const hz = $('ccDfHideZero'); if (hz) hz.onchange = () => { S.hideZero = hz.checked; render(); };
+    ['ccDfCsv', 'ccDfPrint', 'ccDfClear'].forEach(id => { const b = $(id); if (b) b.style.display = ''; });
+    const aw = $('ccDfActiveWrap'); if (aw) aw.style.display = '';
+    S.view = rows; S.tot = t;
+  }
+  function progress(){
+    const f = S.failed.length;
+    status(S.busy ? `⟳ Loading customer ledgers… ${S.done} of ${S.total}${f ? ' · ' + f + ' failed' : ''} <span style="color:var(--text3)">(server is slow - rows appear as they load)</span>`
+      : `Period ${esc(fmtD(S.from) || 'start')} → ${esc(fmtD(S.to))} · ${S.done} of ${S.total} customers loaded` + (f ? ` · <b style="color:var(--red)">${f} failed</b> <button class="btn btn-sm btn-ghost" id="ccDfRetry" style="padding:2px 8px">Retry failed</button>` : ' · complete'));
+    const rb = $('ccDfRetry'); if (rb) rb.onclick = () => runReport(true);
+  }
+  async function runReport(retryOnly){
+    const from = ($('ccDfFrom') && $('ccDfFrom').value) || '', to = ($('ccDfTo') && $('ccDfTo').value) || todayISO();
+    if (from && from > to) { status('<b style="color:var(--red)">From date is after To date.</b>'); return; }
+    if (S.busy) return;
+    if (!customers().length && typeof W.bnxLoadDueCollection === 'function') { status('⟳ Loading customer list…'); try { await W.bnxLoadDueCollection(); } catch (e) {} }
+    const list = candidates(from);
+    if (!list.length) { status('No credit customers loaded yet - try again in a moment.'); return; }
+    const sameRange = retryOnly && S.from === from && S.to === to;
+    S.from = from; S.to = to; S.busy = true; const my = ++S.run;
+    const todo = sameRange ? list.filter(c => S.failed.includes(String(c.customerId))) : list;
+    if (!sameRange) { S.rows = []; S.done = 0; S.total = list.length; S.failed = []; } else { S.failed = []; }
+    const have = new Set(S.rows.map(r => r.id));
+    let i = 0, lastPaint = 0;
+    const paint = force => { const n = Date.now(); if (force || n - lastPaint > 400) { lastPaint = n; render(); progress(); } };
+    async function worker(){
+      while (i < todo.length && my === S.run) {
+        const c = todo[i++], id = String(c.customerId);
+        try {
+          let v, tries = 0;
+          for (;;) { try { v = await loadOne(c, from, to); break; } catch (e) { if (++tries >= 2) throw e; } }
+          if (my !== S.run) return;
+          if (!have.has(id)) { have.add(id); S.rows.push(Object.assign({ id, name: c.customer || id }, v)); S.done++; }
+        } catch (e) { S.failed.push(id); }
+        paint(false);
+      }
+    }
+    progress();
+    await Promise.all([worker(), worker(), worker(), worker()]);
+    if (my !== S.run) return;
+    S.busy = false; paint(true);
+    applyActive();
+  }
+  function applyActive(){
+    const cb = $('ccDfActive');
+    W.__bnxCcActive = (cb && cb.checked) ? new Set(S.rows.filter(r => r.dr > 0.004 || r.cr > 0.004).map(r => String(r.id))) : null;
+    if (typeof W.searchCreditCustomer === 'function') W.searchCreditCustomer((W.__bnx72CR && W.__bnx72CR.q) || '');
+  }
+  function csv(){
+    const q = v => { const t = String(v == null ? '' : v); return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t; };
+    const rows = [['Customer Date Report', fmtD(S.from) + ' to ' + fmtD(S.to)], ['Customer', 'Opening', 'Credit Sales', 'Receipts/Adj', 'Closing']]
+      .concat((S.view || []).map(r => [r.name, r.opening, r.dr, r.cr, r.closing]))
+      .concat([['TOTAL', r2(S.tot.o), r2(S.tot.d), r2(S.tot.c), r2(S.tot.z)]]);
+    const a = D.createElement('a'); a.href = URL.createObjectURL(new Blob(['﻿' + rows.map(r => r.map(q).join(',')).join('\n')], { type:'text/csv' }));
+    a.download = 'customer_date_report_' + (S.from || 'start') + '_to_' + S.to + '.csv'; D.body.appendChild(a); a.click(); setTimeout(() => a.remove(), 500);
+  }
+  function print(){
+    const w = W.open('', '_blank', 'width=900,height=700'); if (!w) return;
+    const rows = (S.view || []).map(r => `<tr><td>${esc(r.name)}</td><td class="n">${inr(r.opening)}</td><td class="n">${inr(r.dr)}</td><td class="n">${inr(r.cr)}</td><td class="n">${inr(r.closing)}</td></tr>`).join('');
+    w.document.write(`<html><head><meta charset="UTF-8"><title>Customer Date Report</title><style>body{font-family:Arial,sans-serif;font-size:12px;padding:18px}table{width:100%;border-collapse:collapse}th,td{border:1px solid #ccc;padding:4px 6px}th{background:#f1ede6;text-align:left}.n{text-align:right}tfoot td{font-weight:700}</style></head><body><h2>Customer Date Report</h2><div>${esc(fmtD(S.from) || 'Start')} to ${esc(fmtD(S.to))}</div><br><table><thead><tr><th>Customer</th><th class="n">Opening</th><th class="n">Credit Sales</th><th class="n">Receipts / Adj.</th><th class="n">Closing</th></tr></thead><tbody>${rows}</tbody><tfoot><tr><td>TOTAL</td><td class="n">${inr(S.tot.o)}</td><td class="n">${inr(S.tot.d)}</td><td class="n">${inr(S.tot.c)}</td><td class="n">${inr(S.tot.z)}</td></tr></tfoot></table><script>window.onload=function(){setTimeout(function(){window.print()},300)}<\/script></body></html>`);
+    w.document.close();
+  }
+  function wire(){
+    const bar = $('ccDateBar'); if (!bar || bar.dataset.wired) return; bar.dataset.wired = '1';
+    const [f, t] = presetRange('month'); setRange(f, t);
+    $('ccDfChips').addEventListener('click', e => { const b = e.target.closest('button[data-p]'); if (!b) return; const [a, z] = presetRange(b.dataset.p); setRange(a, z); runReport(false); });
+    $('ccDfRun').onclick = () => runReport(false);
+    $('ccDfCsv').onclick = csv; $('ccDfPrint').onclick = print;
+    $('ccDfActive').onchange = applyActive;
+    $('ccDfClear').onclick = () => { S.run++; S.busy = false; S.rows = []; S.failed = []; $('ccDateReport').innerHTML = ''; status(''); W.__bnxCcActive = null; const cb = $('ccDfActive'); if (cb) cb.checked = false; ['ccDfCsv', 'ccDfPrint', 'ccDfClear', 'ccDfActiveWrap'].forEach(id => { const b = $(id); if (b) b.style.display = 'none'; }); applyActive(); };
+  }
+  if (D.readyState === 'loading') D.addEventListener('DOMContentLoaded', wire); else wire();
 })();
 </script>
 
