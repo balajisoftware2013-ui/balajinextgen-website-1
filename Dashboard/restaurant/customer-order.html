@@ -455,7 +455,7 @@ button:focus-visible,[role=button]:focus-visible,input:focus-visible{outline:3px
       </div>
       <div class="spacer"></div>
       <button class="btn btn-primary" id="ph-continue" disabled>Continue</button>
-      <button class="btn btn-ghost" style="margin-top:8px;box-shadow:none;" onclick="STATE.afterIdentify='';goScreen('s-menu')">← Back to menu</button>
+      <button class="btn btn-ghost" style="margin-top:8px;box-shadow:none;" onclick="bnxSkipGuestAsk_()">Skip — just view the menu</button>
     </div>
   </div>
 
@@ -603,8 +603,25 @@ const GAS_APIS_DASH = {
   V2_AUTH:     'https://script.google.com/macros/s/' + (localStorage.getItem('bnx_api_auth') || 'AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx') + '/exec',
   V2_FRONTEND: 'https://script.google.com/macros/s/' + (localStorage.getItem('bnx_api_front') || 'AKfycbyiaO9zpZAQ1pTlDjz7B2yEUfjv1vrlXTYjTkIY-YwKr6ahOCV6lU_AiB4dpmnBySG1') + '/exec',
 };
+/* ROOT FIX 2026-10-08 ("mobile + name not saved in Google Sheet, no WhatsApp"): this page has no login, so the
+   POST CUSTOMER_CHECKIN was refused by the session check ("Invalid or expired session") and every guest only sat in
+   a local retry queue. Check-in now uses the public, rate-limited GET route GUEST_CHECKIN (same doGet that serves
+   PUBLIC_MENU) → GUEST_CRM in the client's MASTER DB + automatic WhatsApp / SMS welcome. POST stays as a fallback. */
+async function bnxGuestCheckinGet_(payload){
+  const q=new URLSearchParams({action:'GUEST_CHECKIN',clientId:STATE.clientId});
+  ['mobileNo','customerName','tableId','scanKey','requestId','source'].forEach(k=>{ if(payload[k]!=null && payload[k]!=='') q.set(k,String(payload[k])); });
+  ['notifyOptIn','welcomeSms','deferWelcome'].forEach(k=>{ if(payload[k]!==undefined) q.set(k,payload[k]?'true':'false'); });
+  const ctl=new AbortController(), tm=setTimeout(()=>ctl.abort(),25000);
+  try{ const r=await fetch(GAS_APIS_DASH.V2_CORE+'?'+q.toString(),{signal:ctl.signal}); return await r.json(); }
+  catch(e){ return {success:false,offline:true,error:e.message}; } finally{ clearTimeout(tm); }
+}
 async function gasApi(action,payload,endpoint,timeoutMs){
   payload=payload||{};
+  if(action==='CUSTOMER_CHECKIN' && (endpoint||'V2_CORE')==='V2_CORE'){
+    const g=await bnxGuestCheckinGet_(payload);
+    if(g && g.success!==false) return g;
+    if(g && !g.offline && !/unknown|not installed|invalid client|no master/i.test(String(g.error||''))) return g;   /* real refusal (bad number, rate limit) */
+  }
   const url=GAS_APIS_DASH[endpoint||'V2_CORE'];
   try{
     /* PASS #38 FIX ("fix all according" — checked this file against the
@@ -879,7 +896,8 @@ async function boot(){
   bnxPaintBrandText(); applyBrandLogo();
   /* FIX (logo shows late): start the public info call at once, in parallel, instead of only after GET_CLIENT_INFO fails */
   try{ bnxQrPromoFromCache_(); }catch(e){}
-  bnxPublicFetch().then(pub=>{ if(pub && pub.info && (pub.info.name||pub.info.logoUrl)) bnxLateInfo(pub.info); bnxQrPromoLoad_(pub); }).catch(()=>{});
+  bnxPublicFetch().then(pub=>{ if(pub && pub.info){ const w=pub.info.whatsapp||pub.info.phone||''; if(w){ STATE.waNumber=String(w); try{ gxPaint(); }catch(e){} } }
+    if(pub && pub.info && (pub.info.name||pub.info.logoUrl)) bnxLateInfo(pub.info); bnxQrPromoLoad_(pub); }).catch(()=>{});
   const infoP = gasApi('GET_CLIENT_INFO', {}, 'V2_CORE').catch(()=>null);
   const infoRes = null;   /* never block the menu on the info call — bnxLateInfo applies name/logo/permissions when it arrives */
   if (!infoRes) infoP.then(async r=>{ if (r && r.success && r.data) bnxLateInfo(r.data); else { bnxInfoFail(r); const pub=await bnxPublicFetch(); if (pub && pub.info && (pub.info.name||pub.info.logoUrl)) bnxLateInfo(pub.info); } });
@@ -1454,8 +1472,8 @@ function closeActiveMenuCard(){
 const phInput = document.getElementById('ph-input');
 phInput.addEventListener('input', ()=>{
   phInput.value = phInput.value.replace(/\D/g,'').slice(0,10);
-  document.getElementById('ph-continue').disabled = phInput.value.length !== 10;
-  document.getElementById('ph-err').textContent = '';
+  document.getElementById('ph-continue').disabled = !/^[6-9]\d{9}$/.test(phInput.value);
+  document.getElementById('ph-err').textContent = (phInput.value.length===10 && !/^[6-9]/.test(phInput.value)) ? 'Mobile number should start with 6, 7, 8 or 9.' : '';
 });
 document.getElementById('ph-continue').onclick = async ()=>{
   const btn = document.getElementById('ph-continue');
@@ -1485,6 +1503,10 @@ document.getElementById('ph-continue').onclick = async ()=>{
 
   btn.disabled = false; btn.textContent = 'Continue';
 
+  if (res && res.success === false && !res.offline && res.error && /valid|too many|busy|mobile/i.test(String(res.error))){
+    document.getElementById('ph-err').textContent = String(res.error);   /* real refusal: wrong number / rate limit */
+    return;
+  }
   if (!res || res.success === false){
     // Offline / backend unreachable — don't block ordering, just proceed as a new guest.
     STATE.isNewCustomer = true;
@@ -1528,7 +1550,7 @@ function bnxQueueCheckin_(rec){
 }
 async function bnxFlushPendingCheckins_(){
   try{
-    const q=JSON.parse(localStorage.getItem('bnx_pending_checkin')||'[]'); if(!q.length) return;
+    const q=JSON.parse(localStorage.getItem('bnx_pending_checkin')||'[]').filter(r=>r && /^\d{10}$/.test(String(r.mobileNo||'').replace(/\D/g,'').slice(-10))); if(!q.length){ localStorage.setItem('bnx_pending_checkin','[]'); return; }
     const left=[]; for (const rec of q){ if(rec.clientId && STATE.clientId && rec.clientId!==STATE.clientId){ left.push(rec); continue; } if(!(await bnxSaveCustomerRecord_(rec))) left.push(rec); }
     localStorage.setItem('bnx_pending_checkin',JSON.stringify(left));
   }catch(e){}
@@ -1547,6 +1569,7 @@ async function bnxAutoCapture_(){
     if(!dev){ dev='dv-'+Date.now().toString(36)+Math.random().toString(36).slice(2,8); localStorage.setItem('bnx_device_id',dev); }
     const vk='bnx_visits_'+STATE.clientId; const visits=(parseInt(localStorage.getItem(vk)||'0',10)||0)+1;
     let prof=null; try{ prof=gxLoad(); }catch(e){}
+    if(!/^\d{10}$/.test(String(STATE.customerPhone||(prof&&prof.phone)||''))) return;   /* nothing to save yet — the guest is asked below */
     const rec={
       requestId:'auto-'+STATE.scanKey+'-'+dev, clientId:STATE.clientId, tableId:STATE.tableId, scanKey:STATE.scanKey,
       mobileNo:STATE.customerPhone||(prof&&prof.phone)||'', customerName:STATE.customerName||(prof&&prof.name)||'',
@@ -2030,6 +2053,8 @@ function gxPaint(){
     +'<div class="gx-sub">'+(p.visits>1?'So good to see you again.':'Thanks for coming back.')+(STATE.tableId?' Table '+escH(STATE.tableId)+'.':'')+'</div></div>'
     +'<button class="gx-not" onclick="gxForget()">Not you?</button></div>';
   if(chips.length) h+='<div class="gx-chips">'+chips.join('')+'</div>';
+  if(bnxWaLink_(p)) h+='<div class="gx-sec"><div class="gx-sec-h"><span>'+(p.welcomed?'💬 Chat with us on WhatsApp':'💬 Get your welcome & offers on WhatsApp')+'</span>'
+    +'<a class="gx-add" style="text-decoration:none;background:#25D366;color:#fff;border-color:#25D366" href="'+escH(bnxWaLink_(p))+'" target="_blank" rel="noopener" onclick="bnxWaTapped_()">WhatsApp</a></div></div>';
   const last=p.orders&&p.orders[0];
   if(last&&(last.items||[]).length){
     const txt=last.items.slice(0,4).map(it=>escH(it.name)+' ×'+escH(it.qty)).join(', ')+(last.items.length>4?' +'+(last.items.length-4)+' more':'');
@@ -2050,6 +2075,8 @@ gasApi = async function(action, payload, endpoint){
   try{
     if(action==='CUSTOMER_CHECKIN' && r && r.success!==false && payload && payload.mobileNo){
       gxSave({phone:payload.mobileNo, name:r.customerName||payload.customerName, points:r.points, visits:r.visitCount, crn:gxCrn(r), optIn:payload.notifyOptIn});
+      if(r.welcomeSent){ const q=gxLoad(); if(q){ q.welcomed=true; gxStore(q); } }
+      if(r.welcome==='sent') bnxToast('✅ Saved — welcome message sent on '+(r.welcomeChannel==='SMS'?'SMS':'WhatsApp')+'.');
       setTimeout(gxPaint,0);
     }
     if(action==='SAVE_ORDER' && r && r.success!==false && payload && payload.mobileNo){
@@ -2371,6 +2398,38 @@ function bnxGoMenuList(){
   try{ if(!document.getElementById('s-menu').classList.contains('active')) enterMenu(); }catch(e){}
   setTimeout(()=>{ const t=document.getElementById('mn-search'); if(t) t.scrollIntoView({behavior:'smooth',block:'start'}); },60);
 }
+
+
+/* ═══ SCAN → ask mobile + name once per visit (after the video / event), saved to GUEST_CRM ═══ */
+function bnxSkipGuestAsk_(){ try{ sessionStorage.setItem('bnx_ask_'+STATE.clientId+'_'+STATE.scanKey,'skip'); }catch(e){} STATE.afterIdentify=''; goScreen('s-menu'); }
+function bnxAskGuest_(){
+  try{
+    if(!STATE.clientId || qs.get('nophone')) return;
+    if(STATE.__introRunning || document.getElementById('bnx-intro')) return;
+    if(STATE.customerPhone || (gxLoad()||{}).phone) return;
+    if(sessionStorage.getItem('bnx_ask_'+STATE.clientId+'_'+STATE.scanKey)) return;
+    const cur=document.querySelector('.screen.active'); if(cur && !/^(s-menu|s-landing)$/.test(cur.id)) return;
+    const box=document.getElementById('mc-modal'); if(box && box.classList.contains('show')) return;
+    sessionStorage.setItem('bnx_ask_'+STATE.clientId+'_'+STATE.scanKey,'asked');
+    STATE.afterIdentify=''; goScreen('s-phone');
+    setTimeout(()=>{ try{ phInput.focus(); }catch(e){} },250);
+  }catch(e){}
+}
+function bnxAskGuestSoon_(ms){ setTimeout(bnxAskGuest_, ms||400); }
+setTimeout(()=>{ if(!BNX_INTRO.started) bnxAskGuest_(); }, 3500);      /* no video / event: ask 3.5 s after the scan */
+const _bnxIntroClose0 = bnxIntroClose;
+bnxIntroClose = function(){ _bnxIntroClose0.apply(this, arguments); bnxAskGuestSoon_(500); };
+
+/* WhatsApp: the restaurant's number from CLIENT_SETTINGS (WHATSAPP_NUMBER / RESTAURANT_PHONE). The guest's own
+   "Hi" opens the chat, so the WhatsApp Business "Greeting message" auto-replies even when no API is set up. */
+function bnxWaLink_(p){
+  const n=String(STATE.waNumber||'').replace(/\D/g,'').slice(-10); if(!/^[6-9]\d{9}$/.test(n)) return '';
+  p=p||gxLoad()||{};
+  const rn=(STATE.restaurantName&&STATE.restaurantName!=='Our Restaurant')?STATE.restaurantName:'';
+  const t='Hi'+(rn?' '+rn:'')+'! I am '+(p.name||STATE.customerName||'a guest')+(STATE.tableId?' at table '+STATE.tableId:'')+(p.crn?' (Customer No. '+p.crn+')':'')+'.';
+  return 'https://wa.me/91'+n+'?text='+encodeURIComponent(t);
+}
+function bnxWaTapped_(){ try{ const q=gxLoad(); if(q){ q.waTapped=Date.now(); gxStore(q); } }catch(e){} }
 
 /* DEBUG PANEL — open the QR link with &debug=1 to see what loaded and what the server said */
 (function(){
