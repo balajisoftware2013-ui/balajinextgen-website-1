@@ -728,7 +728,35 @@ button:focus-visible,[role=button]:focus-visible,input:focus-visible{outline:3px
       if (o.onEnded && o.frameSeconds) T(function(){ if (!dead) o.onEnded(); }, o.frameSeconds * 1000);
       if (o.onPlaying) o.onPlaying();
     }
-    if (info.kind === 'youtube'){ useFrame(info.src); api.destroy = function(){ dead = true; clear(); box.remove(); }; return api; }
+    if (info.kind === 'youtube'){
+      /* 2026-10-08 ("YouTube link paste and save → play direct"): the embed used to be cut after a fixed
+         25 s with no sound. Now the YouTube player API (postMessage, no extra script) reports the real end,
+         errors (owner disabled embedding → skip), progress, and lets the guest's tap turn the sound on. */
+      var ysrc = info.src + '&enablejsapi=1&origin=' + encodeURIComponent(location.origin && location.origin !== 'null' ? location.origin : '*');
+      var noEnd = o.frameSeconds; o.frameSeconds = 0;               /* the API reports the end — no fixed cut */
+      useFrame(ysrc);
+      var fr = api.el, gotApi = false, endedOnce = false;
+      var post = function(func, args){ try{ fr.contentWindow.postMessage(JSON.stringify({ event:'command', func:func, args:args||[] }), '*'); }catch(e){} };
+      var listen = function(){ try{ fr.contentWindow.postMessage(JSON.stringify({ event:'listening', id:'bnxv', channel:'widget' }), '*'); }catch(e){} };
+      fr.addEventListener('load', function(){ listen(); T(listen, 600); T(listen, 1800); });
+      var onMsg = function(ev){
+        if (dead || ev.source !== fr.contentWindow) return;
+        var d; try{ d = typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data; }catch(e){ return; }
+        if (!d || !d.event) return;
+        gotApi = true;
+        var st = d.event === 'onStateChange' ? d.info : (d.event === 'infoDelivery' && d.info && d.info.playerState !== undefined ? d.info.playerState : null);
+        if (d.event === 'infoDelivery' && d.info && d.info.duration){ api.duration = d.info.duration; if (d.info.currentTime != null) api.currentTime = d.info.currentTime; if (o.onProgress) o.onProgress(api.currentTime || 0, api.duration); }
+        if (st === 0 && !endedOnce){ endedOnce = true; if (o.loop) { post('seekTo', [0, true]); post('playVideo'); endedOnce = false; } else if (o.onEnded) o.onEnded(); }
+        if (d.event === 'onError'){ fail('youtube error ' + d.info); }
+      };
+      window.addEventListener('message', onMsg);
+      /* no API reply at all (very old WebView): fall back to the fixed duration so the guest is never stuck */
+      if (noEnd && o.onEnded) T(function(){ if (!gotApi && !dead) o.onEnded(); }, noEnd * 1000);
+      api.setMuted = function(m){ post(m ? 'mute' : 'unMute'); if (!m){ post('setVolume', [100]); post('playVideo'); } };
+      api.play = function(){ post('playVideo'); };
+      api.destroy = function(){ dead = true; clear(); window.removeEventListener('message', onMsg); box.remove(); };
+      return api;
+    }
 
     var v = document.createElement('video');
     var manual = SAVE_DATA || REDUCED, userGo = false;              /* manual = only the viewer's tap may start it */
@@ -822,16 +850,20 @@ const GAS_APIS_DASH = {
    a local retry queue. Check-in now uses the public, rate-limited GET route GUEST_CHECKIN (same doGet that serves
    PUBLIC_MENU) → GUEST_CRM in the client's MASTER DB + automatic WhatsApp / SMS welcome. POST stays as a fallback. */
 /* the QR-promo / guest code may be deployed on V2_CORE or on the erp-config (V2_AUTH) deployment */
+const BNX_PROMO_DEPLOY='https://script.google.com/macros/s/AKfycbwHdqrP4IvuVD2ZkupNybrEkiXu3kmuI6-tQoiHgYxoqr1KgUupeFsi3PIoFEbuv6XA/exec';
 function bnxEpList_(){
   const out=[]; const add=u=>{ if(u && /\/exec$/.test(u) && out.indexOf(u)<0) out.push(u); };
   try{ add(localStorage.getItem('bnx_guest_api_ok')); }catch(e){}
   add(GAS_APIS_DASH.V2_CORE); add(GAS_APIS_DASH.V2_AUTH);
+  /* 2026-10-08 ROOT FIX ("dashboard saves video/YouTube but the QR page plays the default"): the dashboard
+     saves Video & Events to V2_CORE v955 (AKfycbwHdq…), which this page never asked → the guest never got it. */
+  add(BNX_PROMO_DEPLOY);
   return out;
 }
 function bnxEpOk_(u){ try{ localStorage.setItem('bnx_guest_api_ok',u); }catch(e){} }
 async function bnxGuestCheckinGet_(payload){
   const q=new URLSearchParams({action:'GUEST_CHECKIN',clientId:STATE.clientId});
-  ['mobileNo','customerName','tableId','scanKey','requestId','source'].forEach(k=>{ if(payload[k]!=null && payload[k]!=='') q.set(k,String(payload[k])); });
+  ['mobileNo','customerName','tableId','scanKey','requestId','source','partyName','partyDate'].forEach(k=>{ if(payload[k]!=null && payload[k]!=='') q.set(k,String(payload[k])); });
   ['notifyOptIn','welcomeSms','deferWelcome'].forEach(k=>{ if(payload[k]!==undefined) q.set(k,payload[k]?'true':'false'); });
   let last={success:false,offline:true,error:'no server'};
   for (const base of bnxEpList_()){
@@ -847,6 +879,12 @@ async function bnxGuestCheckinGet_(payload){
 }
 async function gasApi(action,payload,endpoint,timeoutMs){
   payload=payload||{};
+  /* PARTY QR: every check-in from a party QR carries the party name (source + partyName + party scanKey),
+     so the guest list of that party can be pulled from the customer records */
+  if(action==='CUSTOMER_CHECKIN' && typeof STATE!=='undefined' && STATE.party){
+    payload=Object.assign({},payload,{ partyName:STATE.party, PARTY_NAME:STATE.party, partyDate:STATE.partyDate||'', party:STATE.party,
+      source:String(payload.source||'QR_SCAN').replace(/\|PARTY:.*$/,'')+'|PARTY:'+STATE.party });
+  }
   if(action==='CUSTOMER_CHECKIN' && (endpoint||'V2_CORE')==='V2_CORE'){
     const g=await bnxGuestCheckinGet_(payload);
     if(g && g.success!==false) return g;
@@ -933,9 +971,13 @@ function bnxNormClientId(v){
 const STATE = {
   clientId: bnxNormClientId(qs.get('client') || qs.get('clientId') || ''),  // only the restaurant in the QR link — never a remembered one
   tableId:  qs.get('table')  || qs.get('tableId')  || '',
+  /* PARTY QR (?party=NIRVAAN&pd=2026-10-12): scans are tagged with the party name */
+  party:    String(qs.get('party')||'').replace(/[|<>]/g,'').trim().slice(0,60),
+  partyDate:String(qs.get('pd')||'').replace(/[^0-9-]/g,'').slice(0,10),
   /* VISIT KEY: one visit = this table, this business day (a reload or a second scan at the
      same table on the same day must not count as another visit / another welcome). */
   scanKey:  (function(){ try{ const d=new Date(Date.now()+5.5*3600*1000+new Date().getTimezoneOffset()*60000); if(d.getHours()<6) d.setDate(d.getDate()-1);
+              if(qs.get('party')) return 'party-'+String(qs.get('party')).toLowerCase().replace(/[^a-z0-9]+/g,'').slice(0,24)+'-'+d.toISOString().slice(0,10).replace(/-/g,'');
               return 'qr-'+(String(qs.get('table')||qs.get('tableId')||'counter').toLowerCase().replace(/[^a-z0-9]+/g,''))+'-'+d.toISOString().slice(0,10).replace(/-/g,''); }
             catch(e){ return 'qr-'+Date.now().toString(36); } })(),
   customerName: '',
@@ -1159,6 +1201,13 @@ async function boot(){
   bnxPaintBrandText();
   document.getElementById('ph-table-sub').textContent = STATE.tableId ? ('Table '+STATE.tableId) : 'Takeaway / Counter';
   document.getElementById('mn-sub').textContent = STATE.tableId ? ('Table '+STATE.tableId) : 'Takeaway / Counter';
+  if (STATE.party){   /* PARTY QR: the guest sees which party they are checking in to */
+    const pl='🎉 '+STATE.party+(STATE.tableId?' · Table '+STATE.tableId:'');
+    document.getElementById('ph-table-sub').textContent = pl;
+    document.getElementById('mn-sub').textContent = pl;
+    try{ const ht=document.querySelector('#s-phone .hero-title'); if(ht) ht.textContent='Welcome to '+STATE.party+'!'; }catch(e){}
+    try{ const hi=document.querySelector('#s-phone .hint'); if(hi) hi.textContent='Check in for '+STATE.party+' — we send your welcome & party updates on WhatsApp. No spam, ever.'; }catch(e){}
+  }
 
   // DIRECT MENU MODE: open the restaurant's live item menu as soon as
   // the restaurant/client QR is resolved. Customer phone/name entry no
@@ -2431,7 +2480,7 @@ function bnxPaintHero(){
   document.getElementById('hv-name').textContent=nm?('Welcome to '+nm):'Welcome';
   const first=(STATE.customerName||'').split(' ')[0];
   document.getElementById('hv-sub').textContent=first?('Hi '+first+'! '+(window.__occText||'Hope you are hungry')):(window.__occText||'Fresh food, made with care');
-  document.getElementById('hv-table').textContent=STATE.tableId?('Table '+STATE.tableId):'Takeaway / Counter';
+  document.getElementById('hv-table').textContent=(STATE.party?'🎉 '+STATE.party+(STATE.tableId?' · ':''):'')+(STATE.tableId?('Table '+STATE.tableId):(STATE.party?'':'Takeaway / Counter'));
   const wn=document.getElementById('hv-wm-name'); if(wn) wn.textContent=nm;
   document.querySelectorAll('#mn-hero .brand-logo-slot').forEach(el=>{ el.dataset.logoSrc=''; });
   try{ applyBrandLogo(); }catch(e){}
@@ -2592,14 +2641,18 @@ function bnxIntroShow_(){
     const pl=BNXVideo.mount(layer, st.v.src, { fit:'contain', loop:false, frameSeconds:25, label:'Welcome video',
       onEnded:()=>{ if(BNX_INTRO.steps[BNX_INTRO.i]===st) bnxIntroNext(); },
       onFail:()=>{ if(BNX_INTRO.steps[BNX_INTRO.i]===st) bnxIntroNext(); },
-      onPlaying:()=>{ if(pl && pl.kind!=='file' && pl.kind!=='drive'){ const sb=document.getElementById('bi-sound'); if(sb) sb.style.display='none'; } } });
+      onProgress:(t,d)=>{ if(d){ prog.style.width=Math.min(100,t/d*100)+'%'; } },
+      onPlaying:()=>{ if(pl && pl.kind!=='file' && pl.kind!=='drive' && pl.kind!=='youtube'){ const sb=document.getElementById('bi-sound'); if(sb) sb.style.display='none'; } } });
     BNX_INTRO.player=pl;
-    if(pl.el && pl.el.tagName==='VIDEO'){
+    if(pl.kind==='youtube'){ /* progress comes from the YouTube API; sound button stays */ }
+    else if(pl.el && pl.el.tagName==='VIDEO'){
       pl.el.addEventListener('timeupdate',()=>{ if(pl.el.duration) prog.style.width=(pl.el.currentTime/pl.el.duration*100)+'%'; });
       pl.el.addEventListener('click',()=>{ muted=!muted; pl.setMuted(muted); snd(); });
     } else { const sb=document.getElementById('bi-sound'); if(sb) sb.style.display='none'; let t=0; BNX_INTRO.timer=setInterval(()=>{ t+=0.5; prog.style.width=Math.min(100,t/25*100)+'%'; },500); }
     document.getElementById('bi-sound').onclick=()=>{ muted=!muted; pl.setMuted(muted); snd(); };
-    setTimeout(()=>{ if(BNX_INTRO.steps[BNX_INTRO.i]===st) bnxIntroNext(); },60000);                       /* hard cap */
+    /* hard cap: 60 s, or the real length of a YouTube video (+5 s, max 5 min) once the player reports it */
+    const capAt=Date.now(); const cap=()=>{ if(BNX_INTRO.steps[BNX_INTRO.i]!==st) return; const d=Number(pl&&pl.duration)||0; const lim=d?Math.min(300,d+5)*1000:60000; if(Date.now()-capAt>=lim) bnxIntroNext(); else setTimeout(cap,1000); };
+    setTimeout(cap,1000);
     return;
   }
   const e=st.e, isToday=String(e.date)===bnxBizDayIST();
