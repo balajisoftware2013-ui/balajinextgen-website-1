@@ -17703,7 +17703,12 @@ async function settleOrder(){
       ? getBusinessDate()
       : now.toLocaleDateString('en-GB');
 
-    const requestId = bnxUuid();
+    const requestId = (function(){   /* same bill content => same requestId (no duplicates while logged out) */
+      let fp=''; try{ fp=JSON.stringify([tbl,total,payMethod,(items||[]).map(i=>[i.name,i.qty,i.rate||i.price])]); }catch(e){}
+      const c=window.__bnxBillFp;
+      if(fp && c && c.fp===fp && c.id) return c.id;
+      const id=bnxUuid(); window.__bnxBillFp={fp:fp,id:id}; return id;
+    })();
     const draftBill = {
       // BILL_DATE = Business Date; BILL_TIME remains the actual clock time.
       dt: billBusinessDate, tm: now.toLocaleTimeString('en-IN',{hour12:true,hour:'2-digit',minute:'2-digit'}),
@@ -17733,12 +17738,19 @@ async function settleOrder(){
     const res = await gasApi('SAVE_BILL', { requestId, bill: draftBill }, 'V2_CORE');
     if (!res || !res.success){
       bnxQueuePending('SAVE_BILL', { requestId, bill: draftBill }, requestId);
+      if (bnxIsAuthText_(res) || (res && (res.statusCode===401 || res.statusCode===403))) {
+        try{ if (typeof window.bnxSessionSuspect_==='function') window.bnxSessionSuspect_('expired'); }catch(e){}
+        const m='🔒 Session expired — this bill is NOT recorded yet. It is kept safely on this device (do NOT settle it again) and syncs automatically after you log in again.';
+        if (typeof showNotif==='function') showNotif(m,'error'); else alert(m);
+        return;
+      }
       bnxSetLiveStatus('offline');
       if (typeof showNotif === 'function') showNotif('📴 Could not reach server — order queued as Pending Sync. Not printed or recorded yet.', 'error');
       else alert('⚠️ Could not reach the server. Queued and will save automatically — NOT recorded yet, nothing printed.');
       return;
     }
     bnxSetLiveStatus('live');
+    window.__bnxBillFp = null;   /* confirmed — next bill gets its own requestId */
     // FIX ("bill view problem" — View/Cancel/Reprint/Edit silently doing
     // nothing for some bills): res.serverId/res.billNo comes straight
     // from the server and can be a raw number for a numeric bill-number
@@ -20709,7 +20721,15 @@ async function bmSaveBill(reprintAfter){
     d.time = d.time || now.toTimeString().slice(0,5);
 
     const isEditingExisting = (function(){ try{ var r=localStorage.getItem(bnxBillRegKey())||''; return !!d.billno && r.indexOf('"no":'+JSON.stringify(d.billno))>-1; }catch(e){ return bnxGetBillRegister().some(b=>b.no===d.billno); } })();
-    const requestId = bnxUuid();
+    /* SESSION-EXPIRY FIX: a fresh requestId on every tap queued the SAME bill again and again
+       while the session was expired -> duplicates after re-login. Identical bill content now
+       keeps ONE requestId (server de-duplicates on it); cleared once the bill is confirmed. */
+    const requestId = (function(){
+      let fp=''; try{ fp=JSON.stringify([d.table,d.cname,d.cmob,d.total,d.paymode,d.date,(d.items||[]).map(i=>[i.name,i.qty,i.rate])]); }catch(e){}
+      const c=window.__bnxBillFp;
+      if(fp && c && c.fp===fp && c.id) return c.id;
+      const id=bnxUuid(); window.__bnxBillFp={fp:fp,id:id}; return id;
+    })();
     const draftBill = {
       no: isEditingExisting ? d.billno : undefined,
       // Canonical invoice date/time fields. dt/tm are retained for compatibility.
@@ -20758,6 +20778,7 @@ async function bmSaveBill(reprintAfter){
         const hasConfirmedBill = !!(res && ((res.data && res.data.BILL_NUMBER) || res.serverId || res.billNo));
         if (res && (res.success === true || hasConfirmedBill)) break;
         lastSaveError = new Error((res && (res.message || res.error)) || 'SAVE_BILL returned no success');
+        if (BNX_AUTH_TEXT_RE.test(String(lastSaveError.message||'')) || (res && (res.statusCode===401 || res.statusCode===403))) { lastSaveError.authExpired=true; break; }   /* retrying cannot help */
       } catch (e) {
         lastSaveError = e;
         console.warn('[BM_SAVE] SAVE_BILL retry '+attempt+'/'+maxSaveAttempts+' failed:', e);
@@ -20774,6 +20795,12 @@ async function bmSaveBill(reprintAfter){
     const saveConfirmed = !!(res && (res.success === true || (res.data && res.data.BILL_NUMBER) || res.serverId || res.billNo));
     if (!saveConfirmed){
       bnxQueuePending('SAVE_BILL', { requestId, bill: draftBill }, requestId);
+      if (lastSaveError && (lastSaveError.authExpired || BNX_AUTH_TEXT_RE.test(String(lastSaveError.message||'')))) {
+        try{ if (typeof window.bnxSessionSuspect_==='function') window.bnxSessionSuspect_('expired'); }catch(e){}
+        const m='🔒 Session expired — this bill is NOT recorded yet. It is kept safely on this device (do NOT enter it again) and syncs automatically after you log in again.';
+        if (typeof showNotif==='function') showNotif(m,'error'); else alert(m);
+        return null;
+      }
       bnxSetLiveStatus('offline');
       console.error('[BM_SAVE] SAVE_BILL failed after '+maxSaveAttempts+' attempts:', lastSaveError || res);
       if (typeof showNotif==='function') showNotif('📴 Server unavailable after '+maxSaveAttempts+' quick retries — bill queued as Pending Sync. NOT printed as a tax invoice because it is not recorded yet.', 'error');
@@ -20781,6 +20808,7 @@ async function bmSaveBill(reprintAfter){
       return null;
     }
     bnxSetLiveStatus('live');
+    window.__bnxBillFp = null;   /* confirmed — next bill gets its own requestId */
     // FINAL LIVE-SYNC FIX: the server invalidates its report cache after a
     // successful write, but this browser also had a 15s dashboard snapshot.
     // Clear that snapshot immediately and refresh in the background so the
@@ -21840,10 +21868,11 @@ async function flushOutbox(force){
   try{ return await __bnxFlushOutboxInner(list, force); } finally { __bnxFlushing = false; }
 }
 async function __bnxFlushOutboxInner(list, force){
-  let anyFailed = false;
+  let anyFailed = false, authStop = false;
   const remaining = [];
   const now = Date.now();
   for(const entry of list){
+    if(authStop){ remaining.push(entry); continue; }   /* session expired: leave the rest untouched */
     const dueAt = (entry.lastAttemptAt||0) + Math.min(15000 * Math.pow(2, entry.attempts), 300000);
     if(!force && now < dueAt){ remaining.push(entry); continue; }
     entry.attempts++;
@@ -21858,6 +21887,14 @@ async function __bnxFlushOutboxInner(list, force){
       // no way to tell a session/auth failure apart from a scope
       // violation or a missing tab. Stash it on the entry every attempt.
       entry.lastError = (res && res.error) || (res && res.errorCode) || 'No response from server';
+      /* SESSION-EXPIRY FIX: an expired login is not a failed attempt. Undo the count so nothing is
+         pushed to the failed store while staff are simply logged out; stop hammering the server. */
+      if (bnxIsAuthText_(res) || (res && (res.statusCode===401 || res.statusCode===403))) {
+        entry.attempts = Math.max(0, entry.attempts-1); entry.lastAttemptAt = 0;
+        remaining.push(entry); anyFailed = true; authStop = true;
+        try{ if (typeof window.bnxSessionSuspect_==='function') window.bnxSessionSuspect_(entry.lastError); }catch(e){}
+        continue;
+      }
       const nonRetryable = bnxIsNonRetryableOutboxError_(entry.lastError);
       if(entry.attempts < 10 && !nonRetryable){
         remaining.push(entry);
