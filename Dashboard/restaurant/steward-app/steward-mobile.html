@@ -1,6 +1,38 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<script id="bnx-storage-doctor">
+/* STORAGE DOCTOR (2026-10-09, "storage full — kept newest 150 of 264 bills"): the browser gives each site ~5 MB.
+   Big re-downloadable caches (reports, DSR, item/menu lists, logs …) filled it, so newer data could not be saved.
+   On load and every 10 min: if storage is above 3.5 MB, the largest RE-DOWNLOADABLE caches are removed until it is
+   under 2.5 MB. NEVER touched: unsynced bills/KOT outbox, held/draft orders, login/session, settings, numbering,
+   printer, role access, table snapshot, guest data. Console: bnxStorageReport() lists what uses the space. */
+(function(){
+  var KEEP=/outbox|pending|queue|failed|held|unsynced|draft|override|open_?kots?|picked|session|^erp_|token|auth|seq|prefix|setting|config|cfg|role|perm|access|printer|brand|theme|tax_?mode|device|guest|table_master|tbl_snap|tables?_cache|last_client|licen|day_?(status|state|key)|apv_rules|petty|billno|invoice|footer|incentive_rules|kot_?ovr/i;
+  var CACHE=/cache|dsr|report|summary|snapshot|master|items?\b|items_|menu|list|log|hist|export|dump|tmp|temp|preview|stats|analytics|ledger|recent|register|_data|dash|floor|sync|backup|index/i;
+  function size(k){ try{ return ((localStorage.getItem(k)||'').length+k.length)*2; }catch(e){ return 0; } }
+  function all(){ var o=[]; try{ for(var i=0;i<localStorage.length;i++){ var k=localStorage.key(i); o.push({key:k,bytes:size(k)}); } }catch(e){} return o.sort(function(a,b){ return b.bytes-a.bytes; }); }
+  function total(l){ return (l||all()).reduce(function(a,x){ return a+x.bytes; },0); }
+  window.bnxStorageReport=function(){ var l=all(); try{ console.table(l.slice(0,25).map(function(x){ return {key:x.key,KB:Math.round(x.bytes/1024),protected:KEEP.test(x.key)}; })); }catch(e){} console.info('[STORAGE] total '+Math.round(total(l)/1024)+' KB in '+l.length+' keys'); return l; };
+  function clean(force){
+    var l=all(), t=total(l); if(!force && t<3.5*1024*1024) return 0;
+    var removed=[], target=2.5*1024*1024, billReg=/^bnx_bill_register_/;
+    var cand=l.filter(function(x){ return !KEEP.test(x.key) && x.bytes>20*1024 && CACHE.test(x.key); });
+    cand.sort(function(a,b){ return (billReg.test(a.key)?1:0)-(billReg.test(b.key)?1:0) || b.bytes-a.bytes; });   /* bill register last */
+    for(var i=0;i<cand.length && t>target;i++){ try{ localStorage.removeItem(cand[i].key); t-=cand[i].bytes; removed.push(cand[i].key+' ('+Math.round(cand[i].bytes/1024)+' KB)'); }catch(e){} }
+    if(removed.length) console.info('[STORAGE] freed space — removed re-downloadable caches: '+removed.join(', ')+' · now '+Math.round(t/1024)+' KB');
+    return removed.length;
+  }
+  window.bnxStorageClean=clean;
+  /* a failed write anywhere → clean once, then retry it */
+  try{
+    var proto=Storage.prototype, orig=proto.setItem;
+    if(!orig.__bnxDoc){ var w=function(k,v){ try{ return orig.call(this,k,v); }catch(e){ if(this===window.localStorage && /quota|exceed/i.test(String(e&&(e.name||e.message)))){ if(clean(true)) return orig.call(this,k,v); } throw e; } }; w.__bnxDoc=true; proto.setItem=w; }
+  }catch(e){}
+  clean(false); setInterval(function(){ clean(false); },600000);
+})();
+</script>
+
 <script>
 /* FIX iPhone/iOS blank page: Safari (private mode / blocked storage / some in-app browsers) THROWS on any
    localStorage/sessionStorage access. The app reads localStorage at top level (API ids), so one throw killed
@@ -20555,6 +20587,64 @@ body.bnx-bulk-on.bnx-bulk-has #bnx-bulk-bar{display:flex}
 </script>
 
 
+<script id="bnx-steward-offline-tables">
+/* OFFLINE-FIRST TABLES — Steward app (2026-10-09): last good table list saved on this phone per client;
+   app opened / refreshed without internet → that list shows at once instead of an empty floor; a failed refresh
+   never clears it; chip "Offline — tables as of 9:41 PM"; back online → orders/KOTs waiting on the phone sync first,
+   then tables reload. A server list with tables always wins. */
+(function(){
+  var W=window, D=document;
+  function cid(){ try{ return String((typeof CLIENT_ID!=='undefined'&&CLIENT_ID)||localStorage.getItem('ERP_CLIENT')||'default'); }catch(e){ return 'default'; } }
+  function key(){ return 'bnx_tbl_snap_stw_'+cid(); }
+  function get(){ try{ return Array.isArray(TABLES)?TABLES:[]; }catch(e){ return []; } }
+  function put(v){ try{ TABLES=v; }catch(e){} }
+  function src(){ try{ return bnxTablesSource; }catch(e){ return ''; } }
+  function redraw(){ try{ if(D.getElementById('s-tables')&&D.getElementById('s-tables').classList.contains('active')&&typeof renderMobTables==='function') renderMobTables(); }catch(e){}
+    try{ if(D.getElementById('s-home')&&D.getElementById('s-home').classList.contains('active')&&typeof renderMyTables==='function') renderMyTables(); }catch(e){} }
+  var lastJ='';
+  function bday(){ try{ return typeof businessDate==='function'?businessDate():''; }catch(e){ return ''; } }
+  function save(){ try{ var t=get(); if(!t.length||src()!=='live'||W.__bnxStwFromCache) return; var j=JSON.stringify(t); if(j===lastJ) return; lastJ=j; localStorage.setItem(key(),JSON.stringify({at:Date.now(),bd:bday(),rows:t})); }catch(e){} }
+  function hhmm(t){ try{ return new Date(t).toLocaleTimeString('en-IN',{hour:'numeric',minute:'2-digit'}); }catch(e){ return ''; } }
+  function restore(){
+    try{ if(get().length) return false; var sn=JSON.parse(localStorage.getItem(key())||'null'); if(!sn||!Array.isArray(sn.rows)||!sn.rows.length) return false;
+      var newDay=!!(sn.bd && bday() && sn.bd!==bday());   /* saved on an earlier business day: keep the tables, not yesterday's status */
+      put(sn.rows.map(function(t){ var o=Object.assign({},t); if(newDay){ o.status='AVAILABLE'; o.bill=0; o.covers=0; o.kotCount=0; o.orderIds=[]; o.rounds=0; o.startTime=''; o.steward=''; o.stewardId=''; o.stewardLogin=''; o.reserved=false; } return o; }));
+      W.__bnxStwFromCache=true; W.__bnxStwSnapAt=sn.at;
+      try{ if(bnxTablesSource==='offline'||bnxTablesSource==='none') bnxTablesSource='cache'; }catch(e){}
+      redraw(); chip(); return true; }catch(e){ return false; }
+  }
+  function pending(){ try{ var n=0; for(var i=0;i<localStorage.length;i++){ var k=localStorage.key(i); if(/outbox|pending|queue/i.test(k)&&!/failed/i.test(k)){ var v=localStorage.getItem(k)||''; if(v.length>4){ try{ var a=JSON.parse(v); n+=Array.isArray(a)?a.length:0; }catch(e){} } } } return n; }catch(e){ return 0; } }
+  function chip(){
+    var fromCache=!!W.__bnxStwFromCache; try{ if(bnxTablesSource==='cache') fromCache=true; }catch(e){}
+    var off=navigator.onLine===false||fromCache, c=D.getElementById('bnx-stw-off');
+    if(!off){ if(c) c.remove(); return; }
+    if(!c){ c=D.createElement('div'); c.id='bnx-stw-off'; c.setAttribute('role','status');
+      c.style.cssText='position:fixed;left:50%;transform:translateX(-50%);top:calc(env(safe-area-inset-top,0px) + 8px);z-index:9990;background:#1f2937;color:#fff;padding:7px 13px;border-radius:99px;font:600 12px system-ui,sans-serif;box-shadow:0 6px 18px rgba(0,0,0,.25);max-width:calc(100vw - 24px);text-align:center';
+      c.onclick=function(){ if(navigator.onLine!==false) resync(); }; D.body.appendChild(c); }
+    var n=pending();
+    c.textContent=(navigator.onLine===false?'📴 Offline':'⚠️ Server not reachable')+' — tables'+(function(){ var at=W.__bnxStwSnapAt; try{ if(!at&&bnxTablesLastUpdated) at=+bnxTablesLastUpdated; }catch(e){} return at?' as of '+hhmm(at):''; })()+(n?' · '+n+' waiting to sync':'')+(navigator.onLine===false?'':' · tap to retry');
+  }
+  function wrap(){
+    var f=W.loadTablesLive; if(typeof f!=='function'||f.__bnxStwOff) return;
+    var w=async function(){
+      var ok=false; try{ ok=await f.apply(this,arguments); }catch(e){ ok=false; }
+      if(get().length && src()==='live'){ W.__bnxStwFromCache=false; W.__bnxStwSnapAt=Date.now(); save(); }
+      else if(!get().length) restore();
+      chip(); return ok;
+    };
+    w.__bnxStwOff=true; W.loadTablesLive=w;
+  }
+  var busy=false;
+  function resync(){ if(busy) return; busy=true; var t0=Date.now();
+    (function step(){ if(pending() && Date.now()-t0<25000){ setTimeout(step,1500); return; }
+      Promise.resolve(W.loadTablesLive&&W.loadTablesLive()).finally(function(){ busy=false; chip(); redraw(); }); })(); }
+  D.addEventListener('DOMContentLoaded',function(){ setTimeout(wrap,0); setTimeout(function(){ wrap(); if(!get().length) restore(); },2500); });
+  setInterval(function(){ wrap(); save(); if(!get().length) restore(); chip(); },5000);
+  W.addEventListener('offline',chip);
+  W.addEventListener('online',function(){ chip(); setTimeout(resync,1500); });
+  W.bnxStwTablesRestore=restore;
+})();
+</script>
 </body>
 </html>
 
