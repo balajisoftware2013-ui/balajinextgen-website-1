@@ -23593,12 +23593,49 @@ PAGE_META['s-qr-promo'] = ['Customer QR Promotion','Welcome video · Today / upc
   window.qrpUseMyClient=function(){ qrpCid(); qrpLoad(); };
   function qrpSession(){try{if(typeof bnxCurrentSession_==='function')return bnxCurrentSession_();}catch(e){} for(const k of ['ERP_SESSION','erp_session','erp_token','ERP_USER','erpUser']){try{const a=localStorage.getItem(k)||sessionStorage.getItem(k);if(a)return a;}catch(e){}} try{return typeof ERP!=='undefined'&&ERP.getSession?ERP.getSession():'';}catch(e){return '';}}
   async function qrpApi(action,payload,timeout){const cid=qrpCid();if(!cid)return{success:false,message:'No logged-in client'};const url=(typeof GAS_APIS_DASH!=='undefined'&&GAS_APIS_DASH.V2_CORE)||'';if(!url)return{success:false,message:'V2_CORE API URL not available'};const ctl=new AbortController(),tm=setTimeout(()=>ctl.abort(),timeout||60000);try{const r=await fetch(url,{method:'POST',body:JSON.stringify(Object.assign({action,clientId:cid,sessionToken:qrpSession()},payload||{})),signal:ctl.signal});const t=await r.text();try{return JSON.parse(t)}catch(e){return{success:false,message:'Non-JSON server response'}}}catch(e){return{success:false,message:e.name==='AbortError'?'Server timeout':e.message||'Network error'}}finally{clearTimeout(tm);}}
+/* ROUTER COMPAT (2026-10-08 "Unknown action: QR_PROMO_SAVE_EVENT"): until the live V2_CORE router forwards the new
+   QR_PROMO_* actions, the same work is done through the 3 actions it already answers
+   (QR_PROMO_GET / QR_PROMO_SAVE_VIDEO / QR_PROMO_SAVE_EVENTS). Nothing is faked: every save is a real server write. */
+function bnxQrpCompat(base){
+  const unknown=r=>!!r&&r.success===false&&/unknown action/i.test(String(r.error||r.message||''));
+  const KEEP=['id','title','date','time','venue','description','posterUrl','posterFileId','active'];
+  const slim=e=>{const o={};KEEP.forEach(k=>{if(e[k]!==undefined&&e[k]!==null)o[k]=e[k];});return o;};
+  async function list(){const g=await base('QR_PROMO_GET',{},45000);if(!g||!g.success)throw new Error((g&&(g.error||g.message))||'could not read events');return {video:(g.data&&g.data.video)||{},events:((g.data&&g.data.events)||[]).map(slim)};}
+  async function saveAll(events){const r=await base('QR_PROMO_SAVE_EVENTS',{events},120000);if(!r||!r.success)throw new Error((r&&(r.error||r.message))||'could not save events');return r;}
+  return async function(action,payload,timeout){
+    const r=await base(action,payload,timeout);
+    if(!unknown(r)) return r;
+    try{
+      if(action==='QR_PROMO_SAVE_EVENT'){
+        const ev=Object.assign({},payload.event||{}); if(!ev.id) ev.id='EV'+Date.now().toString(36)+Math.random().toString(36).slice(2,5);
+        const L=await list(); const old=L.events.find(x=>String(x.id)===String(ev.id));
+        if(old && !ev.posterDataUrl && !ev.posterUrl && !ev.posterFileId){ ev.posterUrl=old.posterUrl||''; ev.posterFileId=old.posterFileId||''; }
+        const events=L.events.filter(x=>String(x.id)!==String(ev.id)); events.push(ev);
+        const s=await saveAll(events);
+        const back=((s.data&&s.data.events)||[]).find(x=>String(x.id)===String(ev.id))||ev;
+        return {success:true,data:Object.assign({},back,{warn:ev.posterDataUrl&&!back.posterFileId&&!back.posterUrl?'Poster not stored — deploy menu-card-qr-promo.gs (router compat mode).':''})};
+      }
+      if(action==='QR_PROMO_DELETE_EVENT'){
+        const L=await list(); await saveAll(L.events.filter(x=>String(x.id)!==String(payload.id))); return {success:true};
+      }
+      if(action==='QR_PROMO_DELETE_VIDEO'){
+        const L=await list(); if(!L.video.videoUrl) return {success:true};
+        return await base('QR_PROMO_SAVE_VIDEO',{videoUrl:L.video.videoUrl,active:false},60000);
+      }
+      if(action==='QR_PROMO_UPLOAD_INIT') return {success:false,legacy:true,error:'LEGACY_ROUTER'};
+    }catch(e){ return {success:false,error:e.message||String(e)}; }
+    return r;
+  };
+}
+
+  const qrpX=bnxQrpCompat((a,p,t)=>qrpApi(a,p,t));
   function qrpMsg(t,ok){const e=$q('qrpStatus');if(e){e.textContent=t;e.style.color=ok?'var(--green)':'var(--red,#b42318)';}}
   function readFile(f){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result||''));r.onerror=()=>rej(r.error||new Error('File read failed'));r.readAsDataURL(f);});}
   async function b64(blob){const d=await readFile(blob);return d.slice(d.indexOf(',')+1);}
   function mimeOf(f){if(f.type)return f.type;const n=f.name.toLowerCase();return /\.webm$/.test(n)?'video/webm':/\.(mp4|m4v)$/.test(n)?'video/mp4':/\.png$/.test(n)?'image/png':'image/jpeg';}
   async function chunkUpload(file,onPct){
-    const init=await qrpApi('QR_PROMO_UPLOAD_INIT',{fileName:file.name,mime:mimeOf(file),size:file.size},60000);
+    const init=await qrpX('QR_PROMO_UPLOAD_INIT',{fileName:file.name,mime:mimeOf(file),size:file.size},60000);
+    if(init&&init.legacy)return {legacy:true};
     if(!init?.success)throw new Error(init?.error||init?.message||'upload could not start');
     const id=init.data.uploadId,cs=Number(init.data.chunkSize)||2097152;let off=0,fails=0;
     while(off<file.size){
@@ -23624,7 +23661,13 @@ PAGE_META['s-qr-promo'] = ['Customer QR Promotion','Welcome video · Today / upc
       if(qrpVideoFile){
         if(qrpVideoFile.size>100*1048576)return qrpMsg('Video must be 100 MB or less.',false);
         const up=await chunkUpload(qrpVideoFile,p=>qrpMsg('Uploading video… '+Math.round(p*100)+'%',true));
-        fileId=up.fileId; url='';
+        if(up.legacy){   /* live router has no chunked upload yet: one-piece upload (≤ 12 MB) */
+          if(qrpVideoFile.size>12*1048576)return qrpMsg('This server version accepts videos up to 12 MB — use the compressed 720p copy, or deploy menu-card-qr-promo.gs for up to 100 MB.',false);
+          qrpMsg('Uploading video…',true);
+          const u=await qrpApi('QR_PROMO_SAVE_VIDEO',{videoDataUrl:await readFile(qrpVideoFile),fileName:qrpVideoFile.name,mime:mimeOf(qrpVideoFile),active},180000);
+          if(!u?.success)return qrpMsg('Video upload failed: '+(u?.error||u?.message||'server error'),false);
+          url=u.data?.videoUrl||''; fileId=u.data?.fileId||'';
+        } else { fileId=up.fileId; url=''; }
       }
       if(!fileId&&!url)return qrpMsg('Choose a video file or paste an https:// video link.',false);
       if(url&&!/^https:\/\//i.test(url))return qrpMsg('Video URL must start with https://',false);
@@ -23636,7 +23679,7 @@ PAGE_META['s-qr-promo'] = ['Customer QR Promotion','Welcome video · Today / upc
     }catch(e){qrpMsg('Video upload failed: '+(e.message||e),false);}
   };
   window.qrpPreviewVideo=function(){const u=String($q('qrpVideoUrl')?.value||'').trim();if(!u)return qrpMsg('Enter/select a video first.',false);const m=u.match(/drive\.google\.com\/(?:file\/d\/|open\?id=|uc\?(?:export=\w+&)?id=)([\w-]+)/);const src=m?'https://drive.google.com/file/d/'+m[1]+'/preview':u;let old=document.getElementById('qrpPreview');if(old)old.remove();let v;if(m){v=document.createElement('iframe');v.allow='autoplay';v.style='display:block;width:min(520px,100%);aspect-ratio:16/9;border:0;margin-top:10px;border-radius:10px;background:#000;';}else{v=document.createElement('video');v.controls=true;v.muted=true;v.playsInline=true;v.style='display:block;width:min(520px,100%);margin-top:10px;border-radius:10px;background:#000;';}v.id='qrpPreview';$q('qrpVideoNote').after(v);v.src=src;if(v.play)v.play().catch(()=>{});};
-  window.qrpClearVideo=async function(){if(!confirm('Remove the welcome video?'))return;const r=await qrpApi('QR_PROMO_DELETE_VIDEO',{},60000);if(r?.success){if($q('qrpVideoActive'))$q('qrpVideoActive').checked=false;if($q('qrpVideoUrl'))$q('qrpVideoUrl').value='';$q('qrpVideoNote').textContent='No welcome video.';}qrpMsg(r?.success?'✅ Welcome video removed.':'Could not remove video: '+(r?.error||r?.message||'server error'),!!r?.success);};
+  window.qrpClearVideo=async function(){if(!confirm('Remove the welcome video?'))return;const r=await qrpX('QR_PROMO_DELETE_VIDEO',{},60000);if(r?.success){if($q('qrpVideoActive'))$q('qrpVideoActive').checked=false;if($q('qrpVideoUrl'))$q('qrpVideoUrl').value='';$q('qrpVideoNote').textContent='No welcome video.';}qrpMsg(r?.success?'✅ Welcome video removed.':'Could not remove video: '+(r?.error||r?.message||'server error'),!!r?.success);};
   function qrpPaintEvents(){
     const e=$q('qrpEventsList');if(!e)return;
     if(!qrpEvents.length){e.innerHTML='<div style="font-size:11px;color:var(--text3);">No events saved.</div>';return;}
@@ -23660,14 +23703,14 @@ PAGE_META['s-qr-promo'] = ['Customer QR Promotion','Welcome video · Today / upc
       if(qrpPosterFile){qrpMsg('Preparing poster…',true);ev.posterDataUrl=await shrinkImage(qrpPosterFile);ev.posterFileName=qrpPosterFile.name.replace(/\.\w+$/,'')+'.jpg';ev.posterUrl='';}
       if(ev.posterUrl&&!/^https:\/\//i.test(ev.posterUrl))return qrpMsg('Poster URL must start with https://',false);
       qrpMsg('Saving event…',true);
-      const r=await qrpApi('QR_PROMO_SAVE_EVENT',{event:ev},120000);
+      const r=await qrpX('QR_PROMO_SAVE_EVENT',{event:ev},120000);
       if(!r?.success)return qrpMsg('Could not save event: '+(r?.error||r?.message||'server error'),false);
       qrpClearEventForm();qrpMsg('✅ Event "'+title+'" saved — customers see it after the video.'+(r.data?.warn?' ⚠️ '+r.data.warn:''),!r.data?.warn);
       qrpLoad(true);
     }catch(e){qrpMsg('Could not save event: '+(e.message||e),false);}
   };
-  window.qrpToggleEvent=async function(id){const x=qrpEvents.find(e=>String(e.id)===String(id));if(!x)return;const r=await qrpApi('QR_PROMO_SAVE_EVENT',{event:{id:x.id,title:x.title,date:x.date,time:x.time,venue:x.venue,description:x.description,active:x.active===false}},60000);qrpMsg(r?.success?(x.active===false?'✅ Event visible to customers.':'Event hidden.'):'Could not update event: '+(r?.error||r?.message||''),!!r?.success);if(r?.success)qrpLoad(true);};
-  window.qrpDeleteEvent=async function(id){if(!confirm('Delete this event?'))return;const r=await qrpApi('QR_PROMO_DELETE_EVENT',{id},60000);if(!r?.success)return qrpMsg('Could not delete event: '+(r?.error||r?.message||''),false);qrpEvents=qrpEvents.filter(x=>String(x.id)!==String(id));qrpPaintEvents();qrpMsg('✅ Event removed.',true);};
+  window.qrpToggleEvent=async function(id){const x=qrpEvents.find(e=>String(e.id)===String(id));if(!x)return;const r=await qrpX('QR_PROMO_SAVE_EVENT',{event:{id:x.id,title:x.title,date:x.date,time:x.time,venue:x.venue,description:x.description,active:x.active===false}},60000);qrpMsg(r?.success?(x.active===false?'✅ Event visible to customers.':'Event hidden.'):'Could not update event: '+(r?.error||r?.message||''),!!r?.success);if(r?.success)qrpLoad(true);};
+  window.qrpDeleteEvent=async function(id){if(!confirm('Delete this event?'))return;const r=await qrpX('QR_PROMO_DELETE_EVENT',{id},60000);if(!r?.success)return qrpMsg('Could not delete event: '+(r?.error||r?.message||''),false);qrpEvents=qrpEvents.filter(x=>String(x.id)!==String(id));qrpPaintEvents();qrpMsg('✅ Event removed.',true);};
   window.qrpLoad=async function(quiet){const r=await qrpApi('QR_PROMO_GET',{},30000);if(!r?.success)return qrpMsg('Could not load promotion settings: '+(r?.error||r?.message||'server error'),false);const d=r.data||{},v=d.video||{};qrpEvents=Array.isArray(d.events)?d.events:[];$q('qrpVideoUrl').value=v.videoUrl||'';$q('qrpVideoActive').checked=v.videoUrl?!!v.active:true;$q('qrpVideoNote').textContent=v.videoUrl?((v.active?'Active video':'Video is OFF')+': '+(v.name||v.videoUrl)):'No welcome video.';qrpPaintEvents();if(!quiet)qrpMsg('Loaded '+qrpCid()+'.',true);};
   document.addEventListener('DOMContentLoaded',()=>setTimeout(qrpCid,500));
 })();

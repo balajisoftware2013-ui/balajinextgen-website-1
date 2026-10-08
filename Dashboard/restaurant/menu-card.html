@@ -575,6 +575,42 @@ function bnxEventPosterFile(e){
    Designed Menu Card view crashed). Now: video goes to Drive in 2 MB pieces (QR_PROMO_UPLOAD_*),
    events are real rows (QR_PROMO_SAVE_EVENT), and the list below is read back from the server. */
 const MC_PROMO = { video:null, events:[], loaded:false, err:'' };
+/* ROUTER COMPAT (2026-10-08 "Unknown action: QR_PROMO_SAVE_EVENT"): until the live V2_CORE router forwards the new
+   QR_PROMO_* actions, the same work is done through the 3 actions it already answers
+   (QR_PROMO_GET / QR_PROMO_SAVE_VIDEO / QR_PROMO_SAVE_EVENTS). Nothing is faked: every save is a real server write. */
+function bnxQrpCompat(base){
+  const unknown=r=>!!r&&r.success===false&&/unknown action/i.test(String(r.error||r.message||''));
+  const KEEP=['id','title','date','time','venue','description','posterUrl','posterFileId','active'];
+  const slim=e=>{const o={};KEEP.forEach(k=>{if(e[k]!==undefined&&e[k]!==null)o[k]=e[k];});return o;};
+  async function list(){const g=await base('QR_PROMO_GET',{},45000);if(!g||!g.success)throw new Error((g&&(g.error||g.message))||'could not read events');return {video:(g.data&&g.data.video)||{},events:((g.data&&g.data.events)||[]).map(slim)};}
+  async function saveAll(events){const r=await base('QR_PROMO_SAVE_EVENTS',{events},120000);if(!r||!r.success)throw new Error((r&&(r.error||r.message))||'could not save events');return r;}
+  return async function(action,payload,timeout){
+    const r=await base(action,payload,timeout);
+    if(!unknown(r)) return r;
+    try{
+      if(action==='QR_PROMO_SAVE_EVENT'){
+        const ev=Object.assign({},payload.event||{}); if(!ev.id) ev.id='EV'+Date.now().toString(36)+Math.random().toString(36).slice(2,5);
+        const L=await list(); const old=L.events.find(x=>String(x.id)===String(ev.id));
+        if(old && !ev.posterDataUrl && !ev.posterUrl && !ev.posterFileId){ ev.posterUrl=old.posterUrl||''; ev.posterFileId=old.posterFileId||''; }
+        const events=L.events.filter(x=>String(x.id)!==String(ev.id)); events.push(ev);
+        const s=await saveAll(events);
+        const back=((s.data&&s.data.events)||[]).find(x=>String(x.id)===String(ev.id))||ev;
+        return {success:true,data:Object.assign({},back,{warn:ev.posterDataUrl&&!back.posterFileId&&!back.posterUrl?'Poster not stored — deploy menu-card-qr-promo.gs (router compat mode).':''})};
+      }
+      if(action==='QR_PROMO_DELETE_EVENT'){
+        const L=await list(); await saveAll(L.events.filter(x=>String(x.id)!==String(payload.id))); return {success:true};
+      }
+      if(action==='QR_PROMO_DELETE_VIDEO'){
+        const L=await list(); if(!L.video.videoUrl) return {success:true};
+        return await base('QR_PROMO_SAVE_VIDEO',{videoUrl:L.video.videoUrl,active:false},60000);
+      }
+      if(action==='QR_PROMO_UPLOAD_INIT') return {success:false,legacy:true,error:'LEGACY_ROUTER'};
+    }catch(e){ return {success:false,error:e.message||String(e)}; }
+    return r;
+  };
+}
+
+const mcPromoApi=bnxQrpCompat((a,p,t)=>gasApi(a,p,t));
 function bnxDecodeEventName(name){
   const raw=String(name||''); if(!raw.startsWith('EVENT_JSON:')) return null;
   try{ const b=raw.slice(11).replace(/-/g,'+').replace(/_/g,'/'); return JSON.parse(decodeURIComponent(escape(atob(b+'='.repeat((4-b.length%4)%4))))); }catch(e){ return null; }
@@ -584,7 +620,8 @@ function mcGuessMime(f){ if(f.type) return f.type; const n=f.name.toLowerCase();
 /* file → Drive, 2 MB at a time; after a slow/failed piece it asks Drive where it stopped and resumes there */
 async function mcChunkUpload(file, onPct){
   const mime=mcGuessMime(file);
-  const init=await mcUploadRetry('QR_PROMO_UPLOAD_INIT',{ fileName:file.name, mime, size:file.size },60000);
+  const init=await mcPromoApi('QR_PROMO_UPLOAD_INIT',{ fileName:file.name, mime, size:file.size },60000);
+  if(init && init.legacy) return { legacy:true };
   if(!(init && init.success)) throw new Error((init&&(init.error||init.message))||'upload could not start');
   const uploadId=init.data.uploadId, cs=Number(init.data.chunkSize)||2097152;
   let off=0, fails=0;
@@ -621,10 +658,14 @@ async function saveVideoPromo(){
     if(link) payload.videoUrl=link;
     else {
       const up=await mcChunkUpload(umVideoPendingFile, p=>mcBtn('umVideoSaveBtn','Uploading '+Math.round(p*100)+'%…'));
-      payload.fileId=up.fileId;
+      if(up.legacy){   /* live router has no chunked upload yet: one-piece upload (≤ 12 MB) */
+        if(umVideoPendingFile.size>12*1024*1024) throw new Error('this server version accepts videos up to 12 MB — use the compressed CL00010_welcome_720p.mp4 (2.7 MB), or deploy menu-card-qr-promo.gs for up to 100 MB');
+        mcBtn('umVideoSaveBtn','Uploading…');
+        payload.videoDataUrl=await mcReadAsDataUrl(umVideoPendingFile); payload.fileName=umVideoPendingFile.name; payload.mime=mcGuessMime(umVideoPendingFile);
+      } else payload.fileId=up.fileId;
     }
     mcBtn('umVideoSaveBtn','Saving…');
-    const r=await mcUploadRetry('QR_PROMO_SAVE_VIDEO', payload, 60000);
+    const r=await mcPromoApi('QR_PROMO_SAVE_VIDEO', payload, 180000);
     if(!(r && r.success)) throw new Error((r&&(r.error||r.message))||'no response');
     umVideoPendingFile=null; closeUploadModal();
     toast('✅ Video saved'+(active?' — plays first when customers scan':'')+(r.data&&r.data.warn?' ⚠️ '+r.data.warn:''), r.data&&r.data.warn?'error':'success');
@@ -645,7 +686,7 @@ async function saveEventPromo(){
       ev.posterDataUrl=prep.dataUrl; ev.posterFileName=prep.fileName;
       mcBtn('umEventSaveBtn','Uploading poster…');
     }
-    const r=await mcUploadRetry('QR_PROMO_SAVE_EVENT',{ event:ev },120000);
+    const r=await mcPromoApi('QR_PROMO_SAVE_EVENT',{ event:ev },120000);
     if(!(r && r.success)) throw new Error((r&&(r.error||r.message))||'no response');
     umEventPosterFile=null; closeUploadModal();
     toast('✅ Event "'+title+'" saved'+(ev.active?' — customers see it after the video':' (hidden)')+(r.data&&r.data.warn?' ⚠️ '+r.data.warn:''), r.data&&r.data.warn?'error':'success');
@@ -671,12 +712,12 @@ function mcOpenPromo(tab, ev){
 function mcEditEvent(id){ const ev=MC_PROMO.events.find(e=>e.id===id); if(ev) mcOpenPromo('event',ev); }
 async function mcToggleEvent(id){
   const ev=MC_PROMO.events.find(e=>e.id===id); if(!ev) return;
-  const r=await gasApi('QR_PROMO_SAVE_EVENT',{ event:{ id:ev.id, title:ev.title, date:ev.date, time:ev.time, venue:ev.venue, description:ev.description, active:!ev.active } },60000);
+  const r=await mcPromoApi('QR_PROMO_SAVE_EVENT',{ event:{ id:ev.id, title:ev.title, date:ev.date, time:ev.time, venue:ev.venue, description:ev.description, active:!ev.active } },60000);
   if(r&&r.success){ toast(ev.active?'Event hidden':'✅ Event visible to customers','success'); mcLoadPromo(); } else toast('❌ '+((r&&(r.error||r.message))||'no response'),'error');
 }
 async function mcDeleteEvent(id){
   if(!confirm('Delete this event?')) return;
-  const r=await gasApi('QR_PROMO_DELETE_EVENT',{ id },45000);
+  const r=await mcPromoApi('QR_PROMO_DELETE_EVENT',{ id },45000);
   if(r&&r.success){ toast('Event deleted','success'); mcLoadPromo(); } else toast('❌ '+((r&&(r.error||r.message))||'no response'),'error');
 }
 async function mcToggleVideo(){
@@ -686,7 +727,7 @@ async function mcToggleVideo(){
 }
 async function mcDeleteVideo(){
   if(!confirm('Remove the welcome video?')) return;
-  const r=await gasApi('QR_PROMO_DELETE_VIDEO',{},45000);
+  const r=await mcPromoApi('QR_PROMO_DELETE_VIDEO',{},45000);
   if(r&&r.success){ toast('Video removed','success'); mcLoadPromo(); } else toast('❌ '+((r&&(r.error||r.message))||'no response'),'error');
 }
 function mcRenderPromoPanel(){
