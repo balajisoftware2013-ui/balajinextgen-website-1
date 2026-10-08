@@ -995,8 +995,15 @@ async function bnxGuestCheckinGet_(payload){
     const ctl=new AbortController(), tm=setTimeout(()=>ctl.abort(),75000);   /* 2026-10-09: was 25 s — slow server cut every mobile + name save off */
     try{
       const j=await (await fetch(base+'?'+q.toString(),{signal:ctl.signal})).json();
-      /* a deployment without GUEST_CHECKIN answers its default "ERP API" reply — try the next one */
-      if(j && (j.isNewCustomer!==undefined || j.customerName!==undefined || (j.success===false && j.error && !/not installed/i.test(j.error)))){ bnxEpOk_(base); return j; }
+      /* a deployment without GUEST_CHECKIN answers its default "ERP API" reply or "Unknown action" — try the next one.
+         ROOT FIX 2026-10-09 ("client sheet not updated after scan"): an "Unknown action" / "Invalid session" reply from
+         the old deployment was taken as the final answer AND saved as this phone's working server, so every later
+         check-in from that phone went only to a server that cannot save it — nothing reached GUEST_CRM after 09:36. */
+      const err=String((j&&(j.error||j.message))||'');
+      const notHere=j && j.success===false && /unknown|not installed|not supported|invalid action|no action|invalid or expired session|unauthori[sz]ed|session/i.test(err);
+      if(j && !notHere && (j.isNewCustomer!==undefined || j.customerName!==undefined || j.customerId!==undefined || j.crn!==undefined || (j.success===false && err))){
+        if(j.success!==false){ bnxEpOk_(base); } return j; }
+      if(notHere){ try{ if(localStorage.getItem('bnx_guest_api_ok')===base) localStorage.removeItem('bnx_guest_api_ok'); }catch(e){} }
       last={success:false,error:'GUEST_CHECKIN not installed on '+base.slice(-20)};
     }catch(e){ last={success:false,offline:true,error:e.message}; } finally{ clearTimeout(tm); }
   }
@@ -1983,6 +1990,8 @@ document.getElementById('ph-continue').onclick = async ()=>{
     return;
   }
   if (!res || res.success === false){
+    /* not saved on any server → keep it on this phone and retry (every 45 s, on reconnect, next visit) */
+    try{ bnxQueueCheckin_({ requestId:'chkin-q-'+STATE.scanKey+'-'+STATE.customerPhone, mobileNo:STATE.customerPhone, tableId:STATE.tableId, scanKey:STATE.scanKey, notifyOptIn:STATE.notifyOptIn, source:'QR_SCAN', clientId:STATE.clientId, ...(phName.length>=2?{customerName:phName,name:phName,updateName:true,welcomeSms:true}:{deferWelcome:true}) }); }catch(e){}
     // Offline / backend unreachable — don't block ordering, just proceed as a new guest.
     STATE.isNewCustomer = true;
     goScreen('s-name');
@@ -2938,6 +2947,7 @@ function bnxQrPromoApply_(p, fromCache){
   setTimeout(()=>{ try{ bnxAutoEvent_(); }catch(e){} },0);
   STATE.promoEvents = bnxMapEvents_(p.events);
   try{ bnxRenderPromoEvents(); }catch(e){}
+  if(STATE.__introRunning){ try{ bnxIntroRefreshTail_(); const sk=[...document.querySelectorAll('#bnx-intro .bi-chip')].find(b=>/Menu ›/.test(b.textContent)); if(sk && BNX_INTRO.i < BNX_INTRO.steps.length-1) sk.textContent='Skip ›'; }catch(e){} }
   if(!BNX_INTRO.started) bnxIntroMaybe_();
   if(!STATE.__introRunning) bnxQrPromoHero_();
 }
@@ -2998,16 +3008,35 @@ function bnxIntroMaybe_(){
   if(/^builtin:/.test(vu)) steps.push({ type:'card' });
   else { const vs=vu && window.BNXVideo && BNXVideo.parse(vu) ? {src:vu} : null;
     if(vs) steps.push({ type:'video', v:vs, isDefault:!!STATE.qrPromo.isDefault }); }
-  /* each event: its own video first (Event videos = Yes), then its poster & details (Event poster = Yes) */
-  bnxUpcomingEvents().forEach((e,k)=>{
-    if(cfg.ev && e.videoUrl && window.BNXVideo && BNXVideo.parse(e.videoUrl)) steps.push({ type:'video', v:{src:e.videoUrl}, isDefault:false, ev:e, k:k });
-    if(cfg.ep) steps.push({ type:'event', e:e, k:k });
-  });
+  bnxIntroEventSteps_({}).forEach(x=>steps.push(x));
   if(!steps.length) return;
   BNX_INTRO.started=true; BNX_INTRO.steps=steps; BNX_INTRO.i=0;
   try{ sessionStorage.setItem(bnxIntroKey_(),'1'); }catch(e){}
   STATE.__introRunning=true;
   bnxIntroShow_();
+}
+/* each event: its own video first (Event videos = Yes), then its poster & details (Event poster = Yes).
+   ROOT FIX 2026-10-09 ("welcome video and event video also play next"): the event steps were frozen when the intro
+   STARTED. The welcome video starts from the phone copy / first server reply, often before the events arrive (slow
+   25-30 s server, events from the second deployment) → after the welcome video the intro just closed. Now the event
+   steps are rebuilt from the LATEST events every time the intro moves on, so events that land while the welcome
+   video plays still play next. Events already shown are never repeated. */
+function bnxEvKey_(e){ return String((e&&e.id)||'')+'|'+String((e&&e.title)||'')+'|'+String((e&&e.date)||''); }
+function bnxIntroEventSteps_(skip){
+  const cfg=STATE.gcfg||{wv:1,dv:1,ev:1,ep:1}, out=[];
+  bnxUpcomingEvents().forEach((e,k)=>{
+    const key=bnxEvKey_(e);
+    if(cfg.ev && e.videoUrl && window.BNXVideo && BNXVideo.parse(e.videoUrl) && !skip['v'+key]) out.push({ type:'video', v:{src:e.videoUrl}, isDefault:false, ev:e, k:k, key:'v'+key });
+    if(cfg.ep && !skip['p'+key]) out.push({ type:'event', e:e, k:k, key:'p'+key });
+  });
+  return out;
+}
+/* keep the steps already played + the current one; replace what is still to come with the latest events */
+function bnxIntroRefreshTail_(){
+  if(!BNX_INTRO.steps || !BNX_INTRO.started) return;
+  const keep=BNX_INTRO.steps.slice(0, BNX_INTRO.i+1), skip={};
+  keep.forEach(x=>{ if(x && x.key) skip[x.key]=1; });
+  BNX_INTRO.steps=keep.concat(bnxIntroEventSteps_(skip));
 }
 function bnxIntroBox_(){
   let b=document.getElementById('bnx-intro');
@@ -3021,6 +3050,7 @@ function bnxIntroBox_(){
 function bnxIntroShow_(){
   clearInterval(BNX_INTRO.timer); BNX_INTRO.timer=0;
   if(BNX_INTRO.player){ try{ BNX_INTRO.player.destroy(); }catch(e){} BNX_INTRO.player=null; }
+  try{ bnxIntroRefreshTail_(); }catch(e){}
   const st=BNX_INTRO.steps[BNX_INTRO.i]; if(!st){ bnxIntroClose(); return; }
   const box=bnxIntroBox_(); box.classList.add('show');
   document.documentElement.style.overflow='hidden';
@@ -3111,7 +3141,7 @@ function bnxAutoEvent_(){
   const today=bnxBizDayIST(), evs=bnxUpcomingEvents().filter(e=>String(e.date)===today);
   if(evs.length===1) bnxSetEvent_(evs[0].title,'only-event-today');   /* one event tonight → that one, no tap needed */
 }
-function bnxIntroNext(){ if(!document.getElementById('bnx-intro')) return; BNX_INTRO.i++; if(BNX_INTRO.i>=BNX_INTRO.steps.length) bnxIntroClose(); else bnxIntroShow_(); }
+function bnxIntroNext(){ if(!document.getElementById('bnx-intro')) return; try{ bnxIntroRefreshTail_(); }catch(e){} BNX_INTRO.i++; if(BNX_INTRO.i>=BNX_INTRO.steps.length) bnxIntroClose(); else bnxIntroShow_(); }
 function bnxIntroClose(){
   clearInterval(BNX_INTRO.timer); BNX_INTRO.timer=0;
   if(BNX_INTRO.player){ try{ BNX_INTRO.player.destroy(); }catch(e){} BNX_INTRO.player=null; }
