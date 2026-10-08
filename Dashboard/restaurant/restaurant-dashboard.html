@@ -1447,6 +1447,33 @@ function bnxSanitizeDue_(action, res){
   try{
     if(String(action||'')!=='GET_DUE_COLLECTION' || !res || !res.success || !res.data) return res;
     const d=res.data, LIM=1e9, bad=[];
+    /* FIX (Due Collection top cards): the server's totalOutstanding / overdue30Plus can disagree with the
+       customer rows shown in "Accounts Receivable — Customer Outstanding" (e.g. -17.6L total above a list of
+       positive dues, overdue 30+ larger than the total). The cards must equal the table, so they are rebuilt
+       from the customer rows whenever they differ by more than Rs 1. */
+    try{
+      if(Array.isArray(d.customers) && d.customers.length){
+        const _n=function(v){ v=Number(v); return isFinite(v)&&Math.abs(v)<1e9 ? v : 0; };
+        const _r=function(v){ return Math.round(v*100)/100; };
+        let _tot=0,_od=0,_cnt=0; const _ag={d0_30:0,d31_60:0,d61_90:0,d90p:0};
+        d.customers.forEach(function(c){
+          const o=_n(c.outstanding); if(!(o>0.01)) return;
+          _tot+=o; _cnt++;
+          const a=c.aging;
+          if(a && typeof a==='object'){ _ag.d0_30+=_n(a.d0_30); _ag.d31_60+=_n(a.d31_60); _ag.d61_90+=_n(a.d61_90); _ag.d90p+=_n(a.d90p); _od+=_n(a.d31_60)+_n(a.d61_90)+_n(a.d90p); }
+          else{ const od=_n(c.overdueDays);
+            if(od>90){_ag.d90p+=o;_od+=o;} else if(od>60){_ag.d61_90+=o;_od+=o;} else if(od>30){_ag.d31_60+=o;_od+=o;} else _ag.d0_30+=o; }
+        });
+        _tot=_r(_tot); _od=Math.min(_r(_od),_tot);
+        if(Math.abs(_n(d.totalOutstanding)-_tot)>1 || Math.abs(_n(d.overdue30Plus)-_od)>1){
+          d.__serverTotals={totalOutstanding:d.totalOutstanding,overdue30Plus:d.overdue30Plus};
+          d.totalOutstanding=_tot; d.overdue30Plus=_od; d.activeCustomers=_cnt;
+          d.netOutstanding=_r(_tot-_n(d.receivedToday));
+          d.aging={d0_30:_r(_ag.d0_30),d31_60:_r(_ag.d31_60),d61_90:_r(_ag.d61_90),d90p:_r(_ag.d90p)};
+          console.warn('[DATA] Due totals did not match customer rows - cards rebuilt from rows',d.__serverTotals);
+        }
+      }
+    }catch(e){ console.warn('[DATA] due reconcile failed',e); }
     ['receivedToday','receivedInPeriod','receivedCash','receivedBank','totalOutstanding','netOutstanding','overdue30Plus'].forEach(function(f){
       if(d[f]!=null){ const v=Number(d[f]); if(!isFinite(v) || Math.abs(v)>LIM) bad.push(f); }
     });
@@ -50028,6 +50055,19 @@ D.head.appendChild(st);
       var opening=(fromInfo&&fromInfo.ok)?Number(fromInfo.opening):NaN;
       var closing=(toInfo&&toInfo.ok)?Number(toInfo.closing):NaN;
       var collection=Math.round((dueCash+dueBank)*100)/100;
+      /* FIX (Receivables gaps): when the ledger roll-back can't answer, fill the dashes from the live customer rows.
+         Closing = sum of customers' dues (only valid when the period ends today); Opening = Closing - Credit + Collection + CN. */
+      var _derived=false;
+      try{
+        var _L=win.__bnxDueLive, _cs=_L&&Array.isArray(_L.customers)?_L.customers:[];
+        var _bd=(typeof win.bnxReportBusinessDate_==='function')?win.bnxReportBusinessDate_():'';
+        if(!Number.isFinite(closing) && _cs.length && (!_bd || r.to>=_bd)){
+          closing=Math.round(_cs.reduce(function(t,c){var o=Number(c.outstanding);return t+(isFinite(o)&&o>0?o:0);},0)*100)/100; _derived=true;
+        }
+        if(!Number.isFinite(opening) && Number.isFinite(closing)){
+          opening=Math.round((closing-credit+collection+cn)*100)/100; _derived=true;
+        }
+      }catch(e){}
       var calcClosing=Number.isFinite(opening)?Math.round((opening+credit-collection-cn)*100)/100:NaN;
       var diff=(Number.isFinite(closing)&&Number.isFinite(calcClosing))?Math.round((closing-calcClosing)*100)/100:NaN;
       win.__bnxRecvRange={key:key,from:r.from,to:r.to,opening:opening,credit:credit,collection:collection,dueCash:dueCash,dueBank:dueBank,cn:cn,closing:closing,calcClosing:calcClosing,diff:diff,days:days};
@@ -50044,6 +50084,7 @@ D.head.appendChild(st);
         }else if(Number.isFinite(diff)){
           chk.textContent=(diff>0?'+':'−')+money(Math.abs(diff)); chk.style.color='var(--red)'; chk.title='Reconciliation difference: actual closing minus calculated closing';
         }else{ chk.textContent='—'; chk.style.color=''; }
+        if(_derived && Number.isFinite(diff) && Math.abs(diff)<=0.01){ chk.textContent='✓ Live'; chk.style.color='var(--green)'; chk.title='Opening is worked back from the live customer dues (no ledger snapshot available)'; }
       }
       var title=r.from===r.to?'Due on '+r.from:('Due roll-forward · '+r.from+' → '+r.to);
       var opn=$('d-recv-opening-note'); if(opn) opn.textContent=r.from===r.to?'(opening of day)':'(opening of selected period)';
@@ -50055,6 +50096,12 @@ D.head.appendChild(st);
     var custs=Array.isArray(D.customers)?D.customers:[], owing=custs.filter(function(c){return apiNum(c.outstanding)>0;});
     var total=apiNum(D.totalOutstanding), net=D.netOutstanding!=null?apiNum(D.netOutstanding):total;
     setTxt('d-recv-custcount',String(owing.length));
+    /* FIX: Overdue (30+) must come from the same customer rows, and can never exceed the total due */
+    (function(){var tot=0,od=0;owing.forEach(function(c){var o=apiNum(c.outstanding);tot+=o;var a=c.aging;
+      if(a&&typeof a==='object')od+=apiNum(a.d31_60)+apiNum(a.d61_90)+apiNum(a.d90p);else if(apiNum(c.overdueDays)>30)od+=o;});
+      od=Math.min(od,tot);setTxt('d-recv-overdue',money(od),'Customers with dues older than 30 days · from the customer list');
+      var lb=$('d-recv-overdue-lbl');if(lb){var n=owing.filter(function(c){return apiNum(c.overdueDays)>30;}).length;
+        var h='Overdue (30+ days) <span style="font-size:9px;font-weight:500;">('+n+' of '+owing.length+' customers)</span>';if(lb.innerHTML!==h)lb.innerHTML=h;}})();
     setTxt('d-recv-net',money(net),'Total outstanding after receipts and advances');
     /* Movement Check is painted by refreshRecvRange_ from the DSR roll-forward. */
     var last=null; custs.forEach(function(c){var d=String(c.lastPaymentDate||'').slice(0,10); if(/^\d{4}-\d{2}-\d{2}$/.test(d)&&apiNum(c.lastPaymentAmount)>0&&(!last||d>last.d)) last={d:d,a:apiNum(c.lastPaymentAmount),n:String(c.customer||c.name||'')};});
@@ -54977,7 +55024,13 @@ function dcRow(c,i){
   var col=od>30?'#c62828':'#a15c00';
   return '<tr onclick="bnx72OpenStatement(\''+id+'\')">'+
     '<td class="c" style="color:#999">'+(i+1)+'</td>'+
-    '<td><div style="font-weight:600">'+esc(c.customer)+'</div><div class="sub">'+[c.phone?esc(c.phone):'',c.openBills?(c.openBills+' open bill'+(c.openBills===1?'':'s')):'',N(c.openingRemaining)>0.01?'old bal '+inr(c.openingRemaining,0):''].filter(Boolean).join(' · ')+'</div></td>'+
+    '<td><div style="font-weight:600">'+esc(c.customer)+'</div><div class="sub">'+(function(){var ob=N(c.openBills),old=N(c.openingRemaining),bd=N(c.billsDue),parts=[];
+      if(c.phone)parts.push(esc(c.phone));
+      /* old balance is shown only when it is a real opening balance: not when it equals the whole due of a customer who has open bills */
+      var oldReal=old>0.01&&!(ob>0&&bd<0.01&&old>=N(c.outstanding)-1);
+      if(ob)parts.push(ob+' open bill'+(ob===1?'':'s')+(ob>0&&bd>0.01?' '+inr(bd,0):(ob>0&&old>0.01&&!oldReal?' '+inr(c.outstanding,0):'')));
+      if(oldReal)parts.push('old bal '+inr(old,0));
+      return parts.join(' \u00b7 ');})()+'</div></td>'+
     '<td><span class="tag '+(tk==='corporate'?'cor':tk==='aggregator'?'agg':'')+'">'+esc(c.type||'Individual')+'</span></td>'+
     '<td class="n" style="font-weight:700;color:'+col+'">'+inr(c.outstanding)+'</td>'+
     '<td class="nw">'+fmtDate(c.lastBillDate)+'</td>'+
@@ -55052,7 +55105,7 @@ function renderDc(){
   var rf=paintReceipts();
   if(d){
     var custOn=dcCustFilterActive(),pl=periodLabel();
-    var out=custOn?r2(tot.o):N(d.totalOutstanding),od=custOn?r2(tot.od):N(d.overdue30Plus);
+    var out=custOn?r2(tot.o):r2(all.reduce(function(s,c){return s+N(c.outstanding);},0)),od=custOn?r2(tot.od):Math.min(r2(all.reduce(function(s,c){return s+overdue30(c);},0)),out);
     /* received: filtered vouchers; with no filter use the server period total */
     var rec,cntR;
     if(PD.loading){rec=null;cntR=null;}
