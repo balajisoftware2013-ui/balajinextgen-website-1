@@ -107,11 +107,20 @@ function bnxMcShare_(file) {
   try { file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); return ''; }
   catch (e) { return 'Could not set Drive sharing automatically — set the file to "Anyone with the link: Viewer".'; }
 }
+/* ROOT FIX 2026-10-08 ("all drive save"): with no MC_ROOT_FOLDER_ID property the root was found BY NAME — the first
+   folder called CLIENT_DATABASES anywhere in Drive (there can be copies under DEMO / Suite Module / shared folders),
+   so uploads could land in the wrong place. Default is now the real folder:
+   My Drive › Balaji NextGen ERP › CLIENT_DATABASES  (1u2yVJCgH2EwLAP950l_97vo5Ckx9cgL7).
+   Every upload goes to  CLIENT_DATABASES/<clientId>/MENU_CARDS  or  CLIENT_DATABASES/<clientId>/QR_PROMO. */
+var MC_ROOT_FOLDER_DEFAULT = '1u2yVJCgH2EwLAP950l_97vo5Ckx9cgL7';
 function bnxMcRootFolder_() {
-  var rootId = PropertiesService.getScriptProperties().getProperty('MC_ROOT_FOLDER_ID');
-  if (rootId) return DriveApp.getFolderById(rootId);
+  var ids = [PropertiesService.getScriptProperties().getProperty('MC_ROOT_FOLDER_ID'), MC_ROOT_FOLDER_DEFAULT];
+  for (var i = 0; i < ids.length; i++) {
+    if (!ids[i]) continue;
+    try { var f = DriveApp.getFolderById(ids[i]); if (!f.isTrashed()) return f; } catch (e) {}
+  }
   var it = DriveApp.getFoldersByName(MC_ROOT_NAME);
-  if (!it.hasNext()) throw new Error('Drive folder ' + MC_ROOT_NAME + ' not found');
+  if (!it.hasNext()) throw new Error('Drive folder ' + MC_ROOT_NAME + ' not found — set Script property MC_ROOT_FOLDER_ID');
   return it.next();
 }
 function bnxMcSubFolder_(clientId, sub) {
@@ -462,18 +471,31 @@ function bnxQrpSaveVideo_(req) {
       var sh = bnxQrpSheet_(cid, QRP_SETTINGS_SHEET, QRP_SETTINGS_HEAD), cur = bnxQrpVideo_(cid);
       var row = cur.row || (sh.getLastRow() + 1);
       bnxQrpWrite_(sh, row, { CLIENT_ID: cid, VIDEO_URL: url, VIDEO_FILE_ID: fid, VIDEO_NAME: name, VIDEO_ACTIVE: active ? 'YES' : 'NO', UPDATED_AT: new Date() });
+      /* REPLACE (2026-10-08): the previous video file goes to Drive Bin (restorable for 30 days) — only a file this
+         system uploaded into CLIENT_DATABASES/<client>/QR_PROMO, never someone's own Drive file or an outside link */
+      var replaced = '';
+      if (cur.fileId && cur.fileId !== fid) replaced = bnxQrpTrashOwn_(cid, cur.fileId);
     } finally { lock.releaseLock(); }
     bnxMcClearPublicCache_(cid);
-    return { success: true, data: { videoUrl: url, fileId: fid, name: name, active: active, clientId: cid, warn: warn } };
+    return { success: true, data: { videoUrl: url, fileId: fid, name: name, active: active, clientId: cid, warn: warn, replaced: replaced } };
   } catch (e) { return { success: false, error: String(e && e.message || e) }; }
 }
 
+function bnxQrpTrashOwn_(cid, fileId) {
+  try {
+    var f = DriveApp.getFileById(fileId), folder = bnxQrpFolder_(cid), ps = f.getParents(), inside = false;
+    while (ps.hasNext()) if (ps.next().getId() === folder.getId()) inside = true;
+    if (!inside) return '';
+    var n = f.getName(); f.setTrashed(true); return n;
+  } catch (e) { return ''; }
+}
 function bnxQrpDeleteVideo_(req) {
   try {
     var cid = bnxMcCid_(req);
     var lock = LockService.getScriptLock(); lock.waitLock(20000);
     try {
       var cur = bnxQrpVideo_(cid);
+      if (cur.fileId) bnxQrpTrashOwn_(cid, cur.fileId);
       if (cur.row) bnxQrpWrite_(bnxQrpSheet_(cid, QRP_SETTINGS_SHEET, QRP_SETTINGS_HEAD), cur.row,
         { VIDEO_URL: '', VIDEO_FILE_ID: '', VIDEO_NAME: '', VIDEO_ACTIVE: 'NO', UPDATED_AT: new Date() });
     } finally { lock.releaseLock(); }
@@ -813,4 +835,36 @@ function bnxFindDoPost() {
     : 'Live doPost source starts with:\n' + String(f).slice(0, 400));
   Logger.log('ADD AS FIRST LINES INSIDE doPost (use the variable that holds the parsed body, e.g. req / body / data):\n' +
     '  var __mp = bnxMpHandle_(e);\n  if (__mp) return __mp;');
+}
+
+
+/* ============================================================
+   DRIVE CHECK / TIDY (run from the editor)
+   bnxDriveWhere('CL00010')  → logs the exact folders uploads go to
+   bnxDriveTidy('CL00010')   → moves every file this client already uses (menu cards, welcome video,
+                                event posters) into CLIENT_DATABASES/<client>/MENU_CARDS | QR_PROMO
+   ============================================================ */
+function bnxDriveWhere(clientId) {
+  clientId = clientId || 'CL00010';
+  var root = bnxMcRootFolder_();
+  Logger.log('ROOT       ' + root.getName() + '  ' + root.getUrl());
+  Logger.log('MENU_CARDS ' + bnxMcFolder_(clientId).getUrl());
+  Logger.log('QR_PROMO   ' + bnxQrpFolder_(clientId).getUrl());
+}
+function bnxDriveTidy(clientId) {
+  clientId = clientId || 'CL00010';
+  var mcF = bnxMcFolder_(clientId), qpF = bnxQrpFolder_(clientId), moved = 0, skipped = [];
+  function put(id, folder, what) {
+    if (!id) return;
+    try {
+      var f = DriveApp.getFileById(id), ps = f.getParents();
+      while (ps.hasNext()) if (ps.next().getId() === folder.getId()) return;
+      f.moveTo(folder); moved++; Logger.log('moved  ' + what + '  ' + f.getName());
+    } catch (e) { skipped.push(what + ' ' + id + ' (' + e.message + ')'); }
+  }
+  bnxMcRows_({ clientId: clientId }).rows.forEach(function (r) { put(r.fileId || bnxMcId_(r.fileUrl), mcF, 'menu card'); });
+  var v = bnxQrpVideo_(clientId); put(v.fileId, qpF, 'welcome video');
+  bnxQrpEvents_(clientId, false).forEach(function (e) { put(e.posterFileId, qpF, 'poster ' + e.title); });
+  Logger.log('Done — ' + moved + ' file(s) moved.' + (skipped.length ? '  Not moved (owned by someone else or deleted): ' + skipped.join(' | ') : ''));
+  bnxDriveWhere(clientId);
 }
