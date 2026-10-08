@@ -20698,6 +20698,62 @@ body.bnx-bulk-on.bnx-bulk-has #bnx-bulk-bar{display:flex}
   W.bnxStwTablesRestore=restore;
 })();
 </script>
+<script id="bnx-steward-api-governor">
+/* STEWARD API GOVERNOR (2026-10-09, "sync then all system delay"): every steward phone polled tables / active orders /
+   reservations / KOTs every ~20 s with no sharing — many phones × several calls queued the shared Apps Script server
+   (25-30 s per answer for everyone, dashboard included).
+   • identical reads in flight share ONE request; • master data (items, menu, tax, staff, printers) kept 10 min;
+   • live floor / orders / KOT kept 15 s; • a phone with the app in the background answers from its last copy;
+   • any save clears the live copies (and master copies only when masters change) so the next read is fresh. */
+(function(){
+  var W=window, cache=new Map(), pending=new Map(), stats={};
+  var READ=/^(GET_|LIST_|FETCH_|RD_FETCH|SEARCH_|LOAD_)/i, NEVER=/^(GET_CONFIG|GET_NEXT|NEXT_|HEARTBEAT|GET_SEQUENCE|GET_KOT_NO)/i;
+  var MASTER=/^(GET_MASTER|GET_ITEMS?\b|GET_ITEM_|GET_MENU|LIST_ITEMS|LIST_MENU|GET_CATEGOR|GET_ITEM_GROUP|GET_TAX|GET_STAFF|LIST_STAFF|GET_CLIENT_PRINTERS|GET_PRINTERS|GET_COMPANY|GET_CLIENT_SETTINGS|GET_SETTINGS|GET_PAYMENT_MODES|GET_UNITS|GET_BOOTSTRAP|GET_MENU_CARDS|GET_ACTIVE_MENU_CARD)|^RD_FETCH_SHEET$/i;
+  var MASTER_WRITE=/ITEM|MENU|MASTER|CATEGOR|TAX|STAFF|USER|PRINTER|SETTING|COMPANY/i;
+  function ttl(A,p){ if(A==='RD_FETCH_SHEET' && !/MASTER|PRINTER/i.test(String(p&&p.tab||''))) return 15000; return MASTER.test(A)?600000:15000; }
+  function isMasterCall(A,p){ return MASTER.test(A) && !(A==='RD_FETCH_SHEET' && !/PRINTER/i.test(String(p&&p.tab||''))); }   /* table sheet = live, never from the device copy */
+  function cidK(){ try{ return String((typeof CLIENT_ID!=='undefined'&&CLIENT_ID)||localStorage.getItem('ERP_CLIENT')||''); }catch(e){ return ''; } }
+  /* DEVICE COPY (2026-10-09 "fast need"): master data is also kept in this device's IndexedDB (12 h). Opening the app
+     answers at once from it and refreshes ONE time in the background — no 25-30 s wait per master call on every open. */
+  var IDB=null;
+  function idb(){ if(IDB) return IDB; IDB=new Promise(function(res){ try{ var rq=indexedDB.open('bnx_api_cache',1); rq.onupgradeneeded=function(){ try{ rq.result.createObjectStore('kv'); }catch(e){} }; rq.onsuccess=function(){ res(rq.result); }; rq.onerror=function(){ res(null); }; setTimeout(function(){ res(null); },1500); }catch(e){ res(null); } }); return IDB; }
+  function idbGet(k){ return idb().then(function(db){ if(!db) return null; return new Promise(function(res){ try{ var q=db.transaction('kv').objectStore('kv').get(k); q.onsuccess=function(){ res(q.result||null); }; q.onerror=function(){ res(null); }; setTimeout(function(){ res(null); },800); }catch(e){ res(null); } }); }); }
+  function idbPut(k,v){ idb().then(function(db){ if(!db) return; try{ db.transaction('kv','readwrite').objectStore('kv').put(v,k); }catch(e){} }); }
+  function idbClear(){ idb().then(function(db){ if(!db) return; try{ db.transaction('kv','readwrite').objectStore('kv').clear(); }catch(e){} }); }
+
+  function wrap(){
+    var base=W.gasApi; if(typeof base!=='function'||base.__bnxStwGov) return;
+    var w=async function(a,p,e){
+      var A=String(a||''), st=stats[A]||(stats[A]={n:0,hit:0,ms:0});
+      var isRead=READ.test(A)&&!NEVER.test(A)&&!(p&&(p.force||p.noCache));
+      if(!isRead){ if(MASTER_WRITE.test(A)){ cache.clear(); idbClear(); } else cache.forEach(function(v,k){ if(!MASTER.test(v.a)||v.a==='RD_FETCH_SHEET') cache.delete(k); }); return base.apply(this,arguments); }
+      var k=''; try{ k=cidK()+'|'+(e||'')+'|'+A+'|'+JSON.stringify(p||{}); }catch(x){}
+      var c=k&&cache.get(k);
+      if(c && (Date.now()-c.t<c.ttl || (document.hidden && Date.now()-c.t<300000))){ st.hit++; return c.r; }
+      if(k && pending.has(k)){ st.hit++; return pending.get(k); }
+      var t0=Date.now(), self=this, args=arguments;
+      var fetchLive=function(){ var t1=Date.now(); return Promise.resolve().then(function(){ return base.apply(self,args); }).then(function(r){ st.n++; st.ms+=Date.now()-t1;
+        if(r && r.success!==false && k){ cache.set(k,{t:Date.now(),r:r,a:A,ttl:ttl(A,p)}); if(isMasterCall(A,p)) idbPut('m|'+k,{t:Date.now(),r:r}); } return r; }); };
+      if(k && isMasterCall(A,p)){
+        var d=await idbGet('m|'+k);
+        if(d && d.r && Date.now()-d.t<43200000){
+          st.hit++; cache.set(k,{t:Date.now(),r:d.r,a:A,ttl:ttl(A,p)});
+          if(Date.now()-d.t>120000 && !pending.has(k)){ var bg=fetchLive(); pending.set(k,bg); bg.then(function(){ pending.delete(k); },function(){ pending.delete(k); }); }
+          return d.r;
+        }
+      }
+      var pr=fetchLive();
+      if(k){ pending.set(k,pr); pr.then(function(){ pending.delete(k); },function(){ pending.delete(k); }); }
+      return pr;
+    };
+    Object.keys(base).forEach(function(k2){ try{ w[k2]=base[k2]; }catch(x){} });
+    w.__bnxStwGov=true; W.gasApi=w; try{ gasApi=w; }catch(x){}
+  }
+  wrap(); var n=0, ti=setInterval(function(){ wrap(); if(++n>30) clearInterval(ti); },1000);
+  W.bnxStewardApiStats=function(){ var rows=Object.keys(stats).map(function(a){ var x=stats[a]; return {action:a,calls:x.n,shared:x.hit,avg_ms:x.n?Math.round(x.ms/x.n):0}; }); try{ console.table(rows); }catch(e){} return rows; };
+  W.bnxStewardApiCacheClear=function(){ cache.clear(); };
+})();
+</script>
 </body>
 </html>
 
