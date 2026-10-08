@@ -1061,7 +1061,10 @@ let usingFallbackMenu = true; // customer-facing — see loadMenuFromServer() an
 const CART_KEY = 'bnx_cart_'+(STATE.clientId||'')+'_'+(STATE.tableId||'');
 try{ STATE.cart = JSON.parse(sessionStorage.getItem(CART_KEY)||'{}') || {}; }catch(e){}
 let activeCat = 'All';
-let activeStation = 'ALL'; // 'ALL' (food + bar together) | 'FOOD' | 'BAR'
+let activeStation = 'FOOD'; // 'FOOD' (default, first) | 'BAR' | 'COCKTAIL' | 'ALL'
+/* Cocktails get their own 3rd menu (Food → Bar → Cocktails): bar items whose category or name is a cocktail */
+const BNX_COCKTAIL_RE=/cocktail|martini|margarita|mojito|sangria|long ?island|\bliit\b|cosmopolitan|daiquiri|negroni|pina ?colada|old ?fashioned|bloody ?mary|caipiroska|caipirinha|whisky ?sour|mai ?tai|blue ?lagoon|sex on the beach|tequila sunrise|shooter|signature drink/i;
+function bnxIsCocktail(m){ return !!(m && m.isBar && (BNX_COCKTAIL_RE.test(String(m.cat||'')) || BNX_COCKTAIL_RE.test(String(m.name||'')))); }
 
 let _toastT;
 function bnxToast(msg){
@@ -1440,7 +1443,41 @@ function bnxImgErr(img){
 
 /* PUBLIC MENU (no session): read-only GET route on the backend (public-menu.gs). Used when the normal
    guest calls are rejected with "Invalid or expired session". Fetched once and shared. */
+/* 2026-10-08 ROOT FIX ("Menu could not load (Invalid or expired session)" + "welcome video not showing"):
+   PUBLIC_MENU was asked from ONE deployment only (V2_CORE). When that one failed, the fallback POST calls were
+   refused ("Invalid or expired session") → no menu, and no promo (the video comes inside PUBLIC_MENU).
+   Now every known deployment is asked at the same time; the first real menu wins and is remembered, and the
+   video/events are taken from whichever answer carries them. */
 function bnxPublicFetch(){
+  if(!window.__pubP){
+    const eps=[]; const add=u=>{ if(u && /\/exec$/.test(u) && eps.indexOf(u)<0) eps.push(u); };
+    try{ add(localStorage.getItem('bnx_pub_api_ok')); }catch(e){}
+    add(GAS_APIS_DASH.V2_CORE); try{ bnxEpList_().forEach(add); }catch(e){}
+    const hasMenu=d=>!!(d && ((Array.isArray(d.food)&&d.food.length)||(Array.isArray(d.bar)&&d.bar.length)));
+    const ask=(base,ms)=>{
+      const url=base+'?action=PUBLIC_MENU&clientId='+encodeURIComponent(STATE.clientId);
+      if(window.__early && window.__early.url===url) return window.__early.p.then(d=>({base,d}));
+      const ctl=new AbortController(); const tm=setTimeout(()=>ctl.abort(),ms);
+      return fetch(url,{signal:ctl.signal}).then(r=>r.json()).then(j=>({base,d:(j&&j.success&&j.data)?j.data:null})).catch(()=>({base,d:null})).finally(()=>clearTimeout(tm));
+    };
+    const all=eps.map(b=>ask(b,15000));
+    window.__pubAllP=Promise.all(all);
+    window.__pubP=new Promise(res=>{
+      let left=all.length, done=false;
+      if(!left){ res(null); return; }
+      all.forEach(p=>p.then(x=>{
+        if(done) return;
+        if(hasMenu(x.d)){ done=true; try{ localStorage.setItem('bnx_pub_api_ok',x.base); }catch(e){}
+          /* menu came without the promo → borrow the promo from another deployment's answer when it lands */
+          if(!x.d.promo){ window.__pubAllP.then(rs=>{ const o=rs.find(r=>r.d&&r.d.promo); if(o&&!BNX_INTRO.__promoGot){ try{ bnxQrPromoLoad_({promo:o.d.promo,info:x.d.info}); }catch(e){} } }); }
+          res(x.d); return; }
+        if(--left===0){ done=true; const any=(x.d)||null; res(any); }
+      }));
+    });
+  }
+  return window.__pubP;
+}
+function bnxPublicFetchOld_(){
   if(!window.__pubP){
     const url=GAS_APIS_DASH.V2_CORE+'?action=PUBLIC_MENU&clientId='+encodeURIComponent(STATE.clientId);
     const once=async(ms)=>{
@@ -1965,13 +2002,19 @@ async function enterMenu(){
 // bar items (a client with no bar license just sees Food, no dead tab).
 function renderStations(){
   const wrap = document.getElementById('mn-stations');
-  const hasBar = MENU.some(m=>m.isBar) && !isPureVeg();
-  if (!hasBar){ wrap.style.display='none'; activeStation='ALL'; return; }
+  const hasBar = MENU.some(m=>m.isBar && !bnxIsCocktail(m)) && !isPureVeg();
+  const hasCk = MENU.some(bnxIsCocktail) && !isPureVeg();
+  const hasFood = MENU.some(m=>!m.isBar);
+  /* menu not loaded yet → keep the default (Food); only a loaded menu with no bar items switches to All */
+  if (!hasBar && !hasCk){ wrap.style.display='none'; if (MENU.length) activeStation='ALL'; return; }
+  if (activeStation==='FOOD' && !hasFood) activeStation = hasBar?'BAR':'COCKTAIL';
+  if (activeStation==='COCKTAIL' && !hasCk) activeStation='BAR';
   wrap.style.display='flex';
-  wrap.innerHTML = `
-    <button class="station-btn ${activeStation==='ALL'?'active':''}" onclick="setStation('ALL')">✨ All</button>
-    <button class="station-btn ${activeStation==='FOOD'?'active':''}" onclick="setStation('FOOD')">🍽 Food</button>
-    <button class="station-btn ${activeStation==='BAR'?'active':''}" onclick="setStation('BAR')">🍸 Bar</button>`;
+  wrap.innerHTML =
+    (hasFood?`<button class="station-btn ${activeStation==='FOOD'?'active':''}" onclick="setStation('FOOD')">🍽 Food</button>`:'')+
+    (hasBar?`<button class="station-btn ${activeStation==='BAR'?'active':''}" onclick="setStation('BAR')">🍷 Bar</button>`:'')+
+    (hasCk?`<button class="station-btn ${activeStation==='COCKTAIL'?'active':''}" onclick="setStation('COCKTAIL')">🍸 Cocktails</button>`:'')+
+    `<button class="station-btn ${activeStation==='ALL'?'active':''}" onclick="setStation('ALL')" style="flex:0 0 auto;padding:10px 12px">✨ All</button>`;
 }
 /* Apply the dashboard-controlled mode: view only (default) / order / call steward. */
 function applyOrderMode(){
@@ -2014,11 +2057,12 @@ function stationMenu(){
   const q = MENU_QUERY.trim().toLowerCase();
   const st = isPureVeg() ? 'FOOD' : activeStation;
   const _needPrice = MENU.some(x=>x.price>0);
-  return MENU.filter(m => m.avail && (!_needPrice || m.price > 0) && (st==='ALL' || (st==='BAR') === !!m.isBar)
+  const inSt = m => st==='ALL' || (st==='FOOD' ? !m.isBar : st==='COCKTAIL' ? bnxIsCocktail(m) : (m.isBar && !bnxIsCocktail(m)));
+  return MENU.filter(m => m.avail && (!_needPrice || m.price > 0) && inSt(m)
                        && (!isPureVeg() || m.isBar===false && m.veg!=='NV')
                        && (VEG_FILTER==='ALL' || (VEG_FILTER==='V' ? m.veg==='V' : m.veg==='NV'))
                        && (!q || (m.name+' '+m.cat).toLowerCase().includes(q)))
-             .sort((a,b)=> (a.isBar?1:0)-(b.isBar?1:0) || (b.popular?1:0)-(a.popular?1:0));   /* food first, then bar; best sellers first in each */
+             .sort((a,b)=> ((a.isBar?1:0)+(bnxIsCocktail(a)?1:0))-((b.isBar?1:0)+(bnxIsCocktail(b)?1:0)) || (b.popular?1:0)-(a.popular?1:0));   /* Food → Bar → Cocktails; best sellers first in each */
 }
 function setVeg(v){ VEG_FILTER=v; document.querySelectorAll('.veg-chip').forEach(c=>c.classList.toggle('active',c.dataset.v===v)); renderCats(); renderMenu(); }
 
@@ -2043,7 +2087,7 @@ function renderMenu(){
   const el = document.getElementById('mn-list');
   if (!list.length && MENU_LOADING && !MENU.length) return;   /* first load in progress: keep the skeleton */
   if (!list.length && !MENU.length){ el.innerHTML = '<div class="empty-note">\ud83c\udf7d\ufe0f Menu is not available right now.<br><button onclick="bnxRetryMenu()" style="margin-top:10px;padding:9px 18px;border:0;border-radius:10px;background:#d97706;color:#fff;font-weight:800;cursor:pointer;">Retry</button><div style="font-size:11px;opacity:.7;margin-top:8px">If this keeps happening, please ask our staff.</div></div>'; return; }
-  if (!list.length){ el.innerHTML = `<div class="empty-note">🍽️ ${MENU_QUERY.trim()?'Nothing matches “'+escH(MENU_QUERY.trim())+'”. Try another word or clear the search.':'No '+(activeStation==='BAR'?'bar':activeStation==='ALL'?'menu':'food')+' items in this category right now — try another one!'}</div>`; return; }
+  if (!list.length){ el.innerHTML = `<div class="empty-note">🍽️ ${MENU_QUERY.trim()?'Nothing matches “'+escH(MENU_QUERY.trim())+'”. Try another word or clear the search.':'No '+(activeStation==='BAR'?'bar':activeStation==='COCKTAIL'?'cocktail':activeStation==='ALL'?'menu':'food')+' items in this category right now — try another one!'}</div>`; return; }
   el.innerHTML = '<div class="list-head">'+escH(activeCat==='All'?'All items':activeCat)+' · '+list.length+'</div>' + list.map(m=>{
     const qty = STATE.cart[m.id]||0;
     const veg = (m.veg||'').toUpperCase();
@@ -2609,6 +2653,7 @@ function bnxQrPromoHero_(){
 }
 /* PUBLIC_MENU came from a deployment without the promo code → fetch the promo from the other one */
 async function bnxPromoFromOtherEp_(){
+  try{ if(window.__pubAllP){ const rs=await window.__pubAllP; const o=rs.find(r=>r.d&&r.d.promo); if(o){ try{ localStorage.setItem('bnx_guest_api_ok',o.base); }catch(e){} return o.d.promo; } } }catch(e){}
   for (const base of bnxEpList_()){
     if (window.__early && window.__early.url && window.__early.url.indexOf(base)===0) continue;
     try{
@@ -2619,6 +2664,7 @@ async function bnxPromoFromOtherEp_(){
   return null;
 }
 function bnxQrPromoLoad_(pub){
+  if(pub && pub.promo) BNX_INTRO.__promoGot=true;
   try{
     if(!pub){   /* menu server did not answer: last promo this phone got from the server (≤ 6 h), else the default video */
       let c=null; try{ c=JSON.parse(localStorage.getItem('bnx_promo_'+STATE.clientId)||'null'); }catch(e){}
@@ -2647,7 +2693,7 @@ function bnxIntroMaybe_(){
   if(BNX_INTRO.started || qs.get('nointro')) return;
   let seen=false; try{ seen=!!sessionStorage.getItem(bnxIntroKey_()); }catch(e){}
   if(seen && !qs.get('intro')) return;
-  if(Date.now()-BNX_INTRO.t0 > 15000 && !qs.get('intro')) return;          /* promo arrived late: guest is already browsing */
+  if(Date.now()-BNX_INTRO.t0 > 25000 && !qs.get('intro')) return;          /* promo arrived late: guest is already browsing */
   if(Object.keys(STATE.cart||{}).length) return;
   const steps=[];
   const vs=STATE.qrPromo.videoUrl && window.BNXVideo && BNXVideo.parse(STATE.qrPromo.videoUrl) ? {src:STATE.qrPromo.videoUrl} : null;
@@ -2844,7 +2890,7 @@ function bnxSaveView(){ try{ sessionStorage.setItem('bnx_view_'+STATE.clientId, 
 window.addEventListener('pagehide', bnxSaveView); document.addEventListener('visibilitychange', ()=>{ if(document.hidden) bnxSaveView(); });
 (function restoreView(){
   try{ const v=JSON.parse(sessionStorage.getItem('bnx_view_'+STATE.clientId)||'null'); if(!v) return;
-    activeCat=v.cat||'All'; activeStation=v.st||'ALL'; VEG_FILTER=v.veg||'ALL';
+    activeCat=v.cat||'All'; activeStation=v.st||'FOOD'; VEG_FILTER=v.veg||'ALL';
     document.querySelectorAll('.veg-chip').forEach(c=>c.classList.toggle('active',c.dataset.v===VEG_FILTER));
     window.__bnxRestoreY=v.y||0;
   }catch(e){}
