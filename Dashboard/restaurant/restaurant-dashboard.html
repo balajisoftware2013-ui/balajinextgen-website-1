@@ -5290,6 +5290,15 @@ window.esc = window.esc || function(v){ return String(v==null?'':v).replace(/[&<
 #page-dashboard .tbl th,#page-dashboard .ledger-tbl th{font-size:10.5px!important;font-weight:600!important;}
 #page-dashboard .tbl td,#page-dashboard .ledger-tbl td{font-size:12px!important;}
 </style>
+<style id="bnx-menu-table-fit">
+/* 2026-10-09 Menu Creation table: the Action column (Edit / Delete) was pushed off the right edge.
+   The table scrolls sideways inside its box and Action stays pinned on the right, always visible. */
+div:has(> #menuItemsTable){overflow-x:auto!important;max-width:100%;-webkit-overflow-scrolling:touch}
+#menuItemsTable{min-width:820px}
+#menuItemsTable th:last-child,#menuItemsTable td.mit-act{position:sticky;right:0;z-index:2;background:var(--surface,#fff);box-shadow:-6px 0 8px -6px rgba(0,0,0,.18)}
+#menuItemsTable td.mit-act button{font-size:11px!important;padding:5px 10px!important}
+#menuItemsTable td:nth-child(2){min-width:180px;white-space:normal}
+</style>
 </head>
 <body>
 <script id="bnx-final-runtime-guard-20261001">
@@ -24192,13 +24201,19 @@ function renderMenuItemsTable(){
     const active = item.avail !== false;
     const icon = item.e || bnxDefaultIcon(item.c);
     const group = bnxItemGroupName_(item) || '—';
+    /* 2026-10-09: show the item's real photo (assets/item-images/<ITEM_ID>.jpg); icon if no photo */
+    let photo=''; try{ photo=(typeof window.bnxResolveItemImageUrl_==='function'?window.bnxResolveItemImageUrl_(item):'')||''; }catch(e){}
+    if(/^data:image\/svg/i.test(photo)) photo='';
+    const iconCell = photo ? `<img src="${String(photo).replace(/"/g,'&quot;')}" alt="" loading="lazy" style="width:38px;height:38px;object-fit:cover;border-radius:8px;display:block;margin:auto" onerror="this.outerHTML='<span style=&quot;font-size:16px&quot;>${String(icon).replace(/'/g,'')}</span>'">` : icon;
+    /* GST is stored as a fraction (0.05) or a percent (5) — always show the percent */
+    const gstN = Number(item.gst)||0, gstPct = gstN>0 && gstN<=1 ? Math.round(gstN*10000)/100 : gstN;
     return `<tr>
-      <td style="font-size:16px;text-align:center;" title="Item icon">${icon}</td>
+      <td style="font-size:16px;text-align:center;" title="Item photo / icon">${iconCell}</td>
       <td>${item.n}</td><td>${item.c||'Uncategorised'}</td><td>${group}</td>
       <td class="mono">₹${(Number(item.p)||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
-      <td>${vegCell}</td><td class="mono">${item.gst||0}%</td>
+      <td>${vegCell}</td><td class="mono">${gstPct}%</td>
       <td><span class="pill ${active?'p-g':'p-r'}" style="cursor:pointer;" onclick="bnxToggleMenuItemActive('${item.code}')" title="Click to toggle">${active?'Active':'Inactive'}</span></td>
-      <td style="white-space:nowrap;">
+      <td class="mit-act" style="white-space:nowrap;">
         <button onclick="bnxEditMenuItem('${item.code}')" style="font-size:10px;padding:3px 8px;border-radius:6px;border:1px solid var(--border2);background:none;cursor:pointer;margin-right:4px;">✏ Edit</button>
         <button onclick="bnxDeleteMenuItem('${item.code}')" style="font-size:10px;padding:3px 8px;border-radius:6px;border:1px solid rgba(239,68,68,.4);color:#ef4444;background:none;cursor:pointer;">🗑</button>
       </td>
@@ -52203,6 +52218,23 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
   'use strict';
   var W=window;
   var TTL=10000, cache=new Map(), pending=new Map(), stats={}, lastOk=0, started=Date.now();
+  /* 2026-10-09 SPEED ROOT FIX ("sync then all system delay"): 48 calls/min from ONE dashboard queued every request on
+     Apps Script (25-30 s each). (a) master data was re-downloaded every 10 s, (b) EVERY save (KOT, order, table)
+     wiped the whole cache so the item master downloaded again, (c) hidden background tabs kept polling.
+     Now: master/settings 10 min, reports 2 min, live floor/KOT 20 s; a save clears only what it changes;
+     a hidden tab answers from its last copy instead of calling the server. */
+  var MASTER=/^(GET_MASTER|GET_ITEMS?\b|GET_ITEM_|GET_MENU|LIST_ITEMS|LIST_MENU|GET_CATEGOR|GET_ITEM_GROUP|GET_TAX_CONFIG|GET_TAX|GET_STAFF|LIST_STAFF|GET_USERS|GET_CLIENT_PRINTERS|GET_PRINTERS|GET_COMPANY|GET_CLIENT_SETTINGS|GET_SETTINGS|GET_LOCATIONS|GET_PAYMENT_MODES|GET_UNITS|GET_RECIPE|GET_SUPPLIER|GET_ROLE|GET_BRAND|GET_CLIENT_ASSETS|QR_PROMO_GET|GET_MENU_CARDS|GET_ACTIVE_MENU_CARD|GET_BOOTSTRAP|GET_LEDGER_MASTER|GET_ITEM_MASTER)/i;
+  var REPORT=/^(GET_DSR|GET_ACCOUNTS|GET_CUSTOMER_LEDGER|GET_.*REPORT|REPORT_|GET_SALES|GET_ITEM_GROUP_WISE|GET_DAY_BOOK|GET_CASHBOOK|GET_EXPENSE|GET_PURCHASE|GET_STOCK|GET_INVENTORY|GET_CRM|GET_ANALYTICS)/i;
+  var MASTER_WRITE=/ITEM|MENU|MASTER|CATEGOR|TAX|STAFF|USER|PRINTER|SETTING|COMPANY|CLIENT_ASSETS|RECIPE|SUPPLIER|UNIT|ROLE|BRAND|LOCATION|PAYMENT_MODE|QR_PROMO/i;
+  function ttlFor(A){ return MASTER.test(A)?600000:REPORT.test(A)?120000:20000; }
+  /* DEVICE COPY (2026-10-09 "fast need"): master data is also kept in this device's IndexedDB (12 h). Opening the app
+     answers at once from it and refreshes ONE time in the background — no 25-30 s wait per master call on every open. */
+  var IDB=null;
+  function idb(){ if(IDB) return IDB; IDB=new Promise(function(res){ try{ var rq=indexedDB.open('bnx_api_cache',1); rq.onupgradeneeded=function(){ try{ rq.result.createObjectStore('kv'); }catch(e){} }; rq.onsuccess=function(){ res(rq.result); }; rq.onerror=function(){ res(null); }; setTimeout(function(){ res(null); },1500); }catch(e){ res(null); } }); return IDB; }
+  function idbGet(k){ return idb().then(function(db){ if(!db) return null; return new Promise(function(res){ try{ var q=db.transaction('kv').objectStore('kv').get(k); q.onsuccess=function(){ res(q.result||null); }; q.onerror=function(){ res(null); }; setTimeout(function(){ res(null); },800); }catch(e){ res(null); } }); }); }
+  function idbPut(k,v){ idb().then(function(db){ if(!db) return; try{ db.transaction('kv','readwrite').objectStore('kv').put(v,k); }catch(e){} }); }
+  function idbClear(){ idb().then(function(db){ if(!db) return; try{ db.transaction('kv','readwrite').objectStore('kv').clear(); }catch(e){} }); }
+
   var READ=/^(GET_|LIST_|FETCH_|RD_FETCH|SEARCH_|LOAD_|REPORT_|DASHBOARD)/i;
   var NEVER=/^(GET_CONFIG|GET_NEXT|NEXT_BILL_NO|HEARTBEAT|GET_SEQUENCE|GET_KOT_NO)/i;   /* must always be live */
   function key(a,p,e){ try{ var c=''; try{ c=(typeof bnxCurrentClient_==='function'?bnxCurrentClient_():'')||''; }catch(y){} return c+'|'+(e||'V2_CORE')+'|'+a+'|'+JSON.stringify(p||{}); }catch(x){ return ''; } }
@@ -52212,12 +52244,23 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
     var w=async function(a,p,e){
       var A=String(a||''), s=st(A), k='';
       var isRead=READ.test(A)&&!NEVER.test(A)&&!(p&&(p.force||p.noCache));
-      if(!isRead){ cache.clear(); }
+      if(!isRead){ if(MASTER_WRITE.test(A)){ cache.clear(); idbClear(); } else cache.forEach(function(v,kk){ if(!MASTER.test(v.a||'')) cache.delete(kk); }); }
       else{
         k=key(A,p,e);
         var c=k&&cache.get(k);
-        if(c && Date.now()-c.t<TTL){ s.hit++; return c.r; }
+        if(c && Date.now()-c.t<(c.ttl||TTL)){ s.hit++; return c.r; }
+        if(c && document.hidden && Date.now()-c.t<300000){ s.hit++; return c.r; }   /* background tab: last copy, no server call */
         if(k && pending.has(k)){ s.hit++; return pending.get(k); }
+        if(k && MASTER.test(A)){
+          var d=await idbGet('m|'+k);
+          if(d && d.r && Date.now()-d.t<43200000){
+            s.hit++; cache.set(k,{t:Date.now(),r:d.r,a:A,ttl:ttlFor(A)});
+            if(Date.now()-d.t>120000 && !pending.has(k)){   /* refresh once in the background */
+              var self0=this, bg=run.call(self0,A,a,p,e,s,true,k); pending.set(k,bg); bg.then(function(){ pending.delete(k); },function(){ pending.delete(k); });
+            }
+            return d.r;
+          }
+        }
       }
       if(isRead && k){
         var pr=run.call(this,A,a,p,e,s,isRead,k);
@@ -52232,8 +52275,8 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
       catch(err){ s.n++; s.fail++; throw err; }
       var ms=performance.now()-t0; s.n++; s.ms+=ms; if(ms>s.max) s.max=ms;
       var ok=!!(r&&r.success!==false);
-      if(ok){ lastOk=Date.now(); if(isRead&&k) cache.set(k,{t:Date.now(),r:r}); } else s.fail++;
-      if(cache.size>150){ var old=Date.now()-TTL; cache.forEach(function(v,kk){ if(v.t<old) cache.delete(kk); }); }
+      if(ok){ lastOk=Date.now(); if(isRead&&k){ cache.set(k,{t:Date.now(),r:r,a:A,ttl:ttlFor(A)}); if(MASTER.test(A)) idbPut('m|'+k,{t:Date.now(),r:r}); } } else s.fail++;
+      if(cache.size>150){ var now=Date.now(); cache.forEach(function(v,kk){ if(now-v.t>(v.ttl||TTL)) cache.delete(kk); }); }
       return r;
     }
     Object.keys(base).forEach(function(k2){ try{ w[k2]=base[k2]; }catch(x){} });
@@ -52243,7 +52286,7 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
   /* writes sent through erpApi (e.g. SETTLE_DUE_BILL) must also clear the read cache */
   var prevErp=W.erpApi;
   if(typeof prevErp==='function' && !prevErp.__bnxGov){
-    var we=function(payload){ var A=String(payload&&payload.action||''); if(!(READ.test(A)&&!NEVER.test(A))) cache.clear(); return prevErp.apply(this,arguments); };
+    var we=function(payload){ var A=String(payload&&payload.action||''); if(!(READ.test(A)&&!NEVER.test(A))){ if(MASTER_WRITE.test(A)) cache.clear(); else cache.forEach(function(v,kk){ if(!MASTER.test(v.a||'')) cache.delete(kk); }); } return prevErp.apply(this,arguments); };
     we.__bnxGov=true; W.erpApi=we; try{ erpApi=we; }catch(x){}
   }
   W.bnxApiCacheClear=function(){ cache.clear(); };
@@ -52256,6 +52299,7 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
         var el=document.getElementById(id); if(el){ el.className='db-pill online'; el.innerHTML='<span class="db-dot"></span>'+label+' \u2713'; }
         return true;
       }
+      if(document.hidden) return true;   /* background tab: no connection pings */
       return prevCheck.apply(this,arguments);
     };
     try{ checkDB=W.checkDB; }catch(x){}
