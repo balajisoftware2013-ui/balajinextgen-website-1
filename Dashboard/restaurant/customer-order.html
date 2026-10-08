@@ -896,7 +896,7 @@ function bnxEpList_(){
 function bnxEpOk_(u){ try{ localStorage.setItem('bnx_guest_api_ok',u); }catch(e){} }
 async function bnxGuestCheckinGet_(payload){
   const q=new URLSearchParams({action:'GUEST_CHECKIN',clientId:STATE.clientId});
-  ['mobileNo','customerName','name','tableId','scanKey','requestId','source','partyName','partyDate','crn','customerId'].forEach(k=>{ if(payload[k]!=null && payload[k]!=='') q.set(k,String(payload[k])); });
+  ['mobileNo','customerName','name','tableId','scanKey','requestId','source','partyName','partyDate','crn','customerId','eventName'].forEach(k=>{ if(payload[k]!=null && payload[k]!=='') q.set(k,String(payload[k])); });
   ['notifyOptIn','welcomeSms','deferWelcome','updateName'].forEach(k=>{ if(payload[k]!==undefined) q.set(k,payload[k]?'true':'false'); });
   let last={success:false,offline:true,error:'no server'};
   for (const base of bnxEpList_()){
@@ -914,6 +914,9 @@ async function gasApi(action,payload,endpoint,timeoutMs){
   payload=payload||{};
   /* PARTY QR: every check-in from a party QR carries the party name (source + partyName + party scanKey),
      so the guest list of that party can be pulled from the customer records */
+  if(action==='CUSTOMER_CHECKIN' && typeof STATE!=='undefined' && STATE.event){
+    payload=Object.assign({},payload,{ eventName:STATE.event });
+  }
   if(action==='CUSTOMER_CHECKIN' && typeof STATE!=='undefined' && STATE.party){
     payload=Object.assign({},payload,{ partyName:STATE.party, PARTY_NAME:STATE.party, partyDate:STATE.partyDate||'', party:STATE.party,
       source:String(payload.source||'QR_SCAN').replace(/\|PARTY:.*$/,'')+'|PARTY:'+STATE.party });
@@ -1006,6 +1009,10 @@ const STATE = {
   tableId:  qs.get('table')  || qs.get('tableId')  || '',
   /* PARTY QR (?party=NIRVAAN&pd=2026-10-12): scans are tagged with the party name */
   party:    String(qs.get('party')||'').replace(/[|<>]/g,'').trim().slice(0,60),
+  /* EVENT this guest came for: from an event / party QR (?event= / ?party=), or picked on the event poster,
+     or automatic when only ONE event runs today. Saved with every check-in → GUEST_CRM.LAST_EVENT / EVENTS
+     and GUEST_TRANSACTIONS.EVENT, so the dashboard can filter guests per event (several events a day). */
+  event:    String(qs.get('event')||qs.get('party')||'').replace(/[|<>]/g,'').trim().slice(0,60),
   partyDate:String(qs.get('pd')||'').replace(/[^0-9-]/g,'').slice(0,10),
   /* VISIT KEY: one visit = this table, this business day (a reload or a second scan at the
      same table on the same day must not count as another visit / another welcome). */
@@ -2663,6 +2670,7 @@ function bnxQrPromoApply_(p, fromCache){
   STATE.qrPromo.videoUrl = newUrl;
   STATE.qrPromo.videoActive = !!STATE.qrPromo.videoUrl;
   STATE.qrPromo.events = (Array.isArray(p.events)?p.events:[]).filter(x=>x && x.active!==false);
+  setTimeout(()=>{ try{ bnxAutoEvent_(); }catch(e){} },0);
   STATE.promoEvents = STATE.qrPromo.events.map(e=>({ id:e.id, title:e.title, date:String(e.date||'').slice(0,10), time:e.time||'', venue:e.venue||'',
     description:e.description||'', posterUrl:e.posterUrl||'', posterImg:e.posterImg||'', posterThumb:e.posterThumb||'', active:true }));
   try{ bnxRenderPromoEvents(); }catch(e){}
@@ -2787,6 +2795,7 @@ function bnxIntroShow_(){
     +'<div class="bi-title">'+escH(e.title||'Special Event')+'</div>'
     +'<div class="bi-meta">📅 '+escH(bnxEventDateLabel(e))+(e.time?' · ⏰ '+escH(e.time):'')+(e.venue?'<br>📍 '+escH(e.venue):'')+'</div>'
     +(e.description?'<div class="bi-meta" style="color:#bfb3a5">'+escH(e.description)+'</div>':'')
+    +(!isToday?'':STATE.event===String(e.title||'')?'<div class="bi-meta" style="color:#4ade80;font-weight:800">✅ You are checked in for this event</div>':'<button type="button" class="bi-here" onclick="bnxPickEvent('+(st.k||0)+')" style="margin:10px 0 2px;width:100%;padding:12px;border:0;border-radius:12px;background:#16a34a;color:#fff;font-weight:900;font-size:15px">✅ I am here for '+escH(e.title||'this event')+'</button>')
     +'<div class="bi-acts">'+(more?'<button type="button" onclick="bnxIntroNext()">Next event ›</button>':(hasCard?'<button type="button" onclick="bnxIntroClose();openActiveMenuCard(0)">📄 Menu card</button>':''))
     +'<button class="go" type="button" onclick="bnxGoMenuList()">📖 View menu</button></div></div>';
 }
@@ -2795,6 +2804,24 @@ document.addEventListener('keydown',e=>{
   if(e.key==='Escape'){ e.preventDefault(); bnxIntroClose(); }
   else if((e.key==='ArrowRight'||e.key==='Enter') && !(e.target&&e.target.closest&&e.target.closest('button,input'))){ e.preventDefault(); bnxIntroNext(); }
 });
+/* which event the guest came for (several events on one day) */
+function bnxSetEvent_(title, why){
+  title=String(title||'').replace(/[|<>]/g,'').trim().slice(0,60); if(!title || STATE.event===title) return;
+  STATE.event=title; try{ sessionStorage.setItem('bnx_event_'+STATE.clientId+'_'+STATE.scanKey, title); }catch(e){}
+  /* guest already known on this phone → record the event on the server now */
+  const p=(typeof gxLoad==='function'&&gxLoad())||{};
+  const ph=STATE.customerPhone||p.phone;
+  if(ph) gasApi('CUSTOMER_CHECKIN',{ requestId:'evt-'+STATE.scanKey+'-'+ph+'-'+title.replace(/[^A-Za-z0-9]/g,'').slice(0,20), mobileNo:ph, tableId:STATE.tableId, scanKey:STATE.scanKey,
+    notifyOptIn:STATE.notifyOptIn, source:'QR_SCAN', deferWelcome:true, crn:p.crn||'' }, 'V2_CORE').catch(()=>{});
+  try{ bnxPaintWaCheckin_(); }catch(e){}
+}
+function bnxPickEvent(k){ const ev=bnxUpcomingEvents()[k]; if(!ev) return; bnxSetEvent_(ev.title,'picked'); bnxToast('✅ Checked in for '+ev.title); try{ bnxIntroShow_(); }catch(e){} }
+function bnxAutoEvent_(){
+  if(STATE.event) return;
+  try{ const s=sessionStorage.getItem('bnx_event_'+STATE.clientId+'_'+STATE.scanKey); if(s){ STATE.event=s; return; } }catch(e){}
+  const today=bnxBizDayIST(), evs=bnxUpcomingEvents().filter(e=>String(e.date)===today);
+  if(evs.length===1) bnxSetEvent_(evs[0].title,'only-event-today');   /* one event tonight → that one, no tap needed */
+}
 function bnxIntroNext(){ if(!document.getElementById('bnx-intro')) return; BNX_INTRO.i++; if(BNX_INTRO.i>=BNX_INTRO.steps.length) bnxIntroClose(); else bnxIntroShow_(); }
 function bnxIntroClose(){
   clearInterval(BNX_INTRO.timer); BNX_INTRO.timer=0;
@@ -2858,8 +2885,8 @@ function bnxWaLink_(p){
 function bnxWaCheckinLink_(){
   const n=String(STATE.waNumber||'').replace(/\D/g,'').slice(-10); if(!/^[6-9]\d{9}$/.test(n)) return '';
   const rn=(STATE.restaurantName&&STATE.restaurantName!=='Our Restaurant')?STATE.restaurantName:'';
-  const code='#CI-'+STATE.clientId+'-'+(STATE.tableId?'T'+String(STATE.tableId).replace(/[^A-Za-z0-9]/g,''):'C')+(STATE.party?'-P'+String(STATE.party).replace(/[^A-Za-z0-9]/g,'').slice(0,20):'');
-  const t='Hi'+(rn?' '+rn:'')+' 👋 Please check me in'+(STATE.tableId?' · Table '+STATE.tableId:'')+(STATE.party?' · '+STATE.party:'')+'\n'+code;
+  const code='#CI-'+STATE.clientId+'-'+(STATE.tableId?'T'+String(STATE.tableId).replace(/[^A-Za-z0-9]/g,''):'C')+(STATE.party?'-P'+String(STATE.party).trim().replace(/\s+/g,'_').replace(/[^A-Za-z0-9_]/g,'').slice(0,30):'')+(STATE.event&&STATE.event!==STATE.party?'-E'+String(STATE.event).trim().replace(/\s+/g,'_').replace(/[^A-Za-z0-9_]/g,'').slice(0,30):'');
+  const t='Hi'+(rn?' '+rn:'')+' 👋 Please check me in'+(STATE.tableId?' · Table '+STATE.tableId:'')+(STATE.party?' · '+STATE.party:'')+(STATE.event&&STATE.event!==STATE.party?' · '+STATE.event:'')+'\n'+code;
   return 'https://wa.me/91'+n+'?text='+encodeURIComponent(t);
 }
 function bnxPaintWaCheckin_(){
