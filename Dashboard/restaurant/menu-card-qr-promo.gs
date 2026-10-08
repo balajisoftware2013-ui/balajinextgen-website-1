@@ -440,7 +440,9 @@ function bnxQrpPublic_(clientId) {
   clientId = String(clientId || '').trim();
   var v = bnxQrpVideo_(clientId);
   var ev = bnxQrpEvents_(clientId, true).map(function (e) { delete e.row; delete e.past; return e; });
-  return { video: { videoUrl: v.active ? v.videoUrl : '', fileId: v.active ? v.fileId : '', name: v.name, active: v.active }, events: ev };
+  /* state: ON = own video plays · OFF = owner switched video off (nothing plays) · NONE = no video set → page plays the default */
+  var state = v.active ? 'ON' : (v.videoUrl ? 'OFF' : 'NONE');
+  return { video: { videoUrl: v.active ? v.videoUrl : '', fileId: v.active ? v.fileId : '', name: v.name, active: v.active, state: state }, events: ev };
 }
 
 /* QR_PROMO_GET — admin: video + every event (incl. past / hidden) */
