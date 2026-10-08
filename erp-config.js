@@ -89,6 +89,11 @@ const ROLE_DASHBOARD = {
      alone isn't enough). Path assumed to match chef-dashboard.html's
      sibling files — correct if the real file lives elsewhere. */
   ASSISTANT_CHEF: 'Dashboard/restaurant/chef-dashboard.html',
+  /* NEW 2026-10-08 ("social media login direct same open"): both social-media roles land
+     straight on the restaurant dashboard's Settings page (Customer QR Promotion / Menu),
+     no welcome selector. The dashboard itself limits them to the menu + promotion panels. */
+  SOCIAL_MEDIA_MANAGER  : 'Dashboard/restaurant/restaurant-dashboard.html#settings',
+  SOCIAL_MEDIA_EXECUTIVE: 'Dashboard/restaurant/restaurant-dashboard.html#settings',
   WAITER       : 'Dashboard/employee-dashboard.html',
   STORE_MANAGER: 'Dashboard/inventory/inventory.html',
   STORE_HELPER : 'Dashboard/inventory/inventory.html',
@@ -176,8 +181,11 @@ const FIXED_ROLE_DASHBOARDS = [
      chef"): same one-layer-deeper requirement as STEWARD/MANAGER/CAPTAIN
      above — without this, ASSISTANT_CHEF's industry would resolve first
      and the ROLE_DASHBOARD entry above would never be consulted. */
-  'ASSISTANT_CHEF','STORE_HELPER'
+  'ASSISTANT_CHEF','STORE_HELPER',
+  'SOCIAL_MEDIA_MANAGER','SOCIAL_MEDIA_EXECUTIVE'
 ];
+/* Roles that skip welcome.html and open their dashboard directly. */
+const DIRECT_OPEN_ROLES = ['ASSISTANT_CHEF','STORE_HELPER','SOCIAL_MEDIA_MANAGER','SOCIAL_MEDIA_EXECUTIVE'];
 
 /* Map raw CLIENT_MASTER / USER.INDUSTRY strings → INDUSTRY_DASHBOARD keys.
    Keys are lowercased with WHITESPACE stripped (see _erpResolveIndustry-
@@ -464,7 +472,7 @@ const ERP = {
     // Always persist so welcome.html can read it without re-computing
     try{ localStorage.setItem('erp_target_dashboard', target); }catch(e){}
     const skip = localStorage.getItem('erp_skip_selector') === 'true';
-    if (skip || ['ASSISTANT_CHEF','STORE_HELPER'].includes(this.getRole())) { _safeNavigate(target); return; }
+    if (skip || DIRECT_OPEN_ROLES.includes(this.getRole())) { _safeNavigate(target); return; }
     // Show welcome screen first — guard against redirect loops
     var _cur = window.location.pathname.toLowerCase();
     if (!_cur.includes('welcome')) { _safeNavigate('welcome.html'); }
