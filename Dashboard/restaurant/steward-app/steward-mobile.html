@@ -131,7 +131,7 @@
    Printing still goes ONLY through the real relay (POST /print with
    ESC/POS) or RawBT.
    ═══════════════════════════════════════════════════════════════════ */
-window.BNX_STEWARD_BUILD='PRN-FW8-NATIVE-DETECT';
+window.BNX_STEWARD_BUILD='SM-2026.10.09-v8';   /* shown on screen (Profile + corner badge) — tells which version a phone runs */
 /* FW8: robust native-bridge detection. The Android app may inject the bridge a moment after the page
    starts, under another name, or typeof may report 'object' on some WebViews. */
 (function(){
@@ -5740,7 +5740,7 @@ async function bnxDoLoginInner_(){
   const __bootP = loadBootstrapOrFallback().catch(e=>console.error('[BOOT] bootstrap rejected:', e));
   await Promise.race([
     Promise.allSettled([loadTablesLive(), loadKOTFromServer(), Promise.race([Promise.allSettled([bnxBrandP_,bnxNameP_]), new Promise(r=>setTimeout(r,1200))])]),
-    new Promise(r=>setTimeout(r,(Array.isArray(TABLES)&&TABLES.length)?700:2500))
+    new Promise(r=>setTimeout(r,(Array.isArray(TABLES)&&TABLES.length)?500:900))   /* 2026-10-09: Home after ≤ 0.9 s (was 2.5 s); tables / KOT keep loading */
   ]);
   void __bootP;
   try{ bnxUpdateGreetingAndShift(new Date().getHours()); if(window.bnxRefreshHomeBrand) window.bnxRefreshHomeBrand(true); }catch(_){}
@@ -14271,31 +14271,44 @@ function closeTopLayer(){
   return true;
 }
 
-/* ───────── BACK NAVIGATION ───────── */
-var stack=[], skip=false, origShow=W.showScreen;
+/* ───────── BACK NAVIGATION (rewritten 2026-10-09: "back problem") ─────────
+   Before: one browser-history entry per screen, bottom-nav screens had none, so Back from Tables / KOT / Profile
+   (opened from the bottom bar) or with a popup open on Home closed the whole app, and history.back() + our own
+   stack got out of step (Back jumped two screens / reopened old ones). Now the app keeps ONE guard entry:
+   Back → closes the top popup → else the screen you came from → else Home → on Home "press Back again to exit". */
+var stack=[], skip=false, origShow=W.showScreen, exitArm=0;
+function armGuard(){ try{ if(!(history.state&&history.state.bnxGuard)) history.pushState({bnxGuard:1},''); }catch(e){} }
 W.showScreen=function(id,navEl){
   var from=cur();
   if(from!==id) hideAllPopups();
   var r=origShow.apply(this,arguments);
-  if(!skip && from && from!==id && from!=='s-login'){
+  if(!skip && from && from!==id && from!=='s-login' && id!=='s-login'){
     var viaBottomNav=!!(navEl && navEl.closest && navEl.closest('.bottom-nav'));
-    if(viaBottomNav||id==='s-home'){ stack=[]; }
-    else { stack.push(from); try{history.pushState({bnx:1},'');}catch(e){} }
+    if(id==='s-home') stack=[];
+    else if(viaBottomNav) stack=['s-home'];
+    else { stack.push(from); if(stack.length>20) stack.shift(); }
   }
+  if(id!=='s-login') armGuard();
   return r;
 };
 W.bnxGoBack=function(fallback){
   if(closeTopLayer()) return;
-  if(stack.length){ try{history.back();}catch(e){ var p=stack.pop(); skip=true; try{origShow(p);}finally{skip=false;} } }
-  else { skip=true; try{origShow(fallback||'s-home');}finally{skip=false;} }
+  var p=stack.pop()||fallback||'s-home'; if(p===cur()) p='s-home';
+  skip=true; try{origShow(p);}finally{skip=false;}
 };
 W.addEventListener('popstate',function(){
-  if(closeTopLayer()){ try{history.pushState({bnx:1},'');}catch(e){} return; }
   var c=cur();
-  if(c==='s-login') return;
-  if(stack.length){ var p=stack.pop(); skip=true; try{origShow(p);}finally{skip=false;} }
-  else if(c!=='s-home'){ skip=true; try{origShow('s-home');}finally{skip=false;} }
+  if(c==='s-login') return;                                    /* login screen: normal browser Back */
+  var lk=doc.getElementById('bnx-stw-lock'); if(lk){ armGuard(); return; }   /* locked by POS: stay */
+  var extra=doc.getElementById('bnx-pm-view')||doc.getElementById('bnx-print-doctor');
+  if(extra){ extra.remove(); armGuard(); return; }
+  if(closeTopLayer()){ armGuard(); return; }
+  if(stack.length || c!=='s-home'){ W.bnxGoBack('s-home'); armGuard(); return; }
+  if(Date.now()-exitArm<2200){ try{ history.back(); }catch(e){} return; }   /* second Back on Home = leave */
+  exitArm=Date.now(); try{ toast('Press Back again to exit','info'); }catch(e){}
+  armGuard();
 });
+setTimeout(function(){ if(cur()&&cur()!=='s-login') armGuard(); },1500);
 /* top-bar ← buttons: go to the screen you came from (not always Home) */
 doc.addEventListener('click',function(e){
   var b=e.target&&e.target.closest?e.target.closest('.tb-back'):null; if(!b) return;
@@ -20995,6 +21008,108 @@ body.bnx-bulk-on.bnx-bulk-has #bnx-bulk-bar{display:flex}
 })();
 </script>
 
+<script id="bnx-steward-speed">
+/* ═══ STEWARD SPEED LAYER (2026-10-09: "very slow", "hang", "login take time", "every steward order place not break speed") ═══
+   Measured: the page itself is fast (screen change ~170 ms); the waits are the server. Each phone sent ~12 background
+   reads a minute (GET_ACTIVE_ORDERS / GET_KOT / GET_TABLE_FLOOR / LIST_RESERVATIONS from several layers), so 10-15
+   phones + the POS kept Apps Script busy and every order save / login queued behind them.
+   1. ORDERS FIRST: while an order / KOT / bill is being saved, background reads wait (or use the last answer).
+   2. One background read per kind per 15 s (60 s when the phone is idle 3 min, none while the screen is off);
+      identical reads at the same moment share one request. After a save the next read is fresh at once.
+   3. Server warm-up when the app opens and when the login box is touched (no cold start at the Login tap).
+   4. Login: Home opens ≤ 0.9 s after the server says OK (tables / KOT load behind it). */
+(function(){
+  'use strict';
+  var W=window, D=document;
+  var POLL=/^(GET_ACTIVE_ORDERS|GET_KOT|GET_KOTS|GET_TABLE_FLOOR|GET_TABLE_STATUS|GET_TABLES|GET_TABLE_LIVE|LIST_RESERVATIONS|GET_RESERVATIONS|GET_ONLINE_ORDERS|GET_NOTIFICATIONS|GET_DAY_STATUS)$/;
+  var WRITE=/^(SAVE_|UPDATE_|CANCEL_|VOID_|DELETE_|SETTLE|CLOSE_|TRANSFER_|MOVE_|MERGE_|SPLIT_|ADD_|PLACE_|CREATE_|MARK_)/;
+  var cache={}, inflight={}, writes=0, writeWait=[], lastTouch=Date.now(), stats={saved:0,shared:0,net:0};
+  ['touchstart','pointerdown','keydown','scroll'].forEach(function(ev){ D.addEventListener(ev,function(){ lastTouch=Date.now(); },{passive:true,capture:true}); });
+  function clone(x){ try{ return JSON.parse(JSON.stringify(x)); }catch(e){ return x; } }
+  function minGap(){ return (Date.now()-lastTouch>180000)?60000:15000; }
+  function waitWrites(ms){ if(!writes) return Promise.resolve(); return new Promise(function(r){ var t=setTimeout(r,ms); writeWait.push(function(){ clearTimeout(t); r(); }); }); }
+  function wrap(){
+    var base=W.gasApi; if(typeof base!=='function'||base.__bnxSpeed||W.__bnxSpeedOn) return;
+    W.__bnxSpeedOn=true;   /* installed exactly once — a second copy inside the chain would wait on itself */
+    var f=async function(action,payload){
+      var a=String(action||'');
+      if(WRITE.test(a)){
+        writes++;
+        try{ var r=await base.apply(this,arguments); if(r&&r.success!==false) cache={}; return r; }
+        finally{ writes=Math.max(0,writes-1); if(!writes){ var q=writeWait.splice(0); q.forEach(function(fn){ try{ fn(); }catch(e){} }); } }
+      }
+      if(!POLL.test(a)) return base.apply(this,arguments);
+      var force=!!(payload&&(payload.force||payload.refresh||payload.fresh));
+      var key; try{ key=a+'|'+JSON.stringify(payload||{}); }catch(e){ return base.apply(this,arguments); }
+      var c=cache[key], age=c?Date.now()-c.at:1e12;
+      if(c && !force && (D.hidden || age<minGap())){ stats.saved++; return clone(c.res); }
+      if(writes && c && !force){ stats.saved++; return clone(c.res); }          /* an order is being saved: it goes first */
+      if(inflight[key]){ stats.shared++; return clone(await inflight[key]); }
+      var self=this, args=arguments;
+      inflight[key]=(async function(){ await waitWrites(8000); stats.net++; return base.apply(self,args); })();
+      try{ var res=await inflight[key]; if(res&&res.success!==false) cache[key]={at:Date.now(),res:res}; return clone(res); }
+      finally{ delete inflight[key]; }
+    };
+    f.__bnxSpeed=true; Object.keys(base).forEach(function(k){ try{ f[k]=base[k]; }catch(e){} });
+    W.gasApi=f; try{ gasApi=f; }catch(e){}
+  }
+  /* installed after every other layer has wrapped gasApi (they run on DOMContentLoaded / load) */
+  if(D.readyState==='complete') setTimeout(wrap,1500); else W.addEventListener('load',function(){ setTimeout(wrap,1500); });
+
+  /* server warm-up: a plain GET wakes the Apps Script container so the Login / first save is not a cold start */
+  var warmAt=0;
+  function warm(){
+    if(Date.now()-warmAt<240000) return; warmAt=Date.now();
+    var ids=[]; try{ ids.push(localStorage.getItem('bnx_api_core')||(typeof BNX_BOOTSTRAP_CORE_ID!=='undefined'?BNX_BOOTSTRAP_CORE_ID:'')); ids.push(localStorage.getItem('bnx_api_auth')||(typeof BNX_BOOTSTRAP_AUTH_ID!=='undefined'?BNX_BOOTSTRAP_AUTH_ID:'')); }catch(e){}
+    ids.filter(Boolean).forEach(function(id){ try{ fetch('https://script.google.com/macros/s/'+id+'/exec?action=PING&t='+Date.now(),{mode:'no-cors',cache:'no-store'}).catch(function(){}); }catch(e){} });
+  }
+  setTimeout(warm,300);
+  D.addEventListener('focusin',function(e){ if(e.target&&/login-(user|pass)/.test(e.target.id||'')) warm(); });
+  D.addEventListener('visibilitychange',function(){ if(!D.hidden) warm(); });
+  W.bnxSpeedStats=function(){ return Object.assign({cached:Object.keys(cache).length,writesInFlight:writes},stats); };
+})();
+</script>
+
+<script id="bnx-version-badge">
+/* ═══ VERSION BADGE (2026-10-09: "version mention then easily understand which version has the problem") ═══
+   Shows THIS page's build and the SERVER's build (GET ?action=BNX_WHOAMI on the deployment the page uses).
+   Green = page + server are the current fix set. Amber = the server still runs old code → in Apps Script:
+   Deploy › Manage deployments › ✏ › Version: NEW VERSION › Deploy. Tap the badge for details. */
+(function(){
+  var W=window, D=document, PAGE=(window.BNX_STEWARD_BUILD||'SM-2026.10.09-v8'), NEED='GS-2026.10.09-v8';
+  var SRV={build:'',ok:null,url:'',features:{}};
+  function ids(){ var out=[], add=function(u){ var m=String(u||'').match(/AKfycb[A-Za-z0-9_-]{20,}/); if(m&&out.indexOf(m[0])<0) out.push(m[0]); };
+    add('AKfycbwHdqrP4IvuVD2ZkupNybrEkiXu3kmuI6-tQoiHgYxoqr1KgUupeFsi3PIoFEbuv6XA');
+    try{ add(localStorage.getItem('bnx_promo_api_ok')); add(localStorage.getItem('bnx_pq_api_ok')); add(localStorage.getItem('bnx_api_core')); }catch(e){}
+    try{ add(W.GAS_APIS_DASH&&W.GAS_APIS_DASH.V2_CORE); }catch(e){}
+    return out; }
+  async function check(){
+    var list=ids();
+    for(var i=0;i<list.length;i++){
+      try{ var ctl=new AbortController(), tm=setTimeout(function(){ ctl.abort(); },20000);
+        var r=await fetch('https://script.google.com/macros/s/'+list[i]+'/exec?action=BNX_WHOAMI&t='+Date.now(),{signal:ctl.signal}); clearTimeout(tm);
+        var j=await r.json(); var d=(j&&j.data)||{};
+        if(d.scriptId){ SRV={build:d.build||('old '+(d.menuCardQrPromo||'')),ok:d.build===NEED,url:list[i],features:d}; break; }
+      }catch(e){}
+    }
+    if(SRV.ok===null) SRV.build='not reachable';
+    paint();
+  }
+  function paint(){
+    var b=D.getElementById('bnx-ver-badge');
+    if(!b){ b=D.createElement('div'); b.id='bnx-ver-badge';
+      b.style.cssText='position:fixed;left:8px;bottom:'+((W.innerWidth||1200)<760?'70px':'8px')+';z-index:9989;font:700 10px/1.25 "DM Mono",monospace;padding:4px 8px;border-radius:8px;cursor:pointer;opacity:.92;box-shadow:0 2px 8px rgba(0,0,0,.15)';
+      b.onclick=function(){ alert('PAGE  '+PAGE+'\nSERVER  '+(SRV.build||'checking…')+(SRV.url?'\n'+SRV.url.slice(0,60)+'…':'')+'\n\n'+(SRV.ok?'✅ Page and server are the current version.':'⚠️ Server is NOT the current version ('+NEED+').\nApps Script → put menu-card-qr-promo.gs LAST → Deploy › Manage deployments › ✏ › Version: NEW VERSION › Deploy.')+'\n\nIf PAGE is not the newest: re-upload the HTML file and refresh (Ctrl+F5 / clear app cache).'); };
+      (D.body||D.documentElement).appendChild(b); }
+    var ok=SRV.ok===true, bad=SRV.ok===false;
+    b.style.background=ok?'#ecfdf3':bad?'#fff7e6':'#f3f4f6'; b.style.color=ok?'#065f46':bad?'#92400e':'#555';
+    b.textContent=PAGE+' · server '+(SRV.build?SRV.build:'…')+(ok?' ✓':bad?' ⚠':'');
+  }
+  W.BNX_PAGE_BUILD=PAGE; W.bnxVersionCheck=check;
+  try{ console.info('%c[BUILD] '+PAGE,'color:#b47a26;font-weight:bold'); }catch(e){}
+  if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ paint(); setTimeout(check,2500); }); else { paint(); setTimeout(check,2500); }
+})();
+</script>
 </body>
 </html>
 
