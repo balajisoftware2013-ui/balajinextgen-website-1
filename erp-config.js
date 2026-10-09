@@ -186,6 +186,14 @@ const FIXED_ROLE_DASHBOARDS = [
 ];
 /* Roles that skip welcome.html and open their dashboard directly. */
 const DIRECT_OPEN_ROLES = ['ASSISTANT_CHEF','STORE_HELPER','SOCIAL_MEDIA_MANAGER','SOCIAL_MEDIA_EXECUTIVE'];
+/* 2026-10-09: pages a role may NEVER open, whatever the client's Role Access says.
+   Social-media roles land straight on the restaurant dashboard Settings (menu + promotion)
+   and do not see Reports Hub (sales / finance data). */
+const ROLE_HIDDEN_PAGES = {
+  SOCIAL_MEDIA_MANAGER  : ['reports','dashboard'],
+  SOCIAL_MEDIA_EXECUTIVE: ['reports','dashboard']
+};
+function _erpNormRole(r){ return (r||'').toString().toUpperCase().trim().replace(/[\s-]+/g,'_'); }
 
 /* Map raw CLIENT_MASTER / USER.INDUSTRY strings → INDUSTRY_DASHBOARD keys.
    Keys are lowercased with WHITESPACE stripped (see _erpResolveIndustry-
@@ -427,7 +435,9 @@ const ERP = {
     }catch(e){ return null; }
   },
 
-  getRole()    { return localStorage.getItem(ERP_KEYS.ROLE)    || ''; },
+  getRole()    { return _erpNormRole(localStorage.getItem(ERP_KEYS.ROLE)); },
+  /* true when this role must not open that dashboard page (e.g. 'reports' for social-media roles) */
+  isPageHidden(page){ var h=ROLE_HIDDEN_PAGES[this.getRole()]; return !!(h && h.indexOf(String(page||''))>=0); },
   getSession() { return localStorage.getItem(ERP_KEYS.SESSION) || ''; },
   getClient()  { return localStorage.getItem(ERP_KEYS.CLIENT)  || ''; },
 
