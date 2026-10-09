@@ -60202,4 +60202,303 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
 })();
 </script>
 
+<script id="bnx-import-center">
+/* IMPORT CENTER (2026-10-10) — Sales · Purchase · Bank Transaction · Aggregator (Swiggy/Zomato…) Transaction & Settlement · Receipt · Payment
+   Two formats per type (Format 1 = standard / invoice-level, Format 2 = detailed / alternate layout).
+   Flow: pick type + format → download template → upload .xlsx/.xls/.csv → auto-detect header row + format → validate every row
+   (dates, amounts, required fields, duplicates) → preview → SAVE.
+   Saving writes EVERY accepted transaction to the Transaction DB and updates the Master DB (parties, items, platforms, banks),
+   format-wise, in IndexedDB on this device (not affected by the 5 MB localStorage limit / Storage Doctor), then syncs to the server in
+   batches via gasApi('IMPORT_TRANSACTIONS'). Rows the server has not accepted stay PENDING and can be retried; everything can be downloaded. */
+(function(){
+  if(window.__bnxImportCenter) return; window.__bnxImportCenter=true;
+  var E=function(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});};
+  var M=function(n){return Number(n||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});};
+  function toast(m,t){ if(typeof showNotif==='function') showNotif(m,t||''); else console.log(m); }
+
+  /* ───────────── column specs ───────────── */
+  function C(k,label,type,req,al){ return {k:k,label:label,type:type,req:!!req,al:[k,label].concat(al||[]).map(function(x){return String(x).toLowerCase().replace(/[^a-z0-9]/g,'');})}; }
+  var SPEC={
+   sales:{label:'Sales',icon:'🧾',dir:'IN',party:'CUSTOMER',f:{
+     1:{name:'Format 1 — Invoice-wise',cols:[C('date','Date','d',1,['Bill Date','Invoice Date','Sale Date']),C('no','Bill No','t',1,['Invoice No','Bill Number','Invoice Number']),C('party','Customer','t',0,['Customer Name','Party','Party Name','Guest']),C('mode','Payment Mode','t',0,['Mode','Pay Mode']),C('taxable','Taxable Amount','n',0,['Taxable','Taxable Value','Net Sales','Subtotal']),C('tax','GST','n',0,['Tax','Tax Amount','GST Amount']),C('amount','Total','n',1,['Total Amount','Amount','Grand Total','Bill Amount','Net Amount']),C('remarks','Remarks','t',0,['Narration','Notes'])]},
+     2:{name:'Format 2 — Item-wise',cols:[C('date','Date','d',1,['Bill Date','Invoice Date']),C('no','Invoice No','t',1,['Bill No','Invoice Number']),C('party','Party','t',0,['Customer','Customer Name','Party Name']),C('item','Item','t',1,['Item Name','Product','Description']),C('qty','Qty','n',0,['Quantity']),C('rate','Rate','n',0,['Price','Unit Price']),C('disc','Discount','n',0,['Disc']),C('taxpct','Tax %','n',0,['GST %','Tax Rate']),C('amount','Amount','n',1,['Line Total','Total','Net Amount']),C('mode','Payment Mode','t',0,['Mode'])]}}},
+   purchase:{label:'Purchase',icon:'🛒',dir:'OUT',party:'SUPPLIER',f:{
+     1:{name:'Format 1 — Bill-wise',cols:[C('date','Date','d',1,['Bill Date','Purchase Date','Invoice Date']),C('no','Bill No','t',1,['Invoice No','Supplier Invoice','Bill Number']),C('party','Supplier','t',1,['Supplier Name','Vendor','Vendor Name','Party']),C('gstin','GSTIN','t',0,['Supplier GSTIN']),C('taxable','Taxable Amount','n',0,['Taxable','Taxable Value']),C('tax','GST','n',0,['Tax','GST Amount','Tax Amount']),C('amount','Total','n',1,['Total Amount','Amount','Bill Amount','Net Amount']),C('paid','Paid','n',0,['Paid Amount','Amount Paid']),C('remarks','Remarks','t',0,['Narration','Notes'])]},
+     2:{name:'Format 2 — Item-wise',cols:[C('date','Date','d',1,['Bill Date','Purchase Date']),C('no','Bill No','t',1,['Invoice No']),C('party','Supplier','t',1,['Supplier Name','Vendor','Party']),C('item','Item','t',1,['Item Name','Product','Description']),C('qty','Qty','n',0,['Quantity']),C('unit','Unit','t',0,['UOM']),C('rate','Rate','n',0,['Price']),C('taxpct','GST %','n',0,['Tax %','Tax Rate']),C('amount','Amount','n',1,['Line Total','Total'])]}}},
+   bank:{label:'Bank Transaction',icon:'🏦',dir:'',party:'',f:{
+     1:{name:'Format 1 — Debit / Credit columns',cols:[C('date','Date','d',1,['Txn Date','Transaction Date','Value Date']),C('narr','Narration','t',1,['Description','Particulars','Remarks']),C('no','Ref No','t',0,['Reference','Reference No','Cheque No','UTR','Chq/Ref No']),C('debit','Debit','n',0,['Withdrawal','Withdrawals','Dr','Debit Amount']),C('credit','Credit','n',0,['Deposit','Deposits','Cr','Credit Amount']),C('balance','Balance','n',0,['Closing Balance','Running Balance']),C('account','Account','t',0,['Bank Account','Account No'])]},
+     2:{name:'Format 2 — Amount + Dr/Cr',cols:[C('date','Date','d',1,['Txn Date','Transaction Date']),C('narr','Description','t',1,['Narration','Particulars']),C('no','Reference','t',0,['Ref No','UTR','Cheque No']),C('amount','Amount','n',1,['Txn Amount','Transaction Amount']),C('drcr','Dr/Cr','t',1,['Type','Txn Type','Cr/Dr','Transaction Type']),C('balance','Balance','n',0,['Closing Balance']),C('mode','Mode','t',0,['Channel','Payment Mode']),C('account','Account','t',0,['Bank Account'])]}}},
+   aggtxn:{label:'Aggregator Transaction (Swiggy / Zomato…)',icon:'🛵',dir:'IN',party:'PLATFORM',plat:1,f:{
+     1:{name:'Format 1 — Order summary',cols:[C('date','Order Date','d',1,['Date']),C('no','Order ID','t',1,['Order No','Order Number']),C('platform','Platform','t',0,['Aggregator']),C('gross','Gross Amount','n',1,['Gross','Order Value','Item Total']),C('disc','Discount','n',0,['Restaurant Discount']),C('comm','Commission','n',0,['Platform Commission','Service Fee']),C('tax','Taxes','n',0,['GST','Tax']),C('amount','Net Payable','n',0,['Net','Net Amount','Payout'])]},
+     2:{name:'Format 2 — Charge breakup',cols:[C('date','Order Date','d',1,['Date']),C('no','Order ID','t',1,['Order No']),C('platform','Platform','t',0,['Aggregator']),C('gross','Item Total','n',1,['Gross']),C('pack','Packaging','n',0,['Packaging Charges']),C('disc','Restaurant Discount','n',0,['Discount']),C('comm','Platform Fee','n',0,['Commission']),C('tax','GST on Fee','n',0,['GST','Tax']),C('amount','Net','n',0,['Net Payable','Net Amount','Payout'])]}}},
+   aggsettle:{label:'Aggregator Settlement (Swiggy / Zomato…)',icon:'💳',dir:'IN',party:'PLATFORM',plat:1,f:{
+     1:{name:'Format 1 — Settlement summary',cols:[C('date','Settlement Date','d',1,['Date','Payout Date']),C('no','UTR','t',1,['Reference','UTR No','Settlement ID','Payout ID']),C('platform','Platform','t',0,['Aggregator']),C('pfrom','Period From','d',0,['From Date']),C('pto','Period To','d',0,['To Date']),C('gross','Gross Sales','n',0,['Gross','Total Sales']),C('ded','Total Deductions','n',0,['Deductions']),C('amount','Net Settled','n',1,['Net Amount','Net Payout','Settlement Amount'])]},
+     2:{name:'Format 2 — Deduction breakup',cols:[C('date','Settlement Date','d',1,['Date','Payout Date']),C('no','UTR','t',1,['Reference','Settlement ID']),C('platform','Platform','t',0,['Aggregator']),C('orders','Orders','n',0,['No of Orders','Order Count']),C('gross','Sales','n',0,['Gross Sales']),C('comm','Commission','n',0,['Platform Fee']),C('tcs','TCS','n',0,[]),C('tds','TDS','n',0,[]),C('other','Other Deductions','n',0,['Other']),C('amount','Net Settled','n',1,['Net','Net Amount','Net Payout'])]}}},
+   receipt:{label:'Receipt',icon:'📥',dir:'IN',party:'CUSTOMER',f:{
+     1:{name:'Format 1 — Simple',cols:[C('date','Date','d',1,['Receipt Date']),C('no','Receipt No','t',1,['Voucher No','Receipt Number']),C('party','Party','t',1,['Received From','Customer','Party Name']),C('amount','Amount','n',1,['Received Amount','Receipt Amount']),C('mode','Mode','t',0,['Payment Mode']),C('ref','Ref No','t',0,['Reference','UTR','Cheque No']),C('narr','Narration','t',0,['Remarks','Notes'])]},
+     2:{name:'Format 2 — Against bill',cols:[C('date','Date','d',1,['Receipt Date']),C('no','Receipt No','t',1,['Voucher No']),C('party','Party','t',1,['Received From','Customer']),C('against','Against Bill','t',0,['Bill No','Invoice No','Reference Bill']),C('amount','Amount','n',1,['Received Amount']),C('mode','Mode','t',0,['Payment Mode']),C('account','Bank / Cash Account','t',0,['Account','Deposit To']),C('narr','Narration','t',0,['Remarks'])]}}},
+   payment:{label:'Payment',icon:'📤',dir:'OUT',party:'PAYEE',f:{
+     1:{name:'Format 1 — Simple',cols:[C('date','Date','d',1,['Payment Date']),C('no','Voucher No','t',1,['Payment No','Payment Number']),C('party','Paid To','t',1,['Party','Payee','Supplier']),C('amount','Amount','n',1,['Paid Amount','Payment Amount']),C('mode','Mode','t',0,['Payment Mode']),C('ref','Ref No','t',0,['Reference','UTR','Cheque No']),C('narr','Narration','t',0,['Remarks','Notes'])]},
+     2:{name:'Format 2 — Ledger / Against bill',cols:[C('date','Date','d',1,['Payment Date']),C('no','Voucher No','t',1,['Payment No']),C('party','Paid To','t',1,['Party','Payee']),C('ledger','Ledger / Category','t',0,['Ledger','Category','Expense Head']),C('against','Against Bill','t',0,['Bill No','Invoice No']),C('amount','Amount','n',1,['Paid Amount']),C('mode','Mode','t',0,['Payment Mode']),C('narr','Narration','t',0,['Remarks'])]}}}
+  };
+  var PLATFORMS=['Swiggy','Zomato','ONDC','Magicpin','Other'];
+
+  /* ───────────── parsing helpers ───────────── */
+  var MON={jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12};
+  function p2(n){return String(n).padStart(2,'0');}
+  function validYmd(y,m,d){ if(m<1||m>12||d<1||d>31||y<1990||y>2100) return ''; var t=new Date(y,m-1,d); return (t.getFullYear()===y&&t.getMonth()===m-1&&t.getDate()===d)?(y+'-'+p2(m)+'-'+p2(d)):''; }
+  function pDate(v){
+    if(v==null||v==='') return '';
+    if(v instanceof Date){ if(isNaN(v)) return ''; var x=new Date(v.getTime()+12*3600*1000); return validYmd(x.getFullYear(),x.getMonth()+1,x.getDate()); }
+    if(typeof v==='number'){ if(v>20000&&v<80000){ var d=new Date(Math.round((v-25569)*86400*1000)); return validYmd(d.getUTCFullYear(),d.getUTCMonth()+1,d.getUTCDate()); } return ''; }
+    var s=String(v).trim(), m;
+    if((m=s.match(/^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/))) return validYmd(+m[1],+m[2],+m[3]);
+    if((m=s.match(/^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4})/))){ var y=+m[3]; if(y<100) y+=2000; return validYmd(y,+m[2],+m[1]); }       // India: dd/mm/yyyy
+    if((m=s.match(/^(\d{1,2})[-\/ .]([A-Za-z]{3})[a-z]*[-\/ .,]*(\d{2,4})/))){ var y2=+m[3]; if(y2<100) y2+=2000; return validYmd(y2,MON[m[2].toLowerCase()]||0,+m[1]); }
+    if(/^\d{5}$/.test(s)) return pDate(+s);
+    return '';
+  }
+  function pNum(v){ if(v==null||v==='') return null; if(typeof v==='number') return isFinite(v)?v:null; var s=String(v).trim(); if(!s||/^[-–—]+$/.test(s)) return null;
+    var neg=/^\(.*\)$/.test(s)||/^-/.test(s); var n=parseFloat(s.replace(/[^0-9.]/g,'')); if(isNaN(n)) return null; return neg?-n:n; }
+  function nk(h){ return String(h==null?'':h).toLowerCase().replace(/[^a-z0-9]/g,''); }
+  function parseCSV(text){
+    var rows=[],row=[],f='',q=false,i=0; text=String(text).replace(/^\ufeff/,'');
+    for(;i<text.length;i++){ var c=text[i];
+      if(q){ if(c==='"'){ if(text[i+1]==='"'){f+='"';i++;} else q=false; } else f+=c; }
+      else if(c==='"') q=true; else if(c===','){row.push(f);f='';} else if(c==='\n'||c==='\r'){ if(c==='\r'&&text[i+1]==='\n') i++; row.push(f);f=''; rows.push(row); row=[]; } else f+=c; }
+    if(f!==''||row.length){row.push(f);rows.push(row);} return rows;
+  }
+  /* find header row + score each format */
+  function scoreFmt(hdr,spec){ var set={},hits=0,reqHit=0,req=0; hdr.forEach(function(h,i){ set[nk(h)]=i; });
+    spec.cols.forEach(function(c){ var f=c.al.some(function(a){return a in set;}); if(c.req) req++; if(f){hits++; if(c.req) reqHit++;} }); return {hits:hits,reqHit:reqHit,req:req}; }
+  function findHeader(rows,type){ var best={i:-1,s:-1};
+    for(var i=0;i<Math.min(rows.length,25);i++){ var r=rows[i]||[]; if(r.filter(function(x){return String(x==null?'':x).trim();}).length<2) continue;
+      [1,2].forEach(function(fm){ var sc=scoreFmt(r,SPEC[type].f[fm]), v=sc.reqHit*10+sc.hits; if(v>best.s) best={i:i,s:v,fmt:fm,sc:sc}; }); }
+    return best; }
+  function mapCols(hdr,spec){ var idx={}; hdr.forEach(function(h,i){ idx[nk(h)]=i; });
+    return spec.cols.map(function(c){ var at=-1; for(var j=0;j<c.al.length;j++){ if(c.al[j] in idx){at=idx[c.al[j]];break;} } return at; }); }
+
+  /* normalise one record → {date,ref,party,amount,dir,mode,item,gstin,qty} */
+  function normRec(type,fmt,r,ctx){
+    var sp=SPEC[type], o={date:r.date||'',ref:String(r.no||'').trim(),party:String(r.party||'').trim(),amount:0,dir:sp.dir,mode:String(r.mode||'').trim(),item:String(r.item||'').trim(),gstin:String(r.gstin||'').trim().toUpperCase(),qty:r.qty||0,platform:''};
+    var n=function(k){return Number(r[k])||0;};
+    if(type==='bank'){ o.party=''; o.ref=String(r.no||'').trim(); o.narr=String(r.narr||'').trim();
+      if(fmt===1){ if(n('credit')>0){o.dir='IN';o.amount=n('credit');} else {o.dir='OUT';o.amount=Math.abs(n('debit'));} }
+      else { o.amount=Math.abs(n('amount')); o.dir=/^c/i.test(String(r.drcr||'').trim())?'IN':'OUT'; } o.account=String(r.account||'').trim(); }
+    else if(type==='aggtxn'){ o.platform=String(r.platform||'').trim()||ctx.platform; o.party=o.platform;
+      o.amount=r.amount!=null&&r.amount!==''&&isFinite(r.amount)?Number(r.amount):(n('gross')+n('pack')-n('disc')-n('comm')-n('tax')); }
+    else if(type==='aggsettle'){ o.platform=String(r.platform||'').trim()||ctx.platform; o.party=o.platform; o.amount=Number(r.amount)||0; }
+    else o.amount=Math.abs(n('amount'));
+    return o;
+  }
+  function validate(type,fmt,vals,cols,ctx){
+    var rec={},err=[],spec=SPEC[type].f[fmt];
+    cols.forEach(function(c,i){ var v=vals[i]; var has=!(v==null||String(v).trim()==='');
+      if(c.type==='d'){ var d=has?pDate(v):''; if(has&&!d) err.push(c.label+' not a valid date ("'+v+'")'); else if(!has&&c.req) err.push(c.label+' missing'); rec[c.k]=d; }
+      else if(c.type==='n'){ var n=has?pNum(v):null; if(has&&n===null) err.push(c.label+' not a number ("'+v+'")'); else if(!has&&c.req&&!(type==='bank'&&(c.k==='debit'||c.k==='credit'))) err.push(c.label+' missing'); rec[c.k]=n; }
+      else { if(!has&&c.req) err.push(c.label+' missing'); rec[c.k]=has?String(v).trim():''; } });
+    if(type==='bank'&&fmt===1&&!(Math.abs(rec.debit||0)>0||Math.abs(rec.credit||0)>0)) err.push('Debit or Credit amount required');
+    if(type==='bank'&&fmt===2&&rec.drcr&&!/^(c|d)/i.test(rec.drcr)) err.push('Dr/Cr must be Dr or Cr');
+    var o=normRec(type,fmt,rec,ctx);
+    if(!(o.amount>0)&&!err.length) err.push('Amount must be greater than 0');
+    return {rec:rec,norm:o,err:err};
+  }
+  function hash(s){ var h=2166136261; for(var i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619); } return (h>>>0).toString(36); }
+  function keyOf(type,o){ return type+'|'+o.date+'|'+o.ref.toLowerCase()+'|'+o.party.toLowerCase()+'|'+o.item.toLowerCase()+'|'+(+o.qty||0)+'|'+o.dir+'|'+o.amount.toFixed(2)+(type==='bank'?'|'+hash(o.narr||''):''); }
+  /* rows (array of arrays) → processed list */
+  function process(type,fmt,rows,hi,ctx){
+    var spec=SPEC[type].f[fmt], hdr=rows[hi], map=mapCols(hdr,spec), missing=[];
+    spec.cols.forEach(function(c,i){ if(c.req&&map[i]<0&&!(type==='bank'&&fmt===1&&(c.k==='debit'||c.k==='credit'))) missing.push(c.label); });
+    if(type==='bank'&&fmt===1&&map[3]<0&&map[4]<0) missing.push('Debit / Credit');
+    var out=[],seen={};
+    if(missing.length) return {missing:missing,rows:out};
+    for(var i=hi+1;i<rows.length;i++){ var r=rows[i]||[]; if(!r.some(function(x){return String(x==null?'':x).trim();})) continue;
+      var first=String(r[0]==null?'':r[0]).trim(); if(/^(grand\s*)?total\b/i.test(first)||/^(opening|closing)\s+balance/i.test(first)) continue;
+      var vals=map.map(function(ix){return ix>=0?r[ix]:'';}), v=validate(type,fmt,vals,spec.cols,ctx), key=keyOf(type,v.norm), st='OK', msg='';
+      if(v.err.length){st='ERROR';msg=v.err.join('; ');} else if(seen[key]){st='DUP';msg='Duplicate inside this file';} seen[key]=1;
+      out.push({line:i+1,st:st,msg:msg,vals:vals.map(function(x){return x instanceof Date?pDate(x):(x==null?'':String(x));}),norm:v.norm,rec:v.rec,key:key}); }
+    return {missing:missing,rows:out};
+  }
+  window.BNX_IMPORT_CORE={SPEC:SPEC,pDate:pDate,pNum:pNum,parseCSV:parseCSV,findHeader:findHeader,process:process,keyOf:keyOf};
+
+  /* ───────────── local DB (IndexedDB): transactions + masters + batches ───────────── */
+  function cid(){ try{ return (typeof bnxCurrentClient_==='function'&&bnxCurrentClient_())||'default'; }catch(e){ return 'default'; } }
+  var DBP=null, MEM={tx:{},batches:{},master:{}};
+  function db(){ if(DBP) return DBP; DBP=new Promise(function(res,rej){ if(!window.indexedDB){ rej(new Error('IndexedDB unavailable')); return; }
+    var r=indexedDB.open('bnx_import_'+String(cid()).replace(/[^\w-]/g,''),1);
+    r.onupgradeneeded=function(){ var d=r.result; d.createObjectStore('tx',{keyPath:'id'}); d.createObjectStore('batches',{keyPath:'id'}); d.createObjectStore('master',{keyPath:'id'}); };
+    r.onsuccess=function(){res(r.result);}; r.onerror=function(){rej(r.error);}; }); return DBP; }
+  function dbAll(store){ return db().then(function(d){ return new Promise(function(res,rej){ var q=d.transaction(store).objectStore(store).getAll(); q.onsuccess=function(){res(q.result||[]);}; q.onerror=function(){rej(q.error);}; }); }).catch(function(){ return Object.keys(MEM[store]).map(function(k){return MEM[store][k];}); }); }
+  function dbPut(store,list){ if(!list.length) return Promise.resolve(); return db().then(function(d){ return new Promise(function(res,rej){ var t=d.transaction(store,'readwrite'),s=t.objectStore(store); list.forEach(function(x){s.put(x);}); t.oncomplete=function(){res();}; t.onerror=function(){rej(t.error);}; }); }).catch(function(){ list.forEach(function(x){MEM[store][x.id]=x;}); }); }
+  function dbDel(store,ids){ return db().then(function(d){ return new Promise(function(res,rej){ var t=d.transaction(store,'readwrite'),s=t.objectStore(store); ids.forEach(function(i){s.delete(i);}); t.oncomplete=function(){res();}; t.onerror=function(){rej(t.error);}; }); }).catch(function(){ ids.forEach(function(i){delete MEM[store][i];}); }); }
+
+  /* ───────────── file reading ───────────── */
+  function readFile(file){ return new Promise(function(res,rej){
+    var ext=(file.name.split('.').pop()||'').toLowerCase(), fr=new FileReader();
+    if(ext==='csv'||ext==='txt'||ext==='tsv'){ fr.onload=function(){res(parseCSV(fr.result));}; fr.onerror=function(){rej(fr.error);}; fr.readAsText(file); return; }
+    if(typeof XLSX==='undefined'){ rej(new Error('Excel reader not loaded — check your connection, or save the file as .csv and upload again')); return; }
+    fr.onload=function(){ try{ var wb=XLSX.read(fr.result,{type:'array',cellDates:true}); var ws=wb.Sheets[wb.SheetNames[0]]; res(XLSX.utils.sheet_to_json(ws,{header:1,raw:true,defval:'',blankrows:false})); }catch(e){rej(e);} };
+    fr.onerror=function(){rej(fr.error);}; fr.readAsArrayBuffer(file); }); }
+
+  /* ───────────── downloads ───────────── */
+  function save(blob,name){ var a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name; document.body.appendChild(a); a.click(); setTimeout(function(){URL.revokeObjectURL(a.href);a.remove();},1500); }
+  function csvText(aoa){ var q=function(v){v=String(v==null?'':v);return /[",\n\r]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;}; return '\ufeff'+aoa.map(function(r){return r.map(q).join(',');}).join('\r\n'); }
+  function stamp(){ var d=new Date(); return d.getFullYear()+p2(d.getMonth()+1)+p2(d.getDate()); }
+  var SAMPLE={d:'2026-10-01 (or 01/10/2026)',n:'1250.00',t:'text'};
+  function template(type,fmt,kind){ var sp=SPEC[type].f[fmt], hdr=sp.cols.map(function(c){return c.label;}), nm=type+'_format'+fmt+'_template';
+    if(kind==='csv'||typeof XLSX==='undefined'){ save(new Blob([csvText([hdr])],{type:'text/csv;charset=utf-8'}),nm+'.csv'); return; }
+    var wb=XLSX.utils.book_new(), ws=XLSX.utils.aoa_to_sheet([hdr]); ws['!cols']=hdr.map(function(h){return {wch:Math.max(14,h.length+4)};}); XLSX.utils.book_append_sheet(wb,ws,'Data');
+    var ins=[['Import template — '+SPEC[type].label+' · '+sp.name],['Fill the "Data" sheet from row 2. Columns are matched by header name, so the order does not matter, but every required column must be present.'],[],['Column','Required','Type','Accepted header names','Example']];
+    sp.cols.forEach(function(c){ ins.push([c.label,c.req?'YES':'no',c.type==='d'?'Date':c.type==='n'?'Number':'Text',c.al.slice(1).join(' / '),SAMPLE[c.type]]); });
+    ins.push([],['Dates: dd/mm/yyyy, dd-mm-yyyy, yyyy-mm-dd or dd-Mon-yyyy. Amounts: plain numbers (₹ and commas are ignored). Duplicate rows are detected and skipped.']);
+    var w2=XLSX.utils.aoa_to_sheet(ins); w2['!cols']=[{wch:24},{wch:10},{wch:10},{wch:60},{wch:28}]; XLSX.utils.book_append_sheet(wb,w2,'Instructions'); XLSX.writeFile(wb,nm+'.xlsx'); }
+
+  /* ───────────── server sync (batch, idempotent, retry) ───────────── */
+  function pickMasters(rows){ var m={}; rows.forEach(function(t){ addMaster(m,t); }); return Object.keys(m).map(function(k){return m[k];}); }
+  function addMaster(m,t){
+    var kind=SPEC[t.type].party; if(t.party&&kind){ var id=kind+'|'+t.party.toLowerCase(), x=m[id]||(m[id]={id:id,kind:kind,name:t.party,gstin:'',count:0,total:0,first:t.date,last:t.date,types:{},formats:{}});
+      if(t.gstin) x.gstin=t.gstin; x.count++; x.total+=t.amount*(t.dir==='OUT'?-1:1); if(t.date<x.first) x.first=t.date; if(t.date>x.last) x.last=t.date; x.types[t.type]=(x.types[t.type]||0)+1; x.formats['F'+t.fmt]=(x.formats['F'+t.fmt]||0)+1; }
+    if(t.item){ var iid='ITEM|'+t.item.toLowerCase(), y=m[iid]||(m[iid]={id:iid,kind:'ITEM',name:t.item,gstin:'',count:0,total:0,first:t.date,last:t.date,types:{},formats:{}});
+      y.count++; y.total+=t.amount; if(t.date<y.first) y.first=t.date; if(t.date>y.last) y.last=t.date; y.types[t.type]=(y.types[t.type]||0)+1; y.formats['F'+t.fmt]=(y.formats['F'+t.fmt]||0)+1; }
+    if(t.type==='bank'&&t.account){ var bid='BANK|'+t.account.toLowerCase(), z=m[bid]||(m[bid]={id:bid,kind:'BANK',name:t.account,gstin:'',count:0,total:0,first:t.date,last:t.date,types:{},formats:{}});
+      z.count++; z.total+=t.amount*(t.dir==='OUT'?-1:1); if(t.date<z.first) z.first=t.date; if(t.date>z.last) z.last=t.date; z.types.bank=(z.types.bank||0)+1; z.formats['F'+t.fmt]=(z.formats['F'+t.fmt]||0)+1; }
+  }
+  async function upsertMasters(rows){ var cur=await dbAll('master'), by={}; cur.forEach(function(x){by[x.id]=x;});
+    pickMasters(rows).forEach(function(n){ var o=by[n.id]; if(!o){ by[n.id]=n; return; }
+      o.count+=n.count; o.total+=n.total; if(n.gstin) o.gstin=n.gstin; if(n.first<o.first) o.first=n.first; if(n.last>o.last) o.last=n.last;
+      Object.keys(n.types).forEach(function(k){o.types[k]=(o.types[k]||0)+n.types[k];}); Object.keys(n.formats).forEach(function(k){o.formats[k]=(o.formats[k]||0)+n.formats[k];}); });
+    await dbPut('master',Object.keys(by).map(function(k){return by[k];})); }
+  async function syncPending(onProgress){
+    var all=await dbAll('tx'), pend=all.filter(function(t){return t.status!=='SYNCED';}), groups={};
+    pend.forEach(function(t){ var k=t.batchId+'|'+t.type+'|'+t.fmt; (groups[k]=groups[k]||[]).push(t); });
+    var ok=0,fail=0,lastErr='';
+    for(var g in groups){ var list=groups[g];
+      for(var i=0;i<list.length;i+=200){ var chunk=list.slice(i,i+200);
+        var payload={requestId:'imp_'+hash(g+'|'+i+'|'+chunk[0].id),source:'Import Center',type:chunk[0].type,format:chunk[0].fmt,batchId:chunk[0].batchId,
+          rows:chunk.map(function(t){return {id:t.id,date:t.date,ref:t.ref,party:t.party,item:t.item,qty:t.qty,amount:t.amount,dir:t.dir,mode:t.mode,platform:t.platform,gstin:t.gstin,narr:t.narr||'',account:t.account||'',data:t.data};}),masters:pickMasters(chunk)};
+        var r; try{ r=await gasApi('IMPORT_TRANSACTIONS',payload,'V2_CORE'); }catch(e){ r={success:false,error:e.message}; }
+        var good=!!(r&&r.success); chunk.forEach(function(t){ t.status=good?'SYNCED':'PENDING'; t.syncError=good?'':String((r&&r.error)||'Server did not accept'); t.syncedAt=good?Date.now():0; });
+        await dbPut('tx',chunk); if(good) ok+=chunk.length; else {fail+=chunk.length; lastErr=String((r&&r.error)||'Server did not accept');}
+        if(onProgress) onProgress(ok+fail,pend.length); if(!good) break; }
+    }
+    return {ok:ok,fail:fail,err:lastErr}; }
+
+  /* ───────────── modal UI ───────────── */
+  var ST={type:'sales',fmt:1,platform:'Swiggy',tab:'import',res:null,file:'',inclDup:false,busy:'',msg:''}, root=null;
+  function css(){ if(document.getElementById('bnx-imp-css')) return; var s=document.createElement('style'); s.id='bnx-imp-css'; s.textContent=
+   '#bnxImp{position:fixed;inset:0;z-index:100000;background:rgba(15,23,42,.55);display:flex;align-items:center;justify-content:center;padding:12px}'+
+   '#bnxImp .bi-box{background:var(--surface,#fff);color:var(--text,#18212b);width:min(1080px,98vw);max-height:94vh;display:flex;flex-direction:column;border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.35);overflow:hidden;font-size:13px}'+
+   '#bnxImp .bi-h{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid rgba(0,0,0,.1);font-weight:800;font-size:15px}#bnxImp .bi-h .sp{flex:1}'+
+   '#bnxImp .bi-tabs{display:flex;gap:4px;padding:8px 16px 0}#bnxImp .bi-tab{border:0;background:none;padding:8px 14px;border-radius:8px 8px 0 0;cursor:pointer;font:inherit;font-weight:700;color:inherit;opacity:.65}#bnxImp .bi-tab.on{opacity:1;background:rgba(49,113,155,.12);color:#31719B}'+
+   '#bnxImp .bi-b{padding:14px 16px;overflow:auto;flex:1}#bnxImp .bi-row{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-bottom:12px}#bnxImp label.f{display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;opacity:.85}'+
+   '#bnxImp select,#bnxImp input[type=text]{padding:8px 10px;border:1px solid rgba(0,0,0,.2);border-radius:8px;font:inherit;background:var(--surface,#fff);color:inherit;min-width:170px}'+
+   '#bnxImp .bi-btn{border:1px solid rgba(0,0,0,.18);background:var(--surface,#fff);color:inherit;padding:8px 12px;border-radius:8px;cursor:pointer;font:inherit;font-weight:700}#bnxImp .bi-btn.p{background:#31719B;color:#fff;border-color:#31719B}#bnxImp .bi-btn.g{background:#16a34a;color:#fff;border-color:#16a34a}#bnxImp .bi-btn:disabled{opacity:.45;cursor:not-allowed}'+
+   '#bnxImp .bi-drop{border:2px dashed #31719B;border-radius:12px;padding:18px;text-align:center;cursor:pointer;background:rgba(49,113,155,.06);margin-bottom:12px}#bnxImp .bi-drop.hot{background:rgba(49,113,155,.18)}'+
+   '#bnxImp .bi-chips{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}#bnxImp .chip{padding:6px 10px;border-radius:999px;font-weight:700;font-size:12px;background:rgba(0,0,0,.06)}#bnxImp .chip.ok{background:#dcfce7;color:#166534}#bnxImp .chip.er{background:#fee2e2;color:#991b1b}#bnxImp .chip.du{background:#fef3c7;color:#92400e}'+
+   '#bnxImp .bi-note{padding:9px 12px;border-radius:8px;font-size:12px;margin:8px 0;background:rgba(49,113,155,.1)}#bnxImp .bi-note.er{background:#fee2e2;color:#991b1b}#bnxImp .bi-note.ok{background:#dcfce7;color:#166534}#bnxImp .bi-note.wa{background:#fef3c7;color:#92400e}'+
+   '#bnxImp .bi-tw{overflow:auto;max-height:42vh;border:1px solid rgba(0,0,0,.12);border-radius:8px}#bnxImp table{border-collapse:collapse;width:100%;font-size:11.5px}#bnxImp th{position:sticky;top:0;background:#FC7D72;color:#fff;padding:6px 8px;text-align:left;white-space:nowrap}#bnxImp td{padding:5px 8px;border-top:1px solid rgba(0,0,0,.08);white-space:nowrap;max-width:260px;overflow:hidden;text-overflow:ellipsis}'+
+   '#bnxImp tr.ER td{background:#fff1f2}#bnxImp tr.DUP td{background:#fffbeb}#bnxImp .bi-f{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 16px;border-top:1px solid rgba(0,0,0,.1)}'; document.head.appendChild(s); }
+  function ensureRoot(){ css(); if(root&&document.body.contains(root)) return root; root=document.createElement('div'); root.id='bnxImp'; root.addEventListener('click',onClick); root.addEventListener('change',onChange);
+    root.addEventListener('dragover',function(e){e.preventDefault();}); root.addEventListener('drop',function(e){ var f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0]; if(f){e.preventDefault();handleFile(f);} }); document.body.appendChild(root); return root; }
+  function close(){ if(root){root.remove();root=null;} }
+  function opts(list,sel){ return list.map(function(o){return '<option value="'+E(o[0])+'"'+(String(o[0])===String(sel)?' selected':'')+'>'+E(o[1])+'</option>';}).join(''); }
+  function chips(res){ var c={OK:0,ERROR:0,DUP:0,amt:0}; res.rows.forEach(function(r){ c[r.st]++; if(r.st==='OK') c.amt+=r.norm.amount*(r.norm.dir==='OUT'?-1:1); });
+    return '<div class="bi-chips"><span class="chip">Rows: '+res.rows.length+'</span><span class="chip ok">✔ Ready: '+c.OK+'</span><span class="chip du">⚠ Duplicates: '+c.DUP+'</span><span class="chip er">✖ Errors: '+c.ERROR+'</span><span class="chip">Net amount: ₹'+M(c.amt)+'</span></div>'; }
+  function viewImport(){
+    var sp=SPEC[ST.type], fm=sp.f[ST.fmt], h='<div class="bi-row">'+
+      '<label class="f">Import type<select data-k="type">'+opts(Object.keys(SPEC).map(function(k){return [k,SPEC[k].icon+' '+SPEC[k].label];}),ST.type)+'</select></label>'+
+      '<label class="f">Format<select data-k="fmt">'+opts([[1,sp.f[1].name],[2,sp.f[2].name]],ST.fmt)+'</select></label>'+
+      (sp.plat?'<label class="f">Platform (if file has no Platform column)<select data-k="platform">'+opts(PLATFORMS.map(function(p){return [p,p];}),ST.platform)+'</select></label>':'')+
+      '<span style="flex:1"></span><button class="bi-btn" data-act="tpl-x">⬇ Template (Excel)</button><button class="bi-btn" data-act="tpl-c">⬇ Template (CSV)</button></div>'+
+      '<div class="bi-note"><b>'+E(fm.name)+'</b> — columns: '+fm.cols.map(function(c){return (c.req?'<b>'+E(c.label)+'*</b>':E(c.label));}).join(' · ')+'</div>'+
+      '<div class="bi-drop" data-act="pick">⬆ <b>Click to choose a file</b> or drop it here (.xlsx · .xls · .csv)'+(ST.file?'<div style="margin-top:6px;font-size:12px">Loaded: <b>'+E(ST.file)+'</b></div>':'')+'<input type="file" id="bnxImpFile" accept=".xlsx,.xls,.csv,.tsv,.txt" style="display:none"></div>';
+    if(ST.msg) h+=ST.msg; var res=ST.res;
+    if(res){ if(res.missing&&res.missing.length) h+='<div class="bi-note er">❌ Required column(s) not found for this format: <b>'+E(res.missing.join(', '))+'</b>. Download the template, or switch Format above.</div>';
+      else{ h+=chips(res)+'<div class="bi-tw"><table><thead><tr><th>#</th><th>Status</th>'+fm.cols.map(function(c){return '<th>'+E(c.label)+'</th>';}).join('')+'</tr></thead><tbody>'+
+        res.rows.slice(0,300).map(function(r){ return '<tr class="'+(r.st==='OK'?'':r.st)+'"><td>'+r.line+'</td><td>'+(r.st==='OK'?'✔':r.st==='DUP'?'⚠ '+E(r.msg):'✖ '+E(r.msg))+'</td>'+r.vals.map(function(v){return '<td title="'+E(v)+'">'+E(v)+'</td>';}).join('')+'</tr>'; }).join('')+'</tbody></table></div>'+(res.rows.length>300?'<div style="font-size:11px;opacity:.7;margin-top:4px">Showing first 300 of '+res.rows.length+' rows (all rows are validated and will be saved).</div>':'')+
+        '<label style="display:flex;gap:6px;align-items:center;margin-top:8px"><input type="checkbox" data-k="inclDup"'+(ST.inclDup?' checked':'')+'> Also import rows flagged as duplicates (already saved earlier or repeated in file)</label>'; } }
+    return h; }
+  function viewSaved(){ var h='<div class="bi-note" id="biSavedNote">Loading saved data…</div><div id="biSaved"></div>'; setTimeout(loadSaved,0); return h; }
+  async function loadSaved(){ var box=document.getElementById('biSaved'); if(!box) return; var tx=await dbAll('tx'), ms=await dbAll('master'), bs=await dbAll('batches'), g={};
+    tx.forEach(function(t){ var k=t.type+'|'+t.fmt, x=g[k]||(g[k]={type:t.type,fmt:t.fmt,n:0,sy:0,pe:0,amt:0}); x.n++; if(t.status==='SYNCED') x.sy++; else x.pe++; x.amt+=t.amount*(t.dir==='OUT'?-1:1); });
+    var pend=tx.filter(function(t){return t.status!=='SYNCED';}).length, note=document.getElementById('biSavedNote');
+    if(note){ note.className='bi-note '+(pend?'wa':'ok'); note.innerHTML=tx.length?(pend?'⏳ <b>'+pend+'</b> transaction(s) are saved on this device but <b>not yet on the server</b>'+(tx.find(function(t){return t.syncError;})?' — '+E(tx.find(function(t){return t.syncError;}).syncError):'')+'. Use “Sync now” to retry. They are safe and downloadable.':'✅ All '+tx.length+' saved transaction(s) are synced.'):'Nothing imported yet.'; }
+    var rows=Object.keys(g).sort().map(function(k){return g[k];});
+    box.innerHTML=(rows.length?'<div class="bi-tw"><table><thead><tr><th>Type</th><th>Format</th><th>Transactions</th><th>Synced</th><th>Pending</th><th>Net amount</th><th></th></tr></thead><tbody>'+rows.map(function(x){ return '<tr><td>'+E(SPEC[x.type].icon+' '+SPEC[x.type].label)+'</td><td>Format '+x.fmt+'</td><td>'+x.n+'</td><td>'+x.sy+'</td><td>'+x.pe+'</td><td>₹'+M(x.amt)+'</td><td><button class="bi-btn" data-act="dl-one" data-t="'+x.type+'" data-f="'+x.fmt+'">⬇ Excel</button> <button class="bi-btn" data-act="dl-csv" data-t="'+x.type+'" data-f="'+x.fmt+'">⬇ CSV</button></td></tr>'; }).join('')+'</tbody></table></div>':'')+
+      '<div class="bi-row" style="margin-top:12px"><button class="bi-btn p" data-act="dl-all">⬇ Download everything (Excel: transactions format-wise + masters)</button><button class="bi-btn" data-act="dl-master">⬇ Master DB only</button><button class="bi-btn g" data-act="sync"'+(pend?'':' disabled')+'>🔄 Sync now</button></div>'+
+      '<div style="font-weight:800;margin:14px 0 6px">Master DB — '+ms.length+' record(s)</div>'+(ms.length?'<div class="bi-tw" style="max-height:24vh"><table><thead><tr><th>Kind</th><th>Name</th><th>GSTIN</th><th>Txns</th><th>Net</th><th>First</th><th>Last</th><th>Formats</th></tr></thead><tbody>'+ms.sort(function(a,b){return b.count-a.count;}).slice(0,100).map(function(m){return '<tr><td>'+E(m.kind)+'</td><td>'+E(m.name)+'</td><td>'+E(m.gstin)+'</td><td>'+m.count+'</td><td>₹'+M(m.total)+'</td><td>'+E(m.first)+'</td><td>'+E(m.last)+'</td><td>'+E(Object.keys(m.formats).join(', '))+'</td></tr>';}).join('')+'</tbody></table></div>':'<div style="opacity:.7">No master records yet.</div>')+
+      (bs.length?'<div style="font-weight:800;margin:14px 0 6px">Import history</div><div class="bi-tw" style="max-height:20vh"><table><thead><tr><th>When</th><th>Type</th><th>Format</th><th>File</th><th>Saved</th><th>Net</th><th></th></tr></thead><tbody>'+bs.sort(function(a,b){return b.at-a.at;}).slice(0,30).map(function(b){return '<tr><td>'+E(new Date(b.at).toLocaleString('en-IN'))+'</td><td>'+E(SPEC[b.type]?SPEC[b.type].label:b.type)+'</td><td>F'+b.fmt+'</td><td>'+E(b.file)+'</td><td>'+b.saved+'</td><td>₹'+M(b.amount)+'</td><td><button class="bi-btn" data-act="del-batch" data-b="'+E(b.id)+'">🗑 Delete</button></td></tr>';}).join('')+'</tbody></table></div>':''); }
+  function render(){ var r=ensureRoot(), ok=ST.res&&!ST.res.missing.length?ST.res.rows.filter(function(x){return x.st==='OK'||(ST.inclDup&&x.st==='DUP');}).length:0, er=ST.res&&ST.res.rows?ST.res.rows.filter(function(x){return x.st==='ERROR';}).length:0;
+    r.innerHTML='<div class="bi-box"><div class="bi-h"><span>⬆ Import Center</span><span class="sp"></span><button class="bi-btn" data-act="close">✕ Close</button></div>'+
+      '<div class="bi-tabs"><button class="bi-tab'+(ST.tab==='import'?' on':'')+'" data-act="tab-import">⬆ Import</button><button class="bi-tab'+(ST.tab==='saved'?' on':'')+'" data-act="tab-saved">📚 Saved data & downloads</button></div>'+
+      '<div class="bi-b">'+(ST.tab==='import'?viewImport():viewSaved())+'</div>'+
+      (ST.tab==='import'?'<div class="bi-f"><button class="bi-btn g" data-act="save"'+(ok&&!ST.busy?'':' disabled')+'>💾 Save '+ok+' transaction(s) to DB & Master</button>'+(er?'<button class="bi-btn" data-act="dl-err">⬇ Download '+er+' error row(s)</button>':'')+'<span style="flex:1"></span><span style="font-size:12px;opacity:.8">'+E(ST.busy)+'</span></div>':'')+'</div>'; }
+  async function handleFile(file){ ST.file=file.name; ST.msg=''; ST.res=null; ST.busy='Reading file…'; render();
+    try{ var rows=await readFile(file); var hd=findHeader(rows,ST.type);
+      if(hd.i<0){ ST.busy=''; ST.msg='<div class="bi-note er">❌ Could not find a header row for this import type. Download the template and use its column names.</div>'; render(); return; }
+      if(hd.fmt!==ST.fmt){ var cur=scoreFmt(rows[hd.i],SPEC[ST.type].f[ST.fmt]); if(hd.sc.reqHit>cur.reqHit||(hd.sc.reqHit===cur.reqHit&&hd.sc.hits>cur.hits)){ ST.fmt=hd.fmt; ST.msg='<div class="bi-note">ℹ️ Columns match <b>Format '+hd.fmt+'</b> better — switched automatically.</div>'; } }
+      var res=process(ST.type,ST.fmt,rows,hd.i,{platform:ST.platform}); ST.busy='Checking duplicates…'; render();
+      if(!res.missing.length){ var have={}; (await dbAll('tx')).forEach(function(t){have[t.key]=1;}); res.rows.forEach(function(r){ if(r.st==='OK'&&have[r.key]){r.st='DUP';r.msg='Already imported earlier';} }); }
+      ST.res=res; ST.busy=''; }catch(e){ ST.busy=''; ST.msg='<div class="bi-note er">❌ '+E(e.message||e)+'</div>'; } render(); }
+  async function doSave(){ var res=ST.res; if(!res) return; var take=res.rows.filter(function(x){return x.st==='OK'||(ST.inclDup&&x.st==='DUP');}); if(!take.length) return;
+    ST.busy='Saving…'; render(); var batch='B'+Date.now().toString(36), now=Date.now(), spec=SPEC[ST.type].f[ST.fmt], used={};
+    var recs=take.map(function(r,i){ var id=hash(r.key); if(used[id]||r.st==='DUP') id=id+'_'+batch+'_'+i; used[id]=1; var d={}; spec.cols.forEach(function(c,j){d[c.label]=r.vals[j];});
+      var n=r.norm; return {id:id,key:r.key,type:ST.type,fmt:ST.fmt,batchId:batch,date:n.date,ref:n.ref,party:n.party,item:n.item,qty:n.qty,amount:n.amount,dir:n.dir,mode:n.mode,platform:n.platform,gstin:n.gstin,narr:n.narr||'',account:n.account||'',data:d,status:'PENDING',syncError:'',createdAt:now}; });
+    try{ await dbPut('tx',recs); await upsertMasters(recs); await dbPut('batches',[{id:batch,type:ST.type,fmt:ST.fmt,file:ST.file,saved:recs.length,amount:recs.reduce(function(s,t){return s+t.amount*(t.dir==='OUT'?-1:1);},0),at:now}]); }
+    catch(e){ ST.busy=''; ST.msg='<div class="bi-note er">❌ Save failed: '+E(e.message)+'</div>'; render(); return; }
+    ST.busy='Syncing to server…'; render(); var s=await syncPending(function(a,b){ ST.busy='Syncing '+a+' / '+b+'…'; render(); });
+    ST.busy=''; ST.res=null; ST.file='';
+    ST.msg='<div class="bi-note ok">✅ <b>'+recs.length+'</b> transaction(s) saved to the Transaction DB and Master DB (Format '+ST.fmt+').'+(s.fail?'</div><div class="bi-note wa">⏳ '+s.fail+' not yet accepted by the server ('+E(s.err)+'). They are stored safely on this device — open “Saved data & downloads” → Sync now to retry, or download them.':' Server sync complete.')+'</div>'; toast('✅ Imported '+recs.length+' transaction(s)','success'); render(); }
+  /* downloads of saved data (format-wise sheets + masters) */
+  function rowsFor(list,type,fmt){ var sp=SPEC[type].f[fmt], h=sp.cols.map(function(c){return c.label;}).concat(['Direction','Net Amount','Status','Batch']);
+    return [h].concat(list.map(function(t){ return sp.cols.map(function(c){return t.data&&t.data[c.label]!=null?t.data[c.label]:'';}).concat([t.dir,t.amount,t.status,t.batchId]); })); }
+  function masterAoa(ms){ return [['Kind','Name','GSTIN','Transactions','Net Amount','First Date','Last Date','Types','Formats']].concat(ms.map(function(m){return [m.kind,m.name,m.gstin,m.count,m.total,m.first,m.last,Object.keys(m.types).join(', '),Object.keys(m.formats).join(', ')];})); }
+  async function dlSaved(kind,type,fmt){ var tx=await dbAll('tx'), ms=await dbAll('master'); if(!tx.length&&kind!=='master'){ toast('⚠️ Nothing saved yet.','error'); return; }
+    if(kind==='csv'){ save(new Blob([csvText(rowsFor(tx.filter(function(t){return t.type===type&&String(t.fmt)===String(fmt);}),type,+fmt))],{type:'text/csv;charset=utf-8'}),type+'_format'+fmt+'_saved_'+stamp()+'.csv'); return; }
+    if(typeof XLSX==='undefined'){ toast('⚠️ Excel engine not loaded — use the CSV download.','error'); return; }
+    var wb=XLSX.utils.book_new(), add=function(a,n){ var ws=XLSX.utils.aoa_to_sheet(a); XLSX.utils.book_append_sheet(wb,ws,n.slice(0,31)); };
+    if(kind==='one') add(rowsFor(tx.filter(function(t){return t.type===type&&String(t.fmt)===String(fmt);}),type,+fmt),SPEC[type].label+' F'+fmt);
+    else if(kind==='all') Object.keys(SPEC).forEach(function(tp){ [1,2].forEach(function(f){ var l=tx.filter(function(t){return t.type===tp&&t.fmt===f;}); if(l.length) add(rowsFor(l,tp,f),SPEC[tp].label.split(' (')[0]+' F'+f); }); });
+    if(kind==='all'||kind==='master'){ add(masterAoa(ms.filter(function(m){return /CUSTOMER|SUPPLIER|PAYEE|PLATFORM/.test(m.kind);})),'Master - Parties'); add(masterAoa(ms.filter(function(m){return m.kind==='ITEM';})),'Master - Items'); add(masterAoa(ms.filter(function(m){return m.kind==='BANK';})),'Master - Banks'); }
+    XLSX.writeFile(wb,'Import_DB_'+(kind==='one'?type+'_F'+fmt+'_':kind==='master'?'Master_':'')+stamp()+'.xlsx'); }
+  function dlErrors(){ var res=ST.res; if(!res) return; var sp=SPEC[ST.type].f[ST.fmt], aoa=[['Line','Status','Reason'].concat(sp.cols.map(function(c){return c.label;}))];
+    res.rows.filter(function(r){return r.st==='ERROR';}).forEach(function(r){aoa.push([r.line,r.st,r.msg].concat(r.vals));}); save(new Blob([csvText(aoa)],{type:'text/csv;charset=utf-8'}),ST.type+'_errors_'+stamp()+'.csv'); }
+  async function onClick(e){ var b=e.target.closest('[data-act]'); if(!b){ if(e.target===root) close(); return; } var a=b.getAttribute('data-act');
+    if(a==='close') close(); else if(a==='tab-import'){ST.tab='import';render();} else if(a==='tab-saved'){ST.tab='saved';render();}
+    else if(a==='tpl-x') template(ST.type,ST.fmt,'xlsx'); else if(a==='tpl-c') template(ST.type,ST.fmt,'csv');
+    else if(a==='pick'){ var f=document.getElementById('bnxImpFile'); if(f){ f.onchange=function(){ if(f.files[0]) handleFile(f.files[0]); }; f.click(); } }
+    else if(a==='save') doSave(); else if(a==='dl-err') dlErrors();
+    else if(a==='dl-all') dlSaved('all'); else if(a==='dl-master') dlSaved('master'); else if(a==='dl-one') dlSaved('one',b.dataset.t,b.dataset.f); else if(a==='dl-csv') dlSaved('csv',b.dataset.t,b.dataset.f);
+    else if(a==='sync'){ b.disabled=true; var s=await syncPending(); toast(s.fail?'⚠️ '+s.fail+' still pending: '+s.err:'✅ Synced '+s.ok+' transaction(s)',s.fail?'error':'success'); loadSaved(); }
+    else if(a==='del-batch'){ var id=b.dataset.b, tx=await dbAll('tx'), mine=tx.filter(function(t){return t.batchId===id;}); if(mine.some(function(t){return t.status==='SYNCED';})){ toast('⚠️ This batch is already on the server — delete it there, not here.','error'); return; }
+      if(!confirm('Delete this import batch ('+mine.length+' transactions) from this device? Master counts are not reduced.')) return; await dbDel('tx',mine.map(function(t){return t.id;})); await dbDel('batches',[id]); loadSaved(); } }
+  function onChange(e){ var k=e.target.getAttribute&&e.target.getAttribute('data-k'); if(!k) return;
+    if(k==='inclDup'){ ST.inclDup=e.target.checked; render(); return; }
+    ST[k]=(k==='fmt')?+e.target.value:e.target.value; if(k==='type'){ ST.fmt=1; } ST.res=null; ST.file=''; ST.msg=''; render(); }
+  document.addEventListener('keydown',function(e){ if(e.key==='Escape'&&root) close(); });
+
+  /* ───────────── "⬆ Import ▾" dropdown on the relevant pages ───────────── */
+  var menu=null; function closeMenu(){ if(menu){menu.remove();menu=null;} }
+  function openMenu(btn){ var was=menu&&menu.__f===btn; closeMenu(); if(was) return; menu=document.createElement('div'); menu.__f=btn;
+    menu.style.cssText='position:fixed;z-index:99999;background:#fff;color:#18212b;border:1px solid rgba(0,0,0,.15);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.18);padding:4px;min-width:290px;font-size:13px';
+    var items=Object.keys(SPEC).map(function(k){return [SPEC[k].icon+'  '+SPEC[k].label,function(){open(k);}];}).concat([['—'],['📚  Saved imports & downloads',function(){open(null,'saved');}]]);
+    items.forEach(function(it){ if(it[0]==='—'){ var hr=document.createElement('div'); hr.style.cssText='border-top:1px solid #e5e7eb;margin:4px 0'; menu.appendChild(hr); return; }
+      var x=document.createElement('button'); x.type='button'; x.textContent=it[0]; x.style.cssText='display:block;width:100%;text-align:left;border:0;background:none;padding:9px 12px;border-radius:7px;cursor:pointer;font:inherit;color:inherit';
+      x.onmouseenter=function(){x.style.background='#f1f5f9';}; x.onmouseleave=function(){x.style.background='none';}; x.onclick=function(ev){ev.stopPropagation();closeMenu();it[1]();}; menu.appendChild(x); });
+    document.body.appendChild(menu); var r=btn.getBoundingClientRect(); menu.style.top=(r.bottom+6)+'px'; menu.style.left=Math.max(8,Math.min(r.left,innerWidth-menu.offsetWidth-8))+'px'; }
+  document.addEventListener('click',function(e){ if(menu&&!menu.contains(e.target)&&!(e.target.closest&&e.target.closest('.bnx-imp-btn'))) closeMenu(); });
+  function open(type,tab){ if(type){ ST.type=type; ST.fmt=1; ST.res=null; ST.file=''; ST.msg=''; } ST.tab=tab||'import'; render(); }
+  window.bnxImportOpen_=open;
+  window.BNX_IMPORT_CORE.ui={ST:ST,handleFile:handleFile,doSave:doSave,dbAll:dbAll,syncPending:syncPending,open:open,dlSaved:dlSaved};
+  var PAGES=['page-accounts-ledger','page-reports','page-aggregator-settlement','page-order-register','page-bills-list','page-due-collection','page-customer-credit','page-settlement','page-online-orders'];
+  function install(){ PAGES.forEach(function(id){ var pg=document.getElementById(id); if(!pg||pg.querySelector('.bnx-imp-btn')) return;
+      var host=pg.querySelector('.section-h > div:last-child')||pg.querySelector('.section-h');
+      var b=document.createElement('button'); b.type='button'; b.className='btn btn-sm btn-ghost bnx-imp-btn'; b.textContent='⬆ Import ▾'; b.title='Import Sales, Purchase, Bank, Aggregator, Receipt, Payment (Format 1 / Format 2)'; b.onclick=function(e){e.stopPropagation();openMenu(b);};
+      if(host){ host.insertBefore(b,host.firstChild?host.querySelector('.or-views')||null:null); if(b.parentNode!==host) host.appendChild(b); }
+      else { var row=document.createElement('div'); row.style.cssText='display:flex;justify-content:flex-end;padding:6px 0'; row.appendChild(b); pg.insertBefore(row,pg.firstChild); } }); }
+  install(); document.addEventListener('DOMContentLoaded',function(){ install(); setTimeout(install,1500); setTimeout(install,4000); });
+  document.addEventListener('click',function(){ setTimeout(install,400); },true);
+})();
+</script>
+
 </body></html>
