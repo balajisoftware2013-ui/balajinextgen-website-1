@@ -5879,6 +5879,15 @@ function mapRow(m,isBarDefault){
    runs through loadBootstrapOrFallback() where that local const is not
    in scope. Keep this mapper global so bootstrap can never throw
    ReferenceError: mapRow is not defined. */
+/* item available? accepts true/false, Yes/No, 1/0 and the dashboard's text status (available / limited / unavailable /
+   not available / out of stock / inactive) in avail, availability, AVAILABILITY_STATUS, AVAILABLE, IS_ACTIVE, status */
+function bnxItemAvail_(m){
+  m=m||{};
+  var vals=[m.avail,m.availability,m.availabilityStatus,m.AVAILABILITY_STATUS,m.AVAILABLE,m.available,m.IS_ACTIVE,m.isActive,m.status,m.STATUS];
+  for(var i=0;i<vals.length;i++){ var v=vals[i]; if(v===false) return false; if(v==null||v===''||v===true) continue;
+    if(/^(no|n|0|false|unavailable|not ?available|out ?of ?stock|inactive|disabled|off|hidden|86)$/i.test(String(v).trim())) return false; }
+  return true;
+}
 function bnxMapMenuRow_(m,isBarDefault){
   m=m||{};
   const bar=!!(isBarDefault===true || m.isBar===true || m.IS_BAR===true ||
@@ -5889,7 +5898,7 @@ function bnxMapMenuRow_(m,isBarDefault){
     cat:m.category||m.CATEGORY||m.c||m.CATEGORY_NAME||'Other',
     price:parseFloat(m.price ?? m.PRICE ?? m.p) || 0,
     icon:m.icon||m.ICON||m.e||m.emoji||m.ICON_KEY||m.CATEGORY_ICON||m.PRODUCT_ICON_KEY||bnxDefaultIcon(m.category||m.CATEGORY||m.c),
-    avail:m.avail!==false && m.AVAILABLE!==false,
+    avail:bnxItemAvail_(m),   /* 2026-10-09: "unavailable" (text) counted as available — every not-available item still showed */
     gst:Number(m.gst ?? m.GST ?? m.GST_RATE ?? m.TAX_RATE)||0,
     group:m.group||m.itemGroup||m.ITEM_GROUP||m.ITEM_GROUP_NAME||m.GROUP_NAME||'',
     groupType:m.groupType||m.GROUP_TYPE||m.group_type||m.itemGroupType||m.ITEM_GROUP_TYPE||'',
@@ -10463,6 +10472,8 @@ function bnxGetFilteredMenu_(){
   bnxFixMenuGroups_();
   const q = String(menuSearchQuery||'').trim().toLowerCase();
   let filtered = Array.isArray(MENU) ? MENU.slice() : [];
+  /* POS › Steward App Control › "Hide not-available items" (default ON) */
+  if(!(window.__bnxStwCtl && window.__bnxStwCtl.hideUnavailable===false)) filtered=filtered.filter(function(m){ return m && m.avail!==false && bnxItemAvail_(m); });
   if(menuTypeFilter==='FOOD') filtered=filtered.filter(m=>!bnxMenuIsBar_(m));
   else if(menuTypeFilter==='BAR') filtered=filtered.filter(m=>bnxMenuIsBar_(m));
   if(menuQuickFilter==='FAV') filtered=filtered.filter(bnxMenuIsFav_);
@@ -11380,7 +11391,7 @@ function bnxFireKOTPrint_(entry, orderRef){
     return Promise.all(jobs).then(function(res){
       if(res.length && res.every(function(r){return r.ok;})){
         const names=[]; res.forEach(function(r){ if(names.indexOf(r.label)<0) names.push(r.label); });
-        try{ toast('🖨️ KOT printed — '+names.join(' + '),'success'); }catch(_){}
+        try{ if(!(window.bnxPrintRoute_&&window.bnxPrintRoute_().k==='pos')) toast('🖨️ KOT printed — '+names.join(' + '),'success'); }catch(_){}   /* POS route: the POS station reports "printed" */
       }
       return res;
     });
@@ -11399,11 +11410,11 @@ async function placeOrder(){
     toast('⏳ KOT is already being sent — please wait','info');
     return window.__BNX_PLACE_ORDER_PROMISE;
   }
-  window.__BNX_PLACE_ORDER_PROMISE = bnxPlaceOrderImpl_();
+  const __p = window.__BNX_PLACE_ORDER_PROMISE = bnxPlaceOrderImpl_();
   try{
-    return await window.__BNX_PLACE_ORDER_PROMISE;
+    return await __p;
   }finally{
-    window.__BNX_PLACE_ORDER_PROMISE = null;
+    if(window.__BNX_PLACE_ORDER_PROMISE === __p) window.__BNX_PLACE_ORDER_PROMISE = null;   /* a background save never clears the next order's guard */
   }
 }
 async function bnxPlaceOrderImpl_(){
@@ -11501,28 +11512,44 @@ async function bnxPlaceOrderImpl_(){
   // Auto-captured at the moment "Send to KDS" is tapped — matches
   // orderDate's own auto-capture pattern above. No manual time entry.
   const orderTime = new Date().toTimeString().slice(0,5);
-  const res = await gasApi('SAVE_ORDER', {
+  /* SPEED FIX 2026-10-09 ("save and send take time"): the steward waited for the whole server save (often 8-15 s on a
+     busy night). If the server has not answered in 2.5 s the screen is released — cart cleared, Home shown, next order
+     can start — and THIS order keeps saving in the background (same requestId = never a duplicate); the KOT prints
+     the moment the server confirms. Everything below uses the table captured here, never the steward's next table. */
+  const __tbl = selTable; let __released = false;
+  const __saveP = gasApi('SAVE_ORDER', {
     requestId, stewardApp:true, tableId:selTable.id, locationId:identity.locationId||'', orderSource:'POS', orderType:'DINEIN', waiter:stewardName, steward:stewardName, waiterName:stewardName, waiterLogin:identity.loginId, covers:customerFields.covers||'', COVERS:customerFields.covers||'', guestNo:customerFields.guestNo||'', guestCount:customerFields.guestCount||'', guests:customerFields.guests||'', GUEST_NO:customerFields.guestNo||'', GUEST_COUNT:customerFields.guestCount||'', items, occasion:'None', customerName:customerFields.customerName, CUSTOMER_NAME:customerFields.customerName, customerMobile:customerFields.customerMobile, CUSTOMER_MOBILE:customerFields.customerMobile, mobile:customerFields.customerMobile, orderDate, orderTime, businessDate:orderDate, BUSINESS_DATE:orderDate,
     ...orderIdentityFields
   }, 'V2_CORE');
+  const __relT = setTimeout(function(){
+    __released = true;
+    try{ order={}; orderItemRemarks={}; updateOrderBadge(); refreshCurrentMenuView_(); bnxToggleOrderDrawer_(false); }catch(e){}
+    try{ selectOccasion('None'); bnxClearOrderCustomerFields_(); }catch(e){}
+    if(btn){ btn.disabled = false; btn.textContent = '📤 Send KOT'; }
+    window.__BNX_PLACE_ORDER_PROMISE = null;           /* next order is not blocked */
+    try{ showScreen('s-home'); }catch(e){}
+    toast('⏳ '+__tbl.id+': KOT saving in background — take the next order','info');
+  }, 2500);
+  const res = await __saveP;
+  clearTimeout(__relT);
 
-  if(btn){ btn.disabled = false; btn.textContent = '📤 Send KOT'; }
+  if(btn && !__released){ btn.disabled = false; btn.textContent = '📤 Send KOT'; }
 
   if(!res || !res.success){
     // Genuine failure or offline — queue it, tell the truth about the
     // state ("Pending Sync"), never pretend it's on the dashboard yet.
-    bnxQueuePending('SAVE_ORDER', { requestId, tableId:selTable.id, locationId:identity.locationId||'', orderSource:'POS', orderType:'DINEIN', waiter:stewardName, steward:stewardName, waiterName:stewardName, waiterLogin:identity.loginId, covers:customerFields.covers||'', COVERS:customerFields.covers||'', guestNo:customerFields.guestNo||'', guestCount:customerFields.guestCount||'', guests:customerFields.guests||'', GUEST_NO:customerFields.guestNo||'', GUEST_COUNT:customerFields.guestCount||'', items, occasion:'None', customerName:customerFields.customerName, CUSTOMER_NAME:customerFields.customerName, customerMobile:customerFields.customerMobile, CUSTOMER_MOBILE:customerFields.customerMobile, mobile:customerFields.customerMobile, orderDate, orderTime, businessDate:orderDate, BUSINESS_DATE:orderDate, ...orderIdentityFields }, requestId, 'kot');
+    bnxQueuePending('SAVE_ORDER', { requestId, tableId:__tbl.id, locationId:identity.locationId||'', orderSource:'POS', orderType:'DINEIN', waiter:stewardName, steward:stewardName, waiterName:stewardName, waiterLogin:identity.loginId, covers:customerFields.covers||'', COVERS:customerFields.covers||'', guestNo:customerFields.guestNo||'', guestCount:customerFields.guestCount||'', guests:customerFields.guests||'', GUEST_NO:customerFields.guestNo||'', GUEST_COUNT:customerFields.guestCount||'', items, occasion:'None', customerName:customerFields.customerName, CUSTOMER_NAME:customerFields.customerName, customerMobile:customerFields.customerMobile, CUSTOMER_MOBILE:customerFields.customerMobile, mobile:customerFields.customerMobile, orderDate, orderTime, businessDate:orderDate, BUSINESS_DATE:orderDate, ...orderIdentityFields }, requestId, 'kot');
     toast('📴 Could not reach server — order queued, will send when back online','error');
     bnxSetLiveStatus('offline');
     // Still reflected locally so THIS device's own screens are usable
     // offline, but tagged pending — never shown as a confirmed KOT.
-    const localTag = { kotNo:'PENDING-'+requestId.slice(0,8), orderNo:'', orderId:'', table:selTable.id, type:'KITCHEN', time:new Date().toISOString(),
+    const localTag = { kotNo:'PENDING-'+requestId.slice(0,8), orderNo:'', orderId:'', table:__tbl.id, type:'KITCHEN', time:new Date().toISOString(),
       waiter:stewardName, steward:stewardName, covers:customerFields.covers||'', COVERS:customerFields.covers||'', guestNo:customerFields.guestNo||'', guestCount:customerFields.guestCount||'', guests:customerFields.guests||'', GUEST_NO:customerFields.guestNo||'', GUEST_COUNT:customerFields.guestCount||'', items, amount, customerName:customerFields.customerName, CUSTOMER_NAME:customerFields.customerName, customerMobile:customerFields.customerMobile, CUSTOMER_MOBILE:customerFields.customerMobile, mobile:customerFields.customerMobile, orderTime, status:'PENDING_SYNC', userId:identity.userId, USER_ID:identity.userId, createdById:identity.userId, CREATED_BY_ID:identity.userId, loginId:identity.loginId, LOGIN_ID:identity.loginId, createdByLogin:identity.loginId, CREATED_BY_LOGIN:identity.loginId, createdByName:stewardName, CREATED_BY_NAME:stewardName };
     bnxLoadOpenKots(); KOT.unshift(localTag); bnxSetOpenKotsRaw(JSON.stringify(KOT));
     bnxFireKOTPrint_(localTag, localTag.kotNo);   /* print even though server sync is pending */
-    order={}; orderItemRemarks={};
-    try{ updateOrderBadge(); refreshCurrentMenuView_(); bnxToggleOrderDrawer_(false); }catch(e){}
-    setTimeout(() => showScreen('s-home'), 1200);
+    if(!__released){ order={}; orderItemRemarks={}; }
+    if(!__released){ try{ updateOrderBadge(); refreshCurrentMenuView_(); bnxToggleOrderDrawer_(false); }catch(e){} }
+    if(!__released) setTimeout(() => showScreen('s-home'), 1200);
     return;
   }
 
@@ -11550,15 +11577,15 @@ async function bnxPlaceOrderImpl_(){
     bnxSetLiveStatus('offline');
     toast('⚠️ Server accepted the order but returned no KOT number — refreshing kitchen status','error');
     await loadKOTFromServer().catch(()=>{});
-    order={}; orderItemRemarks={};
-    selectOccasion('None');
-    bnxClearOrderCustomerFields_();
-    setTimeout(() => showScreen('s-home'), 1200);
+    if(!__released){ order={}; orderItemRemarks={}; }
+    if(!__released){ selectOccasion('None');
+    bnxClearOrderCustomerFields_(); }
+    if(!__released) setTimeout(() => showScreen('s-home'), 1200);
     return;
   }
   lastOrderId = orderId;
   bnxLoadOpenKots();
-  const entry = { kotNo:orderId, orderNo:(res.data&&res.data.ORDER_NUMBER)||orderId, orderId:(res.data&&res.data.ORDER_ID)||res.transactionId||orderId, table:selTable.id, type:'KITCHEN', time:res.serverTimestamp||new Date().toISOString(), waiter:stewardName, steward:stewardName, covers:customerFields.covers||'', COVERS:customerFields.covers||'', guestNo:customerFields.guestNo||'', guestCount:customerFields.guestCount||'', guests:customerFields.guests||'', GUEST_NO:customerFields.guestNo||'', GUEST_COUNT:customerFields.guestCount||'', items, amount, customerName:customerFields.customerName, CUSTOMER_NAME:customerFields.customerName, customerMobile:customerFields.customerMobile, CUSTOMER_MOBILE:customerFields.customerMobile, mobile:customerFields.customerMobile, orderTime, status:'NEW', userId:identity.userId, USER_ID:identity.userId, createdById:identity.userId, CREATED_BY_ID:identity.userId, loginId:identity.loginId, LOGIN_ID:identity.loginId, createdByLogin:identity.loginId, CREATED_BY_LOGIN:identity.loginId, createdByName:stewardName, CREATED_BY_NAME:stewardName };
+  const entry = { kotNo:orderId, orderNo:(res.data&&res.data.ORDER_NUMBER)||orderId, orderId:(res.data&&res.data.ORDER_ID)||res.transactionId||orderId, table:__tbl.id, type:'KITCHEN', time:res.serverTimestamp||new Date().toISOString(), waiter:stewardName, steward:stewardName, covers:customerFields.covers||'', COVERS:customerFields.covers||'', guestNo:customerFields.guestNo||'', guestCount:customerFields.guestCount||'', guests:customerFields.guests||'', GUEST_NO:customerFields.guestNo||'', GUEST_COUNT:customerFields.guestCount||'', items, amount, customerName:customerFields.customerName, CUSTOMER_NAME:customerFields.customerName, customerMobile:customerFields.customerMobile, CUSTOMER_MOBILE:customerFields.customerMobile, mobile:customerFields.customerMobile, orderTime, status:'NEW', userId:identity.userId, USER_ID:identity.userId, createdById:identity.userId, CREATED_BY_ID:identity.userId, loginId:identity.loginId, LOGIN_ID:identity.loginId, createdByLogin:identity.loginId, CREATED_BY_LOGIN:identity.loginId, createdByName:stewardName, CREATED_BY_NAME:stewardName };
   KOT.unshift(entry);
   if(KOT.length>100) KOT.length=100;
   bnxSetOpenKotsRaw(JSON.stringify(KOT));
@@ -11614,15 +11641,15 @@ async function bnxPlaceOrderImpl_(){
   Promise.race([__kotSyncP, new Promise(function(r){ setTimeout(r,3000); })])
     .then(function(){ bnxFireKOTPrint_(entry, orderId); }, function(){ bnxFireKOTPrint_(entry, orderId); });
   PLACED_ORDERS[orderId] = {
-    id: orderId, table: selTable.id, items: JSON.parse(JSON.stringify(items)), amount, steward: stewardName,
+    id: orderId, table: __tbl.id, items: JSON.parse(JSON.stringify(items)), amount, steward: stewardName,
     status: 'PLACED', timestamp: Date.now(), originalItems: JSON.parse(JSON.stringify(items)), hasServerId: true
   };
 
   toast('✅ KOT sent to kitchen — confirmed on server','success');
-  order={}; orderItemRemarks={};
-  selectOccasion('None');
-  bnxClearOrderCustomerFields_();
-  try{ updateOrderBadge(); refreshCurrentMenuView_(); bnxToggleOrderDrawer_(false); }catch(e){}
+  if(!__released){ order={}; orderItemRemarks={}; }
+  if(!__released){ selectOccasion('None');
+  bnxClearOrderCustomerFields_(); }
+  if(!__released){ try{ updateOrderBadge(); refreshCurrentMenuView_(); bnxToggleOrderDrawer_(false); }catch(e){} }
 
   // FIX ("My Orders / My Running Tables not showing on Home"):
   // bnxUpdateTableOverlay() previously only patched status/covers/bill —
@@ -11636,13 +11663,13 @@ async function bnxPlaceOrderImpl_(){
   // data from the backend today). Tagging steward here means the
   // table is correctly recognized as "mine" the instant the KOT is
   // sent, with zero dependency on that backend gap.
-  bnxUpdateTableOverlay(selTable.id, { status:'RUNNING', covers: selTable.covers||0, bill: (selTable.bill||0)+amount, steward: stewardName, stewardId:getCurrentStaffIdentity().userId||'', stewardLogin:getCurrentStaffIdentity().loginId||'' }).catch(()=>{});
+  bnxUpdateTableOverlay(__tbl.id, { status:'RUNNING', covers: __tbl.covers||0, bill: (__tbl.bill||0)+amount, steward: stewardName, stewardId:getCurrentStaffIdentity().userId||'', stewardLogin:getCurrentStaffIdentity().loginId||'' }).catch(()=>{});
   // Refresh from the shared server projection after the write so this device
   // uses exactly the same Running Table / Map state that other devices use.
   setTimeout(()=>loadTablesLive().catch(()=>{}),250);
 
-  showOrderPlacedModal(orderId);
-  setTimeout(() => showScreen('s-home'), 1500);
+  if(!__released){ showOrderPlacedModal(orderId);
+  setTimeout(() => showScreen('s-home'), 1500); } else toast('✅ '+__tbl.id+': KOT '+orderId+' confirmed on server','success');
 }
 /* Same shared overlay the dashboard's bnxSaveTableStatus() writes to —
    updates immediately here, and best-effort syncs to the backend
@@ -20760,6 +20787,214 @@ body.bnx-bulk-on.bnx-bulk-has #bnx-bulk-bar{display:flex}
   W.bnxStewardApiCacheClear=function(){ cache.clear(); };
 })();
 </script>
+<script id="bnx-pos-print-route">
+/* ═══ KOT PRINTING = POS CONTROL (2026-10-09) ═══
+   "printer configuration direct in mobile can't any changes — all from POS control", same for every client and every
+   steward: this phone does NOT print and has nothing to set up. A phone browser cannot reach a raw port-9100 printer,
+   which is why every phone needed its own relay / app setup before. Now every KOT ticket (send, add-on, reprint) goes
+   to this client's print queue on the server in < 1 s and the POS PC (restaurant dashboard + QZ Tray = "KOT print
+   station") prints it on the master printer of that station (Kitchen / Bar / Hukka from CLIENT_PRINTER_MASTER).
+   The steward sees "🖨️ printed at Kitchen ✓" or "POS print station offline — will print when it is on".
+   Owner can switch a client back to the Steward Printer App route from the POS (route PHONE_APP). */
+(function(){
+  'use strict';
+  var W=window, D=document;
+  function cid(){ try{ return String((typeof CLIENT_ID!=='undefined'&&CLIENT_ID)||(W.getCurrentStaffIdentity&&W.getCurrentStaffIdentity().clientId)||'').trim(); }catch(e){ return ''; } }
+  function tok(){ try{ return (typeof getSessionToken==='function'&&getSessionToken())||localStorage.getItem('ERP_SESSION')||''; }catch(e){ return ''; } }
+  function t(m,k){ try{ if(typeof toast==='function') toast(m,k||'info'); }catch(e){} }
+  function esc(v){ return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+  var CFG={route:'POS',printers:[],stationOnline:false,station:'',at:0};
+  try{ var c0=JSON.parse(localStorage.getItem('bnx_pm_'+cid())||'null'); if(c0) CFG=Object.assign(CFG,c0); }catch(e){}
+  function urls(){
+    var ids=[], add=function(u){ var m=String(u||'').match(/AKfycb[A-Za-z0-9_-]{20,}/); if(m&&ids.indexOf(m[0])<0) ids.push(m[0]); };
+    try{ add(typeof BNX_BOOTSTRAP_CORE_ID!=='undefined'?BNX_BOOTSTRAP_CORE_ID:''); }catch(e){}
+    try{ add(localStorage.getItem('bnx_pq_api_ok')); add(localStorage.getItem('bnx_api_core')); }catch(e){}
+    return ids.map(function(id){ return 'https://script.google.com/macros/s/'+id+'/exec'; });
+  }
+  async function post(action,p,ms){
+    var body=JSON.stringify(Object.assign({action:action,clientId:cid(),sessionToken:tok()},p||{})), last={success:false,error:'no server'};
+    var list=urls();
+    for(var i=0;i<list.length;i++){
+      var ctl=new AbortController(), tm=setTimeout(function(){ ctl.abort(); },ms||15000);
+      try{ var r=await fetch(list[i],{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:body,signal:ctl.signal}); last=await r.json();
+        if(last&&last.success===false&&/unknown action|not handled/i.test(String(last.error||''))) continue;
+        try{ localStorage.setItem('bnx_pq_api_ok',list[i]); }catch(e){} return last; }
+      catch(e){ last={success:false,offline:true,error:e.name==='AbortError'?'timeout':e.message}; }
+      finally{ clearTimeout(tm); }
+    }
+    return last;
+  }
+  function posRoute(){ return String(CFG.route||'POS').toUpperCase()!=='PHONE_APP'; }
+  async function loadCfg(){
+    if(!cid()) return;
+    var r=await post('PRINTER_MASTER_GET',{},15000);
+    if(r&&r.success&&r.data){ CFG=Object.assign(CFG,r.data,{at:Date.now()}); try{ localStorage.setItem('bnx_pm_'+cid(),JSON.stringify(CFG)); }catch(e){}
+      /* master IPs for every other print code on this page (PHONE_APP route / Print Doctor) */
+      try{ var m={}; (CFG.printers||[]).forEach(function(p){ if(p.ip&&p.active!==false) m[p.role]=p.ip; }); W.__bnxMasterPrinterIps=m; }catch(e){} }
+  }
+  function roleOf(type){ var x=String(type||'').toUpperCase();
+    if(/^(BILL|BILLING|RECEIPT)$/.test(x)) return 'BILL';
+    if(/HUKKA|HOOKAH|SHEESHA|SHISHA|CIGARETTE|TOBACCO/.test(x)) return 'HUKKA';
+    if(/BAR|BEVERAGE|LIQUOR|SPIRIT|ALCOHOL|COCKTAIL|MOCKTAIL|JUICE|BEER|WINE|WHISK|VODKA|RUM|GIN|TEQUILA/.test(x)) return 'BAR';
+    return 'KITCHEN'; }
+  var NM={KITCHEN:'Kitchen',BAR:'Bar',HUKKA:'Hukka',BILL:'Bill'};
+
+  /* batch: every station ticket of one KOT goes in ONE request */
+  var batch=[], timer=0, waiters=[];
+  function pendKey(){ return 'bnx_pq_pending_'+cid(); }
+  function pend(){ try{ return JSON.parse(localStorage.getItem(pendKey())||'[]')||[]; }catch(e){ return []; } }
+  function setPend(a){ try{ localStorage.setItem(pendKey(),JSON.stringify(a.slice(-60))); }catch(e){} }
+  async function flush(){
+    timer=0; var jobs=batch.splice(0), ws=waiters.splice(0); if(!jobs.length) return;
+    var r=await post('PRINT_QUEUE_ADD',{jobs:jobs},15000);
+    if(r&&r.success){
+      var roles=[]; jobs.forEach(function(j){ var n=NM[j.role]||j.role; if(roles.indexOf(n)<0) roles.push(n); });
+      CFG.stationOnline=!!(r.data&&r.data.stationOnline);
+      t(CFG.stationOnline?'🖨️ KOT sent to POS printer — '+roles.join(' + '):'🖨️ KOT queued — POS print station is OFF; it prints as soon as the POS PC is open',CFG.stationOnline?'success':'error');
+      watch((r.data&&r.data.ids)||jobs.map(function(j){return j.id;}));
+      ws.forEach(function(f){ f(true); });
+    }else{
+      setPend(pend().concat(jobs));
+      t('📴 KOT print queued on this phone — sends to the POS printer when the server answers','error');
+      ws.forEach(function(f){ f(true); });     /* the KOT itself is saved; printing will follow */
+    }
+  }
+  function queue(type,d){
+    var r=roleOf(d&&d.role||type), items=(d&&Array.isArray(d.items))?d.items:[];
+    if(!items.length) return Promise.resolve(false);
+    /* POS › Steward App Control: "KOT print = No" for this login → KOT is saved for kitchen / KDS, nothing is printed */
+    if(W.__bnxStwCtl&&W.__bnxStwCtl.locked===true){ t('🔒 Steward app locked by POS','error'); return Promise.resolve(false); }
+    if(W.__bnxStwCtl&&W.__bnxStwCtl.print===false){ if(!queue.__said||Date.now()-queue.__said>4000){ queue.__said=Date.now(); t('ℹ️ KOT saved — printing is switched off for your login by the POS','info'); } return Promise.resolve(true); }
+    var id=['K',cid(),String(d.kotNo||d.orderNo||''),r,String(d.splitIndex||1),d.reprint?('R'+Date.now()):''].join('-').replace(/[^A-Za-z0-9_.:-]/g,'');
+    if(!(d.kotNo||d.orderNo)) id+='-'+Date.now().toString(36);
+    batch.push({id:id,role:r,table:d.table||'',waiter:d.waiter||'',covers:d.covers||'',items:items.map(function(i){ return {name:i.name||i.n||i.ITEM_NAME||i.itemName||'Item',qty:i.qty||i.QUANTITY||1,size:i.size||i.SIZE||i.sizeName||'',note:i.note||i.notes||i.remark||i.remarks||''}; }),
+      kotNo:d.kotNo||'',orderNo:d.orderNo||'',splitIndex:d.splitIndex||1,splitTotal:d.splitTotal||1,customerName:d.customerName||'',remarks:d.remarks||'',reprint:!!d.reprint,from:'STEWARD'});
+    if(!timer) timer=setTimeout(flush,350);
+    return new Promise(function(res){ waiters.push(res); });
+  }
+  /* "printed at Kitchen ✓" feedback */
+  function watch(ids){
+    var t0=Date.now(), said={};
+    (function poll(){
+      if(Date.now()-t0>90000) return;
+      post('PRINT_QUEUE_STATUS',{ids:ids},12000).then(function(r){
+        var js=(r&&r.success&&r.data&&r.data.jobs)||[], left=false;
+        js.forEach(function(j){ if(said[j.id]) return;
+          if(j.st==='DONE'){ said[j.id]=1; t('✅ Printed at '+(NM[j.role]||j.role)+(j.table?' · '+j.table:''),'success'); }
+          else if(j.st==='FAIL'){ said[j.id]=1; t('⚠️ '+(NM[j.role]||j.role)+' KOT NOT printed: '+(j.err||'printer problem')+' — tell the POS counter','error'); }
+          else left=true; });
+        if(left) setTimeout(poll,4000);
+      }).catch(function(){ setTimeout(poll,6000); });
+    })();
+  }
+  /* resend tickets that could not reach the server */
+  setInterval(function(){ var p=pend(); if(!p.length||!posRoute()) return; setPend([]); p.forEach(function(j){ batch.push(j); }); if(!timer) timer=setTimeout(flush,100); },15000);
+
+  function install(){
+    if(!posRoute()) return;
+    if(!(W.bnxDirectKOTPrint_&&W.bnxDirectKOTPrint_.__bnxPos)){
+      var legacy=W.bnxDirectKOTPrint_;
+      var f=function(type,d){ if(!posRoute()&&legacy) return legacy.apply(this,arguments); return queue(type,d||{}); };
+      f.__bnxPos=true; W.bnxDirectKOTPrint_=f; try{ bnxDirectKOTPrint_=f; }catch(e){}
+    }
+    if(!(W.bnxPrintRoute_&&W.bnxPrintRoute_.__bnxPos)){
+      var oldRoute=W.bnxPrintRoute_;
+      var g=function(){ return posRoute()?{k:'pos',label:'POS print station'}:(oldRoute?oldRoute.apply(this,arguments):{k:'none'}); };
+      g.__bnxPos=true; W.bnxPrintRoute_=g;
+    }
+    /* Printer Setup on the phone = read-only view of the POS master */
+    W.bnxOpenPrinterSetup=function(){
+      var m=D.getElementById('bnx-pm-view'); if(m) m.remove();
+      m=D.createElement('div'); m.id='bnx-pm-view';
+      m.style.cssText='position:fixed;inset:0;z-index:10050;background:rgba(0,0,0,.5);display:flex;align-items:flex-end;justify-content:center';
+      var rows=(CFG.printers||[]).filter(function(p){ return p.ip; }).map(function(p){ return '<tr><td style="padding:6px 4px"><b>'+esc(NM[p.role]||p.role)+'</b></td><td>'+esc(p.label||'')+'</td><td style="font-family:monospace">'+esc(p.ip)+'</td></tr>'; }).join('');
+      m.innerHTML='<div style="background:#fff;color:#222;width:100%;max-width:560px;border-radius:18px 18px 0 0;padding:16px 16px calc(env(safe-area-inset-bottom,0px) + 16px);font:13.5px/1.5 \'DM Sans\',sans-serif;max-height:85vh;overflow:auto">'
+        +'<div style="display:flex;justify-content:space-between;align-items:center"><b style="font-size:16px">🖨️ Printers — managed by POS</b><button type="button" data-x style="border:0;background:none;font-size:22px">✕</button></div>'
+        +'<p style="margin:6px 0 10px;color:#555">Nothing to set on this phone. KOTs print at the POS counter PC on the restaurant\'s master printers. Changes are made only in the POS dashboard › Settings › Printers.</p>'
+        +'<div style="padding:9px 11px;border-radius:12px;margin-bottom:10px;'+(CFG.stationOnline?'background:#ecfdf3;color:#065f46':'background:#fff7e6;color:#7a4a00')+'">'+(CFG.stationOnline?'✅ POS print station online'+(CFG.station?' ('+esc(CFG.station)+')':''):'⚠️ POS print station is OFF — KOTs wait and print as soon as the POS PC (dashboard + QZ Tray) is open')+'</div>'
+        +'<table style="width:100%;border-collapse:collapse;font-size:13px">'+(rows||'<tr><td style="color:#b42318">No printers set for this restaurant yet — ask the manager to set them in the POS.</td></tr>')+'</table>'
+        +'<button type="button" data-r style="margin-top:12px;width:100%;padding:11px;border-radius:12px;border:1px solid #ddd;background:#fff;font-weight:800">↻ Refresh from POS</button></div>';
+      m.addEventListener('click',function(e){ if(e.target===m||e.target.closest('[data-x]')) m.remove(); if(e.target.closest('[data-r]')){ loadCfg().then(function(){ m.remove(); W.bnxOpenPrinterSetup(); }); } });
+      D.body.appendChild(m);
+    };
+    try{ bnxOpenPrinterSetup=W.bnxOpenPrinterSetup; }catch(e){}
+  }
+  var css=D.createElement('style'); css.textContent='#bnx-print-nolink{display:none!important}'; (D.head||D.documentElement).appendChild(css);
+  function boot(){ install(); loadCfg().then(install).catch(function(){}); }
+  if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ setTimeout(boot,1200); }); else setTimeout(boot,1200);
+  /* later layers may re-define the print functions — keep ours on top */
+  setInterval(function(){ try{ if(posRoute()) install(); }catch(e){} },3000);
+  setInterval(loadCfg,5*60000);
+  W.bnxPosPrint={cfg:function(){ return CFG; },reload:loadCfg,queue:queue,post:post};
+})();
+</script>
+
+<script id="bnx-steward-control">
+/* ═══ STEWARD APP CONTROL FROM POS (2026-10-09) ═══
+   Owner / manager sets on the POS (Settings › 📱 Steward App Control), for all stewards or one steward:
+   Order placing Yes/No · KOT printing Yes/No · Lock the app · Hide not-available items. This phone checks it at
+   start, every 45 s and when it comes back to the screen — no setting on the phone itself. */
+(function(){
+  'use strict';
+  var W=window, D=document, CTL=null;
+  try{ CTL=JSON.parse(localStorage.getItem('bnx_stwctl')||'null'); }catch(e){}
+  if(CTL) W.__bnxStwCtl=CTL;
+  function id(){ try{ return W.getCurrentStaffIdentity?W.getCurrentStaffIdentity():{}; }catch(e){ return {}; } }
+  function t(m,k){ try{ if(typeof toast==='function') toast(m,k||'info'); }catch(e){} }
+  function lockScreen(on){
+    var o=D.getElementById('bnx-stw-lock');
+    if(!on){ if(o) o.remove(); return; }
+    if(o) return;
+    o=D.createElement('div'); o.id='bnx-stw-lock';
+    o.style.cssText='position:fixed;inset:0;z-index:2147483000;background:rgba(20,12,4,.94);color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px;font:15px/1.5 "DM Sans",sans-serif';
+    o.innerHTML='<div style="font-size:54px">🔒</div><div style="font-size:20px;font-weight:900;margin:8px 0">Steward app locked by POS</div>'
+      +'<div style="opacity:.85;max-width:320px">Your login '+(id().fullName?'(<b>'+String(id().fullName).replace(/[<>&]/g,'')+'</b>) ':'')+'is locked by the manager. Please contact the POS counter.</div>'
+      +'<button type="button" style="margin-top:18px;padding:11px 18px;border-radius:12px;border:0;background:#fff;color:#111;font-weight:800">↻ Check again</button>';
+    o.querySelector('button').onclick=function(){ load(true); };
+    (D.body||D.documentElement).appendChild(o);
+  }
+  function apply(){
+    var c=W.__bnxStwCtl||{};
+    lockScreen(c.locked===true);
+    var noOrder=c.order===false;
+    D.querySelectorAll('[onclick="placeOrder()"]').forEach(function(b){
+      if(noOrder){ b.dataset.bnxOff='1'; b.style.opacity='.45'; b.title='Order placing is switched off for your login (POS)'; }
+      else if(b.dataset.bnxOff){ delete b.dataset.bnxOff; b.style.opacity=''; b.title=''; } });
+    try{ if(typeof renderMenu==='function' && c.__menuSig!==String(c.hideUnavailable)){ c.__menuSig=String(c.hideUnavailable); renderMenu(); } }catch(e){}
+  }
+  async function load(manual){
+    var P=W.bnxPosPrint&&W.bnxPosPrint.post; if(!P) return;
+    var me=id(); if(!me.userId&&!me.loginId) return;
+    var r=await P('STEWARD_CONTROL_GET',{userId:me.userId,loginId:me.loginId},12000);
+    if(r&&r.success&&r.data&&r.data.me){
+      var was=W.__bnxStwCtl||{};
+      W.__bnxStwCtl=Object.assign({},r.data.me,{at:Date.now()});
+      try{ localStorage.setItem('bnx_stwctl',JSON.stringify(W.__bnxStwCtl)); }catch(e){}
+      if(was.order!==false&&W.__bnxStwCtl.order===false) t('⛔ Order placing switched OFF for you by the POS','error');
+      if(was.order===false&&W.__bnxStwCtl.order!==false) t('✅ Order placing switched ON by the POS','success');
+      if(manual&&!W.__bnxStwCtl.locked) t('✅ Unlocked','success');
+      apply();
+    }
+  }
+  /* order placing gate (wraps the real placeOrder; the save code itself is unchanged) */
+  function gate(){
+    if(typeof W.placeOrder!=='function'||W.placeOrder.__bnxCtl) return;
+    var orig=W.placeOrder;
+    var f=function(){ var c=W.__bnxStwCtl||{};
+      if(c.locked===true){ lockScreen(true); return; }
+      if(c.order===false){ t('⛔ Order placing is switched off for your login by the POS — ask the manager','error'); return; }
+      return orig.apply(this,arguments); };
+    f.__bnxCtl=true; W.placeOrder=f; try{ placeOrder=f; }catch(e){}
+  }
+  gate(); apply();
+  setInterval(function(){ gate(); apply(); },3000);
+  setTimeout(function(){ load(); },2500);
+  setInterval(load,45000);
+  D.addEventListener('visibilitychange',function(){ if(!D.hidden) load(); });
+  W.bnxStewardControl={reload:function(){ return load(true); }};
+})();
+</script>
+
 </body>
 </html>
 
