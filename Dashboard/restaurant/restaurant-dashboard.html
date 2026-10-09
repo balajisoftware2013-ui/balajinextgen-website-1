@@ -16222,9 +16222,15 @@ async function bnxSaveMenuItemToBackend(item){
     name:item.n, itemName:item.n, category:item.c, price:Number(item.p)||0,
     gst:Number(item.gst)||0, isVeg:item.v ? (item.v==='V') : null,
     veg:item.v||'', icon:item.e||bnxDefaultIcon(item.c),
-    itemCode:item.code||'', avail:item.avail!==false,
+    /* 2026-10-09 ROOT FIX ("IMPORTED HASHFREEZER price / image not saved"): item.code holds the ITEM_ID (ITM00797) but
+       was sent as itemCode; the server matches ITEM_CODE (ITM772608 for POS quick-add items) → row never found.
+       Both ids now go separately. */
+    itemCode:item.itemCode||item.ITEM_CODE||item.code||'', itemId:item.code||item.ITEM_ID||item.id||'', ITEM_ID:item.code||item.ITEM_ID||item.id||'', ITEM_CODE:item.itemCode||item.ITEM_CODE||item.code||'',
+    avail:item.avail!==false,
     unit:item.unit||'NOS', hsn:item.hsn||'', itemGroupId:item.itemGroupId||item.ITEM_GROUP_ID||'', itemGroupName:item.itemGroupName||item.ITEM_GROUP_NAME||'',
-    imageUrl:item.imageUrl||item.productImageUrl||item.PRODUCT_IMAGE_URL||item.IMAGE_URL||'', printTo:item.printTo||(item.isBar?'BAR':'Kitchen (Printer 2)'), isBar:!!item.isBar, menuType:item.menuType||(item.isBar?'BAR':'RESTAURANT')
+    /* only a real https link — a photo kept on this PC (data:image base64, 1-2 MB) made SAVE_MENU_ITEM fail
+       (Sheets cell limit 50,000 characters) so the price was never saved either */
+    imageUrl:(function(u){ u=String(u||''); return /^https:\/\//i.test(u)&&u.length<2000?u:''; })(item.imageUrl||item.productImageUrl||item.PRODUCT_IMAGE_URL||item.IMAGE_URL||''), printTo:item.printTo||(item.isBar?'BAR':'Kitchen (Printer 2)'), isBar:!!item.isBar, menuType:item.menuType||(item.isBar?'BAR':'RESTAURANT')
   };
   const _rid = payload.itemCode||String(Date.now());
   /* OFFLINE: don't make the person wait for a network timeout — queue at once,
@@ -16237,7 +16243,7 @@ async function bnxSaveMenuItemToBackend(item){
     const r=await gasApi('SAVE_MENU_ITEM', payload, 'V2_CORE');
     if(r && r.success){
       /* saved live → drop any older queued copy so "pending sync" clears */
-      try{ if(payload.itemCode){ const ob=bnxGetOutbox(); const keep=ob.filter(e=>!(String(e.action).toUpperCase()==='SAVE_MENU_ITEM' && String(e.requestId)===String(payload.itemCode))); if(keep.length!==ob.length) bnxSetOutbox(keep); } }catch(e){}
+      try{ const ids=[payload.itemCode,payload.itemId].filter(Boolean).map(String); if(ids.length){ const ob=bnxGetOutbox(); const keep=ob.filter(e=>!(String(e.action).toUpperCase()==='SAVE_MENU_ITEM' && ids.indexOf(String(e.requestId))>=0)); if(keep.length!==ob.length) bnxSetOutbox(keep); } }catch(e){}   /* older queued copies (sent with the ITEM_ID) are dropped too */
       return r;
     }
     if(typeof bnxQueuePending==='function') bnxQueuePending('SAVE_MENU_ITEM', payload, payload.itemCode||String(Date.now()));
@@ -24365,24 +24371,24 @@ function bnxEditMenuItem(code){
     bnxRebuildCategoryPills();
     buildMenu();
     renderMenuItemsTable();
-    const saveBtn = mo.querySelector('#emSave');
-    saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
-    const r = await bnxSaveMenuItemToBackend(item);
+    const saveBtn = mo.querySelector('#emSave'), cancelBtn = mo.querySelector('#emCancel');
+    saveBtn.disabled = true; cancelBtn.disabled = true;
+    /* 2026-10-09: photo FIRST (its Drive link then rides in the same item save), each step time-boxed — the button
+       used to stay on "Uploading image…" for ever when the server was slow. */
+    const box = (p, ms) => Promise.race([p, new Promise(res=>setTimeout(()=>res({success:false,error:'server did not answer in '+Math.round(ms/1000)+' s'}),ms))]);
+    let ir = null;
     if (selectedImageFile && typeof window.bnxSaveMenuItemImageFile_ === 'function') {
       saveBtn.textContent = 'Uploading image…';
-      const ir = await window.bnxSaveMenuItemImageFile_(item, selectedImageFile);
-      if (ir && ir.success && ir.imageUrl) {
-        item.imageUrl = ir.imageUrl;
-        try { buildMenu(); renderMenuItemsTable(); } catch(e) {}
-        showNotif('✅ '+name+' updated + image saved to client Google Drive', 'success');
-      } else {
-        showNotif(r && r.success
-          ? '⚠️ '+name+' saved, but Google Drive image upload failed: '+(ir?.error||'server unavailable')
-          : '⚠️ '+name+' saved locally/server pending; image upload failed: '+(ir?.error||'server unavailable'), 'error');
-      }
-    } else {
-      showNotif(r && r.success ? ('✅ '+name+' updated in Menu Master') : ('⚠️ '+name+' updated locally — server sync pending, will retry automatically'), r && r.success ? 'success' : 'error');
+      ir = await box(window.bnxSaveMenuItemImageFile_(item, selectedImageFile), 90000);
+      if (ir && ir.success && ir.imageUrl) item.imageUrl = ir.imageUrl;
     }
+    saveBtn.textContent = 'Saving…';
+    const r = await box(bnxSaveMenuItemToBackend(item), 60000);
+    bnxSaveMenuData();
+    try { buildMenu(); renderMenuItemsTable(); } catch(e) {}
+    const ok = !!(r && r.success), imgOk = !selectedImageFile || !!(ir && ir.success);
+    showNotif((ok ? '✅ '+name+' saved — ₹'+price+(r.menuRows&&r.menuRows.tabs&&r.menuRows.tabs.length?' ('+r.menuRows.tabs.join(', ')+')':'') : '⚠️ '+name+' kept on this PC — server: '+((r&&(r.error||r.message))||'no answer')+' · retries automatically')
+      + (selectedImageFile ? (imgOk ? ' · photo saved to Google Drive' : ' · photo NOT saved: '+((ir&&ir.error)||'server unavailable')) : ''), ok && imgOk ? 'success' : 'error');
     mo.remove();
   };
 }
@@ -38015,10 +38021,22 @@ function compressImage(file){
     };rd.readAsDataURL(file);
   });
 }
-function imagePayload(item,data){return {itemId:String(item?.id||item?.ITEM_ID||item?.itemId||'').trim(),itemCode:String(item?.code||item?.itemCode||item?.ITEM_CODE||'').trim(),imageData:data};}
+/* 2026-10-09: item.code is the ITEM_ID, item.itemCode the ITEM_CODE — send each in its own field */
+function imagePayload(item,data){return {itemId:String(item?.ITEM_ID||item?.itemId||item?.code||item?.id||'').trim(),itemCode:String(item?.itemCode||item?.ITEM_CODE||item?.code||'').trim(),name:String(item?.n||item?.name||''),isBar:!!item?.isBar,imageData:data};}
 async function saveDriveImage(item,data){
   if(typeof gasApi!=='function')return {success:false,error:'Server API unavailable'};
   var p=imagePayload(item,data);if(!p.itemId&&!p.itemCode)return {success:false,error:'Item ID/code missing'};
+  /* 2026-10-09 ROOT FIX ("image upload failed: Item not found in ITEM_MASTER"): gasApi('V2_CORE') can point at a
+     deployment whose old handler only looks in ITEM_MASTER (POS quick-add items such as HASHFREEZER live only in
+     MENU_CARD_ITEMS). The fixed handler (menu-card-qr-promo.gs) is asked first; the old route stays as a fallback. */
+  try{
+    if(typeof window.bnxPromoPost==='function'){
+      var cid=String(window.CLIENT_ID||localStorage.getItem('ERP_CLIENT')||''), ses=(typeof bnxCurrentSession_==='function'?bnxCurrentSession_():'')||localStorage.getItem('ERP_SESSION')||'';
+      var r1=await window.bnxPromoPost(Object.assign({action:'SAVE_MENU_ITEM_IMAGE',clientId:cid,sessionToken:ses},p),120000);
+      if(r1&&r1.success&&r1.imageUrl) return r1;
+      if(r1&&!r1.unknownAction&&!r1.offline&&r1.error&&!/unknown action|not handled/i.test(String(r1.error))) return r1;
+    }
+  }catch(e){}
   try{return await gasApi('SAVE_MENU_ITEM_IMAGE',p,'V2_CORE');}catch(e){return {success:false,error:e.message};}
 }
 window.bnxSaveMenuItemImageFile_=async function(item,file){
@@ -38059,10 +38077,26 @@ window.bnxUploadProductImage_=async function(k,file){
    the selected compressed image through the dedicated image endpoint. */
 var oldSave=window.bnxSaveMenuItemToBackend;
 if(typeof oldSave==='function'&&!oldSave.__bnxDriveImageWrap){
+  /* 2026-10-09: after the normal SAVE_MENU_ITEM, the fixed backend writes the row matched by ITEM_ID OR ITEM_CODE
+     (MENU_ITEM_ENSURE) — works whichever deployment V2_CORE points at. Success there = saved. */
+  async function ensureRow(item){
+    if(typeof window.bnxPromoPost!=='function'||!item) return null;
+    var cid=String(window.CLIENT_ID||localStorage.getItem('ERP_CLIENT')||''), ses=(typeof bnxCurrentSession_==='function'?bnxCurrentSession_():'')||localStorage.getItem('ERP_SESSION')||'';
+    var img=String(item.imageUrl||''); if(!/^https:\/\//i.test(img)||img.length>2000) img='';
+    try{ return await window.bnxPromoPost({action:'MENU_ITEM_ENSURE',clientId:cid,sessionToken:ses,itemId:item.code||item.ITEM_ID||item.id||'',itemCode:item.itemCode||item.ITEM_CODE||item.code||'',
+      name:item.n||'',price:Number(item.p)||0,category:item.c||'',veg:item.v||'',itemGroupId:item.itemGroupId||'',itemGroupName:item.itemGroupName||'',avail:item.avail!==false,imageUrl:img},45000); }catch(e){ return null; }
+  }
   var wrapped=async function(item){
     var r=await oldSave.apply(this,arguments);
-    if(r&&r.success&&item&&item.imageUrl){
-      try{var ir=await saveDriveImage(Object.assign({},item,{id:r.id||item.id,ITEM_ID:r.id||item.ITEM_ID}),item.imageUrl);if(ir&&ir.success&&ir.imageUrl)item.imageUrl=ir.imageUrl;}catch(e){console.warn('[MENU IMAGE DRIVE]',e);}
+    try{ var en=await ensureRow(item);
+      if(en&&en.success){ r=Object.assign({},r||{},{success:true,menuRows:en.data}); if(r.error&&!(r&&r.id)) delete r.error;
+        try{ var ob=bnxGetOutbox(), ids=[item.code,item.itemCode].filter(Boolean).map(String), keep=ob.filter(function(e){ return !(String(e.action).toUpperCase()==='SAVE_MENU_ITEM'&&ids.indexOf(String(e.requestId))>=0); }); if(keep.length!==ob.length) bnxSetOutbox(keep); }catch(e){} }
+    }catch(e){}
+    /* only a photo still kept on this PC (data:image) is uploaded — a Drive / https link was re-sent as "image data" on every save */
+    if(r&&r.success&&item&&/^data:image\//i.test(String(item.imageUrl||''))){
+      try{var ir=await saveDriveImage(item,item.imageUrl);if(ir&&ir.success&&ir.imageUrl){item.imageUrl=ir.imageUrl;
+        try{var key='bnx_menu_images_'+(typeof CLIENT_ID!=='undefined'?CLIENT_ID:'default'),x=JSON.parse(localStorage.getItem(key)||'{}');Object.keys(x).forEach(function(k){if(/^data:/i.test(String(x[k]))&&[item.code,item.itemCode,item.n].map(String).indexOf(k)>=0)x[k]=ir.imageUrl;});localStorage.setItem(key,JSON.stringify(x));}catch(e){}
+      }}catch(e){console.warn('[MENU IMAGE DRIVE]',e);}
     }
     return r;
   };
@@ -44324,7 +44358,7 @@ function bnxOpenImportHub(){
     try{ connectQz().catch(function(){}); }catch(e){}
   },300);
 
-  window.bnxDirectPrintRaw_=directPrintRaw; window.bnxConnectQz_=connectQz; window.bnxIpSettings_=ipSettings;   /* used by UPI QR → Test on POS printer */
+  window.bnxDirectPrintRaw_=directPrintRaw; window.bnxConnectQz_=connectQz; window.bnxIpSettings_=ipSettings; window.bnxKotRaw_=kotRaw; window.bnxRoleForKot_=roleForKOT;   /* 2026-10-09: used by the KOT print station */   /* used by UPI QR → Test on POS printer */
   window.bnxDirectBillInvoice=async function(d){
     try{
       const enabled=localStorage.getItem('bnx_direct_ip_print')!=='0';
@@ -58013,6 +58047,260 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
   }
   wrap(); D.addEventListener('DOMContentLoaded',wrap); setInterval(wrap,2000);
   W.bnxStaleFloorTest_={bizStart:bizStart,startMs:startMs,clean:clean};
+})();
+</script>
+
+<script id="bnx-print-master-station">
+/* ═══ MASTER PRINTERS + KOT PRINT STATION (2026-10-09) ═══
+   "printer configuration direct in mobile can't any changes — all from POS control", for every client:
+   1. Printer IPs come from the server (CLIENT_PRINTER_MASTER of the logged-in client) — not from this file.
+      Before, the Settings fields carried CL00010's IPs as built-in values, so any other client printed to them.
+      "💾 Save Print Settings" now saves the MASTER for this client: every PC and steward phone uses it.
+   2. This PC is the KOT print station when QZ Tray is connected: steward phones put their KOT tickets in the
+      client's print queue and this page prints them on the right printer (Kitchen / Bar / Hukka) at once.
+      Several PCs can be on — each ticket is claimed by one station only, so it never prints twice.
+   Chip bottom-left shows the station; tap it to switch this PC off / on as a station. */
+(function(){
+  var W=window, D=document, ROLES=['BILL','KITCHEN','HUKKA','BAR'], FIELD={BILL:'pr1',KITCHEN:'pr2',HUKKA:'pr3',BAR:'pr4'};
+  var LBL={BILL:'Billing Printer',KITCHEN:'Kitchen KOT Printer',HUKKA:'HUKKA KOT Printer',BAR:'Bar Printer'};
+  var IPRE=/\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/;
+  function cid(){ try{ return String(W.CLIENT_ID||localStorage.getItem('ERP_CLIENT')||'').trim().toUpperCase(); }catch(e){ return ''; } }
+  function ses(){ try{ if(typeof W.bnxCurrentSession_==='function'){ var s=W.bnxCurrentSession_(); if(s) return s; } }catch(e){} try{ return localStorage.getItem('ERP_SESSION')||''; }catch(e){ return ''; } }
+  function role(){ try{ var u=JSON.parse(localStorage.getItem('ERP_USER')||'{}'); return String(u.ROLE||u.role||''); }catch(e){ return ''; } }
+  function api(action,p,ms){ if(typeof W.bnxPromoPost!=='function') return Promise.resolve({success:false,error:'API not ready'});
+    return W.bnxPromoPost(Object.assign({action:action,clientId:cid(),sessionToken:ses(),bnxRole:role()},p||{}),ms||20000).catch(function(e){ return {success:false,error:e.message}; }); }
+  function note(m,t){ try{ if(typeof W.showNotif==='function') W.showNotif(m,t||'info'); }catch(e){} }
+  function isMobile(){ return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent||'') || (W.innerWidth||1200)<700; }
+
+  /* ── 1. master printers ── */
+  var MASTER=null;
+  function applyMaster(list){
+    var map={}; (list||[]).forEach(function(p){ if(p&&p.role&&ROLES.indexOf(p.role)>=0&&p.active!==false&&p.ip) map[p.role]=p; });
+    MASTER=map;
+    var key=(typeof W.bnxPrinterKey==='function')?W.bnxPrinterKey():('bnx_printer_settings_'+cid()), cfg={};
+    try{ cfg=JSON.parse(localStorage.getItem(key)||'{}')||{}; }catch(e){}
+    cfg.clientId=cid();
+    ROLES.forEach(function(r){ var f=FIELD[r], p=map[r], ip=p?p.ip:'', nm=ip?((p.label||LBL[r])+' — '+ip):'';
+      cfg[f]=Object.assign({},cfg[f]||{},{role:r,ip:ip,name:nm});
+      var el=D.getElementById(f+'-name'); if(el){ el.value=nm; el.placeholder=ip?'':'No '+r+' printer set for '+cid()+' — type "Label — 192.168.x.x"'; } });
+    try{ localStorage.setItem(key,JSON.stringify(cfg)); }catch(e){}
+    try{ W.__bnxPrinterDown={}; }catch(e){}
+  }
+  W.bnxLoadPrinterMaster=async function(){
+    if(!cid()) return null;
+    var r=await api('PRINTER_MASTER_GET',{},20000);
+    if(r&&r.success&&r.data){ applyMaster(r.data.printers); paintChip(); return r.data; }
+    return null;
+  };
+  /* "💾 Save Print Settings" → the client's MASTER (all PCs + all steward phones) */
+  var oldSave=W.bnxSavePrinterSettings;
+  W.bnxSavePrinterSettings=async function(){
+    try{ if(typeof oldSave==='function') oldSave.apply(this,arguments); }catch(e){}
+    var list=ROLES.map(function(r){ var v=(D.getElementById(FIELD[r]+'-name')||{}).value||'', m=v.match(IPRE);
+      return {role:r,label:String(v.split(/—|-\s/)[0]||LBL[r]).trim().slice(0,60)||LBL[r],ip:m?m[0]:'',port:9100,active:!!m}; });
+    var r=await api('PRINTER_MASTER_SAVE',{printers:list,route:'POS'},30000);
+    if(r&&r.success){ applyMaster(r.data&&r.data.printers); note('✅ Printers saved as MASTER for '+cid()+' — every POS PC and steward phone uses them now','success'); }
+    else note('⚠️ Saved on this PC only — server: '+((r&&r.error)||'not reachable'),'error');
+  };
+  try{ bnxSavePrinterSettings=W.bnxSavePrinterSettings; }catch(e){}
+
+  /* ── 2. KOT print station ── */
+  var ST={on:false,qz:false,v:0,busy:false,printed:0,failed:0,last:'',lastAt:0,force:0};
+  function stationWanted(){ try{ var v=localStorage.getItem('bnx_print_station_'+cid()); return v===null?!isMobile():v==='1'; }catch(e){ return !isMobile(); } }
+  function stationName(){ try{ var n=localStorage.getItem('bnx_station_name'); if(!n){ n='POS-'+Math.random().toString(36).slice(2,6).toUpperCase(); localStorage.setItem('bnx_station_name',n); } return n; }catch(e){ return 'POS'; } }
+  async function qzReady(){
+    if(typeof W.bnxConnectQz_!=='function') return false;
+    try{ await Promise.race([W.bnxConnectQz_(),new Promise(function(_,j){ setTimeout(function(){ j(new Error('QZ timeout')); },8000); })]); return true; }catch(e){ return false; }
+  }
+  async function printJob(j){
+    var r=String(j.role||'KITCHEN').toUpperCase(), title=r+' KOT'+(j.reprint?' (REPRINT)':'');
+    if(typeof W.bnxKotRaw_!=='function'||typeof W.bnxDirectPrintRaw_!=='function') throw new Error('print engine not loaded');
+    var ip=(W.bnxIpSettings_?W.bnxIpSettings_():{})[r]; if(!ip) throw new Error('No '+r+' printer IP in the master printer settings');
+    var data=await W.bnxKotRaw_(title,j.table,j.waiter,j.covers,j.items,j.kotNo,j.orderNo,j.si,j.sn,j.cust,j.rem);
+    await W.bnxDirectPrintRaw_(r,data,'KOT '+(j.kotNo||'')+' '+r);
+  }
+  async function tick(){
+    if(ST.busy||!cid()) return; ST.on=stationWanted(); if(!ST.on){ paintChip(); return; }
+    ST.busy=true;
+    try{
+      if(!ST.qz){ ST.qz=await qzReady(); if(!ST.qz){ paintChip(); return; } if(!MASTER) await W.bnxLoadPrinterMaster(); }
+      var force=Date.now()-ST.force>30000; if(force) ST.force=Date.now();
+      var r=await api('PRINT_QUEUE_CLAIM',{station:stationName(),qz:true,since:force?'':ST.v,force:force},15000);
+      if(!(r&&r.success&&r.data)) return;
+      ST.v=r.data.v||ST.v;
+      var jobs=r.data.jobs||[]; if(!jobs.length) return;
+      var res=[];
+      /* stations print in parallel, tickets of one station in order */
+      var byRole={}; jobs.forEach(function(j){ (byRole[j.role]=byRole[j.role]||[]).push(j); });
+      await Promise.all(Object.keys(byRole).map(async function(k){
+        for(var i=0;i<byRole[k].length;i++){ var j=byRole[k][i];
+          try{ await printJob(j); res.push({id:j.id,ok:true}); ST.printed++; ST.last=k+' · T'+(j.table||'-'); ST.lastAt=Date.now(); }
+          catch(e){ res.push({id:j.id,ok:false,error:String(e&&e.message||e)}); ST.failed++; ST.last='⚠️ '+k+': '+String(e&&e.message||e).slice(0,60); }
+        } }));
+      await api('PRINT_QUEUE_DONE',{results:res},15000);
+      var ok=res.filter(function(x){return x.ok;}).length;
+      if(ok) note('🖨️ '+ok+' steward KOT'+(ok>1?'s':'')+' printed','success');
+      if(ok<res.length) note('⚠️ '+(res.length-ok)+' KOT not printed — '+ST.last+' (retrying)','error');
+    }catch(e){ ST.qz=false; }
+    finally{ ST.busy=false; paintChip(); }
+  }
+  function paintChip(){
+    var c=D.getElementById('bnx-station-chip');
+    if(!c){ c=D.createElement('div'); c.id='bnx-station-chip';
+      c.style.cssText='position:fixed;right:96px;bottom:14px;z-index:9990;font:700 11px/1.3 "DM Sans",sans-serif;padding:7px 11px;border-radius:999px;box-shadow:0 4px 14px rgba(0,0,0,.18);cursor:pointer;max-width:70vw;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+      c.title='KOT print station — tap to switch this PC on / off';
+      c.onclick=function(){ var on=!stationWanted(); try{ localStorage.setItem('bnx_print_station_'+cid(),on?'1':'0'); }catch(e){} ST.qz=false; note(on?'🖨️ This PC prints steward KOTs':'This PC no longer prints steward KOTs',on?'success':'info'); tick(); paintChip(); };
+      (D.body||D.documentElement).appendChild(c); }
+    var on=stationWanted();
+    if(!on){ c.style.background='#f3f4f6'; c.style.color='#555'; c.textContent='🖨️ KOT station: OFF on this PC'; return; }
+    if(!ST.qz){ c.style.background='#fff7e6'; c.style.color='#7a4a00'; c.textContent='🖨️ KOT station: waiting for QZ Tray…'; return; }
+    c.style.background='#ecfdf3'; c.style.color='#065f46';
+    c.textContent='🖨️ KOT station ON · '+ST.printed+' printed'+(ST.failed?' · '+ST.failed+' failed':'')+(ST.last?' · last '+ST.last:'');
+  }
+  function boot(){ if(!cid()) return setTimeout(boot,2000); W.bnxLoadPrinterMaster().catch(function(){}); paintChip(); tick(); }
+  if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ setTimeout(boot,3000); }); else setTimeout(boot,3000);
+  setInterval(tick,4000);
+  W.bnxPrintStation={tick:tick,state:ST,load:function(){ return W.bnxLoadPrinterMaster(); }};
+})();
+</script>
+
+<style id="bnx-mobile-view-fix">
+/* MOBILE VIEW FIX (2026-10-09) — phone width ≤ 760 px */
+@media (max-width:760px){
+  /* UPI QR on Invoice: 3 columns squeezed the middle one to 1 letter wide ("N o U P I …" down the page) */
+  #bnxUpiQrBox > div[style*="grid-template-columns"]{grid-template-columns:1fr!important;gap:12px!important}
+  #bnxUpiQrBox #bnxUpiImg{text-align:center}
+  #bnxUpiQrBox #bnxUpiImg img{max-width:160px!important}
+  #bnxUpiQrBox .grid.g2{grid-template-columns:1fr!important}
+  #bnxUpiQrBox #bnxUpiTestQr{display:inline-block}
+  /* wide tables (Bills List, credit ledger, reports …): scroll sideways inside their card instead of being cut off */
+  .page .card:has(table.tbl),.page .card:has(table.bnx77-tbl),.page .card:has(#blTable){overflow-x:auto!important;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain}
+  #page-bills-list #blTable{min-width:1120px!important}
+  #page-bills-list #blTable th,#page-bills-list #blTable td{white-space:nowrap}
+  #page-bills-list #blTable .bl-actions-cell,#page-bills-list #blTable thead th:last-child,#page-bills-list #blTable tbody td:last-child{position:static!important;min-width:0!important;box-shadow:none!important}   /* sticky 250 px Actions column covered the whole phone screen */
+  /* KPI tiles: labels wrap to 2 lines instead of "TOTAL OUTST…" */
+  #page-due-collection .stat *,#page-customer-credit .stat *,#page-bills-list .stat *,#page-dashboard .stat *{text-overflow:clip!important;white-space:normal!important;overflow:visible!important}
+  #page-due-collection .stat,#page-customer-credit .stat,#page-bills-list .stat{min-width:0}
+  /* Accounts Ledger cards: no 150 px empty blocks on a phone */
+  #page-accounts-ledger .card,#page-accounts-ledger [class*="tile"],#page-accounts-ledger [class*="hub"] > *{min-height:0!important}
+  #page-accounts-ledger [onclick]{min-height:0!important}
+  /* print-station chip is for the counter PC only */
+  #bnx-station-chip{display:none!important}
+}
+</style>
+<script id="bnx-mobile-view-fix-js">
+(function(){
+  var W=window, D=document;
+  /* tables without a .card wrapper: give them a scroll box on phones */
+  function wrapTables(){
+    if((W.innerWidth||1200)>760) return;
+    D.querySelectorAll('.page.active table').forEach(function(t){
+      if(t.closest('.bnx-tscroll')||t.closest('.modal-box')) return;
+      var p=t.parentElement; if(!p) return;
+      var cs=getComputedStyle(p); if(cs.overflowX==='auto'||cs.overflowX==='scroll') return;
+      if(t.scrollWidth<=p.clientWidth+4) return;
+      var box=D.createElement('div'); box.className='bnx-tscroll'; box.style.cssText='overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%';
+      p.insertBefore(box,t); box.appendChild(t);
+    });
+  }
+  /* Due Collection showed ₹0 while Customer Credit showed ₹42 lakh: both read GET_DUE_COLLECTION, but only the
+     Customer Credit page asked for it — opening Due Collection first showed the empty defaults. Now every open of
+     either page loads it (at most once a minute) and shows "loading…" instead of ₹0 meanwhile. */
+  var lastDue=0;
+  function dueOpen(){
+    if(typeof W.bnxLoadDueCollection!=='function') return;
+    if(Date.now()-lastDue<60000 && W.__bnx72LastDue) return;
+    lastDue=Date.now();
+    if(!W.__bnx72LastDue) ['dcTotalOutstanding','dcReceivedToday','dcNetOutstanding','dcOverdue30'].forEach(function(id){ var e=D.getElementById(id); if(e&&!e.dataset.bnxLive) e.textContent='loading…'; });
+    W.bnxLoadDueCollection().catch(function(){});
+  }
+  function hook(){
+    var old=W.showPage; if(typeof old!=='function'||old.__bnxMob) return;
+    var f=function(p){ var r=old.apply(this,arguments); try{ if(/^(due-collection|customer-credit)$/.test(String(p))) setTimeout(dueOpen,50); setTimeout(wrapTables,400); }catch(e){} return r; };
+    f.__bnxMob=true; Object.keys(old).forEach(function(k){ try{ f[k]=old[k]; }catch(e){} }); W.showPage=f;
+    try{ showPage=f; }catch(e){}
+  }
+  hook(); D.addEventListener('DOMContentLoaded',function(){ setTimeout(hook,1500); setTimeout(hook,5000); });
+  setInterval(function(){ hook(); wrapTables(); },3000);
+  try{ if(/due-collection|customer-credit/.test(location.hash)) setTimeout(dueOpen,4000); }catch(e){}
+})();
+</script>
+
+<script id="bnx-steward-control-panel">
+/* ═══ SETTINGS › 📱 STEWARD APP CONTROL (2026-10-09) ═══
+   All stewards (defaults) + each steward user: Order placing Yes/No · KOT printing Yes/No · Lock the app.
+   Plus: hide items marked "not available" from the steward menu. Saved on the server for this client
+   (STEWARD_CONTROL_SAVE); every steward phone follows it within 45 s, no setting on the phone. */
+(function(){
+  var W=window, D=document;
+  function cid(){ try{ return String(W.CLIENT_ID||localStorage.getItem('ERP_CLIENT')||'').trim().toUpperCase(); }catch(e){ return ''; } }
+  function user(){ try{ return JSON.parse(localStorage.getItem('ERP_USER')||'{}')||{}; }catch(e){ return {}; } }
+  function ses(){ try{ if(typeof W.bnxCurrentSession_==='function'){ var s=W.bnxCurrentSession_(); if(s) return s; } }catch(e){} try{ return localStorage.getItem('ERP_SESSION')||''; }catch(e){ return ''; } }
+  function api(a,p,ms){ if(typeof W.bnxPromoPost!=='function') return Promise.resolve({success:false,error:'API not ready'}); var u=user();
+    return W.bnxPromoPost(Object.assign({action:a,clientId:cid(),sessionToken:ses(),bnxRole:String(u.ROLE||u.role||''),bnxUser:String(u.FULL_NAME||u.USERNAME||'')},p||{}),ms||30000); }
+  function esc(v){ return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+  var S={defaults:{},users:{},staff:[],q:''};
+  function install(){
+    if(D.getElementById('s-steward-ctl')) return true;
+    var nav=[].slice.call(D.querySelectorAll('.stg-nav-item')).find(function(n){ return /'s-staff'/.test(n.getAttribute('onclick')||''); });
+    var staffPanel=D.getElementById('s-staff');
+    if(!nav||!staffPanel) return false;
+    try{ if(typeof SETTINGS_PANEL_ROLES!=='undefined') SETTINGS_PANEL_ROLES['s-steward-ctl']=['OWNER','ADMIN','MANAGER']; }catch(e){}
+    var n=D.createElement('div'); n.className='stg-nav-item'; n.setAttribute('onclick',"sNav(this,'s-steward-ctl');setTimeout(bnxStwCtlLoad,80)"); n.textContent='📱 Steward App Control';
+    nav.parentNode.insertBefore(n,nav.nextSibling);
+    var p=D.createElement('div'); p.className='stg-panel'; p.id='s-steward-ctl'; p.style.display='none';
+    p.innerHTML='<div class="stg-panel-title">📱 Steward App Control</div>'
+      +'<div class="stg-panel-sub">Controls every steward phone of this client from the POS — nothing can be changed on the phone. Phones follow a change within 45 seconds.</div>'
+      +'<div style="border:1.5px solid var(--thm-gold,#b47a26);border-radius:11px;padding:12px;margin-bottom:12px;background:var(--surface2,#fffaf3)">'
+      +'<div style="font-size:12.5px;font-weight:800;margin-bottom:8px">All stewards (default)</div>'
+      +'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:9px">'
+      +'<label class="qrp-yn">🛒 Place orders<select class="fi" id="stwDefOrder"><option value="1">Yes — allowed</option><option value="0">No — view only</option></select></label>'
+      +'<label class="qrp-yn">🖨️ KOT printing<select class="fi" id="stwDefPrint"><option value="1">Yes — prints at POS</option><option value="0">No — KDS / KOT screen only</option></select></label>'
+      +'<label class="qrp-yn">🍽 Not-available items<select class="fi" id="stwDefHide"><option value="1">Hide from steward menu</option><option value="0">Show (greyed)</option></select></label>'
+      +'<label class="qrp-yn">🔒 Steward app<select class="fi" id="stwDefLock"><option value="0">Open</option><option value="1">Locked for everyone</option></select></label>'
+      +'</div></div>'
+      +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px"><input class="fi" id="stwQ" placeholder="Search steward name / login" style="max-width:260px;font-size:12px"><button class="btn btn-sm btn-ghost" type="button" onclick="bnxStwCtlLoad()">↻ Load</button><button class="btn btn-sm btn-primary" type="button" onclick="bnxStwCtlSave()">💾 Save steward control</button><span id="stwNote" style="font-size:10.5px;color:var(--text3)"></span></div>'
+      +'<div style="overflow-x:auto"><table class="tbl" style="min-width:620px"><thead><tr><th>Steward</th><th>Login</th><th>Place orders</th><th>KOT printing</th><th>Lock app</th></tr></thead><tbody id="stwBody"><tr><td colspan="5" style="text-align:center;color:var(--text3);padding:14px">Press ↻ Load</td></tr></tbody></table></div>';
+    staffPanel.parentNode.insertBefore(p,staffPanel.nextSibling);
+    D.getElementById('stwQ').addEventListener('input',function(){ S.q=this.value.toLowerCase(); paint(); });
+    return true;
+  }
+  function sel(id,k,v){ var o=[['','Default'],['1','Yes'],['0','No']], cur=v===true?'1':v===false?'0':'';
+    return '<select class="fi" data-u="'+esc(id)+'" data-k="'+k+'" style="font-size:11.5px;padding:4px 6px;width:auto">'+o.map(function(x){ return '<option value="'+x[0]+'"'+(x[0]===cur?' selected':'')+'>'+x[1]+'</option>'; }).join('')+'</select>'; }
+  function paint(){
+    var b=D.getElementById('stwBody'); if(!b) return;
+    var list=S.staff.filter(function(s){ return !S.q||(s.name+' '+s.login+' '+s.userId).toLowerCase().indexOf(S.q)>=0; });
+    b.innerHTML=list.length?list.map(function(s){ var k=String(s.userId).toUpperCase(), u=S.users[k]||{};
+      return '<tr'+(u.locked?' style="background:#fff1f0"':'')+'><td><b>'+esc(s.name||s.userId)+'</b>'+(s.active===false?' <span class="pill p-r" style="font-size:9px">inactive</span>':'')+'<div style="font-size:10px;color:var(--text3)">'+esc(s.type||'')+'</div></td><td class="mono">'+esc(s.login||s.userId)+'</td><td>'+sel(k,'order',u.order)+'</td><td>'+sel(k,'print',u.print)+'</td>'
+        +'<td><label style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="checkbox" data-u="'+esc(k)+'" data-k="locked"'+(u.locked?' checked':'')+'> 🔒 Locked</label></td></tr>'; }).join('')
+      :'<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:14px">No staff found in USER_MASTER for '+esc(cid())+'</td></tr>';
+  }
+  W.bnxStwCtlLoad=async function(){
+    install(); var n=D.getElementById('stwNote'); if(n) n.textContent='Loading…';
+    var r=await api('STEWARD_CONTROL_GET',{list:true},30000);
+    if(!(r&&r.success&&r.data)){ if(n) n.textContent='Could not load: '+((r&&(r.error||r.message))||'server'); return; }
+    S.defaults=r.data.defaults||{}; S.users=r.data.users||{}; S.staff=r.data.staff||[];
+    var d=S.defaults, v=function(id,x){ var e=D.getElementById(id); if(e) e.value=x?'1':'0'; };
+    v('stwDefOrder',d.order!==false); v('stwDefPrint',d.print!==false); v('stwDefHide',d.hideUnavailable!==false); v('stwDefLock',d.locked===true);
+    paint(); if(n) n.textContent=S.staff.length+' staff loaded'+(Object.keys(S.users).length?' · '+Object.keys(S.users).length+' with own setting':'');
+  };
+  W.bnxStwCtlSave=async function(){
+    var n=D.getElementById('stwNote'); if(n) n.textContent='Saving…';
+    var g=function(id){ return (D.getElementById(id)||{}).value==='1'; };
+    var defaults={order:g('stwDefOrder'),print:g('stwDefPrint'),hideUnavailable:g('stwDefHide'),locked:g('stwDefLock')};
+    var users={};
+    D.querySelectorAll('#stwBody [data-u]').forEach(function(e){ var k=e.dataset.u, f=e.dataset.k; users[k]=users[k]||{};
+      if(e.type==='checkbox'){ if(e.checked) users[k].locked=true; else if(defaults.locked) users[k].locked=false; }
+      else if(e.value==='1') users[k][f]=true; else if(e.value==='0') users[k][f]=false; });
+    var r=await api('STEWARD_CONTROL_SAVE',{defaults:defaults,users:users},30000);
+    if(!(r&&r.success)){ if(n) n.textContent='Not saved: '+((r&&(r.error||r.message))||'server'); return; }
+    S.users=(r.data&&r.data.users)||S.users; paint();
+    var locked=Object.keys(S.users).filter(function(k){ return S.users[k].locked; }).length;
+    if(n) n.textContent='✅ Saved '+new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})+' · orders '+(defaults.order?'ON':'OFF')+' · printing '+(defaults.print?'ON':'OFF')+(defaults.locked?' · ALL LOCKED':locked?' · '+locked+' locked':'')+' — phones follow within 45 s';
+    try{ if(typeof W.showNotif==='function') W.showNotif('📱 Steward app control saved','success'); }catch(e){}
+  };
+  function boot(){ if(!install()) setTimeout(boot,2000); }
+  if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ setTimeout(boot,1000); }); else setTimeout(boot,1000);
 })();
 </script>
 
