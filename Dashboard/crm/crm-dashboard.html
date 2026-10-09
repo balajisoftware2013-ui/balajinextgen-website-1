@@ -659,7 +659,7 @@ addEventListener('hashchange',()=>{const h=location.hash.slice(1);if(h!==view&&(
    ═══════════════════════════════════════════════════════════════════════════════════════════════ */
 (function(){
 'use strict';
-var G={guests:[],txns:[],loaded:false,err:'',at:0,tab:'guests',f:{from:'',to:'',ev:'',src:'',tbl:'',q:''}};
+var G={guests:[],txns:[],scans:[],loaded:false,err:'',at:0,tab:'guests',party:'',f:{from:'',to:'',ev:'',src:'',tbl:'',q:''}};
 var EPS=['AKfycbwHdqrP4IvuVD2ZkupNybrEkiXu3kmuI6-tQoiHgYxoqr1KgUupeFsi3PIoFEbuv6XA','AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ','AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx'];
 function ls(k){try{return localStorage.getItem(k)||sessionStorage.getItem(k)||'';}catch(e){return '';}}
 function login(){
@@ -685,9 +685,10 @@ async function call(action,extra){
 async function load(force){
   if(G.loaded&&!force&&Date.now()-G.at<60000) return;
   G.err='';paint('Loading guests from the server…');
-  var a=await call('GET_CRM_CUSTOMERS',{max:5000}), b=await call('GET_CRM_TRANSACTIONS',{max:20000});
+  var R=await Promise.all([call('GET_CRM_CUSTOMERS',{max:5000}),call('GET_CRM_TRANSACTIONS',{max:20000}),call('GET_CRM_SCANS',{max:20000})]), a=R[0], b=R[1], c=R[2];
   if(a&&a.success){G.guests=a.data||[];} else G.err=(a&&(a.error||a.message))||'GET_CRM_CUSTOMERS failed';
   if(b&&b.success){G.txns=b.data||[];} else if(!G.err) G.err='Visits log: '+((b&&(b.error||b.message))||'GET_CRM_TRANSACTIONS failed');
+  G.scans=(c&&c.success&&Array.isArray(c.data))?c.data:[];
   G.loaded=true;G.at=Date.now();render();
 }
 /* ── helpers ── */
@@ -707,6 +708,55 @@ function guestsF(){var f=G.f,q=f.q.toLowerCase(),tx=txnsF(),seen={};tx.forEach(f
   }).sort(function(a,b){return String(b.LAST_VISIT||'').localeCompare(String(a.LAST_VISIT||''));});}
 function grp(arr,key){var m={};arr.forEach(function(x){var k=key(x);(Array.isArray(k)?k:[k]).forEach(function(kk){kk=kk||'—';m[kk]=(m[kk]||0)+1;});});return Object.keys(m).map(function(k){return [k,m[k]];}).sort(function(a,b){return b[1]-a[1];});}
 function opt(id,vals,cur,all){var e=document.getElementById(id);if(!e)return;e.innerHTML='<option value="">'+all+'</option>'+vals.map(function(v){return '<option'+(v===cur?' selected':'')+'>'+esc(v)+'</option>';}).join('');}
+/* 2026-10-09: spend = ORDER (QR orders) + BILL (counter bills linked by mobile or table + night) */
+function isSpend(t){var ty=String(t.TYPE||'').toUpperCase();return ty==='ORDER'||ty==='BILL';}
+function evOf(t){return evs(t)[0]||'';}
+/* one party / event: every guest who scanned or checked in for it, how many times, when, table, spend at that party */
+function partyRows(name){
+  var P={},key=String(name||'').trim();if(!key)return [];
+  var gIdx={};G.guests.forEach(function(g){gIdx[mob(g)]=g;});
+  function row(m,nm,crn){var o=P[m]=P[m]||{m:m,name:'',crn:'',visits:0,scans:0,first:'',last:'',tables:{},spend:0,bills:0,days:{}};if(nm&&!o.name)o.name=nm;if(crn&&!o.crn)o.crn=crn;return o;}
+  function when(o,d){d=String(d||'');if(!d)return;if(!o.first||d<o.first)o.first=d;if(!o.last||d>o.last)o.last=d;var dd=day(d);if(dd)o.days[dd]=1;}
+  txnsF().forEach(function(t){if(evs(t).indexOf(key)<0)return;var m=mob(t);if(!m)return;var o=row(m,t.NAME,t.CUSTOMER_ID);var ty=String(t.TYPE||'').toUpperCase();
+    if(ty==='VISIT'){o.visits++;when(o,t.DATE_TIME);} if(isSpend(t)){o.spend+=N(t.AMOUNT);o.bills++;} if(t.TABLE)o.tables[t.TABLE]=1;});
+  G.scans.forEach(function(sc){var e=String(sc.EVENT||sc.PARTY||'').trim();if(e!==key||!inP(day(sc.DATE_TIME)))return;var m=mob(sc);
+    if(!m){var a=row('anon-'+(sc.DEVICE_ID||sc.SCAN_ID),'(not identified yet)','');a.scans++;when(a,sc.DATE_TIME);return;}
+    var o=row(m,sc.NAME,sc.CRN);o.scans++;when(o,sc.DATE_TIME);if(sc.TABLE)o.tables[sc.TABLE]=1;});
+  G.guests.forEach(function(g){var m=mob(g);if(!P[m]&&evs(g).indexOf(key)>=0&&inP(day(g.LAST_VISIT))){var o=row(m,g.NAME,g.CRN);when(o,g.LAST_VISIT);}});
+  return Object.keys(P).map(function(k){var o=P[k],g=gIdx[o.m]||{};o.name=o.name||String(g.NAME||'');o.crn=o.crn||String(g.CRN||'');o.allVisits=N(g.VISIT_COUNT);o.totalSpend=N(g.TOTAL_SPEND);if(!o.visits&&o.scans)o.visits=1;return o;})
+    .sort(function(a,b){return String(a.first).localeCompare(String(b.first));});
+}
+/* full history of one guest: every visit / party / order / bill / scan, newest first */
+function guestHistory(m){
+  var out=[];
+  G.txns.forEach(function(t){if(mob(t)!==m)return;out.push({t:String(t.DATE_TIME||''),k:String(t.TYPE||''),ev:evOf(t),tb:t.TABLE||'',no:t.ORDER_NO||'',amt:N(t.AMOUNT),src:srcOf(t)});});
+  G.scans.forEach(function(sc){if(mob(sc)!==m)return;out.push({t:String(sc.DATE_TIME||''),k:'SCAN',ev:String(sc.EVENT||sc.PARTY||''),tb:sc.TABLE||'',no:'',amt:0,src:String(sc.IDENTIFIED_BY||sc.STATUS||'')});});
+  return out.sort(function(a,b){return b.t.localeCompare(a.t);});
+}
+function showHistory(m){
+  var g=G.guests.filter(function(x){return mob(x)===m;})[0]||{},h=guestHistory(m),ev={},sp=0,vis=0,days={};
+  h.forEach(function(x){if(x.ev)ev[x.ev]=(ev[x.ev]||0)+(x.k==='VISIT'?1:0);if(x.k==='BILL'||x.k==='ORDER')sp+=x.amt;if(x.k==='VISIT'){vis++;var d=day(x.t);if(d)days[d]=1;}});
+  var old=document.getElementById('gHist');if(old)old.remove();
+  var d=document.createElement('div');d.id='gHist';d.style.cssText='position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;padding:14px';
+  d.innerHTML='<div class="card" style="max-width:860px;width:100%;max-height:88vh;overflow:auto;margin:0"><header><h2>'+esc(g.NAME||'Guest')+' · '+esc(m)+(g.CRN?' · '+esc(g.CRN):'')+'</h2><button class="btn s" data-gx="hclose">Close</button></header>'+
+    '<section class="kpis"><div class="kpi"><span>Visits</span><b>'+Math.max(vis,N(g.VISIT_COUNT))+'</b><small>'+Object.keys(days).length+' different nights</small></div>'+
+    '<div class="kpi"><span>Spend</span><b>'+inr(Math.round(Math.max(sp,N(g.TOTAL_SPEND))))+'</b><small>'+h.filter(function(x){return x.k==='BILL'||x.k==='ORDER';}).length+' bills / orders</small></div>'+
+    '<div class="kpi"><span>Parties / events</span><b>'+Object.keys(ev).length+'</b><small>'+esc(Object.keys(ev).join(', ')||'—')+'</small></div>'+
+    '<div class="kpi"><span>First · last visit</span><b style="font-size:14px">'+esc(day(g.FIRST_VISIT)||'—')+'</b><small>last '+esc(g.LAST_VISIT||'—')+'</small></div></section>'+
+    '<div class="scroll"><table class="gcrm"><thead><tr><th>When</th><th>What</th><th>Party / event</th><th>Table</th><th>Bill / order</th><th class="num">Amount</th><th>How</th></tr></thead><tbody>'+
+    (h.length?h.map(function(x){return '<tr><td>'+esc(x.t)+'</td><td>'+pill(x.k)+'</td><td>'+esc(x.ev||'—')+'</td><td>'+esc(x.tb)+'</td><td>'+esc(x.no)+'</td><td class="num">'+(x.amt?inr(x.amt):'')+'</td><td>'+esc(x.src)+'</td></tr>';}).join(''):rowEmpty(7,'No history rows'))+'</tbody></table></div></div>';
+  d.addEventListener('click',function(e){if(e.target===d||e.target.closest('[data-gx="hclose"]'))d.remove();});
+  document.body.appendChild(d);
+}
+async function linkBills(){
+  var L=login();if(!L.cid)return toast('Log in to the ERP first');
+  toast('Linking bills to guests…');
+  var ok=ls('bnx_guestcrm_api_ok'),list=(ok?[ok]:[]).concat(EPS.filter(function(x){return x!==ok;}));
+  for(var i=0;i<list.length;i++){try{var r=await (await fetch('https://script.google.com/macros/s/'+list[i]+'/exec',{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},
+    body:JSON.stringify({action:'CRM_LINK_BILLS',clientId:L.cid,sessionToken:L.tok,days:7})})).json();
+    if(r&&r.success&&r.data){toast('✅ '+r.data.linked+' bill(s) linked ('+r.data.byMobile+' by mobile, '+r.data.byTable+' by table) · '+r.data.already+' already linked');return load(true);}}catch(e){}}
+  toast('Link bills: server does not have the new CRM file yet (deploy a new version)');
+}
 function wa(g){var m=mob(g);if(!/^[6-9]\d{9}$/.test(m))return '';var t='Hi '+(String(g.NAME||'').split(' ')[0]||'')+'! Thank you for visiting us'+(evs(g).length?' for '+evs(g)[evs(g).length-1]:'')+'. Your customer number is '+(g.CRN||g.CUSTOMER_ID||'')+'. 🙏';
   return '<a class="btn s" style="padding:3px 9px;background:#25D366;color:#fff;border-color:#25D366" target="_blank" rel="noopener" href="https://wa.me/91'+m+'?text='+encodeURIComponent(t)+'">WhatsApp</a>';}
 function csv(name,head,rows){var c=[head.join(',')].concat(rows.map(function(r){return r.map(csvCell).join(',');})).join('\n');var a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['﻿'+c],{type:'text/csv'}));
@@ -719,14 +769,14 @@ function render(){
   var allEv=grp(G.guests.concat(G.txns),evs).map(function(x){return x[0];}).filter(function(x){return x!=='—';}).sort();
   var allSrc=grp(G.txns.concat(G.guests),srcOf).map(function(x){return x[0];}).filter(function(x){return x!=='—';});
   var allTbl=grp(G.txns,function(t){return String(t.TABLE||'');}).map(function(x){return x[0];}).filter(function(x){return x&&x!=='—';}).sort(function(a,b){return String(a).localeCompare(String(b),undefined,{numeric:true});});
-  var visits=tx.filter(function(t){return String(t.TYPE||'').toUpperCase()==='VISIT';}), orders=tx.filter(function(t){return String(t.TYPE||'').toUpperCase()==='ORDER';});
+  var visits=tx.filter(function(t){return String(t.TYPE||'').toUpperCase()==='VISIT';}), orders=tx.filter(isSpend);
   var newG=gs.filter(function(g){return inP(day(g.FIRST_VISIT));}).length;
   var named=gs.filter(function(g){return String(g.NAME||'').trim();}).length, welcomed=gs.filter(function(g){return String(g.WELCOME_SENT||'').trim();}).length;
   var spend=orders.reduce(function(a,t){return a+N(t.AMOUNT);},0), uniq={};visits.forEach(function(t){uniq[mob(t)]=1;});
   var ret=gs.filter(function(g){return N(g.VISIT_COUNT)>1;}).length;
   var tab=function(id,l){return '<button role="tab" aria-selected="'+(G.tab===id)+'" data-gt="'+id+'">'+l+'</button>';};
   var h='<div class="head"><div><h1>Guest CRM (QR)</h1><div class="sub">QR scans, WhatsApp check-ins, events and visits'+(G.at?' · updated '+new Date(G.at).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}):'')+'</div></div>'+
-    '<div class="acts"><button class="btn s" data-gx="reload">Refresh</button></div></div>'+
+    '<div class="acts"><button class="btn s" data-gx="linkbills" title="Find tonight\'s bills of every guest (mobile on the bill, or the table they scanned)">Link bills</button><button class="btn s" data-gx="reload">Refresh</button></div></div>'+
     (G.err?'<div class="banner" role="status"><div><b>Could not load everything.</b> '+esc(G.err)+'</div></div>':'')+
     '<section class="kpis">'+
       '<div class="kpi"><span>Guests</span><b>'+gs.length+'</b><small>'+newG+' new in period</small></div>'+
@@ -734,7 +784,7 @@ function render(){
       '<div class="kpi"><span>Returning guests</span><b>'+(gs.length?Math.round(ret/gs.length*100):0)+'%</b><small>'+ret+' came more than once</small></div>'+
       '<div class="kpi"><span>Name captured</span><b>'+(gs.length?Math.round(named/gs.length*100):0)+'%</b><small'+(named<gs.length?' class="warn"':'')+'>'+(gs.length-named)+' without name</small></div>'+
       '<div class="kpi"><span>Welcome sent</span><b>'+welcomed+'</b><small>WhatsApp / SMS</small></div>'+
-      '<div class="kpi"><span>QR orders</span><b>'+orders.length+'</b><small>'+inr(Math.round(spend))+'</small></div>'+
+      '<div class="kpi"><span>Bills + QR orders</span><b>'+orders.length+'</b><small>'+inr(Math.round(spend))+'</small></div>'+
     '</section>'+
     '<form class="filters" id="gF2" onsubmit="return false">'+
       '<div class="f"><label for="gFrom">From</label><input type="date" id="gFrom" value="'+esc(f.from)+'"></div>'+
@@ -745,26 +795,39 @@ function render(){
       '<div class="f"><label for="gQ">Search</label><input id="gQ" placeholder="Name, mobile, CRN" value="'+esc(f.q)+'"></div>'+
       '<button class="btn" type="button" data-gx="today">Today</button><button class="btn" type="button" data-gx="month">This month</button><button class="btn" type="button" data-gx="reset">Reset</button>'+
     '</form>'+
-    '<div class="tabs" role="tablist">'+tab('guests','Guests')+tab('visits','Visits log')+tab('events','Event-wise')+tab('days','Day-wise')+tab('src','Sources & tables')+tab('dq','Data quality')+'</div>';
+    '<div class="tabs" role="tablist">'+tab('guests','Guests')+tab('party','Party / event guests')+tab('visits','Visits log')+tab('events','Event-wise')+tab('days','Day-wise')+tab('src','Sources & tables')+tab('dq','Data quality')+'</div>';
   var body='';
   if(G.tab==='guests'){
     body='<div class="card"><header><h2>Guests · '+gs.length+'</h2><button class="btn s" data-gx="csv-guests">Export CSV</button></header><div class="scroll"><table class="gcrm"><thead><tr><th>CRN</th><th>Name</th><th>Mobile</th><th>Events</th><th class="num">Visits</th><th class="num">Orders</th><th class="num">Spend</th><th>First visit</th><th>Last visit</th><th>Source</th><th>Welcome</th><th></th></tr></thead><tbody>'+
-      (gs.length?gs.map(function(g){return '<tr><td>'+esc(g.CRN||g.CUSTOMER_ID||'')+'</td><td>'+(String(g.NAME||'').trim()?esc(g.NAME):'<span class="pill p-overdue">no name</span>')+'</td><td>'+esc(g.MOBILE)+'</td><td>'+esc(evs(g).join(', ')||'—')+'</td><td class="num">'+N(g.VISIT_COUNT)+'</td><td class="num">'+N(g.TOTAL_ORDERS)+'</td><td class="num">'+inr(N(g.TOTAL_SPEND))+'</td><td>'+esc(g.FIRST_VISIT||'')+'</td><td>'+esc(g.LAST_VISIT||'')+'</td><td>'+esc(srcOf(g))+'</td><td>'+(String(g.WELCOME_SENT||'').trim()?'<span class="pill p-won">sent</span>':'—')+'</td><td>'+wa(g)+'</td></tr>';}).join(''):rowEmpty(12,G.loaded?'No guests for these filters':'Loading…'))+'</tbody></table></div></div>';
+      (gs.length?gs.map(function(g){return '<tr data-ghist="'+esc(mob(g))+'" style="cursor:pointer" title="Click: full visit / party / bill history"><td>'+esc(g.CRN||g.CUSTOMER_ID||'')+'</td><td>'+(String(g.NAME||'').trim()?esc(g.NAME):'<span class="pill p-overdue">no name</span>')+'</td><td>'+esc(g.MOBILE)+'</td><td>'+esc(evs(g).join(', ')||'—')+'</td><td class="num">'+N(g.VISIT_COUNT)+'</td><td class="num">'+N(g.TOTAL_ORDERS)+'</td><td class="num">'+inr(N(g.TOTAL_SPEND))+'</td><td>'+esc(g.FIRST_VISIT||'')+'</td><td>'+esc(g.LAST_VISIT||'')+'</td><td>'+esc(srcOf(g))+'</td><td>'+(String(g.WELCOME_SENT||'').trim()?'<span class="pill p-won">sent</span>':'—')+'</td><td>'+wa(g)+'</td></tr>';}).join(''):rowEmpty(12,G.loaded?'No guests for these filters':'Loading…'))+'</tbody></table></div></div>';
+  } else if(G.tab==='party'){
+    var plist=grp(G.txns.concat(G.scans.map(function(x){return {EVENT:x.EVENT||x.PARTY};})).concat(G.guests),evs).map(function(x){return x[0];}).filter(function(x){return x&&x!=='—';}).sort();
+    if(!G.party||plist.indexOf(G.party)<0){ var lastEv=G.txns.concat(G.scans).filter(function(t){return evs(t).length||t.PARTY;}).sort(function(a,b){return String(b.DATE_TIME||'').localeCompare(String(a.DATE_TIME||''));})[0];
+      G.party=f.ev&&plist.indexOf(f.ev)>=0?f.ev:(lastEv&&plist.indexOf(evs(lastEv)[0]||lastEv.PARTY)>=0?(evs(lastEv)[0]||lastEv.PARTY):(plist[0]||'')); }   /* default: the latest party */
+    var pr=partyRows(G.party),known=pr.filter(function(o){return o.m.indexOf('anon-')!==0;}),pSp=known.reduce(function(a,o){return a+o.spend;},0);
+    G.__party=pr;
+    body='<div class="card"><header><h2>Party / event</h2><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><select id="gParty" class="btn s" style="min-width:220px">'+plist.map(function(x){return '<option'+(x===G.party?' selected':'')+'>'+esc(x)+'</option>';}).join('')+'</select><button class="btn s" data-gx="csv-party">Export CSV</button></div></header>'+
+      '<section class="kpis"><div class="kpi"><span>Guests (identified)</span><b>'+known.length+'</b><small>'+(pr.length-known.length)+' phones scanned without number yet</small></div>'+
+      '<div class="kpi"><span>Scans / visits</span><b>'+pr.reduce(function(a,o){return a+Math.max(o.visits,o.scans);},0)+'</b><small>dates: '+esc(Object.keys(pr.reduce(function(a,o){Object.keys(o.days).forEach(function(d){a[d]=1;});return a;},{})).sort().join(', ')||'—')+'</small></div>'+
+      '<div class="kpi"><span>Spend at this party</span><b>'+inr(Math.round(pSp))+'</b><small>'+known.reduce(function(a,o){return a+o.bills;},0)+' bills / orders linked</small></div>'+
+      '<div class="kpi"><span>Returning guests</span><b>'+known.filter(function(o){return o.allVisits>1;}).length+'</b><small>came on other days too</small></div></section>'+
+      '<div class="scroll"><table class="gcrm"><thead><tr><th>#</th><th>Name</th><th>Mobile</th><th>CRN</th><th>First scan</th><th>Last</th><th>Table</th><th class="num">Visits here</th><th class="num">Spend here</th><th class="num">All visits</th><th class="num">All spend</th><th></th></tr></thead><tbody>'+
+      (pr.length?pr.map(function(o,i){var an=o.m.indexOf('anon-')===0;return '<tr'+(an?'':' data-ghist="'+esc(o.m)+'" style="cursor:pointer"')+'><td>'+(i+1)+'</td><td>'+(an?'<span class="pill p-overdue">no number yet</span>':esc(o.name||'—'))+'</td><td>'+(an?'':esc(o.m))+'</td><td>'+esc(o.crn)+'</td><td>'+esc(o.first)+'</td><td>'+esc(o.last)+'</td><td>'+esc(Object.keys(o.tables).join(', '))+'</td><td class="num">'+Math.max(o.visits,o.scans?1:0)+'</td><td class="num">'+(o.spend?inr(Math.round(o.spend)):'')+'</td><td class="num">'+(an?'':o.allVisits)+'</td><td class="num">'+(an||!o.totalSpend?'':inr(Math.round(o.totalSpend)))+'</td><td>'+(an?'':wa({MOBILE:o.m,NAME:o.name,CRN:o.crn,EVENTS:G.party}))+'</td></tr>';}).join(''):rowEmpty(12,plist.length?'No guests for this party in the chosen dates':'No party / event scans yet'))+'</tbody></table></div></div>';
   } else if(G.tab==='visits'){
     var vs=tx.slice().sort(function(a,b){return String(b.DATE_TIME||'').localeCompare(String(a.DATE_TIME||''));});
     body='<div class="card"><header><h2>Visits and orders · '+vs.length+'</h2><button class="btn s" data-gx="csv-visits">Export CSV</button></header><div class="scroll"><table class="gcrm"><thead><tr><th>Date / time</th><th>CRN</th><th>Name</th><th>Mobile</th><th>Type</th><th>Event</th><th>Table</th><th>Order</th><th class="num">Amount</th><th>Source</th></tr></thead><tbody>'+
       (vs.length?vs.map(function(t){return '<tr><td>'+esc(t.DATE_TIME||'')+'</td><td>'+esc(t.CUSTOMER_ID||'')+'</td><td>'+esc(t.NAME||'—')+'</td><td>'+esc(t.MOBILE)+'</td><td>'+pill(t.TYPE||'')+'</td><td>'+esc(t.EVENT||'—')+'</td><td>'+esc(t.TABLE||'')+'</td><td>'+esc(t.ORDER_NO||'')+'</td><td class="num">'+(N(t.AMOUNT)?inr(N(t.AMOUNT)):'')+'</td><td>'+esc(srcOf(t))+'</td></tr>';}).join(''):rowEmpty(10,G.loaded?'No visits for these filters':'Loading…'))+'</tbody></table></div></div>';
   } else if(G.tab==='events'){
     var E={};tx.forEach(function(t){var list=evs(t);if(!list.length)list=['(no event)'];list.forEach(function(e){var o=E[e]=E[e]||{v:0,g:{},o:0,amt:0,first:'',last:'',days:{}};var ty=String(t.TYPE||'').toUpperCase();var d=day(t.DATE_TIME);
-      if(ty==='VISIT'){o.v++;o.g[mob(t)]=1;} if(ty==='ORDER'){o.o++;o.amt+=N(t.AMOUNT);} if(d){o.days[d]=1;if(!o.first||d<o.first)o.first=d;if(!o.last||d>o.last)o.last=d;}});});
+      if(ty==='VISIT'){o.v++;o.g[mob(t)]=1;} if(ty==='ORDER'||ty==='BILL'){o.o++;o.amt+=N(t.AMOUNT);} if(d){o.days[d]=1;if(!o.first||d<o.first)o.first=d;if(!o.last||d>o.last)o.last=d;}});});
     var er=Object.keys(E).map(function(k){var o=E[k];return [k,Object.keys(o.days).sort().join(', '),Object.keys(o.g).length,o.v,o.o,o.amt];}).sort(function(a,b){return b[3]-a[3];});
     G.__ev=er;
     body='<div class="grid2"><div class="card"><header><h2>Guests per event</h2></header>'+bars(er.map(function(r){return [r[0],r[2],r[2]+' guests'];}))+'</div>'+
       '<div class="card"><header><h2>How guests chose the event</h2></header>'+bars(grp(tx.filter(function(t){return evs(t).length;}),srcOf).map(function(x){return [x[0],x[1],x[1]+' visits'];}))+'</div></div>'+
-      '<div class="card"><header><h2>Event-wise report</h2><button class="btn s" data-gx="csv-events">Export CSV</button></header><div class="scroll"><table class="gcrm"><thead><tr><th>Event</th><th>Date(s)</th><th class="num">Guests</th><th class="num">Visits</th><th class="num">QR orders</th><th class="num">Order value</th><th></th></tr></thead><tbody>'+
-      (er.length?er.map(function(r){return '<tr><td><b>'+esc(r[0])+'</b></td><td>'+esc(r[1])+'</td><td class="num">'+r[2]+'</td><td class="num">'+r[3]+'</td><td class="num">'+r[4]+'</td><td class="num">'+inr(Math.round(r[5]))+'</td><td>'+(r[0]!=='(no event)'?'<button class="btn s" data-gev="'+esc(r[0])+'">Guest list</button>':'')+'</td></tr>';}).join(''):rowEmpty(7,'No visits in this period'))+'</tbody></table></div></div>';
+      '<div class="card"><header><h2>Event-wise report</h2><button class="btn s" data-gx="csv-events">Export CSV</button></header><div class="scroll"><table class="gcrm"><thead><tr><th>Event</th><th>Date(s)</th><th class="num">Guests</th><th class="num">Visits</th><th class="num">Bills / orders</th><th class="num">Spend</th><th></th></tr></thead><tbody>'+
+      (er.length?er.map(function(r){return '<tr><td><b>'+esc(r[0])+'</b></td><td>'+esc(r[1])+'</td><td class="num">'+r[2]+'</td><td class="num">'+r[3]+'</td><td class="num">'+r[4]+'</td><td class="num">'+inr(Math.round(r[5]))+'</td><td>'+(r[0]!=='(no event)'?'<button class="btn s" data-gparty="'+esc(r[0])+'">Guest list</button>':'')+'</td></tr>';}).join(''):rowEmpty(7,'No visits in this period'))+'</tbody></table></div></div>';
   } else if(G.tab==='days'){
-    var D={};tx.forEach(function(t){var d=day(t.DATE_TIME)||'—';var o=D[d]=D[d]||{v:0,g:{},o:0,amt:0,ev:{}};var ty=String(t.TYPE||'').toUpperCase();if(ty==='VISIT'){o.v++;o.g[mob(t)]=1;}if(ty==='ORDER'){o.o++;o.amt+=N(t.AMOUNT);}evs(t).forEach(function(e){o.ev[e]=1;});});
+    var D={};tx.forEach(function(t){var d=day(t.DATE_TIME)||'—';var o=D[d]=D[d]||{v:0,g:{},o:0,amt:0,ev:{}};var ty=String(t.TYPE||'').toUpperCase();if(ty==='VISIT'){o.v++;o.g[mob(t)]=1;}if(ty==='ORDER'||ty==='BILL'){o.o++;o.amt+=N(t.AMOUNT);}evs(t).forEach(function(e){o.ev[e]=1;});});
     var nw={};G.guests.forEach(function(g){var d=day(g.FIRST_VISIT);if(d)nw[d]=(nw[d]||0)+1;});
     var dr=Object.keys(D).sort().reverse().map(function(d){var o=D[d];return [d,o.v,Object.keys(o.g).length,nw[d]||0,o.o,o.amt,Object.keys(o.ev).join(', ')];});G.__days=dr;
     body='<div class="card"><header><h2>Visits per day</h2></header>'+bars(dr.slice(0,14).reverse().map(function(r){return [r[0],r[1],r[1]+' visits · '+r[3]+' new'];}))+'</div>'+
@@ -793,20 +856,24 @@ function render(){
   opt('gEv',allEv,f.ev,'All events');opt('gSrc',allSrc,f.src,'All sources');opt('gTbl',allTbl,f.tbl,'All tables');
 }
 /* ── events ── */
-document.addEventListener('change',function(e){var id=e.target&&e.target.id;var m={gFrom:'from',gTo:'to',gEv:'ev',gSrc:'src',gTbl:'tbl'};if(view==='guests'&&m[id]){G.f[m[id]]=e.target.value;render();}});
+document.addEventListener('change',function(e){if(view==='guests'&&e.target&&e.target.id==='gParty'){G.party=e.target.value;render();return;}var id=e.target&&e.target.id;var m={gFrom:'from',gTo:'to',gEv:'ev',gSrc:'src',gTbl:'tbl'};if(view==='guests'&&m[id]){G.f[m[id]]=e.target.value;render();}});
 document.addEventListener('input',function(e){if(view==='guests'&&e.target&&e.target.id==='gQ'){G.f.q=e.target.value;clearTimeout(G.__t);G.__t=setTimeout(function(){render();var q=document.getElementById('gQ');if(q){q.focus();q.setSelectionRange(q.value.length,q.value.length);}},250);}});
 document.addEventListener('click',function(e){
   if(view!=='guests')return;
   var t=e.target.closest('[data-gt]');if(t){G.tab=t.dataset.gt;render();return;}
   var ev=e.target.closest('[data-gev]');if(ev){G.f.ev=ev.dataset.gev;G.tab='guests';render();return;}
+  var gp=e.target.closest('[data-gparty]');if(gp){G.party=gp.dataset.gparty;G.tab='party';render();return;}
+  var hi=e.target.closest('[data-ghist]');if(hi&&!e.target.closest('a,button')){showHistory(hi.dataset.ghist);return;}
   var x=e.target.closest('[data-gx]');if(!x)return;var a=x.dataset.gx,today=iso(new Date());
   if(a==='reload')return load(true);
+  if(a==='linkbills')return linkBills();
+  if(a==='csv-party')return csv('party-'+String(G.party||'').replace(/[^A-Za-z0-9]+/g,'_'),['PARTY','NAME','MOBILE','CRN','FIRST_SCAN','LAST','TABLES','VISITS_HERE','SPEND_HERE','ALL_VISITS','ALL_SPEND'],(G.__party||[]).filter(function(o){return o.m.indexOf('anon-')!==0;}).map(function(o){return [G.party,o.name,o.m,o.crn,o.first,o.last,Object.keys(o.tables).join(' '),Math.max(o.visits,o.scans?1:0),o.spend,o.allVisits,o.totalSpend];}));
   if(a==='today'){G.f.from=G.f.to=today;return render();}
   if(a==='month'){G.f.from=today.slice(0,8)+'01';G.f.to=today;return render();}
   if(a==='reset'){G.f={from:'',to:'',ev:'',src:'',tbl:'',q:''};return render();}
   if(a==='csv-guests')return csv('guests',['CRN','NAME','MOBILE','EVENTS','VISITS','ORDERS','SPEND','FIRST_VISIT','LAST_VISIT','SOURCE','WELCOME_SENT','OPT_IN'],guestsF().map(function(g){return [g.CRN||g.CUSTOMER_ID,g.NAME,g.MOBILE,evs(g).join(' | '),g.VISIT_COUNT,g.TOTAL_ORDERS,g.TOTAL_SPEND,g.FIRST_VISIT,g.LAST_VISIT,srcOf(g),g.WELCOME_SENT,g.OPT_IN];}));
   if(a==='csv-visits')return csv('visits',['DATE_TIME','CRN','NAME','MOBILE','TYPE','EVENT','TABLE','ORDER_NO','AMOUNT','SOURCE'],txnsF().map(function(t){return [t.DATE_TIME,t.CUSTOMER_ID,t.NAME,t.MOBILE,t.TYPE,t.EVENT,t.TABLE,t.ORDER_NO,t.AMOUNT,srcOf(t)];}));
-  if(a==='csv-events')return csv('events',['EVENT','DATES','GUESTS','VISITS','QR_ORDERS','ORDER_VALUE'],G.__ev||[]);
+  if(a==='csv-events')return csv('events',['EVENT','DATES','GUESTS','VISITS','BILLS_ORDERS','SPEND'],G.__ev||[]);
   if(a==='csv-days')return csv('days',['DATE','VISITS','GUESTS','NEW_GUESTS','QR_ORDERS','ORDER_VALUE','EVENTS'],G.__days||[]);
 });
 /* hook into the page's navigation: rail link + showView */
