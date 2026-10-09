@@ -2394,24 +2394,49 @@ function retakeSelfie(){
   document.getElementById("snapBtn").onclick = captureSelfie;
   startCamera();
 }
+const SHARED_CFG_KEY = "bnERP_shared_attcfg_v1";
+function attCfg(){
+  let c=null;
+  try{ const all=JSON.parse(localStorage.getItem(SHARED_CFG_KEY)||"{}"); c=all[DB.currentClientId]||null; }catch(e){}
+  const g=DB.load().geofence||{};
+  if(c && Array.isArray(c.locations) && c.locations.length){
+    return {enforce:c.enforce!==false, maxAcc:c.maxAcc||200, locations:c.locations.filter(l=>l.on!==false)};
+  }
+  return {enforce:g.enforce!==false, maxAcc:200, locations:[{id:"default",name:g.name||"Office",lat:g.lat,lng:g.lng,radius:g.radius||200}]};
+}
+function myAllowedLocs(cfg){
+  let locs=[];
+  try{ const all=JSON.parse(localStorage.getItem(SHARED_EMP_KEY)||"{}"); const arr=all[DB.currentClientId]||[];
+       const me=arr.find(e=>e.id===state.user.id); locs=(me&&me.locs)||[]; }catch(e){}
+  if(!locs.length) return cfg.locations;
+  const f=cfg.locations.filter(l=>locs.indexOf(l.id)>=0);
+  return f;
+}
 function fetchGps(){
   const chip = document.getElementById("gpsChip");
-  if(!navigator.geolocation){ chip.textContent="⚠️ Geolocation not supported on this device"; chip.className="gps-chip bad"; state.gpsInside=null; return; }
+  chip.onclick = fetchGps; chip.style.cursor="pointer";
+  chip.className="gps-chip"; chip.textContent="📍 Fetching GPS location…";
+  state.gps=null; state.gpsInside=null; state.gpsPlace="";
+  if(!navigator.geolocation){ chip.textContent="⚠️ Geolocation not supported on this device - use a phone"; chip.className="gps-chip bad"; return; }
   navigator.geolocation.getCurrentPosition(pos=>{
     state.gps = {lat:pos.coords.latitude, lng:pos.coords.longitude, acc:pos.coords.accuracy};
-    const geo = DB.load().geofence;
-    const dist = haversine(state.gps.lat,state.gps.lng,geo.lat,geo.lng);
-    const inside = dist <= geo.radius;
-    state.gpsInside = inside;
-    chip.className = "gps-chip " + (inside?"ok":"bad");
-    chip.innerHTML = inside
-      ? `✅ Inside office geofence (${geo.name}) · ±${Math.round(state.gps.acc)}m accuracy`
-      : `🏠 ${Math.round(dist)}m from ${geo.name} — outside ${geo.radius}m radius, will be marked Work From Home`;
+    const cfg=attCfg(); const locs=myAllowedLocs(cfg);
+    if(!locs.length){ state.gpsInside=false; chip.className="gps-chip bad"; chip.textContent="🚫 No office location is allowed for you. Ask HR."; return; }
+    let best=null,bd=1e12;
+    locs.forEach(l=>{ const d=haversine(state.gps.lat,state.gps.lng,l.lat,l.lng); if(d<bd){bd=d;best=l;} });
+    const inside = bd <= best.radius;
+    state.gpsLowAcc = state.gps.acc > cfg.maxAcc;
+    state.gpsInside = inside && !state.gpsLowAcc;
+    state.gpsPlace = inside ? best.name : "";
+    const names=locs.map(l=>l.name).join(", ");
+    if(state.gpsLowAcc){ chip.className="gps-chip bad"; chip.textContent=`📡 GPS not accurate enough (±${Math.round(state.gps.acc)}m, need ±${cfg.maxAcc}m). Go near a window / switch on high accuracy and tap here to retry.`; }
+    else if(inside){ chip.className="gps-chip ok"; chip.textContent=`✅ Inside ${best.name} · ±${Math.round(state.gps.acc)}m accuracy`; }
+    else { chip.className="gps-chip bad"; chip.textContent=`🚫 ${Math.round(bd)}m from ${best.name} (limit ${best.radius}m). ${cfg.enforce?"You can mark attendance only inside: ":"Office: "}${names}. Tap to retry.`; }
   }, err=>{
     chip.className="gps-chip bad";
-    chip.textContent="⚠️ Location permission denied — attendance will be flagged for review";
+    chip.textContent="⚠️ Location permission denied. Allow location for this site, then tap here.";
     state.gpsInside = null;
-  }, {enableHighAccuracy:true, timeout:8000});
+  }, {enableHighAccuracy:true, timeout:10000, maximumAge:0});
 }
 function haversine(lat1,lon1,lat2,lon2){
   const R=6371000, toRad=d=>d*Math.PI/180;
@@ -2428,6 +2453,11 @@ function updateDeviceInfo(){
   }
 }
 async function confirmCheckInOut(){
+  const cfg0 = attCfg();
+  if(cfg0.enforce && state.gpsInside!==true){
+    toast(state.gps ? "Attendance can be marked only inside the office. Move to the office and tap the location bar to retry." : "Location not verified yet. Allow location, wait for the green tick, then confirm.","error");
+    return;
+  }
   const now = new Date();
   const time = now.toTimeString().slice(0,5);
   const remarks = document.getElementById("ciRemarks").value.trim();
@@ -2436,11 +2466,11 @@ async function confirmCheckInOut(){
     // (marked Work From Home), null = location unavailable/denied (flagged).
     let status, note;
     if(state.gpsInside===true){ status = isLate(time)?"Late":"Present"; note="office"; }
-    else if(state.gpsInside===false){ status = "Work From Home"; note="wfh"; }
+    else if(state.gpsInside===false && !cfg0.enforce){ status = "Work From Home"; note="wfh"; }
     else { status = isLate(time)?"Late":"Present"; note="unverified"; }
     const rec = {emp:state.user.id, date:todayISO(), status, checkIn:time, checkOut:"", hours:"-", ot:"-",
       lat: state.gps?.lat||null, lng: state.gps?.lng||null, selfie: state.selfieData?"captured":"",
-      remarks: note==="unverified" ? (remarks + (remarks?" · ":"") + "⚠️ location not verified").trim() : remarks};
+      remarks: (note==="unverified" ? (remarks + (remarks?" · ":"") + "⚠️ location not verified").trim() : remarks) + (state.gpsPlace?((remarks?" · ":"")+"📍 "+state.gpsPlace):"")};
     await saveAttendanceToBackend(rec);
     pushSharedAttendanceStatus(state.user.id, todayISO(), status, DB.currentClientId);
     toast(note==="wfh" ? `Checked in from home at ${time}` : `Checked in at ${time}${isLate(time)?' (marked Late)':''}`,"success");
@@ -2451,7 +2481,7 @@ async function confirmCheckInOut(){
     const hrs = Math.floor(totalMin/60), mins = totalMin%60;
     const otMin = Math.max(totalMin-480,0);
     await saveAttendanceToBackend({emp:state.user.id, date:todayISO(), checkOut:time,
-      hours:`${hrs}h ${mins}m`, ot: otMin>0?`${Math.floor(otMin/60)}h ${otMin%60}m`:"-", remarks: remarks||mine.remarks});
+      hours:`${hrs}h ${mins}m`, ot: otMin>0?`${Math.floor(otMin/60)}h ${otMin%60}m`:"-", remarks: ((remarks||mine.remarks||"") + (state.gpsPlace?" · 📍 out: "+state.gpsPlace:"")).trim()});
     toast(`Checked out at ${time} · ${hrs}h ${mins}m worked`,"success");
   }
   closeModal("ciOverlay");
@@ -3021,7 +3051,8 @@ function renderSettings(){
         </div>
         <div class="field"><label>Coordinates</label><div style="font-size:12.5px;color:var(--muted);">${d.geofence.lat.toFixed(5)}, ${d.geofence.lng.toFixed(5)}</div></div>
         <button class="btn btn-primary btn-sm" onclick="useMyLocationAsOffice()">📍 Set to My Current Location</button>
-        <div class="section-sub" style="margin-top:8px;">Employees checking in outside this radius are automatically marked <strong>Work From Home</strong> instead of Present.</div>
+        <label style="display:flex;gap:8px;align-items:center;margin-top:12px;font-size:13px;"><input type="checkbox" ${d.geofence.enforce!==false?'checked':''} onchange="setGeoEnforce(this.checked)"/> <strong>Office only</strong> - block check-in and check-out outside the office</label>
+        <div class="section-sub" style="margin-top:8px;">With this on, staff outside the radius cannot mark attendance at all. Several office locations and which staff may use which location are managed in the HR Dashboard (QR Scan Attendance page, same browser) and apply here automatically.</div>
       </div>
       <div class="card card-pad">
         <div class="section-title" style="margin-bottom:14px;">Attendance Rules</div>
@@ -3043,6 +3074,7 @@ function renderSettings(){
       </div>
     </div>`;
 }
+function setGeoEnforce(v){ const d=DB.load(); d.geofence.enforce=!!v; DB.save(); toast(v?"Office-only attendance ON":"Office-only attendance OFF (outside = Work From Home)","success"); }
 function updateGeoRadius(v){ const d=DB.load(); d.geofence.radius=Number(v); DB.save(); toast("Geo-fence radius updated","success"); }
 function useMyLocationAsOffice(){
   if(!navigator.geolocation){ toast("Geolocation not supported on this device","error"); return; }
