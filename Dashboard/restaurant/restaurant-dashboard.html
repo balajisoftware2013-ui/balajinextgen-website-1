@@ -38442,13 +38442,22 @@ function compressImage(file){
   return new Promise(function(resolve,reject){
     var rd=new FileReader();rd.onerror=reject;rd.onload=function(){
       var img=new Image();img.onerror=reject;img.onload=function(){
-        var max=1200,w=img.naturalWidth||img.width,h=img.naturalHeight||img.height;
-        if(w>max||h>max){var scale=Math.min(max/w,max/h);w=Math.max(1,Math.round(w*scale));h=Math.max(1,Math.round(h*scale));}
-        var c=document.createElement('canvas');c.width=w;c.height=h;var ctx=c.getContext('2d');ctx.drawImage(img,0,0,w,h);
-        var data=c.toDataURL('image/webp',0.82);
-        /* Some browsers do not support WebP canvas output. */
-        if(!/^data:image\/webp;base64,/i.test(data)) data=c.toDataURL('image/jpeg',0.84);
-        if(data.length>1600000){data=c.toDataURL('image/jpeg',0.72);}
+        /* 2026-10-10 SPEED FIX ("image upload very slow"): was 1200 px / q0.82 = 300 KB-1.6 MB of base64 posted to
+           Apps Script, which then writes it to Drive. Menu tiles are shown at ~300 px, so 800 px and a ~150 KB
+           ceiling look the same and upload 5-10x faster. Quality / size steps down until it fits. */
+        var max=800,TARGET=160000,w=img.naturalWidth||img.width,h=img.naturalHeight||img.height;
+        function enc(mw,q){
+          var k=Math.min(1,mw/Math.max(w,h)), cw=Math.max(1,Math.round(w*k)), ch=Math.max(1,Math.round(h*k));
+          var c=document.createElement('canvas');c.width=cw;c.height=ch;var ctx=c.getContext('2d');
+          ctx.fillStyle='#fff';ctx.fillRect(0,0,cw,ch);ctx.drawImage(img,0,0,cw,ch);
+          var d=c.toDataURL('image/webp',q);
+          if(!/^data:image\/webp;base64,/i.test(d)) d=c.toDataURL('image/jpeg',q);   /* browser without WebP */
+          return d;
+        }
+        var data=enc(max,0.78);
+        if(data.length>TARGET) data=enc(max,0.62);
+        if(data.length>TARGET) data=enc(640,0.6);
+        if(data.length>TARGET) data=enc(480,0.55);
         resolve(data);
       };img.src=String(rd.result||'');
     };rd.readAsDataURL(file);
@@ -38459,6 +38468,7 @@ function imagePayload(item,data){return {itemId:String(item?.ITEM_ID||item?.item
 async function saveDriveImage(item,data){
   if(typeof gasApi!=='function')return {success:false,error:'Server API unavailable'};
   var p=imagePayload(item,data);if(!p.itemId&&!p.itemCode)return {success:false,error:'Item ID/code missing'};
+  if(typeof navigator!=='undefined'&&navigator.onLine===false)return {success:false,offline:true,error:'Offline — photo kept on this PC, uploads when internet returns'};
   /* 2026-10-09 ROOT FIX ("image upload failed: Item not found in ITEM_MASTER"): gasApi('V2_CORE') can point at a
      deployment whose old handler only looks in ITEM_MASTER (POS quick-add items such as HASHFREEZER live only in
      MENU_CARD_ITEMS). The fixed handler (menu-card-qr-promo.gs) is asked first; the old route stays as a fallback. */
@@ -38467,6 +38477,9 @@ async function saveDriveImage(item,data){
       var cid=String(window.CLIENT_ID||localStorage.getItem('ERP_CLIENT')||''), ses=(typeof bnxCurrentSession_==='function'?bnxCurrentSession_():'')||localStorage.getItem('ERP_SESSION')||'';
       var r1=await window.bnxPromoPost(Object.assign({action:'SAVE_MENU_ITEM_IMAGE',clientId:cid,sessionToken:ses},p),120000);
       if(r1&&r1.success&&r1.imageUrl) return r1;
+      /* 2026-10-10: a timeout / network failure used to trigger a SECOND full upload through the old route
+         (2 x 90-120 s waiting). Only an "unknown action" answer falls back now. */
+      if(r1&&r1.offline) return r1;
       if(r1&&!r1.unknownAction&&!r1.offline&&r1.error&&!/unknown action|not handled/i.test(String(r1.error))) return r1;
     }
   }catch(e){}
@@ -38521,15 +38534,26 @@ if(typeof oldSave==='function'&&!oldSave.__bnxDriveImageWrap){
   }
   var wrapped=async function(item){
     var r=await oldSave.apply(this,arguments);
+    /* 2026-10-10 SPEED: the photo upload (Drive write) used to run AFTER the row check, one after the other, with the
+       dialog waiting for both. It now starts at once in the background; the dialog closes when the row is saved. */
+    var photoJob=null;
+    if(r&&r.success&&item&&/^data:image\//i.test(String(item.imageUrl||''))){
+      try{ if(typeof showNotif==='function') showNotif('🖼 Item saved — photo uploading in background…','info'); }catch(e){}
+      photoJob=saveDriveImage(item,item.imageUrl);
+    }
     try{ var en=await ensureRow(item);
       if(en&&en.success){ r=Object.assign({},r||{},{success:true,menuRows:en.data}); if(r.error&&!(r&&r.id)) delete r.error;
         try{ var ob=bnxGetOutbox(), ids=[item.code,item.itemCode].filter(Boolean).map(String), keep=ob.filter(function(e){ return !(String(e.action).toUpperCase()==='SAVE_MENU_ITEM'&&ids.indexOf(String(e.requestId))>=0); }); if(keep.length!==ob.length) bnxSetOutbox(keep); }catch(e){} }
     }catch(e){}
     /* only a photo still kept on this PC (data:image) is uploaded — a Drive / https link was re-sent as "image data" on every save */
-    if(r&&r.success&&item&&/^data:image\//i.test(String(item.imageUrl||''))){
-      try{var ir=await saveDriveImage(item,item.imageUrl);if(ir&&ir.success&&ir.imageUrl){item.imageUrl=ir.imageUrl;
-        try{var key='bnx_menu_images_'+(typeof CLIENT_ID!=='undefined'?CLIENT_ID:'default'),x=JSON.parse(localStorage.getItem(key)||'{}');Object.keys(x).forEach(function(k){if(/^data:/i.test(String(x[k]))&&[item.code,item.itemCode,item.n].map(String).indexOf(k)>=0)x[k]=ir.imageUrl;});localStorage.setItem(key,JSON.stringify(x));}catch(e){}
-      }}catch(e){console.warn('[MENU IMAGE DRIVE]',e);}
+    if(photoJob){
+      photoJob.then(function(ir){
+        if(ir&&ir.success&&ir.imageUrl){ item.imageUrl=ir.imageUrl;
+          try{var key='bnx_menu_images_'+(typeof CLIENT_ID!=='undefined'?CLIENT_ID:'default'),x=JSON.parse(localStorage.getItem(key)||'{}');Object.keys(x).forEach(function(k){if(/^data:/i.test(String(x[k]))&&[item.code,item.itemCode,item.n].map(String).indexOf(k)>=0)x[k]=ir.imageUrl;});localStorage.setItem(key,JSON.stringify(x));}catch(e){}
+          try{ if(typeof buildMenu==='function') buildMenu(); }catch(e){}
+          try{ if(typeof showNotif==='function') showNotif('✅ Item photo saved to Google Drive','success'); }catch(e){}
+        } else { try{ if(typeof showNotif==='function') showNotif('⚠️ Photo kept on this PC — Drive upload failed: '+((ir&&ir.error)||'no response')+' (retried on next save)','error'); }catch(e){} }
+      }).catch(function(e){ console.warn('[MENU IMAGE DRIVE]',e); });
     }
     return r;
   };
