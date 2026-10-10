@@ -358,7 +358,7 @@ window.bnxSafeUri_=function(s){s=String(s==null?'':s).replace(/[\uD800-\uDBFF](?
         if (/unknown action|not handled/i.test(String(last.error||last.message||''))) { setNo(list[k],action); continue; }
         try{ localStorage.setItem('bnx_promo_api_ok', list[k]); }catch(e){}
         return last;
-      }catch(e){ last={success:false,offline:true,error:e.name==='AbortError'?'Server timeout':(e.message||'Network error')}; }
+      }catch(e){ last={success:false,offline:true,error:e.name==='AbortError'?'Server timeout':(e.message||'Network error')}; if(/^BACKUP_/.test(action)) break; /* never re-run a backup/restore on another deployment after a timeout */ }
       finally{ clearTimeout(tm); }
     }
     if (last && /unknown action/i.test(String(last.error||last.message||''))) { last.unknownAction=true; last.error='No deployment has '+obj.action+' yet — add the new .gs files and deploy a NEW VERSION (check: open the /exec URL with ?action=BNX_WHOAMI)'; }
@@ -8511,6 +8511,129 @@ document.addEventListener('DOMContentLoaded', function(){
       </div>
     </div>
   </div>
+  <!-- ===== BACKUP & RESTORE (Super Admin) - talks to BackupRestore.gs (BACKUP_GET / SAVE / NOW / RESTORE) ===== -->
+  <div class="card" id="bnxBackupCard" style="margin-top:15px;">
+    <div class="card-header">
+      <span class="card-title">💾 Backup &amp; Restore</span>
+      <span id="bkStatus" style="font-size:11px;color:var(--text3);">Not loaded</span>
+    </div>
+    <div id="bkWarn" style="display:none;background:var(--gold-bg);border:1px solid var(--gold);border-radius:8px;padding:8px 10px;font-size:11px;margin-bottom:10px;">⚠️ Server is not verifying your login session for backup actions yet (add <b>bnxValidateSession_</b> in Apps Script).</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;">
+      <div style="background:var(--surface2);border-radius:10px;padding:12px;">
+        <div style="font-size:12px;font-weight:800;margin-bottom:8px;">⚙️ Settings</div>
+        <label style="display:flex;gap:7px;align-items:center;font-size:12px;margin-bottom:8px;"><input type="checkbox" id="bkEnabled"> Nightly auto backup (4 AM IST)</label>
+        <label style="font-size:11px;color:var(--text3);">Client's own Drive folder (link or ID — blank = default folder)</label>
+        <input class="fi" id="bkFolder" placeholder="https://drive.google.com/drive/folders/…" style="width:100%;margin:3px 0 8px;font-size:11px;">
+        <label style="display:flex;gap:7px;align-items:center;font-size:12px;margin-bottom:6px;"><input type="checkbox" id="bkAutoDel"> Auto-delete old backups <span style="font-size:10px;color:var(--text3);">(OFF = nothing is ever deleted)</span></label>
+        <div style="display:flex;gap:8px;margin-bottom:8px;">
+          <div style="flex:1"><label style="font-size:10px;color:var(--text3);">Keep daily (days)</label><input class="fi" id="bkKeepDays" type="number" min="7" max="365" value="30" style="width:100%;font-size:11px;"></div>
+          <div style="flex:1"><label style="font-size:10px;color:var(--text3);">Keep per old month</label><input class="fi" id="bkKeepMonthly" type="number" min="0" max="12" value="2" style="width:100%;font-size:11px;"></div>
+        </div>
+        <div style="display:flex;gap:7px;flex-wrap:wrap;">
+          <button class="btn btn-sm btn-primary" id="bkSaveBtn" onclick="bnxBk.save()">💾 Save settings</button>
+          <button class="btn btn-sm btn-ghost" id="bkNowBtn" onclick="bnxBk.now()">⚡ Backup now</button>
+          <button class="btn btn-sm btn-ghost" onclick="bnxBk.load()">🔄 Refresh</button>
+        </div>
+      </div>
+      <div style="background:var(--surface2);border-radius:10px;padding:12px;">
+        <div style="font-size:12px;font-weight:800;margin-bottom:8px;">♻️ Restore</div>
+        <label style="font-size:11px;color:var(--text3);">Backup to restore from</label>
+        <select class="fi" id="bkPick" style="width:100%;margin:3px 0 8px;font-size:11px;" onchange="bnxBk.pickChanged()"></select>
+        <label style="font-size:11px;color:var(--text3);">Sheets to restore</label>
+        <div id="bkSheets" style="max-height:130px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:6px 8px;margin:3px 0 8px;font-size:11px;background:var(--surface);"></div>
+        <div style="font-size:10px;color:var(--text3);margin-bottom:6px;">A safety copy of the live data is taken automatically first. Restore switches itself off after use (or 30 min).</div>
+        <input class="fi" id="bkConfirm" placeholder="Type RESTORE to confirm" style="width:100%;margin-bottom:8px;font-size:11px;">
+        <button class="btn btn-sm btn-primary" id="bkRestoreBtn" style="background:var(--red,#c0392b);border-color:var(--red,#c0392b);" onclick="bnxBk.restore()">♻️ Restore selected sheets</button>
+      </div>
+    </div>
+    <div style="font-size:12px;font-weight:800;margin:14px 0 6px;">📜 Backup history</div>
+    <div style="overflow-x:auto;">
+      <table class="tbl"><thead><tr><th>Time</th><th>Database</th><th>Type</th><th>Size</th><th>Status</th><th>File</th><th>By</th></tr></thead>
+      <tbody id="bkLog"><tr><td colspan="7" style="text-align:center;color:var(--text3);padding:14px;">Loading…</td></tr></tbody></table>
+    </div>
+  </div>
+  <script>
+  (function(){
+    var W=window, S={log:[],sheets:[],loaded:false,busy:false};
+    function $(i){return document.getElementById(i);}
+    function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+    function note(m,t){try{if(typeof W.showNotif==='function')return W.showNotif(m,t||'success');}catch(e){} alert(m);}
+    function api(a,p,ms){
+      if(typeof W.bnxApprovalApi!=='function') return Promise.resolve({success:false,error:'API helper not ready - reload the page'});
+      return W.bnxApprovalApi(a,p||{},ms||30000);
+    }
+    function busy(b,ids){S.busy=b;(ids||['bkSaveBtn','bkNowBtn','bkRestoreBtn']).forEach(function(i){var e=$(i);if(e)e.disabled=b;});}
+    function paint(d){
+      var s=d.settings||{};
+      $('bkEnabled').checked=!!s.enabled; $('bkFolder').value=s.folderId||''; $('bkAutoDel').checked=!!s.autoDelete;
+      $('bkKeepDays').value=s.keepDays||30; $('bkKeepMonthly').value=(s.keepMonthly==null?2:s.keepMonthly);
+      $('bkWarn').style.display=(d.verifiedSession===false)?'block':'none';
+      $('bkStatus').textContent=(s.lastBackupAt?'Last backup: '+new Date(s.lastBackupAt).toLocaleString('en-IN')+' · '+(s.lastStatus||''):'No backup yet')+' · '+(s.enabled?'Auto ON':'Auto OFF');
+      S.log=d.log||[]; S.sheets=d.sheets||[];
+      $('bkLog').innerHTML=S.log.length?S.log.map(function(r){
+        var ok=r.STATUS==='OK';
+        return '<tr><td>'+esc(r.CREATED_AT)+'</td><td>'+esc(r.DB_KIND)+'</td><td>'+esc(r.TRIGGER)+'</td><td>'+(r.SIZE_KB?esc(r.SIZE_KB)+' KB':'')+'</td>'
+          +'<td style="color:'+(ok?'var(--green)':'var(--red,#c0392b)')+';font-weight:700;" title="'+esc(r.MESSAGE)+'">'+esc(r.STATUS)+'</td>'
+          +'<td>'+(r.FILE_URL?'<a href="'+esc(r.FILE_URL)+'" target="_blank" rel="noopener">Open</a>':'')+'</td><td>'+esc(r.CREATED_BY)+'</td></tr>';
+      }).join(''):'<tr><td colspan="7" style="text-align:center;color:var(--text3);padding:14px;">No backups yet.</td></tr>';
+      var okRows=S.log.filter(function(r){return r.STATUS==='OK'&&r.DB_KIND==='TRANSACTION'&&r.BACKUP_ID&&r.TRIGGER!=='RESTORE';});
+      $('bkPick').innerHTML=okRows.length?okRows.map(function(r){return '<option value="'+esc(r.BACKUP_ID)+'">'+esc(r.CREATED_AT)+' · '+esc(r.TRIGGER)+'</option>';}).join(''):'<option value="">No backup available</option>';
+      $('bkSheets').innerHTML='<label style="display:block;font-weight:700;margin-bottom:4px;"><input type="checkbox" onchange="bnxBk.all(this.checked)"> Select all</label>'
+        +S.sheets.map(function(n){return '<label style="display:block;"><input type="checkbox" class="bkSh" value="'+esc(n)+'"> '+esc(n)+'</label>';}).join('');
+    }
+    var bk=W.bnxBk={
+      load:function(){
+        $('bkStatus').textContent='Loading…';
+        return api('BACKUP_GET',{}).then(function(r){
+          if(r&&r.success){S.loaded=true;paint(r.data);} else {$('bkStatus').textContent='⚠️ '+((r&&r.error)||'Failed');}
+        });
+      },
+      save:function(){
+        if(S.busy)return; busy(true);
+        var days=Number($('bkKeepDays').value)||30, mon=Number($('bkKeepMonthly').value);
+        api('BACKUP_SAVE',{enabled:$('bkEnabled').checked,folderId:$('bkFolder').value.trim(),autoDelete:$('bkAutoDel').checked,keepDays:days,keepMonthly:isNaN(mon)?2:mon}).then(function(r){
+          busy(false); if(r&&r.success){note('✅ Backup settings saved');bk.load();} else note('❌ '+((r&&r.error)||'Save failed'),'error');
+        });
+      },
+      now:function(){
+        if(S.busy)return; busy(true); $('bkNowBtn').textContent='⏳ Backing up…';
+        api('BACKUP_NOW',{},180000).then(function(r){
+          busy(false); $('bkNowBtn').textContent='⚡ Backup now';
+          if(r&&r.success&&r.data){ note(r.data.duplicate?'ℹ️ Backup was just completed':(r.data.ok?'✅ Backup completed':'⚠️ Backup finished with errors - see history'),r.data.ok?'success':'error'); bk.load(); }
+          else { note('❌ '+((r&&r.error)||'Backup failed')+' (it may still be running - press Refresh in a minute)','error'); }
+        });
+      },
+      all:function(on){document.querySelectorAll('#bkSheets .bkSh').forEach(function(c){c.checked=on;});},
+      pickChanged:function(){},
+      restore:async function(){
+        if(S.busy)return;
+        var id=$('bkPick').value, sheets=[].slice.call(document.querySelectorAll('#bkSheets .bkSh:checked')).map(function(c){return c.value;});
+        if(!id) return note('Select a backup first','error');
+        if(!sheets.length) return note('Select at least one sheet','error');
+        if($('bkConfirm').value.trim()!=='RESTORE') return note('Type RESTORE to confirm','error');
+        if(!confirm('Restore '+sheets.length+' sheet(s) from the selected backup?\nCurrent data in those sheets will be replaced (a safety copy is taken first).')) return;
+        busy(true);
+        try{
+          var en=await api('BACKUP_SAVE',{restoreEnabled:true});
+          if(!en||!en.success) throw new Error((en&&en.error)||'Could not enable restore');
+          for(var i=0;i<sheets.length;i++){
+            $('bkRestoreBtn').textContent='⏳ '+(i+1)+'/'+sheets.length+' '+sheets[i];
+            var r=await api('BACKUP_RESTORE',{backupId:id,sheet:sheets[i],confirm:'RESTORE',last:(i===sheets.length-1)},180000);
+            if(!r||!r.success) throw new Error('Sheet '+sheets[i]+': '+((r&&r.error)||'failed')+(i? ' (earlier sheets were already restored)':''));
+          }
+          note('✅ Restore completed - '+sheets.length+' sheet(s). Reload the dashboard to see restored data.');
+          $('bkConfirm').value='';
+        }catch(e){
+          note('❌ '+e.message,'error');
+          try{ await api('BACKUP_SAVE',{restoreEnabled:false}); }catch(x){}
+        }
+        $('bkRestoreBtn').textContent='♻️ Restore selected sheets'; busy(false); bk.load();
+      }
+    };
+    // load once, the first time the card becomes visible (Super Admin page opened)
+    try{ var io=new IntersectionObserver(function(en){ if(en[0].isIntersecting&&!S.loaded){ bk.load(); } }); io.observe($('bnxBackupCard')); }catch(e){}
+  })();
+  </script>
 </div>
 <div class="page" id="page-online-orders">
   <div class="section-h">
