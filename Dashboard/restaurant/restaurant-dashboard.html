@@ -55527,30 +55527,43 @@ html body #page-pos .cart-panel>.pos-head-actions .pill{flex:0 0 auto!important;
     var x=parseInt(m[1],10), f=function(v){v=((v%24)+24)%24;return (v%12||12)+(v<12?' AM':' PM');};
     return f(x)+' – '+f(x+1);
   }
-  function renderPeak(){
-    var box=$('bnxdPeakBars'); if(!box) return;
-    var src=Array.isArray(W._hourlyChartData)?W._hourlyChartData:[];
-    if(!src.length){ var d=summary(); if(d&&Array.isArray(d.hourlyChart)) src=d.hourlyChart; }
-    var pts=src.map(function(p){return {h:p.h,v:num(p.v!=null?p.v:p.sales),b:num(p.bills)};}).filter(function(p){return p.v>0;});
-    /* FIX 2026-10-10: server hour buckets were wrong vs the POS export (midnight sales shown as 3 PM, a 7 AM bucket
-       that cannot exist). When the bill register fully covers the period, bucket by each bill's real clock time. */
-    try{
-      var ft=(typeof W.bnxDashCurrentFromTo_==='function')?W.bnxDashCurrentFromTo_():null, sm=summary();
-      var expect=0; if(sm&&sm.orderTypeCounts) Object.keys(sm.orderTypeCounts).forEach(function(k){expect+=num(sm.orderTypeCounts[k]);});
-      if(ft&&typeof W.bnxResolveReportRange==='function'&&typeof W.bnxBillHour_==='function'){
-        var bl=(W.bnxResolveReportRange(ft.from,ft.to).bills||[]).filter(function(b){return !/cancel|void|delet/i.test(String(b.status||''));});
-        if(bl.length&&(!expect||bl.length>=expect*0.95)){
-          var by={}; bl.forEach(function(b){var h=W.bnxBillHour_(b); if(h===null)return; (by[h]=by[h]||{h:h,v:0,b:0}); by[h].v+=num(b.total); by[h].b++;});
-          var cp=Object.keys(by).map(function(k){return by[k];}).filter(function(p){return p.v>0;});
-          if(cp.length) pts=cp;
-        }
-      }
-    }catch(e){ console.warn('[Peak hours client calc]',e); }
-    if(!pts.length){ box.innerHTML='<div class="bnxd-empty">No hourly sales for this period yet.</div>'; return; }
+  /* FIX 2026-10-10 (Peak Hours wrong): the server's hour buckets are wrong (midnight sales landed in 3 PM, a 7 AM bucket
+     appeared). The earlier client fix only ran when the whole period's bills were already in this browser, so on
+     Month / Quarter / Year it silently fell back to the wrong server buckets. Now: pull the period's real bills first
+     (cached, same call the Reports Hub uses), bucket every bill by its own clock time, and never show the server buckets. */
+  var peakPulled={}, peakSeq=0;
+  function peakCompute(ft,sm){
+    if(!(ft&&typeof W.bnxResolveReportRange==='function'&&typeof W.bnxBillHour_==='function')) return null;
+    var expect=0; if(sm&&sm.orderTypeCounts) Object.keys(sm.orderTypeCounts).forEach(function(k){expect+=num(sm.orderTypeCounts[k]);});
+    var bl=(W.bnxResolveReportRange(ft.from,ft.to).bills||[]).filter(function(b){return !/cancel|void|delet/i.test(String(b.status||''));});
+    var by={}; bl.forEach(function(b){var h=W.bnxBillHour_(b); if(h===null) return; (by[h]=by[h]||{h:h,v:0,b:0}); by[h].v+=num(b.total); by[h].b++;});
+    var pts=Object.keys(by).map(function(k){return by[k];}).filter(function(p){return p.v>0;});
+    return {pts:pts,bills:bl.length,expect:expect,full:bl.length>0&&(!expect||bl.length>=expect*0.95)};
+  }
+  function peakDraw(box,pts,partial){
     var total=pts.reduce(function(s,p){return s+p.v;},0);
     var top=pts.slice().sort(function(a,b){return b.v-a.v;}).slice(0,5);
-    bars(box,top.map(function(p,i){return {label:hourLabel(p.h),v:p.v,text:money(p.v),color:i===0?'var(--gold)':'var(--blue)'};}),
-      esc('Top '+top.length+' hours = '+(top.reduce(function(s,p){return s+p.v;},0)/total*100).toFixed(0)+'% of sales'+(top[0].b?' · busiest hour '+top[0].b+' bills':'')));
+    var note='Top '+top.length+' hours = '+(top.reduce(function(s,p){return s+p.v;},0)/total*100).toFixed(0)+'% of sales'+(top[0].b?' \u00b7 busiest hour '+top[0].b+' bills':'')+(partial?' \u00b7 '+partial:'');
+    bars(box,top.map(function(p,i){return {label:hourLabel(p.h),v:p.v,text:money(p.v),color:i===0?'var(--gold)':'var(--blue)'};}),esc(note));
+  }
+  function renderPeak(){
+    var box=$('bnxdPeakBars'); if(!box) return;
+    var ft=null, sm=summary();
+    try{ ft=(typeof W.bnxDashCurrentFromTo_==='function')?W.bnxDashCurrentFromTo_():null; }catch(e){}
+    var r=null; try{ r=peakCompute(ft,sm); }catch(e){ console.warn('[Peak hours client calc]',e); }
+    if(r&&r.full&&r.pts.length){ peakDraw(box,r.pts,''); return; }
+    var key=ft?(ft.from+'|'+ft.to):'', last=peakPulled[key]||0;
+    if(ft&&typeof W.bnxPullBillsFromServer==='function'&&Date.now()-last>60000){
+      peakPulled[key]=Date.now(); var my=++peakSeq;
+      box.innerHTML='<div class="bnxd-empty">Loading hourly sales\u2026</div>';
+      Promise.resolve().then(function(){return W.bnxPullBillsFromServer(ft.from,ft.to);}).then(function(){ if(my===peakSeq) renderPeak(); },function(){ if(my===peakSeq){ peakPulled[key]=0; peakFallback(box,r); } });
+      return;
+    }
+    peakFallback(box,r);
+  }
+  function peakFallback(box,r){
+    if(r&&r.pts.length){ peakDraw(box,r.pts,'based on '+r.bills+(r.expect?' of '+r.expect:'')+' bills loaded'); return; }
+    box.innerHTML='<div class="bnxd-empty">Hourly sales could not be loaded for this period. Change the period or reload to retry.</div>';
   }
   function renderInsights(){
     try{
@@ -55660,9 +55673,50 @@ html body #page-pos .cart-panel>.pos-head-actions .pill{flex:0 0 auto!important;
   }
   W.bnxRenderDashBars_=function(){ perLabels(); renderModeCols(); renderCatBars(); };
   wrap('bnxRenderDashCategorySales_',function(p){ perLabels(); renderCatBars(p); });
-  wrap('bnxRenderTopSellingItems_',function(items){ renderItemBars(items); });
+  /* FIX 2026-10-10 (Top Items wrong): both Top Items cards used the dashboard summary's topItems list, which does not match
+     the Item Sales report (case-split names like "wai wai combo" vs "WAI WAI COMBO", differing totals). They now use the
+     SAME server item report the Reports Hub shows (GET_ITEM_SALES_REPORT) for the selected period, merge names that differ
+     only by case/spacing, and rank by quantity sold. The summary list is only a fallback if that report cannot load. */
+  var liveItems={key:'',list:null}, itemSeq=0;
+  function normName(n){ return String(n==null?'':n).replace(/\s+/g,' ').trim().toUpperCase(); }
+  function drawItems(list){
+    renderItemBars(list);
+    var body=$('dashTopItemsBody'); if(!body) return;
+    var top=(Array.isArray(list)?list:[]).filter(function(it){return num(it.qty)>0;}).sort(function(a,b){return num(b.qty)-num(a.qty);}).slice(0,5);
+    body.innerHTML=top.length?top.map(function(it,i){
+      return '<tr><td>'+(i+1)+'</td><td>'+esc(it.name)+'</td><td class="mono">'+num(it.qty).toLocaleString('en-IN')+'</td><td class="mono">'+Math.round(num(it.revenue)).toLocaleString('en-IN',{maximumFractionDigits:0})+'</td></tr>';
+    }).join(''):'<tr><td colspan="4" style="text-align:center;color:var(--text3);padding:14px;">No sales recorded for this range yet.</td></tr>';
+  }
+  async function loadTopItemsLive(key,fallback){
+    var my=++itemSeq;
+    try{
+      var ft=W.bnxDashCurrentFromTo_(), pay=(typeof W.bnxDateRangePayload_==='function')?W.bnxDateRangePayload_(ft.from,ft.to):{range:'custom'};
+      var res=await W.gasApi('GET_ITEM_SALES_REPORT',Object.assign({},pay,{from:ft.from,to:ft.to,FROM_DATE:ft.from,TO_DATE:ft.to}),'V2_CORE');
+      if(my!==itemSeq) return;
+      var rows=res&&res.data&&Array.isArray(res.data.rows)?res.data.rows:null;
+      if(!rows) throw new Error('no rows');
+      var m={}; rows.forEach(function(r){
+        var k=normName(r.ITEM_NAME||r.name); if(!k) return;
+        var o=m[k]||(m[k]={name:k,qty:0,revenue:0});
+        o.qty+=num(r.QUANTITY_SOLD!=null?r.QUANTITY_SOLD:r.qty);
+        o.revenue+=num(r.NET_SALES!=null?r.NET_SALES:(r.GROSS_SALES!=null?r.GROSS_SALES:r.revenue));
+      });
+      liveItems={key:key,list:Object.keys(m).map(function(k){return m[k];})};
+      drawItems(liveItems.list);
+    }catch(e){
+      if(my!==itemSeq) return;
+      console.warn('[Top items live]',e);
+      drawItems(fallback);
+    }
+  }
+  wrap('bnxRenderTopSellingItems_',function(items){
+    var key=rangeKey();
+    if(liveItems.list&&liveItems.key===key){ drawItems(liveItems.list); return; }
+    var box=$('bnxdItemBars'); if(box) box.innerHTML='<div class="bnxd-empty">Loading\u2026</div>';
+    loadTopItemsLive(key,items);
+  });
   wrap('bnxComputeDashExtras_',function(){ perLabels(); setTimeout(renderModeCols,60); });
-  wrap('setDashRange',function(){ perLabels(); ['bnxdCatBars','bnxdItemBars'].forEach(function(id){var e=$(id); if(e) e.innerHTML='<div class="bnxd-empty">Loading…</div>';}); });
+  wrap('setDashRange',function(){ liveItems={key:'',list:null}; perLabels(); ['bnxdCatBars','bnxdItemBars'].forEach(function(id){var e=$(id); if(e) e.innerHTML='<div class="bnxd-empty">Loading…</div>';}); });
 
   /* ───────── 2. SALES TREND: touch + keyboard ───────── */
   function trendGeom(svg){
