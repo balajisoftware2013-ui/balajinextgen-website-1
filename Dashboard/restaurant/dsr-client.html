@@ -437,12 +437,7 @@ async function gasApiRaw_(action,payload,endpoint){
     }catch(e){
       // Network errors are not authentication errors; preserve the final
       // error below instead of redirecting the user to login unnecessarily.
-      console.error('[API_DEBUG] ❌ Fetch error (attempt '+(i+1)+'/'+ contexts.length+'):', {
-        message: e.message,
-        name: e.name,
-        url: url,
-        action: action
-      });
+      console.error('[API_DEBUG] ❌ Fetch error '+action+' (attempt '+(i+1)+'/'+ contexts.length+'): '+(e&&e.name==='AbortError'?'timed out (server too slow)':(e&&e.message)||e)+' — '+String(url).slice(0,80));
       /* BNX FIX 2026-10-05: with a single stored session there was no second try, so one slow/aborted
          call returned success:false and the month fell back to payments-only (Gross/Net = 0).
          Read calls now get ONE automatic retry on the same session before giving up. */
@@ -1176,6 +1171,9 @@ function bnxDsrStage_(stage){
 }
 async function fetchDsrMonthLive_(year,month){
   const _mk=String(year)+'-'+String(month).padStart(2,'0');
+  /* FIX 2026-10-10: a future month (e.g. Nov while today is 10 Oct) was being requested, wasting slow server calls
+     and ending on "NO LIVE POS DATA FOR 2026-11-30". Nothing can exist yet, so skip the call. */
+  try{ if(_mk+'-01' > bnxToday_()) return true; }catch(e){}
   if(BNX_DSR_MONTH_FLIGHT_.has(_mk)) return BNX_DSR_MONTH_FLIGHT_.get(_mk);
   const _work=(async()=>{
   /* BNX FIX 2026-10-05: the day-book and GET_BILLS were fired in parallel with the matrix; on the
@@ -1293,7 +1291,9 @@ async function bnxDsrLoadFyBg_(ds){
 }
 window.bnxDsrLoadFyBg_=bnxDsrLoadFyBg_;
 async function onDsrDateChange(){
-  const ds=$('repDate')?.value; if(!ds)return;
+  let ds=$('repDate')?.value; if(!ds)return;
+  /* FIX 2026-10-10: a date after today can never have POS data — fall back to today instead of loading it. */
+  try{ const _t=bnxToday_(); if(/^\d{4}-\d{2}-\d{2}$/.test(ds) && ds>_t){ ds=_t; $('repDate').value=_t; } }catch(e){}
   const my=++BNX_DSR_SEQ_;
   try{if($('itemGroupDsrFrom'))$('itemGroupDsrFrom').value=ds.slice(0,8)+'01';if($('itemGroupDsrTo'))$('itemGroupDsrTo').value=ds;}catch(e){}
   refreshHdr();
@@ -1342,6 +1342,7 @@ function populateDsrMonthSelectors_(){
   const current=$('repDate')?.value?.slice(0,7)||'';
   const months=[...new Set(Object.keys(STANDARD_DATA).filter(k=>/^\d{4}-\d{2}-\d{2}$/.test(k)).map(d=>d.slice(0,7)))].sort().reverse();
   if(current && !months.includes(current)) months.unshift(current);
+  { const _tm=bnxToday_().slice(0,7); for(let i=months.length-1;i>=0;i--){ if(months[i]>_tm) months.splice(i,1); } }   /* FIX 2026-10-10: no future months */
   sel.innerHTML=months.map(m=>'<option value="'+m+'">'+new Date(m+'-01T00:00:00').toLocaleString('en-IN',{month:'long',year:'numeric'})+'</option>').join('');
   if(current)sel.value=current;
 }
@@ -3954,6 +3955,7 @@ async function dsrCalendarMove_(delta){
   if(!/^\d{4}-\d{2}$/.test(month))return;
   const dt=new Date(Number(month.slice(0,4)),Number(month.slice(5,7))-1+delta,1);
   const target=dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0');
+  if(target>bnxToday_().slice(0,7)){ showToast('No data for future months','warn'); return; }   /* FIX 2026-10-10 */
   await fetchDsrMonthLive_(dt.getFullYear(),dt.getMonth()+1);
   if($('mtd-month'))$('mtd-month').value=target;
   const current=$('repDate')?.value||'';
@@ -7668,7 +7670,15 @@ W.bnxDsrCheck_=function(){
   scopes.forEach(function(s){
     var p=s[0], nm=s[1], v=function(k){ return num(p+'_'+k); };
     var net=v('net'), tend=v('cash')+v('card')+v('gpay')+v('duesales')+v('zomato')+v('swiggy')+v('eazydine')+bnxDsrHiddenTender_(p);
-    if(Math.abs(net-tend)>TOL) add('err',[p+'_net',p+'_diff'],nm+': payment modes total '+money(tend)+' ≠ Net Sale '+money(net)+' (diff '+money(net-tend)+') — a bill is unsettled or a pay mode is not mapped');
+    if(Math.abs(net-tend)>TOL){
+      /* FIX 2026-10-10 ("diff fix"): name the exact days that carry the Diff so the bad bill / unmapped pay mode can be found. */
+      var _bad=[]; try{ Object.keys(STANDARD_DATA||{}).sort().forEach(function(k){ if(k<s[2]||k>s[3]) return; var r=STANDARD_DATA[k]; if(!r||r._snap) return;
+        var rn=(Number(r.gross)||0)+(Number(r.svc)||0)+(Number(r.tax)||0)+(Number(r.round)||0); if(!(rn>0)) rn=Number(r.net)||0;
+        var dd=rn-bnxDsrTender_(r); if(Math.abs(dd)>TOL) _bad.push([k,dd]); }); }catch(e){}
+      _bad.sort(function(x,y){return Math.abs(y[1])-Math.abs(x[1]);});
+      var _txt=_bad.length?(' · days with a gap: '+_bad.slice(0,6).map(function(x){return x[0].slice(8,10)+'/'+x[0].slice(5,7)+' '+money(x[1]);}).join(', ')+(_bad.length>6?' …+'+(_bad.length-6)+' more':'')):'';
+      add('err',[p+'_net',p+'_diff'],nm+': payment modes total '+money(tend)+' ≠ Net Sale '+money(net)+' (diff '+money(net-tend)+') — a bill is unsettled or a pay mode is not mapped'+_txt);
+    }
     var pos=posDays(s[2],s[3]);
     if(Object.keys(pos.keys).length&&Math.abs(pos.net-net)>TOL) add('err',[p+'_net'],nm+': Net Sale on the DSR '+money(net)+' ≠ POS bills net '+money(pos.net)+' (diff '+money(net-pos.net)+') — category split incomplete or a value was edited');
     var lim=Math.max(50,pos.bills||0,(pos.days||1)*50);
