@@ -24712,7 +24712,7 @@ function bnxEditMenuItem(code){
        normal SAVE_MENU_ITEM); a slow / busy server can no longer keep the screen on "Saving…" for 1-2 minutes. */
     mo.remove();
     showNotif('💾 '+name+' updated — saving to server in background…','success');
-    bnxMenuBgSave_(item, selectedImageFile);
+    (window.bnxSaveWithChip_||window.bnxMenuBgSave_)(item, selectedImageFile);
     return;
     mo.remove();
   };
@@ -50166,7 +50166,7 @@ window.bnxQrGen=qrcode;
     pulling=true;
     try{
       const S=st();
-      const r=await api('GET_CLIENT_ASSETS',{have:{LOGO:S.LOGO||'',UPI:S.UPI||'',BANNER:S.BANNER||''},force:true,noCache:true});   /* force: the API cache kept an old/empty answer for 10 min (+12 h on-device) so a 2nd PC never saw the logo */
+      const r=await api('GET_CLIENT_ASSETS',{have:{LOGO:S.LOGO||'',UPI:S.UPI||'',BANNER:S.BANNER||'',ITEMIMGS:S.ITEMIMGS||''},force:true,noCache:true});   /* force: the API cache kept an old/empty answer for 10 min (+12 h on-device) so a 2nd PC never saw the logo */
       if(!r||!r.success){
         if(notDeployed(r)) setStatus('missing','⚠ Server not updated — deploy BNX_ClientAssets.gs; logo/QR are on this PC only');
         else{ setStatus('error','⚠ Could not read Google Sheet: '+((r&&r.error)||'offline')+' — using this PC copy'); if((W.__bnxAssetRetry=(W.__bnxAssetRetry||0)+1)<=4) setTimeout(function(){ pull(); },20000*W.__bnxAssetRetry); }
@@ -50176,6 +50176,8 @@ window.bnxQrGen=qrcode;
       /* LOGO */
       const loc=localLogo(), locChanged=!!(loc&&S.logoSig&&sig(loc)!==S.logoSig);
       W.__bnxAssetRetry=0;
+      /* item photo links ride on this same request (one server call instead of two) */
+      try{ if(typeof W.bnxItemImgApply_==='function'){ const iu=await W.bnxItemImgApply_(D.ITEMIMGS); if(iu) stSet({ITEMIMGS:iu}); } }catch(e){ console.warn('[ASSETS] item images',e); }
       if(!D.LOGO){ if(loc) await pushLogo(); }
       else if(D.LOGO.unchanged){ if(locChanged) await pushLogo(); }
       else if(D.LOGO.dataUrl){ if(locChanged) await pushLogo(); else applyServerLogo(D.LOGO); }
@@ -50237,7 +50239,7 @@ window.bnxQrGen=qrcode;
   }
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',function(){ setTimeout(boot,1200); });
   else setTimeout(boot,1200);
-  setInterval(pull,5*60*1000);
+  setInterval(function(){ if(!document.hidden) pull(); },15*60*1000);   /* 15 min, visible tab only — GET_CLIENT_ASSETS had taken 695 s in total */
   window.addEventListener('online',function(){ setTimeout(pull,1500); });
 })();
 
@@ -50362,25 +50364,26 @@ window.bnxQrGen=qrcode;
       return true;
     }catch(e){ return false; }
   }
-  var pulling=false;
-  async function pull(){
-    if(pulling||!cid()) return; pulling=true;
+  /* called by the dashboard's ONE GET_CLIENT_ASSETS request (data.ITEMIMGS) — no separate server call */
+  W.bnxItemImgApply_=async function(d){
+    var stamp='';
     try{
-      var S=ld(SK()), r=await api('GET_CLIENT_ASSETS',{have:{ITEMIMGS:S.stamp||''},force:true,noCache:true});
-      if(r&&r.success&&r.data&&r.data.ITEMIMGS&&!r.data.ITEMIMGS.unchanged&&r.data.ITEMIMGS.json){
-        var srv={}; try{ srv=JSON.parse(r.data.ITEMIMGS.json)||{}; }catch(e){}
+      if(d&&!d.unchanged&&d.json){
+        var srv={}; try{ srv=JSON.parse(d.json)||{}; }catch(e){}
         var x=ld(KEY()); Object.keys(srv).forEach(function(k){ x[k]=srv[k]; }); sv(KEY(),x);
-        S.stamp=r.data.ITEMIMGS.updatedAt; sv(SK(),S);
       }
+      if(d&&d.updatedAt) stamp=d.updatedAt;
       hydrate();
       await resend();
-    }catch(e){ console.warn('[ITEMIMG] pull failed',e); }
-    finally{ pulling=false; }
-  }
+    }catch(e){ console.warn('[ITEMIMG] apply failed',e); }
+    return stamp;
+  };
 
   /* 2) photos that only exist on this PC (data:) → upload again */
   async function resend(){
-    var x=ld(KEY()), keys=Object.keys(x).filter(function(k){ return /^data:image\//i.test(String(x[k])); }).slice(0,4);
+    var x=ld(KEY());
+    if(Array.isArray(W.menuData)) W.menuData.forEach(function(m){ var k=idOf(m); if(k&&/^data:image\//i.test(String(m.imageUrl||''))&&!/^https:\/\//i.test(String(x[k]||''))) x[k]=m.imageUrl; });   /* photo chosen in "Edit Menu Item" but never uploaded */
+    var keys=Object.keys(x).filter(function(k){ return /^data:image\//i.test(String(x[k])); }).slice(0,4);
     if(!keys.length||!Array.isArray(W.menuData)) return;
     for(var i=0;i<keys.length;i++){
       var k=keys[i], m=W.menuData.find(function(z){ return idOf(z)===k; }); if(!m) continue;
@@ -50410,12 +50413,60 @@ window.bnxQrGen=qrcode;
     try{ var h=img.closest('.mi-em,.prod-em'); if(h) h.innerHTML=h.getAttribute('data-fallback')||'🍽️'; }catch(e){}
   };
 
-  function boot(){ wrapPost(); wrapGas(); var n=0; (function w(){ if(cid()||n++>20){ setTimeout(pull,3500); setTimeout(hydrate,9000); setTimeout(pull,20000); } else setTimeout(w,500); })(); }
-  setInterval(function(){ wrapPost(); wrapGas(); },4000);
+  /* 5) one item → its uploaded photo first; ids whose static file does not exist stop being requested (no more 404 flood) */
+  var missKey=function(){ return 'bnx_img404_'+(cid()||'x'); }, memFail={};
+  document.addEventListener('error',function(e){
+    try{ var t=e.target; if(!t||t.tagName!=='IMG') return;
+      var src=String(t.currentSrc||t.src||''), m=/(?:^|\/)assets\/item-images\/(ITM\d+)\.\w+/i.exec(src); if(!m) return;
+      var id=m[1].toUpperCase(), set=memFail[id]||(memFail[id]={}); set[src]=(set[src]||0)+1;
+      if(Object.keys(set).length>=2||set[src]>=2){ var x=ld(missKey()); x[id]=Date.now(); sv(missKey(),x); } }catch(x){}
+  },true);
+  function wrapResolve(){
+    var cur=W.bnxResolveItemImageUrl_; if(typeof cur!=='function'||cur.__bnxStored) return;
+    var w=function(item){
+      try{ var x=ld(KEY()), u=x[idOf(item)]||x[String(item&&item.itemCode||'')]||x[String(item&&item.n||'')];
+        if(u&&/^(https:\/\/|data:image\/)/i.test(u)) return u; }catch(e){}
+      var r=cur.apply(this,arguments);
+      try{ var mm=/(?:^|\/)assets\/item-images\/(ITM\d+)\./i.exec(r||''); if(mm){ var t=ld(missKey())[mm[1].toUpperCase()]; if(t&&Date.now()-t<6*3600e3) return ''; } }catch(e){}
+      return r; };
+    Object.keys(cur).forEach(function(k){ try{ w[k]=cur[k]; }catch(e){} });
+    w.__bnxStored=1; W.bnxResolveItemImageUrl_=w; try{ bnxResolveItemImageUrl_=w; }catch(e){}
+  }
+  function boot(){ wrapPost(); wrapGas(); wrapResolve(); setTimeout(hydrate,9000); setTimeout(hydrate,25000); }
+  setInterval(function(){ wrapPost(); wrapGas(); wrapResolve(); },4000);
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',boot); else boot();
-  setInterval(pull,5*60*1000);
-  W.addEventListener('online',function(){ setTimeout(pull,1500); });
-  W.bnxItemImageSync=pull;
+  W.bnxItemImageSync=function(){ return typeof W.bnxAssetsSyncNow==='function'?W.bnxAssetsSyncNow():null; };
+})();
+</script>
+<script id="bnx-save-chip">
+/* SAVE RESULT you can't miss (2026-10-10, "save but save or not — no message"): Edit Menu Item closes at once and the
+   server save runs in the background; the little toasts vanished in seconds, so nobody knew if it was saved.
+   Now a sticky chip at the bottom shows  ⏳ Saving… → ✅ saved on server  or  ❌ NOT saved + Retry (stays until closed). */
+(function(){
+  var W=window, chip=null, hideT=null;
+  function el(){ if(chip&&document.body.contains(chip)) return chip; chip=document.createElement('div'); chip.id='bnxSaveChip';
+    chip.style.cssText='position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:2147483000;max-width:min(94vw,520px);padding:11px 16px;border-radius:12px;font:600 13px/1.4 system-ui,Segoe UI,sans-serif;box-shadow:0 8px 30px rgba(0,0,0,.28);display:flex;gap:12px;align-items:center;flex-wrap:wrap;color:#fff';
+    document.body.appendChild(chip); return chip; }
+  function show(html,kind,ms,actions){
+    var c=el(); clearTimeout(hideT);
+    c.style.background=kind==='ok'?'#15803d':kind==='warn'?'#b45309':kind==='err'?'#b91c1c':'#1f2937';
+    c.innerHTML='<span>'+html+'</span>'; (actions||[]).forEach(function(a){ var b=document.createElement('button'); b.type='button'; b.textContent=a[0];
+      b.style.cssText='border:0;border-radius:8px;padding:6px 12px;font-weight:700;cursor:pointer;background:#fff;color:#111'; b.onclick=a[1]; c.appendChild(b); });
+    if(ms) hideT=setTimeout(function(){ if(chip&&chip.parentNode) chip.parentNode.removeChild(chip); },ms);
+  }
+  function esc(x){ return String(x==null?'':x).replace(/[<>&"]/g,function(c){ return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]; }); }
+  var running=0;
+  W.bnxSaveWithChip_=async function(item,file){
+    var name=esc(item&&item.n||'Item'), res;
+    running++; show('⏳ Saving “'+name+'” to the server…','busy',0);
+    try{ res=await W.bnxMenuBgSave_(item,file); }catch(e){ res={ok:false,error:e&&e.message||String(e)}; }
+    running--; if(running>0) return res;
+    var retry=function(){ W.bnxSaveWithChip_(item,file); }, close=function(){ if(chip&&chip.parentNode) chip.parentNode.removeChild(chip); };
+    if(res&&res.ok&&!res.photoFailed) show('✅ “'+name+'” saved on the server'+(res.hadPhoto?' · photo saved':''),'ok',9000);
+    else if(res&&res.ok) show('⚠️ “'+name+'” saved, but the <b>photo was NOT saved</b> — '+esc(res.error||'server busy'),'warn',0,[['Retry photo',retry],['Close',close]]);
+    else show('❌ “'+name+'” is <b>NOT saved on the server</b> yet (kept on this device) — '+esc(res&&res.error||'no answer'),'err',0,[['Retry now',retry],['Close',close]]);
+    return res;
+  };
 })();
 </script>
 <style id="bnx-final-fix-20261003b">
@@ -60229,14 +60280,14 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
   /* ---------- (1) menu item: background save, never blocks the modal ---------- */
   W.bnxMenuBgSave_=async function(item,file){
     var box=function(p,ms){ return Promise.race([p,new Promise(function(r){ setTimeout(function(){ r({success:false,error:'server busy ('+Math.round(ms/1000)+' s)'}); },ms); })]); };
-    var name=item.n, msgs=[];
+    var name=item.n, msgs=[], photoFailed=false;
     try{
       /* fast path: my client-DB write (ITEM_MASTER + menu cards) — seconds, not minutes */
       var ids={itemId:item.code||item.ITEM_ID||'',itemCode:item.itemCode||item.ITEM_CODE||item.code||'',ITEM_ID:item.code||'',ITEM_CODE:item.itemCode||item.code||''};
       var base=Object.assign({name:name,itemName:name,category:item.c,price:Number(item.p)||0,gst:Number(item.gst)||0,veg:item.v||'',avail:!(item.avail===false||/^(unavailable|off|inactive)$/i.test(String(item.avail||''))),availability:(item.avail===false?'unavailable':String(item.avail||'available')),menuActive:item.menuActive!==false,itemGroupId:item.itemGroupId||'',itemGroupName:item.itemGroupName||''},ids);
       if(file && typeof W.bnxSaveMenuItemImageFile_==='function'){
         var ir=await box(W.bnxSaveMenuItemImageFile_(item,file),120000);
-        if(ir&&ir.success&&ir.imageUrl){ item.imageUrl=ir.imageUrl; base.imageUrl=ir.imageUrl; msgs.push('photo saved to Google Drive'); } else msgs.push('photo NOT saved: '+((ir&&ir.error)||'server busy'));
+        if(ir&&ir.success&&ir.imageUrl){ item.imageUrl=ir.imageUrl; base.imageUrl=ir.imageUrl; msgs.push('photo saved to Google Drive'); } else { photoFailed=true; msgs.push('photo NOT saved: '+((ir&&ir.error)||'server busy')); }
       }
       var en=await box(api('MENU_ITEM_ENSURE',base,30000),35000);
       var okFast=!!(en&&en.success);
@@ -60244,7 +60295,8 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
       showNotif((okFast?'✅ '+name+' saved to client menu ('+(((en.data||{}).tabs||[]).join(', ')||'ITEM_MASTER')+')':'⏳ '+name+' — client DB busy, normal save running')+(msgs.length?' · '+msgs.join(' · '):''), okFast?'success':'error');
       var r=await box(bnxSaveMenuItemToBackend(item),120000);   /* queues + retries itself when the server is slow */
       if(!okFast && !(r&&r.success)) showNotif('⚠️ '+name+' kept on this device — will retry automatically ('+((r&&(r.error||r.message))||'no answer')+')','error');
-    }catch(e){ showNotif('⚠️ '+name+' saved on this device; server retry pending ('+e.message+')','error'); }
+      return {ok:!!(okFast||(r&&r.success)), photoFailed:photoFailed, hadPhoto:!!file, error:(en&&en.error)||(r&&(r.error||r.message))||''};
+    }catch(e){ showNotif('⚠️ '+name+' saved on this device; server retry pending ('+e.message+')','error'); return {ok:false,photoFailed:photoFailed,hadPhoto:!!file,error:e.message}; }
   };
 
   /* ---------- (2) day-wise cash book ---------- */
