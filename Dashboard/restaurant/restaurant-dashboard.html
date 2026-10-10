@@ -1385,6 +1385,34 @@ function bnxIsReadOnlyAction_(a){ return /^(GET_|LIST_|RD_FETCH_|NEXT_)/.test(St
 // stale session and sends the user back to login with a clear reason,
 // instead of leaving a half-broken screen where every action quietly
 // fails forever.
+/* STAY-LOGIN BACKUP (2026-10-10): a copy of the login keys is kept while logged in. If the keys disappear
+   WITHOUT an explicit logout (expiry timer in erp-config.js, quota clean-up, a flaky reload while offline),
+   they are restored — also at page load, before the rest of the page reads them. Explicit logout / forced
+   re-login removes the backup and stamps bnx_explicit_logout_at, so a real logout is never undone. */
+(function(){
+  var KEYS=['ERP_USER','ERP_SESSION','ERP_ROLE','ERP_CLIENT','ERP_EXPIRY'];
+  function explicitRecently(){ try{ return (Date.now()-(+localStorage.getItem('bnx_explicit_logout_at')||0))<120000; }catch(e){ return false; } }
+  function save(){
+    try{
+      var o={t:Date.now(),v:{}}, any=false;
+      KEYS.forEach(function(k){ var v=localStorage.getItem(k); if(v){ o.v[k]=v; any=true; } });
+      if(any && (o.v.ERP_SESSION||o.v.ERP_USER)) localStorage.setItem('bnx_sess_backup',JSON.stringify(o));
+    }catch(e){}
+  }
+  window.bnxRestoreSessionBackup_=function(){
+    try{
+      if(explicitRecently()) return false;
+      if(localStorage.getItem('ERP_SESSION')||localStorage.getItem('ERP_USER')) return true;
+      var o=JSON.parse(localStorage.getItem('bnx_sess_backup')||'null');
+      if(!o||!o.v||(Date.now()-o.t)>12*3600000) return false;     /* older than 12 h → do not revive */
+      Object.keys(o.v).forEach(function(k){ localStorage.setItem(k,o.v[k]); });
+      localStorage.setItem('ERP_EXPIRY',String(Date.now()+30*60000));
+      return true;
+    }catch(e){ return false; }
+  };
+  try{ if(!localStorage.getItem('ERP_SESSION') && !localStorage.getItem('ERP_USER')) window.bnxRestoreSessionBackup_(); }catch(e){}
+  save(); setInterval(save,15000);
+})();
 /* SESSION INACTIVITY POLICY — 5 HOURS
    A logged-in ERP session expires after 5 continuous hours with NO user action.
    Normal staff activity (click/tap, keyboard, touch, pointer, scroll, POS use)
@@ -1434,9 +1462,10 @@ function bnxIsReadOnlyAction_(a){ return /^(GET_|LIST_|RD_FETCH_|NEXT_)/.test(St
     return t > 0 && (now()-t) >= IDLE_LIMIT_MS;
   }
   function enforce(){
+    if(navigator.onLine===false) return false;   /* STAY-LOGIN: never log out while the network is down */
     if(expired()){
       clear();
-      try{ bnxForceReauth('Session expired after 5 hours of inactivity — please log in again.'); }
+      try{ bnxForceReauth('Session expired after 5 hours of inactivity — please log in again.', true); }
       catch(e){
         try{ localStorage.removeItem('ERP_SESSION'); }catch(x){}
         try{ window.location.href = window.bnxRootPath ? window.bnxRootPath('login.html') : '../login.html'; }catch(x){}
@@ -1475,9 +1504,13 @@ function bnxIsReadOnlyAction_(a){ return /^(GET_|LIST_|RD_FETCH_|NEXT_)/.test(St
    `var` is hoisted, and also makes window._bnxReauthTriggered visible to the
    inactivity tracker, which checks it to stop recording activity. */
 var _bnxReauthTriggered = false;
-function bnxForceReauth(message){
+function bnxForceReauth(message, auto){
   if (_bnxReauthTriggered) return;
+  /* STAY-LOGIN (2026-10-10): an AUTOMATIC reauth (idle timer / bad response) is never allowed while the
+     network is down — the user stays signed in and keeps working; the outbox syncs later. */
+  if (auto && navigator.onLine===false){ try{ if (typeof showNotif === 'function') showNotif('📴 Offline — you stay logged in; data syncs when internet returns','warning'); }catch(e){} return; }
   _bnxReauthTriggered = true;
+  try{ localStorage.setItem('bnx_explicit_logout_at', String(Date.now())); localStorage.removeItem('bnx_sess_backup'); }catch(e){}
   try{ if (typeof showNotif === 'function') showNotif('🔒 ' + message, 'error'); }catch(e){}
   setTimeout(function(){
     try{
@@ -1505,7 +1538,12 @@ function bnxIsAuthText_(data){
 }
 function bnxCheckAuthFailure_(data){
   if (data && data.success === false && (data.statusCode === 401 || data.statusCode === 403)) {
-    bnxForceReauth(data.statusCode === 401 ? 'Your session has expired — please log in again.' : 'This session is not authorized for this client — please log in again.');
+    /* STAY-LOGIN (2026-10-10): ROOT CAUSE of the "flash logout" — ONE 401/403 answer (even from a side feature
+       such as CLIENT_ASSETS, or a flaky proxy) wiped the whole login at once. Now: never while offline, and a
+       confirming probe (bnxSessionSuspect_) decides; a real expiry shows the "Session expired" prompt with
+       "Stay on this page" — no automatic redirect. */
+    if (navigator.onLine === false) return false;
+    try{ if (typeof window.bnxSessionSuspect_ === 'function') window.bnxSessionSuspect_(String(data.error||data.message||'auth '+data.statusCode)); }catch(e){}
     return true;
   }
   if (bnxIsAuthText_(data)) { try{ if (typeof window.bnxSessionSuspect_ === 'function') window.bnxSessionSuspect_(String(data.error||data.message||'')); }catch(e){} return true; }
@@ -13333,6 +13371,7 @@ window.addEventListener('pageshow', function(ev){
 //      pending exists → offer Sync Now / Logout Anyway / Cancel. That
 //      flow is implemented below instead of a blind logout.
 function bnxDoLogoutNow_(){
+  try{ localStorage.setItem('bnx_explicit_logout_at', String(Date.now())); localStorage.removeItem('bnx_sess_backup'); }catch(e){}
   try{
     var u = (typeof ERP!=='undefined' && ERP.getUser) ? ERP.getUser() : null;
     var loginId = u && (u.LOGIN_ID||u.loginId||u.EMAIL||u.MOBILE);
@@ -54329,7 +54368,16 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
   slide();
   /* login wiped locally (expiry / other tab logged out) → say so instead of failing silently */
   var hadSession=false; try{ hadSession=!!bnxCurrentSession_(); }catch(e){}
-  setInterval(function(){ var has=false; try{ has=!!bnxCurrentSession_(); }catch(e){} if(hadSession && !has) showExpired(); },20000);
+  setInterval(function(){ var has=false; try{ has=!!bnxCurrentSession_(); }catch(e){}
+    if(hadSession && !has){
+      /* STAY-LOGIN: login vanished without an explicit logout (expiry timer / flaky storage) → put it back */
+      if(W.bnxRestoreSessionBackup_ && W.bnxRestoreSessionBackup_()){ has=true; try{ if(typeof showNotif==='function') showNotif('🔐 Login restored — you stay signed in','success'); }catch(x){} }
+      else if(navigator.onLine!==false) showExpired();
+    }
+    if(has) hadSession=true;
+  },20000);
+  /* offline: keep the local login window open (never revive one that already expired) */
+  setInterval(function(){ if(navigator.onLine!==false) return; try{ var k=expKey(), e=+localStorage.getItem(k)||0, n=Date.now(); if(e>n && e<n+6*3600000) localStorage.setItem(k,String(n+6*3600000)); }catch(x){} },30000);
   /* keep-alive: an authenticated call every 10 min while the page is open (HEARTBEAT may be
      an unrouted action and then never refreshes the server session) */
   setInterval(function(){ if(!D.hidden && !shown) probe().then(function(s){ if(s==='expired') showExpired(); }); },600000);
