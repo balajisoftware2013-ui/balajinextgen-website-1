@@ -1328,7 +1328,7 @@ async function onDsrDateChange(){
   bnxDsrPaint_(ds);
   try{ buildDash(); }catch(e){}
   if(st) st.textContent=ok?('🔴 Live POS · '+ds+' · '+new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})):('⚠️ Sales data did not load for '+ds+' — press Recalculate to retry');
-  if(!ok){ showToast('⚠️ Live POS data could not be loaded for '+ds,'warn'); return false; }
+  if(!ok){ try{ loadDsrDueControl_(ds); }catch(e){} showToast('⚠️ Live POS data could not be loaded for '+ds,'warn'); return false; }
   const side=[
     (async()=>{try{await loadDsrDueControl_(ds);bnxDueDisplaySummary_();}catch(e){console.warn('[DSR DUE CONTROL]',e);}})(),
     (async()=>{try{await bnxAuditLivePOSSource_(ds);}catch(e){}})(),
@@ -3840,6 +3840,7 @@ function recalcAll() {
   const dLive=$('d_currgd')?.dataset.live==='1';
   const dCGD=dLive?(parseFloat(String($('d_currgd')?.textContent||'0').replace(/,/g,''))||0):bnxDsrCloseDues_(v('d_opengd'),v('d_duesales'),v('d_duerecvcash'),v('d_duerecvbank'),v('d_guestcn'));
   st('d_gross',dG);st('d_net',dN);st('d_totalcash',dTC);if(!dLive)st('d_currgd',dCGD);
+  ['d','m','y'].forEach(function(pf){ try{ if($(pf+'_currgd')?.dataset.live!=='1' && $(pf+'_due_total')) st(pf+'_due_total',v(pf+'_duerecvcash')+v(pf+'_duerecvbank')); }catch(e){} });
   const dDiff=dN-tenderOf('d'); diffTo('d_diff',dDiff);
 
   const mG=v('m_liquor')+v('m_liquormrp')+v('m_food')+v('m_bev')+v('m_hf')+v('m_others')+v('m_nosplit');
@@ -4617,8 +4618,24 @@ async function bnxGetDuePeriod_(from,to){
   return {received:bnxRangeDueRecv_(from,to),payments:0,raw:null};
 }
 async function bnxGetLiveOutstanding_(asOf){
-  try{const r=await gasApi('GET_DUE_COLLECTION',asOf?{asOfDate:asOf}:{});if(r&&r.success&&r.data)return {closing:bnxDueNum_(r.data.outstandingAsOf!=null?r.data.outstandingAsOf:r.data.totalOutstanding),overdue:bnxDueNum_(r.data.overdue30Plus),customers:Array.isArray(r.data.customers)?r.data.customers:[],raw:r.data};}catch(e){console.warn('[DSR OUTSTANDING]',e);}
-  return {closing:0,overdue:0,customers:[],raw:null};
+  /* FIX 2026-10-10 ("opening / closing outstanding show wrong"): the figure now comes from the SAME feed as the Dashboard
+     (parent DUES_LIST = CUSTOMER_DUES sheet, or its as-of helper for past dates). The old call alone could time out and the
+     sheet then showed Opening 0 / Closing = this period's credit − receipts (e.g. -12,24,997 YTD). */
+  try{
+    const P=window.parent;
+    if(P&&P!==window){
+      if(asOf&&asOf<bnxToday_()&&typeof P.bnxDsrDuesAsOf_==='function'){
+        const x=await P.bnxDsrDuesAsOf_(asOf);
+        if(x&&x.ok&&isFinite(Number(x.closing))) return {closing:bnxDueNum_(x.closing),overdue:0,customers:[],raw:x,ok:true};
+      }
+      if(typeof P.bnxApprovalApi==='function'){
+        const r=await P.bnxApprovalApi('DUES_LIST',{},60000);
+        if(r&&r.success&&r.data&&Array.isArray(r.data.customers)) return {closing:bnxDueNum_(r.data.totalOutstanding),overdue:bnxDueNum_(r.data.overdue30Plus),customers:r.data.customers,raw:r.data,ok:true};
+      }
+    }
+  }catch(e){ console.warn('[DSR OUTSTANDING] dashboard feed',e); }
+  try{const r=await gasApi('GET_DUE_COLLECTION',asOf?{asOfDate:asOf}:{});if(r&&r.success&&r.data)return {closing:bnxDueNum_(r.data.outstandingAsOf!=null?r.data.outstandingAsOf:r.data.totalOutstanding),overdue:bnxDueNum_(r.data.overdue30Plus),customers:Array.isArray(r.data.customers)?r.data.customers:[],raw:r.data,ok:true};}catch(e){console.warn('[DSR OUTSTANDING]',e);}
+  return {closing:0,overdue:0,customers:[],raw:null,ok:false};
 }
 function bnxApplyDueControl_(prefix,x){
   if(!x)return;
@@ -4633,6 +4650,11 @@ async function loadDsrDueControl_(asOfDate){
   const monthStart=ds.slice(0,8)+'01';
   const fy=mo>=4?yr:yr-1, fyStart=fy+'-04-01';
   const live=await bnxGetLiveOutstanding_(ds);
+  if(!live.ok){
+    try{ const note=$('dsrSourceStatus'); if(note) note.textContent='⚠️ Guest dues (Opening / Closing Outstanding) not loaded — server slow, retrying…'; }catch(e){}
+    if(!window.__bnxDueRetry_){ window.__bnxDueRetry_=1; setTimeout(function(){ window.__bnxDueRetry_=0; try{ loadDsrDueControl_(ds); }catch(e){} },20000); }
+    return false;
+  }
   const [dayP,mtdP,ytdP]=await Promise.all([
     bnxGetDuePeriod_(ds,ds),bnxGetDuePeriod_(monthStart,ds),bnxGetDuePeriod_(fyStart,ds)
   ]);
@@ -7697,7 +7719,10 @@ W.bnxDsrCheck_=function(){
     var tc=v('cash')+v('duerecvcash'); if(Math.abs(tc-v('totalcash'))>TOL) add('err',[p+'_totalcash'],nm+': Total Cash Collection '+money(v('totalcash'))+' ≠ CASH + Due Received Cash '+money(tc));
     var roll=v('opengd')+v('duesales')-v('duerecvcash')-v('duerecvbank')-v('guestcn');
     if(Math.abs(roll-v('currgd'))>TOL) add('err',[p+'_opengd',p+'_currgd'],nm+': guest dues do not roll — Opening '+money(v('opengd'))+' + Credit '+money(v('duesales'))+' − Received '+money(v('duerecvcash')+v('duerecvbank'))+' − CN '+money(v('guestcn'))+' = '+money(roll)+', but Current shows '+money(v('currgd')));
-    if(v('currgd')<-TOL) add('err',[p+'_currgd'],nm+': Current Guest Dues is negative ('+money(v('currgd'))+')');
+    if(v('currgd')<-TOL){
+      var _lv=($i(p+'_currgd')||{}).dataset&&$i(p+'_currgd').dataset.live==='1';
+      add(_lv?'err':'warn',[p+'_currgd'],_lv?(nm+': Current Guest Dues is negative ('+money(v('currgd'))+')'):(nm+': Opening / Closing Outstanding not loaded from the server yet (showing a rough roll of this period only) — wait for the live balance or press Recalculate'));
+    }
     ['liquor','liquormrp','food','bev','hf','others','svc','tax','cash','card','gpay','duesales','zomato','swiggy','eazydine','duerecvcash','duerecvbank','disc','guestcn'].forEach(function(k){ if(v(k)<-TOL) add('err',[p+'_'+k],nm+': '+k+' is negative ('+money(v(k))+')'); });
     var before=v('gross')+v('disc'); if(before>0&&v('disc')/before>0.2) add('warn',[p+'_disc'],nm+': Discount '+money(v('disc'))+' is '+(v('disc')/before*100).toFixed(1)+'% of sale before discount');
     var ig=(W.__bnxIgInfo||{})[p];
@@ -7708,7 +7733,7 @@ W.bnxDsrCheck_=function(){
     }
     [['zomato','Zomato'],['swiggy','Swiggy'],['eazydine','EazyDine']].forEach(function(a){ if(v(a[0]+'coll')-v(a[0])>TOL) add('warn',[p+'_'+a[0]+'coll'],nm+': '+a[1]+' collection '+money(v(a[0]+'coll'))+' is more than '+a[1]+' sales '+money(v(a[0]))); });
   });
-  if(Math.abs(num('d_currgd')-num('m_currgd'))>TOL) add('err',['d_currgd','m_currgd'],'Closing guest dues differ: Today '+money(num('d_currgd'))+' vs MTD '+money(num('m_currgd'))+' — both must be the balance at the end of '+dNice);
+  if(Math.abs(num('d_currgd')-num('m_currgd'))>TOL && ($i('m_currgd')||{}).dataset && $i('m_currgd').dataset.live==='1') add('err',['d_currgd','m_currgd'],'Closing guest dues differ: Today '+money(num('d_currgd'))+' vs MTD '+money(num('m_currgd'))+' — both must be the balance at the end of '+dNice);
   ['net'].forEach(function(k){ if(num('m_'+k)+TOL<num('d_'+k)) add('err',['m_'+k],'MTD Net Sale '+money(num('m_net'))+' is smaller than Today '+money(num('d_net'))); });
   var miss=[]; for(var d=1, last=+ds.slice(8,10); d<last; d++){ var k=ds.slice(0,8)+pad(d); if(!(STANDARD_DATA&&STANDARD_DATA[k])) miss.push(pad(d)); }
   if(miss.length) add('warn',[],'MTD has no live data for '+miss.map(function(x){return x+'/'+ds.slice(5,7);}).join(', ')+' — check those days are synced (or the outlet was closed)');
