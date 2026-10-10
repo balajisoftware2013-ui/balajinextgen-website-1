@@ -41098,6 +41098,579 @@ body:not(.pos-machine) #bmProductGrid,
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ensureUi); else ensureUi();
 })();
 </script>
+<script id="bnx-pass-swift-outstanding">
+/* ═══════════════════════════════════════════════════════════════════════
+   SWIFT OUTSTANDING REPORT  (Due Collection page)
+   FIX ("TRANSACTION DB status DUE and sales ledger have party-wise but
+   outstanding are not captured"): the server builds party outstanding from
+   BILL_MASTER.CUSTOMER_ID only. Credit bills saved with a blank customer id,
+   or with a pseudo id (CUST-ZOMATO_LIGHT, CUST-NARAYAN_SIR …), or with the
+   party typed in another case (Narayan sir / NARAYAN SIR), never reached any
+   party total. This report reads every DUE bill straight from GET_BILLS,
+   resolves each to its real party (id → name → saved map), shows what the
+   server missed, and lets the user:
+     • ✔ mark a bill (or many) received WITH a receive date
+     • 🧭 track a bill: bill → party → receipts → balance
+     • 🔗 map an unmapped bill to its party (saved here + DB-fix CSV)
+   New credit bills are also stamped with the canonical party id on save.
+═══════════════════════════════════════════════════════════════════════ */
+(function(){
+  'use strict';
+  var W = window;
+  var S = { rows:[], srvTotal:0, srvBills:0, loaded:false, loading:false, view:'party', q:'', bucket:'', only:'', sel:{}, canon:{byName:{},byId:{}}, srvRows:[] };
+
+  function api(a,p){ return typeof W.gasApi==='function' ? W.gasApi(a,p||{},'V2_CORE') : Promise.resolve({success:false,error:'gasApi unavailable'}); }
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+  function r2(v){ return Math.round((Number(v)||0)*100)/100; }
+  function money(v){ var n=Number(v||0); return (n<-0.004?'−₹':'₹')+Math.abs(n).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+  function nk(v){ return String(v==null?'':v).toUpperCase().replace(/[^A-Z0-9]+/g,''); }
+  function notify(m,t){ if(typeof W.showNotif==='function') W.showNotif(m,t||'success'); }
+  function ymd(d){ return String(d||'').slice(0,10); }
+  function today(){ try{ if(typeof W.bnxReportBusinessDate_==='function') return W.bnxReportBusinessDate_(); }catch(e){} var d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+  function fdate(d){ d=ymd(d); if(!/^\d{4}-\d{2}-\d{2}$/.test(d)) return d||'—'; var p=d.split('-'); return p[2]+'-'+p[1]+'-'+p[0]; }
+  function age(d){ d=ymd(d); if(!/^\d{4}-\d{2}-\d{2}$/.test(d)) return 0; return Math.max(0,Math.floor((Date.now()-new Date(d+'T00:00:00').getTime())/864e5)); }
+  function ageColor(a){ return a>90?'var(--red)':a>60?'#e65100':a>30?'var(--gold)':'var(--text2)'; }
+  function rid(){ return (W.crypto&&crypto.randomUUID)?crypto.randomUUID():('r'+Date.now()+Math.random().toString(36).slice(2)); }
+  function cid(){ try{ return String((typeof CLIENT_ID!=='undefined'&&CLIENT_ID)||W.CLIENT_ID||'default'); }catch(e){ return 'default'; } }
+  function canWrite(w){ return typeof W.bnxRequireFullAccess==='function' ? W.bnxRequireFullAccess(w) : true; }
+  function modal(html){ var b=document.getElementById('detailModalBody'),m=document.getElementById('detailModal'); if(!b||!m) return; b.innerHTML=html; m.style.display='flex'; }
+  function closeModal(){ if(typeof W.closeDetailModal==='function') W.closeDetailModal(); else { var m=document.getElementById('detailModal'); if(m) m.style.display='none'; } }
+  function csv(name,rows){
+    var t=rows.map(function(r){ return r.map(function(v){ var s=String(v==null?'':v); return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s; }).join(','); }).join('\n');
+    var a=document.createElement('a'); a.href=URL.createObjectURL(new Blob(['﻿'+t],{type:'text/csv'})); a.download=name; document.body.appendChild(a); a.click(); setTimeout(function(){ a.remove(); },500);
+  }
+
+  /* ---------- persisted bill→party map + receive log (per client) ---------- */
+  var MK=function(){ return 'bnxSwiftBillMap_'+cid(); }, LK=function(){ return 'bnxSwiftRcvLog_'+cid(); };
+  function lsGet(k,d){ try{ var v=JSON.parse(localStorage.getItem(k)||'null'); return v==null?d:v; }catch(e){ return d; } }
+  function lsSet(k,v){ try{ localStorage.setItem(k,JSON.stringify(v)); }catch(e){} }
+
+  /* ---------- canonical parties (CUS#####) ---------- */
+  function addCanon(c,id,name){
+    id=String(id||'').toUpperCase(); if(!/^CUS\d+$/.test(id)||!name) return;
+    name=String(name).trim(); var k=nk(name); if(!k) return;
+    c.byName[k]=id;
+    var cur=c.byId[id];
+    if(!cur || (name===name.toUpperCase() && cur!==cur.toUpperCase())) c.byId[id]=name;
+  }
+  function buildCanon(){
+    var c={byName:{},byId:{}};
+    try{ ((W.__bnx72CR&&W.__bnx72CR.data&&W.__bnx72CR.data.customers)||[]).forEach(function(x){ addCanon(c,x.customerId,x.customer||x.name); }); }catch(e){}
+    S.srvRows.forEach(function(x){ addCanon(c,x.customerId,x.customer); });
+    S.rows.forEach(function(x){ if(x.rawId) addCanon(c,x.rawId,x.rawName); });
+    S.canon=c; return c;
+  }
+  function canonId(name){ var c=S.canon; if(!c||!Object.keys(c.byName).length) c=buildCanon(); return c.byName[nk(name)]||''; }
+  function canonName(id){ return (S.canon.byId||{})[String(id||'').toUpperCase()]||''; }
+
+  /* ---------- load + resolve ---------- */
+  async function load(force){
+    if(S.loading) return; S.loading=true; paint();
+    var bills=[], srv=[];
+    try{
+      var r=await W.erpApi({action:'GET_BILLS',range:'all'},'V2_CORE');
+      bills=(r&&r.success&&Array.isArray(r.data))?r.data:[];
+      if(!(r&&r.success)) notify('⚠️ Bills could not load: '+((r&&r.error)||'server error'),'error');
+    }catch(e){ notify('⚠️ Bills could not load: '+(e&&e.message||e),'error'); }
+    try{
+      var o=await api('GET_OUTSTANDING_BILLS',{});
+      srv=(o&&o.success&&o.data&&Array.isArray(o.data.rows))?o.data.rows:[];
+    }catch(e){}
+    S.srvRows=srv;
+    S.srvTotal=r2(srv.reduce(function(s,x){ return s+(Number(x.due)||0); },0));
+    S.srvBills=srv.filter(function(x){ return !x.isOpening; }).length;
+    var srvById={}, srvByNo={};
+    srv.forEach(function(x){ if(x.billId) srvById[x.billId]=x; if(x.billNo) srvByNo[x.billNo]=x; });
+
+    var map=lsGet(MK(),{}), rows=[];
+    bills.forEach(function(b){
+      if(String(b.BILL_STATUS||'').toUpperCase()==='CANCELLED') return;
+      var due=r2(b.DUE_AMOUNT); if(!(due>0.009)) return;
+      rows.push({ billId:String(b.BILL_ID||''), billNo:String(b.BILL_NUMBER||''), date:ymd(b.BILL_DATE), time:String(b.BILL_TIME||'').slice(0,8),
+        table:String(b.TABLE_ID||''), rawId:String(b.CUSTOMER_ID||''), rawName:String(b.CUSTOMER_NAME||''),
+        billAmount:r2(b.GRAND_TOTAL), due:due, payStatus:String(b.PAYMENT_STATUS||'') });
+    });
+    S.rows=rows; buildCanon();
+    rows.forEach(function(x){
+      var s=srvById[x.billId]||srvByNo[x.billNo]; x.inServer=!!s;
+      x.received=s?r2(s.received):0; x.adjusted=s?r2(s.adjusted):0; x.paidAtBill=s?r2(s.paidAtBill):r2(Math.max(0,x.billAmount-x.due));
+      x.age=age(x.date); x.key=x.billId||x.billNo; x.flag='';
+      var m=map[x.key];
+      if(m&&m.customerId){ x.customerId=m.customerId; x.customer=canonName(m.customerId)||m.customer; x.flag='mapped'; }
+      else if(/^CUS\d+$/i.test(x.rawId)){ x.customerId=x.rawId.toUpperCase(); x.customer=canonName(x.customerId)||x.rawName; }
+      else {
+        var id=canonId(x.rawName||x.rawId.replace(/^CUST-/i,'').replace(/_/g,' '));
+        if(id){ x.customerId=id; x.customer=canonName(id)||x.rawName; x.flag='merged'; }
+        else { x.customerId=''; x.customer=x.rawName||'(no party)'; x.flag='unmapped'; }
+      }
+      if(x.customerId&&x.rawName&&nk(x.rawName)!==nk(x.customer)&&!x.flag) x.flag='merged';
+      x.pk=x.customerId||('NM:'+nk(x.customer));
+    });
+    /* opening balances the server already carries (no bill behind them) */
+    srv.filter(function(x){ return x.isOpening&&Number(x.due)>0.009; }).forEach(function(x){
+      var id=String(x.customerId||'').toUpperCase();
+      rows.push({ billId:String(x.billId||('OPEN-'+id)), billNo:'OPENING', date:ymd(x.date), time:'', table:'', rawId:id, rawName:x.customer, billAmount:r2(x.billAmount), due:r2(x.due),
+        payStatus:'OPENING', inServer:true, received:0, adjusted:r2(x.adjusted), paidAtBill:0, age:age(x.date), key:String(x.billId||('OPEN-'+id)), flag:'', customerId:id, customer:canonName(id)||x.customer, pk:id||('NM:'+nk(x.customer)), isOpening:true });
+    });
+    S.sel={}; S.loaded=true; S.loading=false; paint();
+    if(S.rows.length){ try{ fixTopCard(); }catch(e){} }
+  }
+
+  function totals(){
+    var all=S.rows, tot=r2(all.reduce(function(s,x){ return s+x.due; },0));
+    var miss=all.filter(function(x){ return !x.isOpening&&(!x.inServer||x.flag==='unmapped'||x.flag==='merged'); });
+    var un=all.filter(function(x){ return x.flag==='unmapped'; });
+    var parties={}; all.forEach(function(x){ parties[x.pk]=1; });
+    return { total:tot, bills:all.filter(function(x){ return !x.isOpening; }).length, parties:Object.keys(parties).length,
+      missed:r2(miss.reduce(function(s,x){ return s+x.due; },0)), missedN:miss.length, unmapped:r2(un.reduce(function(s,x){ return s+x.due; },0)), unmappedN:un.length,
+      over30:r2(all.filter(function(x){ return x.age>30; }).reduce(function(s,x){ return s+x.due; },0)) };
+  }
+  /* the Due Collection headline card should show the corrected figure */
+  function fixTopCard(){
+    var t=totals(), el=document.getElementById('dcTotalOutstanding'); if(!el||!(t.total>0)) return;
+    el.textContent=money(t.total); el.title='All DUE bills + opening, parties merged. Server list alone: '+money(S.srvTotal);
+  }
+
+  /* ---------- UI ---------- */
+  function css(){
+    if(document.getElementById('bnxSwiftCss')) return;
+    var st=document.createElement('style'); st.id='bnxSwiftCss';
+    st.textContent='\
+#bnxSwiftCard .sw-kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;padding:10px 14px}\
+#bnxSwiftCard .sw-k{border:1px solid var(--border,#e5e0d8);border-radius:10px;padding:8px 10px;background:var(--surface,#fff)}\
+#bnxSwiftCard .sw-k b{display:block;font-size:16px;font-family:var(--mono,monospace)}#bnxSwiftCard .sw-k span{font-size:10px;color:var(--text3,#888);font-weight:700;text-transform:uppercase}\
+#bnxSwiftCard .sw-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:0 14px 10px}\
+#bnxSwiftCard .sw-warn{margin:0 14px 10px;padding:9px 12px;border-radius:9px;background:var(--gold-bg,#fff6e0);border:1px solid var(--gold,#b8690e);font-size:12px}\
+#bnxSwiftCard .sw-tg{display:inline-flex;border:1px solid var(--border2,#ddd);border-radius:9px;overflow:hidden}\
+#bnxSwiftCard .sw-tg button{border:0;background:var(--surface,#fff);padding:7px 12px;font-size:12px;font-weight:700;cursor:pointer;color:var(--text2)}\
+#bnxSwiftCard .sw-tg button.on{background:var(--gold,#b8690e);color:#fff}\
+#bnxSwiftCard table.sw-t{width:100%;border-collapse:collapse;font-size:12px}\
+#bnxSwiftCard .sw-t th{background:var(--surface2,#f6f3ee);text-align:left;padding:6px 8px;font-size:10.5px;white-space:nowrap}\
+#bnxSwiftCard .sw-t td{padding:6px 8px;border-top:1px solid var(--border,#eee);white-space:nowrap}\
+#bnxSwiftCard .n{text-align:right;font-family:"DM Mono","Noto Sans",monospace}\
+#bnxSwiftCard details{border:1px solid var(--border,#e5e0d8);border-radius:12px;margin:0 14px 8px;background:var(--surface,#fff)}\
+#bnxSwiftCard summary{list-style:none;cursor:pointer;display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;padding:10px 12px}\
+#bnxSwiftCard summary::-webkit-details-marker{display:none}\
+#bnxSwiftCard .sw-chip{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:800;margin-left:6px;background:var(--surface2,#f4f0ea)}\
+#bnxSwiftCard .sw-chip.w{background:#fde8e8;color:#b42318}#bnxSwiftCard .sw-chip.m{background:#e6f4ea;color:#1a7f3c}#bnxSwiftCard .sw-chip.g{background:#fff2d6;color:#9a5b00}\
+#bnxSwiftCard a.sw-bill{font-weight:800;cursor:pointer;color:var(--blue,#1a5fb4);text-decoration:underline dotted}\
+#bnxSwiftCard .sw-ov{overflow-x:auto;padding:0 14px 10px}\
+.sw-flow{display:flex;align-items:stretch;gap:6px;flex-wrap:wrap;margin:10px 0}.sw-node{flex:1 1 130px;border:1.5px solid var(--border2,#ddd);border-radius:12px;padding:9px 10px;background:var(--surface,#fff);font-size:12px}\
+.sw-node b{display:block;font-size:13px}.sw-node small{color:var(--text3,#888)}.sw-arrow{align-self:center;font-size:18px;color:var(--text3,#888)}\
+.sw-node.ok{border-color:#1a7f3c}.sw-node.bad{border-color:#b42318}.sw-node.warn{border-color:#c77700}\
+.sw-tl{border-left:3px solid var(--border2,#ddd);margin:8px 0 8px 8px;padding-left:12px}.sw-tl div{margin:0 0 8px;font-size:12px}.sw-tl i{font-style:normal;font-weight:800}\
+.sw-in{width:100%;padding:8px 10px;border:1px solid var(--border2,#ddd);border-radius:8px;font-family:inherit}\
+@media(max-width:700px){#bnxSwiftCard .sw-t th:nth-child(n+7),#bnxSwiftCard .sw-t td:nth-child(n+7){white-space:normal}}';
+    document.head.appendChild(st);
+  }
+  function ensureUi(){
+    css();
+    var page=document.getElementById('page-due-collection'); if(!page) return null;
+    var c=document.getElementById('bnxSwiftCard'); if(c) return c;
+    c=document.createElement('div'); c.className='card'; c.id='bnxSwiftCard'; c.style.marginBottom='14px';
+    c.innerHTML='\
+<div class="card-header" style="flex-wrap:wrap;gap:8px"><span class="card-title">⚡ Swift Outstanding Report — all DUE bills, party-wise</span>\
+<div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-sm btn-ghost" data-sw="refresh">⟳ Refresh</button><button class="btn btn-sm btn-ghost" data-sw="csv">📥 Export</button><button class="btn btn-sm btn-ghost" data-sw="fix" title="Bills whose party id must be corrected in BILL_MASTER">🛠 DB-fix CSV</button></div></div>\
+<div id="swBody"></div>';
+    var cards=page.querySelectorAll(':scope > .card'); var anchor=cards[0]||null;
+    if(anchor&&anchor.nextSibling) page.insertBefore(c,anchor.nextSibling); else page.appendChild(c);
+    c.addEventListener('click',onClick);
+    c.addEventListener('input',function(e){ if(e.target.id==='swQ'){ S.q=e.target.value; clearTimeout(S._t); S._t=setTimeout(paintBody,160); } });
+    c.addEventListener('change',function(e){
+      if(e.target.id==='swBucket'){ S.bucket=e.target.value; paintBody(); }
+      else if(e.target.id==='swOnly'){ S.only=e.target.value; paintBody(); }
+      else if(e.target.getAttribute('data-sel')!==null){ var k=e.target.getAttribute('data-sel'); if(e.target.checked) S.sel[k]=1; else delete S.sel[k]; paintFoot(); }
+    });
+    return c;
+  }
+  function visible(){
+    var q=S.q.trim().toUpperCase();
+    return S.rows.filter(function(x){
+      if(S.bucket){ var a=x.age; var ok=(S.bucket==='0_30'&&a<=30)||(S.bucket==='31_60'&&a>30&&a<=60)||(S.bucket==='61_90'&&a>60&&a<=90)||(S.bucket==='90p'&&a>90); if(!ok) return false; }
+      if(S.only==='unmapped'&&x.flag!=='unmapped') return false;
+      if(S.only==='missed'&&!(x.flag==='unmapped'||x.flag==='merged'||(!x.inServer&&!x.isOpening))) return false;
+      return !q||(x.billNo+' '+x.customer+' '+x.rawName+' '+x.table+' '+x.customerId).toUpperCase().indexOf(q)>=0;
+    });
+  }
+  function chips(x){
+    var h='';
+    if(x.flag==='unmapped') h+='<span class="sw-chip w" title="Bill has no party id">⚠ UNMAPPED</span>';
+    else if(x.flag==='merged') h+='<span class="sw-chip g" title="Saved as '+esc(x.rawId||x.rawName)+' — merged to '+esc(x.customerId)+'">↺ MERGED</span>';
+    else if(x.flag==='mapped') h+='<span class="sw-chip m">🔗 MAPPED</span>';
+    if(!x.inServer&&!x.isOpening) h+='<span class="sw-chip w" title="Server outstanding list does not contain this bill">NOT IN SERVER</span>';
+    if(x.isOpening) h+='<span class="sw-chip">OPENING</span>';
+    return h;
+  }
+  function billRow(x){
+    var a=x.isOpening?'<span style="color:var(--text3)">—</span>':'<a class="sw-bill" data-sw="track" data-k="'+esc(x.key)+'">'+esc(x.billNo)+'</a>';
+    return '<tr><td>'+(x.isOpening?'':'<input type="checkbox" data-sel="'+esc(x.key)+'" '+(S.sel[x.key]?'checked':'')+'>')+'</td><td>'+a+chips(x)+'</td><td>'+fdate(x.date)+'</td><td>'+esc(x.table||'—')+'</td>'
+      +(S.view==='bill'?'<td>'+esc(x.customer)+(x.customerId?' <small style="color:var(--text3)">'+esc(x.customerId)+'</small>':'')+'</td>':'')
+      +'<td class="n">'+(x.isOpening?'—':money(x.billAmount))+'</td><td class="n">'+(x.paidAtBill?money(x.paidAtBill):'—')+'</td><td class="n">'+(x.received?money(x.received):'—')+'</td><td class="n"><b style="color:'+ageColor(x.age)+'">'+money(x.due)+'</b></td><td class="n" style="color:'+ageColor(x.age)+'">'+x.age+'d</td>'
+      +'<td><button class="btn btn-sm btn-primary" data-sw="recv" data-k="'+esc(x.key)+'">✔ Received</button> '+(x.isOpening?'':'<button class="btn btn-sm btn-ghost" data-sw="track" data-k="'+esc(x.key)+'">🧭 Track</button>')+(x.flag==='unmapped'?' <button class="btn btn-sm btn-ghost" data-sw="map" data-k="'+esc(x.key)+'">🔗 Map</button>':'')+'</td></tr>';
+  }
+  function thead(){ return '<thead><tr><th></th><th>Bill No</th><th>Date</th><th>Table</th>'+(S.view==='bill'?'<th>Party</th>':'')+'<th class="n">Bill Amt</th><th class="n">Paid at Bill</th><th class="n">Received</th><th class="n">Due</th><th class="n">Age</th><th>Action</th></tr></thead>'; }
+  function paintBody(){
+    var host=document.getElementById('swBody'); if(!host) return;
+    var area=document.getElementById('swList'); if(!area) return;
+    var rows=visible(), h='';
+    if(!rows.length){ area.innerHTML='<div style="padding:18px;text-align:center;color:var(--text3)">'+(S.loading?'Loading…':'No outstanding bills for this selection.')+'</div>'; paintFoot(); return; }
+    if(S.view==='bill'){
+      rows=rows.slice().sort(function(a,b){ return String(a.date).localeCompare(String(b.date))||String(a.billNo).localeCompare(String(b.billNo),undefined,{numeric:true}); });
+      h='<div class="sw-ov"><table class="sw-t">'+thead()+'<tbody>'+rows.map(billRow).join('')+'</tbody></table></div>';
+    } else {
+      var g={}; rows.forEach(function(x){ (g[x.pk]=g[x.pk]||{pk:x.pk,name:x.customer,id:x.customerId,rows:[]}).rows.push(x); });
+      var list=Object.keys(g).map(function(k){ var p=g[k]; p.tot=r2(p.rows.reduce(function(s,x){ return s+x.due; },0)); p.old=Math.max.apply(null,p.rows.map(function(x){ return x.age; })); p.un=p.rows.some(function(x){ return x.flag==='unmapped'; }); return p; }).sort(function(a,b){ return b.tot-a.tot; });
+      h=list.map(function(p){
+        var bn=p.rows.filter(function(x){ return !x.isOpening; }).length;
+        return '<details '+(list.length<=3||S.q?'open':'')+'><summary><div><b>'+esc(p.name)+'</b>'+(p.id?' <small style="color:var(--text3)">'+esc(p.id)+'</small>':'')+(p.un?'<span class="sw-chip w">⚠ UNMAPPED PARTY</span>':'')+'<div style="font-size:10.5px;color:var(--text3)">'+bn+' bill(s) · oldest '+p.old+'d</div></div>'
+          +'<div style="display:flex;gap:8px;align-items:center"><b class="n" style="color:var(--red);font-size:15px">'+money(p.tot)+'</b><button class="btn btn-sm btn-primary" data-sw="recvParty" data-p="'+esc(p.pk)+'">✔ Mark all received</button></div></summary>'
+          +'<div class="sw-ov"><table class="sw-t">'+thead()+'<tbody>'+p.rows.sort(function(a,b){ return String(a.date).localeCompare(String(b.date)); }).map(billRow).join('')+'</tbody></table></div></details>';
+      }).join('');
+    }
+    area.innerHTML=h; paintFoot();
+  }
+  function paintFoot(){
+    var el=document.getElementById('swFoot'); if(!el) return;
+    var rows=visible(), tot=r2(rows.reduce(function(s,x){ return s+x.due; },0));
+    var sel=S.rows.filter(function(x){ return S.sel[x.key]; }), st=r2(sel.reduce(function(s,x){ return s+x.due; },0));
+    el.innerHTML='<div><b>'+rows.length+'</b> row(s) · Outstanding <b>'+money(tot)+'</b></div><div style="display:flex;gap:8px;align-items:center"><span style="font-weight:700">'+(sel.length?sel.length+' selected · '+money(st):'')+'</span><button class="btn btn-sm btn-primary" data-sw="recvSel" '+(sel.length?'':'disabled')+'>✔ Mark selected received</button></div>';
+  }
+  function paint(){
+    var c=ensureUi(); if(!c) return;
+    var host=document.getElementById('swBody');
+    if(!S.loaded){ host.innerHTML='<div style="padding:18px;text-align:center;color:var(--text3)">'+(S.loading?'⟳ Reading every DUE bill…':'Press Refresh to load.')+'</div>'; return; }
+    var t=totals();
+    var warn=(t.missedN||Math.abs(t.total-S.srvTotal)>1)?'<div class="sw-warn">⚠️ <b>Server party list shows '+money(S.srvTotal)+'</b>, bills actually due add up to <b>'+money(t.total)+'</b>. '
+      +(t.missedN?'<b>'+t.missedN+' bill(s) worth '+money(t.missed)+'</b> carry a blank / pseudo party id or a different spelling and were not counted under the right party — they are merged below.':'')
+      +(t.unmappedN?' <b>'+t.unmappedN+' bill(s) ('+money(t.unmapped)+')</b> have no matching party: use <b>🔗 Map</b>.':'')+'</div>':'';
+    host.innerHTML='<div class="sw-kpi"><div class="sw-k"><span>Total outstanding</span><b style="color:var(--red)">'+money(t.total)+'</b></div><div class="sw-k"><span>Parties</span><b>'+t.parties+'</b></div><div class="sw-k"><span>Open bills</span><b>'+t.bills+'</b></div>'
+      +'<div class="sw-k"><span>Over 30 days</span><b>'+money(t.over30)+'</b></div><div class="sw-k"><span>Missed by server</span><b style="color:'+(t.missedN?'var(--red)':'var(--green)')+'">'+money(t.missed)+'</b></div><div class="sw-k"><span>Unmapped</span><b style="color:'+(t.unmappedN?'var(--red)':'var(--green)')+'">'+t.unmappedN+'</b></div></div>'+warn
+      +'<div class="sw-bar"><div class="sw-tg"><button data-sw="view" data-v="party" class="'+(S.view==='party'?'on':'')+'">👥 Party-wise</button><button data-sw="view" data-v="bill" class="'+(S.view==='bill'?'on':'')+'">🧾 Bill-wise</button></div>'
+      +'<input class="fi" id="swQ" placeholder="Search bill / party / table…" value="'+esc(S.q)+'" style="flex:1 1 200px;min-width:0">'
+      +'<select class="fi fsel" id="swBucket"><option value="">All ages</option><option value="0_30"'+(S.bucket==='0_30'?' selected':'')+'>0–30 d</option><option value="31_60"'+(S.bucket==='31_60'?' selected':'')+'>31–60 d</option><option value="61_90"'+(S.bucket==='61_90'?' selected':'')+'>61–90 d</option><option value="90p"'+(S.bucket==='90p'?' selected':'')+'>90+ d</option></select>'
+      +'<select class="fi fsel" id="swOnly"><option value="">All bills</option><option value="missed"'+(S.only==='missed'?' selected':'')+'>Missed by server</option><option value="unmapped"'+(S.only==='unmapped'?' selected':'')+'>Unmapped only</option></select></div>'
+      +'<div id="swList"></div><div class="sw-bar" id="swFoot" style="justify-content:space-between;padding-top:8px"></div>';
+    paintBody();
+  }
+
+  /* ---------- actions ---------- */
+  function byKey(k){ return S.rows.filter(function(x){ return x.key===k; })[0]; }
+  function onClick(e){
+    var b=e.target.closest('[data-sw]'); if(!b) return;
+    var a=b.getAttribute('data-sw'), k=b.getAttribute('data-k');
+    if(a==='refresh') load(true);
+    else if(a==='view'){ S.view=b.getAttribute('data-v'); paint(); }
+    else if(a==='csv') exportCsv();
+    else if(a==='fix') exportFix();
+    else if(a==='track'){ var r=byKey(k); if(r) openTrack(r); }
+    else if(a==='recv'){ var r2_=byKey(k); if(r2_) openReceive([r2_]); }
+    else if(a==='map'){ var r3=byKey(k); if(r3) openMap(r3); }
+    else if(a==='recvParty'){ var pk=b.getAttribute('data-p'); openReceive(visible().filter(function(x){ return x.pk===pk&&!x.isOpening; })); }
+    else if(a==='recvSel'){ openReceive(S.rows.filter(function(x){ return S.sel[x.key]; })); }
+  }
+
+  var RV={rows:[],party:null};
+  function partyOptions(sel){
+    var ids=S.canon.byId, o=Object.keys(ids).sort(function(a,b){ return ids[a].localeCompare(ids[b]); }).map(function(id){ return '<option value="'+esc(id)+'"'+(id===sel?' selected':'')+'>'+esc(ids[id])+' ('+esc(id)+')</option>'; }).join('');
+    return o;
+  }
+  function openReceive(rows){
+    rows=(rows||[]).filter(function(x){ return !x.isOpening; });
+    if(!rows.length){ notify('⚠️ Tick the bills first','error'); return; }
+    if(!canWrite('Receiving payment')) return;
+    var pks=Object.keys(rows.reduce(function(m,x){ m[x.pk]=1; return m; },{}));
+    if(pks.length>1){ notify('⚠️ Select bills of one party at a time ('+pks.length+' parties selected)','error'); return; }
+    RV.rows=rows.map(function(x){ return Object.assign({},x,{pay:x.due}); });
+    var cust=rows[0], needMap=!cust.customerId;
+    var tot=r2(RV.rows.reduce(function(s,x){ return s+x.pay; },0));
+    modal('<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><div><div style="font-weight:800;font-size:16px">✔ Mark Received</div><div style="font-size:12px;color:#888">'+esc(cust.customer)+' · '+RV.rows.length+' bill(s)</div></div><button onclick="closeDetailModal()" style="border:none;background:var(--thm-soft,#f2ede5);width:28px;height:28px;border-radius:8px;cursor:pointer">✕</button></div>'
+      +(needMap?'<div style="margin-bottom:8px"><label style="font-size:11px;font-weight:700">Map to party (bill has no party id)</label><select id="swRvParty" class="sw-in"><option value="">— choose party —</option>'+partyOptions('')+'<option value="__NEW__">➕ Keep as new party “'+esc(cust.customer)+'”</option></select></div>':'')
+      +'<div style="max-height:230px;overflow:auto;border:1px solid var(--border2,#e5e0d8);border-radius:10px;margin-bottom:10px"><table class="sw-t" style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr><th style="text-align:left;padding:6px">Bill</th><th style="padding:6px">Date</th><th style="text-align:right;padding:6px">Due</th><th style="text-align:right;padding:6px">Receive ₹</th></tr></thead><tbody>'
+      +RV.rows.map(function(x,i){ return '<tr><td style="padding:5px 6px;font-weight:700">'+esc(x.billNo)+'</td><td style="padding:5px 6px">'+fdate(x.date)+'</td><td style="padding:5px 6px;text-align:right">'+money(x.due)+'</td><td style="padding:5px 6px;text-align:right"><input type="number" min="0" step="0.01" max="'+x.due+'" value="'+x.pay+'" data-i="'+i+'" class="swRvAmt" style="width:110px;text-align:right;padding:5px;border:1px solid var(--border2,#ddd);border-radius:7px"></td></tr>'; }).join('')
+      +'</tbody></table></div>'
+      +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px"><div><label style="font-size:11px;font-weight:700">Received Date</label><input id="swRvDate" type="date" class="sw-in" value="'+today()+'" max="'+today()+'"></div>'
+      +'<div><label style="font-size:11px;font-weight:700">Mode</label><select id="swRvMode" class="sw-in"><option value="CASH">Cash</option><option value="UPI">UPI</option><option value="CARD">Card</option><option value="BANK">Bank Transfer</option><option value="CHEQUE">Cheque</option></select></div></div>'
+      +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px"><div><label style="font-size:11px;font-weight:700">UTR / Cheque / Ref</label><input id="swRvRef" class="sw-in" placeholder="Optional"></div><div><label style="font-size:11px;font-weight:700">Narration</label><input id="swRvNarr" class="sw-in" placeholder="Received against bill"></div></div>'
+      +'<div id="swRvSum" style="font-size:12px;padding:8px 10px;border-radius:9px;background:var(--surface2,#f6f3ee);margin-bottom:10px">Receiving <b>'+money(tot)+'</b></div>'
+      +'<div style="display:flex;gap:8px"><button class="btn btn-primary" id="swRvSave" style="flex:1;padding:11px">💾 Save — mark received</button><button class="btn btn-ghost" style="padding:11px 16px" onclick="closeDetailModal()">Cancel</button></div>');
+    var host=document.getElementById('detailModalBody');
+    host.querySelectorAll('.swRvAmt').forEach(function(inp){ inp.addEventListener('input',function(){ var x=RV.rows[+inp.getAttribute('data-i')]; var v=r2(inp.value); x.pay=Math.max(0,Math.min(v,x.due)); document.getElementById('swRvSum').innerHTML='Receiving <b>'+money(RV.rows.reduce(function(s,y){ return s+y.pay; },0))+'</b>'; }); });
+    document.getElementById('swRvSave').addEventListener('click',saveReceive);
+  }
+  async function saveReceive(){
+    var rows=RV.rows.filter(function(x){ return x.pay>0.009; });
+    var date=(document.getElementById('swRvDate')||{}).value||today();
+    if(!rows.length){ notify('⚠️ Enter an amount to receive','error'); return; }
+    if(date>today()){ notify('⚠️ Receive date cannot be in the future','error'); return; }
+    var first=RV.rows[0], customerId=first.customerId, customer=first.customer;
+    var sel=document.getElementById('swRvParty');
+    if(sel){
+      if(!sel.value){ notify('⚠️ Choose the party for this bill','error'); return; }
+      if(sel.value!=='__NEW__'){ customerId=sel.value; customer=canonName(customerId)||customer; saveMap(RV.rows,customerId,customer); }
+    }
+    var amt=r2(rows.reduce(function(s,x){ return s+x.pay; },0));
+    var btn=document.getElementById('swRvSave'); if(btn){ if(btn.disabled) return; btn.disabled=true; btn.textContent='Saving…'; }
+    var r=await api('SAVE_DUES_RECEIPT',{ requestId:rid(), customerId:customerId||'', customerName:customer, amount:amt,
+      allocations:rows.map(function(x){ return {billId:x.billId,billNo:x.billNo,amount:x.pay}; }),
+      paymentMode:(document.getElementById('swRvMode')||{}).value||'CASH', date:date,
+      reference:(document.getElementById('swRvRef')||{}).value||'', narration:(document.getElementById('swRvNarr')||{}).value||('Received against '+rows.map(function(x){ return x.billNo; }).join(', ')) });
+    if(!r||!r.success){ if(btn){ btn.disabled=false; btn.textContent='💾 Save — mark received'; } notify('❌ Not saved: '+((r&&r.error)||'server error'),'error'); return; }
+    var log=lsGet(LK(),[]); rows.forEach(function(x){ log.push({billNo:x.billNo,billId:x.billId,amount:x.pay,date:date,mode:(document.getElementById('swRvMode')||{}).value||'CASH',voucher:(r.data&&r.data.voucherNo)||'',ts:Date.now()}); }); lsSet(LK(),log.slice(-2000));
+    notify('✅ '+money(amt)+' received on '+fdate(date)+(r.data&&r.data.voucherNo?' · '+r.data.voucherNo:''),'success');
+    closeModal(); if(typeof W.bnxLoadDueCollection==='function'){ try{ W.bnxLoadDueCollection(); }catch(e){} }
+    load(true);
+  }
+  function saveMap(rows,id,name){ var m=lsGet(MK(),{}); rows.forEach(function(x){ m[x.key]={customerId:id,customer:name,billNo:x.billNo,at:Date.now()}; }); lsSet(MK(),m); }
+  function openMap(r){
+    modal('<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><div><div style="font-weight:800;font-size:16px">🔗 Map bill to party</div><div style="font-size:12px;color:#888">'+esc(r.billNo)+' · '+money(r.due)+' · saved as “'+esc(r.rawName||'—')+'”</div></div><button onclick="closeDetailModal()" style="border:none;background:var(--thm-soft,#f2ede5);width:28px;height:28px;border-radius:8px;cursor:pointer">✕</button></div>'
+      +'<select id="swMapParty" class="sw-in" style="margin-bottom:10px"><option value="">— choose party —</option>'+partyOptions('')+'</select>'
+      +'<div style="font-size:11px;color:var(--text3);margin-bottom:10px">The mapping is applied to every report here immediately. Use <b>🛠 DB-fix CSV</b> to correct CUSTOMER_ID in BILL_MASTER permanently.</div>'
+      +'<div style="display:flex;gap:8px"><button class="btn btn-primary" id="swMapSave" style="flex:1;padding:11px">Save mapping</button><button class="btn btn-ghost" style="padding:11px 16px" onclick="closeDetailModal()">Cancel</button></div>');
+    document.getElementById('swMapSave').addEventListener('click',function(){
+      var id=(document.getElementById('swMapParty')||{}).value; if(!id){ notify('⚠️ Choose the party','error'); return; }
+      saveMap([r],id,canonName(id)); closeModal(); notify('🔗 '+r.billNo+' mapped to '+canonName(id),'success'); load(true);
+    });
+  }
+
+  /* ---------- track with map ---------- */
+  async function openTrack(r){
+    var log=lsGet(LK(),[]).filter(function(x){ return x.billNo===r.billNo||x.billId===r.billId; });
+    var ev=[];
+    if(r.customerId){
+      try{
+        var L=await api('GET_CUSTOMER_LEDGER',{customerId:r.customerId,from:'',to:''});
+        if(L&&L.success&&L.data){
+          Object.keys(L.data).forEach(function(k){
+            var v=L.data[k]; if(!Array.isArray(v)) return;
+            v.forEach(function(it){
+              if(!it||typeof it!=='object') return; var s=JSON.stringify(it);
+              if(s.indexOf(r.billNo)<0&&(!r.billId||s.indexOf(r.billId)<0)) return;
+              var amt=Number(it.credit||it.received||it.amount||it.allocated||it.cr||0), dt=ymd(it.date||it.receiptDate||it.RECEIPT_DATE||'');
+              if(amt>0&&dt&&/receipt|rcpt|payment|due/i.test(String(it.type||it.voucherType||it.narration||k+' receipt')))
+                ev.push({date:dt,amount:amt,ref:String(it.voucherNo||it.ref||it.reference||''),mode:String(it.mode||it.paymentMode||'')});
+            });
+          });
+        }
+      }catch(e){}
+    }
+    log.forEach(function(x){ if(!ev.some(function(y){ return y.ref&&y.ref===x.voucher; })) ev.push({date:x.date,amount:x.amount,ref:x.voucher,mode:x.mode,local:true}); });
+    ev.sort(function(a,b){ return a.date.localeCompare(b.date); });
+    var rcv=r2(ev.reduce(function(s,x){ return s+x.amount; },0))||r.received;
+    var st=r.flag==='unmapped'?'bad':(r.flag==='merged'||!r.inServer)?'warn':'ok';
+    modal('<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div><div style="font-weight:800;font-size:16px">🧭 Track bill '+esc(r.billNo)+'</div><div style="font-size:12px;color:#888">'+fdate(r.date)+(r.time?' '+esc(r.time):'')+(r.table?' · Table '+esc(r.table):'')+' · '+r.age+' days old</div></div><button onclick="closeDetailModal()" style="border:none;background:var(--thm-soft,#f2ede5);width:28px;height:28px;border-radius:8px;cursor:pointer">✕</button></div>'
+      +'<div class="sw-flow"><div class="sw-node ok"><small>🧾 BILL</small><b>'+money(r.billAmount)+'</b><small>paid at bill '+money(r.paidAtBill)+'</small></div><div class="sw-arrow">➜</div>'
+      +'<div class="sw-node '+st+'"><small>👤 PARTY</small><b>'+esc(r.customer)+'</b><small>'+(r.customerId?esc(r.customerId):'no party id')+(r.rawId&&r.rawId!==r.customerId?' · saved as '+esc(r.rawId):'')+'</small></div><div class="sw-arrow">➜</div>'
+      +'<div class="sw-node '+(ev.length?'ok':'warn')+'"><small>💰 RECEIPTS</small><b>'+ev.length+' · '+money(rcv)+'</b><small>'+(ev.length?'last '+fdate(ev[ev.length-1].date):'none yet')+'</small></div><div class="sw-arrow">➜</div>'
+      +'<div class="sw-node bad"><small>⏳ BALANCE DUE</small><b>'+money(r.due)+'</b><small>'+(r.inServer?'in server list':'missing in server list')+'</small></div></div>'
+      +'<div class="sw-tl"><div><i>'+fdate(r.date)+'</i> — billed '+money(r.billAmount)+(r.paidAtBill?', paid at counter '+money(r.paidAtBill):'')+', credit '+money(r.due+r.received)+'</div>'
+      +ev.map(function(x){ return '<div><i>'+fdate(x.date)+'</i> — received <b style="color:var(--green)">'+money(x.amount)+'</b>'+(x.mode?' via '+esc(x.mode):'')+(x.ref?' · '+esc(x.ref):'')+(x.local?' <small>(logged here)</small>':'')+'</div>'; }).join('')
+      +'<div><i>'+fdate(today())+'</i> — still due <b style="color:var(--red)">'+money(r.due)+'</b></div></div>'
+      +'<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-primary" id="swTrRecv">✔ Mark received</button>'+(r.flag==='unmapped'?'<button class="btn btn-ghost" id="swTrMap">🔗 Map to party</button>':'')+(r.customerId&&typeof W.bnx72OpenStatement==='function'?'<button class="btn btn-ghost" id="swTrStmt">📒 Party statement</button>':'')+'<button class="btn btn-ghost" onclick="closeDetailModal()">Close</button></div>');
+    var q=function(id,fn){ var el=document.getElementById(id); if(el) el.addEventListener('click',fn); };
+    q('swTrRecv',function(){ openReceive([r]); }); q('swTrMap',function(){ openMap(r); }); q('swTrStmt',function(){ closeModal(); W.bnx72OpenStatement(r.customerId); });
+  }
+
+  /* ---------- exports ---------- */
+  function exportCsv(){
+    var rows=visible();
+    csv('swift_outstanding_'+today()+'.csv',[['Party','Party ID','Bill No','Date','Table','Bill Amount','Paid at Bill','Received','Due','Age (days)','Flag','Saved As']]
+      .concat(rows.map(function(x){ return [x.customer,x.customerId,x.billNo,x.date,x.table,x.billAmount,x.paidAtBill,x.received,x.due,x.age,x.flag||(x.inServer?'':'NOT IN SERVER'),x.rawId||x.rawName]; })));
+  }
+  function exportFix(){
+    var rows=S.rows.filter(function(x){ return !x.isOpening&&x.customerId&&(x.flag==='merged'||x.flag==='mapped'||!/^CUS\d+$/i.test(x.rawId)); });
+    if(!rows.length){ notify('Nothing to fix — every due bill already carries its party id','success'); return; }
+    csv('BILL_MASTER_customer_fix_'+today()+'.csv',[['BILL_ID','BILL_NUMBER','CURRENT_CUSTOMER_ID','CURRENT_CUSTOMER_NAME','CORRECT_CUSTOMER_ID','CORRECT_CUSTOMER_NAME','DUE_AMOUNT']]
+      .concat(rows.map(function(x){ return [x.billId,x.billNo,x.rawId,x.rawName,x.customerId,x.customer,x.due]; })));
+    var un=S.rows.filter(function(x){ return x.flag==='unmapped'; }).length;
+    if(un) notify('⚠️ '+un+' bill(s) still need a party — map them first, then export again','info');
+  }
+
+  /* ---------- stamp the canonical party id on NEW credit bills ---------- */
+  function wrapSave(){
+    var g=W.gasApi; if(typeof g!=='function'||g.__bnxSwiftBill) return;
+    var w=function(a,p,e){
+      try{
+        if(a==='SAVE_BILL'&&p&&p.bill&&!/^CUS\d+$/i.test(String(p.bill.customerId||''))){
+          var nm=p.bill.customer||p.bill.customerName||''; var id=nm?canonId(nm):'';
+          if(id) p=Object.assign({},p,{bill:Object.assign({},p.bill,{customerId:id,customerName:canonName(id)||nm})});
+        }
+      }catch(x){}
+      return g.call(this,a,p,e);
+    };
+    Object.keys(g).forEach(function(k){ try{ w[k]=g[k]; }catch(x){} }); w.__bnxSwiftBill=true; W.gasApi=w;
+  }
+  wrapSave(); setInterval(wrapSave,5000);
+
+  /* ---------- page hook ---------- */
+  var origShow=W.showPage;
+  if(typeof origShow==='function'&&!origShow.__bnxSwift){
+    var hw=function(id){ var res=origShow.apply(this,arguments); try{ if(id==='due-collection'){ ensureUi(); paint(); if(!S.loaded||Date.now()-(S.at||0)>60000){ S.at=Date.now(); load(); } } }catch(e){} return res; };
+    Object.keys(origShow).forEach(function(k){ try{ hw[k]=origShow[k]; }catch(x){} }); hw.__bnxSwift=true; W.showPage=hw;
+  }
+  W.bnxSwiftOutstanding={ load:load, ensure:function(){ return S.loaded?Promise.resolve():load(); }, canonId:canonId, canonName:canonName, buildCanon:buildCanon, parties:function(){ if(!Object.keys(S.canon.byId).length) buildCanon(); return S.canon.byId; }, open:function(){ if(typeof W.showPage==='function') W.showPage('due-collection'); var c=ensureUi(); if(c&&c.scrollIntoView) c.scrollIntoView({behavior:'smooth',block:'start'}); } };
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',ensureUi); else ensureUi();
+})();
+</script>
+
+<script id="bnx-credit-bill-guard">
+/* ═══════════════════════════════════════════════════════════════════════
+   CREDIT BILL GUARD (POS Settle + New Bill)
+   FIX ("if pos bill and select credit then customer name and mobile no add
+   and group and ref by select then save bill"): a CREDIT / DUE bill can no
+   longer be saved without a real customer name, a 10-digit mobile, a Group
+   and a Ref By. The two extra pickers appear only when the payment mode is
+   credit, known parties auto-fill mobile + group, and a brand-new party is
+   created as a credit customer (so it gets a CUS id) BEFORE the bill is
+   saved — so the bill lands under the right party in outstanding.
+═══════════════════════════════════════════════════════════════════════ */
+(function(){
+  'use strict';
+  var W=window, ST={group:'',refBy:'',checkedAt:0};
+  function cid(){ try{ return String((typeof CLIENT_ID!=='undefined'&&CLIENT_ID)||W.CLIENT_ID||'default'); }catch(e){ return 'default'; } }
+  function $(id){ return document.getElementById(id); }
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+  function nn(s){ return String(s||'').trim().replace(/\s+/g,' ').toUpperCase(); }
+  function nk(s){ return String(s||'').toUpperCase().replace(/[^A-Z0-9]+/g,''); }
+  function notify(m,t){ if(typeof W.showNotif==='function') W.showNotif(m,t||'error'); else alert(m); }
+  function isCredit(v){ return /^(CREDIT|DUE)$/i.test(String(v||'').trim()); }
+  function posCredit(){ try{ return isCredit(W.bnxPosPayMode_()); }catch(e){ return false; } }
+  function billCredit(){ var e=$('bm-bf-paymode'); return !!e&&isCredit(e.value); }
+  function gKey(){ return 'bnx_credit_groups_'+cid(); }
+  function gMap(){ try{ return JSON.parse(localStorage.getItem(gKey())||'{}')||{}; }catch(e){ return {}; } }
+  var GENERIC=/^(GENERAL CUSTOMER|DEFAULT CUSTOMER|CASH SALES?|CASH|WALK[- ]?IN|CUSTOMER|GUEST|NA|N\/A|-+)?$/;
+
+  /* ---- data: groups, referrers, known parties ---- */
+  function parties(){ var o=[]; try{ ((W.__bnx72CR&&W.__bnx72CR.data&&W.__bnx72CR.data.customers)||[]).forEach(function(c){ o.push({id:c.customerId,name:c.customer||c.name,phone:c.phone||c.mobile||'',group:c.group||c.groupName||c.customerGroup||''}); }); }catch(e){}
+    try{ var m=W.bnxSwiftOutstanding&&W.bnxSwiftOutstanding.parties&&W.bnxSwiftOutstanding.parties(); if(m) Object.keys(m).forEach(function(id){ if(!o.some(function(x){ return x.id===id; })) o.push({id:id,name:m[id],phone:'',group:''}); }); }catch(e){}
+    return o; }
+  function groups(){ var g={}, m=gMap(); Object.keys(m).forEach(function(k){ var v=String(m[k]||'').trim(); if(v&&v!=='__none__') g[v]=1; });
+    parties().forEach(function(p){ var v=String(p.group||'').trim(); if(v&&!/^ungrouped$/i.test(v)) g[v]=1; }); return Object.keys(g).sort(); }
+  function refs(){ var r={}; ['waiterSel','bm-bf-waiter'].forEach(function(id){ var s=$(id); if(s) [].forEach.call(s.options,function(o){ var v=String(o.value||'').trim(); if(v&&!/^(loading|select)/i.test(o.text)) r[v]=1; }); });
+    try{ JSON.parse(localStorage.getItem('bnxCrRefs_'+cid())||'[]').forEach(function(v){ r[v]=1; }); }catch(e){} return Object.keys(r).sort(); }
+  function find(name){ var k=nk(name); return parties().filter(function(p){ return nk(p.name)===k; })[0]||null; }
+
+  /* ---- UI ---- */
+  function css(){ if($('bnxCrCss')) return; var s=document.createElement('style'); s.id='bnxCrCss';
+    s.textContent='.bnxCr-bad{outline:2px solid var(--red,#c0392b)!important;outline-offset:1px}.bnxCr-box{display:none}.bnxCr-box.on{display:flex}#bnxCrPos{align-items:center;gap:6px;flex-wrap:wrap}#bnxCrPos select{flex:1;min-width:110px}'; document.head.appendChild(s); }
+  function opts(list,sel,addLbl,first){ return '<option value="">'+first+'</option>'+list.map(function(v){ return '<option'+(v===sel?' selected':'')+'>'+esc(v)+'</option>'; }).join('')+'<option value="__NEW__">'+addLbl+'</option>'; }
+  function pick(kind,el){
+    if(el.value!=='__NEW__') { ST[kind]=el.value; sync(); return; }
+    var v=(prompt(kind==='group'?'New group name':'Ref by (name)')||'').trim();
+    if(v){ if(kind==='group'){ ST.group=v; } else { ST.refBy=v; try{ var a=JSON.parse(localStorage.getItem('bnxCrRefs_'+cid())||'[]'); if(a.indexOf(v)<0){ a.push(v); localStorage.setItem('bnxCrRefs_'+cid(),JSON.stringify(a)); } }catch(e){} } }
+    else ST[kind]='';
+    sync();
+  }
+  function fill(){ /* (re)paint all four selects from ST + lists */
+    var gl=groups(); if(ST.group&&gl.indexOf(ST.group)<0) gl.push(ST.group);
+    var rl=refs(); if(ST.refBy&&rl.indexOf(ST.refBy)<0) rl.push(ST.refBy);
+    [['bnxCrPosG','group'],['bnxCrBillG','group']].forEach(function(x){ var e=$(x[0]); if(e) e.innerHTML=opts(gl,ST.group,'➕ New group…','— Group * —'); });
+    [['bnxCrPosR','refBy'],['bnxCrBillR','refBy']].forEach(function(x){ var e=$(x[0]); if(e) e.innerHTML=opts(rl,ST.refBy,'➕ Other…','— Ref by * —'); });
+  }
+  function sync(){
+    css();
+    var pc=posCredit(), bc=billCredit();
+    var a=$('bnxCrPos'); if(a) a.classList.toggle('on',pc);
+    var b=$('bnxCrBill'); if(b) b.classList.toggle('on',bc);
+    var c=$('bnxCrBill2'); if(c) c.classList.toggle('on',bc);
+    fill();
+    if((pc||bc)&&W.bnxSwiftOutstanding&&W.bnxSwiftOutstanding.ensure) W.bnxSwiftOutstanding.ensure();
+  }
+  function inject(){
+    css();
+    var n=$('custNameInput');
+    if(n&&!$('bnxCrPos')){
+      var row=n.closest('.waiter-row')||n.parentNode, d=document.createElement('div'); d.className='waiter-row bnxCr-box'; d.id='bnxCrPos';
+      d.innerHTML='<span style="color:var(--text3)">Credit:</span><select class="waiter-sel" id="bnxCrPosG"></select><select class="waiter-sel" id="bnxCrPosR"></select>';
+      row.parentNode.insertBefore(d,row.nextSibling);
+      $('bnxCrPosG').addEventListener('change',function(){ pick('group',this); }); $('bnxCrPosR').addEventListener('change',function(){ pick('refBy',this); });
+      n.setAttribute('list','bnxCrNames'); n.addEventListener('change',function(){ autofill(n,$('custMobileInput')); });
+      n.addEventListener('blur',function(){ autofill(n,$('custMobileInput')); });
+      var m=$('custMobileInput'); if(m) m.setAttribute('maxlength','10');
+    }
+    var bn=$('bm-bf-cname');
+    if(bn&&!$('bnxCrBill')){
+      var g=bn.closest('.bf-g')||bn.parentNode, mob=$('bm-bf-mobile'), after=(mob&&mob.closest('.bf-g'))||g;
+      var d1=document.createElement('div'); d1.className='bf-g bnxCr-box'; d1.id='bnxCrBill'; d1.style.flexDirection='column'; d1.innerHTML='<label>Group *</label><select class="fi fsel" id="bnxCrBillG"></select>';
+      var d2=document.createElement('div'); d2.className='bf-g bnxCr-box'; d2.id='bnxCrBill2'; d2.style.flexDirection='column'; d2.innerHTML='<label>Ref By *</label><select class="fi fsel" id="bnxCrBillR"></select>';
+      after.parentNode.insertBefore(d2,after.nextSibling); after.parentNode.insertBefore(d1,after.nextSibling);
+      $('bnxCrBillG').addEventListener('change',function(){ pick('group',this); }); $('bnxCrBillR').addEventListener('change',function(){ pick('refBy',this); });
+      bn.setAttribute('list','bnxCrNames'); bn.addEventListener('change',function(){ autofill(bn,$('bm-bf-mobile')); }); bn.addEventListener('blur',function(){ autofill(bn,$('bm-bf-mobile')); });
+      if(mob) mob.setAttribute('maxlength','10');
+      var pm=$('bm-bf-paymode'); if(pm) pm.addEventListener('change',sync);
+    }
+    if(!$('bnxCrNames')){ var dl=document.createElement('datalist'); dl.id='bnxCrNames'; document.body.appendChild(dl); }
+    $('bnxCrNames').innerHTML=parties().map(function(p){ return '<option value="'+esc(p.name)+'">'; }).join('');
+    sync();
+  }
+  function autofill(nameEl,mobEl){
+    var p=find(nameEl.value); if(!p) return;
+    if(mobEl&&!String(mobEl.value||'').trim()&&p.phone) mobEl.value=String(p.phone).replace(/\D/g,'').slice(-10);
+    var g=gMap()['n:'+nn(p.name)]||gMap()[p.id]||p.group; if(g&&!/^ungrouped$/i.test(g)&&g!=='__none__'&&!ST.group){ ST.group=g; sync(); }
+  }
+
+  /* ---- validation ---- */
+  function check(nameEl,mobEl,which){
+    var bad=[], name=nn(nameEl&&nameEl.value), mob=String(mobEl&&mobEl.value||'').replace(/\D/g,'').slice(-10);
+    [nameEl,mobEl,$(which+'G'),$(which+'R')].forEach(function(e){ if(e) e.classList.remove('bnxCr-bad'); });
+    if(GENERIC.test(name)) bad.push([nameEl,'customer name']);
+    if(!/^[6-9]\d{9}$/.test(mob)) bad.push([mobEl,'10-digit mobile number']);
+    if(!ST.group) bad.push([$(which+'G'),'group']);
+    if(!ST.refBy) bad.push([$(which+'R'),'ref by']);
+    if(!bad.length) return true;
+    bad.forEach(function(b){ if(b[0]) b[0].classList.add('bnxCr-bad'); });
+    if(bad[0][0]){ try{ bad[0][0].focus(); }catch(e){} }
+    notify('⚠️ Credit bill needs '+bad.map(function(b){ return b[1]; }).join(', '),'error');
+    return false;
+  }
+  function wrapFn(name,test,run){
+    var f=W[name]; if(typeof f!=='function'||f.__bnxCrGuard) return;
+    var w=function(){ if(test()&&!run()) return (name==='settleOrder'||name==='bmSaveBill')?Promise.resolve(null):null; if(name==='settleOrder'&&test()) ST.checkedAt=Date.now(); return f.apply(this,arguments); };
+    Object.keys(f).forEach(function(k){ try{ w[k]=f[k]; }catch(e){} }); w.__bnxCrGuard=true; W[name]=w;
+  }
+  function wrapAll(){
+    wrapFn('settleOrder',posCredit,function(){ return check($('custNameInput'),$('custMobileInput'),'bnxCrPos'); });
+    wrapFn('bmSaveBill',billCredit,function(){
+      if(Date.now()-ST.checkedAt<30000){ ST.checkedAt=0; return true; }   /* already validated by POS Settle */
+      return check($('bm-bf-cname'),$('bm-bf-mobile'),'bnxCrBill');
+    });
+    inject();
+  }
+
+  /* ---- save: create party first, stamp group / ref on the bill ---- */
+  function wrapApi(){
+    var g=W.gasApi; if(typeof g!=='function'||g.__bnxCrBill) return;
+    var w=async function(a,p,e){
+      try{
+        if(a==='SAVE_BILL'&&p&&p.bill&&isCredit(p.bill.pay)&&(ST.group||ST.refBy)){
+          var b=Object.assign({},p.bill), name=String(b.customer||b.customerName||'').trim(), mob=String(b.mob||b.mobile||'').replace(/\D/g,'').slice(-10);
+          var known=find(name), id=known&&known.id;
+          if(!id&&name&&!GENERIC.test(nn(name))){
+            try{ var r=await g.call(this,'SAVE_CREDIT_CUSTOMER',{customerId:'',name:nn(name),phone:mob,type:'Individual',group:ST.group,groupName:ST.group},'V2_CORE');
+              if(r&&r.success){ id=(r.data&&(r.data.customerId||r.data.id))||r.customerId||''; if(W.bnxLoadDueCollection){ try{ W.bnxLoadDueCollection(); }catch(x){} } } }catch(x){}
+          }
+          if(ST.group&&name){ var m=gMap(); m['n:'+nn(name)]=ST.group; if(id) m[id]=ST.group; try{ localStorage.setItem(gKey(),JSON.stringify(m)); }catch(x){} }
+          var tag='REF BY: '+ST.refBy+' | GROUP: '+ST.group;
+          b.refBy=ST.refBy; b.customerGroup=ST.group; b.group=ST.group; b.mob=mob||b.mob; b.customerMobile=mob;
+          b.notes=(b.notes?b.notes+' | ':'')+tag; b.remarks=(b.remarks?b.remarks+' | ':'')+tag;
+          if(id){ b.customerId=id; }
+          p=Object.assign({},p,{bill:b});
+        }
+      }catch(x){ console.warn('[credit-guard]',x); }
+      var res=await g.call(this,a,p,e);
+      try{ if(a==='SAVE_BILL'&&res&&res.success!==false&&p&&p.bill&&isCredit(p.bill.pay)){ ST.group=''; ST.refBy=''; sync(); } }catch(x){}
+      return res;
+    };
+    Object.keys(g).forEach(function(k){ try{ w[k]=g[k]; }catch(x){} }); w.__bnxCrBill=true; W.gasApi=w;
+  }
+
+  /* re-evaluate whenever the pay mode changes (POS buttons / select) */
+  document.addEventListener('click',function(e){ if(e.target.closest&&e.target.closest('.pay-opt,#paymentMethodSelect')) setTimeout(sync,60); },true);
+  document.addEventListener('change',function(e){ if(e.target.id==='paymentMethodSelect'||e.target.id==='bm-bf-paymode') sync(); },true);
+  setInterval(function(){ wrapAll(); wrapApi(); },3000);
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',function(){ wrapAll(); wrapApi(); }); else { wrapAll(); wrapApi(); }
+})();
+</script>
+
 <script id="bnx-pass76-ledger">
 /* ═══════════════════════════════════════════════════════════════════════
    PASS #76 — PROFESSIONAL CUSTOMER LEDGER (Tally-style)
