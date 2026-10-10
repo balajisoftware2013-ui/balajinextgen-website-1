@@ -351,6 +351,12 @@ var BNX_DBG_=function(){};
    The Daily → MTD → report-map → bill-recon chain used to fire the same
    GET_BILLS / day-book requests several times per date change. */
 const BNX_API_FLIGHT_=new Map(), BNX_API_CACHE_=new Map();
+/* FIX 2026-10-10: the DSR page fired cashbook / due-collection / bank-recon / item-sales together on the
+   shared Apps Script; all of them queued, hit the 60 s abort, and each was auto-retried (doubling the load).
+   Now at most 2 requests are on the wire at once; the rest wait their turn (timeout starts only when sent). */
+var BNX_NET_MAX_=2, BNX_NET_ACTIVE_=0; const BNX_NET_WAIT_=[];
+function bnxNetSlot_(){ return new Promise(function(res){ if(BNX_NET_ACTIVE_<BNX_NET_MAX_){BNX_NET_ACTIVE_++;res();} else BNX_NET_WAIT_.push(res); }); }
+function bnxNetRelease_(){ var n=BNX_NET_WAIT_.shift(); if(n) n(); else BNX_NET_ACTIVE_=Math.max(0,BNX_NET_ACTIVE_-1); }
 function bnxApiKey_(a,p,e){try{return (e||'V2_CORE')+'|'+a+'|'+JSON.stringify(p||{});}catch(x){return '';}}
 function bnxApiTtl_(p){var t=(typeof bnxToday_==='function')?bnxToday_():'';var s=JSON.stringify(p||{});var ds=s.match(/\d{4}-\d{2}-\d{2}/g)||[];var touchesToday=!ds.length||ds.some(function(d){return d>=t;});if(!touchesToday&&p&&p.year&&p.month){var n=new Date();touchesToday=(+p.year===n.getFullYear()&&+p.month===n.getMonth()+1);}return touchesToday?45000:600000;}
 function bnxApiClearCache_(){BNX_API_CACHE_.clear();}
@@ -403,7 +409,7 @@ async function gasApiRaw_(action,payload,endpoint){
    * after login/client switching.
    */
   let _bnxRetried=false;
-  const _heavy=/^(GET_DSR_MATRIX|GET_DSR_YTD|GET_BILLS|GET_SALES_DAY_BOOK_REPORT|GET_ITEM_SALES_REPORT)$/.test(String(action));
+  const _heavy=/^(GET_DSR_MATRIX|GET_DSR_YTD|GET_BILLS|GET_SALES_DAY_BOOK_REPORT|GET_ITEM_SALES_REPORT|GET_CASHBOOK_REPORT|GET_DUE_COLLECTION|GET_DSR_BANK_RECONCILIATION|GET_DSR_RANGE)$/.test(String(action));
   for(let i=0;i<contexts.length;i++){
     const ctx=contexts[i];
     const body=Object.assign({
@@ -415,6 +421,7 @@ async function gasApiRaw_(action,payload,endpoint){
       BNX_DBG_('[API_DEBUG] 🔄 Fetching:', {url, attempt: i+1, totalContexts: contexts.length});
       
       /* 60s hard timeout so a slow/dead server can never freeze the report screen */
+      await bnxNetSlot_();
       const _ac=new AbortController(); const _t=setTimeout(()=>{try{_ac.abort();}catch(_){}},_heavy?120000:60000);
       let r; try{
         r=await fetch(url,{
@@ -423,8 +430,8 @@ async function gasApiRaw_(action,payload,endpoint){
           body:JSON.stringify(body),
           signal:_ac.signal
         });
-      } finally { clearTimeout(_t); }
-      
+      } finally { clearTimeout(_t); bnxNetRelease_(); }
+
       BNX_DBG_('[API_DEBUG] 📬 Got response:', {status: r.status, statusText: r.statusText});
       
       const j=await r.json();
@@ -1327,6 +1334,7 @@ async function onDsrDateChange(){
   if(my!==BNX_DSR_SEQ_) return ok;           // a newer date was picked meanwhile
   bnxDsrPaint_(ds);
   try{ buildDash(); }catch(e){}
+  try{ setTimeout(function(){ window.bnxDsrAutoTick_&&window.bnxDsrAutoTick_(false); },2500); }catch(e){}   /* seed the auto-refresh baseline right after each load */
   if(st) st.textContent=ok?('🔴 Live POS · '+ds+' · '+new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})):('⚠️ Sales data did not load for '+ds+' — press Recalculate to retry');
   if(!ok){ try{ loadDsrDueControl_(ds); }catch(e){} showToast('⚠️ Live POS data could not be loaded for '+ds,'warn'); return false; }
   const side=[
@@ -1341,6 +1349,57 @@ async function onDsrDateChange(){
   await Promise.allSettled(side);
   return true;
 }
+
+/* AUTO LIVE UPDATE 2026-10-10: while the selected date is TODAY the report keeps itself current as bills run.
+   Every 60 s (tab visible, nothing loading) it asks only for the cheap month matrix; if today's numbers
+   changed since the last look it re-runs the full month load and repaints Daily / MTD / Dashboard / dues.
+   Idle = one light call a minute. Paused while the tab is hidden; checks at once when you come back. */
+(function(){
+  var _sig=null, _busy=false, _lastDs='';
+  /* Live auto-refresh is ON by default; the choice is remembered per browser. */
+  function _on(){ try{ return localStorage.getItem('bnx_dsr_auto')!=='0'; }catch(e){ return true; } }
+  function _paintBtn(){ var b=document.getElementById('btnAutoLive'); if(b){ b.textContent=_on()?'🔄 Auto: ON':'⏸ Auto: OFF'; b.style.opacity=_on()?'1':'.6'; } }
+  window.bnxToggleAutoLive_=function(){ try{ localStorage.setItem('bnx_dsr_auto',_on()?'0':'1'); }catch(e){} _paintBtn(); if(_on()){ _sig=null; setTimeout(function(){ _tick(true); },300); } };
+  document.addEventListener('DOMContentLoaded',_paintBtn); setTimeout(_paintBtn,1500);
+  function _today(){ try{return bnxToday_();}catch(e){return '';} }
+  async function _tick(force){
+    if(!_on()||_busy||window.BNX_DSR_LOADING_||document.hidden) return;
+    var ds=$('repDate')?.value||''; var t=_today();
+    if(!ds||ds!==t){ _sig=null; _lastDs=ds; return; }          // only follow today
+    if(ds!==_lastDs){ _lastDs=ds; _sig=null; }
+    _busy=true;
+    try{
+      bnxApiClearCache_();
+      var y=Number(ds.slice(0,4)), m=Number(ds.slice(5,7)), dk=ds.slice(8,10);
+      var r=await gasApi('GET_DSR_MATRIX',{year:y,month:m});
+      if(!r||!r.success||!r.data||!r.data.byDay) return;
+      var row=r.data.byDay[dk]||r.data.byDay[String(Number(dk))]||null;
+      var sig=row?JSON.stringify(row):'none';
+      if(_sig===null){ _sig=sig; if(!force) return; }          // first look = baseline
+      else if(sig===_sig && !force) return;                    // nothing new
+      _sig=sig;
+      if($('repDate')?.value!==ds || window.BNX_DSR_LOADING_) return;
+      var st=$('dsrSourceStatus'); if(st) st.textContent='🔄 New bills · '+ds+' · updating…';
+      bnxApiClearCache_();
+      var ok=await fetchDsrMonthLive_(y,m);
+      if($('repDate')?.value!==ds) return;
+      bnxDsrPaint_(ds);
+      try{ buildDash(); }catch(e){}
+      try{ await loadDsrDueControl_(ds); bnxDueDisplaySummary_(); }catch(e){}
+      try{ if(document.getElementById('itab-cashbook')?.classList.contains('active')) await loadCashbookLive_(); }catch(e){}
+      try{ await bnxLoadLiveItemGroupRevenue_(ds); }catch(e){}
+      try{ await bnxAuditLivePOSSource_(ds); }catch(e){}
+      try{ if(document.getElementById('itab-itemgroup-dsr')?.classList.contains('active')) loadItemGroupDsr_(); }catch(e){}
+      try{ if(document.getElementById('itab-recon')?.classList.contains('active')) await loadDsrReconciliation_(); }catch(e){}
+      try{ if(bnxDsrNeedsFy_()){ BNX_FY_LOADED_=null; await bnxDsrLoadFyBg_(ds); } }catch(e){}
+      if(st) st.textContent=ok?('🔴 Live POS · '+ds+' · '+new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})):('⚠️ Sales data did not load for '+ds);
+    }catch(e){ console.warn('[DSR AUTO]',e); }
+    finally{ _busy=false; }
+  }
+  setInterval(function(){ _tick(false); },60000);
+  document.addEventListener('visibilitychange',function(){ if(!document.hidden) setTimeout(function(){ _tick(false); },1500); });
+  window.bnxDsrAutoTick_=_tick;
+})();
 
 function populateDsrMonthSelectors_(){
   const sel=$('mtd-month'); if(!sel)return;
@@ -2432,6 +2491,7 @@ html,body{font-size:14px!important;}
   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
     <b style="color:var(--blue);font-size:12px;">DSR SOURCE / LIVE CONTROL</b>
     <button class="btn btn-primary btn-sm" id="btnLivePOS" onclick="bnxUseLivePOS_()">🔴 Live POS — BILL + ITEM MASTER</button>
+    <button class="btn btn-ghost btn-sm" id="btnAutoLive" onclick="bnxToggleAutoLive_()" title="Auto-refresh while bills are running">🔄 Auto: ON</button>
     <button class="btn btn-ghost btn-sm" onclick="goStep(1)">📤 DSR / Swift Upload</button>
     <span id="dsrSourceStatus" style="margin-left:auto;font-size:10.5px;color:var(--muted);">Live POS ready · BILL_MASTER + ITEM_MASTER</span>
   </div>
