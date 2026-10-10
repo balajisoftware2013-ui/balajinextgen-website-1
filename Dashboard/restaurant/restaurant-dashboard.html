@@ -50294,6 +50294,127 @@ window.bnxQrGen=qrcode;
   setTimeout(run,9000);
 })();
 </script>
+<script id="bnx-item-image-sync">
+/* ITEM IMAGE — "uploaded but not shown (other PC / after reload / live)" (2026-10-10). Root causes fixed:
+   1) The photo upload goes through bnxPromoPost, which never cleared the menu cache — the menu (without the new photo)
+      was served from memory for 10 min and from the on-device copy for 12 h. Now every successful image/menu write clears both.
+   2) If the Drive save failed once, the photo stayed only in this browser (localStorage) forever. Now unsynced local photos
+      are re-uploaded automatically on load (max 4 per run).
+   3) The photo link was only in ITEM_MASTER/MENU rows; if the server handler wrote a different tab the other PCs saw nothing.
+      Every saved link is also kept in the sheet (CLIENT_ASSETS › ITEMIMGS, merged per item) and pulled by every device.
+   4) A Drive picture that the CDN refused showed the emoji at once — now the other Drive endpoints are tried first. */
+(function(){
+  if(window.__bnxItemImgSync) return; window.__bnxItemImgSync=true;
+  var W=window;
+  function cid(){ try{ return String(W.CLIENT_ID||localStorage.getItem('bnx_client_id')||localStorage.getItem('ERP_CLIENT')||'').trim(); }catch(e){ return ''; } }
+  function KEY(){ return 'bnx_menu_images_'+(cid()||'default'); }
+  function SK(){ return 'bnx_itemimg_sync_'+cid(); }
+  function ld(k){ try{ return JSON.parse(localStorage.getItem(k)||'{}')||{}; }catch(e){ return {}; } }
+  function sv(k,v){ try{ localStorage.setItem(k,JSON.stringify(v)); }catch(e){} }
+  function idOf(m){ return String(m&&(m.code||m.itemCode||m.id||m.ITEM_ID||m.ITEM_CODE||m.n)||'').trim(); }
+  function clearCache(){ try{ if(W.bnxApiCacheClear) W.bnxApiCacheClear(); }catch(e){} }
+  function api(a,p){ return typeof W.gasApi==='function'?W.gasApi(a,p||{},'V2_CORE'):Promise.resolve({success:false,error:'gasApi unavailable'}); }
+  var IMG_RE=/MENU|ITEM|IMAGE|PRODUCT/i;
+
+  /* record + push a saved link */
+  var queue={}, qt=null;
+  function remember(keys,url){
+    if(!/^https:\/\//i.test(url||'')) return;
+    var x=ld(KEY()); keys.forEach(function(k){ k=String(k||'').trim(); if(k){ x[k]=url; queue[k]=url; } }); sv(KEY(),x);
+    clearTimeout(qt); qt=setTimeout(flush,800);
+  }
+  async function flush(){
+    var patch=queue; queue={}; if(!Object.keys(patch).length||!cid()) return;
+    var r=await api('SAVE_CLIENT_ASSETS',{itemimgs:{patch:patch}});
+    if(!(r&&r.success&&r.saved&&r.saved.ITEMIMGS)){ Object.keys(patch).forEach(function(k){ queue[k]=patch[k]; }); clearTimeout(qt); qt=setTimeout(flush,60000); }
+    else { var S=ld(SK()); S.stamp=r.saved.ITEMIMGS; sv(SK(),S); }
+  }
+
+  /* 1) cache clear on every successful photo / menu write (also the promo-post route) */
+  function wrapPost(){
+    var b=W.bnxPromoPost; if(typeof b!=='function'||b.__bnxImg) return;
+    var w=async function(p){ var r=await b.apply(this,arguments);
+      try{ var a=String(p&&p.action||'');
+        if(IMG_RE.test(a)&&r&&r.success!==false){ clearCache();
+          if(a==='SAVE_MENU_ITEM_IMAGE'&&r.imageUrl) remember([p.itemId,p.itemCode,p.name],r.imageUrl); } }catch(e){}
+      return r; };
+    w.__bnxImg=1; Object.keys(b).forEach(function(k){ try{ w[k]=b[k]; }catch(e){} }); W.bnxPromoPost=w; try{ bnxPromoPost=w; }catch(e){}
+  }
+  function wrapGas(){
+    var b=W.gasApi; if(typeof b!=='function'||b.__bnxImg) return;
+    var w=async function(a,p,e){ var r=await b.apply(this,arguments);
+      try{ if(String(a)==='SAVE_MENU_ITEM_IMAGE'&&r&&r.success&&r.imageUrl){ clearCache(); remember([p&&p.itemId,p&&p.itemCode,p&&p.name],r.imageUrl); } }catch(x){}
+      return r; };
+    w.__bnxImg=1; Object.keys(b).forEach(function(k){ try{ w[k]=b[k]; }catch(x){} }); W.gasApi=w; try{ gasApi=w; }catch(x){}
+  }
+
+  /* 3) pull links from the sheet, hydrate the menu */
+  function hydrate(){
+    try{
+      if(!Array.isArray(W.menuData)) return false;
+      var x=ld(KEY()), ch=false;
+      W.menuData.forEach(function(m){ var u=x[idOf(m)]||x[String(m.itemCode||'')]||x[String(m.n||'')];
+        if(u&&/^https:\/\//i.test(u)&&m.imageUrl!==u&&(!m.imageUrl||/^data:/i.test(m.imageUrl)||!/^https:\/\//i.test(m.imageUrl))){ m.imageUrl=u; ch=true; } });
+      if(ch){ try{ if(typeof buildMenu==='function') buildMenu(); }catch(e){} try{ if(typeof renderMenuItemsTable==='function') renderMenuItemsTable(); }catch(e){} }
+      return true;
+    }catch(e){ return false; }
+  }
+  var pulling=false;
+  async function pull(){
+    if(pulling||!cid()) return; pulling=true;
+    try{
+      var S=ld(SK()), r=await api('GET_CLIENT_ASSETS',{have:{ITEMIMGS:S.stamp||''},force:true,noCache:true});
+      if(r&&r.success&&r.data&&r.data.ITEMIMGS&&!r.data.ITEMIMGS.unchanged&&r.data.ITEMIMGS.json){
+        var srv={}; try{ srv=JSON.parse(r.data.ITEMIMGS.json)||{}; }catch(e){}
+        var x=ld(KEY()); Object.keys(srv).forEach(function(k){ x[k]=srv[k]; }); sv(KEY(),x);
+        S.stamp=r.data.ITEMIMGS.updatedAt; sv(SK(),S);
+      }
+      hydrate();
+      await resend();
+    }catch(e){ console.warn('[ITEMIMG] pull failed',e); }
+    finally{ pulling=false; }
+  }
+
+  /* 2) photos that only exist on this PC (data:) → upload again */
+  async function resend(){
+    var x=ld(KEY()), keys=Object.keys(x).filter(function(k){ return /^data:image\//i.test(String(x[k])); }).slice(0,4);
+    if(!keys.length||!Array.isArray(W.menuData)) return;
+    for(var i=0;i<keys.length;i++){
+      var k=keys[i], m=W.menuData.find(function(z){ return idOf(z)===k; }); if(!m) continue;
+      var p={itemId:String(m.ITEM_ID||m.itemId||m.code||m.id||'').trim(),itemCode:String(m.itemCode||m.ITEM_CODE||m.code||'').trim(),name:String(m.n||m.name||''),isBar:!!m.isBar,imageData:x[k]};
+      if(!p.itemId&&!p.itemCode) continue;
+      var r=null;
+      try{ var ses=(typeof bnxCurrentSession_==='function'?bnxCurrentSession_():'')||localStorage.getItem('ERP_SESSION')||'';
+        if(typeof W.bnxPromoPost==='function') r=await W.bnxPromoPost(Object.assign({action:'SAVE_MENU_ITEM_IMAGE',clientId:cid(),sessionToken:ses},p),120000);
+        if(!(r&&r.success&&r.imageUrl)) r=await api('SAVE_MENU_ITEM_IMAGE',p); }catch(e){ r=null; }
+      if(r&&r.success&&r.imageUrl){ var y=ld(KEY()); y[k]=r.imageUrl; sv(KEY(),y); m.imageUrl=r.imageUrl; remember([k,p.itemId,p.itemCode,p.name],r.imageUrl); }
+    }
+    try{ if(typeof buildMenu==='function') buildMenu(); }catch(e){}
+  }
+
+  /* 4) picture refused by the CDN → other Drive endpoints, then the emoji */
+  function driveId(u){ var m=String(u||'').match(/googleusercontent\.com\/d\/([\w-]{20,})/)||String(u||'').match(/drive\.google\.com\/(?:uc|open|thumbnail)\?[^#]*\bid=([\w-]{20,})/)||String(u||'').match(/drive\.google\.com\/file\/d\/([\w-]{20,})/); return m?m[1]:''; }
+  var prevFb=W.bnxImgFallback_;
+  W.bnxImgFallback_=function(img){
+    try{
+      var id=driveId(img.currentSrc||img.src);
+      if(id){
+        var alts=['https://drive.google.com/thumbnail?id='+id+'&sz=w400','https://drive.google.com/uc?export=view&id='+id], i=img.__bnxAlt||0;
+        if(i<alts.length){ img.__bnxAlt=i+1; img.referrerPolicy='no-referrer'; img.src=alts[i]; return; }
+      }
+    }catch(e){}
+    if(typeof prevFb==='function') return prevFb(img);
+    try{ var h=img.closest('.mi-em,.prod-em'); if(h) h.innerHTML=h.getAttribute('data-fallback')||'🍽️'; }catch(e){}
+  };
+
+  function boot(){ wrapPost(); wrapGas(); var n=0; (function w(){ if(cid()||n++>20){ setTimeout(pull,3500); setTimeout(hydrate,9000); setTimeout(pull,20000); } else setTimeout(w,500); })(); }
+  setInterval(function(){ wrapPost(); wrapGas(); },4000);
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',boot); else boot();
+  setInterval(pull,5*60*1000);
+  W.addEventListener('online',function(){ setTimeout(pull,1500); });
+  W.bnxItemImageSync=pull;
+})();
+</script>
 <style id="bnx-final-fix-20261003b">
 /* ---- Receive Payment / detail modal: scrollable body, Save bar always visible ---- */
 #detailModal>div{display:flex!important;flex-direction:column;max-height:94vh!important;overflow:hidden!important}
@@ -53798,7 +53919,7 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
     var we=function(payload){ var A=String(payload&&payload.action||''); if(!(READ.test(A)&&!NEVER.test(A))){ if(MASTER_WRITE.test(A)) cache.clear(); else cache.forEach(function(v,kk){ if(!MASTER.test(v.a||'')) cache.delete(kk); }); } return prevErp.apply(this,arguments); };
     we.__bnxGov=true; W.erpApi=we; try{ erpApi=we; }catch(x){}
   }
-  W.bnxApiCacheClear=function(){ cache.clear(); };
+  W.bnxApiCacheClear=function(){ cache.clear(); idbClear(); };   /* 2026-10-10: also the 12 h on-device copy — a stale menu hid new item photos after reload */
 
   /* 2. connection check: reuse recent success; slow server → check every 5 min */
   var prevCheck=W.checkDB;
