@@ -193,6 +193,23 @@ const ROLE_HIDDEN_PAGES = {
   SOCIAL_MEDIA_MANAGER  : ['reports','dashboard'],
   SOCIAL_MEDIA_EXECUTIVE: ['reports','dashboard']
 };
+/* 2026-10-10 ("social media executive / manager — others not allow, only which is given"):
+   these roles may open ONLY the restaurant dashboard (Settings → menu + promotion panels) and the Menu Card.
+   Any other page that loads erp-config.js and calls ERP.requireLogin()/enforceIndustryAccess() sends them back there. */
+const ROLE_LOCKED_PAGES = {
+  SOCIAL_MEDIA_MANAGER  : ['restaurant-dashboard','menu-card'],
+  SOCIAL_MEDIA_EXECUTIVE: ['restaurant-dashboard','menu-card']
+};
+function _erpLockedRoleRedirect(role){
+  try{
+    var ok = ROLE_LOCKED_PAGES[role]; if(!ok) return false;
+    var path = window.location.pathname.toLowerCase();
+    if (path.endsWith('login.html') || ok.some(function(n){ return path.indexOf(n)>=0; })) return false;
+    var prefix = _erpLoginPage().replace(/login\.html$/,'');
+    _safeNavigate(prefix + ROLE_DASHBOARD[role]);
+    return true;
+  }catch(e){ return false; }
+}
 function _erpNormRole(r){ return (r||'').toString().toUpperCase().trim().replace(/[\s-]+/g,'_'); }
 
 /* Map raw CLIENT_MASTER / USER.INDUSTRY strings → INDUSTRY_DASHBOARD keys.
@@ -495,6 +512,7 @@ const ERP = {
       _safeNavigate(_erpLoginPage());
       return null;
     }
+    if (_erpLockedRoleRedirect(_erpNormRole(user.ROLE || user.role))) return null;
     if(Array.isArray(allowedRoles) && allowedRoles.length > 0){
       const role = (user.ROLE || user.role || '').toString().toUpperCase();
       if(!allowedRoles.includes(role)){
@@ -515,6 +533,7 @@ const ERP = {
     const user = this.getUser();
     if(!user) return this.requireLogin();
     const role = (user.ROLE||user.role||'').toUpperCase();
+    if (_erpLockedRoleRedirect(_erpNormRole(role))) return null;
     if (FIXED_ROLE_DASHBOARDS.includes(role)) return user; // role-based pages skip this check
     const norm = (user.INDUSTRY||user.industry||'').toString().toLowerCase().replace(/\s+/g,'');
     const key  = INDUSTRY_ALIAS[norm] || 'DEFAULT';
