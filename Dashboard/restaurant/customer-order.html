@@ -661,7 +661,7 @@ button:focus-visible,[role=button]:focus-visible,input:focus-visible{outline:3px
       </div>
       <div class="spacer"></div>
       <button class="btn btn-primary" id="ph-continue" disabled>Continue</button>
-      <button class="btn btn-ghost" style="margin-top:8px;box-shadow:none;" onclick="bnxSkipGuestAsk_()">Skip — just view the menu</button>
+      <button class="btn btn-ghost" id="ph-skip" style="margin-top:8px;box-shadow:none;display:none;" onclick="bnxSkipGuestAsk_()">Skip — just view the menu</button>
     </div>
   </div>
 
@@ -1361,7 +1361,20 @@ function bnxRenderActions(){
   if (c.review) b.push('<a class="act-btn" href="'+escH(c.review)+'" target="_blank" rel="noopener">⭐ Rate your visit</a>');
   row.innerHTML=b.join(''); row.style.display=b.length?'flex':'none';
 }
+/* ═══ 2026-10-10 MOBILE / WHATSAPP GATE ("no WhatsApp number → no menu") ═══
+   The menu opens ONLY after the guest's mobile number is saved on the server (GUEST_CRM → customer master, transactions,
+   Google Sheet). Owner switch: dashboard → Customer QR Promotion → "Mobile / WhatsApp before menu" (BNXCFG.req, default Yes).
+   Reads localStorage directly (no TDZ on boot). */
+function bnxGateOn_(){ try{ const c=STATE.gcfg||{}; return c.req!==0; }catch(e){ return true; } }   /* only the 'Mobile / WhatsApp before menu' switch turns it off — an old 'ask = No' live control must not silently stop saving */
+function bnxGateOk_(){
+  if(!bnxGateOn_()) return true;
+  if(STATE.gateOk===true) return true;
+  try{ const p=JSON.parse(localStorage.getItem('bnx_guest_'+(STATE.clientId||''))||'null');
+    if(p && /^[6-9]\d{9}$/.test(String(p.phone||'')) && (p.saved===true || p.crn || p.name)){ STATE.gateOk=true; return true; } }catch(e){}
+  return false;
+}
 function goScreen(id, noPush){
+  if(id==='s-menu' && !bnxGateOk_()){ id='s-phone'; try{ STATE.afterIdentify=''; const pi=document.getElementById('ph-input'); if(pi && !pi.value && STATE.customerPhone) pi.value=STATE.customerPhone; }catch(e){} }
   const cur=document.querySelector('.screen.active');
   document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
@@ -1456,7 +1469,9 @@ async function boot(){
   // DIRECT MENU MODE: open the restaurant's live item menu as soon as
   // the restaurant/client QR is resolved. Customer phone/name entry no
   // longer blocks menu viewing; checkout/order rules remain unchanged.
-  enterMenu();
+  /* 2026-10-10: with the mobile gate closed the guest first sees the welcome video / event, then the mobile screen —
+     the menu opens only after the number is saved (see bnxGateOk_). */
+  if (bnxGateOk_()) enterMenu();
 }
 Promise.resolve().then(boot).catch(function(e){ console.error('[BOOT]',e); });
 
@@ -2141,11 +2156,15 @@ document.getElementById('ph-continue').onclick = async ()=>{
   if (!res || res.success === false){
     /* not saved on any server → keep it on this phone and retry (every 45 s, on reconnect, next visit) */
     try{ bnxQueueCheckin_({ requestId:'chkin-q-'+STATE.scanKey+'-'+STATE.customerPhone, mobileNo:STATE.customerPhone, tableId:STATE.tableId, scanKey:STATE.scanKey, notifyOptIn:STATE.notifyOptIn, source:'QR_SCAN', clientId:STATE.clientId, ...(phName.length>=2?{customerName:phName,name:phName,updateName:true,welcomeSms:true}:{deferWelcome:true}) }); }catch(e){}
-    // Offline / backend unreachable — don't block ordering, just proceed as a new guest.
+    /* 2026-10-10 GATE: number NOT saved on the server → no menu. Stay here; the number is kept and retried. */
+    if (bnxGateOn_()){ document.getElementById('ph-err').textContent='We could not save your number right now — please check your internet and tap Continue again.'; return; }
+    // Offline / backend unreachable — gate is off, so don't block ordering, just proceed as a new guest.
     STATE.isNewCustomer = true;
     goScreen('s-name');
     return;
   }
+  /* server confirmed the number (customer master + sheet) → the menu gate opens */
+  STATE.gateOk = true; try{ gxSave({phone:STATE.customerPhone, saved:true, crn:gxCrn(res)}); }catch(e){}
   /* 2026-10-08 ROOT FIX ("QR scan but name not saved"): the name screen opened ONLY for a brand-new number.
      A number first saved without a name (auto check-in / guest closed the page) came back as
      isNewCustomer:false → "Welcome back, Guest" → the name was never asked again, NAME stayed blank
@@ -2300,7 +2319,7 @@ async function bnxTcPoll_(nonce, t0){
     if(r.success===false){ bnxToast(r.rejected?'Truecaller cancelled — use WhatsApp or your number.':(r.error||'Truecaller could not verify')); bnxTcPrepare_(); return; }
     STATE.customerPhone=String(r.mobile||''); STATE.customerName=String(r.customerName||''); STATE.points=Number(r.points||0);
     try{ localStorage.setItem('bnx_guest_phone',STATE.customerPhone); }catch(e){}
-    try{ gxSave({phone:STATE.customerPhone, name:STATE.customerName, points:r.points, visits:r.visitCount, crn:gxCrn(r), optIn:true}); const q=gxLoad(); if(q&&r.welcomeSent){ q.welcomed=true; gxStore(q); } }catch(e){}
+    STATE.gateOk=true; try{ gxSave({phone:STATE.customerPhone, name:STATE.customerName, points:r.points, visits:r.visitCount, crn:gxCrn(r), optIn:true, saved:true}); const q=gxLoad(); if(q&&r.welcomeSent){ q.welcomed=true; gxStore(q); } }catch(e){}
     try{ sessionStorage.setItem('bnx_ask_'+STATE.clientId+'_'+STATE.scanKey,'tc'); }catch(e){}
     bnxToast('✅ Verified with Truecaller — welcome '+(STATE.customerName.split(' ')[0]||'')+'!'+(r.welcome==='sent'?' Welcome sent on WhatsApp.':''));
     STATE.afterIdentify=''; enterMenu(); setTimeout(()=>{ try{ gxPaint(); }catch(e){} },300);
@@ -2813,11 +2832,12 @@ function gxStore(p){ try{ localStorage.setItem(GX_KEY, JSON.stringify(p)); }catc
 function gxSave(patch){
   if(!STATE.clientId) return null;
   const p = gxLoad() || {orders:[]};
-  if(patch.phone && /^\d{10}$/.test(String(patch.phone))){ if(p.phone && p.phone!==patch.phone){ p.orders=[]; p.name=''; p.points=0; p.visits=0; p.crn=''; } p.phone=String(patch.phone); }
+  if(patch.phone && /^\d{10}$/.test(String(patch.phone))){ if(p.phone && p.phone!==patch.phone){ p.orders=[]; p.name=''; p.points=0; p.visits=0; p.crn=''; p.saved=false; } p.phone=String(patch.phone); }
   if(patch.name && String(patch.name).trim() && !/^guest$/i.test(String(patch.name).trim())) p.name=String(patch.name).trim();
   if(patch.points!=null && isFinite(Number(patch.points))) p.points=Number(patch.points);
   if(patch.visits!=null && Number(patch.visits)>0) p.visits=Number(patch.visits);
   if(patch.crn) p.crn=String(patch.crn);
+  if(patch.saved) p.saved=true;   /* server confirmed this number (mobile gate) */
   if(patch.optIn!=null) p.optIn=!!patch.optIn;
   p.seen=Date.now(); p.orders=Array.isArray(p.orders)?p.orders:[];
   if(!p.phone) return null;
@@ -3112,12 +3132,14 @@ function bnxQrPromoApply_(p, fromCache){
   if(fromCache){   /* phone copy: show the event cards at once, but the VIDEO only after the server confirms it
                       (a replaced video must never play from an old copy) */
     STATE.gcfg=bnxGuestCfgFrom_(p.events); try{ bnxLiveCtlRefresh_(); }catch(e){}
+    setTimeout(()=>{ try{ if(bnxGateOk_() && document.getElementById('s-landing').classList.contains('active')) enterMenu(); }catch(e){} },0);
     STATE.qrPromo.events=(Array.isArray(p.events)?p.events:[]).filter(x=>x && x.active!==false && !bnxIsCfgEvent_(x));
     STATE.promoEvents=bnxMapEvents_(p.events);
     try{ bnxRenderPromoEvents(); }catch(e){}
     return;
   }
   const cfg=STATE.gcfg=bnxGuestCfgFrom_(p.events); try{ bnxLiveCtlRefresh_(); }catch(e){}
+  setTimeout(()=>{ try{ if(bnxGateOk_() && document.getElementById('s-landing').classList.contains('active')) enterMenu(); }catch(e){} },0);   /* owner turned the gate off → open menu */
   const own=(cfg.wv && v.active && v.videoUrl) ? String(v.videoUrl) : '';
   const off=String(v.state||'').toUpperCase()==='OFF' || !cfg.wv || !cfg.dv;
   const newUrl= own || (off || qs.get('nodefault') ? '' : (BNX_DEFAULT_WELCOME_VIDEO || 'builtin:welcome'));
@@ -3351,23 +3373,29 @@ function bnxGoMenuList(){
 
 
 /* ═══ SCAN → ask mobile + name once per visit (after the video / event), saved to GUEST_CRM ═══ */
-function bnxSkipGuestAsk_(){ try{ sessionStorage.setItem('bnx_ask_'+STATE.clientId+'_'+STATE.scanKey,'skip'); }catch(e){} STATE.afterIdentify=''; goScreen('s-menu'); }
+setInterval(function(){ try{ const b=document.getElementById('ph-skip'); if(b) b.style.display=bnxGateOn_()?'none':''; }catch(e){} },500);   /* no Skip while the mobile gate is on */
+function bnxSkipGuestAsk_(){ if(bnxGateOn_()){ try{ bnxToast('Please enter your WhatsApp / mobile number to view the menu.'); }catch(e){} return; } try{ sessionStorage.setItem('bnx_ask_'+STATE.clientId+'_'+STATE.scanKey,'skip'); }catch(e){} STATE.afterIdentify=''; goScreen('s-menu'); }
 function bnxAskGuest_(){
   try{
-    if(!STATE.clientId || qs.get('nophone')) return;
-    if(bnxLiveCtl_().ask===false) return;                                  /* owner: "No — straight to menu" */
+    if(!STATE.clientId) return;
+    const gate=bnxGateOn_();                                               /* gate ON = the number is compulsory */
+    if(!gate && (qs.get('nophone') || bnxLiveCtl_().ask===false)) return;  /* owner: "No — straight to menu" */
     if(STATE.__introRunning || document.getElementById('bnx-intro')) return;
+    if(gate && bnxGateOk_()) return;                                        /* number already saved → menu */
     const gp=gxLoad()||{}, knownPhone=STATE.customerPhone||gp.phone, knownName=STATE.customerName||gp.name;
-    if(knownPhone && knownName) return;
-    if(sessionStorage.getItem('bnx_ask_'+STATE.clientId+'_'+STATE.scanKey)) return;
+    if(!gate){
+      if(knownPhone && knownName) return;
+      if(sessionStorage.getItem('bnx_ask_'+STATE.clientId+'_'+STATE.scanKey)) return;
+    }
     const cur=document.querySelector('.screen.active'); if(cur && !/^(s-menu|s-landing)$/.test(cur.id)) return;
     const box=document.getElementById('mc-modal'); if(box && box.classList.contains('show')) return;
-    sessionStorage.setItem('bnx_ask_'+STATE.clientId+'_'+STATE.scanKey,'asked');
+    try{ sessionStorage.setItem('bnx_ask_'+STATE.clientId+'_'+STATE.scanKey,'asked'); }catch(e){}
     STATE.afterIdentify='';
-    if(knownPhone && !knownName){   /* number known, name missing → name screen only */
+    if(!gate && knownPhone && !knownName){   /* number known, name missing → name screen only */
       STATE.customerPhone=knownPhone; STATE.isNewCustomer=false;
       goScreen('s-name'); setTimeout(()=>{ try{ document.getElementById('nm-input').focus(); }catch(e){} },250); return;
     }
+    if(gate && knownPhone && !phInput.value) phInput.value=String(knownPhone).replace(/\D/g,'').slice(-10);
     goScreen('s-phone');
     setTimeout(()=>{ try{ phInput.focus(); }catch(e){} },250);
   }catch(e){}
@@ -3396,6 +3424,7 @@ function bnxWaCheckinLink_(){
      API (Meta webhook) receives the message. Without it the guest tapped "no typing", went to the menu and nothing was
      saved. So the no-typing button shows only when the API is set up; otherwise the guest types number + name (AutoFill). */
   try{ const g=STATE.gcheck||{}; if(!(g.waApi===true || g.whatsapp===true)) return ''; }catch(e){ return ''; }
+  if(bnxGateOn_()) return '';   /* 2026-10-10: one-tap WhatsApp cannot confirm the save to this page → the guest types the number while the gate is on */
   if(!bnxWaGuestOn_()) return ''; const n=String(STATE.waNumber||(STATE.gcheck&&STATE.gcheck.waNumber)||'').replace(/\D/g,'').slice(-10); if(!/^[6-9]\d{9}$/.test(n)) return '';
   const rn=(STATE.restaurantName&&STATE.restaurantName!=='Our Restaurant')?STATE.restaurantName:'';
   const code='#CI-'+STATE.clientId+'-'+(STATE.tableId?'T'+String(STATE.tableId).replace(/[^A-Za-z0-9]/g,''):'C')+(STATE.party?'-P'+String(STATE.party).trim().replace(/\s+/g,'_').replace(/[^A-Za-z0-9_]/g,'').slice(0,30):'')+(STATE.event&&STATE.event!==STATE.party?'-E'+String(STATE.event).trim().replace(/\s+/g,'_').replace(/[^A-Za-z0-9_]/g,'').slice(0,30):'')
