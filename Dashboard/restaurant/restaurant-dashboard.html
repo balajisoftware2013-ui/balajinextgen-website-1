@@ -41848,6 +41848,91 @@ body:not(.pos-machine) #bmProductGrid,
 })();
 </script>
 
+<script id="bnx-dsr-live-autofix">
+/* ═══════════════════════════════════════════════════════════════════════
+   DSR — CLICK "LIVE" → AUTO FIX
+   FIX ("dsr click live auto fix" / Report Check "payment modes total 30,104
+   ≠ Net Sale 1,77,510"): the server DSR matrix sometimes leaves a day's
+   Credit Sale (Guest Due Sales) empty — credit bills saved with no party id
+   are skipped — so payment modes fall short of Net Sale. For every day whose
+   payment modes ≠ Net Sale, the missing credit is now rebuilt from the live
+   DUE / PARTIAL bills (GET_BILLS) and added to Guest Due Sales, never more
+   than the gap itself, so nothing is double counted. Runs automatically on
+   every DSR load; click the green “Live from database” badge (or ⚡ Live fix)
+   to force a fresh pull + re-check. Any gap that live bills cannot explain
+   stays flagged.
+═══════════════════════════════════════════════════════════════════════ */
+(function(){
+  'use strict';
+  var W=window, FIX={};   /* 'YYYY-MM-DD' → {add,bills,unmapped,left} */
+  function pad(n){ return String(n).padStart(2,'0'); }
+  function r2(v){ return Math.round((Number(v)||0)*100)/100; }
+  function payTotal(d){ return (d.cash||0)+(d.iciciCard||0)+(d.iciciGpay||0)+(d.guestDueSales||0)+(d.zomato||0)+(d.swiggy||0)+(d.eazydine||0); }
+  async function creditByDay(y,m){
+    var from=y+'-'+pad(m)+'-01', to=y+'-'+pad(m)+'-'+pad(new Date(y,m,0).getDate());
+    var r=await W.erpApi({action:'GET_BILLS',FROM_DATE:from,TO_DATE:to,BUSINESS_DATE:from},'V2_CORE');
+    var rows=(r&&r.success&&Array.isArray(r.data))?r.data:null; if(!rows) return null;
+    var by={};
+    rows.forEach(function(b){
+      if(String(b.BILL_STATUS||'').toUpperCase()==='CANCELLED') return;
+      var due=Number(b.DUE_AMOUNT)||0; if(!(due>0.009)) return;
+      var d=String(b.BILL_DATE||'').slice(0,10); if(d.slice(0,7)!==from.slice(0,7)) return;
+      var o=by[d]||(by[d]={amt:0,n:0,unmapped:0});
+      o.amt+=due; o.n++; if(!/^CUS\d+$/i.test(String(b.CUSTOMER_ID||''))) o.unmapped+=due;
+    });
+    return by;
+  }
+  async function fixMonth(y,m,days){
+    var need=[]; for(var i=1;i<=31;i++){ var d=days[i]; if(d&&!d.__lf&&(Number(d.netSale)||0)-payTotal(d)>1.5) need.push(i); }
+    if(!need.length) return;
+    var by=await creditByDay(y,m); if(!by) return;
+    need.forEach(function(i){
+      var d=days[i], key=y+'-'+pad(m)+'-'+pad(i), gap=r2((Number(d.netSale)||0)-payTotal(d)), c=by[key];
+      d.__lf=1; if(!c||!(c.amt>0.009)) return;
+      var add=r2(Math.min(gap,c.amt)); d.guestDueSales=r2((d.guestDueSales||0)+add);
+      FIX[key]={add:add,bills:c.n,unmapped:r2(c.unmapped),left:r2(gap-add)};
+    });
+  }
+  function wrapFetch(){
+    var f=W.bnxDsrFetchMonth_; if(typeof f!=='function'||f.__lf) return;
+    var w=async function(y,m,force){ var days=await f.apply(this,arguments); try{ await fixMonth(y,m,days); }catch(e){ console.warn('[dsr-livefix]',e); } return days; };
+    Object.keys(f).forEach(function(k){ try{ w[k]=f[k]; }catch(x){} }); w.__lf=true; W.bnxDsrFetchMonth_=w;
+  }
+  function wrapChecks(){
+    var f=W.bnxDsrSheetChecks_; if(typeof f!=='function'||f.__lf) return;
+    var w=function(M){
+      var out=f.apply(this,arguments);
+      try{
+        var ym=M.dateKey.slice(0,7), tot=0, n=0, un=0, left=0;
+        Object.keys(FIX).forEach(function(k){ if(k.slice(0,7)===ym&&k<=M.dateKey){ tot+=FIX[k].add; n+=FIX[k].bills; un+=FIX[k].unmapped; } });
+        var dk=FIX[M.dateKey];
+        if(dk) out.unshift({lvl:'warn',scope:'day',keys:['guestDueSales'],msg:'Auto-fixed: Credit Sale for '+M.dateKey.split('-').reverse().join('/')+' was empty — ₹'+Math.round(dk.add).toLocaleString('en-IN')+' added from '+dk.bills+' live credit bill(s)'+(dk.unmapped?' (₹'+Math.round(dk.unmapped).toLocaleString('en-IN')+' of it has no party id — map it in Outstanding → Swift report)':'')+(dk.left>1.5?'; ₹'+Math.round(dk.left).toLocaleString('en-IN')+' still unexplained':'')});
+        if(tot>0&&!(dk&&tot===dk.add)) out.unshift({lvl:'warn',scope:'mtd',keys:['guestDueSales'],msg:'Auto-fixed: MTD Credit Sale lifted by ₹'+Math.round(tot).toLocaleString('en-IN')+' from live credit bills ('+n+' bills)'});
+      }catch(e){}
+      return out;
+    };
+    Object.keys(f).forEach(function(k){ try{ w[k]=f[k]; }catch(x){} }); w.__lf=true; W.bnxDsrSheetChecks_=w;
+  }
+  async function liveFix(){
+    var b=document.getElementById('dsrDataBadge'); if(b){ b.textContent='⏳ Live fix…'; }
+    try{ Object.keys(FIX).forEach(function(k){ delete FIX[k]; }); W.__bnxDsrMonthCache={}; W.__bnxDsrIgCache={}; }catch(e){}
+    try{ if(typeof W.bnxLoadDsrSheet==='function') await W.bnxLoadDsrSheet({force:true}); }catch(e){}
+    try{ if(typeof W.loadDsrMatrix==='function') await W.loadDsrMatrix(); }catch(e){}
+    var t=Object.keys(FIX).reduce(function(s,k){ return s+FIX[k].add; },0);
+    if(typeof W.showNotif==='function') W.showNotif(t>0?'⚡ Live fix: ₹'+Math.round(t).toLocaleString('en-IN')+' credit sale restored from live bills':'⚡ Live data refreshed — nothing to fix','success');
+  }
+  W.bnxDsrLiveFix=liveFix;
+  function ui(){
+    var b=document.getElementById('dsrDataBadge');
+    if(b&&!b.__lf){ b.__lf=1; b.style.cursor='pointer'; b.title='Click: pull live data and auto-fix the DSR'; b.addEventListener('click',liveFix); }
+    var c=document.getElementById('dsrSheetCheckBtn');
+    if(c&&!document.getElementById('dsrLiveFixBtn')){ var x=document.createElement('button'); x.id='dsrLiveFixBtn'; x.className='btn btn-sm btn-primary'; x.style.fontSize='11px'; x.textContent='⚡ Live fix'; x.title='Pull live data and auto-fix the DSR'; x.addEventListener('click',liveFix); c.parentNode.insertBefore(x,c.nextSibling); }
+  }
+  setInterval(function(){ wrapFetch(); wrapChecks(); ui(); },1500);
+  wrapFetch(); wrapChecks();
+})();
+</script>
+
 <script id="bnx-pass76-ledger">
 /* ═══════════════════════════════════════════════════════════════════════
    PASS #76 — PROFESSIONAL CUSTOMER LEDGER (Tally-style)
