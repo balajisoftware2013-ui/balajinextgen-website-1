@@ -21364,7 +21364,9 @@ async function bmSaveBill(reprintAfter){
     d.date = isoBillDate;
     d.time = d.time || now.toTimeString().slice(0,5);
 
-    const isEditingExisting = (function(){ try{ var r=localStorage.getItem(bnxBillRegKey())||''; return !!d.billno && r.indexOf('"no":'+JSON.stringify(d.billno))>-1; }catch(e){ return bnxGetBillRegister().some(b=>b.no===d.billno); } })();
+    const isEditingExisting0 = (function(){ try{ var r=localStorage.getItem(bnxBillRegKey())||''; return !!d.billno && r.indexOf('"no":'+JSON.stringify(d.billno))>-1; }catch(e){ return bnxGetBillRegister().some(b=>b.no===d.billno); } })() 
+    /* FIX 2026-10-12: Edit must still be an EDIT when the local bill cache was cleared (Storage Doctor) or the Edit banner knows the bill. */
+    const isEditingExisting = isEditingExisting0 || !!(window.__bnxEditOrig && String(window.__bnxEditOrig.no)===String(d.billno));
     /* 2026-10-11: a NEW bill is saved with the actual clock time of the moment it is saved (e.g. 12:57 PM). The DATE stays the
        business date (6 AM → next 6 AM), so a 1:30 AM bill is dated the previous day but keeps its real time 01:30 AM. Edited bills keep their original time. */
     if(!isEditingExisting && !window.__bnxEditOrig){ d.time=String(now.getHours()%12||12).padStart(2,'0')+':'+String(now.getMinutes()).padStart(2,'0')+' '+(now.getHours()>=12?'PM':'AM'); }
@@ -21415,6 +21417,8 @@ async function bmSaveBill(reprintAfter){
        Clear only the V2_CORE circuit before each idempotent SAVE_BILL retry.
        The SAME requestId is reused for every attempt, so the backend can
        de-duplicate and the bill is never intentionally duplicated. */
+    /* FIX 2026-10-12: remember the split-payment lines now — the SAVE_BILL wrapper empties them once the server confirms */
+    const _splitSnap = (function(){ try{ const L=(Array.isArray(window.__BNX_BM_PAYMENT_LINES)?window.__BNX_BM_PAYMENT_LINES:[]).map(function(x){ return {mode:String(x.mode||'CASH').toUpperCase(),amount:Math.round((Number(x.amount)||0)*100)/100}; }).filter(function(x){return x.amount>0;}); const t=L.reduce(function(a,x){return a+x.amount;},0); return (L.length>1 && Math.abs(t-(Number(d.total)||0))<=1.01) ? L : null; }catch(e){ return null; } })();
     let res = null, lastSaveError = null;
     const maxSaveAttempts = 2;   // each attempt now waits up to 45 s (was 4 x 3 x 12 s)
     for (let attempt = 1; attempt <= maxSaveAttempts; attempt++) {
@@ -21484,8 +21488,11 @@ async function bmSaveBill(reprintAfter){
       no: d.billno, dt: d.date, tm: d.time,
       table: d.table, customer: d.cname, mob: d.cmob, items: d.items, sub: d.sub, gst: d.tax, total: d.total,
       pay: d.paymode, waiter: d.waiter, kot: d.kot, businessDate: d.businessDate, pax: d.pax,
-      advanceAdjusted: d.advanceAdjusted, balanceDue: d.balanceDue
+      advanceAdjusted: d.advanceAdjusted, balanceDue: d.balanceDue,
+      disc: d.disc, sc: d.sc, roundOff: d.roff, splitLines: _splitSnap
     });
+    /* FIX 2026-10-12: the Bills List showed the OLD split (cached payment ledger) after an edit — refresh it from what was just saved */
+    try{ window.__bnxBillPays = window.__bnxBillPays || {}; if(_splitSnap){ const m={}; _splitSnap.forEach(function(x){ const k=(x.mode==='BANK'?'CARD':x.mode); m[k]=(m[k]||0)+x.amount; }); window.__bnxBillPays[String(d.billno)]={m:m}; } else { delete window.__bnxBillPays[String(d.billno)]; } }catch(e){}
     // FIX ("if bill also effect advance adjustment fix"): a credit-billed
     // guest still owes only the BALANCE, not the full total, if part of
     // it was already collected as a reservation advance.
@@ -22653,6 +22660,17 @@ function bnxRecordBill(d){
     // only, doesn't change any existing field other code already reads.
     businessDate: d.businessDate || d.dt, pax: Number(d.pax)||0
   };
+  /* FIX 2026-10-12: an edited bill kept its OLD discount / service charge / round-off while sub, GST and total changed, so the
+     Bills List safety check showed a recalculated (wrong) total — the edit looked "not saved". Store the new figures too. */
+  if (d.disc!=null) entry.disc = Number(d.disc)||0;
+  if (d.sc!=null) entry.sc = Number(d.sc)||0;
+  if (d.roundOff!=null && isFinite(Number(d.roundOff))) entry.roundOff = Number(d.roundOff);
+  if (Array.isArray(d.splitLines) && d.splitLines.length>1){
+    entry.pay = 'SPLIT'; entry.isSplitPayment = true; entry.payments = d.splitLines.map(function(x){ return {mode:x.mode,amount:x.amount}; });
+    entry.payBreakdown = { CASH:0, CARD:0, UPI:0, OTHER:0 };
+    d.splitLines.forEach(function(x){ const k = x.mode==='CASH'?'CASH':x.mode==='UPI'?'UPI':(x.mode==='CARD'||x.mode==='BANK')?'CARD':'OTHER'; entry.payBreakdown[k]+=x.amount; });
+    entry.status = 'Paid';
+  }
   try{ window.bnxSaveBillTimes_(entry.no, entry.startTime, entry.endTime); }catch(e){}
   if (existingIdx>-1) list[existingIdx] = Object.assign(list[existingIdx], entry, {status:list[existingIdx].status==='Cancelled'?'Cancelled':entry.status});
   else list.unshift(entry);
@@ -42469,6 +42487,27 @@ body:not(.pos-machine) #bmProductGrid,
     if (!r || !r.success) { modal('<div style="padding:20px;color:var(--red)">⚠️ ' + esc(r?.error || 'Ledger unavailable') + '</div>'); return; }
     ST.d = r.data; W.__bnx72Stmt = r.data; render();
   };
+  /* 2026-10-12 DATE-WISE DUE / RECEIPT: one line per date — bills put on credit (Due) and money received (Receipt) with the running balance */
+  function dateWiseData_(d){
+    const m = new Map();
+    (d.rows || []).forEach(x => {
+      const k = String(x.date || '').slice(0,10);
+      if (!m.has(k)) m.set(k, { date:k, dr:0, cr:0, bal:0, bills:[], rcpts:[] });
+      const g = m.get(k), dr = Number(x.dr) || 0, cr = Number(x.cr) || 0;
+      g.dr += dr; g.cr += cr; g.bal = x.balance;
+      if (dr > 0) g.bills.push(String(x.ref || x.type || '')); if (cr > 0) g.rcpts.push(String(x.ref || x.type || ''));
+    });
+    return Array.from(m.values()).sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+  }
+  function dateWiseHtml_(d){
+    const g = dateWiseData_(d);
+    const rows = g.map(x => `<tr><td>${fmtDate(x.date)}</td><td class="mono" style="font-size:10.5px">${esc(x.bills.join(', '))}</td><td class="n" style="color:var(--red)">${x.dr ? amt(x.dr) : ''}</td><td class="mono" style="font-size:10.5px">${esc(x.rcpts.join(', '))}</td><td class="n" style="color:var(--green)">${x.cr ? amt(x.cr) : ''}</td><td class="n">${drcr(x.bal)}</td></tr>`).join('');
+    return `<table class="l76-t"><thead><tr><th style="width:92px">Date</th><th>Bill / Due</th><th class="n">Due ₹</th><th>Receipt No.</th><th class="n">Receipt ₹</th><th class="n">Balance</th></tr></thead><tbody>
+      <tr class="ob"><td>${fmtDate(d.from) || '—'}</td><td>Opening balance</td><td class="n">${d.opening > 0 ? amt(d.opening) : ''}</td><td></td><td class="n">${d.opening < 0 ? amt(-d.opening) : ''}</td><td class="n">${drcr(d.opening)}</td></tr>
+      ${rows || '<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:14px">No dues or receipts in this period.</td></tr>'}
+      <tr class="tot"><td></td><td>Total for the period</td><td class="n">${amt(d.periodDr)}</td><td></td><td class="n">${amt(d.periodCr)}</td><td></td></tr>
+      <tr class="cb"><td>${fmtDate(d.to)}</td><td>Closing balance</td><td></td><td></td><td></td><td class="n">${drcr(d.closing)}</td></tr></tbody></table>`;
+  }
   function render(){
     const d = ST.d, B = biz(), ag = d.aging || {};
     const lim = Number(d.creditLimit || 0), used = lim > 0 ? Math.min(100, Math.max(0, (d.outstanding || d.closing) / lim * 100)) : 0;
@@ -42517,11 +42556,12 @@ body:not(.pos-machine) #bmProductGrid,
         <div><span>Closing balance</span><b>${drcr(d.closing)}</b></div>
       </div>
       <div class="l76-age"><b style="padding:3px 0">Ageing (pending):</b><span>0–30: ${rs(ag.d0_30)}</span><span>31–60: ${rs(ag.d31_60)}</span><span style="color:var(--thm-gold,#e65100)">61–90: ${rs(ag.d61_90)}</span><span style="color:var(--red)">90+: ${rs(ag.d90p)}</span></div>
-      <div class="l76-tabs"><button class="${ST.tab === 'ledger' ? 'on' : ''}" onclick="bnx76Tab('ledger')">📒 Ledger (${d.rows.length})</button><button class="${ST.tab === 'bills' ? 'on' : ''}" onclick="bnx76Tab('bills')">🧾 Bill-wise Pending (${pending.length + (openRow ? 1 : 0)})</button></div>
+      <div class="l76-tabs"><button class="${ST.tab === 'ledger' ? 'on' : ''}" onclick="bnx76Tab('ledger')">📒 Ledger (${d.rows.length})</button><button class="${ST.tab === 'bills' ? 'on' : ''}" onclick="bnx76Tab('bills')">🧾 Bill-wise Pending (${pending.length + (openRow ? 1 : 0)})</button><button class="${ST.tab === 'date' ? 'on' : ''}" onclick="bnx76Tab('date')">📅 Date-wise Due / Receipt (${dateWiseData_(d).length})</button></div>
       <div class="l76-wrap" style="display:${ST.tab === 'ledger' ? '' : 'none'}"><table class="l76-t"><thead><tr><th style="width:92px">Date</th><th>Particulars</th><th>Vch Type</th><th>Vch No.</th><th class="n">Debit ₹</th><th class="n">Credit ₹</th><th class="n">Balance</th></tr></thead><tbody>${ledgerRows}</tbody></table></div>
       <div class="l76-wrap" style="display:${ST.tab === 'bills' ? '' : 'none'}"><table class="l76-t"><thead><tr><th>Bill No.</th><th>Bill Date</th><th>Table</th><th class="n">Bill Amt</th><th class="n">Paid at Bill</th><th class="n">Received</th><th class="n">Adjusted</th><th class="n">Pending</th><th class="n">Due Days</th><th></th></tr></thead>
         <tbody>${openRow}${pendRows || (openRow ? '' : '<tr><td colspan="10" style="text-align:center;color:var(--text3);padding:14px">No pending bills.</td></tr>')}
-        ${pendRows || openRow ? `<tr class="tot"><td colspan="7">Total pending</td><td class="n">${rs(pendTot)}</td><td colspan="2"></td></tr>` : ''}</tbody></table></div>`);
+        ${pendRows || openRow ? `<tr class="tot"><td colspan="7">Total pending</td><td class="n">${rs(pendTot)}</td><td colspan="2"></td></tr>` : ''}</tbody></table></div>
+      <div class="l76-wrap" style="display:${ST.tab === 'date' ? '' : 'none'}">${dateWiseHtml_(d)}</div>`);
   }
   W.bnx76Tab = function(t){ ST.tab = t; render(); };
 
