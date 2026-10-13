@@ -63877,4 +63877,491 @@ html body #page-dashboard .bnxd-kpi .stat-chg{flex:0 0 auto!important;margin-top
 })();
 </script>
 <style id="bnx-thead-trapped-20261013">html body table.bnx-thead-trapped thead th{top:0!important}html body #page-bills-list #blTable thead th{top:0!important}</style>
+<script id="bnx-txn-fix-20261013">
+/* ═══════════════════════════════════════════════════════════════════════
+   TRANSACTION DB · PAYMENT-MODE FIX + PARTY-WISE DUES JPG   (2026-10-13)
+   WHY: the DSR sheet and the cash book are correct, but some bills in the TRANSACTION DB carry the wrong
+        payment mode (e.g. Zomato / Swiggy / UPI bills saved as DUE under a pseudo party such as "ZOMATO LIGHT").
+        Every report that reads the transaction DB (DSR matrix, cash book, dues, due-collection) then drifts.
+   WHAT (Due Collection page → "Transaction DB — Payment-Mode Fix"):
+     1. Per day it puts the DSR figure for every pay mode next to what the transaction DB holds (GET_BILLS +
+        BILL_PAYMENTS). The DSR column is pre-filled from GET_DSR_MATRIX and can be typed over with the sheet figure
+        (pinned on this device).
+     2. 🪄 Auto-suggest finds the bills whose mode must change so every mode matches the DSR (exact subset match,
+        aggregator-named parties tried first). The "Correct mode" of any bill can also be set by hand; the
+        "After fix" column re-computes live.
+     3. Apply: DUE bills → paid mode are written with the existing SETTLE_DUE_BILL action (first bill is verified
+        before the rest are sent). Paid-bill mode changes have no server action, so they go to a DB-fix CSV.
+     4. Due received: every receipt of the range, mode editable (EDIT_DUES_RECEIPT) and compared with the DSR
+        due-received cash / bank.
+     5. 🖼 Party-wise same-day Dues + Due-received list → one JPG (drawn straight on a canvas).
+═══════════════════════════════════════════════════════════════════════ */
+(function(){
+  'use strict';
+  var W=window; if(W.bnxTxnFix) return;
+  var BK=['cash','card','gpay','zomato','swiggy','eazydine','credit','other'];
+  var LBL={cash:'Cash',card:'Card',gpay:'UPI / GPay',zomato:'Zomato',swiggy:'Swiggy',eazydine:'EazyDine',credit:'Due (Credit)',other:'Other'};
+  var MODEV={cash:'CASH',card:'CARD',gpay:'UPI',zomato:'ZOMATO',swiggy:'SWIGGY',eazydine:'EAZY DINE ONLINE',credit:'DUE',other:'ONLINE'};
+  var PICK=['cash','card','gpay','zomato','swiggy','eazydine','credit'];
+  var S={from:'',to:'',days:{},order:[],receipts:[],sel:{},rsel:{},loaded:false,busy:false,showAll:false,pins:{}};
+
+  /* ---------- helpers ---------- */
+  function $(id){ return document.getElementById(id); }
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+  function r2(v){ return Math.round((Number(v)||0)*100)/100; }
+  function num(v){ var n=Number(String(v==null?'':v).replace(/[₹,\s]/g,'')); return isFinite(n)?n:0; }
+  function fm(v){ v=r2(v); var neg=v<0; v=Math.abs(v); var s=v.toLocaleString('en-IN',{minimumFractionDigits:(v%1?2:0),maximumFractionDigits:2}); return (neg?'-':'')+s; }
+  function ymd(d){ var s=String(d==null?'':d).trim(); var m=s.match(/^(\d{2})[\/-](\d{2})[\/-](\d{4})/); if(m) return m[3]+'-'+m[2]+'-'+m[1]; return s.slice(0,10); }
+  function fd(d){ d=ymd(d); if(!/^\d{4}-\d{2}-\d{2}$/.test(d)) return d||'—'; var p=d.split('-'); return p[2]+'/'+p[1]+'/'+p[0]; }
+  function pad(n){ return String(n).padStart(2,'0'); }
+  function today(){ try{ if(typeof W.bnxReportBusinessDate_==='function'){ var t=W.bnxReportBusinessDate_(); if(/^\d{4}-\d{2}-\d{2}$/.test(t)) return t; } }catch(e){} var d=new Date(); return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); }
+  function addDays(ds,n){ var d=new Date(ds+'T00:00:00'); d.setDate(d.getDate()+n); return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); }
+  function notify(m,t){ try{ if(typeof W.showNotif==='function') return W.showNotif(m,t||'success'); }catch(e){} try{ console.log('[TXNFIX]',m); }catch(e){} }
+  function cid(){ try{ return String((typeof W.CLIENT_ID!=='undefined'&&W.CLIENT_ID)||'default'); }catch(e){ return 'default'; } }
+  function canWrite(w){ try{ return typeof W.bnxRequireFullAccess==='function'?W.bnxRequireFullAccess(w):true; }catch(e){ return true; } }
+  function gas(a,p){ return typeof W.gasApi==='function'?W.gasApi(a,p||{},'V2_CORE'):Promise.resolve({success:false,error:'gasApi unavailable'}); }
+  function apv(a,p,ms){ return typeof W.bnxApprovalApi==='function'?W.bnxApprovalApi(a,p||{},ms||90000):gas(a,p); }
+  function lsGet(k,d){ try{ var v=JSON.parse(localStorage.getItem(k)||'null'); return v==null?d:v; }catch(e){ return d; } }
+  function lsSet(k,v){ try{ localStorage.setItem(k,JSON.stringify(v)); }catch(e){} }
+  function outlet(){ var n=''; try{ n=((W.BNX_LIVE_CLIENT_INFO||{}).name)||''; }catch(e){} try{ if(!n&&typeof W.loadBrand==='function') n=(W.loadBrand()||{}).name||''; }catch(e){} return String(n||'HASHTAG SILIGURI').toUpperCase(); }
+  function csv(name,rows){
+    var t=rows.map(function(r){ return r.map(function(v){ var s=String(v==null?'':v); return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s; }).join(','); }).join('\n');
+    var a=document.createElement('a'); a.href=URL.createObjectURL(new Blob(['﻿'+t],{type:'text/csv'})); a.download=name; document.body.appendChild(a); a.click(); setTimeout(function(){ a.remove(); },500);
+  }
+
+  /* ---------- mode → DSR bucket ---------- */
+  function nameOf(raw){ var v=String(raw==null?'':raw).trim(); if(!v) return ''; var m=W.__BNX_PAYMENT_MODE_NAMES||{}; return String(m[v.toUpperCase()]||m[v]||v); }
+  function bucketOf(raw){
+    var s=nameOf(raw).toUpperCase(); if(!s) return 'other';
+    if(/ZOMATO/.test(s)) return 'zomato';
+    if(/SWIGGY/.test(s)) return 'swiggy';
+    if(/EAZY|EASY\s*DINE|EZ\s*DINE/.test(s)) return 'eazydine';
+    if(/CREDIT\s*CARD|DEBIT\s*CARD|\bCARD\b|VISA|MASTER|RUPAY|SWIPE|\bPOS\b/.test(s)) return 'card';
+    if(/CREDIT|\bDUE\b|PENDING|UNPAID|RECEIVABLE/.test(s)) return 'credit';
+    if(/UPI|GPAY|G-PAY|PHONEPE|PAYTM|ONLINE|BANK|NEFT|IMPS|RTGS|\bQR\b|BHIM|WALLET/.test(s)) return 'gpay';
+    if(/CASH/.test(s)) return 'cash';
+    return 'other';
+  }
+  function aggHint(p){ var s=String(p||'').toUpperCase(); if(/ZOMATO/.test(s)) return 'zomato'; if(/SWIGGY/.test(s)) return 'swiggy'; if(/EAZY|EASY\s*DINE|EZ\s*DINE/.test(s)) return 'eazydine'; return ''; }
+  function isAgg(b){ return b==='zomato'||b==='swiggy'||b==='eazydine'; }
+
+  /* ---------- DSR matrix day → targets (same mapping as the DSR client) ---------- */
+  function dsrTargets(raw){
+    var low={}; Object.keys(raw||{}).forEach(function(k){ low[String(k).toLowerCase().replace(/[^a-z0-9]/g,'')]=raw[k]; });
+    function g(){ for(var i=0;i<arguments.length;i++){ var v=low[String(arguments[i]).toLowerCase().replace(/[^a-z0-9]/g,'')]; if(v!==undefined&&v!==null&&v!=='') return num(v); } return 0; }
+    var z=g('zomato','zomatosale','zomatosales'), s=g('swiggy','swiggysale','swiggysales'), e=g('eazydine','eazydinesale','eazydinesales','easydine');
+    var online=g('online','onlinesale');
+    return { cash:g('cash','cashsale','cashsales'), card:g('iciciCard','card','cardsale','cardsales'),
+      gpay:g('iciciGpay','gpay','upi','upisale')+Math.max(0,online-z-s-e), zomato:z, swiggy:s, eazydine:e,
+      credit:g('guestDueSales','credit','duesales','creditsale','creditsales'), other:g('other','otherpay')+g('unallocatedPaid'),
+      duecash:g('dueReceivedCash','duerecvcash','duecash'), duebank:g('dueReceivedIcici','duerecvbank','duebank') };
+  }
+
+  /* ---------- bills → rows ---------- */
+  function mkRow(b,pays){
+    var no=String(b.BILL_NUMBER||''), total=r2(b.GRAND_TOTAL), due=Math.max(0,r2(b.DUE_AMOUNT));
+    var lines=pays&&pays[no]&&pays[no].m, comp={}, has=false;
+    if(lines&&typeof lines==='object'){ Object.keys(lines).forEach(function(k){ var a=r2(lines[k]); if(a>0.004){ var bk=bucketOf(k); comp[bk]=r2((comp[bk]||0)+a); has=true; } }); }
+    var mode=b.PAYMENT_MODE||b.PAY_MODE||'';
+    if(due>0.004&&!(comp.credit>0.004)) comp.credit=due;
+    if(!has){
+      var paid=r2(total-(due>0.004?due:0));
+      if(paid>0.004){ var bk=bucketOf(mode); if(bk==='credit'&&due>0.004) bk='other'; comp[bk]=r2((comp[bk]||0)+paid); }
+    }
+    var best=null, bv=0; Object.keys(comp).forEach(function(k){ if(comp[k]>bv){ bv=comp[k]; best=k; } });
+    var cur=(best&&bv>=total-0.5)?best:null;
+    return { key:String(b.BILL_ID||no), id:String(b.BILL_ID||''), no:no, date:ymd(b.BILL_DATE), party:String(b.CUSTOMER_NAME||'').trim(), custId:String(b.CUSTOMER_ID||''),
+      total:total, due:due, comp:comp, cur:cur, to:cur, rawMode:String(nameOf(mode)||mode||''), split:!cur };
+  }
+  function totals(day,useTo){
+    var t={}; BK.forEach(function(b){ t[b]=0; });
+    day.rows.forEach(function(r){
+      Object.keys(r.comp).forEach(function(b){
+        if(useTo&&r.cur&&r.to!==r.cur&&b===r.cur) t[r.to]+=r.comp[b]; else t[b]+=r.comp[b];
+      });
+    });
+    BK.forEach(function(b){ t[b]=r2(t[b]); }); return t;
+  }
+
+  /* ---------- exact subset match (0/1 knapsack on whole rupees) ---------- */
+  function subset(rows,need){
+    need=Math.round(need); if(need<1||need>2000000) return null;
+    var items=rows.map(function(r){ return {r:r,a:Math.round(r.comp[r.cur]||0)}; }).filter(function(x){ return x.a>0&&x.a<=need+1; })
+      .sort(function(a,b){ return b.a-a.a; }).slice(0,150);
+    if(!items.length) return null;
+    var offs=[0,1,-1];
+    for(var o=0;o<offs.length;o++){
+      var t=need+offs[o]; if(t<1) continue;
+      var reach=new Int32Array(t+1).fill(-1); reach[0]=-2;
+      for(var i=0;i<items.length;i++){ var a=items[i].a; if(a>t) continue; for(var s=t;s>=a;s--){ if(reach[s]===-1&&reach[s-a]!==-1) reach[s]=i; } }
+      if(reach[t]!==-1){ var out=[], s2=t; while(s2>0){ var ix=reach[s2]; out.push(items[ix].r); s2-=items[ix].a; } return out; }
+    }
+    return null;
+  }
+  function suggestDay(day){
+    day.rows.forEach(function(r){ r.to=r.cur; r.auto=false; });
+    var now=totals(day,false), diff={}; BK.forEach(function(b){ diff[b]=r2(now[b]-(Number(day.tgt[b])||0)); });
+    function cands(bucket,hint){ return day.rows.filter(function(r){ return r.cur===bucket&&r.to===r.cur&&r.total>0&&(!hint||aggHint(r.party)===hint); }); }
+    BK.filter(function(b){ return diff[b]<-0.5; }).sort(function(a,b){ return diff[a]-diff[b]; }).forEach(function(T){
+      var srcs=BK.filter(function(b){ return diff[b]>0.5; }).sort(function(a,b){ return diff[b]-diff[a]; });
+      if(isAgg(T)) srcs.sort(function(a,b){ return (b==='credit'?1:0)-(a==='credit'?1:0); });
+      for(var i=0;i<srcs.length&&diff[T]<-0.5;i++){
+        var X=srcs[i], need=Math.round(Math.min(-diff[T],diff[X])); if(need<1) continue;
+        var pick=null; if(isAgg(T)){ var h=cands(X,T); if(h.length) pick=subset(h,need); }
+        if(!pick) pick=subset(cands(X),need);
+        if(!pick) continue;
+        var mv=0; pick.forEach(function(r){ r.to=T; r.auto=true; mv+=r.comp[X]; });
+        diff[T]=r2(diff[T]+mv); diff[X]=r2(diff[X]-mv);
+      }
+    });
+  }
+
+  /* ---------- load ---------- */
+  function monthsOf(from,to){ var out=[], d=new Date(from.slice(0,7)+'-01T00:00:00'), e=new Date(to.slice(0,7)+'-01T00:00:00'); while(d<=e){ out.push([d.getFullYear(),d.getMonth()+1]); d.setMonth(d.getMonth()+1); } return out; }
+  function findList(data){
+    if(!data||typeof data!=='object') return [];
+    var ks=['receipts','receiptRows','receiptsInPeriod','receiptsToday','receiptVouchers','payments','collections','rows'];
+    for(var i=0;i<ks.length;i++){ var a=data[ks[i]]; if(Array.isArray(a)&&a.length) return a; }
+    return [];
+  }
+  function pick(x,names){ for(var i=0;i<names.length;i++){ if(x[names[i]]!==undefined&&x[names[i]]!==null&&x[names[i]]!=='') return x[names[i]]; } var low={}; Object.keys(x).forEach(function(k){ low[k.toLowerCase().replace(/[^a-z0-9]/g,'')]=x[k]; }); for(var j=0;j<names.length;j++){ var v=low[names[j].toLowerCase().replace(/[^a-z0-9]/g,'')]; if(v!==undefined&&v!==null&&v!=='') return v; } return ''; }
+  async function load(){
+    if(S.busy) return;
+    var from=($('tfFrom')||{}).value||today(), to=($('tfTo')||{}).value||from;
+    if(to<from){ var x=from; from=to; to=x; }
+    var span=(new Date(to)-new Date(from))/864e5;
+    if(span>31){ notify('⚠️ Choose at most 31 days at a time','error'); return; }
+    S.busy=true; S.from=from; S.to=to; status('Loading bills, payment lines, DSR and receipts…');
+    var bills=[], pays={}, dsrBy={}, rec=[], warn=[];
+    try{
+      var r=await W.erpApi({action:'GET_BILLS',range:'all'},'V2_CORE');
+      if(r&&r.success&&Array.isArray(r.data)) bills=r.data; else warn.push('Bills: '+((r&&r.error)||'no data'));
+    }catch(e){ warn.push('Bills: '+(e&&e.message||e)); }
+    try{ var p=await apv('BILL_PAYMENTS',{from:from,to:to}); if(p&&p.success&&p.data) pays=p.data; else warn.push('Payment lines not available — modes read from the bill header'); }catch(e){ warn.push('Payment lines: '+(e&&e.message||e)); }
+    var ms=monthsOf(from,to);
+    for(var i=0;i<ms.length;i++){
+      try{ var m=await W.erpApi({action:'GET_DSR_MATRIX',year:ms[i][0],month:ms[i][1]},'V2_CORE'); var by=m&&m.success&&m.data&&m.data.byDay;
+        if(by) Object.keys(by).forEach(function(d){ dsrBy[ms[i][0]+'-'+pad(ms[i][1])+'-'+pad(d)]=by[d]; }); else warn.push('DSR '+ms[i][0]+'-'+pad(ms[i][1])+': '+((m&&m.error)||'no data'));
+      }catch(e){ warn.push('DSR: '+(e&&e.message||e)); }
+    }
+    try{
+      var dc=await gas('GET_DUE_COLLECTION',{range:'custom',from:from,to:to});
+      if(dc&&dc.success&&dc.data){ findList(dc.data).forEach(function(x){
+        var amt=num(pick(x,['AMOUNT','RECEIVED_AMOUNT','NET_AMOUNT','amount'])), ds=ymd(pick(x,['RECEIPT_DATE','PAYMENT_DATE','BUSINESS_DATE','DATE','date','receiptDate']));
+        var st=String(pick(x,['STATUS','RECEIPT_STATUS'])).toUpperCase();
+        if(!(amt>0)||!/^\d{4}-\d{2}-\d{2}$/.test(ds)||ds<from||ds>to||/CANCEL|VOID|DELETE/.test(st)) return;
+        var mode=String(pick(x,['PAYMENT_MODE','MODE','paymentMode','mode'])||'CASH').toUpperCase();
+        rec.push({voucher:String(pick(x,['VOUCHER_NO','voucherNo','RECEIPT_NO','RECEIPT_ID'])||''),date:ds,party:String(pick(x,['CUSTOMER_NAME','customer','customerName','PARTY_NAME','party'])||''),amount:amt,mode:mode,to:mode,ref:String(pick(x,['REFERENCE','reference','NARRATION','narration'])||'')});
+      }); } else warn.push('Due receipts: '+((dc&&dc.error)||'no data'));
+    }catch(e){ warn.push('Due receipts: '+(e&&e.message||e)); }
+
+    S.pins=lsGet('bnxTxnFixPins_'+cid(),{}); S.days={}; S.order=[]; S.sel={}; S.rsel={};
+    for(var d=from; d<=to; d=addDays(d,1)){ S.order.push(d); S.days[d]={date:d,rows:[],tgt:{},dsr:dsrTargets(dsrBy[d]||{}),pinned:!!S.pins[d]}; }
+    bills.forEach(function(b){
+      if(/CANCEL|VOID/.test(String(b.BILL_STATUS||'').toUpperCase())) return;
+      var ds=ymd(b.BILL_DATE); var day=S.days[ds]; if(!day) return;
+      var row=mkRow(b,pays); if(row.total>0) day.rows.push(row);
+    });
+    S.order.forEach(function(d){
+      var day=S.days[d], t=day.dsr; BK.forEach(function(b){ day.tgt[b]=(S.pins[d]&&S.pins[d][b]!=null)?Number(S.pins[d][b]):r2(t[b]||0); });
+      day.rows.sort(function(a,b){ return a.no.localeCompare(b.no); });
+      suggestDay(day);
+    });
+    S.receipts=rec.sort(function(a,b){ return a.date.localeCompare(b.date)||a.voucher.localeCompare(b.voucher); });
+    if(!rec.length&&S.order.some(function(d){ return S.days[d].dsr.duecash>0||S.days[d].dsr.duebank>0; })) warn.push('The server sent no due-receipt rows for this range, so the due-received list and JPG section 2 are empty');
+    S.loaded=true; S.busy=false; S.warn=warn; paint();
+  }
+
+  /* ---------- UI ---------- */
+  function css(){
+    if($('bnxTxnFixCss')) return;
+    var st=document.createElement('style'); st.id='bnxTxnFixCss';
+    st.textContent='\
+#bnxTxnFixCard .tf-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;padding:10px 14px}\
+#bnxTxnFixCard .tf-bar label{font-size:10px;font-weight:800;color:var(--text3,#888);display:block;margin-bottom:3px;text-transform:uppercase}\
+#bnxTxnFixCard input[type=date],#bnxTxnFixCard select,#bnxTxnFixCard input.tf-num{padding:6px 8px;border:1px solid var(--border2,#ddd);border-radius:8px;font-family:inherit;font-size:12px;background:var(--surface,#fff);color:inherit}\
+#bnxTxnFixCard input.tf-num{width:92px;text-align:right}\
+#bnxTxnFixCard .tf-note{margin:0 14px 10px;padding:9px 12px;border-radius:9px;background:var(--gold-bg,#fff6e0);border:1px solid var(--gold,#b8690e);font-size:12px;line-height:1.5}\
+#bnxTxnFixCard .tf-ok{background:#e6f4ea;border-color:#1a7f3c}\
+#bnxTxnFixCard .tf-day{border:1px solid var(--border,#e5e0d8);border-radius:12px;margin:0 14px 10px;background:var(--surface,#fff);overflow:hidden}\
+#bnxTxnFixCard .tf-day h4{margin:0;padding:9px 12px;font-size:13px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;background:var(--surface2,#f6f3ee)}\
+#bnxTxnFixCard table.tf-t{width:100%;border-collapse:collapse;font-size:12px}\
+#bnxTxnFixCard .tf-t th{background:var(--surface2,#f6f3ee);text-align:left;padding:6px 8px;font-size:10.5px;white-space:nowrap}\
+#bnxTxnFixCard .tf-t td{padding:5px 8px;border-top:1px solid var(--border,#eee);white-space:nowrap}\
+#bnxTxnFixCard .n{text-align:right;font-family:"DM Mono","Noto Sans",monospace}\
+#bnxTxnFixCard .bad{color:#b42318;font-weight:800}#bnxTxnFixCard .good{color:#1a7f3c;font-weight:800}\
+#bnxTxnFixCard tr.tf-chg td{background:#fff7dd}\
+#bnxTxnFixCard .tf-chip{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:800;background:var(--surface2,#f4f0ea)}\
+#bnxTxnFixCard .tf-chip.api{background:#e6f4ea;color:#1a7f3c}#bnxTxnFixCard .tf-chip.csv{background:#fff2d6;color:#9a5b00}#bnxTxnFixCard .tf-chip.hint{background:#fde8e8;color:#b42318}\
+#bnxTxnFixCard .tf-ov{overflow-x:auto}\
+#bnxTxnJpg{position:fixed;inset:0;z-index:2147483000;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;padding:14px}\
+#bnxTxnJpg .box{background:#fff;border-radius:12px;max-width:min(1000px,96vw);max-height:94vh;display:flex;flex-direction:column;overflow:hidden}\
+#bnxTxnJpg .img{overflow:auto;padding:8px;background:#eee}#bnxTxnJpg img{max-width:100%;display:block;margin:0 auto;background:#fff}\
+#bnxTxnJpg .act{display:flex;gap:8px;padding:10px;flex-wrap:wrap;justify-content:flex-end;border-top:1px solid #ddd}';
+    document.head.appendChild(st);
+  }
+  function ensureUi(){
+    css();
+    var page=$('page-due-collection'); if(!page) return null;
+    var c=$('bnxTxnFixCard'); if(c) return c;
+    c=document.createElement('div'); c.className='card'; c.id='bnxTxnFixCard'; c.style.marginBottom='14px';
+    c.innerHTML='<div class="card-header" style="flex-wrap:wrap;gap:8px"><span class="card-title">🛠 Transaction DB — Payment-Mode Fix · Dues &amp; Received JPG</span></div>'
+      +'<div class="tf-bar"><div><label>From</label><input type="date" id="tfFrom"></div><div><label>To</label><input type="date" id="tfTo"></div>'
+      +'<button class="btn btn-sm btn-primary" data-tf="load">⟳ Load / Compare</button>'
+      +'<button class="btn btn-sm btn-ghost" data-tf="suggest" title="Find the bills whose mode must change so every mode matches the DSR">🪄 Auto-suggest</button>'
+      +'<button class="btn btn-sm btn-ghost" data-tf="reset">↺ Reset changes</button>'
+      +'<button class="btn btn-sm btn-primary" data-tf="apply">✅ Apply fixes</button>'
+      +'<button class="btn btn-sm btn-ghost" data-tf="csv">📥 DB-fix CSV</button>'
+      +'<button class="btn btn-sm btn-ghost" data-tf="jpg">🖼 Dues &amp; Received JPG</button></div>'
+      +'<div id="tfStatus" class="tf-note" style="display:none"></div><div id="tfBody"></div>';
+    var cards=page.querySelectorAll(':scope > .card'); var anchor=cards[0]||null;
+    if(anchor&&anchor.nextSibling) page.insertBefore(c,anchor.nextSibling); else page.appendChild(c);
+    var t=today(); $('tfFrom').value=addDays(t,-1); $('tfTo').value=addDays(t,-1);
+    c.addEventListener('click',onClick); c.addEventListener('change',onChange);
+    paint(); return c;
+  }
+  function status(m,ok){ var e=$('tfStatus'); if(!e) return; e.style.display=m?'block':'none'; e.className='tf-note'+(ok?' tf-ok':''); e.innerHTML=m||''; }
+
+  function paint(){
+    var body=$('tfBody'); if(!body) return;
+    if(!S.loaded){ body.innerHTML='<div style="padding:4px 14px 14px;font-size:12px;color:var(--text3,#888)">Pick the date(s) and press <b>Load / Compare</b>. Nothing is written until you press <b>Apply fixes</b>.</div>'; return; }
+    var h='';
+    if(S.warn&&S.warn.length) status('⚠️ '+S.warn.map(esc).join(' · '));
+    else status('');
+    S.order.forEach(function(d){ h+='<div class="tf-day" id="tfDay_'+d+'"></div>'; });
+    h+='<div id="tfBills"></div><div id="tfRecv"></div>';
+    body.innerHTML=h; S.order.forEach(paintDay); paintBills(); paintRecv(); updateSummary();
+  }
+  function dayDiffTotal(day,useTo){ var t=totals(day,useTo), s=0; BK.forEach(function(b){ s+=Math.abs(t[b]-(Number(day.tgt[b])||0)); }); return r2(s); }
+  function paintDay(d){
+    var day=S.days[d], el=$('tfDay_'+d); if(!el) return;
+    var now=totals(day,false), aft=totals(day,true), offNow=dayDiffTotal(day,false), offAft=dayDiffTotal(day,true);
+    var nChg=day.rows.filter(function(r){ return r.cur&&r.to!==r.cur; }).length;
+    var h='<h4><span>📅 '+fd(d)+' · '+day.rows.length+' bills'+(day.pinned?' · <span class="tf-chip">DSR figures pinned</span>':'')+'</span><span>'
+      +(offAft<1?'<span class="good">✔ matches DSR after fix</span>':'<span class="bad">⚠ ₹'+fm(offAft)+' still differs</span>')+(nChg?' · '+nChg+' bill mode change(s)':'')+'</span></h4>'
+      +'<div class="tf-ov"><table class="tf-t"><thead><tr><th>Mode</th><th class="n">DSR sheet (edit)</th><th class="n">Txn DB now</th><th class="n">Diff now</th><th class="n">Txn DB after fix</th><th class="n">Diff after</th></tr></thead><tbody>';
+    BK.forEach(function(b){
+      var t=Number(day.tgt[b])||0, dn=r2(now[b]-t), da=r2(aft[b]-t);
+      if(!t&&!now[b]&&!aft[b]) return;
+      h+='<tr><td><b>'+LBL[b]+'</b></td><td class="n"><input class="tf-num" type="number" step="1" data-tgt="'+d+'|'+b+'" value="'+t+'"></td><td class="n">'+fm(now[b])+'</td>'
+        +'<td class="n '+(Math.abs(dn)<1?'good':'bad')+'">'+fm(dn)+'</td><td class="n"><b>'+fm(aft[b])+'</b></td><td class="n '+(Math.abs(da)<1?'good':'bad')+'">'+fm(da)+'</td></tr>';
+    });
+    h+='</tbody></table></div>';
+    var splits=day.rows.filter(function(r){ return r.split; }).length;
+    if(splits) h+='<div style="padding:6px 12px;font-size:11px;color:var(--text3,#888)">'+splits+' split-payment bill(s) are counted per line but not moved automatically.</div>';
+    el.innerHTML=h;
+  }
+  function relevant(day,r){
+    if(S.showAll) return true; if(r.split||!r.cur) return false;
+    if(r.to!==r.cur) return true; if(aggHint(r.party)&&r.cur==='credit') return true;
+    var t=totals(day,false), d=Math.abs(t[r.cur]-(Number(day.tgt[r.cur])||0)); return d>=0.5&&r.cur==='credit';
+  }
+  function paintBills(){
+    var el=$('tfBills'); if(!el) return;
+    var rows=[]; S.order.forEach(function(d){ S.days[d].rows.forEach(function(r){ if(relevant(S.days[d],r)) rows.push(r); }); });
+    var lim=rows.length>400; if(lim) rows=rows.slice(0,400);
+    var h='<div class="tf-day"><h4><span>🧾 Bills — set the correct mode</span><span><label style="font-size:11px;font-weight:700"><input type="checkbox" id="tfAll" '+(S.showAll?'checked':'')+'> show every bill</label></span></h4>';
+    if(!rows.length) h+='<div style="padding:10px 12px;font-size:12px;color:var(--text3,#888)">No bill needs a mode change for the selected day(s) — DSR and transaction DB agree. Tick “show every bill” to change one by hand.</div>';
+    else{
+      h+='<div class="tf-ov"><table class="tf-t"><thead><tr><th></th><th>Date</th><th>Bill No</th><th>Party</th><th class="n">Amount</th><th>Now</th><th>Correct mode</th><th>Write path</th></tr></thead><tbody>';
+      rows.forEach(function(r){ h+=billRowHtml(r); });
+      h+='</tbody></table></div>'+(lim?'<div style="padding:6px 12px;font-size:11px">Showing first 400 bills.</div>':'');
+    }
+    el.innerHTML=h+'</div>';
+  }
+  function pathOf(r){
+    if(!r.cur||r.to===r.cur) return aggHint(r.party)&&r.cur==='credit'?'<span class="tf-chip hint">party looks like '+esc(LBL[aggHint(r.party)])+'</span>':'';
+    if(r.cur==='credit'&&r.due>0.004) return '<span class="tf-chip api">API · settle due bill</span>';
+    return '<span class="tf-chip csv">DB-fix CSV</span>';
+  }
+  function billRowHtml(r){
+    var chg=r.cur&&r.to!==r.cur;
+    var opts=PICK.map(function(b){ return '<option value="'+b+'"'+(r.to===b?' selected':'')+'>'+LBL[b]+'</option>'; }).join('');
+    return '<tr data-k="'+esc(r.key)+'" class="'+(chg?'tf-chg':'')+'"><td>'+(chg?'<input type="checkbox" class="tf-sel" '+(S.sel[r.key]===false?'':'checked')+'>':'')+'</td>'
+      +'<td>'+fd(r.date)+'</td><td><b>'+esc(r.no)+'</b></td><td>'+esc(r.party||'—')+'</td><td class="n">'+fm(r.total)+'</td><td>'+esc(r.cur?LBL[r.cur]:'Split')+'</td>'
+      +'<td>'+(r.cur?'<select class="tf-to">'+opts+'</select>':'—')+(r.auto&&chg?' <span class="tf-chip">auto</span>':'')+'</td><td class="tf-path">'+pathOf(r)+'</td></tr>';
+  }
+  function findRow(k){ for(var i=0;i<S.order.length;i++){ var rs=S.days[S.order[i]].rows; for(var j=0;j<rs.length;j++) if(rs[j].key===k) return {r:rs[j],d:S.order[i]}; } return null; }
+
+  function paintRecv(){
+    var el=$('tfRecv'); if(!el) return;
+    var by={}; S.receipts.forEach(function(x){ var o=by[x.date]||(by[x.date]={cash:0,bank:0}); if(/^CASH/.test(x.to)) o.cash+=x.amount; else o.bank+=x.amount; });
+    var h='<div class="tf-day"><h4><span>💰 Due received (transaction sheet)</span><span>'+S.receipts.length+' receipt(s)</span></h4>';
+    h+='<div class="tf-ov"><table class="tf-t"><thead><tr><th>Date</th><th class="n">DSR cash</th><th class="n">Receipts cash</th><th class="n">DSR bank</th><th class="n">Receipts bank</th><th>Status</th></tr></thead><tbody>';
+    S.order.forEach(function(d){ var t=S.days[d].dsr, o=by[d]||{cash:0,bank:0}; if(!t.duecash&&!t.duebank&&!o.cash&&!o.bank) return;
+      var ok=Math.abs(t.duecash-o.cash)<1&&Math.abs(t.duebank-o.bank)<1;
+      h+='<tr><td>'+fd(d)+'</td><td class="n">'+fm(t.duecash)+'</td><td class="n">'+fm(o.cash)+'</td><td class="n">'+fm(t.duebank)+'</td><td class="n">'+fm(o.bank)+'</td><td class="'+(ok?'good':'bad')+'">'+(ok?'✔ matches':'⚠ differs')+'</td></tr>'; });
+    h+='</tbody></table></div>';
+    if(S.receipts.length){
+      h+='<div class="tf-ov"><table class="tf-t"><thead><tr><th></th><th>Date</th><th>Voucher</th><th>Party</th><th class="n">Amount</th><th>Mode</th></tr></thead><tbody>';
+      S.receipts.forEach(function(x,i){
+        var chg=x.to!==x.mode, base=['CASH','UPI','CARD','BANK TRANSFER','CHEQUE'];
+        var o=base.concat(base.indexOf(x.to)<0?[x.to]:[]).map(function(m){ return '<option'+(m===x.to?' selected':'')+'>'+esc(m)+'</option>'; }).join('');
+        h+='<tr data-ri="'+i+'" class="'+(chg?'tf-chg':'')+'"><td>'+(chg?'<input type="checkbox" class="tf-rsel" '+(S.rsel[i]===false?'':'checked')+'>':'')+'</td><td>'+fd(x.date)+'</td><td>'+esc(x.voucher||'—')+'</td><td>'+esc(x.party||'—')+'</td><td class="n">'+fm(x.amount)+'</td><td><select class="tf-rto">'+o+'</select></td></tr>';
+      });
+      h+='</tbody></table></div>';
+    }
+    el.innerHTML=h+'</div>';
+  }
+  function updateSummary(){ /* hook for future use */ }
+
+  function onChange(e){
+    var t=e.target, k;
+    if(t.id==='tfAll'){ S.showAll=t.checked; paintBills(); return; }
+    if(t.classList.contains('tf-to')){
+      var tr=t.closest('tr'), f=findRow(tr.getAttribute('data-k')); if(!f) return;
+      f.r.to=t.value; f.r.auto=false; tr.className=(f.r.cur&&f.r.to!==f.r.cur)?'tf-chg':'';
+      var chg=f.r.cur&&f.r.to!==f.r.cur; tr.cells[0].innerHTML=chg?'<input type="checkbox" class="tf-sel" checked>':''; S.sel[f.r.key]=true;
+      tr.querySelector('.tf-path').innerHTML=pathOf(f.r); paintDay(f.d); return;
+    }
+    if(t.classList.contains('tf-sel')){ var r1=findRow(t.closest('tr').getAttribute('data-k')); if(r1) S.sel[r1.r.key]=t.checked; return; }
+    if(t.classList.contains('tf-rsel')){ S.rsel[+t.closest('tr').getAttribute('data-ri')]=t.checked; return; }
+    if(t.classList.contains('tf-rto')){ var tr2=t.closest('tr'), x=S.receipts[+tr2.getAttribute('data-ri')]; if(!x) return; x.to=t.value; S.rsel[+tr2.getAttribute('data-ri')]=true; paintRecv(); return; }
+    k=t.getAttribute&&t.getAttribute('data-tgt');
+    if(k){ var p=k.split('|'), day=S.days[p[0]]; if(!day) return; var v=r2(t.value); day.tgt[p[1]]=v; day.pinned=true;
+      S.pins[p[0]]=S.pins[p[0]]||{}; BK.forEach(function(b){ S.pins[p[0]][b]=Number(day.tgt[b])||0; }); lsSet('bnxTxnFixPins_'+cid(),S.pins); suggestDay(day); paintDay(p[0]); paintBills(); }
+  }
+  function onClick(e){
+    var b=e.target.closest&&e.target.closest('[data-tf]'); if(!b) return; var a=b.getAttribute('data-tf');
+    if(a==='load') load();
+    else if(a==='suggest'){ if(!S.loaded) return notify('Load first','error'); S.order.forEach(function(d){ suggestDay(S.days[d]); }); paint(); notify('🪄 Suggestions refreshed — review before applying','info'); }
+    else if(a==='reset'){ S.order.forEach(function(d){ S.days[d].rows.forEach(function(r){ r.to=r.cur; r.auto=false; }); }); S.receipts.forEach(function(x){ x.to=x.mode; }); paint(); }
+    else if(a==='apply') apply();
+    else if(a==='csv') exportCsv();
+    else if(a==='jpg') makeJpg();
+  }
+
+  /* ---------- changes / export / apply ---------- */
+  function changes(){
+    var out=[]; S.order.forEach(function(d){ S.days[d].rows.forEach(function(r){ if(r.cur&&r.to!==r.cur&&S.sel[r.key]!==false) out.push(r); }); }); return out;
+  }
+  function exportCsv(){
+    var ch=changes(); if(!ch.length){ notify('Nothing to export — no bill mode is changed','info'); return; }
+    csv('TRANSACTION_DB_payment_mode_fix_'+S.from+(S.to!==S.from?'_to_'+S.to:'')+'.csv',[['BILL_ID','BILL_NUMBER','BILL_DATE','PARTY','AMOUNT','CURRENT_MODE','CORRECT_MODE','WRITE_PATH']]
+      .concat(ch.map(function(r){ return [r.id,r.no,r.date,r.party,r.comp[r.cur],LBL[r.cur],MODEV[r.to],(r.cur==='credit'&&r.due>0.004)?'API settle due':'manual DB fix']; })));
+  }
+  async function verifyOne(r){
+    try{ var p=await apv('BILL_PAYMENTS',{from:r.date,to:r.date}); var m=p&&p.success&&p.data&&p.data[r.no]&&p.data[r.no].m; if(!m) return {ok:false,why:'no payment line found for '+r.no};
+      var okb=Object.keys(m).some(function(k){ return m[k]>0.004&&bucketOf(k)===r.to; }); var still=Object.keys(m).some(function(k){ return m[k]>0.004&&bucketOf(k)==='credit'; });
+      return {ok:okb&&!still,why:okb?(still?'bill still shows a DUE line':''):'new mode line not found'}; }catch(e){ return {ok:false,why:String(e&&e.message||e)}; }
+  }
+  async function apply(){
+    if(S.busy) return; if(!S.loaded){ notify('Load first','error'); return; }
+    var ch=changes(), api=ch.filter(function(r){ return r.cur==='credit'&&r.to!=='credit'&&r.due>0.004; }), man=ch.filter(function(r){ return api.indexOf(r)<0; });
+    var rc=S.receipts.map(function(x,i){ return {x:x,i:i}; }).filter(function(o){ return o.x.to!==o.x.mode&&S.rsel[o.i]!==false; });
+    if(!api.length&&!man.length&&!rc.length){ notify('Nothing to apply — change a “Correct mode” first','info'); return; }
+    if(!canWrite('Fixing payment modes')) return;
+    var msg='Apply to the LIVE transaction DB?\n\n• '+api.length+' DUE bill(s) → settled with the corrected mode (SETTLE_DUE_BILL)\n• '+rc.length+' due-receipt mode change(s) (EDIT_DUES_RECEIPT)\n• '+man.length+' paid-bill mode change(s) → DB-fix CSV (no server action exists)\n\nThe first bill is written and checked before the rest are sent.';
+    if(!confirm(msg)) return;
+    S.busy=true; var okN=0, failN=0, stop=false, errs=[];
+    for(var i=0;i<api.length&&!stop;i++){
+      var r=api[i]; status('Settling '+(i+1)+'/'+api.length+' · '+esc(r.no)+'…');
+      try{
+        var res=await W.erpApi({action:'SETTLE_DUE_BILL',billId:r.id,billNumber:r.no,payments:[{mode:MODEV[r.to],amount:r.due}],
+          paymentDate:r.date,date:r.date,businessDate:r.date,settledOn:r.date,source:'TXN_DB_MODE_FIX'},'V2_CORE');
+        if(!res||!res.success) throw new Error((res&&res.error)||'server refused');
+        okN++;
+        if(okN===1){ var v=await verifyOne(r); if(!v.ok){ stop=true; errs.push('First bill '+r.no+' was written but could not be verified ('+v.why+'). Stopped — check the bill and today\'s DSR/cash book before continuing.'); } }
+      }catch(e){ failN++; errs.push(r.no+': '+(e&&e.message||e)); if(failN>=3){ stop=true; errs.push('Stopped after 3 failures.'); } }
+    }
+    var rOk=0;
+    if(!stop){ for(var j=0;j<rc.length;j++){ var o=rc[j]; status('Receipt '+(j+1)+'/'+rc.length+'…');
+      try{ var rr=await gas('EDIT_DUES_RECEIPT',{voucherNo:o.x.voucher,amount:o.x.amount,paymentMode:o.x.to,reference:o.x.ref}); if(!rr||!rr.success) throw new Error((rr&&rr.error)||'server refused'); rOk++; }
+      catch(e){ errs.push('Receipt '+o.x.voucher+': '+(e&&e.message||e)); } } }
+    S.busy=false;
+    if(man.length) exportCsv();
+    var sum='✅ '+okN+' due bill(s) re-moded · '+rOk+' receipt(s) updated'+(man.length?' · '+man.length+' paid-bill change(s) exported to CSV':'')+(errs.length?'<br>⚠️ '+errs.map(esc).join('<br>⚠️ '):'');
+    await load(); status(sum+'<br>Compare the tables below again, then check the DSR and cash book.',!errs.length);
+    try{ if(typeof W.bnxLoadDueCollection==='function') W.bnxLoadDueCollection(); }catch(e){}
+  }
+
+  /* ---------- party-wise Dues + Due received → JPG ---------- */
+  function collect(){
+    var dues=[]; S.order.forEach(function(d){ S.days[d].rows.forEach(function(r){
+      var a=r.cur?(r.to==='credit'?(r.comp.credit||0):0):(r.comp.credit||0);
+      if(a>0.004) dues.push({date:r.date,no:r.no,amt:r2(a),party:r.party||'(no party)'});
+    }); });
+    var key=function(p){ return String(p).toUpperCase().replace(/\s+/g,' ').trim(); };
+    dues.sort(function(a,b){ return a.date.localeCompare(b.date)||key(a.party).localeCompare(key(b.party))||a.no.localeCompare(b.no); });
+    var rec=S.receipts.map(function(x){ return {date:x.date,no:x.voucher||'—',amt:x.amount,party:x.party||'(no party)',mode:x.to}; });
+    return {dues:dues,rec:rec,key:key};
+  }
+  function ell(ctx,t,w){ t=String(t); if(ctx.measureText(t).width<=w) return t; while(t.length>1&&ctx.measureText(t+'…').width>w) t=t.slice(0,-1); return t+'…'; }
+  function drawTable(ctx,x,y,cols,rows,rowH){
+    rows.forEach(function(row){
+      var cx=x; ctx.fillStyle=row.bg||'#fff'; var tw=cols.reduce(function(s,c){ return s+c.w; },0); ctx.fillRect(x,y,tw,rowH);
+      cols.forEach(function(c,i){
+        ctx.strokeStyle='#222'; ctx.lineWidth=1; ctx.strokeRect(cx+.5,y+.5,c.w,rowH);
+        ctx.fillStyle=row.color||'#000'; ctx.font=(row.bold?'bold ':'')+'15px Arial, Helvetica, sans-serif'; ctx.textBaseline='middle';
+        var t=ell(ctx,row.cells[i]==null?'':row.cells[i],c.w-14);
+        if(c.r){ ctx.textAlign='right'; ctx.fillText(t,cx+c.w-8,y+rowH/2+1); } else if(c.c){ ctx.textAlign='center'; ctx.fillText(t,cx+c.w/2,y+rowH/2+1); } else { ctx.textAlign='left'; ctx.fillText(t,cx+8,y+rowH/2+1); }
+        cx+=c.w;
+      });
+      y+=rowH;
+    });
+    return y;
+  }
+  function buildTables(){
+    var C=collect(), dr=[], rr=[], total=0, g={};
+    C.dues.forEach(function(d){ var k=C.key(d.party); (g[k]=g[k]||[]).push(d); });
+    var gk={}; C.dues.forEach(function(d){ var k=d.date+'|'+C.key(d.party); (gk[k]=gk[k]||[]).push(d); });
+    var seen={};
+    C.dues.forEach(function(d){ var k=d.date+'|'+C.key(d.party); if(seen[k]) return; seen[k]=1; var list=gk[k];
+      list.forEach(function(x){ dr.push({cells:[fd(x.date),x.no,fm(x.amt),x.party]}); total+=x.amt; });
+      if(list.length>1) dr.push({cells:['','Party total ('+list.length+' bills)',fm(list.reduce(function(s,x){ return s+x.amt; },0)),list[0].party],bold:true,bg:'#f3efe6'});
+    });
+    dr.push({cells:['','GRAND TOTAL — '+C.dues.length+' bills',fm(total),''],bold:true,bg:'#ffe9b0'});
+    var rt=0, cash=0, bank=0;
+    C.rec.forEach(function(x){ rr.push({cells:[fd(x.date),x.no,fm(x.amt),x.party,x.mode]}); rt+=x.amt; if(/^CASH/.test(x.mode)) cash+=x.amt; else bank+=x.amt; });
+    rr.push({cells:['','TOTAL RECEIVED — '+C.rec.length,fm(rt),'Cash '+fm(cash)+'  ·  Bank '+fm(bank),''],bold:true,bg:'#e3f3e6'});
+    return {dr:dr,rr:rr,nd:C.dues.length,nr:C.rec.length,total:total,rt:rt};
+  }
+  function makeJpg(){
+    if(!S.loaded){ notify('Load the date(s) first','error'); return; }
+    var T=buildTables(), rowH=30, W0=1000, pad=20, tw=W0-2*pad;
+    var colsD=[{w:120,c:1},{w:230},{w:130,r:1},{w:tw-480}], colsR=[{w:120,c:1},{w:200},{w:130,r:1},{w:tw-600+120},{w:130}];
+    colsR=[{w:120,c:1},{w:190},{w:120,r:1},{w:tw-120-190-120-110},{w:110}];
+    var hdrD={cells:['Date','Bill No','Amount','Party'],bold:true,bg:'#dfe6ee'}, hdrR={cells:['Date','Voucher','Amount','Party','Mode'],bold:true,bg:'#dfe6ee'};
+    var H=pad+78+34+(T.dr.length+1)*rowH+30+34+(T.rr.length+1)*rowH+50;
+    var sc=Math.max(1,Math.min(2,14000/H)); var cv=document.createElement('canvas'); cv.width=Math.round(W0*sc); cv.height=Math.round(H*sc);
+    var ctx=cv.getContext('2d'); ctx.scale(sc,sc); ctx.fillStyle='#fff'; ctx.fillRect(0,0,W0,H);
+    var y=pad; ctx.textBaseline='top'; ctx.textAlign='left'; ctx.fillStyle='#14233b'; ctx.font='bold 24px Arial, Helvetica, sans-serif'; ctx.fillText(outlet(),pad,y); y+=32;
+    ctx.fillStyle='#444'; ctx.font='bold 16px Arial, Helvetica, sans-serif';
+    ctx.fillText('Party-wise Dues & Due Received — '+(S.from===S.to?fd(S.from):fd(S.from)+' to '+fd(S.to)),pad,y); y+=26;
+    ctx.fillStyle='#777'; ctx.font='12px Arial, Helvetica, sans-serif'; ctx.fillText('Dues '+T.nd+' bill(s) ₹'+fm(T.total)+'   ·   Received '+T.nr+' receipt(s) ₹'+fm(T.rt),pad,y); y+=26;
+    ctx.fillStyle='#b8690e'; ctx.font='bold 15px Arial, Helvetica, sans-serif'; ctx.fillText('1) SAME-DAY DUES (party-wise)',pad,y); y+=26;
+    y=drawTable(ctx,pad,y,colsD,[hdrD].concat(T.dr),rowH); y+=26;
+    ctx.fillStyle='#1a7f3c'; ctx.font='bold 15px Arial, Helvetica, sans-serif'; ctx.textAlign='left'; ctx.textBaseline='top'; ctx.fillText('2) DUE RECEIVED',pad,y); y+=26;
+    y=drawTable(ctx,pad,y,colsR,[hdrR].concat(T.rr),rowH); y+=14;
+    ctx.fillStyle='#999'; ctx.font='11px Arial, Helvetica, sans-serif'; ctx.textAlign='left'; ctx.textBaseline='top'; ctx.fillText('Generated '+new Date().toLocaleString('en-IN')+' · Balaji NextGen ERP',pad,y);
+    cv.toBlob(function(b){ if(!b){ notify('JPG generation failed','error'); return; } showJpg(b); },'image/jpeg',0.95);
+  }
+  function showJpg(blob){
+    var old=$('bnxTxnJpg'); if(old) old.remove();
+    var url=URL.createObjectURL(blob), name='Dues_Received_'+outlet().replace(/\s+/g,'_')+'_'+S.from+(S.to!==S.from?'_to_'+S.to:'')+'.jpg';
+    var o=document.createElement('div'); o.id='bnxTxnJpg';
+    var canShare=false; try{ canShare=!!(navigator.share&&navigator.canShare&&navigator.canShare({files:[new File([blob],name,{type:'image/jpeg'})]})); }catch(e){}
+    o.innerHTML='<div class="box"><div class="img"><img alt="Dues and received list" src="'+url+'"></div><div class="act">'
+      +'<a class="btn btn-primary" href="'+url+'" download="'+esc(name)+'" style="text-decoration:none;padding:9px 16px">⬇ Download JPG</a>'
+      +(canShare?'<button class="btn btn-ghost" id="tfShare" style="padding:9px 16px">📤 Share</button>':'')
+      +'<button class="btn btn-ghost" id="tfJClose" style="padding:9px 16px">Close</button></div></div>';
+    document.body.appendChild(o);
+    o.querySelector('#tfJClose').onclick=function(){ o.remove(); URL.revokeObjectURL(url); };
+    o.addEventListener('click',function(e){ if(e.target===o){ o.remove(); URL.revokeObjectURL(url); } });
+    var sh=o.querySelector('#tfShare'); if(sh) sh.onclick=function(){ navigator.share({files:[new File([blob],name,{type:'image/jpeg'})],title:name}).catch(function(){}); };
+    W.__bnxTxnFixJpgBlob=blob;
+  }
+
+  /* ---------- page hook ---------- */
+  var origShow=W.showPage;
+  if(typeof origShow==='function'&&!origShow.__bnxTxnFix){
+    var hw=function(id){ var res=origShow.apply(this,arguments); try{ if(id==='due-collection') ensureUi(); }catch(e){} return res; };
+    Object.keys(origShow).forEach(function(k){ try{ hw[k]=origShow[k]; }catch(x){} }); hw.__bnxTxnFix=true; W.showPage=hw;
+  }
+  W.bnxTxnFix={ load:load, state:function(){ return S; }, bucketOf:bucketOf, subset:subset, suggestDay:suggestDay, totals:totals, mkRow:mkRow, dsrTargets:dsrTargets, buildTables:buildTables, makeJpg:makeJpg,
+    open:function(){ if(typeof W.showPage==='function') W.showPage('due-collection'); var c=ensureUi(); if(c&&c.scrollIntoView) c.scrollIntoView({behavior:'smooth',block:'start'}); } };
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',ensureUi); else ensureUi();
+})();
+</script>
+
 </body></html>
