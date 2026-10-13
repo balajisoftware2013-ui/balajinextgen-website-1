@@ -4967,7 +4967,7 @@ function bnxDueDisplaySummary_(){
   const el=$('dsrDueControlSummary');if(el)el.textContent=parts.join('  |  ');
 }
 
-async function loadDsrReconciliation_(force){
+async function _loadDsrReconciliationImpl_(force){
   const ds=$('repDate')?.value||bnxToday_();
   const from=$('reconFrom'),to=$('reconTo');
   if(from&&!from.value)from.value=ds;if(to&&!to.value)to.value=ds;
@@ -4975,38 +4975,59 @@ async function loadDsrReconciliation_(force){
   const body=$('dsrReconBody'), warn=$('dsrReconWarnings'), summary=$('dsrReconSummary');
   if(body)body.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:14px">Loading live DSR / Swift / settlement / bank controls…</td></tr>';
   if(warn){warn.style.display='none';warn.textContent='';}
-  let bank=null;
-  try{const r=await gasApi('GET_DSR_BANK_RECONCILIATION',{from:rf,to:rt});if(r&&r.success&&r.data)bank=r.data;}catch(e){console.warn('[DSR RECON]',e);}
-  // Local Swift fallback remains available when the backend reconciliation endpoint is unavailable.
-  const swiftTxnRows=(window.swiftRows||[]).map(r=>({date:swiftDate_(r),mode:swiftMode_(r),amount:swiftNum_(r,'amount'),net:swiftMap.settle?swiftNum_(r,'settle'):swiftNum_(r,'amount')-swiftNum_(r,'charge'),charge:swiftNum_(r,'charge'),ref:swiftText_(r,'ref')})).filter(r=>(!rf||!r.date||r.date>=rf)&&(!rt||!r.date||r.date<=rt));
-  const swiftCard=swiftTxnRows.filter(r=>r.mode==='CARD').reduce((s,r)=>s+r.amount,0);
-  const swiftUpi=swiftTxnRows.filter(r=>r.mode==='UPI').reduce((s,r)=>s+r.amount,0);
-  const swiftTotal=swiftCard+swiftUpi;
-  let due=0;try{due=(await bnxGetDuePeriod_(rf,rt)).received||0;}catch(e){}
-  let dsrCard=0,dsrUpi=0,dsrDue=0;
-  Object.entries(STANDARD_DATA||{}).forEach(([d,r])=>{if(d>=rf&&d<=rt){dsrCard+=bnxDueNum_(r.card);dsrUpi+=bnxDueNum_(r.gpay);dsrDue+=bnxDueNum_(r.duerecvcash)+bnxDueNum_(r.duerecvbank);}});
-  const live=bank?.rows?.[0]||null;
-  const actualSwift=live?bnxDueNum_(live.swipeTxn?.card)+bnxDueNum_(live.swipeTxn?.upi):swiftTotal;
-  const actualSettle=live?bnxDueNum_(live.settlement?.totalNet):swiftTxnRows.reduce((s,r)=>s+r.net,0);
-  const actualBank=live?bnxDueNum_(live.bank?.total):actualSettle;
-  const controls=[
-    ['CARD — DSR vs Swift',dsrCard,live?bnxDueNum_(live.swipeTxn?.card):swiftCard,'Live POS card vs Swift transaction feed'],
-    ['UPI — DSR vs Swift',dsrUpi,live?bnxDueNum_(live.swipeTxn?.upi):swiftUpi,'Live POS UPI vs Swift transaction feed'],
-    ['Swift → Settlement',swiftTotal,actualSettle,'Transaction gross/amount vs settlement net; charges are retained separately'],
-    ['Settlement → Bank',actualSettle,actualBank,'Bank credit expected from settlement feed'],
-    ['Due Received',dsrDue,due,'Customer due receipts; never included in Swift settlement totals']
-  ];
-  let alerts=0;
-  if(body)body.innerHTML=controls.map(x=>{const diff=x[1]-x[2],abs=Math.abs(diff),cls=abs<=1?'recon-ok':abs<=10?'recon-warn':'recon-alert';if(abs>10)alerts++;return `<tr><td><b>${x[0]}</b></td><td class="r">₹${fmt(x[1])}</td><td class="r">₹${fmt(x[2])}</td><td class="r ${cls}">${diff===0?'—':(diff>0?'+':'')+'₹'+fmt(diff)}</td><td class="${cls}">${abs<=1?'✅ MATCH':abs<=10?'🟡 REVIEW':'🔴 ALERT'}</td><td>${x[3]}</td></tr>`;}).join('');
-  if($('dr_dsr'))$('dr_dsr').textContent=fmt(dsrCard+dsrUpi);
-  if($('dr_swift'))$('dr_swift').textContent=fmt(actualSwift);
-  if($('dr_settle'))$('dr_settle').textContent=fmt(actualSettle);
-  if($('dr_bank'))$('dr_bank').textContent=fmt(actualBank);
-  if($('dr_due'))$('dr_due').textContent=fmt(due);
-  const status=alerts?'🔴 Review Required':'✅ Controls Matched';if($('dr_status'))$('dr_status').textContent=status;
-  if(summary)summary.textContent=`Period ${rf} → ${rt} · DSR card+UPI ₹${fmt(dsrCard+dsrUpi)} · Swift ₹${fmt(actualSwift)} · Settlement ₹${fmt(actualSettle)} · Bank ₹${fmt(actualBank)} · Due Received ₹${fmt(due)}`;
-  if(warn && live?.otherBankCredits?.length){warn.style.display='block';warn.textContent='⚠️ '+live.otherBankCredits.length+' bank credit(s) were not matched to DUES_RECEIPT. They are excluded from Due Received: ₹'+fmt(live.otherBankCreditsTotal||0)+'.';}
-  return !alerts;
+  let bank=null, liveNote='';
+  /* 2026-10-13: paint() draws the controls from LOCAL data (DSR + uploaded Swift) at once; the live bank call then upgrades it.
+     Before, the table stayed on "Loading…" until the slow / expired live call came back (or forever), so Reconciliation looked empty. */
+  const paint=async()=>{
+    // Local Swift fallback remains available when the backend reconciliation endpoint is unavailable.
+    const swiftTxnRows=(typeof swiftRows!=='undefined'&&Array.isArray(swiftRows)?swiftRows:[]).map(r=>({date:swiftDate_(r),mode:swiftMode_(r),amount:swiftNum_(r,'amount'),net:swiftMap.settle?swiftNum_(r,'settle'):swiftNum_(r,'amount')-swiftNum_(r,'charge'),charge:swiftNum_(r,'charge'),ref:swiftText_(r,'ref')})).filter(r=>(!rf||!r.date||r.date>=rf)&&(!rt||!r.date||r.date<=rt));
+    const swiftCard=swiftTxnRows.filter(r=>r.mode==='CARD').reduce((s,r)=>s+r.amount,0);
+    const swiftUpi=swiftTxnRows.filter(r=>r.mode==='UPI').reduce((s,r)=>s+r.amount,0);
+    const swiftTotal=swiftCard+swiftUpi;
+    let due=0;try{due=(await bnxGetDuePeriod_(rf,rt)).received||0;}catch(e){}
+    let dsrCard=0,dsrUpi=0,dsrDue=0;
+    Object.entries(STANDARD_DATA||{}).forEach(([d,r])=>{if(d>=rf&&d<=rt){dsrCard+=bnxDueNum_(r.card);dsrUpi+=bnxDueNum_(r.gpay);dsrDue+=bnxDueNum_(r.duerecvcash)+bnxDueNum_(r.duerecvbank);}});
+    const live=bank?.rows?.[0]||null;
+    const actualSwift=live?bnxDueNum_(live.swipeTxn?.card)+bnxDueNum_(live.swipeTxn?.upi):swiftTotal;
+    const actualSettle=live?bnxDueNum_(live.settlement?.totalNet):swiftTxnRows.reduce((s,r)=>s+r.net,0);
+    const actualBank=live?bnxDueNum_(live.bank?.total):actualSettle;
+    const controls=[
+      ['CARD — DSR vs Swift',dsrCard,live?bnxDueNum_(live.swipeTxn?.card):swiftCard,'Live POS card vs Swift transaction feed'],
+      ['UPI — DSR vs Swift',dsrUpi,live?bnxDueNum_(live.swipeTxn?.upi):swiftUpi,'Live POS UPI vs Swift transaction feed'],
+      ['Swift → Settlement',swiftTotal,actualSettle,'Transaction gross/amount vs settlement net; charges are retained separately'],
+      ['Settlement → Bank',actualSettle,actualBank,'Bank credit expected from settlement feed'],
+      ['Due Received',dsrDue,due,'Customer due receipts; never included in Swift settlement totals']
+    ];
+    let alerts=0;
+    if(body)body.innerHTML=controls.map(x=>{const diff=x[1]-x[2],abs=Math.abs(diff),cls=abs<=1?'recon-ok':abs<=10?'recon-warn':'recon-alert';if(abs>10)alerts++;return `<tr><td><b>${x[0]}</b></td><td class="r">₹${fmt(x[1])}</td><td class="r">₹${fmt(x[2])}</td><td class="r ${cls}">${diff===0?'—':(diff>0?'+':'')+'₹'+fmt(diff)}</td><td class="${cls}">${abs<=1?'✅ MATCH':abs<=10?'🟡 REVIEW':'🔴 ALERT'}</td><td>${x[3]}</td></tr>`;}).join('');
+    if($('dr_dsr'))$('dr_dsr').textContent=fmt(dsrCard+dsrUpi);
+    if($('dr_swift'))$('dr_swift').textContent=fmt(actualSwift);
+    if($('dr_settle'))$('dr_settle').textContent=fmt(actualSettle);
+    if($('dr_bank'))$('dr_bank').textContent=fmt(actualBank);
+    if($('dr_due'))$('dr_due').textContent=fmt(due);
+    const status=alerts?'🔴 Review Required':'✅ Controls Matched';if($('dr_status'))$('dr_status').textContent=status;
+    if(summary)summary.textContent=`Period ${rf} → ${rt} · DSR card+UPI ₹${fmt(dsrCard+dsrUpi)} · Swift ₹${fmt(actualSwift)} · Settlement ₹${fmt(actualSettle)} · Bank ₹${fmt(actualBank)} · Due Received ₹${fmt(due)}`;
+    if(warn && live?.otherBankCredits?.length){warn.style.display='block';warn.textContent='⚠️ '+live.otherBankCredits.length+' bank credit(s) were not matched to DUES_RECEIPT. They are excluded from Due Received: ₹'+fmt(live.otherBankCreditsTotal||0)+'.';}
+    return !alerts;
+  };
+  try{ await paint(); }catch(e){ console.warn('[DSR RECON local]',e); }
+  try{
+    const r=await Promise.race([gasApi('GET_DSR_BANK_RECONCILIATION',{from:rf,to:rt}),new Promise(res=>setTimeout(()=>res({__timeout:true}),30000))]);
+    if(r&&r.authExpired) liveNote='🔐 Session expired — live bank data was not loaded. Log in again, then press Run Live.';
+    else if(r&&r.__timeout) liveNote='⏱ Live bank data is slow — showing DSR and uploaded Swift figures. Press Run Live to retry.';
+    else if(r&&r.success&&r.data) bank=r.data;
+    else liveNote='ℹ️ Live bank data is not available right now — showing DSR and uploaded Swift figures.';
+  }catch(e){ console.warn('[DSR RECON]',e); liveNote='ℹ️ Live bank data could not be loaded — showing DSR and uploaded Swift figures.'; }
+  let ok=true; try{ ok=await paint(); }catch(e){ console.warn('[DSR RECON live]',e); }
+  if(liveNote&&warn){ warn.textContent=(warn.style.display==='block'&&warn.textContent?warn.textContent+'  ':'')+liveNote; warn.style.display='block'; }
+  return ok;
+}
+/* one run at a time: the tab button called this twice (button + innerTab) — a second call now joins the first */
+let __reconBusy_=null;
+function loadDsrReconciliation_(force){
+  if(__reconBusy_&&!force) return __reconBusy_;
+  const pr=_loadDsrReconciliationImpl_(force); __reconBusy_=pr;
+  const done=()=>{ if(__reconBusy_===pr) __reconBusy_=null; }; pr.then(done,done); return pr;
 }
 function exportDsrReconciliation_(){
   if(typeof XLSX==='undefined'){showToast('XLSX loading','');return;}
