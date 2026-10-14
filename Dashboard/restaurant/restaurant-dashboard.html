@@ -458,10 +458,17 @@ window.bnxSafeUri_=function(s){s=String(s==null?'':s).replace(/[\uD800-\uDBFF](?
     return o;
   }
   var RULES=(function(){ try{ return normalize(JSON.parse(localStorage.getItem('bnx_apv_rules_'+cid())||'null')); }catch(e){ return defaults(); } })(), rulesT=0;
+  var RULES_CACHED=(function(){ try{ return !!localStorage.getItem('bnx_apv_rules_'+cid()); }catch(e){ return false; } })(), rulesBg=null;
   async function rules(force){
     if (!force && Date.now()-rulesT<120000) return RULES;
+    /* PRINT SPEED 2026-10-14: Save & Print waited for APPROVAL_SETTINGS_GET (up to 15 s on a ~17 s-average backend)
+       before SAVE_BILL even started. With a saved copy on this device, answer from it and refresh in the background. */
+    if (!force && RULES_CACHED){
+      if (!rulesBg) rulesBg=apv('APPROVAL_SETTINGS_GET',{},15000).then(function(r){ if (r && r.success && r.data){ RULES=normalize(r.data); rulesT=Date.now(); try{ localStorage.setItem('bnx_apv_rules_'+cid(), JSON.stringify(RULES)); }catch(e){} } }).catch(function(){}).then(function(){ rulesBg=null; });
+      return RULES;
+    }
     var r=await apv('APPROVAL_SETTINGS_GET',{},15000);
-    if (r && r.success && r.data){ RULES=normalize(r.data); rulesT=Date.now(); try{ localStorage.setItem('bnx_apv_rules_'+cid(), JSON.stringify(RULES)); }catch(e){} }
+    if (r && r.success && r.data){ RULES=normalize(r.data); rulesT=Date.now(); RULES_CACHED=true; try{ localStorage.setItem('bnx_apv_rules_'+cid(), JSON.stringify(RULES)); }catch(e){} }
     return RULES;
   }
   W.bnxApvRules = function(){ return RULES; };
@@ -518,6 +525,17 @@ window.bnxSafeUri_=function(s){s=String(s==null?'':s).replace(/[\uD800-\uDBFF](?
     if (!need.length) return {ok:true, body:body};
     if (DONE[rid]) return {ok:true, body:stamp(body, DONE[rid])};
     if (selfOk(r, need, st)){                                              /* exempt role / allowed approver: self-approved, logged */
+      /* PRINT SPEED 2026-10-14: every discounted / credit bill by an Admin/Owner waited for APPROVAL_REQUEST
+         (a full server round trip) BEFORE SAVE_BILL started — the invoice took two back-to-back server calls.
+         When the server does not enforce approvals, the self-approval is logged IN PARALLEL with the save and
+         marked USED with the real bill number afterwards. With server enforcement on, the old wait is kept. */
+      if (!st.serverEnforce){
+        var logP=apv('APPROVAL_REQUEST',{requestId:rid,bill:b,reason:b.ncReason||W.__bnxNCReason||''},20000).then(function(s){
+          if (s && s.success && s.data && s.data.id){ DONE[rid]={id:s.data.id, by:userName()+' ('+r+')', type:need.join('+')}; return s.data.id; }
+          return '';
+        }).catch(function(){ return ''; });
+        return {ok:true, body:body, logP:logP};
+      }
       var s=await apv('APPROVAL_REQUEST',{requestId:rid,bill:b,reason:b.ncReason||W.__bnxNCReason||''},20000);
       if (s && s.success && s.data && s.data.id){ DONE[rid]={id:s.data.id, by:userName()+' ('+r+')', type:need.join('+')}; return {ok:true, body:stamp(body,DONE[rid])}; }
       return {ok:true, body:body};                                        /* approval service down: never block the owner */
@@ -647,6 +665,11 @@ window.bnxSafeUri_=function(s){s=String(s==null?'':s).replace(/[\uD800-\uDBFF](?
           if (act==='SAVE_BILL' && body.bill){
             var g=await gateBill(body);
             if (!g.ok){ setTimeout(function(){ notif('⛔ Bill not saved — '+g.error,'error'); },80); return json({success:false, approvalRejected:true, error:g.error}); }
+            if (g.logP){
+              var respP=await ORIG(input,init);
+              respP.clone().json().then(function(j){ if(j&&(j.success||j.billNo||j.serverId)){ var bn=String(j.serverId||j.billNo||(j.data&&j.data.BILL_NUMBER)||''); g.logP.then(function(id){ if(id) apv('APPROVAL_MARK_USED',{id:id,billNo:bn},20000); }); } }).catch(function(){});
+              return respP;
+            }
             if (g.body!==body){
               init=Object.assign({},init,{body:JSON.stringify(g.body)});
               var resp=await ORIG(input,init), aid=g.body.approvalId;
@@ -17372,18 +17395,131 @@ async function bnxLoadTaxMaster_(){
 }
 document.addEventListener('DOMContentLoaded',function(){ setTimeout(function(){ bnxLoadTaxMaster_().catch(function(){}); },400); });
 window.bnxLoadTaxMaster_=bnxLoadTaxMaster_;
-function bnxMasterTaxMeta_(item,name){
+/* ═══ ITEM-MASTER TAX INDEX — 2026-10-14 ("some liquor items but tax show") ═══
+   ROOT CAUSES (verified against CL00010 MASTER_DB + APPROVALS):
+   1. Tax was resolved from whatever group/taxId the MENU row carried. Bar rows from
+      GET_POS_MENU / the ITEM_MASTER fallback can arrive with NO itemGroupId / taxId; the
+      static fallback then only recognised the word "LIQUOR", so BEER / CRAFT BEER / WINE /
+      SCOTCH … sections fell through to FOOD 5%. (Bill HT/2627/00007254: 3x BUDWISER PREM
+      CAN taxed 5% — ₹140.75 GST on a bill whose food share was only ₹1,037.)
+   2. New Bill (bmComputeTax) taxed any row whose name did not match the bill-menu name
+      exactly with the manual dropdown default = 5%, even when it was a liquor item.
+   3. Five liquor items were created in ITEM_MASTER under FOOD (GRP00001/TAX00001):
+      ITM01123 SINGLETON 12YR BTL MRP, ITM01137 JAGERMIESTER ICE COLD SHOT,
+      ITM01144 OLD MONK MANGO MRP, ITM01147 MOSSO PEACH WINE BTL MRP, ITM01158 SANTORI TOKI.
+   FIX: one resolver for every screen. ITEM_MASTER (by ITEM_ID, then name) → ITEM GROUP →
+   TAX_ID is authoritative; then the row's own group / TAX_ID; then bar/liquor recognition;
+   the old static table is last. A clearly-alcoholic item name that resolves to a GST rate
+   (mis-grouped item) is taxed as liquor and logged once, so a bad master row can never put
+   GST on liquor again. */
+window.__BNX_ITEM_TAX_IDX = window.__BNX_ITEM_TAX_IDX || {byId:{}, byName:{}, n:0};
+const BNX_GROUP_TAX_STATIC_ = {GRP00001:'TAX00001',GRP00002:'TAX00001',GRP00003:'TAX00002',GRP00004:'TAX00004',GRP00005:'TAX00001',GRP00006:'TAX00003'};
+const BNX_LIQUOR_NAME_RE_ = /\b(BEERS?|WINES?|WHISK(?:E)?Y|VODKA|RUM|GIN|TEQUILA|MEZCAL|SCOTCH|BOURBON|BRANDY|COGNAC|CHAMPAGNE|PROSECCO|LIQUOR|LIQUEUR|LAGER|BREEZER|SINGLE\s+MALT|JAGER\w*|BUDWEISER|BUDWISER|BUDWIESER|KINGFISHER|TUBORG|CARLSBERG|HEINEKEN|CORONA|HOEGAARDEN|SMIRNOFF|ABSOLUT|BACARDI|JAMESON|CHIVAS|GLENFIDDICH|GLENLIVET|SINGLETON|SUNTORY|SANTORI|OLD\s+MONK|SULA|JACOB'?S?|MOSSO)\b/i;
+const BNX_LIQUOR_SECTION_RE_ = /\b(LIQUOR|BAR|BEERS?|CRAFT|WINES?|WHISK\w*|SCOTCH|VODKA|RUM|GIN|TEQUILA|COGNAC|BRANDY|CHAMPAGNE|SPARKLING|COCKTAILS?|SHOTS?|SPIRITS?|MALT|APERITIF|ALCOPOPS?|BOURBON|LIQUEUR|ALCOHOL\w*)\b/i;
+const BNX_NONLIQUOR_RE_ = /(MOCKTAIL|SOFT|DRINK\s*&\s*DRIVE|JUICE|WATER|SODA|AERATED|HUKKA|HOOKAH|SHEESHA|HASH\s*FREEZ|TOBACCO|CIGAR|BATTER|CAKE|SAUCE|CHICKEN|FISH|PRAWN|PANEER|PIZZA)/i;
+function bnxItemKey_(v){ return String(v==null?'':v).trim().toUpperCase().replace(/\s+/g,' '); }
+function bnxItemTaxIdxKey_(){ return 'bnx_item_tax_idx_'+((typeof CLIENT_ID!=='undefined'&&CLIENT_ID)?CLIENT_ID:'default'); }
+function bnxBuildItemTaxIdx_(rows){
+  if(!Array.isArray(rows)||!rows.length) return false;
+  const byId={}, byName={}; let n=0;
+  rows.forEach(function(r){
+    if(!r||typeof r!=='object') return;
+    const id=bnxItemKey_(r.ITEM_ID??r.itemId??r.id??''), code=bnxItemKey_(r.ITEM_CODE??r.itemCode??'');
+    const name=bnxItemKey_(r.ITEM_NAME??r.itemName??r.name??'');
+    if(!id&&!name) return;
+    const g=String(r.ITEM_GROUP_ID??r.itemGroupId??'').trim().toUpperCase(), t=String(r.TAX_ID??r.taxId??'').trim().toUpperCase();
+    if(!g&&!t) return;
+    const ar=r.IS_ACTIVE??r.isActive??r.ACTIVE, a=(ar===false||/^(false|no|n|0|inactive)$/i.test(String(ar??'')))?0:1;
+    const e={g:g,t:t,a:a,n:name,s:String(r.MENU_SECTION??r.menuSection??r.CATEGORY_NAME??r.categoryName??'').trim().toUpperCase()};
+    /* ITEM_ID is NOT unique in every master (CL00010: ITM00857 = DARJEELING STYLE MOMO VEG and Jameson (60ML),
+       ITM00858 = OUR GREEN SALAD and GLENIVET 12YR BTL MRP). Keep every row per id; the lookup picks by name. */
+    [id,code].forEach(function(k){ if(!k) return; const L=byId[k]||(byId[k]=[]); if(!L.some(function(x){ return x.n===e.n&&x.g===e.g; })) L.push(e); });
+    if(name){ const p=byName[name]; if(!p||(!p.a&&e.a)) byName[name]=e; }
+    n++;
+  });
+  if(!n) return false;
+  window.__BNX_ITEM_TAX_IDX={byId:byId,byName:byName,n:n,at:Date.now()};
+  try{ localStorage.setItem(bnxItemTaxIdxKey_(),JSON.stringify(window.__BNX_ITEM_TAX_IDX)); }catch(e){}
+  try{ if(typeof recalcCart==='function'&&document.getElementById('cSub')) recalcCart(); }catch(e){}
+  try{ if(typeof bmRecalc==='function'&&document.querySelector('[id^="bm-irow-"]')) bmRecalc(); }catch(e){}
+  return true;
+}
+window.bnxBuildItemTaxIdx_=bnxBuildItemTaxIdx_;
+(function(){ try{ const c=JSON.parse(localStorage.getItem(bnxItemTaxIdxKey_())||'null'); if(c&&c.byId&&c.n) window.__BNX_ITEM_TAX_IDX=c; }catch(e){} })();
+document.addEventListener('DOMContentLoaded',function(){ setTimeout(function(){
+  try{ if(typeof gasApi==='function') gasApi('GET_MASTER',{category:'item_master'},'V2_CORE').then(function(r){ const rows=Array.isArray(r&&r.data)?r.data:[]; if(rows.length){ bnxBuildItemTaxIdx_(rows); try{ localStorage.setItem(bnxItemTaxIdxKey_()+'_loaded','1'); }catch(e){} } }).catch(function(){}); }catch(e){}
+},1200); });
+function bnxItemTaxIdxFind_(x,name){
+  const I=window.__BNX_ITEM_TAX_IDX; if(!I||!I.n) return null;
+  x=x||{};
+  const nm=bnxItemKey_(name||x.n||x.name||x.ITEM_NAME||'');
+  const ids=[x.code,x.itemCode,x.itemId,x.ITEM_ID,x.ITEM_CODE,x.id];
+  for(let k=0;k<ids.length;k++){
+    const kk=bnxItemKey_(ids[k]); let L=kk&&I.byId[kk]; if(!L) continue;
+    if(!Array.isArray(L)) L=[L];                                   /* index cached by an older build */
+    if(L.length===1 && (!nm || !L[0].n || L[0].n===nm || !I.byName[nm])) return L[0];
+    const same=L.filter(function(e){ return e.n===nm; });
+    if(same.length) return same.find(function(e){ return e.a; })||same[0];
+    break;                                                          /* shared / mismatched id → trust the name */
+  }
+  return (nm&&I.byName[nm])||null;
+}
+window.bnxItemTaxIdxFind_=bnxItemTaxIdxFind_;
+function bnxGroupTaxId_(gid){
+  gid=String(gid||'').trim().toUpperCase(); if(!gid) return '';
   const T=window.BNX_LIVE_TAX;
-  if(T&&T.loaded){
-    const x=item||{};
+  if(T&&T.loaded) return T.groupTax['ID:'+gid]||'';
+  return BNX_GROUP_TAX_STATIC_[gid]||'';
+}
+function bnxTaxMetaById_(tid){
+  tid=String(tid||'').trim().toUpperCase(); if(!tid) return null;
+  const T=window.BNX_LIVE_TAX;
+  if(T&&T.loaded&&T.byId[tid]) return Object.assign({},T.byId[tid]);
+  if(BNX_MASTER_TAX_FALLBACK[tid]) return Object.assign({taxId:tid},BNX_MASTER_TAX_FALLBACK[tid]);
+  return null;
+}
+function bnxLiquorTaxMeta_(){
+  const T=window.BNX_LIVE_TAX;
+  const tid=(T&&T.loaded&&(T.groupTax['NM:LIQUOR']||T.groupTax['ID:GRP00003']))||'TAX00002';
+  return bnxTaxMetaById_(tid)||Object.assign({taxId:'TAX00002'},BNX_MASTER_TAX_FALLBACK.TAX00002);
+}
+function bnxLooksLiquor_(name,sectionText){
+  const nm=String(name||''), sec=String(sectionText||'');
+  if(BNX_NONLIQUOR_RE_.test(nm+' '+sec)) return false;
+  return BNX_LIQUOR_NAME_RE_.test(nm) || BNX_LIQUOR_SECTION_RE_.test(sec);
+}
+window.bnxLooksLiquor_=bnxLooksLiquor_;
+const __bnxMisgroupWarned={};
+function bnxMasterTaxMeta_(item,name){
+  const x=item||{};
+  const nm=String(name||x.n||x.name||x.ITEM_NAME||'');
+  const sec=[x.c,x.cat,x.category,x.menuSection,x.MENU_SECTION,x.barCategory,x.itemGroupName,x.ITEM_GROUP_NAME].filter(Boolean).join(' ');
+  let meta=null;
+  /* 1. ITEM_MASTER is authoritative: item → ITEM GROUP → TAX_ID (item TAX_ID if the group has none) */
+  const hit=bnxItemTaxIdxFind_(x,nm);
+  if(hit) meta=bnxTaxMetaById_(bnxGroupTaxId_(hit.g))||bnxTaxMetaById_(hit.t);
+  /* 2. the row's own group / tax id */
+  if(!meta){
+    const T=window.BNX_LIVE_TAX;
     const gid=String(x.itemGroupId||x.ITEM_GROUP_ID||x.groupId||x.GROUP_ID||'').trim().toUpperCase();
     const gnm=bnxTaxNorm_(x.itemGroupName||x.ITEM_GROUP_NAME||x.groupName||x.GROUP_NAME||'');
     const own=String(x.taxId||x.TAX_ID||x.taxID||'').trim().toUpperCase();
-    /* ITEM GROUP is authoritative (same rule as before), then the item's own TAX_ID. */
-    const tid=(gid&&T.groupTax['ID:'+gid])||(gnm&&T.groupTax['NM:'+gnm])||(own&&T.byId[own]?own:'');
-    if(tid&&T.byId[tid]) return Object.assign({},T.byId[tid]);
+    const tid=bnxGroupTaxId_(gid)||(T&&T.loaded&&gnm?T.groupTax['NM:'+gnm]:'')||'';
+    meta=bnxTaxMetaById_(tid)||(own?bnxTaxMetaById_(own):null);
   }
-  return bnxMasterTaxMetaStatic_(item,name);
+  /* 3. bar / liquor item with no usable master link */
+  if(!meta){
+    const bar=x.isBar===true||x.IS_BAR===true||/^(1|true|yes)$/i.test(String(x.IS_BAR??''))||/^BAR$/i.test(String(x.menuType||x.MENU_TYPE||''));
+    if((bar&&!BNX_NONLIQUOR_RE_.test(nm+' '+sec))||bnxLooksLiquor_(nm,sec)) meta=bnxLiquorTaxMeta_();
+  }
+  if(!meta) meta=bnxMasterTaxMetaStatic_(item,name);
+  /* 4. GUARD: liquor is outside GST — a clearly alcoholic item mis-grouped under FOOD/BEVERAGE never gets GST */
+  if(meta && Number(meta.rate)>0 && BNX_LIQUOR_NAME_RE_.test(nm) && !BNX_NONLIQUOR_RE_.test(nm+' '+sec+' '+(hit?hit.s:''))){
+    const k=bnxItemKey_(nm);
+    if(!__bnxMisgroupWarned[k]){ __bnxMisgroupWarned[k]=1; console.warn('[TAX] "'+nm+'" is liquor but its ITEM_MASTER group carries GST — billed as liquor (0%). Fix its ITEM_GROUP_ID to the LIQUOR group.'); }
+    meta=bnxLiquorTaxMeta_();
+  }
+  return meta;
 }
 /* Built-in fallback (CL00010 IDs) — used only when the master DB has no answer. */
 function bnxMasterTaxMetaStatic_(item,name){
@@ -18946,6 +19082,8 @@ async function settleOrder(){
       counterCode: 'C1'
     };
 
+    /* PRINT SPEED 2026-10-14: open the QZ Tray / BILL printer link WHILE the server saves (same as New Bill) */
+    try{ if(localStorage.getItem('bnx_direct_ip_print')!=='0' && window.bnxConnectQz_) window.bnxConnectQz_().catch(function(){}); }catch(e){}
     const res = await gasApi('SAVE_BILL', { requestId, bill: draftBill }, 'V2_CORE');
     if (!res || !res.success){
       bnxQueuePending('SAVE_BILL', { requestId, bill: draftBill }, requestId);
@@ -20854,7 +20992,18 @@ function resetVoucherNumbering(){
    called, so a price change, a menu sync, or an Excel import is
    instantly reflected in New Bill too — one Item Master, one price,
    everywhere, with zero separate state that can go stale. */
+/* PRINT SPEED 2026-10-14: bmGetBillData()/bmComputeTax() rebuilt this whole list (1,200+ items) 2-3 times
+   PER BILL ROW on every keystroke and again during Save & Print. Same menuData → same list for 1.5 s. */
+let __bnxBillMenuMemo=null;
 function bnxGetBillMenu(){
+  const src=(typeof menuData!=='undefined'&&Array.isArray(menuData))?menuData:[];
+  const M=__bnxBillMenuMemo, now=Date.now();
+  if(M && M.src===src && M.len===src.length && now-M.t<1500) return M.out;
+  const out=bnxBuildBillMenu_(src);
+  __bnxBillMenuMemo={src:src,len:src.length,t:now,out:out};
+  return out;
+}
+function bnxBuildBillMenu_(menuData){
   return menuData.map(m=>({
     id: m.code, em: m.e || bnxDefaultIcon(m.c), name: m.n, cat: m.c, price: Number(m.p)||0,
     taxId:m.taxId||m.TAX_ID||'', hsn:m.hsn||m.HSN_CODE||'',
@@ -21181,7 +21330,13 @@ function bmComputeTax(items, discPct, scPct){
   const billMenuByName = Object.create(null);
   billMenu.forEach(m=>{ billMenuByName[String(m.name||'').trim().toLowerCase()] = m; });
   items.forEach((i,ix)=>{
-    const bmItem = billMenuByName[String(i.name||'').trim().toLowerCase()] || null;
+    const bmItem0 = billMenuByName[String(i.name||'').trim().toLowerCase()] || null;
+    /* 2026-10-14 TAX FIX: a row whose name is not on the live bill menu (KOT/table load with a
+       slightly different name, item not yet synced) used to fall to the manual dropdown = 5% GST,
+       liquor included. Resolve it from ITEM_MASTER by name, or recognise liquor by name, first. */
+    const idxHit = bmItem0 ? null : (typeof bnxItemTaxIdxFind_==='function' ? bnxItemTaxIdxFind_({}, i.name) : null);
+    const nameLiquor = !bmItem0 && !idxHit && /^(open food|open item)$/i.test(String(i.name||'').trim())===false && typeof bnxLooksLiquor_==='function' && bnxLooksLiquor_(i.name, i.category||i.cat||'');
+    const bmItem = bmItem0 || ((idxHit||nameLiquor) ? {name:i.name, n:i.name, cat:i.category||i.cat||'', isBar:!!nameLiquor} : null);
     const lineAmt = i.amt * (1 - discRows[ix].pct/100);
     taxOnAmt += lineAmt;
     if (bmItem){
@@ -24656,6 +24811,7 @@ async function bnxLoadMenuDataCore(){
   try{
     const masterRes=await __bnxMasterP;
     const masterRows=Array.isArray(masterRes?.data)?masterRes.data:[];
+    try{ if(masterRows.length && typeof window.bnxBuildItemTaxIdx_==='function') window.bnxBuildItemTaxIdx_(masterRows); }catch(e){}   /* 2026-10-14: ITEM_MASTER → tax index */
     const barWord=/\b(bar|beer|beverage|liquor|alcohol|spirits|scotch|vodka|whisky|whiskey|rum|gin|tequila|brandy|cognac|wine|cocktail|champagne|liqueur)\b/i;
     const activeMaster=v=>{
       if(v===false)return false;
@@ -46633,6 +46789,23 @@ function bnxOpenMasterHub(){
     /* Connect to QZ only on an explicit print or printer test. */
   },300);
 
+  /* PRINT SPEED 2026-10-14: console showed "WebSocket … failed: Page entered Back-Forward Cache" + "Closed connection
+     with QZ Tray" — after the tab sleeps / is restored, the QZ link is gone and the next bill paid the reconnect
+     (and the signing handshake) after the save. If QZ was already used in this tab, reconnect quietly as soon as the
+     tab is visible again, so the printer link is ready before the next Print. */
+  function bnxQzRewarm_(){
+    try{
+      if(document.hidden || !window.qz || !qz.websocket) return;
+      if(localStorage.getItem('bnx_direct_ip_print')==='0') return;
+      if(window.__bnxQzFailAt && Date.now()-window.__bnxQzFailAt<60000) return;
+      if(qz.websocket.isActive()) return;
+      connectQz().catch(function(){});
+    }catch(e){}
+  }
+  window.addEventListener('pageshow',function(){ setTimeout(bnxQzRewarm_,400); });
+  document.addEventListener('visibilitychange',function(){ if(!document.hidden) setTimeout(bnxQzRewarm_,400); });
+  window.bnxQzRewarm_=bnxQzRewarm_;
+
   window.bnxDirectPrintRaw_=directPrintRaw; window.bnxConnectQz_=connectQz; window.bnxIpSettings_=ipSettings; window.bnxKotRaw_=kotRaw; window.bnxRoleForKot_=roleForKOT;   /* 2026-10-09: used by the KOT print station */   /* used by UPI QR → Test on POS printer */
   window.bnxDirectBillInvoice=async function(d){
     try{
@@ -54831,6 +55004,9 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
       try{
         var o=E&&E.lockOn&&E.orig; if(!o||!E.sig||editSig()!==E.sig||!r) return r;
         if(Math.abs(r.sub-o.sub)>=1) return r;                                   /* items differ from the saved bill — leave the live calculation */
+        /* 2026-10-14: a bill saved with WRONG GST (e.g. liquor taxed 5%) must be correctable — when the current
+           item-master tax differs from the saved GST by more than ₹1, show the corrected live figures. */
+        if(Math.abs((Number(r.tax)||0)-(Number(o.gst)||0))>1) return r;
         var base=r.sub-o.disc, roff=o.total-(base+o.sc+o.gst);
         if(Math.abs(roff)>2) return r;                                           /* saved figures do not add up — do not force them */
         r.disc=o.disc; r.sc=o.sc; r.taxBase=base;
