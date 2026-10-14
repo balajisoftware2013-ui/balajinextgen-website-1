@@ -23262,6 +23262,8 @@ function bnxQueuePending(action, payload, requestId){
   }
   list.push({ requestId: rid || bnxUuid(), action, payload, attempts:0, queuedAt:new Date().toISOString() });
   bnxSetOutbox(list);
+  /* replay soon instead of waiting for the 15 s tick */
+  try{ clearTimeout(window.__bnxQFlushT); window.__bnxQFlushT=setTimeout(function(){ try{ flushOutbox(); }catch(e){} },4000); }catch(e){}
 }
 /* P0 FIX (external audit #23 — "Never display Success when the
    backend failed" / status must show LIVE, SYNCING, OFFLINE, PENDING
@@ -23388,10 +23390,13 @@ async function __bnxFlushOutboxInner(list, force){
   let anyFailed = false, authStop = false;
   const remaining = [];
   const now = Date.now();
-  for(const entry of list){
-    if(authStop){ remaining.push(entry); continue; }   /* session expired: leave the rest untouched */
+  /* SPEED 2026-10-15 ("no sync pending"): the outbox was replayed one entry at a time — at ~9 s per server call,
+     18 queued writes kept the "pending sync" chip up for minutes. Entries are now grouped by the record they touch
+     (order / bill / table / KOT) and 3 groups replay in parallel; inside a group the original order is kept. */
+  const one = async (entry) => {
+    if(authStop){ remaining.push(entry); return; }   /* session expired: leave the rest untouched */
     const dueAt = (entry.lastAttemptAt||0) + Math.min(15000 * Math.pow(2, entry.attempts), 300000);
-    if(!force && now < dueAt){ remaining.push(entry); continue; }
+    if(!force && now < dueAt){ remaining.push(entry); return; }
     entry.attempts++;
     entry.lastAttemptAt = now;
     let res;
@@ -23399,7 +23404,7 @@ async function __bnxFlushOutboxInner(list, force){
     catch (err) {
       entry.lastError = String(err && err.message || err || 'Network request failed').slice(0,400);
       remaining.push(entry); anyFailed = true;
-      continue;
+      return;
     }
     if(res && res.success){
       // synced — nothing further to do, entry is simply dropped from the outbox
@@ -23416,13 +23421,13 @@ async function __bnxFlushOutboxInner(list, force){
         entry.attempts = Math.max(0, entry.attempts-1); entry.lastAttemptAt = 0;
         remaining.push(entry); anyFailed = true; authStop = true;
         try{ if (typeof window.bnxSessionSuspect_==='function') window.bnxSessionSuspect_(entry.lastError); }catch(e){}
-        continue;
+        return;
       }
       /* 2026-10-09 ("[OUTBOX] gave up … Item already exists: FIRE STICK"): an earlier try DID save on the slow
          server but answered after the browser stopped waiting; every retry then got "already exists" and after 10
          tries the save was reported as failed (and the "1 pending sync" chip never cleared). The record is on the
          server → this is a success, not a failure. */
-      if (bnxIsAlreadySavedOutboxError_(entry.lastError)) { console.info('[OUTBOX] '+entry.action+' was already saved by an earlier try ('+entry.lastError+') — done.'); continue; }
+      if (bnxIsAlreadySavedOutboxError_(entry.lastError)) { console.info('[OUTBOX] '+entry.action+' was already saved by an earlier try ('+entry.lastError+') — done.'); return; }
       const nonRetryable = bnxIsNonRetryableOutboxError_(entry.lastError);
       if(entry.attempts < 10 && !nonRetryable){
         remaining.push(entry);
@@ -23435,7 +23440,15 @@ async function __bnxFlushOutboxInner(list, force){
         if (typeof showNotif === 'function') showNotif('⚠️ A '+(entry.action==='SAVE_BILL'?'bill':entry.action==='SAVE_ORDER'?'order':entry.action==='SAVE_KOT'?'KOT':'update')+' failed to sync after many tries ('+entry.lastError+') — see the sync-issues badge','error');
       }
     }
-  }
+  };
+  const groups = new Map();
+  list.forEach(e => { const p = (e && e.payload) || {};
+    const k = String(p.orderId||p.ORDER_ID||p.billNo||p.BILL_NO||p.billId||p.tableNo||p.TABLE_ID||p.table||p.kotNo||p.KOT_NO||p.itemCode||e.requestId||Math.random());
+    if(!groups.has(k)) groups.set(k, []); groups.get(k).push(e); });
+  const queues = Array.from(groups.values());
+  const worker = async () => { while(queues.length){ const g = queues.shift(); for(const e of g) await one(e); } };
+  await Promise.all([worker(), worker(), worker()]);
+  { const keep = new Set(remaining); remaining.length = 0; list.forEach(e => { if(keep.has(e)) remaining.push(e); }); }
   /* FIX: anything queued WHILE the awaits above were running (e.g. an item edit
      made during a sync) used to be overwritten by this write and lost. Keep it. */
   try{
@@ -51699,9 +51712,9 @@ window.bnxQrGen=qrcode;
     try{
       var ck='bnx_static_assets_'+c, cache=null; try{ cache=JSON.parse(localStorage.getItem(ck)||'null'); }catch(e){}
       var found=null;
-      if(cache && Date.now()-cache.t < (cache.none?6*60*60e3:60*60e3)) found=cache.none?{}:cache.v;
+      if(cache && Date.now()-cache.t < (cache.none?7*24*60*60e3:60*60e3)) found=cache.none?{}:cache.v;   /* no branding.json → don't re-probe (red 404 in console) for 7 days */
       if(!found){
-        var n=parseInt(String(c).replace(/\D/g,''),10), dirs=[c]; if(n){ ['CLIENT-'+n,'CLIENT_'+n,'client-'+n].forEach(function(x){ if(dirs.indexOf(x)<0) dirs.push(x); }); }
+        var dirs=[c];   /* one folder only — the CLIENT-n / CLIENT_n / client-n guesses were 3 extra 404s per load */
         var dir=BASE+encodeURIComponent(c)+'/', bj=null;
         /* FIX (2026-10-13): do not probe logo/banner extensions blindly.
            Netlify does not provide directory listing; probing png/jpg/jpeg/webp/svg
