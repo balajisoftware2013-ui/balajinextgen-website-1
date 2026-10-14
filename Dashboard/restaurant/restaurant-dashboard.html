@@ -7631,11 +7631,7 @@ document.addEventListener('DOMContentLoaded', function(){
   </div>
   <div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--text3);">
     <span id="blCount">Showing 15 bills</span>
-    <div style="display:flex;gap:6px;">
-      <button class="btn btn-sm btn-ghost" style="font-size:10px;" onclick="blExport(false)">📥 Sales Export</button>
-      <button class="btn btn-sm btn-ghost" style="font-size:10px;" onclick="blExport(true)">📥 Sales + Items</button>
-      <button class="btn btn-sm btn-ghost" style="font-size:10px;" onclick="blPrintAll()">🖨 Print All</button>
-    </div>
+    <!-- 2026-10-14: Sales Export / Sales + Items / Print All moved into Export ▾ / Print ▾ in the DATE / PERIOD bar (were duplicated here) -->
   </div>
 </div>
 
@@ -61467,8 +61463,31 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
     var data=await W.bnxKotRaw_(title,j.table,j.waiter,j.covers,j.items,j.kotNo,j.orderNo,j.si,j.sn,j.cust,j.rem);
     await W.bnxDirectPrintRaw_(r,data,'KOT '+(j.kotNo||'')+' '+r);
   }
+  /* FIX 2026-10-14 ("single KOT printed twice"): with the backend taking 17-170 s, PRINT_QUEUE_DONE often timed out
+     after the ticket WAS printed; the job stayed CLAIMED and the forced re-claim every 30 s handed it back → printed again.
+     A steward phone whose PRINT_QUEUE_ADD timed out also re-sent the same job ids. Now this PC keeps a ledger of every job id
+     it printed (24 h): a re-delivered id is never printed again, only re-confirmed as DONE; unconfirmed DONE results are kept
+     and re-sent until the server accepts them. Only ONE dashboard tab per PC runs the station (two tabs = two printers). */
+  var LEDK=function(){ return 'bnx_ps_printed_'+cid(); }, DONEK=function(){ return 'bnx_ps_done_pending_'+cid(); };
+  function ledger(){ try{ var o=JSON.parse(localStorage.getItem(LEDK())||'{}')||{}, now=Date.now(), ch=false; Object.keys(o).forEach(function(k){ if(now-o[k]>86400000){ delete o[k]; ch=true; } }); if(ch) localStorage.setItem(LEDK(),JSON.stringify(o)); return o; }catch(e){ return {}; } }
+  function markPrinted(id){ try{ var o=ledger(); o[id]=Date.now(); localStorage.setItem(LEDK(),JSON.stringify(o)); }catch(e){} }
+  function donePending(){ try{ return JSON.parse(localStorage.getItem(DONEK())||'[]')||[]; }catch(e){ return []; } }
+  function setDonePending(a){ try{ localStorage.setItem(DONEK(),JSON.stringify(a.slice(-200))); }catch(e){} }
+  var TAB_ID=Math.random().toString(36).slice(2), LEASEK=function(){ return 'bnx_ps_lease_'+cid(); };
+  function ownsStation(){   /* one tab per PC: a 12 s lease renewed by the tab that prints */
+    try{ var l=JSON.parse(localStorage.getItem(LEASEK())||'null'), now=Date.now();
+      if(!l||l.tab===TAB_ID||now-l.t>12000){ localStorage.setItem(LEASEK(),JSON.stringify({tab:TAB_ID,t:now})); return true; }
+      return false; }catch(e){ return true; } }
+  W.addEventListener('beforeunload',function(){ try{ var l=JSON.parse(localStorage.getItem(LEASEK())||'null'); if(l&&l.tab===TAB_ID) localStorage.removeItem(LEASEK()); }catch(e){} });
+  async function sendDone(res){
+    var all=donePending().concat(res||[]); if(!all.length) return;
+    var seen={}; all=all.filter(function(x){ if(!x||seen[x.id]) return false; seen[x.id]=1; return true; });
+    setDonePending(all);
+    try{ var r=await api('PRINT_QUEUE_DONE',{results:all},45000); if(r&&r.success!==false) setDonePending(donePending().filter(function(x){ return !seen[x.id]; })); }catch(e){}
+  }
   async function tick(){
     if(ST.busy||!cid()) return; ST.on=stationWanted(); if(!ST.on){ paintChip(); return; }
+    if(!ownsStation()){ ST.otherTab=true; paintChip(); return; } ST.otherTab=false;
     ST.busy=true;
     try{
       if(!ST.qz){ ST.qz=await qzReady(); if(!ST.qz){ paintChip(); return; } if(!MASTER) await W.bnxLoadPrinterMaster(); }
@@ -61478,16 +61497,25 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
       var r=await api('PRINT_QUEUE_CLAIM',{station:stationName(),qz:true,since:force?'':ST.v,force:force},45000);   /* 2026-10-14: was 15 s — with the backend at 17-170 s a claim that the server DID record timed out here, so the claimed BAR/KITCHEN tickets were never printed */
       if(!(r&&r.success&&r.data)) return;
       ST.v=r.data.v||ST.v;
-      var jobs=r.data.jobs||[]; if(!jobs.length) return;
-      var res=[];
+      var jobs=r.data.jobs||[];
+      if(donePending().length) sendDone([]);                 /* re-confirm earlier prints whose DONE never reached the server */
+      if(!jobs.length) return;
+      var led=ledger(), res=[], seenNow={};
+      jobs=jobs.filter(function(j){
+        if(!j||!j.id||seenNow[j.id]) return false; seenNow[j.id]=1;
+        if(led[j.id]){ res.push({id:j.id,ok:true,dup:true}); return false; }   /* already printed here — never print twice */
+        return true;
+      });
+      if(!jobs.length){ if(res.length) sendDone(res); return; }
       /* stations print in parallel, tickets of one station in order */
       var byRole={}; jobs.forEach(function(j){ (byRole[j.role]=byRole[j.role]||[]).push(j); });
       await Promise.all(Object.keys(byRole).map(async function(k){
         for(var i=0;i<byRole[k].length;i++){ var j=byRole[k][i];
-          try{ await printJob(j); res.push({id:j.id,ok:true}); ST.printed++; ST.last=k+' · T'+(j.table||'-'); ST.lastAt=Date.now(); }
+          try{ await printJob(j); markPrinted(j.id); res.push({id:j.id,ok:true}); ST.printed++; ST.last=k+' · T'+(j.table||'-'); ST.lastAt=Date.now(); }
           catch(e){ res.push({id:j.id,ok:false,error:String(e&&e.message||e)}); ST.failed++; ST.last='⚠️ '+k+': '+String(e&&e.message||e).slice(0,60); }
         } }));
-      await api('PRINT_QUEUE_DONE',{results:res},45000);
+      sendDone(res);                                      /* not awaited: the next tick can start printing new tickets */
+      res=res.filter(function(x){ return !x.dup; });
       var ok=res.filter(function(x){return x.ok;}).length;
       if(ok) note('🖨️ '+ok+' steward KOT'+(ok>1?'s':'')+' printed','success');
       if(ok<res.length) note('⚠️ '+(res.length-ok)+' KOT not printed — '+ST.last+' (retrying)','error');
@@ -61503,13 +61531,14 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
       (D.body||D.documentElement).appendChild(c); }
     var on=stationWanted();
     if(!on){ c.style.background='#f3f4f6'; c.style.color='#555'; c.textContent='🖨️ KOT station: OFF on this PC'; return; }
+    if(ST.otherTab){ c.style.background='#f3f4f6'; c.style.color='#555'; c.textContent='🖨️ KOT station runs in another tab on this PC'; return; }
     if(!ST.qz){ c.style.background='#fff7e6'; c.style.color='#7a4a00'; c.textContent='🖨️ KOT station: waiting for QZ Tray…'; return; }
     c.style.background='#ecfdf3'; c.style.color='#065f46';
     c.textContent='🖨️ KOT station ON · '+ST.printed+' printed'+(ST.failed?' · '+ST.failed+' failed':'')+(ST.last?' · last '+ST.last:'');
   }
   function boot(){ if(!cid()) return setTimeout(boot,2000); W.bnxLoadPrinterMaster().catch(function(){}); paintChip(); tick(); }
   if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ setTimeout(boot,3000); }); else setTimeout(boot,3000);
-  setInterval(tick,4000);
+  setInterval(tick,2500);   /* was 4 s — steward KOTs reach the printer sooner */
   W.bnxPrintStation={tick:tick,state:ST,load:function(){ return W.bnxLoadPrinterMaster(); }};
 })();
 </script>
@@ -66373,6 +66402,62 @@ function hookBills(){
 function boot(){ hook(); hookBills(); if(D.getElementById('page-dashboard')) W.bnxInstantKpi_(false); }
 if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ setTimeout(boot,300); }); else setTimeout(boot,300);
 setInterval(function(){ hook(); hookBills(); },10000);
+})();
+</script>
+<!-- FIX 2026-10-14 — BILLS LIST: one Export / Print / Send set, placed in the DATE / PERIOD bar right after the custom date -->
+<style id="bnx-bl-actions-css">
+#page-bills-list .bnx-tools-row .bnx-tools{display:none!important}        /* the duplicate 📥▾ 🖨▾ Send▾ above the table */
+#bnxBlActions{display:none;gap:6px;align-items:center;margin-left:6px;position:relative}
+body.bnx-bl-on #bnxBlActions{display:inline-flex}
+#bnxBlActions>button{border:1px solid var(--border2,#e5d6c3);background:#fff;border-radius:999px;padding:6px 12px;font-weight:800;font-size:12px;line-height:1.1;font-family:inherit;cursor:pointer;min-height:34px;white-space:nowrap;color:inherit}
+#bnxBlActions>button:hover{border-color:var(--gold,#b8690e)}
+#bnxBlMenu{position:fixed;z-index:100001;background:#fff;border:1px solid #e5d6c3;border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,.18);padding:6px;min-width:210px;display:none}
+#bnxBlMenu button{display:block;width:100%;text-align:left;border:0;background:none;padding:10px 12px;border-radius:8px;font-weight:700;font-size:13px;line-height:1.2;font-family:inherit;cursor:pointer;color:#1f2937;min-height:40px}
+#bnxBlMenu button:hover{background:#fff4e6}
+@media (max-width:760px){#bnxBlActions{margin-left:0}#bnxBlActions>button{padding:6px 10px}}
+</style>
+<script id="bnx-bl-actions-js">
+(function(){
+'use strict';
+var D=document,W=window;
+function card(){ var t=D.getElementById('blTable'); return t?t.closest('.card'):null; }
+function proxy(anchor){ var c=card(); return {closest:function(){ return c; },getBoundingClientRect:function(){ return anchor.getBoundingClientRect(); }}; }
+function menu(){ var m=D.getElementById('bnxBlMenu'); if(!m){ m=D.createElement('div'); m.id='bnxBlMenu'; D.body.appendChild(m);
+  D.addEventListener('click',function(e){ if(!e.target.closest('#bnxBlMenu')&&!e.target.closest('#bnxBlActions')) m.style.display='none'; }); } return m; }
+function open(anchor,items){
+  var m=menu(); if(m.style.display==='block'&&m.__a===anchor){ m.style.display='none'; return; }
+  m.__a=anchor; m.innerHTML='';
+  items.forEach(function(it){ var b=D.createElement('button'); b.type='button'; b.textContent=it[0]; b.onclick=function(e){ e.stopPropagation(); m.style.display='none'; try{ it[1](); }catch(x){ console.error('[BILLS ACTION]',x); if(typeof showNotif==='function') showNotif('⚠️ '+x.message,'error'); } }; m.appendChild(b); });
+  var r=anchor.getBoundingClientRect(); m.style.display='block';
+  m.style.top=(r.bottom+6)+'px'; m.style.left=Math.max(8,Math.min(innerWidth-m.offsetWidth-8,r.left))+'px';
+}
+function build(){
+  var bar=D.getElementById('bnxGlobalPeriodBar'); if(!bar||D.getElementById('bnxBlActions')) return;
+  var g=D.createElement('span'); g.id='bnxBlActions';
+  g.innerHTML='<button type="button" data-a="exp">📥 Export ▾</button><button type="button" data-a="prn">🖨 Print ▾</button><button type="button" data-a="snd">📤 Send ▾</button>';
+  var after=D.getElementById('bnxGpPick')||D.getElementById('bnxGpCustom');
+  if(after&&after.parentNode===bar) bar.insertBefore(g,after.nextSibling); else bar.appendChild(g);
+  g.addEventListener('click',function(e){
+    var b=e.target.closest('button'); if(!b) return; e.stopPropagation();
+    var a=b.getAttribute('data-a');
+    if(a==='exp') open(b,[['📊 Sales Export (bills)',function(){ blExport(false); }],['📦 Sales + Items',function(){ blExport(true); }],['🗂 Other formats (PDF / Excel / CSV)…',function(){ openExportFormatMenu(proxy(b),'bills-list'); }]]);
+    else if(a==='prn') open(b,[['🖨 Print all bills (invoices)',function(){ blPrintAll(); }],['📄 Print this list…',function(){ openPrintFormatMenu(proxy(b)); }]]);
+    else if(a==='snd') open(b,[['📄 PDF',function(){ sendReportPDFDL(proxy(b)); }],['🖼️ JPG',function(){ sendReportJPGDL(proxy(b)); }],['💬 WhatsApp',function(){ shareReportTextWA(proxy(b)); }]]);
+  });
+}
+function sync(){
+  build();
+  var on=!!D.getElementById('page-bills-list')?.classList.contains('active');
+  D.body.classList.toggle('bnx-bl-on',on);
+  if(!on){ var m=D.getElementById('bnxBlMenu'); if(m) m.style.display='none'; }
+}
+function boot(){
+  sync();
+  var pg=D.getElementById('page-bills-list');
+  if(pg&&W.MutationObserver) new MutationObserver(sync).observe(pg,{attributes:true,attributeFilter:['class']});
+  setInterval(sync,2000);
+}
+if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ setTimeout(boot,500); }); else setTimeout(boot,500);
 })();
 </script>
 </body></html>
