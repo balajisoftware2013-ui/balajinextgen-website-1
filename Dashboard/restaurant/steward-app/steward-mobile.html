@@ -4856,10 +4856,11 @@ function bnxUpdateSyncBadge(){
     el.onclick = n ? function(){
       if(bnxFlushInProgress){ toast('Sync already running — please wait','info'); return; }
       toast('Retrying pending transactions. Do not repeat the order.','info');
-      flushOutbox().then(function(){
-        var left=bnxGetOutbox().length, failed=bnxGetFailedOutbox().length;
+      flushOutbox(true).then(function(){
+        var ob=bnxGetOutbox(), left=ob.length, failed=bnxGetFailedOutbox().length;
+        var why=''; try{ var le=ob.find(function(e){return e.lastError;}); if(le) why=' Reason: '+String(le.lastError).slice(0,90); }catch(_){}
         if(!left && !failed) toast('All queued transactions confirmed by server','success');
-        else toast(left+' pending, '+failed+' sync issues. Tap again later; check connection and server errors.','error');
+        else toast(left+' pending, '+failed+' sync issues.'+why+' Tap again later; check connection and server errors.','error');
       }).catch(function(e){ toast('Sync could not finish: '+String(e&&e.message||e).slice(0,100),'error'); });
     } : null;
   }
@@ -4896,7 +4897,7 @@ function bnxUpdateSyncBadge(){
 // flight guard: a flush already in progress makes any new call return
 // immediately instead of starting a second parallel pass.
 let bnxFlushInProgress = false;
-async function flushOutbox(){
+async function flushOutbox(force){
   if (bnxFlushInProgress) return;
   /* PASS #75: the installed app and a browser tab share one outbox in localStorage. Without a lease
      both flushed the same entries at the same moment = same order sent twice. One tab at a time. */
@@ -4911,13 +4912,13 @@ async function flushOutbox(){
   }catch(e){}
   bnxFlushInProgress = true;
   try {
-    await flushOutbox_impl_();
+    await flushOutbox_impl_(!!force);
   } finally {
     bnxFlushInProgress = false;
     try{ const held=JSON.parse(localStorage.getItem(LK)||'null'); if(held && held.id===me) localStorage.removeItem(LK); }catch(e){}
   }
 }
-async function flushOutbox_impl_(){
+async function flushOutbox_impl_(force){
   const list = bnxGetOutbox();
   if(!list.length){
     bnxUpdateSyncBadge();
@@ -4934,7 +4935,8 @@ async function flushOutbox_impl_(){
     // healthy one. Delay grows 15s→30s→60s...capped at 5min, so a
     // backend that's down for a while gets progressively less traffic
     // instead of a constant drumbeat of doomed requests.
-    const dueAt = (entry.lastAttemptAt||0) + Math.min(15000 * Math.pow(2, entry.attempts), 300000);
+    /* LIVE SYNC FIX: manual/foreground retries (force) ignore the wait; auto backoff now caps at 60s (was 5 min) */
+    const dueAt = force ? 0 : (entry.lastAttemptAt||0) + Math.min(15000 * Math.pow(2, Math.min(entry.attempts||0,6)), 60000);
     if(now < dueAt){ remaining.push(entry); continue; }
     entry.attempts++;
     entry.lastAttemptAt = now;
@@ -5021,8 +5023,11 @@ async function flushOutbox_impl_(){
 // a genuine bug in a future edit logs instead of silently going dark
 // on a phone with no visible console.
 setInterval(() => { flushOutbox().catch(e => console.error('[OUTBOX] flushOutbox interval rejected:', e && e.message ? e.message : e)); }, 15000);
-window.addEventListener('online', ()=>{ bnxSetLiveStatus(bnxGetOutbox().length ? 'syncing' : 'live'); flushOutbox().catch(e=>console.error('[OUTBOX] online flush rejected:', e && e.message ? e.message : e)); });
+window.addEventListener('online', ()=>{ bnxSetLiveStatus(bnxGetOutbox().length ? 'syncing' : 'live'); flushOutbox(true).catch(e=>console.error('[OUTBOX] online flush rejected:', e && e.message ? e.message : e)); });
 window.addEventListener('offline', ()=> bnxSetLiveStatus('offline'));
+/* LIVE SYNC FIX: coming back to the app (unlock phone / switch back from WhatsApp) retries pending items at once */
+(function(){ var last=0; function wake(){ try{ if(document.visibilityState==='hidden'||!navigator.onLine) return; if(Date.now()-last<5000) return; last=Date.now(); if(bnxGetOutbox().length) flushOutbox(true).catch(function(e){ console.error('[OUTBOX] wake flush rejected:', e&&e.message?e.message:e); }); }catch(_){} }
+  document.addEventListener('visibilitychange',wake); window.addEventListener('focus',wake); window.addEventListener('pageshow',wake); })();
 bnxSetLiveStatus(navigator.onLine ? (bnxGetOutbox().length || bnxGetFailedOutbox().length ? 'syncing' : 'live') : 'offline');
 bnxUpdateSyncBadge(); // reflect any items already stuck in "failed" from a previous session
 
