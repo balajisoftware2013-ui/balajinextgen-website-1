@@ -12309,7 +12309,26 @@ async function bnxPullBillsRange_(from, to){
       const hasRange = !!(from || to);
       if (hasRange){ params.FROM_DATE = from || to; params.TO_DATE = to || from; }
       params.SUMMARY_ONLY = true;
-      const res = await gasApi('LIST_BILLS', params);
+      let res = await gasApi('LIST_BILLS', params);
+      /* 2026-10-15 ("Bills List Yesterday 0 while Reports/Dashboard show 10 bills"): LIST_BILLS can answer empty (server
+         cache built while BILL_MASTER was unreadable) or fail on a slow server, but GET_BILLS — used by the dashboard KPIs —
+         had the bills. An empty/failed LIST_BILLS for a date range is now checked against GET_BILLS before showing 0. */
+      try{
+        const lb = res && (res.bills || res.data);
+        if (hasRange && (!res || res.success === false || !Array.isArray(lb) || !lb.length)) {
+          const g = await gasApi('GET_BILLS', { FROM_DATE: params.FROM_DATE, TO_DATE: params.TO_DATE, BUSINESS_DATE: params.FROM_DATE }, 'V2_CORE');
+          const rows = g && g.success !== false && Array.isArray(g.data) ? g.data : [];
+          if (rows.length) {
+            const day=v=>{ const t=String(v||''); return /^\d{4}-\d{2}-\d{2}/.test(t)?t.slice(0,10):t; };
+            res = { success:true, bills: rows.map(b=>({
+              no: b.BILL_NUMBER||b.billNo, dt: day(b.BILL_DATE), tm: String(b.BILL_TIME||'').slice(0,8), table: b.TABLE_ID||'-',
+              customer: b.CUSTOMER_NAME||'GENERAL CUSTOMER', total: Number(b.GRAND_TOTAL)||0, sub: Number(b.SUBTOTAL)||0, gst: Number(b.TAX_AMOUNT)||0,
+              disc: (Number(b.ITEM_DISCOUNT)||0)+(Number(b.BILL_DISCOUNT)||0), status: (/CANCEL|VOID/i.test(String(b.BILL_STATUS))?'CANCELLED':(/UNPAID|PARTIAL/i.test(String(b.PAYMENT_STATUS))?'PENDING':'PAID')),
+              pay: String(b.PAYMENT_MODE||b.PAY_MODE||'').toUpperCase(), businessDate: day(b.BUSINESS_DATE||b.BILL_DATE), BILL_ID: b.BILL_ID })) };
+            console.info('[BILLS] LIST_BILLS empty for '+params.FROM_DATE+'..'+params.TO_DATE+' — '+rows.length+' bill(s) loaded from GET_BILLS');
+          }
+        }
+      }catch(e){ console.warn('[BILLS] GET_BILLS fallback failed', e && e.message); }
       if (!res || res.success === false) throw new Error(res?.error || 'LIST_BILLS failed');
       const serverBills = res && (res.bills || res.data || (Array.isArray(res) ? res : []));
       if (!Array.isArray(serverBills)) throw new Error('LIST_BILLS returned invalid data');
@@ -23349,6 +23368,32 @@ function bnxIsNonRetryableOutboxError_(msg){
   const m=String(msg||'');
   return /order not found for this client/i.test(m) || /^unknown action:/i.test(m);
 }
+/* already-saved check for queued SAVE_BILL (see DUPLICATE GUARD in the outbox replay) */
+var __bnxDayBills={};
+async function bnxDayBillsOnServer_(day){
+  const c=__bnxDayBills[day]; if(c && Date.now()-c.t<60000) return c.p;
+  const p=(async()=>{ try{ const r=await gasApi('LIST_BILLS',{FROM_DATE:day,TO_DATE:day,SUMMARY_ONLY:true},'V2_CORE'); const a=r&&(r.bills||r.data); return Array.isArray(a)?a:null; }catch(e){ return null; } })();
+  __bnxDayBills[day]={t:Date.now(),p:p}; return p;
+}
+async function bnxBillAlreadyOnServer_(entry){
+  const b=entry&&entry.payload&&entry.payload.bill; if(!b||b.no) return false;          /* edits always go through */
+  const day=String(b.businessDate||b.billDate||b.dt||'').slice(0,10); if(!/^\d{4}-\d{2}-\d{2}$/.test(day)) return false;
+  const list=await bnxDayBillsOnServer_(day); if(!list) return false;                  /* server unreachable → keep it queued */
+  const T=String(b.table||'').trim().toUpperCase(), tot=Number(b.total)||0, nc=/^NC$|NON.?CHARGE/i.test(String(b.paymode||b.payMode||b.pay||''));
+  const used=entry.__matched||(window.__bnxMatchedBills=window.__bnxMatchedBills||{});
+  const hit=list.find(x=>{ const no=String(x.no||x.BILL_NUMBER||''); if(!no||used[no]) return false;
+    if(String(x.table||x.TABLE_ID||'').trim().toUpperCase()!==T) return false;
+    const st=String(x.status||x.BILL_STATUS||'').toUpperCase(); if(/CANCEL|VOID/.test(st)) return false;
+    const xt=Number(x.total??x.GRAND_TOTAL??0)||0;
+    return Math.abs(xt-tot)<=1 || (nc && (/NON.?CHARGE|NC/.test(st) || xt===0)); });
+  if(hit){ used[String(hit.no||hit.BILL_NUMBER)]=1; return true; }
+  return false;
+}
+/* on start: queued / failed bills that are already on the server leave the "pending sync" / "sync issues" badges */
+setTimeout(async function(){ try{
+  const failed=bnxGetFailedOutbox(); if(failed.length){ const keep=[]; for(const e of failed){ let dup=false; try{ dup=String(e.action).toUpperCase()==='SAVE_BILL' && await bnxBillAlreadyOnServer_(e); }catch(x){} if(!dup) keep.push(e); } if(keep.length!==failed.length){ bnxSetFailedOutbox(keep); console.info('[OUTBOX] '+(failed.length-keep.length)+' failed bill(s) were already on the server — cleared'); } }
+  if(bnxGetOutbox().length) flushOutbox(true);
+}catch(e){} }, 12000);
 function bnxRetryFailedOutbox(){
   bnxCleanSavedFailures_();
   const failed = bnxGetFailedOutbox();
@@ -23421,6 +23466,10 @@ async function __bnxFlushOutboxInner(list, force){
     if(authStop){ remaining.push(entry); return; }   /* session expired: leave the rest untouched */
     const dueAt = (entry.lastAttemptAt||0) + Math.min(15000 * Math.pow(2, entry.attempts), 300000);
     if(!force && now < dueAt){ remaining.push(entry); return; }
+    /* 2026-10-15 DUPLICATE GUARD: a queued bill whose save actually reached the server (or was recovered there) must not
+       be saved a second time — check that business day's bills first; a match (same table + same amount, or same NC
+       table) means it is already in BILL_MASTER → drop it from "pending sync" on every computer. */
+    try{ if(String(entry.action).toUpperCase()==='SAVE_BILL' && await bnxBillAlreadyOnServer_(entry)){ console.info('[OUTBOX] bill for '+((entry.payload&&entry.payload.bill&&entry.payload.bill.table)||'?')+' is already on the server — removed from pending sync'); return; } }catch(e){}
     entry.attempts++;
     entry.lastAttemptAt = now;
     let res;
