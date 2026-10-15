@@ -54896,13 +54896,31 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
     return BILLS.busy;
   }
   function mine(x,id,name){ return (x.cid&&x.cid===String(id)) || (x.nm&&x.nm===nkey(name)); }
+  /* BNX CC-WA AMOUNT FIX 2026-10-15: match by customerId first; name only when no row carries this id
+     (two parties with the same name — e.g. "SUSRITA/ RAJKUMAR" twice — were merged into one statement). */
+  function ownRows(rows,id,name){
+    var byId=rows.filter(function(x){ return x.cid&&x.cid===String(id); });
+    if(byId.length) return byId;
+    return rows.filter(function(x){ return !x.cid&&x.nm&&x.nm===nkey(name); });
+  }
+  function ageOf(d){
+    d=String(d||'').slice(0,10); if(!/^\d{4}-\d{2}-\d{2}$/.test(d)) return 0;
+    var t=String((typeof getBusinessDate==='function')?getBusinessDate():new Date().toISOString().slice(0,10)).slice(0,10);
+    var n=Math.round((new Date(t+'T00:00:00')-new Date(d+'T00:00:00'))/86400000); return n>0?n:0;
+  }
+  /* Customer Credit reads CUSTOMER_DUES (DUES_LIST): use the SAME bills the screen uses */
+  function duesBills(c){
+    if(!c||c.source!=='CUSTOMER_DUES'||!Array.isArray(c.bills)) return null;
+    return c.bills.map(function(b){ var d=String(b.date||''); return { cid:String(c.customerId), nm:nkey(c.customer), no:String(b.billNo==null?'':b.billNo), d:d, amt:r2(b.amount), due:r2(b.due), age:Number(b.age)||ageOf(d), op:!!b.isOpening }; })
+      .filter(function(x){ return x.due>0.009; });
+  }
   function timed(p,ms){ return Promise.race([p,new Promise(function(r){ setTimeout(function(){ r({success:false,error:'timeout'}); },ms); })]); }
   function fetchOne(customerId,name){
     return timed(api('GET_OUTSTANDING_BILLS',{customerId:customerId}),45000)
       .then(function(r){
         var rows=(r&&r.success&&r.data&&Array.isArray(r.data.rows))?r.data.rows.map(slim):null;
         if(rows){
-          var own=rows.filter(function(x){ return mine(x,customerId,name); });
+          var own=ownRows(rows,customerId,name);
           if(!own.length && rows.length && rows.every(function(x){ return !x.cid&&!x.nm; })) own=rows;   /* server filtered; rows carry no party */
           own=own.filter(function(x){ return x.due>0.009; });
           own.forEach(function(x){ x.cid=String(customerId); x.nm=nkey(name); });
@@ -54923,16 +54941,21 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
   }
   function cachedFor(id,name){
     if(!BILLS.rows) return null;
-    return BILLS.rows.filter(function(x){ return mine(x,id,name)&&x.due>0.009; });
+    return ownRows(BILLS.rows,id,name).filter(function(x){ return x.due>0.009; });
   }
   /* bills always add up to the party total: the uncovered amount is the old balance b/f */
   function reconcile(bills,c){
     bills=(bills||[]).map(function(x){ return Object.assign({},x); });
     var total=r2(c.outstanding), diff=r2(total-sumDue(bills));
-    if(bills.length && diff>1){
+    if(bills.length && diff>0.5){
       var op=bills.filter(function(x){ return x.op; })[0];
       if(op) op.due=r2(op.due+diff);
-      else bills.unshift({ cid:String(c.customerId), no:'OPENING', d:'', amt:0, due:diff, age:0, op:true });
+      else bills.unshift({ cid:String(c.customerId), no:'OPENING', d:'', amt:0, due:diff, age:0, op:true, lbl:(r2(c.openingRemaining)>0.5?'':'Other balance') });
+    } else if(bills.length && diff<-0.5){
+      /* bills add up to MORE than the party's due: receipts clear the oldest first (same rule as the dues sheet) */
+      var ex=-diff;
+      sortBills(bills).forEach(function(b){ if(ex<=0.009) return; var t=Math.min(b.due,ex); b.due=r2(b.due-t); ex=r2(ex-t); });
+      bills=bills.filter(function(b){ return b.due>0.009; });
     }
     return bills;
   }
@@ -54968,7 +54991,7 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
     L.push('Outstanding Statement \u2014 *'+o.cust+'*','As on '+todayDmy(),'');
     var bills=o.bills, shown=bills.slice(0,MAX_TXT), n=0;
     shown.forEach(function(b){
-      if(b.op){ L.push('\u2022 Old balance'+(b.d?' (b/f '+dmy(b.d)+')':'')+': *'+rs(b.due)+'*'); return; }
+      if(b.op){ L.push('\u2022 '+(b.lbl||'Old balance')+(b.d?' (b/f '+dmy(b.d)+')':'')+': *'+rs(b.due)+'*'); return; }
       n++;
       var part=b.amt>0.009&&Math.abs(b.amt-b.due)>0.009;
       L.push(n+'. '+dmy(b.d)+' | Bill '+b.no+' | '+(part?rs(b.amt)+' \u2192 due ':'')+'*'+rs(b.due)+'*'+(b.age?' | '+b.age+'d':''));
@@ -55013,7 +55036,7 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
     shown.forEach(function(b,i){
       if(i%2){ x.fillStyle=TH.row; x.fillRect(L,y,R-L,rowH); }
       x.fillStyle='#222'; x.textAlign='left';
-      if(b.op){ x.fillText('\u2014',cols[0],y+23); x.fillText(dmy(b.d)||'',cols[1],y+23); x.font='bold 16px Arial'; x.fillText('Old balance (b/f)',cols[2],y+23); x.font='16px Arial'; }
+      if(b.op){ x.fillText('\u2014',cols[0],y+23); x.fillText(dmy(b.d)||'',cols[1],y+23); x.font='bold 16px Arial'; x.fillText(b.lbl||'Old balance (b/f)',cols[2],y+23); x.font='16px Arial'; }
       else { n++; x.fillText(String(n),cols[0],y+23); x.fillText(dmy(b.d),cols[1],y+23); x.fillText(String(b.no).slice(0,16),cols[2],y+23); }
       x.textAlign='right';
       x.fillText(b.op?'':rs(b.amt),cols[3],y+23);
@@ -55120,7 +55143,7 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
       rows.forEach(function(b,k){
         if(k%2){ x.fillStyle=TH.row; x.fillRect(M,y,PW-2*M,ROW); }
         x.fillStyle='#222'; x.font='19px Arial'; x.textAlign='left';
-        if(b.op){ x.fillText('\u2014',cX.no,y+23); x.fillText(dmy(b.d)||'',cX.date,y+23); x.font='bold 19px Arial'; x.fillText('Old balance (b/f)',cX.bill,y+23); x.font='19px Arial'; }
+        if(b.op){ x.fillText('\u2014',cX.no,y+23); x.fillText(dmy(b.d)||'',cX.date,y+23); x.font='bold 19px Arial'; x.fillText(b.lbl||'Old balance (b/f)',cX.bill,y+23); x.font='19px Arial'; }
         else { serial++; x.fillText(String(serial),cX.no,y+23); x.fillText(dmy(b.d),cX.date,y+23); x.fillText(String(b.no).slice(0,22),cX.bill,y+23); }
         x.textAlign='right'; x.fillText(b.op||!b.amt?'':rs(b.amt),cX.amt,y+23);
         x.font='bold 19px Arial'; x.fillStyle='#b3261e'; x.fillText(rs(b.due),cX.due,y+23);
@@ -55275,7 +55298,7 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
   function prepare(c,ph,bills,fresh){
     var shop=shopInfo(), cfg=upiCfg(), vpa=cfg&&cfg.vpa?cfg.vpa:'';
     bills=sortBills(reconcile(bills,c));
-    var total=bills.length?sumDue(bills):r2(c.outstanding);
+    var total=r2(c.outstanding);   /* = TOTAL DUE on screen (was sum of old-ledger bills) */
     var uri='';
     if(total>0.009&&vpa&&typeof bnxUpiBuildUri==='function'){
       try{ uri=bnxUpiBuildUri(total,'x')||''; if(uri) uri=uri.replace(/&tn=[^&]*/,'')+'&tn='+encodeURIComponent(('Dues '+c.customer).replace(/[^\w .\/\-#]/g,'').slice(0,50)); }catch(e){ uri=''; }
@@ -55315,6 +55338,13 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
         ph=phoneFix(typed);
         if(!ph){ note('That number does not look valid','error'); return; }
         saved[id]=ph; try{ localStorage.setItem(PK(),JSON.stringify(saved)); }catch(e){}
+      }
+      /* dues-sheet bills (what the screen shows) → send now */
+      var db=duesBills(c);
+      if(db){
+        var PD=prepare(c,ph,db,true);
+        if(PD.pdf) sheet(PD,'ready'); else deliver(PD);
+        return;
       }
       /* fast path: saved bill-wise copy matches the live total → send now (inside the click) */
       var cb=cachedFor(id,c.customer);
