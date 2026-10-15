@@ -619,7 +619,7 @@ function mapLiveDsrDay_(raw){
   if(discFix>0 && categoryGross>gross+1){ const f=gross/categoryGross; liquor*=f; food*=f; bev*=f; hf*=f; others*=f; }
   // PASS #72: POS 'ONLINE' tender (UPI/online bank) belongs in the digital-bank column, not hidden.
   const cash=n(raw.cash), card=n(raw.iciciCard);
-  let credit=n(raw.guestDueSales); const zomato=n(raw.zomato), swiggy=n(raw.swiggy); let eazydine=n(raw.eazydine);
+  const credit=n(raw.guestDueSales), zomato=n(raw.zomato), swiggy=n(raw.swiggy); let eazydine=n(raw.eazydine);
   const onlineRaw=n(raw.online), gpay=n(raw.iciciGpay)+Math.max(0,onlineRaw-zomato-swiggy-eazydine);
   const dueCash=n(raw.dueReceivedCash), dueBank=n(raw.dueReceivedIcici);
   // PASS #71: generic ONLINE / OTHER modes and paid-but-mode-unknown
@@ -639,11 +639,7 @@ function mapLiveDsrDay_(raw){
      Check still lists it as a warning, so it is never silently lost. */
   let otherResid=0;
   if(net>0){ const _r=Math.round((net-tender)*100)/100; if(_r>1.5){ otherResid=_r; eazydine+=_r; tender+=_r; } }
-  /* FIX 2026-10-16 ("dsr cash collection wrong", 14/10: tenders 91,916 vs Net 71,026): a bill first saved as CREDIT and then
-     settled the same day in cash/UPI keeps its CREDIT payment row, so the day counted the same ₹20,890 twice (Guest Due Sale +
-     Cash/UPI). The cash really came in, so Cash stays; the settled part is taken out of Guest Due Sales (shown as creditSettled). */
-  let creditSettled=0;
-  if(net>0&&credit>0){ const _o=Math.round((tender-net)*100)/100; if(_o>1.5){ creditSettled=Math.min(credit,_o); credit=Math.round((credit-creditSettled)*100)/100; tender=Math.round((tender-creditSettled)*100)/100; } }
+  const creditSettled=0;
   return {otherResid,creditSettled,
     bills:n(raw.bills),liquor,liquormrp:n(raw.liquorMrp),food,bev,hf,others,
     gross,svc,tax,round,net,cash,card,gpay,pvt:0,credit,zomato,swiggy,eazydine,zomatocoll:n(raw.zomatoColl),swiggycoll:n(raw.swiggyColl),eazydinecoll:n(raw.eazydineColl),
@@ -9782,5 +9778,63 @@ html:not(#_t1):not(#_t2):not(#_t3):not(#_t4):not(#_t5) body .dsr-matrix .section
 html:not(#_t1):not(#_t2):not(#_t3):not(#_t4):not(#_t5) body .dsr-matrix .diff-row td{background:#fff1f1!important;color:#b91c1c!important}
 @media print{html,body{background:#fff!important}body .dsr-matrix thead th{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
 </style>
+<script id="bnx-dsr-overpay-split-20261016">
+/* 2026-10-16 ("wrong cash sale dsr", 14/10: Cash Sale 42,764 / GPay 9,350 while the bills of the day took Cash 24,856):
+   payments taken on a day for OLDER bills (credit bills settled at the POS, entered while the business day was still open)
+   were counted as that day's CASH / GPAY SALE, so tenders exceeded Net Sale. For any day where tenders > Net Sale, the
+   day's payment rows are read (PAYMENT_MASTER) and every payment whose bill is not a bill of that day is moved, by its own
+   mode, from Sale to Due Received (Cash → Due Received Cash; UPI / Card / Bank → Due Received Bank). Applied only when the
+   moved amount equals the excess (±₹2) — otherwise nothing is changed and the Report Check keeps flagging the day. */
+(function(){
+  var W=window, done={}, payCache=null, payAt=0;
+  function N(v){ v=Number(String(v==null?'':v).replace(/[,₹\s]/g,'')); return isFinite(v)?v:0; }
+  function day(v){ try{ return bnxIsoDay_(v); }catch(e){ return String(v||'').slice(0,10); } }
+  function G(r,ks){ for(var i=0;i<ks.length;i++){ if(r[ks[i]]!=null&&r[ks[i]]!=='') return r[ks[i]]; } return ''; }
+  function rowsOf(res){ var d=res&&(res.data||res.rows); if(Array.isArray(d)) return d; if(d&&Array.isArray(d.rows)) return d.rows; return []; }
+  async function payments(){
+    if(payCache&&Date.now()-payAt<120000) return payCache;
+    var r=await gasApi('RD_FETCH_SHEET',{tab:'PAYMENT_MASTER',locationId:(W.CLIENT_ID||'')},'V2_CORE').catch(function(){return null;});
+    var rows=rowsOf(r); if(!rows.length) return null;
+    payCache=rows; payAt=Date.now(); return rows;
+  }
+  async function fix(ds){
+    var e=STANDARD_DATA[ds]; if(!e||e._overSplit) return false;
+    var tender=(typeof bnxDsrTender_==='function')?bnxDsrTender_(e):0, net=N(e.net), over=Math.round((tender-net)*100)/100;
+    if(!(net>0&&over>2)) return false;
+    var bills=await gasApi('GET_BILLS',{FROM_DATE:ds,TO_DATE:ds,BUSINESS_DATE:ds}).catch(function(){return null;});
+    var bl=rowsOf(bills); if(!bl.length) return false;
+    var ids={}; bl.forEach(function(b){ var id=String(G(b,['BILL_ID','billId','id'])||''); if(id) ids[id]=1; var no=String(G(b,['BILL_NUMBER','billNo'])||''); if(no) ids[no]=1; });
+    var pm=await payments(); if(!pm) return false;
+    var mv={cash:0,bank:0,gpay:0,card:0};
+    pm.forEach(function(p){
+      if(day(G(p,['PAYMENT_DATE','DATE','BUSINESS_DATE']))!==ds) return;
+      var st=String(G(p,['PAYMENT_STATUS'])||'').toUpperCase(); if(/VOID|CANCEL|REFUND|FAIL/.test(st)) return;
+      var bid=String(G(p,['BILL_ID','BILL_NUMBER'])||''); if(!bid||ids[bid]) return;
+      var mode=String(G(p,['PAYMENT_MODE','MODE'])||'').toUpperCase(), a=N(G(p,['AMOUNT']));
+      if(!(a>0)||/CREDIT|DUE|NC|COMPLIMENT/.test(mode)) return;
+      if(/CASH/.test(mode)) mv.cash+=a; else if(/CARD/.test(mode)){ mv.card+=a; mv.bank+=a; } else { mv.gpay+=a; mv.bank+=a; }
+    });
+    var tot=mv.cash+mv.bank;
+    if(!(tot>0)||Math.abs(tot-over)>2){ console.info('[DSR] '+ds+': tenders exceed Net by '+over+' but old-bill payments found = '+tot+' — left as is'); return false; }
+    e.cash=Math.round((N(e.cash)-mv.cash)*100)/100; e.gpay=Math.round((N(e.gpay)-mv.gpay)*100)/100; e.card=Math.round((N(e.card)-mv.card)*100)/100;
+    e.duerecvcash=Math.round((N(e.duerecvcash)+mv.cash)*100)/100; e.duerecvbank=Math.round((N(e.duerecvbank)+mv.bank)*100)/100;
+    e._overSplit={cash:mv.cash,bank:mv.bank};
+    try{ bnxRmTotalCash_(e); }catch(_){}
+    console.info('[DSR] '+ds+': ₹'+tot+' paid for older bills moved from Sale to Due Received (cash '+mv.cash+', bank '+mv.bank+')');
+    return true;
+  }
+  async function scan(){
+    if(typeof STANDARD_DATA!=='object') return;
+    var todo=Object.keys(STANDARD_DATA).filter(function(ds){ var e=STANDARD_DATA[ds]; if(!e||e._overSplit||done[ds]) return false;
+      var t=(typeof bnxDsrTender_==='function')?bnxDsrTender_(e):0; return N(e.net)>0&&t-N(e.net)>2; });
+    if(!todo.length) return;
+    var changed=false;
+    for(var i=0;i<todo.length&&i<10;i++){ done[todo[i]]=Date.now(); try{ if(await fix(todo[i])) changed=true; }catch(e){} }
+    if(changed){ var ds=(document.getElementById('repDate')||{}).value||''; try{ if(typeof bnxDsrPaint_==='function') bnxDsrPaint_(ds); }catch(e){} try{ recalcAll(); }catch(e){} }
+  }
+  /* a day that could not be split is tried again after 10 min (new payments / server back) */
+  setInterval(function(){ Object.keys(done).forEach(function(k){ if(Date.now()-done[k]>600000) delete done[k]; }); scan(); },4000);
+})();
+</script>
 </body>
 </html>
