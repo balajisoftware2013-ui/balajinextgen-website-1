@@ -16,6 +16,16 @@ const ERP_REGISTRY_SHEET_NAME = 'TEMPLATE_REGISTRY';
 
 const ERP_FALLBACK_API = 'https://script.google.com/macros/s/AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx/exec';
 
+
+// Shared endpoint routing. Defaults match the supplied restaurant dashboard.
+// A saved deployment ID is used only when it is syntactically valid.
+const ERP_API_ENDPOINTS = (function(){
+  function url(key,fallback){try{var id=localStorage.getItem(key);if(/^AKfycb[A-Za-z0-9_-]{20,}$/.test(id||''))return 'https://script.google.com/macros/s/'+id+'/exec';}catch(e){}return fallback;}
+  return {V2_AUTH:url('bnx_api_auth',ERP_FALLBACK_API),
+    V2_CORE:url('bnx_api_core','https://script.google.com/macros/s/AKfycbwHdqrP4IvuVD2ZkupNybrEkiXu3kmuI6-tQoiHgYxoqr1KgUupeFsi3PIoFEbuv6XA/exec')};
+})();
+window.ERP_API_ENDPOINTS=ERP_API_ENDPOINTS;
+
 const ERP_KEYS = {
   USER:    'ERP_USER',
   SESSION: 'ERP_SESSION',
@@ -396,7 +406,7 @@ function _normalise(raw) {
   ).toString().trim();
 
   // Resolve status — accept ok:true as success
-  const status = (flat.status === 'success' || flat.ok === true || raw.ok === true)
+  const status = (flat.status === 'success' || flat.ok === true || raw.ok === true || flat.success === true || raw.success === true)
     ? 'success' : (flat.status || 'error');
 
   return Object.assign({}, flat, {
@@ -621,9 +631,9 @@ function _erpDemoLogin(loginId, password) {
 
 async function erpApiRequest(payload, endpoint){
   let raw;
-  const ep = endpoint || 'V2_CORE';
-  const target = (ep === 'V2_AUTH' && typeof GAS_APIS_DASH !== 'undefined' && GAS_APIS_DASH.V2_AUTH)
-    ? GAS_APIS_DASH.V2_AUTH : _ERP_API_URL;
+  const ep = endpoint || (/^(LOGIN|LOGOUT|AUTH_LOGIN|VERIFY_LOGIN)$/.test(String(payload&&payload.action||''))?'V2_AUTH':'V2_CORE');
+  const pageEndpoints=typeof GAS_APIS_DASH!=='undefined'?GAS_APIS_DASH:null;
+  const target=(pageEndpoints&&pageEndpoints[ep])||ERP_API_ENDPOINTS[ep]||_ERP_API_URL;
 
   if(payload && payload.action === 'PING'){
     const r = await fetch(target + '?action=PING', { method:'GET', redirect:'follow' });
@@ -644,7 +654,9 @@ async function erpApiRequest(payload, endpoint){
     e.status=resp.status; e.responseText=text.slice(0,300); throw e;
   }
   raw = JSON.parse(text);
-  return _normalise(raw);
+  // Login normalization must not discard menu arrays or envelope status.
+  if(payload && /^(LOGIN|AUTH_LOGIN|VERIFY_LOGIN)$/.test(String(payload.action||'')))return _normalise(raw);
+  return Object.assign({},_normalise(raw),raw);
 }
 
 function erpReadSheet(sheetId, sheetName, tq, cb){
