@@ -2540,7 +2540,7 @@ function normalizeRecipe_(d){var cm=loadData('codemaster'),menuMatch=cm.find(fun
 function rowToMenu(r){return normalizeRecipe_({id:r[0]||Date.now(),name:r[1]||'',category:r[2]||'Cocktail',price:Number(r[3])||0,tax:r[4]||'',outletId:r[5]||'',ingredients:[{code:r[6]||'',itemCode:r[6]||'',name:r[7]||'',ml:Number(r[8])||0,costPerML:Number(r[10])||0,total:(Number(r[8])||0)*(Number(r[10])||0)}]});}
 function rowsToMenu(rows){var groups={};(rows||[]).forEach(function(r){var name=String(r[1]||'').trim();if(!name)return;var key=String(r[0]||'')+'|'+normBarText_(name);if(!groups[key])groups[key]={id:r[0]||Date.now(),name:name,category:r[2]||'Cocktail',price:Number(r[3])||0,tax:r[4]||'',outletId:r[5]||'',ingredients:[]};if(r[7]||Number(r[8]))groups[key].ingredients.push({code:r[6]||'',itemCode:r[6]||'',name:r[7]||'',ml:Number(r[8])||0,costPerML:Number(r[10])||0,total:(Number(r[8])||0)*(Number(r[10])||0)});});return Object.values(groups).map(normalizeRecipe_).filter(function(r){return r.name;});}
 function menuToRows(d){d=normalizeRecipe_(d);var ings=d.ingredients&&d.ingredients.length?d.ingredients:[{name:'',ml:0,costPerML:0}];return ings.map(function(i){return[d.id||Date.now(),d.name||'',d.category||'Cocktail',d.price||0,d.tax||'',currentClient,i.code||i.itemCode||'',i.name||'',i.ml||0,'ML',i.costPerML||0,true];});}
-function getSaleInventoryConsumption_(sale){var qty=Number(sale.qty)||0;if(qty<=0)return[];var recipe=loadData('menu').find(function(r){return normBarText_(r.name)===normBarText_(sale.product||sale.reportName);});if(recipe&&recipe.ingredients&&recipe.ingredients.length)return recipe.ingredients.map(function(i){return{itemName:i.storeItem||i.name,itemCode:i.itemCode||i.code||'',group:(findCodeMap_(i.storeItem||i.name)||{}).group||sale.group||'COCKTAIL',totalML:(Number(i.ml)||0)*qty};}).filter(function(x){return x.itemName&&x.totalML>0;});var cm=findCodeMap_(sale.product||sale.reportName),ml=Number(sale.unitML||sale.mlPerUnit||(cm&&cm.sell)||0);return ml>0?[{itemName:(cm&&cm.store)||sale.product||sale.reportName,itemCode:(cm&&cm.itemCode)||sale.itemCode||'',group:(cm&&cm.group)||sale.group||'Other',totalML:ml*qty}]:[];}
+function getSaleInventoryConsumption_(sale){if(sale&&Array.isArray(sale.consume))return sale.consume;var qty=Number(sale.qty)||0;if(qty<=0)return[];var recipe=loadData('menu').find(function(r){return normBarText_(r.name)===normBarText_(sale.product||sale.reportName);});if(recipe&&recipe.ingredients&&recipe.ingredients.length)return recipe.ingredients.map(function(i){var m_=findCodeMap_(i.name)||findCodeMap_(i.storeItem);return{itemName:(m_&&m_.report)||i.name||i.storeItem,itemCode:i.itemCode||i.code||'',group:(findCodeMap_(i.storeItem||i.name)||{}).group||sale.group||'COCKTAIL',totalML:(Number(i.ml)||0)*qty};}).filter(function(x){return x.itemName&&x.totalML>0;});var cm=findCodeMap_(sale.product||sale.reportName),ml=Number(sale.unitML||sale.mlPerUnit||(cm&&cm.sell)||0);return ml>0?[{itemName:(cm&&(cm.report||cm.store))||sale.reportName||sale.product,itemCode:(cm&&cm.itemCode)||sale.itemCode||'',group:(cm&&cm.group)||sale.group||'Other',totalML:ml*qty}]:[];}
 function getInventoryConsumptionMap_(sales){var map={};(sales||[]).forEach(function(s){getSaleInventoryConsumption_(s).forEach(function(x){var k=normBarText_(x.itemName);if(!k)return;if(!map[k])map[k]={name:x.itemName,soldML:0,qty:0,group:x.group};map[k].soldML+=x.totalML;map[k].qty+=Number(s.qty)||0;});});return map;}
 // ── In-memory cache (loaded per client from GAS) ─────────────────────────────
 const _cache = {};
@@ -4152,7 +4152,7 @@ function handleMocktailUpload(event){
 // ═══════════════════════════════════════════════════
 function _num_(v){ const n=Number(v); return Number.isFinite(n)?n:0; }
 function _storeQtyML_(r){
-  const q=_num_(r.qtyML); if(q>0) return q;
+  const q=_num_(r.qtyML); if(q>0||(q<0&&r.allowNeg)) return q;
   const b=_num_(r.qtyBtl), ml=_num_(r.bottleML); return b>0&&ml>0?b*ml:0;
 }
 function _storeLandedCost_(r){
@@ -6349,5 +6349,199 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
 var tries=0, iv=setInterval(function(){ wrapTdb(); if(cid()&&!CAT.length&&!catLoading) loadCatalog(); if(++tries>40) clearInterval(iv); },1500);
 })();
 </script>
+<script id="bnx-slg-direct-20261016">
+/* SLG Google Sheet direct capture (HASHTAG SILIGURI · CL00010).
+   Reads the live "SLG Bar FY25-27-Report" sheet straight from Google (gviz):
+     IN Bar      → store ISSUES converted to bar stock-in ML (IssQtr × Code_Master UNIT/ISSUE)
+     Data_Store  → purchases (RecQty/RecVal) + issue value (cost)
+     Data_Bar    → POS sales, direct pour ML (Code_Master UNIT/SELL)
+     Menu        → cocktail recipe ML per spirit × qty sold
+     StockAdj    → re-issues
+   and an opening per item = FY opening block + receipts + adj − sales before the From date
+   — the same chain the sheet's Bar_Report uses. While "SLG sheet mode" is on, the Bar Report,
+   Stock, Dashboard and Store pages read this data instead of the backend copy (no double count). */
+(function(){
+  var SLG_SHEETS={CL00010:'1OxFG1CGvoFr-3imy511Ui6AaOGt_wDxz-GLvhwsTsKM'};
+  var FY_START='2025-03-31', OPEN_RANGE='A13363:H14000', INBAR_RANGE='A4:H13361';
+  function sid_(){return (typeof currentClient!=='undefined'&&currentClient&&SLG_SHEETS[currentClient])||'';}
+  function lsGet_(k){try{return localStorage.getItem(k);}catch(e){return null;}}
+  function lsSet_(k,v){try{localStorage.setItem(k,v);}catch(e){}}
+  function modeKey_(){return 'bnx_slg_mode_'+(typeof currentClient!=='undefined'?currentClient:'');}
+  window.bnxSlgOn_=function(){return !!sid_()&&lsGet_(modeKey_())!=='0'&&!!lsGet_('bnx_slg_range_'+currentClient);};
+  var U=function(s){return String(s==null?'':s).trim().replace(/\s+/g,' ').toUpperCase();};
+  var N=function(v){v=Number(v);return isFinite(v)?v:0;};
+
+  /* ---------- gviz JSONP (no CORS, works from any domain) ---------- */
+  function q_(sheet,tq,range,headers){
+    return new Promise(function(res,rej){
+      var cb='__slg'+Date.now().toString(36)+Math.random().toString(36).slice(2,7),s=document.createElement('script'),done=false;
+      var t=setTimeout(function(){fin(new Error('Timeout reading '+sheet));},120000);
+      function fin(err,data){if(done)return;done=true;clearTimeout(t);try{delete window[cb];}catch(e){window[cb]=undefined;}s.remove();err?rej(err):res(data);}
+      window[cb]=function(r){
+        if(!r||r.status==='error'){var e=r&&r.errors&&r.errors[0];return fin(new Error(sheet+': '+((e&&(e.detailed_message||e.message))||'sheet error')));}
+        fin(null,table_(r.table));
+      };
+      s.onerror=function(){fin(new Error('NOT_SHARED'));};
+      s.onload=function(){setTimeout(function(){fin(new Error('NOT_SHARED'));},30);};
+      s.src='https://docs.google.com/spreadsheets/d/'+sid_()+'/gviz/tq?tqx='+encodeURIComponent('out:json;responseHandler:'+cb)+
+        '&sheet='+encodeURIComponent(sheet)+(range?'&range='+range:'')+'&headers='+(headers||0)+'&tq='+encodeURIComponent(tq);
+      document.head.appendChild(s);
+    });
+  }
+  function cell_(c){
+    if(!c||c.v==null)return null;
+    if(typeof c.v==='string'){var m=/^Date\((\d+),(\d+),(\d+)/.exec(c.v);if(m)return m[1]+'-'+String(+m[2]+1).padStart(2,'0')+'-'+String(+m[3]).padStart(2,'0');}
+    return c.v;
+  }
+  function table_(t){return {labels:(t.cols||[]).map(function(c){return c.label||c.id;}),rows:(t.rows||[]).map(function(r){return (r.c||[]).map(cell_);})};}
+  function prevDay_(d){var x=new Date(d+'T00:00:00');x.setDate(x.getDate()-1);return x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0');}
+
+  /* ---------- pull ---------- */
+  window.bnxSlgPull=async function(){
+    if(!sid_()){toast('No SLG Google Sheet linked for this client','warn');return;}
+    var fEl=document.getElementById('rptFrom'),tEl=document.getElementById('rptTo');
+    var today=(typeof todayStr==='function')?todayStr():new Date().toISOString().slice(0,10);
+    var from=(fEl&&fEl.value)||today.slice(0,8)+'01', to=(tEl&&tEl.value)||today;
+    if(from<=FY_START)from='2025-04-01';
+    if(to<from){toast('To date is before From date','warn');return;}
+    if(fEl)fEl.value=from; if(tEl)tEl.value=to;
+    var btn=document.getElementById('bnxSlgBtn'); if(btn){btn.disabled=true;btn.textContent='⟳ Reading SLG sheet…';}
+    var D=function(x){return "date '"+x+"'";};
+    try{
+      var r=await Promise.all([
+        q_('Code_Master','select A,B,C,D,E,F,H where A is not null',null,1),
+        q_('Menu','select *','A2:CZ1200',1),
+        q_('IN Bar','select F, sum(H) where H > 0 group by F',OPEN_RANGE,0),
+        q_('IN Bar','select F, sum(E) where A >= '+D(FY_START)+' and A < '+D(from)+' and E > 0 group by F',INBAR_RANGE,0),
+        q_('IN Bar','select A, F, sum(E) where A >= '+D(from)+' and A <= '+D(to)+' and E > 0 group by A, F',INBAR_RANGE,0),
+        q_('IN Bar','select B, sum(D) where A >= '+D(from)+' and A <= '+D(to)+' and D > 0 and E = 0 group by B',INBAR_RANGE,0),
+        q_('StockAdj','select A, B, D where A is not null and D is not null','A3:D3000',0),
+        q_('Data_Bar','select B, G, sum(C), sum(F) where A >= '+D(FY_START)+' and A < '+D(from)+' group by B, G','A4:J',0),
+        q_('Data_Bar','select A, B, G, H, E, sum(C), sum(D), sum(F) where A >= '+D(from)+' and A <= '+D(to)+' group by A, B, G, H, E','A4:J',0),
+        q_('Data_Store','select A, B, C, sum(G), sum(I), sum(J), sum(L) where A >= '+D(from)+' and A <= '+D(to)+' and B is not null group by A, B, C','A4:P',0)
+      ]);
+      var cmT=r[0],menuT=r[1],openT=r[2],recBT=r[3],recT=r[4],unRecT=r[5],adjT=r[6],saleBT=r[7],saleT=r[8],purT=r[9];
+
+      /* Code Master */
+      var cm=[],byStore={},byPos={},repInfo={};
+      cmT.rows.forEach(function(x,i){
+        var rep=x[0]; if(!rep)return;
+        var o={id:'SLGCM'+i,report:String(rep),store:x[1]||'',issue:N(x[2])||0,barname:x[3]||'',posName:x[3]||'',sell:N(x[4])||0,other:N(x[5])||0,group:x[6]||'',itemCode:'',source:'SLG'};
+        cm.push(o);
+        if(o.store&&!byStore[U(o.store)])byStore[U(o.store)]=o;
+        if(o.barname&&!byPos[U(o.barname)])byPos[U(o.barname)]=o;
+        var k=U(rep); if(!repInfo[k])repInfo[k]={name:String(rep),issue:0,group:''};
+        if(!repInfo[k].issue&&o.issue)repInfo[k].issue=o.issue; if(!repInfo[k].group&&o.group)repInfo[k].group=o.group;
+      });
+      var info=function(rep){return repInfo[U(rep)]||{name:String(rep),issue:0,group:''};};
+
+      /* Menu recipe matrix: col B = POS cocktail name, header row = spirit (report) name, cells = ML */
+      var recipes={},menu=[],seen={},spiritCols=[];
+      menuT.labels.forEach(function(l,j){if(j>=2&&l&&!seen[U(l)]){seen[U(l)]=1;spiritCols.push([j,String(l).trim()]);}});
+      menuT.rows.forEach(function(x,i){
+        var name=x[1]; if(!name||typeof name!=='string')return; var k=U(name); if(recipes[k])return;
+        var ing=[]; spiritCols.forEach(function(c){var ml=N(x[c[0]]);if(ml>0)ing.push({name:c[1],ml:ml});});
+        if(!ing.length)return;
+        recipes[k]=ing;
+        menu.push({id:'SLGMN'+i,name:name.trim(),category:'Cocktail',price:0,source:'SLG',mapped:true,
+          ingredients:ing.map(function(g){return {name:g.name,ml:g.ml,costPerML:0,total:0,storeItem:g.name,mapped:!!repInfo[U(g.name)]};}),
+          totalML:ing.reduce(function(a,g){return a+g.ml;},0),totalCost:0});
+      });
+      function consume_(product,rep,qty,directML){
+        var out={},add=function(n,ml){if(!n||!ml)return;var k=U(n);if(!out[k])out[k]={itemName:info(n).name,group:info(n).group||'COCKTAIL',totalML:0};out[k].totalML+=ml;};
+        if(rep&&U(rep)!=='NEW')add(rep,N(directML));
+        (recipes[U(product)]||[]).forEach(function(g){add(g.name,g.ml*qty);});
+        return Object.keys(out).map(function(k){var o=out[k];o.totalML=+o.totalML.toFixed(3);return o;});
+      }
+
+      /* Opening = FY opening block + receipts + re-issues − (direct + cocktail) sales, all before From */
+      var open={},addO=function(n,v){if(!n)return;var k=U(n);open[k]=(open[k]||0)+N(v);};
+      openT.rows.forEach(function(x){addO(x[0],x[1]);});
+      recBT.rows.forEach(function(x){addO(x[0],x[1]);});
+      adjT.rows.forEach(function(x){if(x[0]&&x[0]>=FY_START&&x[0]<from)addO(x[1],x[2]);});
+      saleBT.rows.forEach(function(x){consume_(x[0],x[1],N(x[2]),x[3]).forEach(function(c){addO(c.itemName,-c.totalML);});});
+
+      /* Issue value per date × report (cost of what went to the bar) */
+      var issVal={},purchases=[];
+      purT.rows.forEach(function(x){
+        var date=x[0],st=x[1],m=byStore[U(st)],rep=m?m.report:'';
+        if(N(x[5])>0&&rep){var k=date+'|'+U(rep);issVal[k]=(issVal[k]||0)+N(x[6]);}
+        if(N(x[3])>0)purchases.push({id:'SLGPU|'+date+'|'+st,date:date,storeItem:st,uom:x[2]||'',qty:N(x[3]),value:+N(x[4]).toFixed(2),reportName:rep,source:'SLG'});
+      });
+
+      var openDate=prevDay_(from),store=[];
+      Object.keys(open).forEach(function(k){var v=+open[k].toFixed(3);if(!v)return;var i=info(k);
+        store.push({id:'SLGOP|'+k,date:openDate,item:'OPENING (SLG sheet)',barName:i.name,group:i.group,uom:'ML',qtyML:v,allowNeg:true,bottleML:i.issue||750,amount:0,source:'SLG_OPEN',remarks:'Opening carried from SLG sheet'});});
+      recT.rows.forEach(function(x){var i=info(x[1]);
+        store.push({id:'SLGIN|'+x[0]+'|'+x[1],date:x[0],item:i.name,barName:i.name,group:i.group,uom:'ML',qtyML:+N(x[2]).toFixed(3),bottleML:i.issue||750,
+          amount:+N(issVal[x[0]+'|'+U(x[1])]).toFixed(2),source:'SLG',remarks:'Store issue → bar (Data_Store IssQtr × UNIT/ISSUE)'});});
+      adjT.rows.forEach(function(x,j){if(!x[0]||x[0]<from||x[0]>to)return;var i=info(x[1]);
+        store.push({id:'SLGADJ|'+j,date:x[0],item:'STOCK ADJ (re-issue)',barName:i.name,group:i.group,uom:'ML',qtyML:N(x[2]),allowNeg:true,bottleML:i.issue||750,amount:0,source:'SLG_ADJ'});});
+
+      var sales=[],unmapped={};
+      saleT.rows.forEach(function(x){
+        var date=x[0],prod=x[1],rep=x[2],qty=N(x[5]); if(!date||!prod)return;
+        var cons=consume_(prod,rep,qty,x[7]);
+        if(!cons.length&&qty>0){var k=U(prod);if(!unmapped[k])unmapped[k]={name:prod,qty:0,amount:0};unmapped[k].qty+=qty;unmapped[k].amount+=N(x[6]);}
+        sales.push({id:'SLGSA|'+date+'|'+prod,date:date,product:prod,qty:qty,amount:+N(x[6]).toFixed(2),
+          reportName:(rep&&U(rep)!=='NEW')?rep:prod,group:x[3]||(recipes[U(prod)]?'COCKTAIL':''),unitML:N(x[4]),
+          totalML:+cons.reduce(function(a,c){return a+c.totalML;},0).toFixed(3),consume:cons,source:'SLG'});
+      });
+
+      saveData('slg_codemaster',cm); saveData('slg_menu',menu); saveData('slg_store',store);
+      saveData('slg_sales',sales); saveData('slg_purchase',purchases);
+      saveData('slg_check',[{from:from,to:to,at:new Date().toISOString(),
+        unmappedPos:Object.keys(unmapped).map(function(k){return unmapped[k];}).sort(function(a,b){return b.amount-a.amount;}),
+        unmappedStore:unRecT.rows.map(function(x){return {name:x[0],qty:N(x[1])};})}]);
+      lsSet_('bnx_slg_range_'+currentClient,from+'|'+to); lsSet_(modeKey_(),'1');
+      toast('SLG sheet: '+sales.length+' POS lines · '+store.length+' bar stock-in lines · '+purchases.length+' purchases ✓','ok');
+      if(typeof renderBarReport==='function')renderBarReport();
+    }catch(e){
+      console.warn('[SLG]',e);
+      toast(e.message==='NOT_SHARED'?'SLG sheet not readable — in Google Sheets: Share ▸ General access ▸ "Anyone with the link" ▸ Viewer':'SLG sheet read failed: '+e.message,'warn');
+    }finally{ if(btn){btn.disabled=false;btn.textContent='📗 Pull SLG Sheet';} bnxSlgPanel_(); }
+  };
+  window.bnxSlgToggle=function(){lsSet_(modeKey_(),bnxSlgOn_()?'0':'1');if(typeof _cache==='object')Object.keys(_cache).forEach(function(k){if(/__(sales|store|menu|codemaster)$/.test(k))delete _cache[k];});bnxSlgPanel_();if(typeof renderBarReport==='function')renderBarReport();};
+
+  /* While SLG mode is on, the stock/sales tables come from the sheet only (the backend copy of the
+     same POS bills would otherwise be counted twice). Manual entries keep writing to the backend tables. */
+  var _ld=loadData;
+  loadData=function(tbl){
+    if((tbl==='sales'||tbl==='store'||tbl==='menu'||tbl==='codemaster')&&bnxSlgOn_()){var a=_ld('slg_'+tbl);if(a&&a.length)return a;}
+    return _ld(tbl);
+  };
+
+  /* Panel on the Bar Report page: button, mode switch, range, purchases, data check */
+  function esc_(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+  window.bnxSlgPanel_=function(){
+    var pg=document.getElementById('pg-bar_report'); if(!pg||!sid_())return;
+    var fb=pg.querySelector('.filter-bar');
+    if(fb&&!document.getElementById('bnxSlgBtn')){
+      fb.insertAdjacentHTML('beforeend','<button class="btn btn-ghost btn-sm" id="bnxSlgBtn" onclick="bnxSlgPull()" title="Read store issues (ML), cocktails, purchases and POS sales straight from the SLG Google Sheet">📗 Pull SLG Sheet</button><button class="btn btn-ghost btn-sm" id="bnxSlgMode" onclick="bnxSlgToggle()"></button>');
+    }
+    var m=document.getElementById('bnxSlgMode'); if(m)m.textContent=bnxSlgOn_()?'Source: SLG sheet ✓':'Source: backend';
+    var box=document.getElementById('bnxSlgBox');
+    if(!box){var tw=pg.querySelector('.tbl-wrap'); if(!tw)return; tw.insertAdjacentHTML('afterend','<div id="bnxSlgBox" style="margin-top:12px;"></div>'); box=document.getElementById('bnxSlgBox');}
+    var chk=(_ld('slg_check')||[])[0], rg=lsGet_('bnx_slg_range_'+currentClient);
+    if(!chk||!bnxSlgOn_()){box.innerHTML='';return;}
+    var pur=_ld('slg_purchase')||[], byItem={};
+    pur.forEach(function(p){var k=p.storeItem;if(!byItem[k])byItem[k]={item:k,uom:p.uom,qty:0,value:0,rep:p.reportName};byItem[k].qty+=p.qty;byItem[k].value+=p.value;});
+    var pl=Object.keys(byItem).map(function(k){return byItem[k];}).sort(function(a,b){return b.value-a.value;});
+    var f=document.getElementById('rptFrom'),t=document.getElementById('rptTo'),r=(rg||'').split('|');
+    var off=(f&&f.value&&f.value!==r[0])||(t&&t.value&&t.value>r[1]);
+    box.innerHTML=(off?'<div style="background:#fef3c7;border:1px solid #f59e0b;color:#92400e;padding:8px 12px;border-radius:8px;margin-bottom:10px;font-size:12px;">SLG data loaded for '+esc_(r[0])+' → '+esc_(r[1])+'. Click <b>📗 Pull SLG Sheet</b> to load the period you selected (opening is carried to the From date).</div>':'')+
+      '<div class="tbl-wrap"><div class="tbl-head"><div class="tbl-title">📗 SLG Sheet — Store Purchases</div><div class="tbl-sub">'+esc_(chk.from)+' → '+esc_(chk.to)+' · '+pl.length+' items · ₹'+formatNum(pl.reduce(function(a,x){return a+x.value;},0))+'</div></div>'+
+      '<div style="overflow-x:auto;max-height:260px;overflow-y:auto;"><table><thead><tr><th>Store Item</th><th>UOM</th><th>Qty</th><th>Value (₹)</th><th>Bar Report Item</th></tr></thead><tbody>'+
+      (pl.length?pl.map(function(x){return '<tr><td>'+esc_(x.item)+'</td><td>'+esc_(x.uom)+'</td><td class="td-num">'+x.qty+'</td><td class="td-num">₹'+formatNum(x.value)+'</td><td>'+(x.rep?esc_(x.rep):'<span class="td-badge badge-amber">⚠ not in Code_Master</span>')+'</td></tr>';}).join(''):'<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:14px;">No purchases in this period.</td></tr>')+
+      '</tbody></table></div></div>'+
+      ((chk.unmappedStore.length||chk.unmappedPos.length)?'<div class="tbl-wrap" style="margin-top:12px;"><div class="tbl-head"><div class="tbl-title">⚠ Not counted in bar stock</div><div class="tbl-sub">Add these to Code_Master (store item / POS name) or Menu (cocktail recipe)</div></div><div style="overflow-x:auto;max-height:260px;overflow-y:auto;"><table><thead><tr><th>Type</th><th>Name</th><th>Qty</th><th>Amount (₹)</th></tr></thead><tbody>'+
+        chk.unmappedStore.map(function(x){return '<tr><td>Store issue</td><td>'+esc_(x.name)+'</td><td class="td-num">'+x.qty+'</td><td></td></tr>';}).join('')+
+        chk.unmappedPos.map(function(x){return '<tr><td>POS sale</td><td>'+esc_(x.name)+'</td><td class="td-num">'+x.qty+'</td><td class="td-num">₹'+formatNum(x.amount)+'</td></tr>';}).join('')+
+        '</tbody></table></div></div>':'');
+  };
+  if(typeof renderBarReport==='function'){var _rb=renderBarReport;renderBarReport=function(){var o=_rb.apply(this,arguments);try{bnxSlgPanel_();}catch(e){}return o;};}
+})();
+</script>
+
 </body>
 </html>
