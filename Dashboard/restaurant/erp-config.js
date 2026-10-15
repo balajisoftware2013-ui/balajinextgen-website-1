@@ -445,15 +445,18 @@ const ERP = {
     localStorage.setItem(ERP_KEYS.SESSION, n.sessionToken || '');
     localStorage.setItem(ERP_KEYS.ROLE,    n.ROLE);
     localStorage.setItem(ERP_KEYS.CLIENT,  n.CLIENT_ID);
+    /* 2026-10-15 ("not be close till logout"): staff logins never expire on this device — only the
+       Logout button ends them. SUPER_ADMIN keeps its 2-hour security limit. */
     const isSuperAdmin = (n.ROLE || "").toUpperCase() === "SUPER_ADMIN";
-    const expiry = Date.now() + (isSuperAdmin ? 2 : 8) * 60 * 60 * 1000;
-    localStorage.setItem(ERP_KEYS.EXPIRY,  expiry);
+    if (isSuperAdmin) localStorage.setItem(ERP_KEYS.EXPIRY, Date.now() + 2 * 60 * 60 * 1000);
+    else localStorage.removeItem(ERP_KEYS.EXPIRY);
   },
 
   getUser(){
     try{
       const expiry = parseInt(localStorage.getItem(ERP_KEYS.EXPIRY) || '0');
-      if(expiry && Date.now() > expiry){
+      /* only SUPER_ADMIN logins time out; every other role stays signed in until Logout */
+      if(expiry && Date.now() > expiry && _erpNormRole(localStorage.getItem(ERP_KEYS.ROLE)) === 'SUPER_ADMIN'){
         this._clearStorage();
         return null;
       }
@@ -838,8 +841,13 @@ async function erpAuthApi(payload)     { return erpApiRequest(payload, 'V2_AUTH'
   window._erpIdleLogout   = function() { _doLogout(); };
 
   /* poll check */
+  /* 2026-10-15: idle auto-logout and browser-close logout apply ONLY to SUPER_ADMIN.
+     POS / cashier / captain / manager … stay logged in until they press Logout. */
+  function _idleRole() { try { return _erpNormRole(localStorage.getItem('ERP_ROLE')) === 'SUPER_ADMIN'; } catch (e) { return false; } }
+
   function _check() {
     if (_isLoginPage()) return;
+    if (!_idleRole()) { if (_warnShown) _hideWarning(); return; }
     if (typeof ERP !== 'undefined' && !ERP.getUser()) return; /* not logged in */
 
     var idle = Date.now() - _lastActive();
@@ -899,7 +907,7 @@ async function erpAuthApi(payload)     { return erpApiRequest(payload, 'V2_AUTH'
       try { knownTok = localStorage.getItem('erp_alive_token') || ''; } catch (e) {}
       if (tok !== knownTok) alive = true;
       var lastSeen = _BOOT_SEEN;
-      if (!alive && lastSeen && (Date.now() - lastSeen) > CLOSE_GRACE_MS) {
+      if (!alive && _idleRole() && lastSeen && (Date.now() - lastSeen) > CLOSE_GRACE_MS) {
         try {
           navigator.sendBeacon(_ERP_API_URL, new Blob(
             [JSON.stringify({ action: 'LOGOUT', sessionToken: tok, token: tok, reason: 'browser_closed' })],
