@@ -64422,11 +64422,12 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
   function invOf(t){ var d=t.data||{}; return String(d.invoiceNumber||d.invoicenumber||t.ref||'').trim(); }
   async function syncViaImporter(onProgress,mode){
     var all=await dbAll('tx'), ok=0, fail=0, lastErr='', res={written:[],warnings:[],checks:[],newItems:[],newCustomers:[],imported:0,skipped:0,replaced:0,conflicts:[]};
-    var want=function(t){ return mode==='reimport'?true:t.status!=='SYNCED'; };
+    var want=function(t){ return mode==='reimport'?true:(t.status!=='SYNCED'||!!t.reimport); };
     /* sales: complete bills only (needs both files) */
     var F1={},F2={};
     all.forEach(function(t){ if(t.type!=='sales') return; var no=invOf(t); if(!no) return;
       if(t.fmt===1) (F1[no]=F1[no]||[]).push(t); else (F2[no]=F2[no]||[]).push(t); });
+    Object.keys(F1).forEach(function(no){ F1[no].sort(function(a,b){return (b.createdAt||0)-(a.createdAt||0);}); });   /* newest upload of a bill wins */
     var nos=Object.keys(F1).filter(function(no){ return F1[no].concat(F2[no]||[]).some(want); }).sort();
     var waiting=[];
     all.forEach(function(t){ if(t.type!=='sales'||!want(t)) return; var no=invOf(t);
@@ -64435,23 +64436,25 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
     nos=nos.filter(function(no){ return F2[no]; });
     if(waiting.length) await dbPut('tx',waiting);
     var total=nos.length+all.filter(function(t){return t.type!=='sales'&&want(t);}).length, done=0;
-    for(var i=0;i<nos.length;i+=40){ var part=nos.slice(i,i+40), bills=[], lines=[];
+    var isRep=function(no){ return mode==='reimport'||F1[no].concat(F2[no]).some(function(t){return !!t.reimport;}); };
+    var queue=nos.filter(isRep).map(function(no){return [no,'reimport'];}).concat(nos.filter(function(no){return !isRep(no);}).map(function(no){return [no,'import'];})), stop=false;
+    for(var i=0;i<queue.length&&!stop;i+=40){ var md=queue[i][1], part=[]; for(var q=i;q<queue.length&&q<i+40&&queue[q][1]===md;q++) part.push(queue[q][0]); i=q-40; var bills=[], lines=[];
       part.forEach(function(no){ bills.push(plainData(F1[no][0].data)); F2[no].forEach(function(t){ lines.push(plainData(t.data)); }); });
-      var r; try{ r=await impPost({action:'IMPORT_POS_SALES',mode:mode||'import',bills:bills,lines:lines}); }catch(e){ r={success:false,error:e.message}; }
+      var r; try{ r=await impPost({action:'IMPORT_POS_SALES',mode:md,bills:bills,lines:lines}); }catch(e){ r={success:false,error:e.message}; }
       var conf={}; (r&&r.conflicts||[]).forEach(function(n){conf[n]=1;});
       var upd=[]; part.forEach(function(no){ var good=!!(r&&r.success)&&!conf[no];
-        F1[no].concat(F2[no]).forEach(function(t){ t.status=good?'SYNCED':'PENDING'; t.syncError=good?'':(conf[no]?no+' already exists as a live ERP bill — cancel it, then Re-import':String((r&&r.error)||'Server did not accept')); t.syncedAt=good?Date.now():0; upd.push(t); });
+        F1[no].concat(F2[no]).forEach(function(t){ t.status=good?'SYNCED':'PENDING'; t.syncError=good?'':(conf[no]?no+' already exists as a live ERP bill — cancel it, then Re-import':String((r&&r.error)||'Server did not accept')); t.syncedAt=good?Date.now():0; if(good) t.reimport=false; upd.push(t); });
         if(good) ok++; else { fail++; lastErr=conf[no]?'bill number already used in the ERP':String((r&&r.error)||'Server did not accept'); } });
       await dbPut('tx',upd);
       if(r&&r.success){ res.imported+=r.bills||0; res.skipped+=(r.skipped||[]).length; res.replaced+=r.replaced||0; res.conflicts=res.conflicts.concat(r.conflicts||[]);
         ['written','warnings','checks','newItems','newCustomers'].forEach(function(k){ res[k]=res[k].concat(r[k]||[]); }); }
-      done+=part.length; if(onProgress) onProgress(done,total); if(!(r&&r.success)) break; }
+      done+=part.length; if(onProgress) onProgress(done,total); if(!(r&&r.success)) stop=true; }
     /* other types: raw rows into IMPORT_TRANSACTIONS */
     var groups={}; all.forEach(function(t){ if(t.type==='sales'||!want(t)) return; var k=t.batchId+'|'+t.type+'|'+t.fmt; (groups[k]=groups[k]||[]).push(t); });
     for(var g in groups){ var list=groups[g];
       for(var j=0;j<list.length;j+=200){ var chunk=list.slice(j,j+200), r2;
-        try{ r2=await impPost({action:'IMPORT_RAW',type:chunk[0].type,format:chunk[0].fmt,batchId:chunk[0].batchId,rows:chunk.map(function(t){return {id:t.id,date:t.date,ref:t.ref,party:t.party,item:t.item,qty:t.qty,amount:t.amount,dir:t.dir,mode:t.mode,platform:t.platform,gstin:t.gstin,narr:t.narr||'',account:t.account||'',data:plainData(t.data)};})}); }catch(e){ r2={success:false,error:e.message}; }
-        var good=!!(r2&&r2.success); chunk.forEach(function(t){ t.status=good?'SYNCED':'PENDING'; t.syncError=good?'':String((r2&&r2.error)||'Server did not accept'); t.syncedAt=good?Date.now():0; });
+        try{ r2=await impPost({action:'IMPORT_RAW',type:chunk[0].type,format:chunk[0].fmt,batchId:chunk[0].batchId,replace:mode==='reimport'||chunk.some(function(t){return !!t.reimport;}),rows:chunk.map(function(t){return {id:t.id,date:t.date,ref:t.ref,party:t.party,item:t.item,qty:t.qty,amount:t.amount,dir:t.dir,mode:t.mode,platform:t.platform,gstin:t.gstin,narr:t.narr||'',account:t.account||'',data:plainData(t.data)};})}); }catch(e){ r2={success:false,error:e.message}; }
+        var good=!!(r2&&r2.success); chunk.forEach(function(t){ t.status=good?'SYNCED':'PENDING'; t.syncError=good?'':String((r2&&r2.error)||'Server did not accept'); t.syncedAt=good?Date.now():0; if(good) t.reimport=false; });
         await dbPut('tx',chunk); if(good) ok+=chunk.length; else { fail+=chunk.length; lastErr=String((r2&&r2.error)||'Server did not accept'); }
         done+=chunk.length; if(onProgress) onProgress(done,total); if(!good) break; } }
     ST.lastSync=Object.assign(res,{at:Date.now(),mode:mode||'import',ok:ok,fail:fail,err:lastErr,waiting:waiting.length});
@@ -64500,6 +64503,8 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
       (sp.plat?'<label class="f">Platform (if file has no Platform column)<select data-k="platform">'+opts(PLATFORMS.map(function(p){return [p,p];}),ST.platform)+'</select></label>':'')+
       '<span style="flex:1"></span><button class="bi-btn" data-act="tpl-x">⬇ Template (Excel)</button><button class="bi-btn" data-act="tpl-c">⬇ Template (CSV)</button></div>'+
       '<div class="bi-note"><b>'+E(fm.name)+'</b> — columns: '+fm.cols.map(function(c){return (c.req?'<b>'+E(c.label)+'*</b>':E(c.label));}).join(' · ')+'</div>'+
+      '<div class="bi-row" style="gap:16px;margin:-2px 0 10px"><label style="display:flex;gap:6px;align-items:center;font-weight:700;cursor:pointer"><input type="radio" name="biMode" data-k="replace" value="0"'+(ST.replace?'':' checked')+'> ➕ New import <span style="font-weight:400;opacity:.75">(bills already imported are skipped)</span></label>'+
+      '<label style="display:flex;gap:6px;align-items:center;font-weight:700;cursor:pointer"><input type="radio" name="biMode" data-k="replace" value="1"'+(ST.replace?' checked':'')+'> ♻ Re-upload &amp; replace <span style="font-weight:400;opacity:.75">(corrected file — the same bills are deleted and written again)</span></label></div>'+
       '<div class="bi-drop" data-act="pick">⬆ <b>Click to choose a file</b> or drop it here (.xlsx · .xls · .csv)'+(ST.file?'<div style="margin-top:6px;font-size:12px">Loaded: <b>'+E(ST.file)+'</b></div>':'')+'<input type="file" id="bnxImpFile" accept=".xlsx,.xls,.csv,.tsv,.txt" style="display:none"></div>';
     if(ST.msg) h+=ST.msg; var res=ST.res;
     if(res){ if(res.missing&&res.missing.length) h+='<div class="bi-note er">❌ Required column(s) not found for this format: <b>'+E(res.missing.join(', '))+'</b>. Download the template, or switch Format above.</div>';
@@ -64537,17 +64542,21 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
       if(hd.fmt!==ST.fmt){ var cur=scoreFmt(rows[hd.i],SPEC[ST.type].f[ST.fmt]); if(hd.sc.reqHit>cur.reqHit||(hd.sc.reqHit===cur.reqHit&&hd.sc.hits>cur.hits)){ ST.fmt=hd.fmt; ST.msg='<div class="bi-note">ℹ️ Columns match <b>Format '+hd.fmt+'</b> better — switched automatically.</div>'; } }
       var invoiceIndex={}; (await dbAll('tx')).forEach(function(t){if(t.type==='sales'&&t.fmt===1&&t.ref)invoiceIndex[t.ref]={date:t.date,party:t.party,mode:t.mode};});
       var res=process(ST.type,ST.fmt,rows,hd.i,{platform:ST.platform,invoiceIndex:Object.keys(invoiceIndex).length?invoiceIndex:null}); ST.busy='Checking duplicates…'; render();
-      if(!res.missing.length){ var have={}; (await dbAll('tx')).forEach(function(t){have[t.key]=1;}); res.rows.forEach(function(r){ if(r.st==='OK'&&have[r.key]){r.st='DUP';r.msg='Already imported earlier';} }); }
+      if(!res.missing.length){ var have={}; (await dbAll('tx')).forEach(function(t){have[t.key]=1;}); res.rows.forEach(function(r){ if(r.st==='OK'&&have[r.key]){ r.prev=true; if(!ST.replace){r.st='DUP';r.msg='Already imported earlier';} } }); }
       ST.res=res; ST.busy=''; }catch(e){ ST.busy=''; ST.msg='<div class="bi-note er">❌ '+E(e.message||e)+'</div>'; } render(); }
   async function doSave(){ var res=ST.res; if(!res) return; var take=res.rows.filter(function(x){return x.st==='OK'||(ST.inclDup&&x.st==='DUP');}); if(!take.length) return;
-    ST.busy='Saving…'; render(); var batch='B'+Date.now().toString(36), now=Date.now(), spec=SPEC[ST.type].f[ST.fmt], used={};
+    ST.busy='Saving…'; render(); var batch='B'+Date.now().toString(36), now=Date.now(), spec=SPEC[ST.type].f[ST.fmt], used={}, replaced=0;
+    if(ST.replace){ var refOf=function(type,o,d){ return String(type==='sales'?((d&&(d.invoiceNumber||d.invoicenumber))||o.ref):o.ref||'').trim().toLowerCase(); }, refs={};
+      take.forEach(function(r){ var k=refOf(ST.type,r.norm,r.sourceData); if(k) refs[k]=1; });
+      var old=(await dbAll('tx')).filter(function(t){ return t.type===ST.type&&t.fmt===ST.fmt&&refs[refOf(t.type,t,t.data)]; });
+      if(old.length){ await dbDel('tx',old.map(function(t){return t.id;})); replaced=old.length; } }
     var recs=take.map(function(r,i){ var id=hash(r.key); if(used[id]||r.st==='DUP') id=id+'_'+batch+'_'+i; used[id]=1; var d=Object.assign({},r.sourceData||{}); spec.cols.forEach(function(c,j){d[c.label]=r.vals[j];});
-      var n=r.norm; return {id:id,key:r.key,type:ST.type,fmt:ST.fmt,batchId:batch,date:n.date,ref:n.ref,party:n.party,item:n.item,qty:n.qty,amount:n.amount,dir:n.dir,mode:n.mode,platform:n.platform,gstin:n.gstin,narr:n.narr||'',account:n.account||'',data:d,status:'PENDING',syncError:'',createdAt:now}; });
+      var n=r.norm; return {id:id,key:r.key,type:ST.type,fmt:ST.fmt,batchId:batch,date:n.date,ref:n.ref,party:n.party,item:n.item,qty:n.qty,amount:n.amount,dir:n.dir,mode:n.mode,platform:n.platform,gstin:n.gstin,narr:n.narr||'',account:n.account||'',data:d,status:'PENDING',syncError:'',createdAt:now,reimport:!!ST.replace}; });
     try{ await dbPut('tx',recs); await upsertMasters(recs); await dbPut('batches',[{id:batch,type:ST.type,fmt:ST.fmt,file:ST.file,saved:recs.length,amount:recs.reduce(function(s,t){return s+t.amount*(t.dir==='OUT'?-1:1);},0),at:now}]); }
     catch(e){ ST.busy=''; ST.msg='<div class="bi-note er">❌ Save failed: '+E(e.message)+'</div>'; render(); return; }
     ST.busy='Syncing to server…'; render(); var s=await syncPending(function(a,b){ ST.busy='Syncing '+a+' / '+b+'…'; render(); });
     ST.busy=''; ST.res=null; ST.file='';
-    ST.msg='<div class="bi-note ok">✅ <b>'+recs.length+'</b> transaction(s) saved to the Transaction DB and Master DB (Format '+ST.fmt+').'+(s.fail?'</div><div class="bi-note wa">⏳ '+s.fail+' not yet accepted by the server ('+E(s.err)+'). They are stored safely on this device — open “Saved data & downloads” → Sync now to retry, or download them.':' Server sync complete.')+'</div>'; toast('✅ Imported '+recs.length+' transaction(s)','success'); render(); }
+    ST.msg='<div class="bi-note ok">✅ <b>'+recs.length+'</b>'+(replaced?' corrected':'')+' transaction(s) saved'+(replaced?' (replaced '+replaced+' earlier row(s) of the same bills)':'')+' to the Transaction DB and Master DB (Format '+ST.fmt+').'+(s.fail?'</div><div class="bi-note wa">⏳ '+s.fail+' not yet accepted by the server ('+E(s.err)+'). They are stored safely on this device — open “Saved data & downloads” → Sync now to retry, or download them.':' Server sync complete.')+'</div>'; toast('✅ Imported '+recs.length+' transaction(s)','success'); render(); }
   /* downloads of saved data (format-wise sheets + masters) */
   function rowsFor(list,type,fmt){ var sp=SPEC[type].f[fmt], h=sp.cols.map(function(c){return c.label;}).concat(['Direction','Net Amount','Status','Batch']);
     return [h].concat(list.map(function(t){ return sp.cols.map(function(c){return t.data&&t.data[c.label]!=null?t.data[c.label]:'';}).concat([t.dir,t.amount,t.status,t.batchId]); })); }
@@ -64579,6 +64588,7 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
     else if(a==='del-batch'){ var id=b.dataset.b, tx=await dbAll('tx'), mine=tx.filter(function(t){return t.batchId===id;}); if(mine.some(function(t){return t.status==='SYNCED';})){ toast('⚠️ This batch is already on the server — delete it there, not here.','error'); return; }
       if(!confirm('Delete this import batch ('+mine.length+' transactions) from this device? Master counts are not reduced.')) return; await dbDel('tx',mine.map(function(t){return t.id;})); await dbDel('batches',[id]); loadSaved(); } }
   function onChange(e){ var k=e.target.getAttribute&&e.target.getAttribute('data-k'); if(!k) return;
+    if(k==='replace'){ ST.replace=e.target.value==='1'; if(ST.res&&ST.res.rows) ST.res.rows.forEach(function(r){ if(!r.prev) return; if(ST.replace&&r.st==='DUP'&&r.msg==='Already imported earlier'){r.st='OK';r.msg='';} else if(!ST.replace&&r.st==='OK'){r.st='DUP';r.msg='Already imported earlier';} }); render(); return; }
     if(k==='inclDup'){ ST.inclDup=e.target.checked; render(); return; }
     ST[k]=(k==='fmt')?+e.target.value:e.target.value; if(k==='type'){ ST.fmt=1; } ST.res=null; ST.file=''; ST.msg=''; render(); }
   document.addEventListener('keydown',function(e){ if(e.key==='Escape'&&root) close(); });
