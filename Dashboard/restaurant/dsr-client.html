@@ -339,8 +339,12 @@ let BNX_AUTH_REDIRECTING_=false;
 function bnxRedirectToLogin_(reason){
   if(BNX_AUTH_REDIRECTING_)return;
   BNX_AUTH_REDIRECTING_=true;
-  try{sessionStorage.setItem('bnx_auth_reason',String(reason||'SESSION_EXPIRED'));}catch(e){}
-  gasToast('⚠️ Connection issue loading the report — please refresh the page.','error');
+  /* SESSION STAY TILL LOGOUT (2026-10-16): this used to write sessionStorage 'bnx_auth_reason'. Inside the dashboard the DSR
+     iframe shares the tab's sessionStorage with the Restaurant Dashboard, so one slow / rejected DSR call left an "expired"
+     marker the dashboard could act on as a logout. Nothing is written now and any stale marker is removed. The login is only
+     ended by the user's own Logout (token removed from storage). */
+  try{sessionStorage.removeItem('bnx_auth_reason');}catch(e){}
+  gasToast('⚠️ Server did not accept the request right now — your login is kept, retrying automatically.','warn');
   // Allow another toast (not another redirect, there is none) after a cooldown
   // instead of latching BNX_AUTH_REDIRECTING_ true forever on one bad request.
   setTimeout(()=>{BNX_AUTH_REDIRECTING_=false;},5000);
@@ -478,6 +482,7 @@ async function gasApiRaw_(action,payload,endpoint){
       
       if(j && !(j.error==='Invalid or expired session' || j.status===401)){
         BNX_DBG_('[API_DEBUG] ✅ Success:', action);
+        window.__bnxAuthOkAt=Date.now();
         return j;
       }
       /* 2026-10-13 ("net slow then session timeout"): a slow / busy server also answers "Invalid or expired session" for a login
@@ -522,6 +527,18 @@ async function gasApiRaw_(action,payload,endpoint){
   if(fresh && !payload.__bnxAuthRefreshAttempt){
     const again=Object.assign({},payload,{__bnxAuthRefreshAttempt:true});
     return gasApiRaw_(action,again,endpoint);
+  }
+  /* SESSION STAY TILL LOGOUT: the Restaurant Dashboard that hosts this page is signed in and keeps its own session alive —
+     let it make the read before reporting anything. */
+  if(/^GET_/.test(String(action)) && !payload.__bnxParentTried){
+    try{
+      const P=bnxDsrAccessibleParent_();
+      if(P && typeof P.gasApi==='function' && P.gasApi!==window.gasApi){
+        const clean=Object.assign({},payload); delete clean.__bnxAuthRefreshAttempt; delete clean.__bnxAltUrlTried;
+        const pr=await P.gasApi(action,clean,endpoint||'V2_CORE');
+        if(pr && pr.success!==false && !/expired session/i.test(String(pr.error||''))){ window.__bnxAuthOkAt=Date.now(); return pr; }
+      }
+    }catch(_){}
   }
   bnxRedirectToLogin_('INVALID_OR_EXPIRED_SESSION');
   return {success:false,authExpired:true,error:'Server rejected the saved login. Sign in again only if retrying after reconnect does not work.'};
@@ -1365,7 +1382,7 @@ async function fetchDsrMonthLive_(year,month){
   const mm=String(month).padStart(2,'0');
   const mFrom=year+'-'+mm+'-01', mTo=year+'-'+mm+'-'+String(new Date(Number(year),Number(month),0).getDate()).padStart(2,'0');
   if(!r || !r.success || !r.data || !r.data.byDay){
-    if(r&&r.authExpired){gasToast('🔐 Session expired — please login again','error');return false;}
+    if(r&&r.authExpired){gasToast('⚠️ Server busy — login kept, retrying','warn');return false;}
     // REPORT MAP: matrix unavailable -> build the month from the Reports Hub feeds.
     // Work on a clean month so snapshot rows can't be mistaken for live rows.
     const snapBak={}; Object.keys(STANDARD_DATA).forEach(k=>{if(k>=mFrom&&k<=mTo&&STANDARD_DATA[k]._snap)snapBak[k]=STANDARD_DATA[k];});
@@ -1686,7 +1703,7 @@ async function directPOSFetchRange(fromDate,toDate){
       bnxDsrSnapPurge_(fromDate,toDate);
       Object.keys(dayMap).forEach(k=>{STANDARD_DATA[k]=mapLiveDsrDay_(dayMap[k]);});
       okCount=1;
-    }else if(r&&r.authExpired){gasToast('🔐 Session expired — please login again','error');return false;}
+    }else if(r&&r.authExpired){gasToast('⚠️ Server busy — login kept, retrying','warn');return false;}
   }catch(e){}
   if(!okCount){
     // Fallback for an older backend: monthly matrices fetched in parallel.
@@ -4033,7 +4050,7 @@ async function saveUploadedBillsAndItems_(){
   try{
     const r=await gasApi('SAVE_DSR_IMPORTED_BILLS',{bills:bills,items:items});
     if(r&&r.success){showToast('✅ Saved '+(r.savedBills||0)+' bills / '+(r.savedItems||0)+' bill items to live database','success');return r;}
-    if(r&&r.authExpired)throw new Error('Session expired — please login again');
+    if(r&&r.authExpired)throw new Error('Server did not accept the request — login kept, try again');
     throw new Error((r&&r.error)||'Live bill save failed');
   }catch(e){
     console.error('[DSR upload save]',e);
@@ -5329,7 +5346,7 @@ async function _loadDsrReconciliationImpl_(force){
   try{ await paint(); }catch(e){ console.warn('[DSR RECON local]',e); }
   try{
     const r=await Promise.race([gasApi('GET_DSR_BANK_RECONCILIATION',{from:rf,to:rt}),new Promise(res=>setTimeout(()=>res({__timeout:true}),30000))]);
-    if(r&&r.authExpired) liveNote='🔐 Session expired — live bank data was not loaded. Log in again, then press Run Live.';
+    if(r&&r.authExpired) liveNote='⚠️ Server did not accept the request — live bank data not loaded. Your login is kept; press Run Live again.';
     else if(r&&r.__timeout) liveNote='⏱ Live bank data is slow — showing DSR and uploaded Swift figures. Press Run Live to retry.';
     else if(r&&r.success&&r.data) bank=r.data;
     else liveNote='ℹ️ Live bank data is not available right now — showing DSR and uploaded Swift figures.';
@@ -6396,7 +6413,7 @@ async function loadItemGroupDsr_(){
 
     if(!r||!r.success){
       if(r&&r.authExpired){
-        tb.innerHTML='<tr><td colspan="8" style="text-align:center;padding:18px;color:var(--red)">🔐 Session expired — please login again.</td></tr>';
+        tb.innerHTML='<tr><td colspan="8" style="text-align:center;padding:18px;color:var(--red)">⚠️ Server did not accept the request — login kept. Press Refresh.</td></tr>';
         return;
       }
       throw new Error(r?.error||'Live item sales report unavailable');
@@ -10278,6 +10295,66 @@ html:not(#_t1):not(#_t2):not(#_t3):not(#_t4):not(#_t5) body .dsr-matrix .diff-ro
   wrap('buildMonthlyDsrMatrix',all); wrap('buildDsrMonthCalendar_',all);
   setInterval(function(){ wrap('buildMonthlyDsrMatrix',all); wrap('buildDsrMonthCalendar_',all); header(); },2000);
   if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',all); else all();
+})();
+</script>
+<script id="bnx-session-stay-till-logout-20261016">
+/* SESSION STAY TILL LOGOUT (2026-10-16)
+   - Keep-alive: while this page is open (also inside the dashboard iframe, also when the tab is in the background) the login
+     is used at least every 8 min, so the server never sees it as idle. A real report call counts; otherwise one light
+     authenticated call (GET_CLIENT_INFO) is made. Nothing is written to the token — the server stays the authority.
+   - Re-login in another tab (new token in storage): reports reload with it automatically.
+   - Logout: only when the user logs out (every session token removed from storage) the page stops calling the server
+     and says so. A slow / rejected call never logs the user out. */
+(function(){
+  'use strict';
+  var W=window, IDLE=8*60*1000, TICK=60*1000, busy=false, loggedOut=false, lastTok='';
+  var KEYS=/^(ERP_SESSION|erp_session|erp_token|sessionToken|SESSION_TOKEN|ERP_SESSION_USER|ERP_USER|erpUser)$/;
+  function tok(){ try{ return getSessionToken_()||''; }catch(e){ return ''; } }
+  try{ sessionStorage.removeItem('bnx_auth_reason'); }catch(e){}
+  W.__bnxAuthOkAt=W.__bnxAuthOkAt||Date.now();
+  lastTok=tok();
+  async function ping(force){
+    if(busy||loggedOut) return;
+    if(!force && Date.now()-(W.__bnxAuthOkAt||0)<IDLE) return;
+    if(!tok()) return;
+    busy=true;
+    try{
+      var r=null, P=null;
+      try{ P=bnxDsrAccessibleParent_(); }catch(e){}
+      /* inside the dashboard: its own API keeps the same login alive */
+      if(P && typeof P.gasApi==='function'){ try{ r=await P.gasApi('GET_CLIENT_INFO',{},'V2_CORE'); }catch(e){ r=null; } }
+      if(!(r&&r.success)) r=await gasApiRaw_('GET_CLIENT_INFO',{},'V2_CORE');
+      if(r&&r.success) W.__bnxAuthOkAt=Date.now();
+    }catch(e){ console.warn('[SESSION KEEP-ALIVE]',e); }
+    finally{ busy=false; }
+  }
+  function onLoggedOut(){
+    if(loggedOut) return; loggedOut=true; W.__bnxLoggedOut=true;
+    try{ localStorage.setItem('bnx_dsr_auto_v2','0'); }catch(e){}
+    try{ var st=document.getElementById('dsrSourceStatus'); if(st) st.textContent='🔒 Logged out — sign in again to load live DSR.'; }catch(e){}
+    try{ gasToast('🔒 You logged out — live DSR stopped.','warn',6000); }catch(e){}
+  }
+  function onLoggedIn(){
+    var was=loggedOut; loggedOut=false; W.__bnxLoggedOut=false; W.__bnxAuthOkAt=Date.now();
+    if(was){ try{ localStorage.setItem('bnx_dsr_auto_v2','1'); }catch(e){} }
+    try{ bnxApiClearCache_(); }catch(e){}
+    setTimeout(function(){ try{ if(typeof W.bnxFinalDsrReload_==='function') W.bnxFinalDsrReload_(); else onDsrDateChange(); }catch(e){} },400);
+  }
+  W.addEventListener('storage',function(e){
+    if(!KEYS.test(e.key||'')) return;
+    var t=tok();
+    if(!t){ onLoggedOut(); lastTok=''; return; }
+    if(t!==lastTok){ lastTok=t; onLoggedIn(); }
+  });
+  setInterval(function(){
+    var t=tok();
+    if(!t){ if(lastTok) onLoggedOut(); lastTok=''; return; }
+    if(t!==lastTok){ lastTok=t; onLoggedIn(); return; }
+    ping(false);
+  },TICK);
+  ['online','focus'].forEach(function(ev){ W.addEventListener(ev,function(){ ping(false); }); });
+  document.addEventListener('visibilitychange',function(){ if(!document.hidden) ping(false); });
+  W.bnxSessionPing_=ping;
 })();
 </script>
 </body>
