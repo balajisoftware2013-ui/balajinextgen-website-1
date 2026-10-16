@@ -46770,6 +46770,7 @@ function bnxOpenMasterHub(){
   }
   setTimeout(bnxQzTrustRefresh,1500); document.addEventListener('click',function(){ setTimeout(bnxQzTrustRefresh,300); });
 
+  try{ ['pointerdown','keydown'].forEach(function(t){ document.addEventListener(t,function(){ window.__bnxQzUserAt=Date.now(); },true); }); }catch(e){}
   function connectQz(){
     if(!window.qz) return loadQz().then(connectQz);
     try{ if(qz.websocket.isActive()){ window.__bnxQzFails=0; return Promise.resolve(); } }catch(e){}
@@ -46778,7 +46779,11 @@ function bnxOpenMasterHub(){
     try{ if(!window.__bnxQzPatched && qz.websocket){ const _c=qz.websocket.connect.bind(qz.websocket); let _inf=null; qz.websocket.connect=function(o){ if(qz.websocket.isActive()) return Promise.resolve(); if(_inf) return _inf; _inf=_c(o).finally(function(){ _inf=null; }); return _inf; }; window.__bnxQzPatched=true; } }catch(e){}
     /* SPEED: if the last attempt just failed, fail instantly for 12s instead of
        making every Print click wait through all retries again. */
-    if(window.__bnxQzFailAt && Date.now()-window.__bnxQzFailAt<Math.min(600000,12000*Math.pow(2,Math.max(0,(window.__bnxQzFails||1)-1)))) return Promise.reject(window.__bnxQzFailErr||new Error('QZ Tray not available'));
+    /* 2026-10-16 ("direct print fix fast"): the back-off (12 s … 10 min after a failed connect) also blocked the cashier's
+       own Print / Settle / KOT click, so a QZ Tray that was started a minute late still sent every bill to the browser
+       print dialog. Background re-warm keeps the back-off; a click made in the last 4 s always tries QZ Tray again. */
+    const _userAsk = Date.now()-(window.__bnxQzUserAt||0) < 4000;
+    if(!_userAsk && window.__bnxQzFailAt && Date.now()-window.__bnxQzFailAt<Math.min(600000,12000*Math.pow(2,Math.max(0,(window.__bnxQzFails||1)-1)))) return Promise.reject(window.__bnxQzFailErr||new Error('QZ Tray not available'));
     try{
       /* default cert lookup fetches /digital-certificate.txt (404 -> "Failed to get certificate")
          on every connect; answer it locally so connect + print start immediately. */
@@ -68258,6 +68263,151 @@ tr.bnx-rf-sub td{background:rgba(var(--gold-rgb,184,105,14),.08);font-weight:700
   setInterval(wrap,3000); wrap();
 })();
 </script>
+<script id="bnx-bill-dedupe-20261016">
+/* 2026-10-16 ("delete bill void then bill no also delete"): one POS sale showed twice in Bills List — the device's own
+   copy without a bill number (Cash · 1 item) and the server copy HT/2627/00007307 (0 items · "Mode missing"). Cancelling
+   one left the other. A bill with no number that matches a numbered bill (same day, same table, same total ±₹1) is now
+   merged into the numbered bill: items and payment mode are copied over and the unnumbered copy is removed, so View /
+   Edit / Cancel (VOID_BILL) always act on the real bill number. */
+(function(){
+  var W=window;
+  function day(b){ var v=String(b&&(b.businessDate||b.dt||b.date)||''); var m=v.match(/^(\d{4})-(\d{2})-(\d{2})/); if(m) return m[0]; m=v.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})/); return m?m[3]+'-'+('0'+m[2]).slice(-2)+'-'+('0'+m[1]).slice(-2):v.slice(0,10); }
+  function tbl(b){ return String(b&&b.table||'').toUpperCase().replace(/^T[-\s]?/,'').replace(/[^A-Z0-9]/g,''); }
+  function tot(b){ return Number(b&&(b.total!=null?b.total:b.grand))||0; }
+  function hasNo(b){ var n=String(b&&b.no||'').trim(); return !!n&&!/^(LOCAL|TMP|TEMP|OFF|PENDING|DRAFT)[-_]/i.test(n); }
+  function dedupe(list){
+    if(!Array.isArray(list)||list.length<2) return {list:list,changed:false};
+    var numbered=list.filter(hasNo), changed=false, out=[];
+    list.forEach(function(u){
+      if(hasNo(u)||/cancel/i.test(String(u.status||''))){ out.push(u); return; }
+      var d=day(u), t=tbl(u), a=tot(u);
+      var m=numbered.find(function(n){ return day(n)===d&&tbl(n)===t&&Math.abs(tot(n)-a)<=1&&!n.__bnxMergedFrom; });   /* one local copy per numbered bill — two real sales of the same amount stay separate */
+      if(!m){ out.push(u); return; }
+      if(!(Number(m.items)>0)&&(Number(u.items)>0||(u.itemsDetail||[]).length)){ m.items=u.items||(u.itemsDetail||[]).length; }
+      if(!(m.itemsDetail||[]).length&&(u.itemsDetail||[]).length) m.itemsDetail=u.itemsDetail;
+      if(!String(m.pay||'').trim()&&u.pay){ m.pay=u.pay; if(u.payBreakdown) m.payBreakdown=u.payBreakdown; if(u.isSplitPayment) m.isSplitPayment=true; }
+      if((!m.mob||m.mob==='-')&&u.mob) m.mob=u.mob;
+      if((!m.waiter||m.waiter==='-')&&u.waiter) m.waiter=u.waiter;
+      m.__bnxMergedFrom='local'; changed=true;
+    });
+    return {list:out,changed:changed};
+  }
+  function wrap(){
+    var g=W.blGetAllBills; if(typeof g!=='function'||g.__bnxDd) return;
+    var w=function(){
+      var list=g.apply(this,arguments);
+      try{ var r=dedupe(list); if(r.changed){ list=r.list; try{ if(typeof W.bnxSaveBillRegister==='function') W.bnxSaveBillRegister(r.list); }catch(e){} } }catch(e){ console.warn('[BILL DEDUPE]',e); }
+      return list;
+    };
+    w.__bnxDd=1; W.blGetAllBills=w; try{ blGetAllBills=w; }catch(e){}
+  }
+  /* cancelling a row that still has no number: refuse with a clear message instead of sending VOID_BILL for "" */
+  function wrapCancel(){
+    var c=W.blCancelBill; if(typeof c!=='function'||c.__bnxDd) return;
+    var w=function(no){ if(!String(no||'').trim()){ alert('This bill has no bill number yet (not saved on the server). Refresh the list — once the server copy arrives it is merged and can be cancelled by its number.'); return; } return c.apply(this,arguments); };
+    w.__bnxDd=1; W.blCancelBill=w; try{ blCancelBill=w; }catch(e){}
+  }
+  W.bnxBillDedupe_=dedupe;
+  setInterval(function(){ wrap(); wrapCancel(); },3000); wrap(); wrapCancel();
+})();
+</script>
+<script id="bnx-bill-item-detail-20261016">
+/* 2026-10-16 ("item commission / composition show" → both): the bill view now shows, per item line,
+   (1) the steward commission — rule used (item / group / Food·Bar·Others %), net amount and ₹ earned, including ₹0 lines
+       (when the incentive is switched OFF it shows what the rules WOULD pay, marked as such), and
+   (2) the recipe composition from the client's BAR_B10_COCKTAIL_RECIPE sheet — ingredient, ml per serve × qty and the
+       ingredient cost (ml × cost/ml), with total cost and margin. Internal view only; never printed on the invoice. */
+(function(){
+  var W=window, REC=null, RECAT=0, RECP=null;
+  function esc(v){ return String(v==null?'':v).replace(/[&<>"']/g,function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+  function inr(n){ return '₹'+(Number(n)||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+  function N(v){ v=Number(String(v==null?'':v).replace(/[,₹\s]/g,'')); return isFinite(v)?v:0; }
+  function key(s){ return String(s||'').toUpperCase().replace(/[^A-Z0-9]+/g,''); }
+  function rowsOf(r){ if(!r||r.success===false) return []; var d=r.data; if(Array.isArray(d)) return d; if(d&&Array.isArray(d.rows)) return d.rows; return Array.isArray(r.rows)?r.rows:[]; }
+  function recipes(){
+    if(REC&&Date.now()-RECAT<600000) return Promise.resolve(REC);
+    if(RECP) return RECP;
+    RECP=Promise.resolve().then(function(){ return typeof W.gasApi==='function'?W.gasApi('RD_FETCH_SHEET',{tab:'BAR_B10_COCKTAIL_RECIPE'},'V2_CORE'):null; })
+      .then(function(r){ var rows=rowsOf(r), by={}, byCode={};
+        rows.forEach(function(x){ if(x.ACTIVE===false||/^FALSE$/i.test(String(x.ACTIVE))) return;
+          var nm=key(x.RECIPE_NAME), id=String(x.RECIPE_ID||''); if(!nm) return;
+          var e=by[nm]||(by[nm]={name:x.RECIPE_NAME,id:id,price:N(x.PRICE),ing:[]});
+          if(e.id!==id) return;                                  /* duplicate recipe rows (same name, other id) — keep the first */
+          e.ing.push({name:x.INGREDIENT,ml:N(x.ML),uom:x.UOM||'ML',cpm:N(x.COST_PER_ML),code:x.ITEM_CODE}); });
+        if(rows.length){ REC=by; RECAT=Date.now(); } return REC||{}; })
+      .catch(function(){ return REC||{}; }).then(function(x){ RECP=null; return x; });
+    return RECP;
+  }
+  function itemsOf(b){ return (b.itemsDetail||[]).map(function(i){ return {name:String(i.name||i.itemName||i.ITEM_NAME||i.n||'Item'),qty:N(i.qty!=null?i.qty:i.QUANTITY)||1,amt:N(i.amt!=null?i.amt:(i.amount!=null?i.amount:N(i.qty||1)*N(i.rate!=null?i.rate:i.price)))}; }); }
+  function commission(b){
+    try{
+      if(typeof BNXInc==='undefined') return '';
+      if(typeof bnxPageAllowed==='function'&&!bnxPageAllowed('incentive',typeof bnxGetRoleSafe==='function'?bnxGetRoleSafe():'')) return '';
+      var base=(typeof bnxDiscClass_==='function')?function(n,m){ return bnxDiscClass_(n,m&&(m.category||m.cat),null); }:null;
+      var cl=function(n,m){
+        var c=base?base(n,m):''; if(c&&c!=='FOOD') return c;
+        try{ var k=key(n), mi=(Array.isArray(W.menuData)?W.menuData:[]).find(function(x){ return key(x.n||x.name)===k; });
+          if(mi&&(mi.isBar===true||/LIQUOR|BAR|BEER|WINE|WHISK|VODKA|RUM|GIN|COCKTAIL|SPIRIT/i.test(String(mi.itemGroupName||'')+' '+String(mi.c||mi.category||'')))) return 'BAR';
+          if(mi&&/HUKKA|HOOKAH|TOBACCO|BEVERAGE/i.test(String(mi.itemGroupName||'')+' '+String(mi.c||mi.category||''))) return 'OTHER'; }catch(e){}
+        if(REC&&REC[key(n)]) return 'BAR';                         /* has a bar recipe → cocktail */
+        return c||'FOOD';
+      };
+      var R=BNXInc.rules(), r=BNXInc.forBill(b,R,cl), would=false;
+      if(r.reason==='off'){ r=BNXInc.forBill(b,Object.assign({},R,{enabled:true}),cl); would=true; }
+      var why={NC:'No incentive (NC bill)',cancelled:'No incentive (cancelled)',due:'Skipped (due bill)','below min':'Below minimum bill'}[r.reason]||'';
+      var rows=(r.lines||[]).map(function(l){ return '<tr><td>'+esc(l.name)+(l.qty>1?' ×'+l.qty:'')+'</td><td style="color:#777">'+esc(l.rule||'—')+'</td><td class="n">'+inr(l.net)+'</td><td class="n" style="font-weight:700">'+inr(l.earn)+'</td></tr>'; }).join('');
+      if(r.flat>0) rows+='<tr><td>Flat per bill</td><td></td><td></td><td class="n" style="font-weight:700">'+inr(r.flat)+'</td></tr>';
+      return '<div class="bnx-bid"><div class="bnx-bid-h"><span>💰 Steward commission <small>· '+esc(b.waiter||'-')+' · internal'+(would?' · incentive is OFF — showing what the rules would pay':'')+'</small></span><b>'+(why?'<small>'+esc(why)+'</small>':inr(r.earn))+'</b></div>'+
+        (rows?'<table class="bnx-bid-t"><thead><tr><th>Item</th><th>Rule</th><th class="n">Net</th><th class="n">Commission</th></tr></thead><tbody>'+rows+'</tbody></table>':'<div class="bnx-bid-e">No item lines on this bill.</div>')+
+        ((!r.lines||!r.lines.some(function(l){ return l.earn>0; }))&&!why?'<div class="bnx-bid-e">No % is set yet — set Food / Bar / Others % (or item / group rules) in Steward Incentive.</div>':'')+'</div>';
+    }catch(e){ console.warn('[bill commission]',e); return ''; }
+  }
+  function compHtml(b,by){
+    var its=itemsOf(b), out=[], totCost=0, totAmt=0, any=false;
+    its.forEach(function(it){
+      var r=by[key(it.name)]; if(!r||!r.ing.length){ out.push('<tr class="it"><td colspan="4"><b>'+esc(it.name)+'</b>'+(it.qty>1?' ×'+it.qty:'')+' <small style="color:#999">— no recipe set</small></td></tr>'); return; }
+      any=true; var cost=0;
+      var lines=r.ing.map(function(g){ var c=g.ml*g.cpm*it.qty; cost+=c; return '<tr><td style="padding-left:18px">'+esc(g.name)+'</td><td class="n">'+g.ml+' '+esc(String(g.uom).toLowerCase())+(it.qty>1?' × '+it.qty+' = '+(g.ml*it.qty)+' '+esc(String(g.uom).toLowerCase()):'')+'</td><td class="n" style="color:#777">'+(g.cpm?inr(g.cpm)+'/'+esc(String(g.uom).toLowerCase()):'')+'</td><td class="n">'+(c?inr(c):'—')+'</td></tr>'; }).join('');
+      totCost+=cost; totAmt+=it.amt;
+      out.push('<tr class="it"><td colspan="3"><b>'+esc(it.name)+'</b>'+(it.qty>1?' ×'+it.qty:'')+'</td><td class="n" style="font-weight:700">'+(cost?inr(cost):'')+'</td></tr>'+lines);
+    });
+    if(!its.length) return '';
+    var mg=totAmt>0&&totCost>0?' · margin '+inr(totAmt-totCost)+' ('+Math.round((totAmt-totCost)/totAmt*100)+'%)':'';
+    return '<div class="bnx-bid-h"><span>🧪 Item composition <small>· recipe (BAR_B10_COCKTAIL_RECIPE) · internal</small></span><b>'+(totCost?'<small>cost </small>'+inr(totCost):'')+'</b></div>'+
+      '<table class="bnx-bid-t"><thead><tr><th>Item / ingredient</th><th class="n">Qty</th><th class="n">Rate</th><th class="n">Cost</th></tr></thead><tbody>'+out.join('')+'</tbody></table>'+
+      (mg?'<div class="bnx-bid-e" style="text-align:right;color:#176b35;font-weight:700">Sale '+inr(totAmt)+mg+'</div>':(!any?'<div class="bnx-bid-e">No recipe found for these items.</div>':''));
+  }
+  function css(){ if(document.getElementById('bnxBidCss')) return; var s=document.createElement('style'); s.id='bnxBidCss';
+    s.textContent='.bnx-bid{margin-top:10px;padding:9px 11px;border:1px dashed var(--border2,#d8d2c4);border-radius:10px;background:var(--surface2,#f7f5f0)}'+
+      '.bnx-bid-h{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;font-weight:800}.bnx-bid-h small{font-weight:600;color:#888}.bnx-bid-h b{color:var(--gold,#b87900);font-size:13.5px}'+
+      '.bnx-bid-t{width:100%;border-collapse:collapse;font-size:11.5px;margin-top:5px}.bnx-bid-t th{text-align:left;font-size:10px;color:#888;font-weight:700;padding:3px 4px;border-bottom:1px solid #e5e0d8}'+
+      '.bnx-bid-t td{padding:3px 4px;border-top:1px solid #eee}.bnx-bid-t .n{text-align:right;white-space:nowrap}.bnx-bid-t tr.it td{background:rgba(0,0,0,.02)}.bnx-bid-e{font-size:11px;color:#999;margin-top:4px}';
+    document.head.appendChild(s); }
+  function install(){
+    if(typeof W.blIncentiveBlock_!=='function'||W.blIncentiveBlock_.__bnxBid) return;
+    var w=function(b){
+      css();
+      /* 2026-10-16 ("not show — if click show then"): hidden by default; one small button reveals both sections */
+      var uid=Math.random().toString(36).slice(2,8);
+      W.__bnxBidBills=W.__bnxBidBills||{}; W.__bnxBidBills[uid]=b;
+      return '<div style="margin-top:10px;text-align:right"><button type="button" id="bnxBidBtn_'+uid+'" class="btn btn-sm btn-ghost" style="height:28px;padding:0 10px;font-size:11.5px" onclick="bnxBidToggle_(\''+uid+'\')">💰 Commission · 🧪 Composition — Show ▾</button></div>'+
+        '<div id="bnxBidWrap_'+uid+'" style="display:none"><div id="bnxComm_'+uid+'"></div><div class="bnx-bid" id="bnxComp_'+uid+'"><div class="bnx-bid-h"><span>🧪 Item composition</span><small style="color:#999">⟳ loading recipes…</small></div></div></div>';
+    };
+    W.bnxBidToggle_=function(uid){
+      var wr=document.getElementById('bnxBidWrap_'+uid), btn=document.getElementById('bnxBidBtn_'+uid), b=(W.__bnxBidBills||{})[uid]; if(!wr||!b) return;
+      var open=wr.style.display==='none'; wr.style.display=open?'':'none';
+      if(btn) btn.textContent='💰 Commission · 🧪 Composition — '+(open?'Hide ▴':'Show ▾');
+      if(open&&!wr.__done){ wr.__done=1;
+        var c2=document.getElementById('bnxComm_'+uid); if(c2) c2.innerHTML=commission(b);
+        recipes().then(function(by){ var el=document.getElementById('bnxComp_'+uid); if(el) el.innerHTML=compHtml(b,by||{})||'<div class="bnx-bid-e">No items.</div>'; var c3=document.getElementById('bnxComm_'+uid); if(c3) c3.innerHTML=commission(b); });
+      }
+    };
+    w.__bnxBid=1; W.blIncentiveBlock_=w; try{ blIncentiveBlock_=w; }catch(e){}
+  }
+  setInterval(install,3000); install();
+  setTimeout(function(){ recipes(); },30000);   /* warm the recipe cache in the background */
+})();
+</script>
 <style id="bnx-ui-compact-20261016">
 /* ═══ 2026-10-16 UI pass ("mobile view fix all views · KPI height reduce · gaps and height · small icons") ═══ */
 /* global search panel: was clipped inside the scrolling top bar (empty grey box, no results) → floats above the page */
@@ -68289,6 +68439,13 @@ tr.bnx-rf-sub td{background:rgba(var(--gold-rgb,184,105,14),.08);font-weight:700
 #page-billing [id^="bm-irow-"] .fi{height:34px!important}
 #page-billing .bm-qty-step button{height:34px!important;min-width:28px!important}
 #page-billing h3,#page-billing .bf-sec,#page-billing .card-title{margin:6px 0 6px!important}
+/* Bills List (2026-10-16 "duplicates remove, gaps reduce"): one totals strip (Pending added), no repeated title */
+#page-bills-list>.grid.g4{display:none!important}
+#page-bills-list>*{margin-bottom:6px!important}
+#page-bills-list>.card{padding:8px 10px!important}
+#page-bills-list>.card h2,#page-bills-list>.card .card-title{display:none!important}
+#page-bills-list table td{padding-top:6px!important;padding-bottom:6px!important}
+#bnxBlTotals .t.bnx-pend b{color:#b45309}
 @media (max-width:700px){
   /* header: one compact row + one scrollable row of small icons */
   .topbar{padding:6px 10px!important;gap:6px!important;min-height:0!important;row-gap:6px!important}
@@ -68376,7 +68533,14 @@ tr.bnx-rf-sub td{background:rgba(var(--gold-rgb,184,105,14),.08);font-weight:700
       [g,c2].forEach(function(x){ if(x) x.addEventListener('change',auto); });
     }
   }
-  function tick(){ try{ dc(); }catch(e){} try{ printers(); }catch(e){} }
+  /* Bills List: Pending count joins the totals strip (the big duplicate cards are hidden) */
+  function blPend(){
+    var st=D.getElementById('bnxBlTotals'), src=D.getElementById('bl-pending-count'); if(!st||!src) return;
+    var t=st.querySelector('.t.bnx-pend');
+    if(!t){ t=D.createElement('div'); t.className='t bnx-pend'; t.innerHTML='<span>Pending</span><b>—</b>'; st.insertBefore(t,st.children[1]||null); }
+    var v=String(src.textContent||'—').trim(), b=t.querySelector('b'); if(b&&b.textContent!==v) b.textContent=v;
+  }
+  function tick(){ try{ dc(); }catch(e){} try{ printers(); }catch(e){} try{ blPend(); }catch(e){} }
   setInterval(tick,1500); if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',tick); else tick();
 })();
 </script>
