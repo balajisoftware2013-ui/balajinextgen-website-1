@@ -32,7 +32,7 @@
   if(!inFrame) return;
   function keep(){ window._erpNavigating=true; }
   keep();
-  ['beforeunload','pagehide','unload'].forEach(function(ev){ window.addEventListener(ev,keep,true); });
+  ['beforeunload','pagehide'].forEach(function(ev){ window.addEventListener(ev,keep,true); });
 })();
 (function(){
   /* FIX (Sep 2026): erp-config.js is optional and usually absent, but the
@@ -10199,31 +10199,86 @@ html:not(#_t1):not(#_t2):not(#_t3):not(#_t4):not(#_t5) body .dsr-matrix .diff-ro
 })();
 </script>
 <script id="bnx-swift-from-db-20261016">
-/* 2026-10-16 (Swift Transaction / Settlement showed "Upload a Swift file" although the client's Transaction DB already holds
-   them in "Swift_Transaction Report" and "Swift_Settlement Report"): when nothing has been uploaded on this device, both
-   are read from the Transaction DB and auto-mapped, exactly as if the file had been uploaded. An uploaded file still wins. */
+/* SWIFT FROM TRANSACTION DB  v2 (2026-10-16, "transactions are not show swift")
+   v1 asked once, 6 s after open, for one exact tab name; on the busy server (queue 17, ~10-20 s per call) that single call
+   failed or the tab was named slightly differently, and it was not asked again for 5 min — so the Swift tab said
+   "Upload a Swift Transaction file" and every Card / UPI difference showed the full DSR amount.
+   v2: tries the known tab names (through the signed-in dashboard first), accepts row objects or a 2-D sheet (finds the
+   header row), retries 20 s → 40 s → 80 s … until loaded, and shows what is happening in the Swift table.
+   An uploaded file still wins. */
 (function(){
-  var W=window, busy=false, tried=0;
-  function rowsOf(r){ if(!r||r.success===false) return []; var d=r.data; if(Array.isArray(d)) return d; if(d&&Array.isArray(d.rows)) return d.rows; return Array.isArray(r.rows)?r.rows:[]; }
-  function clean(rows){ return rows.map(function(x){ var o={}; Object.keys(x).forEach(function(k){ var v=x[k]; if(v instanceof Date) v=v.toISOString(); o[k]=v==null?'':v; }); return o; })
-    .filter(function(o){ return Object.keys(o).some(function(k){ return o[k]!==''&&o[k]!=null; }); }); }
-  async function load(force){
-    if(busy||typeof W.bnxDsrSheet_!=='function') return; if(!force&&Date.now()-tried<300000) return;
-    var needT=!(Array.isArray(W.swiftRows||(typeof swiftRows!=='undefined'?swiftRows:null))&&(typeof swiftRows!=='undefined'?swiftRows:[]).length);
-    var needS=!(typeof swiftSettlementRows!=='undefined'&&swiftSettlementRows.length);
-    if(!needT&&!needS&&!force) return;
-    busy=true; tried=Date.now();
+  var W=window, busy=false, nextAt=0, wait=20000, lastWhy='';
+  var TXN_TABS=['Swift_Transaction Report','Swift_Transaction_Report','Swift Transaction Report','SWIFT_TRANSACTION_REPORT','SWIFT_TRANSACTION','Swift_Transaction','SWIFT_TXN'];
+  var SET_TABS=['Swift_Settlement Report','Swift_Settlement_Report','Swift Settlement Report','SWIFT_SETTLEMENT_REPORT','SWIFT_SETTLEMENT','Swift_Settlement'];
+  function txnCount(){ try{ return (typeof swiftRows!=='undefined'&&Array.isArray(swiftRows))?swiftRows.length:0; }catch(e){ return 0; } }
+  function setCount(){ try{ return (typeof swiftSettlementRows!=='undefined'&&Array.isArray(swiftSettlementRows))?swiftSettlementRows.length:0; }catch(e){ return 0; } }
+  function cellTxt(v){ if(v instanceof Date) return v.toISOString(); return v==null?'':v; }
+  /* object rows, or a 2-D array whose header row is the first row naming a date / amount column */
+  function rowsOf(r){
+    if(!r||r.success===false) return [];
+    var d=r.data!=null?r.data:r.rows;
+    if(d&&!Array.isArray(d)){ d=d.rows||d.data||d.values||null; }
+    if(!Array.isArray(d)||!d.length) return [];
+    if(!Array.isArray(d[0])) return d.map(function(x){ var o={}; Object.keys(x||{}).forEach(function(k){ o[k]=cellTxt(x[k]); }); return o; });
+    var h=-1; for(var i=0;i<Math.min(15,d.length);i++){ var t=(d[i]||[]).join('|').toLowerCase(); if(/date/.test(t)&&/amount|amt/.test(t)){ h=i; break; } }
+    if(h<0) return [];
+    var hd=d[h].map(function(x,ix){ return String(x||'').trim()||('COL_'+ix); });
+    return d.slice(h+1).map(function(row){ var o={}; hd.forEach(function(k,ix){ o[k]=cellTxt(row[ix]); }); return o; });
+  }
+  function nonEmpty(rows){ return rows.filter(function(o){ return Object.keys(o).some(function(k){ return o[k]!==''&&o[k]!=null; }); }); }
+  async function readTab(tabs){
+    var why=[];
+    for(var i=0;i<tabs.length;i++){
+      var r=null; try{ r=await W.bnxDsrSheet_(tabs[i]); }catch(e){ r={success:false,error:String(e&&e.message||e)}; }
+      var rows=nonEmpty(rowsOf(r));
+      if(rows.length) return {rows:rows,tab:tabs[i]};
+      why.push(tabs[i]+': '+((r&&(r.error||r.message))||'no rows'));
+      if(r&&/timed? ?out|abort|failed to fetch|network/i.test(String(r.error||''))) break;   /* server slow — retry later, don't hammer */
+    }
+    return {rows:[],why:why.join(' · ')};
+  }
+  function note(msg){
     try{
-      if(needT||force){ var t=clean(rowsOf(await W.bnxDsrSheet_('Swift_Transaction Report'))); if(t.length&&typeof parseSwiftRows==='function') parseSwiftRows(t,'Transaction DB · Swift_Transaction Report'); }
-      if(needS||force){ var st=clean(rowsOf(await W.bnxDsrSheet_('Swift_Settlement Report')));
-        if(st.length){ swiftSettlementRows=st; swiftSettlementHeaders=Object.keys(st[0]||{}); swiftSettlementMap={};
+      if(txnCount()) return;
+      var b=document.getElementById('swiftReportBody'); if(!b) return;
+      b.innerHTML='<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:14px">'+msg+'</td></tr>';
+    }catch(e){}
+  }
+  async function load(force){
+    if(busy||typeof W.bnxDsrSheet_!=='function') return;
+    var needT=!txnCount(), needS=!setCount();
+    if(!needT&&!needS&&!force) return;
+    if(!force&&Date.now()<nextAt) return;
+    busy=true; note('⏳ Loading Swift transactions from the Transaction DB…');
+    var gotT=!needT, gotS=!needS;
+    try{
+      if(needT||force){
+        var t=await readTab(TXN_TABS);
+        if(t.rows.length&&typeof parseSwiftRows==='function'){ parseSwiftRows(t.rows,'Transaction DB · '+t.tab); gotT=true; }
+        else if(needT){ lastWhy=t.why||''; }
+      }
+      if(needS||force){
+        var st=await readTab(SET_TABS);
+        if(st.rows.length){
+          swiftSettlementRows=st.rows; swiftSettlementHeaders=Object.keys(st.rows[0]||{}); swiftSettlementMap={};
           try{ autoMapSwiftSettlement_(); }catch(e){} try{ saveSwiftSettlementLocal_(); }catch(e){}
-          try{ var e2=document.getElementById('settingsSwiftSettleStatus'); if(e2) e2.textContent='✅ '+st.length+' settlement rows · Transaction DB'; }catch(e){} } }
+          try{ var e2=document.getElementById('settingsSwiftSettleStatus'); if(e2) e2.textContent='✅ '+st.rows.length+' settlement rows · Transaction DB · '+st.tab; }catch(e){}
+          gotS=true;
+        }
+      }
       ['renderSwiftReport','renderSwiftSettlementReport_','buildMonthlyDsrMatrix'].forEach(function(f){ try{ if(typeof W[f]==='function') W[f](); }catch(e){} });
-    }catch(e){ console.warn('[SWIFT DB]',e); } finally{ busy=false; }
+    }catch(e){ console.warn('[SWIFT DB]',e); lastWhy=String(e&&e.message||e); }
+    finally{
+      busy=false;
+      if(gotT&&gotS){ wait=20000; nextAt=0; }
+      else { nextAt=Date.now()+wait; wait=Math.min(wait*2,10*60000);
+        if(!gotT){ console.info('[SWIFT DB] not loaded yet — '+(lastWhy||'server slow')+' · retry in '+Math.round((nextAt-Date.now())/1000)+' s');
+          note('⏳ Swift transactions not received from the server yet (server slow) — retrying automatically. <a href="#" onclick="bnxSwiftFromDb_(true);return false">Retry now</a> · or upload a Swift file in Settings.'); } }
+    }
   }
   W.bnxSwiftFromDb_=load;
-  setTimeout(function(){ load(false); },6000);
+  setTimeout(function(){ load(false); },4000);
+  setInterval(function(){ if(!txnCount()||!setCount()) load(false); },15000);
   document.addEventListener('click',function(e){ var t=e.target&&e.target.closest&&e.target.closest('button,.tab,[onclick]'); if(t&&/Swift|Reconcil/i.test(t.textContent||'')) setTimeout(function(){ load(false); },300); },true);
 })();
 </script>
@@ -10327,7 +10382,7 @@ html:not(#_t1):not(#_t2):not(#_t3):not(#_t4):not(#_t5) body .dsr-matrix .diff-ro
      and says so. A slow / rejected call never logs the user out. */
 (function(){
   'use strict';
-  var W=window, IDLE=8*60*1000, TICK=60*1000, busy=false, loggedOut=false, lastTok='';
+  var W=window, IDLE=8*60*1000, TICK=60*1000, busy=false, loggedOut=false, lastTok='', missing=0;
   var KEYS=/^(ERP_SESSION|erp_session|erp_token|sessionToken|SESSION_TOKEN|ERP_SESSION_USER|ERP_USER|erpUser)$/;
   function tok(){ try{ return getSessionToken_()||''; }catch(e){ return ''; } }
   try{ sessionStorage.removeItem('bnx_auth_reason'); }catch(e){}
@@ -10350,25 +10405,24 @@ html:not(#_t1):not(#_t2):not(#_t3):not(#_t4):not(#_t5) body .dsr-matrix .diff-ro
   }
   function onLoggedOut(){
     if(loggedOut) return; loggedOut=true; W.__bnxLoggedOut=true;
-    try{ localStorage.setItem('bnx_dsr_auto_v2','0'); }catch(e){}
     try{ var st=document.getElementById('dsrSourceStatus'); if(st) st.textContent='🔒 Logged out — sign in again to load live DSR.'; }catch(e){}
     try{ gasToast('🔒 You logged out — live DSR stopped.','warn',6000); }catch(e){}
   }
   function onLoggedIn(){
     var was=loggedOut; loggedOut=false; W.__bnxLoggedOut=false; W.__bnxAuthOkAt=Date.now();
-    if(was){ try{ localStorage.setItem('bnx_dsr_auto_v2','1'); }catch(e){} }
     try{ bnxApiClearCache_(); }catch(e){}
     setTimeout(function(){ try{ if(typeof W.bnxFinalDsrReload_==='function') W.bnxFinalDsrReload_(); else onDsrDateChange(); }catch(e){} },400);
   }
   W.addEventListener('storage',function(e){
     if(!KEYS.test(e.key||'')) return;
     var t=tok();
-    if(!t){ onLoggedOut(); lastTok=''; return; }
+    if(!t) return;   /* a missing token is confirmed by the timer below, never on one storage event */
     if(t!==lastTok){ lastTok=t; onLoggedIn(); }
   });
   setInterval(function(){
     var t=tok();
-    if(!t){ if(lastTok) onLoggedOut(); lastTok=''; return; }
+    if(!t){ missing++; if(lastTok&&missing>=3) { onLoggedOut(); lastTok=''; } return; }   /* 3 min without a token = logged out (the dashboard restores a wiped login within 20 s) */
+    missing=0;
     if(t!==lastTok){ lastTok=t; onLoggedIn(); return; }
     ping(false);
   },TICK);
