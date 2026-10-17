@@ -14434,6 +14434,10 @@ function bnxDashCurrentFromTo_(){
   const toISO = d => { const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), day=String(d.getDate()).padStart(2,'0'); return `${y}-${m}-${day}`; };
   const today = typeof getBusinessDate === 'function' ? getBusinessDate() : toISO(new Date());
   const range = dashActiveRange;
+  if (range === 'yesterday') { /* FIX: this case was missing, so Yesterday popups (cash/UPI/card/credit...) opened TODAY's business date and showed "no transactions" */
+    const yd = new Date(today + 'T00:00:00'); yd.setDate(yd.getDate() - 1); const yk = toISO(yd);
+    return { from: yk, to: yk };
+  }
   if (range === 'custom') {
     const from = document.getElementById('dashFrom')?.value || today;
     const to = document.getElementById('dashTo')?.value || from;
@@ -29568,10 +29572,22 @@ async function cbSave(){
    List. If the server is temporarily unavailable, only already-cached live
    records are shown — never invented transactions. */
 async function bnxLoadLiveBillsForDetail_(from,to){
-  try{
-    if(typeof bnxPullBillsFromServer==='function') await bnxPullBillsFromServer(from||'',to||'');
-  }catch(e){}
-  return typeof bnxGetBillRegister==='function' ? (bnxGetBillRegister()||[]) : [];
+  /* SPEED: every click used to wait for a full server pull. Now: pulled within the last 2 min (10 min for a finished day) -> no wait;
+     pulled before but older -> show what we have at once and refresh quietly; never pulled -> wait once. Same range clicked twice shares one request. */
+  const reg=()=>typeof bnxGetBillRegister==='function' ? (bnxGetBillRegister()||[]) : [];
+  const C=(window.__bnxDetCache=window.__bnxDetCache||{}), K=(from||'')+'|'+(to||''), now=Date.now(), c=C[K];
+  let past=false; try{ past=!!to && to<getBusinessDate(); }catch(e){}
+  const fresh=past?600000:120000;
+  const pull=()=>{
+    if(typeof bnxPullBillsFromServer!=='function') return Promise.resolve();
+    if(C[K]&&C[K].p) return C[K].p;
+    const pr=Promise.resolve().then(()=>bnxPullBillsFromServer(from||'',to||'')).then(()=>{ C[K]={t:Date.now()}; }).catch(()=>{ C[K]=c||undefined; if(!C[K]) delete C[K]; });
+    C[K]=Object.assign({},c||{},{p:pr}); pr.then(()=>{ if(C[K]) delete C[K].p; }); return pr;
+  };
+  if(c&&c.t&&now-c.t<fresh) return reg();
+  if(c&&c.t){ pull(); return reg(); }
+  try{ await pull(); }catch(e){}
+  return reg();
 }
 function bnxDetailMoney_(v){
   return '₹'+Number(v||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
@@ -56456,7 +56472,7 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
   function masterWrite(A){ return MASTER_WRITE.test(A) && !OPS_WRITE.test(A); }
   /* slow-server mode: while Apps Script answers slower than 15 s, non-master reads are reused 3× longer (max 2 min) */
   var recent=[]; function slow(){ if(recent.length<4) return false; var a=0; recent.forEach(function(x){ a+=x; }); return a/recent.length>15000; }
-  function ttlFor(A){ var t=MASTER.test(A)?600000:REPORT.test(A)?120000:20000; return (!MASTER.test(A)&&slow())?Math.min(t*3,Math.max(t,120000)):t; }
+  function ttlFor(A){ var t=MASTER.test(A)?600000:REPORT.test(A)?120000:/^RD_FETCH_SHEET/i.test(A)?90000:/^(GET_BILLS|LIST_BILLS)$/i.test(A)?45000:20000; /* 2026-10-18: whole-sheet reads + bill lists were the heaviest calls (5-6 s each, 20 s cache) */ return (!MASTER.test(A)&&slow())?Math.min(t*3,Math.max(t,120000)):t; }
   /* DEVICE COPY (2026-10-09 "fast need"): master data is also kept in this device's IndexedDB (12 h). Opening the app
      answers at once from it and refreshes ONE time in the background — no 25-30 s wait per master call on every open. */
   var IDB=null;
@@ -63623,14 +63639,16 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
   /* FIX ("Due Received wrong on dashboard": showed 45,418.01 for one receipt of 22,709.01): when the receipt vouchers of the same
      period are loaded in Due Collection, the dashboard shows THEIR total if the server figure disagrees (duplicate rows). */
   function dueFix_(r){
+    /* CHANGED: never replace the server figure. The receipt list can be incomplete (it is read customer by customer), so a lower list total
+       must not hide real money. If the two disagree the figure stays as the server sent it and a warning is added to its tooltip + console. */
     try{
       if(!r||!D||typeof W.bnxDcReceivedFor!=='function') return r;
       var from=D.from||String(KEY).split('|')[0], to=D.to||String(KEY).split('|')[1];
       var x=W.bnxDcReceivedFor(from,to); if(!x) return r;
       var srv=(Number(r.dueCash)||0)+(Number(r.dueBank)||0);
       if(Math.abs(srv-x.sum)<=1) return r;
-      var o={}; for(var k in r) o[k]=r[k]; o.dueCash=x.cash; o.dueBank=x.bank; o.__fixed=1;
-      console.warn('[DASH] Due Received server '+srv+' vs receipt vouchers '+x.sum+' — showing vouchers');
+      var o={}; for(var k in r) o[k]=r[k]; o.__warn='⚠ Due Collection lists '+inr(x.sum)+' ('+x.n+' receipt'+(x.n===1?'':'s')+') but the server total is '+inr(srv)+' — check for a duplicate or missing receipt';
+      if(W.__bnxDueWarnLast!==o.__warn){ W.__bnxDueWarnLast=o.__warn; console.warn('[DASH] '+o.__warn); }   /* once per change, not on every repaint */
       return o;
     }catch(e){ return r; }
   }
@@ -63641,7 +63659,7 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
     put('d-cash',p.cash); put('d-upi',p.upi); put('d-bank',p.card); put('d-pc-online',p.zomato+p.swiggy,'Zomato '+inr(p.zomato)+' · Swiggy '+inr(p.swiggy));
     put('d-pc-total',D.collection); put('d-credit-sales',p.credit); put('d-pc-gross',D.collection+p.credit);
     r=dueFix_(r);
-    put('d-kpi-duercvd',r.dueCash+r.dueBank,'Cash '+inr(r.dueCash)+' · Bank/UPI '+inr(r.dueBank)+(r.__fixed?' · matched to receipt vouchers':''));
+    put('d-kpi-duercvd',r.dueCash+r.dueBank,'Cash '+inr(r.dueCash)+' · Bank/UPI '+inr(r.dueBank)+(r.__warn?' · '+r.__warn:''));
     if(c){
       put('d-cp-opening',c.opening); put('d-cp-received',c.cashSale,'Cash sale in cash book · POS cash '+inr(c.posCash)); put('d-cp-duercvd',c.dueCash);
       put('d-cp-totalinflow',c.cashSale+c.dueCash+c.mainIn+c.otherIn,(c.mainIn?'incl. main cash brought in '+inr(c.mainIn):''));
@@ -63654,7 +63672,7 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
       W.__bnxCpManual=true;
     }
     if(r){ r=dueFix_(r);
-      put('d-recv-opening',r.opening,'Customer dues on '+D.from); put('d-recv-creditsales',r.credit); put('d-due-rcvd',r.dueCash+r.dueBank,'Cash '+inr(r.dueCash)+' · Bank/UPI '+inr(r.dueBank));
+      put('d-recv-opening',r.opening,'Customer dues on '+D.from); { var _pc=(p&&isFinite(Number(p.credit)))?Number(p.credit):null, _bad=_pc!=null&&Math.abs(Number(r.credit)-_pc)>1; put('d-recv-creditsales',_bad?_pc:r.credit,_bad?'Corrected: server sent '+inr(r.credit)+'; credit billed in the period is '+inr(_pc):''); } put('d-due-rcvd',r.dueCash+r.dueBank,'Cash '+inr(r.dueCash)+' · Bank/UPI '+inr(r.dueBank));
       put('d-recv-cn',r.cn,'Dues discount / credit note'); put('d-recv-closing',r.closing,'Customer dues on '+D.to+' (today: '+inr(r.current)+')');
       var ck=$('d-recv-netmove'); if(ck){ /* FIX: was hard-coded to always show MATCH; now a real check */
         var _calc=Math.round((Number(r.opening)+Number(r.credit)-(Number(r.dueCash)+Number(r.dueBank))-Number(r.cn))*100)/100, _df=Math.round((Number(r.closing)-_calc)*100)/100;
