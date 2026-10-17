@@ -1537,7 +1537,7 @@ function bnxIsReadOnlyAction_(a){ return /^(GET_|LIST_|RD_FETCH_|NEXT_)/.test(St
   window.addEventListener('storage',function(ev){ if(ev.key==='ERP_EXPIRY'||ev.key==='ERP_SESSION'||ev.key==='ERP_USER') setTimeout(holdExpiry,0); });
   save(); setInterval(save,15000);
 })();
-/* SESSION INACTIVITY POLICY — 24 HOURS
+/* SESSION INACTIVITY POLICY — 2 HOURS (2026-10-17: logout ONLY after 2 h with no work; never because of slow / dropped internet)
    After 24 hours without activity, check whether the server session is still valid.
    Normal staff activity (click/tap, keyboard, touch, pointer, scroll, POS use)
    refreshes the inactivity clock. This is client-side inactivity enforcement;
@@ -1545,7 +1545,7 @@ function bnxIsReadOnlyAction_(a){ return /^(GET_|LIST_|RD_FETCH_|NEXT_)/.test(St
    or revoked token earlier. Activity is throttled so localStorage is not written
    on every mousemove/scroll event. */
 (function(){
-  var IDLE_LIMIT_MS = 24 * 60 * 60 * 1000;   /* 2026-10-13: was 5 h — long enough for a full trading day + overnight */
+  var IDLE_LIMIT_MS = 2 * 60 * 60 * 1000;   /* 2026-10-17: 2 hours without any work */
   var KEY = 'BNX_LAST_ACTIVITY_AT';
   var lastWrite = 0;
   var CHECK_MS = 60 * 1000;
@@ -1582,24 +1582,30 @@ function bnxIsReadOnlyAction_(a){ return /^(GET_|LIST_|RD_FETCH_|NEXT_)/.test(St
     if(tNow && tNow!==tOld){ localStorage.setItem(KEY,String(Date.now())); localStorage.setItem(KEY+'_TOK',tNow); }
   }catch(e){}
   function expired(){
-    /* 2026-10-17 STAY TILL LOGOUT: no idle limit — only an explicit Logout (or the server refusing the token) ends a login. */
-    return false;
+    var t=read(); return t>0 && (now()-t)>IDLE_LIMIT_MS;
+  }
+  var EVENTS=['click','keydown','pointerdown','touchstart','scroll','wheel','mousemove'];
+  function hookFrames(){   /* work done inside same-origin iframes (e.g. the DSR screen) counts as activity too */
+    try{ var fr=document.querySelectorAll('iframe'); for(var i=0;i<fr.length;i++){ try{ var w=fr[i].contentWindow; if(w&&!w.__bnxIdleHook){ w.__bnxIdleHook=1; EVENTS.forEach(function(ev){ w.addEventListener(ev,activity,{passive:true,capture:true}); }); } }catch(e){} } }catch(e){}
   }
   function enforce(){
-    if(navigator.onLine===false) return false;   /* STAY-LOGIN: never log out while the network is down */
+    /* STAY-LOGIN: a dropped / slow internet connection NEVER logs anybody out — the 2 h clock is checked only while online. */
+    if(navigator.onLine===false) return false;
+    hookFrames();
     if(expired()){
-      /* Preserve held orders, pending bills and the current screen. A browser idle clock
-         must not destroy login credentials; server-side auth remains authoritative. */
-      try{ if(typeof window.bnxSessionSuspect_==='function') window.bnxSessionSuspect_('idle-check'); }catch(e){}
-      return false;
+      /* 2 hours with no click / key / touch / save: real logout. Unsynced bills stay in the outbox and sync after the next login. */
+      if(!window._bnxReauthTriggered){ try{ bnxForceReauth('Logged out — no activity for 2 hours. Please log in again.'); }catch(e){} }
+      return true;
     }
     return false;
   }
   function activity(){
     if(window._bnxReauthTriggered) return;
+    if(navigator.onLine!==false && expired()){ enforce(); return; }   /* a touch AFTER 2 h idle cannot revive the login */
     if(!read()) write(true);
     else write(false);
   }
+  window.bnxMarkActivity_=function(){ activity(); };   /* called for real work (saves, bills, imports) */
 
   /* Do not count page loading itself as staff activity when an old timestamp
      exists — otherwise closing a tab overnight would silently reset the clock. */
@@ -1608,14 +1614,15 @@ function bnxIsReadOnlyAction_(a){ return /^(GET_|LIST_|RD_FETCH_|NEXT_)/.test(St
     else enforce();
   }catch(e){}
 
-  ['click','keydown','pointerdown','touchstart','scroll'].forEach(function(ev){
+  EVENTS.forEach(function(ev){
     window.addEventListener(ev, activity, {passive:true, capture:true});
   });
-  window.addEventListener('focus', function(){ enforce(); if(!expired()) activity(); });
+  window.addEventListener('focus', function(){ if(!enforce()) activity(); });
+  window.addEventListener('online', function(){ enforce(); });
   window.setInterval(enforce, CHECK_MS);
 
   window.BNX_SESSION_IDLE_LIMIT_MS = IDLE_LIMIT_MS;
-  window.BNX_SESSION_IDLE_LIMIT_HOURS = 24;
+  window.BNX_SESSION_IDLE_LIMIT_HOURS = 2;
 })();
 
 /* 2026-10-07 ROOT FIX: was `let`. The 5-hour inactivity check above runs at
@@ -1815,6 +1822,7 @@ function bnxSanitizeDue_(action, res){
 let _bnxWarnedNoSession = false;
 async function gasApi(action, payload, endpoint) {
   payload = payload || {};
+  try{ if(/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_|DELETE_|CANCEL_|VOID_|IMPORT_|ADD_|EDIT_)/i.test(String(action||'')) && window.bnxMarkActivity_) window.bnxMarkActivity_(); }catch(e){}
   const ep = endpoint || 'V2_CORE';
   if (action !== 'GET_CONFIG' && !bnxCurrentClient_()) {
     return Promise.resolve({success:false,error:'No authenticated client session',statusCode:401,offline:true});
@@ -56664,6 +56672,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
   var suspecting=false;
   W.bnxSessionSuspect_=function(){
     if(shown||suspecting) return;
+    if(W.__bnxImportBusy){ W.__bnxImportPendingCheck=1; return; }   /* big import = busy server = false 'expired' answers; re-checked after the import */
     suspecting=true;
     var waits=[1500,6000,20000];
     (async function(){
@@ -64725,15 +64734,29 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
      SKIP those half-written bills as 'already imported' — so every retry goes in 'reimport' mode (delete + write again = clean, repeatable). */
   async function postBills_(md,bills,lines){
     var r,m=md;
-    for(var a=0;a<3;a++){
+    for(var a=0;a<4;a++){
       try{ r=await impPost({action:'IMPORT_POS_SALES',mode:m,bills:bills,lines:lines}); }catch(e){ r={success:false,error:e.message}; }
       if(r&&r.success) return r;
-      if(/session|auth|unauthor|add-on|unknown action|401|403/i.test(String((r&&r.error)||''))) return r;
+      var er=String((r&&r.error)||'');
+      if(/add-on|unknown action/i.test(er)) return r;
+      if(/session|auth|unauthor|401|403/i.test(er)){
+        /* A busy Apps Script answers "Invalid or expired session" for a login that is still valid. The request was refused BEFORE
+           writing anything, so just wait and send the SAME batch again (same mode) — 5 s, 15 s, 30 s. */
+        await new Promise(function(z){ setTimeout(z,[5000,15000,30000][a]||30000); });
+        continue;
+      }
       m='reimport';
       await new Promise(function(z){ setTimeout(z,2500*(a+1)); });
     }
     return r; }
   async function syncViaImporter(onProgress,mode){
+    window.__bnxImportBusy=(window.__bnxImportBusy||0)+1;
+    try{ return await syncViaImporterCore_(onProgress,mode); }
+    finally{
+      window.__bnxImportBusy=Math.max(0,(window.__bnxImportBusy||1)-1);
+      if(!window.__bnxImportBusy && window.__bnxImportPendingCheck){ window.__bnxImportPendingCheck=0;
+        setTimeout(function(){ try{ if(window.bnxSessionSuspect_) window.bnxSessionSuspect_('after-import'); }catch(e){} },20000); } } }
+  async function syncViaImporterCore_(onProgress,mode){
     var all=await dbAll('tx'), ok=0, fail=0, lastErr='', res={written:[],warnings:[],checks:[],newItems:[],newCustomers:[],imported:0,skipped:0,replaced:0,conflicts:[]};
     var want=function(t){ return mode==='reimport'?true:(t.status!=='SYNCED'||!!t.reimport); };
     /* sales: complete bills only (needs both files) */
