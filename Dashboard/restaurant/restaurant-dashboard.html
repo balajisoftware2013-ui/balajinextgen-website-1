@@ -1144,7 +1144,8 @@ async function bnxFetchJson_(endpoint, options){
 
         const parsedAction = (()=>{ try{return JSON.parse(fetchOpts.body||'{}').action||'';}catch(e){return '';} })();
         const timeoutMs = Number(fetchOpts.timeoutMs) ||
-          (/^(UPLOAD_|SAVE_MENU_ITEM_IMAGE|SAVE_[A-Z_]*(IMAGE|LOGO|FILE|DRIVE|ASSETS?|BRAND|BRANDING|PHOTO|POSTER|VIDEO|BANNER)|QR_PROMO_)/i.test(parsedAction) ? 90000 :
+          (/^IMPORT_/i.test(parsedAction) ? BNX_IMPORT_TIMEOUT_MS :
+           /^(UPLOAD_|SAVE_MENU_ITEM_IMAGE|SAVE_[A-Z_]*(IMAGE|LOGO|FILE|DRIVE|ASSETS?|BRAND|BRANDING|PHOTO|POSTER|VIDEO|BANNER)|QR_PROMO_)/i.test(parsedAction) ? 90000 :
            /^(SAVE_BILL|SETTLE_|SAVE_ORDER|SAVE_KOT|CREATE_ORDER)/i.test(parsedAction) ? BNX_BILL_WRITE_TIMEOUT_MS :
            /^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? BNX_WRITE_TIMEOUT_MS :
            /^GET_DASHBOARD_SUMMARY$/i.test(parsedAction) ? BNX_DASHBOARD_TIMEOUT_MS : (/^(GET_|LIST_|RD_)/i.test(parsedAction) ? BNX_REPORT_TIMEOUT_MS : BNX_READ_TIMEOUT_MS));
@@ -1428,6 +1429,7 @@ const CLIENT_INDUSTRY=(function(){
 const REQUEST_QUEUE = { pending: [], active: 0, maxConcurrent: 5 };
 const API_RETRY_CONFIG = { maxAttempts: 3, baseDelay: 250, maxDelay: 2500 };
 const BNX_READ_TIMEOUT_MS = 8000;
+const BNX_IMPORT_TIMEOUT_MS = 300000; /* IMPORT_* (Import Center) — Apps Script needs 10-80 s per batch; was wrongly cut at 8 s */
 /* 2026-10-09 ("Logo kept on this PC — Google Sheet save failed: ERP request timed out after 12s"): the server now answers in
    ~25-30 s (BN_HEALTH avg_response), so every ordinary save (settings, logo/assets, staff, masters) was cut off at 12 s while
    the server was still saving — the screen said "failed" for a save that usually went through. Same reason as the bill fix below. */
@@ -1854,7 +1856,7 @@ async function gasApi(action, payload, endpoint) {
       try {
         let attempt = 0;
         const isCriticalWrite = /^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(String(action||''));
-        const maxAttempts = /^(UPLOAD_|SAVE_MENU_ITEM_IMAGE|SAVE_DUES_RECEIPT|SAVE_BILL|SETTLE_)/i.test(String(action||'')) ? 1 : API_RETRY_CONFIG.maxAttempts; /* SAVE_BILL: the caller retries with the SAME requestId (idempotent) — no hidden inner retries */ /* receipts: never blind-retry (a timed-out call may already be saved -> duplicate money entry) */ /* uploads: never auto-retry (avoids duplicate Drive files) */
+        const maxAttempts = /^(IMPORT_|UPLOAD_|SAVE_MENU_ITEM_IMAGE|SAVE_DUES_RECEIPT|SAVE_BILL|SETTLE_)/i.test(String(action||'')) ? 1 : API_RETRY_CONFIG.maxAttempts; /* SAVE_BILL: the caller retries with the SAME requestId (idempotent) — no hidden inner retries */ /* receipts: never blind-retry (a timed-out call may already be saved -> duplicate money entry) */ /* uploads: never auto-retry (avoids duplicate Drive files) */
         while (attempt < maxAttempts) {
           try {
             const session = bnxCurrentSession_();
@@ -64719,6 +64721,18 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
       pay.push({mode:String(x['Pay Through']||x['Payment Mode']||'').trim(),amount:a,ref:String(x['Ref.No.']||'').trim(),card:String(x['Card Type']||'').trim()}); });
     d['Total']=tot; d['Net Amount']=tot; d['Total including Tips']=tot; d['Payment Mode']=pay.map(function(p){return p.mode;}).join('+'); d.PAYMENTS=pay; return d;
   }
+  /* A call that timed out / failed may already have half-written some of its bills on the server. Retrying in 'import' mode would
+     SKIP those half-written bills as 'already imported' — so every retry goes in 'reimport' mode (delete + write again = clean, repeatable). */
+  async function postBills_(md,bills,lines){
+    var r,m=md;
+    for(var a=0;a<3;a++){
+      try{ r=await impPost({action:'IMPORT_POS_SALES',mode:m,bills:bills,lines:lines}); }catch(e){ r={success:false,error:e.message}; }
+      if(r&&r.success) return r;
+      if(/session|auth|unauthor|add-on|unknown action|401|403/i.test(String((r&&r.error)||''))) return r;
+      m='reimport';
+      await new Promise(function(z){ setTimeout(z,2500*(a+1)); });
+    }
+    return r; }
   async function syncViaImporter(onProgress,mode){
     var all=await dbAll('tx'), ok=0, fail=0, lastErr='', res={written:[],warnings:[],checks:[],newItems:[],newCustomers:[],imported:0,skipped:0,replaced:0,conflicts:[]};
     var want=function(t){ return mode==='reimport'?true:(t.status!=='SYNCED'||!!t.reimport); };
@@ -64741,9 +64755,10 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
     var total=nos.length+all.filter(function(t){return t.type!=='sales'&&want(t);}).length, done=0;
     var isRep=function(no){ return mode==='reimport'||F1[no].concat(F2[no]).some(function(t){return !!t.reimport;}); };
     var queue=nos.filter(isRep).map(function(no){return [no,'reimport'];}).concat(nos.filter(function(no){return !isRep(no);}).map(function(no){return [no,'import'];})), stop=false;
-    for(var i=0;i<queue.length&&!stop;i+=40){ var md=queue[i][1], part=[]; for(var q=i;q<queue.length&&q<i+40&&queue[q][1]===md;q++) part.push(queue[q][0]); i=q-40; var bills=[], lines=[];
+    var BATCH=10, failStreak=0;   /* 10 bills per call (was 40) — each call must finish well inside the Apps Script limit */
+    for(var i=0;i<queue.length&&!stop;i+=BATCH){ var md=queue[i][1], part=[]; for(var q=i;q<queue.length&&q<i+BATCH&&queue[q][1]===md;q++) part.push(queue[q][0]); i=q-BATCH; var bills=[], lines=[];
       part.forEach(function(no){ bills.push(mergeBillLegs_(F1[no])); F2[no].forEach(function(t){ lines.push(plainData(t.data)); }); });
-      var r; try{ r=await impPost({action:'IMPORT_POS_SALES',mode:md,bills:bills,lines:lines}); }catch(e){ r={success:false,error:e.message}; }
+      var r=await postBills_(md,bills,lines);
       var conf={}; (r&&r.conflicts||[]).forEach(function(n){conf[n]=1;});
       var upd=[]; part.forEach(function(no){ var good=!!(r&&r.success)&&!conf[no];
         F1[no].concat(F2[no]).concat(good?dupOld.filter(function(t){return invOf(t)===no;}):[]).forEach(function(t){ t.status=good?'SYNCED':'PENDING'; t.syncError=good?'':(conf[no]?no+' already exists as a live ERP bill — cancel it, then Re-import':String((r&&r.error)||'Server did not accept')); t.syncedAt=good?Date.now():0; if(good) t.reimport=false; upd.push(t); });
@@ -64751,7 +64766,8 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
       await dbPut('tx',upd);
       if(r&&r.success){ res.imported+=r.bills||0; res.skipped+=(r.skipped||[]).length; res.replaced+=r.replaced||0; res.conflicts=res.conflicts.concat(r.conflicts||[]);
         ['written','warnings','checks','newItems','newCustomers'].forEach(function(k){ res[k]=res[k].concat(r[k]||[]); }); }
-      done+=part.length; if(onProgress) onProgress(done,total); if(!(r&&r.success)) stop=true; }
+      done+=part.length; if(onProgress) onProgress(done,total);
+      if(!(r&&r.success)){ failStreak++; if(failStreak>=3||/session|auth|unauthor|add-on|unknown action|401|403/i.test(String((r&&r.error)||''))) stop=true; } else failStreak=0; }
     /* other types: raw rows into IMPORT_TRANSACTIONS */
     var groups={}; all.forEach(function(t){ if(t.type==='sales'||!want(t)) return; var k=t.batchId+'|'+t.type+'|'+t.fmt; (groups[k]=groups[k]||[]).push(t); });
     for(var g in groups){ var list=groups[g];
