@@ -14954,7 +14954,11 @@ async function bnxDashRangeRescue_(rangeParams, seq){
     const rows=res.data.filter(b=>{
       const st=String(b.BILL_STATUS||b.status||'').trim().toUpperCase();
       if(st==='CANCELLED'||st==='VOID') return false;
-      const bd=String(b.BUSINESS_DATE||b.businessDate||b.dt||'').slice(0,10);
+      /* 2026-10-17: imported bills come back with BUSINESS_DATE as an ISO-UTC timestamp (IST midnight = previous day 18:30Z); .slice(0,10) read them ONE DAY EARLY, so yesterday's imported sales were filtered out. Use the local date. */
+      const _raw=b.BUSINESS_DATE||b.businessDate||b.dt||'';
+      let bd=String(_raw).trim().slice(0,10);
+      if(/^\d{4}-\d{2}-\d{2}T.*(Z|[+-]\d{2}:?\d{2})$/.test(String(_raw).trim())){ const _d=new Date(String(_raw).trim()); if(!isNaN(_d)) bd=_d.getFullYear()+'-'+String(_d.getMonth()+1).padStart(2,'0')+'-'+String(_d.getDate()).padStart(2,'0'); }
+      else { const _m=String(_raw).trim().match(/^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{4})/); if(_m) bd=_m[3]+'-'+_m[2].padStart(2,'0')+'-'+_m[1].padStart(2,'0'); }
       return !/^\d{4}-\d{2}-\d{2}$/.test(bd) || (bd>=from && bd<=to);
     });
     if(!rows.length) return false;
@@ -14985,6 +14989,8 @@ async function bnxDashboardBillsFallback_(rangeParams){
       from = to = (typeof getBusinessDate === 'function') ? getBusinessDate() : new Date().toISOString().slice(0,10);
     } else if (rp.range === 'custom' && rp.from && rp.to) {
       from = String(rp.from); to = String(rp.to);
+    } else if (rp.range === 'yesterday' && rp.from) {
+      from = to = String(rp.from);   /* 2026-10-17: Yesterday had no fallback at all, so a failed summary left ₹0.00 */
     } else {
       return false;
     }
@@ -15052,7 +15058,7 @@ async function loadDashboard(){
       try{
         const _rv=Number(d.revenue!==undefined?d.revenue:d.todayRevenue)||0, _ts=Number(d.totalSales)||0, _or=Number(d.orders!==undefined?d.orders:d.todayOrders)||0;
         if(rangeParams && rangeParams.range && rangeParams.range!=='today' && _rv===0 && _ts===0 && _or===0){
-          setTimeout(()=>{ bnxDashRangeRescue_(rangeParams, requestSeq); }, 900);
+          setTimeout(async()=>{ const _ok=await bnxDashRangeRescue_(rangeParams, requestSeq); if(!_ok && requestSeq===_bnxDashboardRangeSeq){ setTimeout(()=>{ if(requestSeq===_bnxDashboardRangeSeq) bnxDashRangeRescue_(rangeParams, requestSeq); }, 30000); /* 2026-10-17: server timed out once - try the bills read one more time */ } }, 900);
         }
       }catch(_e){}
       bnxSaveDashboardSnapshot_(rangeParams,d);
@@ -63365,8 +63371,10 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
   }
   async function load(force){
     var rg=range(); if(!rg||busy) return; if(!force&&Date.now()<(W.__bnxFinNext||0)) return; var k=rg.from+'|'+rg.to; if(k===KEY&&!force&&D) return;
+    /* 2026-10-17 SERVER LOAD: Apps Script runs few scripts at once; DASH_FIN started while GET_DASHBOARD_SUMMARY was still running made BOTH time out. Wait for the summary first. */
+    try{ if(!force&&typeof _bnxDashSummaryPromise!=='undefined'&&_bnxDashSummaryPromise&&(W.__bnxFinDefer=(W.__bnxFinDefer||0)+1)<=20){ setTimeout(function(){ load(false); },4000); return; } W.__bnxFinDefer=0; }catch(e){}
     if(k!==KEY&&!fromCache(k)){ wait(true); clearTimeout(W.__bnxFinWT); W.__bnxFinWT=setTimeout(function(){ wait(false); },12000); }
-    busy=true; try{ var res=await api('DASH_FIN',{from:rg.from,to:rg.to,force:!!force},120000); if(res&&res.success){ W.__bnxFinFail=0; W.__bnxFinNext=0; D=res.data; KEY=k; apply(); try{ D._ts=Date.now(); localStorage.setItem(ckey(k),JSON.stringify(D)); }catch(e){} console.info('[DASH_FIN] '+k+' from TRANSACTION DB'+(D.cached?' (cached)':'')); } else { var er=String((res&&res.error)||'no answer'), cfg=/Missing config/i.test(er); W.__bnxFinFail=(W.__bnxFinFail||0)+1; var dl=cfg?600000:Math.min(20000*Math.pow(2,W.__bnxFinFail-1),300000); W.__bnxFinNext=Date.now()+dl; wait(false); console.warn('[DASH_FIN] not loaded: '+er+' — next try in '+Math.round(dl/1000)+' s'+(cfg?' | FIX ON SERVER: Apps Script > Project Settings > Script properties > add MASTER_CONTROL_ID, then Deploy > New version':'')); } }catch(e){ W.__bnxFinNext=Date.now()+20000; wait(false); } busy=false;
+    busy=true; try{ var res=await api('DASH_FIN',{from:rg.from,to:rg.to,force:!!force},120000); if(res&&res.success){ W.__bnxFinFail=0; W.__bnxFinNext=0; D=res.data; KEY=k; apply(); try{ D._ts=Date.now(); localStorage.setItem(ckey(k),JSON.stringify(D)); }catch(e){} console.info('[DASH_FIN] '+k+' from TRANSACTION DB'+(D.cached?' (cached)':'')); } else { var er=String((res&&res.error)||'no answer'), cfg=/Missing config/i.test(er); W.__bnxFinFail=(W.__bnxFinFail||0)+1; var tmo=/timeout|abort|network/i.test(er), dl=cfg?600000:Math.min((tmo?60000:20000)*Math.pow(2,W.__bnxFinFail-1),600000);   /* a timeout means the server is overloaded: 1 min, 2, 4 … max 10 min (was 20 s, 40 s …) */ W.__bnxFinNext=Date.now()+dl; wait(false); console.warn('[DASH_FIN] not loaded: '+er+' — next try in '+Math.round(dl/1000)+' s'+(cfg?' | FIX ON SERVER: Apps Script > Project Settings > Script properties > add MASTER_CONTROL_ID, then Deploy > New version':'')); } }catch(e){ W.__bnxFinNext=Date.now()+20000; wait(false); } busy=false;
   }
   W.bnxDashFinReload=function(){ load(true); };
   /* no flicker: when an older painter rewrites one of these boxes, put the DB value back at once (not 2.5 s later) */
