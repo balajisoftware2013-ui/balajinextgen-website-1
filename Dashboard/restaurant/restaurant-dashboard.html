@@ -12561,6 +12561,18 @@ async function bnxPullBillsFromServer(from, to){
   }
   return bnxPullBillsRange_(from,to);
 }
+/* SPEED 2026-10-18: GET_BILLS (the dashboard's own call) often answers while LIST_BILLS is still busy on the slow server.
+   Same row mapping the empty-LIST_BILLS fallback uses. Returns null when GET_BILLS has no rows. */
+function bnxBillsFromGetBills_(g){
+  const rows = g && g.success !== false && Array.isArray(g.data) ? g.data : [];
+  if(!rows.length) return null;
+  const day=v=>{ const t=String(v||''); return /^\d{4}-\d{2}-\d{2}/.test(t)?t.slice(0,10):t; };
+  return { success:true, bills: rows.map(b=>({
+    no: b.BILL_NUMBER||b.billNo, dt: day(b.BILL_DATE), tm: String(b.BILL_TIME||'').slice(0,8), table: b.TABLE_ID||'-',
+    customer: b.CUSTOMER_NAME||'GENERAL CUSTOMER', total: Number(b.GRAND_TOTAL)||0, sub: Number(b.SUBTOTAL)||0, gst: Number(b.TAX_AMOUNT)||0,
+    disc: (Number(b.ITEM_DISCOUNT)||0)+(Number(b.BILL_DISCOUNT)||0), status: (/CANCEL|VOID/i.test(String(b.BILL_STATUS))?'CANCELLED':(/UNPAID|PARTIAL/i.test(String(b.PAYMENT_STATUS))?'PENDING':((/^(NC|NO.?CHARGE|NON.?CHARGE|COMPLIMENT)/i.test(String(b.PAYMENT_MODE||b.PAY_MODE||b.BILL_STATUS||'')) || (Number(b.GRAND_TOTAL)===0 && Number(b.SUBTOTAL)>0))?'COMPLIMENTARY':'PAID'))),
+    pay: String(b.PAYMENT_MODE||b.PAY_MODE||'').toUpperCase(), businessDate: day(b.BUSINESS_DATE||b.BILL_DATE), BILL_ID: b.BILL_ID })) };
+}
 async function bnxPullBillsRange_(from, to){
   // Range-aware authoritative sync. For an explicitly selected range,
   // replace the cached bills inside that range with the server result.
@@ -12586,7 +12598,14 @@ async function bnxPullBillsRange_(from, to){
       const hasRange = !!(from || to);
       if (hasRange){ params.FROM_DATE = from || to; params.TO_DATE = to || from; }
       params.SUMMARY_ONLY = true;
-      let res = await gasApi('LIST_BILLS', params);
+      /* race: LIST_BILLS now; if it has not answered in 6 s, GET_BILLS is asked too and the first usable answer wins */
+      let res = await new Promise(function(resolve){
+        let done=false; const fin=function(v){ if(!done){ done=true; resolve(v); } };
+        gasApi('LIST_BILLS', params).then(fin, function(e){ fin({success:false,error:String(e&&e.message||e)}); });
+        if(hasRange){ setTimeout(function(){ if(done) return;
+          gasApi('GET_BILLS', { FROM_DATE: params.FROM_DATE, TO_DATE: params.TO_DATE, BUSINESS_DATE: params.FROM_DATE }, 'V2_CORE')
+            .then(function(g){ const r=bnxBillsFromGetBills_(g); if(r){ console.info('[BILLS] GET_BILLS answered first for '+params.FROM_DATE+'..'+params.TO_DATE); fin(r); } }).catch(function(){}); },6000); }
+      });
       /* 2026-10-15 ("Bills List Yesterday 0 while Reports/Dashboard show 10 bills"): LIST_BILLS can answer empty (server
          cache built while BILL_MASTER was unreadable) or fail on a slow server, but GET_BILLS — used by the dashboard KPIs —
          had the bills. An empty/failed LIST_BILLS for a date range is now checked against GET_BILLS before showing 0. */
@@ -15080,7 +15099,7 @@ async function bnxRenderDashChartsRow_(){
     if(salesTrendHeader) salesTrendHeader.innerHTML='📈 Sales Trend <span style="font-size:10px;color:var(--text3);font-weight:400;">('+rangeText+')</span>';
     // Also populate the Analytics monthly trend from the same live server rows.
     const monthlyBox=document.getElementById('dashMonthlyRevenueTrend');
-    if(monthlyBox){const yearRows=[];const byMonth={};rows.forEach(r=>{const d=key(r.SALE_DATE);const mk=d.slice(0,7);byMonth[mk]=(byMonth[mk]||0)+Number(r.GROSS_SALES||0);});Object.keys(byMonth).sort().forEach(m=>yearRows.push({m,v:byMonth[m]}));monthlyBox.innerHTML=yearRows.length?yearRows.map(x=>'<div style="display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border);"><span>'+new Date(x.m+'-01T00:00:00').toLocaleDateString('en-IN',{month:'short',year:'numeric'})+'</span><b>₹'+money(x.v)+'</b></div>').join(''):'<div style="padding:24px;text-align:center;color:var(--text3);">No live sales for selected period.</div>';}
+    if(monthlyBox&&monthlyBox.dataset.bnxAn!=='1'){const yearRows=[];const byMonth={};rows.forEach(r=>{const d=key(r.SALE_DATE);const mk=d.slice(0,7);byMonth[mk]=(byMonth[mk]||0)+Number(r.GROSS_SALES||0);});Object.keys(byMonth).sort().forEach(m=>yearRows.push({m,v:byMonth[m]}));monthlyBox.innerHTML=yearRows.length?yearRows.map(x=>'<div style="display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border);"><span>'+new Date(x.m+'-01T00:00:00').toLocaleDateString('en-IN',{month:'short',year:'numeric'})+'</span><b>₹'+money(x.v)+'</b></div>').join(''):'<div style="padding:24px;text-align:center;color:var(--text3);">No live sales for selected period.</div>';}
   }catch(e){console.error('[Dashboard] bnxRenderDashChartsRow_ error:',e);}
 }
 
@@ -54992,6 +55011,7 @@ D.head.appendChild(st);
       if(!d){
         ['an-rev','an-ord','an-cov','an-avg'].forEach(function(i){var e=$(i);if(e){e.textContent='\u2014';e.style.opacity='';}});
         if(staff)staff.innerHTML='<div style="padding:16px;text-align:center;color:var(--text3);font-size:12px">Could not load live data. <a href="#" onclick="bnxAnalyticsReload();return false" style="color:var(--gold)">Retry</a></div>';
+        var mb0=$('dashMonthlyRevenueTrend'); if(mb0)mb0.innerHTML='<div style="padding:16px;text-align:center;color:var(--text3);font-size:12px">Could not load live data. <a href="#" onclick="bnxAnalyticsReload();return false" style="color:var(--gold)">Retry</a></div>';
         return;
       }
       var k=kpi(d), pk=pd?kpi(pd):null;
@@ -54999,7 +55019,36 @@ D.head.appendChild(st);
       set('an-rev',compact(k.sales)); set('an-ord',k.orders.toLocaleString('en-IN')); set('an-cov',k.covers.toLocaleString('en-IN')); set('an-avg',k.avg?inr(k.avg):'\u2014');
       chg($('an-rev-chg'),k.sales,pk&&pk.sales); chg($('an-ord-chg'),k.orders,pk&&pk.orders); chg($('an-cov-chg'),k.covers,pk&&pk.covers); chg($('an-avg-chg'),k.avg,pk&&pk.avg,true);
       if(staff)renderStaff(staff,d.stewardPerformance);
+      /* 2026-10-18: Monthly Revenue Trend was never filled on this page ("Loading live monthly sales…" forever).
+         Painted at once from the two months already loaded, then older months are added one by one in the background. */
+      var series={}; series[cur]=k.sales; if(pk)series[prev]=pk.sales;
+      paintMonthly(series,cur);
+      (function older(off){
+        if(off<-5||my!==seq)return;
+        var mk=monthKey(off);
+        summary({range:'month',month:mk}).then(function(od){
+          if(my!==seq)return;
+          if(od){ series[mk]=kpi(od).sales; paintMonthly(series,cur); }
+          older(off-1);
+        });
+      })(-2);
     });
+  }
+  function paintMonthly(series,cur){
+    var box=$('dashMonthlyRevenueTrend'); if(!box)return;
+    box.dataset.bnxAn='1'; box.style.cssText='';
+    var keys=Object.keys(series).sort(), max=0;
+    keys.forEach(function(m){ if(series[m]>max)max=series[m]; });
+    if(!keys.length||!(max>0)){ box.innerHTML='<div style="text-align:center;padding:16px;color:var(--text3);font-size:12px">No sales yet.</div>'; return; }
+    var short=function(n){ return n>=1e7?'\u20b9'+(n/1e7).toFixed(2)+'Cr':n>=1e5?'\u20b9'+(n/1e5).toFixed(1)+'L':inr(n); };
+    var SM=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    box.innerHTML='<div style="display:flex;align-items:flex-end;gap:10px;height:150px;padding:6px 2px 0">'+keys.map(function(m){
+      var v=series[m], h=Math.max(4,Math.round(v/max*110)), x=m.split('-'), on=(m===cur);
+      return '<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;min-width:0" title="'+monthLabel(m)+': '+inr(v)+'">'+
+        '<div style="font-size:10.5px;font-weight:700;color:var(--text2);white-space:nowrap">'+short(v)+'</div>'+
+        '<div style="width:100%;max-width:46px;height:'+h+'px;margin-top:4px;border-radius:6px 6px 0 0;background:'+(on?'var(--gold)':'rgba(var(--bx-rgb,184,105,14),.35)')+'"></div>'+
+        '<div style="font-size:10.5px;color:var(--text3);margin-top:5px">'+SM[+x[1]-1]+'</div></div>';
+    }).join('')+'</div>'+(keys.length<6?'<div style="font-size:10.5px;color:var(--text3);text-align:center;margin-top:6px">loading earlier months\u2026</div>':'');
   }
   window.bnxAnalyticsReload=loadAnalytics;
   function renderStaff(box,list){
@@ -70564,6 +70613,13 @@ body.bnx-on-dsr [data-bnx-fab]{display:none!important;}
   D.addEventListener('click',function(){setTimeout(sweep,50);},true);
 })();
 </script>
+<style id="bnx-billing-hide-toolbar-20261018">
+/* 2026-10-18: New Bill top strip held only "Product List" and "Print KOT" (Preview Thermal / A4 were already hidden), both unused.
+   The whole strip is removed so no empty gap is left above Bill Details / Live Bill Preview. */
+html:not(#_t) body #page-billing>.section-h,
+#page-billing>.section-h{display:none!important;margin:0!important;padding:0!important;height:0!important;min-height:0!important;border:0!important;overflow:hidden!important}
+html:not(#_t) body #page-billing>.grid{margin-top:0!important}
+</style>
 <script id="bnx-bills-prefetch-20261018">
 /* SPEED 2026-10-18: Bills List 'Yesterday' sat on "Connecting to server" because nothing had pulled it yet and the
    request waited behind slow background reads. Yesterday's bills are now pulled once, quietly, a few seconds after
