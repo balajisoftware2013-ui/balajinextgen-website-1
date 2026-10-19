@@ -2945,7 +2945,7 @@ details.bnx-default-fold>summary .bnx-fold-label:after{content:"Show ▾";font-s
 details.bnx-default-fold[open]>summary .bnx-fold-label:after{content:"Hide ▴"}
 details.bnx-default-fold:not([open])>.bnx-fold-content{display:none!important}
 </style>
-<meta name="bnx-build" content="DSR-2026.10.20-v2">
+<meta name="bnx-build" content="DSR-2026.10.20-v4">
 </head>
 <body class="bnx-dsr-responsive">
 <div id="bnxBoot"><i></i><span>Loading DSR…</span></div>
@@ -4885,7 +4885,7 @@ function buildYTD() {
     <div class="chip chip-y"><div class="chip-val">₹${fmtL(ytdTot.food||0)}</div><div class="chip-lbl">YTD Food</div></div>
     <div class="chip chip-y"><div class="chip-val">₹${fmtL(ytdTot.cash||0)}</div><div class="chip-lbl">YTD CASH</div></div>
     <div class="chip chip-y"><div class="chip-val" id="ytdDueReceivedChip">₹${fmtL(BNX_DUE_CONTROL_?.ytd?.received||0)}</div><div class="chip-lbl">YTD Due Received</div></div>
-    <div class="chip chip-y"><div class="chip-val" id="ytdClosingDueChip">₹${fmtL(BNX_DUE_CONTROL_?.ytd?.closing||0)}</div><div class="chip-lbl">Closing Outstanding</div></div>
+    <div class="chip chip-y"><div class="chip-val" id="ytdClosingDueChip">${BNX_DUE_CONTROL_?.loaded?'₹'+fmtL(BNX_DUE_CONTROL_.ytd.closing):'—'}</div><div class="chip-lbl">Closing Outstanding</div></div>
     <div class="chip chip-y"><div class="chip-val">₹${fmtL(ytdTot.disc||0)}</div><div class="chip-lbl">YTD Discount</div></div>
     <div class="chip chip-y"><div class="chip-val">${months.length}</div><div class="chip-lbl">Months</div></div>`;
   const maxN=Math.max(...months.map(([,m])=>m.net),1);
@@ -5339,30 +5339,27 @@ async function bnxGetDuePeriod_(from,to){
   return {received:bnxRangeDueRecv_(from,to),payments:0,raw:null};
 }
 async function bnxGetLiveOutstanding_(asOf){
-  /* FIX 2026-10-10 ("opening / closing outstanding show wrong"): the figure now comes from the SAME feed as the Dashboard
-     (parent DUES_LIST = CUSTOMER_DUES sheet, or its as-of helper for past dates). The old call alone could time out and the
-     sheet then showed Opening 0 / Closing = this period's credit − receipts (e.g. -12,24,997 YTD). */
-  try{
-    const P=bnxDsrAccessibleParent_();
-    if(P&&P!==window){
-      if(asOf&&asOf<bnxToday_()&&typeof P.bnxDsrDuesAsOf_==='function'){
-        const x=await P.bnxDsrDuesAsOf_(asOf);
-        if(x&&x.ok&&isFinite(Number(x.closing))) return {closing:bnxDueNum_(x.closing),overdue:0,customers:[],raw:Object.assign({},x,{outstandingAsOf:x.closing}),ok:true,exact:x.exact};
-      }
-      if(typeof P.bnxApprovalApi==='function'){
-        const r=await P.bnxApprovalApi('DUES_LIST',{},60000);
-        if(r&&r.success&&r.data&&Array.isArray(r.data.customers)){const cs=r.data.customers;const rs=+cs.reduce((t,c)=>{const o=Number(c.outstanding);return t+(isFinite(o)&&Math.abs(o)<1e9&&o>0.01?o:0);},0).toFixed(2);const srv=bnxDueNum_(r.data.totalOutstanding);if(cs.length&&Math.abs(rs-srv)>1)console.info('[DSR OUTSTANDING] server total '+srv+' differs from customer rows '+rs+' - using customer rows (same as Dashboard)');return {closing:cs.length?rs:srv,overdue:bnxDueNum_(r.data.overdue30Plus),customers:cs,raw:r.data,ok:true,serverTotal:srv};}
-      }
-    }
-  }catch(e){ console.warn('[DSR OUTSTANDING] dashboard feed',e); }
-  if(location.protocol==='file:'&&window.parent!==window){
-    try{const x=await bnxDsrParentRead_('BNX_DSR_DUES_AS_OF',{date:asOf});
-      if(x&&x.ok&&x.closing!=null)return {closing:bnxDueNum_(x.closing),overdue:0,customers:[],raw:Object.assign({},x,{outstandingAsOf:x.closing}),ok:true,exact:x.exact};
-    }catch(_){}
+  const tasks=[], historical=!!asOf&&asOf<bnxToday_();
+  function valid(r){
+    const d=r&&r.success&&r.data;
+    if(!d)throw new Error('Outstanding request failed');
+    const value=d&&(d.outstandingAsOf!=null?d.outstandingAsOf:(!historical?d.totalOutstanding:null));
+    if(value===null||value===undefined||String(value).trim()===''||!Number.isFinite(Number(value)))throw new Error('No valid outstanding total');
+    return {closing:Number(value),overdue:bnxDueNum_(d.overdue30Plus),customers:Array.isArray(d.customers)?d.customers:[],raw:d,ok:true};
   }
-  try{const r=await gasApi('GET_DUE_COLLECTION',asOf?{asOfDate:asOf}:{});if(r&&r.success&&r.data&&(r.data.outstandingAsOf!=null||r.data.totalOutstanding!=null))return {closing:bnxDueNum_(r.data.outstandingAsOf!=null?r.data.outstandingAsOf:r.data.totalOutstanding),overdue:bnxDueNum_(r.data.overdue30Plus),customers:Array.isArray(r.data.customers)?r.data.customers:[],raw:r.data,ok:true};}catch(e){console.warn('[DSR OUTSTANDING]',e);}
-  return {closing:0,overdue:0,customers:[],raw:null,ok:false};
+  // Independent reads: a slow parent extension must not block the core endpoint.
+  tasks.push(Promise.resolve().then(()=>gasApi('GET_DUE_COLLECTION',historical?{asOfDate:asOf}:{})).then(valid));
+  const P=bnxDsrAccessibleParent_();
+  if(P&&P!==window){
+    if(!historical&&typeof P.bnxApprovalApi==='function')tasks.push(Promise.resolve().then(()=>P.bnxApprovalApi('DUES_LIST',{},60000)).then(valid));
+    if(historical&&typeof P.bnxDsrDuesAsOf_==='function')tasks.push(Promise.resolve().then(()=>P.bnxDsrDuesAsOf_(asOf)).then(x=>{
+      if(!x||!x.ok||x.closing==null||!Number.isFinite(Number(x.closing)))throw new Error('Historical dues unavailable');
+      return {closing:Number(x.closing),overdue:0,customers:[],raw:x,ok:true,exact:x.exact};
+    }));
+  }
+  try{return await Promise.any(tasks);}catch(e){return {closing:null,overdue:0,customers:[],raw:null,ok:false};}
 }
+
 function bnxApplyDueControl_(prefix,x){
   if(!x)return;
   const op=$(prefix+'_opengd'), cur=$(prefix+'_currgd'), rec=$(prefix+'_due_total');
@@ -5400,6 +5397,8 @@ async function loadDsrDueControl_(asOfDate){
     }
     return false;
   }
+  if(String($('repDate')?.value||'').slice(0,10)!==ds)return false;
+  ['d','m','y'].forEach(function(p){const c=$(p+'_currgd');if(c){c.textContent=fmt(live.closing);c.dataset.live='1';c.dataset.asOf=ds;c.title='Outstanding verified as of '+ds+'; opening awaits period movement';}});
   const [dayP,mtdP,ytdP]=await Promise.all([
     bnxGetDuePeriod_(ds,ds),bnxGetDuePeriod_(monthStart,ds),bnxGetDuePeriod_(fyStart,ds)
   ]);
@@ -5428,7 +5427,8 @@ async function loadDsrDueControl_(asOfDate){
      period); the plug is only a fallback, and the sheet says which one is in use. */
   const _P=bnxDsrAccessibleParent_();
   const _openAt=async f=>{try{if(location.protocol==='file:'&&window.parent!==window){const x=await bnxDsrParentRead_('BNX_DSR_DUES_AS_OF',{date:f});if(x&&x.ok&&x.opening!=null)return bnxDueNum_(x.opening);}if(_P&&typeof _P.bnxDsrDuesAsOf_==='function'){const x=await _P.bnxDsrDuesAsOf_(f);if(x&&x.ok&&isFinite(Number(x.opening)))return +Number(x.opening).toFixed(2);}}catch(e){}return null;};
-  const [opD,opM,opY]=await Promise.all([_openAt(ds),_openAt(monthStart),_openAt(fyStart)]);
+  const [opD,opM,opY]=[null,null,null]; // Opening is explicitly reconstructed below; do not block on redundant historical reads.
+  if(String($('repDate')?.value||'').slice(0,10)!==ds)return false;
   const calc=(from,p,indOpen)=>{
     const credit=bnxRangeCredit_(from,ds);
     const cn=bnxRangeCn_(from,ds);
@@ -10092,9 +10092,9 @@ table th,table td,.btn,.btn-sm,.sub-tab,.step-btn{color:#111!important;}
   if(typeof BNX_DUE_CONTROL_!=='undefined'&&BNX_DUE_CONTROL_.loaded&&BNX_DUE_CONTROL_.date===date)return;
   ['d','m','y'].forEach(function(p){
    const op=document.getElementById(p+'_opengd'),cl=document.getElementById(p+'_currgd');
-   const gaveUp=window.__bnxDueFailed_===date, txt=gaveUp?'—':'Loading…';
+   const gaveUp=window.__bnxDueFailed_===date, txt=gaveUp?'Unavailable':'Awaiting dues data';
    if(op){op.readOnly=true;op.placeholder='';op.value='';op.placeholder=txt;op.readOnly=true;op.title=gaveUp?'Customer dues not available — tap the note above to retry':'Opening outstanding awaits customer dues data';}
-   if(cl){cl.textContent=txt;cl.dataset.live='0';cl.title=gaveUp?'Customer dues not available — tap the note above to retry':'Closing outstanding awaits customer dues data';}
+   if(cl&&!(cl.dataset.live==='1'&&cl.dataset.asOf===date)){cl.textContent=txt;cl.dataset.live='0';cl.title=gaveUp?'Customer dues not available — tap the note above to retry':'Closing outstanding awaits customer dues data';}
   });
  }
  if(typeof orig==='function')window.recalcAll=function(){const r=orig.apply(this,arguments);pending();return r;};
@@ -11090,7 +11090,7 @@ html:not(#bnxSpacing) body .dsr-val.editable{height:27px!important;min-height:0!
 
 <script id="bnx-version-badge">
 (function(){
- var build='DSR-2026.10.20-v2';window.BNX_PAGE_BUILD=build;
+ var build='DSR-2026.10.20-v4';window.BNX_PAGE_BUILD=build;
  function paint(){var b=document.getElementById('bnx-ver-badge');if(!b){b=document.createElement('div');b.id='bnx-ver-badge';b.style.cssText='position:fixed;right:8px;bottom:8px;z-index:9989;padding:4px 8px;border-radius:8px;background:#f3f4f6;color:#333;font:700 10px/1.25 Arial,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.12)';(document.body||document.documentElement).appendChild(b);}b.textContent=build;b.title='Frontend build · 20 October 2026';}
  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',paint);else paint();
 })();
@@ -11099,4 +11099,12 @@ html:not(#bnxSpacing) body .dsr-val.editable{height:27px!important;min-height:0!
 <style id="bnx-version-label-position">
 #bnx-ver-badge{left:auto!important;right:8px!important;font-size:10px!important;max-width:min(360px,88vw);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 @media print{#bnx-ver-badge{display:none!important}}
+</style>
+
+<style id="bnx-dsr-all-page-spacing-v4" media="screen">
+html:not(#dsrSpaceA):not(#dsrSpaceB) body .step-panel>.card{padding:10px 12px!important;margin-bottom:8px!important;min-width:0!important}
+html:not(#dsrSpaceA):not(#dsrSpaceB) body .card-title{margin-bottom:7px!important}
+html:not(#dsrSpaceA):not(#dsrSpaceB) body :is(.step-panel,.card)>:is(.grid,.chips){gap:8px!important}
+html:not(#dsrSpaceA):not(#dsrSpaceB) body :is(.tab-bar,.bar-area){gap:6px!important;flex-wrap:wrap!important}
+@media(max-width:600px){html:not(#dsrSpaceA):not(#dsrSpaceB) body .step-panel>.card{padding:8px!important}}
 </style>
