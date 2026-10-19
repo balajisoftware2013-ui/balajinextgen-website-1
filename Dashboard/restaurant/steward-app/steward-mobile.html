@@ -297,7 +297,7 @@ button{transition:background-color .15s ease,box-shadow .15s ease}
    Printing still goes ONLY through the real relay (POST /print with
    ESC/POS) or RawBT.
    ═══════════════════════════════════════════════════════════════════ */
-window.BNX_STEWARD_BUILD='SM-2026.10.09-v10';   /* shown on screen (Profile + corner badge) — tells which version a phone runs */
+window.BNX_STEWARD_BUILD='SM-2026.10.20-v1';   /* shown on screen (Profile + corner badge) — tells which version a phone runs */
 /* FW8: robust native-bridge detection. The Android app may inject the bridge a moment after the page
    starts, under another name, or typeof may report 'object' on some WebViews. */
 (function(){
@@ -3279,6 +3279,7 @@ html body .tp-t.RUNNING.sel,html body .tp-t.OCCUPIED.sel{box-shadow:0 0 0 3px rg
 #s-new-order #menu-grid .menu-card .mc-price,#new-order-scroll #menu-grid .menu-card .mc-price{white-space:normal!important;overflow-wrap:anywhere!important}
 @media(max-width:420px){#s-new-order #menu-grid .menu-card .mc-name,#new-order-scroll #menu-grid .menu-card .mc-name{font-size:12.5px!important}}
 </style>
+<meta name="bnx-build" content="SM-2026.10.20-v1">
 </head>
 <body>
 <script>
@@ -4379,11 +4380,12 @@ window.__bnxWriteGen=0;
 function bnxIsReadAction_(a){ return /^(GET_|LIST_|CHECK_|FETCH_|LOAD_|READ_|RD_FETCH)/i.test(String(a||'')); }
 function bnxApiCacheClear_(){ __bnxReadCache.clear(); __bnxReadInflight.clear(); window.__bnxWriteGen++; }
 function bnxClone_(v){ try{ return typeof structuredClone==='function'?structuredClone(v):JSON.parse(JSON.stringify(v)); }catch(e){ return v; } }
+window.addEventListener('storage',function(e){if(e.key==='bnx_data_changed_'+getClientId())bnxApiCacheClear_();});
 async function gasApi(action,payload,endpoint){
   if(!bnxIsReadAction_(action)){
     bnxApiCacheClear_();
     try{ return await bnxGasApiNet_(action,payload,endpoint); }
-    finally{ bnxApiCacheClear_(); }
+    finally{ bnxApiCacheClear_();try{localStorage.setItem('bnx_data_changed_'+getClientId(),Date.now()+'-'+Math.random());}catch(e){} }
   }
   let key;
   try{ key=(endpoint||'V2_CORE')+'|'+action+'|'+JSON.stringify(payload||{})+'|'+getClientId()+'|'+getSessionToken(); }
@@ -4403,6 +4405,8 @@ async function gasApi(action,payload,endpoint){
 }
 async function bnxGasApiNet_(action,payload,endpoint){
   payload=payload||{};
+  const requestClient=String(getClientId()||'');
+  if(CLIENT_ID&&requestClient!==String(CLIENT_ID))return{success:false,error:'Client changed. Refresh before sending orders.'};
   const ep=endpoint||'V2_CORE';
   /* only the very first run (no cached deployment id yet) waits for GET_CONFIG;
      with a cached id every call goes out immediately (404 recovery below still
@@ -4412,7 +4416,7 @@ async function bnxGasApiNet_(action,payload,endpoint){
     try{ await Promise.race([__bnxConfigReady,new Promise(r=>setTimeout(r,1500))]); }catch(e){}
   }
 
-  const readOnly=/^(GET_|LIST_|CHECK_|FETCH_|LOAD_|READ_)/i.test(String(action||''));
+  const readOnly=bnxIsReadAction_(action);
   let lastErr=null;
   let deploymentRecovered=false;
 
@@ -4438,11 +4442,9 @@ async function bnxGasApiNet_(action,payload,endpoint){
       const r=await fetch(url,{
         method:'POST',
         headers:{'Content-Type':'text/plain;charset=utf-8'},
-        body:JSON.stringify(Object.assign({
-          action:action,
-          clientId:getClientId(),
-          sessionToken:getSessionToken()
-        },payload)),
+        body:JSON.stringify(Object.assign({},payload,{
+          action:action,clientId:getClientId(),sessionToken:getSessionToken()
+        })),
         signal:controller.signal
       });
       if(!r.ok){
@@ -4461,6 +4463,7 @@ async function bnxGasApiNet_(action,payload,endpoint){
       let parsed;
       try{parsed=JSON.parse(text);}
       catch(e){throw new Error('Invalid server response');}
+      if(requestClient!==String(getClientId()||''))return{success:false,error:'Client changed while request was running'};
       return parsed;
     }catch(e){
       clearTimeout(timer);
@@ -5008,6 +5011,10 @@ function bnxQueuePending(action, payload, requestId, onSuccess){
     if(typeof toast==='function') toast('⚠️ KOT pending server sync ('+k+') — auto-retry active','error');
   }
 }
+function bnxDeferQueuedOrder_(rid,until){
+ const list=bnxGetOutbox();const e=list.find(x=>String(x.requestId)===String(rid));if(e){e.deferUntil=until||0;bnxSetOutbox(list);}
+}
+function bnxConfirmQueuedOrder_(rid){bnxSetOutbox(bnxGetOutbox().filter(e=>String(e.requestId)!==String(rid)));}
 // P0 FIX (external audit #5 — "KOT status updates need the same
 // guaranteed outbox treatment everywhere"): gasApi() here already
 // never rejects (its catch resolves {success:false,offline:true,...}
@@ -5154,10 +5161,16 @@ function bnxUpdateSyncBadge(){
 // immediately instead of starting a second parallel pass.
 let bnxFlushInProgress = false;
 async function flushOutbox(force){
+  if(navigator.locks&&typeof navigator.locks.request==='function'){
+    return navigator.locks.request('bnx-outbox-'+(CLIENT_ID||'default'),{ifAvailable:true},async function(lock){if(lock)return bnxFlushOwned_(force);});
+  }
+  return bnxFlushOwned_(force);
+}
+async function bnxFlushOwned_(force){
   if (bnxFlushInProgress) return;
   /* PASS #75: the installed app and a browser tab share one outbox in localStorage. Without a lease
      both flushed the same entries at the same moment = same order sent twice. One tab at a time. */
-  const LK='bnx_flush_lock', me=String(Date.now())+Math.random().toString(36).slice(2);
+  const LK='bnx_flush_lock_'+(CLIENT_ID||'default'), me=String(Date.now())+Math.random().toString(36).slice(2);
   try{
     const cur=JSON.parse(localStorage.getItem(LK)||'null');
     if(cur && Date.now()-cur.t<45000) return;
@@ -5167,12 +5180,22 @@ async function flushOutbox(force){
     if(!chk || chk.id!==me) return;
   }catch(e){}
   bnxFlushInProgress = true;
+  const leaseTimer=setInterval(()=>{try{const l=JSON.parse(localStorage.getItem(LK)||'null');if(l&&l.id===me)localStorage.setItem(LK,JSON.stringify({id:me,t:Date.now()}));}catch(e){}},10000);
   try {
     await flushOutbox_impl_(!!force);
   } finally {
-    bnxFlushInProgress = false;
+    clearInterval(leaseTimer);bnxFlushInProgress = false;
     try{ const held=JSON.parse(localStorage.getItem(LK)||'null'); if(held && held.id===me) localStorage.removeItem(LK); }catch(e){}
   }
+}
+async function bnxRecoverQueuedOrder_(entry,res){
+ const p=entry.payload||{},d=res.data||{};
+ const no=d.ORDER_NUMBER||d.ORDER_NO||d.ORDER_ID||res.orderId||res.transactionId;
+ if(!no){toast('Order saved but KOT reference is missing — refresh KOT register and verify before resending','error');return;}
+ const ticket={kotNo:no,orderNo:d.ORDER_NUMBER||d.ORDER_NO||no,orderId:d.ORDER_ID||res.transactionId||no,
+ table:p.tableId,waiter:p.waiter||p.steward,steward:p.steward||p.waiter,covers:p.covers,items:p.items||[],
+ businessDate:p.businessDate||p.BUSINESS_DATE||p.orderDate,customerName:p.customerName,remarks:p.remarks||''};
+ await bnxSyncRealKotTickets_(ticket,ticket.orderNo,p.locationId||'');
 }
 async function flushOutbox_impl_(force){
   const list = bnxGetOutbox();
@@ -5185,6 +5208,7 @@ async function flushOutbox_impl_(force){
   const remaining = [];
   const now = Date.now();
   for(const entry of list){
+    if(entry.deferUntil && entry.deferUntil>Date.now()){remaining.push(entry);continue;}
     // EXPONENTIAL BACKOFF (production audit #13 — "retry with
     // exponential backoff, no duplicate network calls"): flat 15s
     // retries hammer an already-failing backend at the same rate as a
@@ -5220,9 +5244,11 @@ async function flushOutbox_impl_(force){
       continue;
     }
     try {
-      if(res && !res.success && /already (exist|saved|synced|processed)|duplicate/i.test(String(res.error||res.message||''))) res={success:true};
+      // A duplicate error alone does not prove this request was saved. Keep it visible for verification.
+      if(res && !res.success && (res.alreadyProcessed===true || (res.data&&res.data.requestId===entry.requestId&&res.data.ORDER_ID)))res=Object.assign({},res,{success:true});
       if(res && res.success){
         // Successfully synced late — apply any follow-up UI update tagged on this entry
+        if(entry.action==='SAVE_ORDER'&&entry.onSuccessTag==='kot')await bnxRecoverQueuedOrder_(entry,res);
         if(entry.onSuccessTag==='kot') bnxLoadOpenKots();
         if(typeof entry.onSuccessTag==='string' && entry.onSuccessTag.startsWith('kot-edit:')){
           const kotNo = entry.onSuccessTag.slice('kot-edit:'.length);
@@ -8973,6 +8999,9 @@ async function bnxSyncRealKotTickets_(entry, orderId, locationId){
           price:Number(i.price!=null?i.price:(i.rate!=null?i.rate:i.RATE))||0,
           UNIT_ID:i.UNIT_ID||'PIECE',
           ORDER_ITEM_ID:i.ORDER_ITEM_ID||'',
+          ITEM_CODE:i.ITEM_CODE||i.itemCode||i.ITEM_ID||i.id||'',
+          CATEGORY_ID:i.CATEGORY_ID||i.categoryId||'',
+          SIZE:i.SIZE||i.size||'',size:i.size||i.SIZE||'',
           ITEM_GROUP_ID:i.ITEM_GROUP_ID||i.itemGroupId||'',
           ITEM_GROUP_NAME:i.ITEM_GROUP_NAME||i.itemGroupName||'',
           GROUP_TYPE:i.GROUP_TYPE||i.groupType||part.type||'KITCHEN',
@@ -12235,11 +12264,15 @@ async function placeOrder(){
   const __p = window.__BNX_PLACE_ORDER_PROMISE = bnxPlaceOrderImpl_();
   try{
     return await __p;
+  }catch(e){
+    const btn=document.querySelector('#s-new-order .btn-primary[onclick="placeOrder()"]');if(btn){btn.disabled=false;btn.textContent='📤 Send KOT';}
+    toast('Order not confirmed: '+String(e&&e.message||e)+' — check Pending Sync before resending','error');
   }finally{
     if(window.__BNX_PLACE_ORDER_PROMISE === __p) window.__BNX_PLACE_ORDER_PROMISE = null;   /* a background save never clears the next order's guard */
   }
 }
 async function bnxPlaceOrderImpl_(){
+  const __orderClient=String(CLIENT_ID||'');
   const tot=Object.values(order).reduce((a,b)=>a+b,0);
   if(!tot){ toast('No items in order','error'); return; }
   if(!selTable){ toast('No table selected','error'); return; }
@@ -12281,7 +12314,7 @@ async function bnxPlaceOrderImpl_(){
     // already sitting on this same menu object — just forwarding it.
     const itemGroupId=String(m.itemGroupId||m.ITEM_GROUP_ID||'').trim();
     const itemGroupName=String(m.itemGroupName||m.ITEM_GROUP_NAME||m.group||m.itemGroup||m.ITEM_GROUP||m.GROUP_NAME||'').trim();
-    return {id:itemId, ITEM_ID:itemId, itemId:itemId, name:String(m.name), ITEM_NAME:String(m.name), qty:itemQty, QUANTITY:itemQty, price:rate, rate:rate, RATE:rate, cat:m.cat||'', category:m.cat||'', gst:taxRate, TAX_RATE:taxRate, taxRate:taxRate, itemGroupId:itemGroupId, ITEM_GROUP_ID:itemGroupId, itemGroupName:itemGroupName, ITEM_GROUP_NAME:itemGroupName, itemGroup:itemGroupName, ITEM_GROUP:itemGroupName, group:itemGroupName, groupType:(m.groupType||m.GROUP_TYPE||m.group_type||m.itemGroupType||m.ITEM_GROUP_TYPE||bnxKOTGroupType_({},m)), GROUP_TYPE:(m.groupType||m.GROUP_TYPE||m.group_type||m.itemGroupType||m.ITEM_GROUP_TYPE||bnxKOTGroupType_({},m)), SPECIAL_INSTRUCTIONS:String((orderItemRemarks&&(orderItemRemarks[itemId]||orderItemRemarks[id]||orderItemRemarks[String(m.code||'')]))||'').trim().slice(0,180), itemRemark:String((orderItemRemarks&&(orderItemRemarks[itemId]||orderItemRemarks[id]))||'').trim().slice(0,180)};
+    return {id:itemId, ITEM_ID:itemId, itemId:itemId, ITEM_CODE:String(m.itemCode||m.code||m.ITEM_CODE||itemId), itemCode:String(m.itemCode||m.code||m.ITEM_CODE||itemId), categoryId:String(m.categoryId||m.CATEGORY_ID||m.MENU_CATEGORY_ID||''), CATEGORY_ID:String(m.categoryId||m.CATEGORY_ID||m.MENU_CATEGORY_ID||''), size:String(m.size||m.SIZE||m.servingSize||m.SERVING_SIZE||''), SIZE:String(m.size||m.SIZE||m.servingSize||m.SERVING_SIZE||''), name:String(m.name), ITEM_NAME:String(m.name), qty:itemQty, QUANTITY:itemQty, price:rate, rate:rate, RATE:rate, cat:m.cat||'', category:m.cat||'', gst:taxRate, TAX_RATE:taxRate, taxRate:taxRate, itemGroupId:itemGroupId, ITEM_GROUP_ID:itemGroupId, itemGroupName:itemGroupName, ITEM_GROUP_NAME:itemGroupName, itemGroup:itemGroupName, ITEM_GROUP:itemGroupName, group:itemGroupName, groupType:(m.groupType||m.GROUP_TYPE||m.group_type||m.itemGroupType||m.ITEM_GROUP_TYPE||bnxKOTGroupType_({},m)), GROUP_TYPE:(m.groupType||m.GROUP_TYPE||m.group_type||m.itemGroupType||m.ITEM_GROUP_TYPE||bnxKOTGroupType_({},m)), SPECIAL_INSTRUCTIONS:String((orderItemRemarks&&(orderItemRemarks[itemId]||orderItemRemarks[id]||orderItemRemarks[String(m.code||'')]))||'').trim().slice(0,180), itemRemark:String((orderItemRemarks&&(orderItemRemarks[itemId]||orderItemRemarks[id]))||'').trim().slice(0,180)};
   });
   const amount = items.reduce((a,i)=>a+i.price*i.qty,0);
   const identity = getCurrentStaffIdentity();
@@ -12339,11 +12372,15 @@ async function bnxPlaceOrderImpl_(){
      can start — and THIS order keeps saving in the background (same requestId = never a duplicate); the KOT prints
      the moment the server confirms. Everything below uses the table captured here, never the steward's next table. */
   const __tbl = selTable; let __released = false;
-  const __saveP = gasApi('SAVE_ORDER', {
+  const __orderPayload = {
     requestId, stewardApp:true, tableId:selTable.id, locationId:identity.locationId||'', orderSource:'POS', orderType:'DINEIN', waiter:stewardName, steward:stewardName, waiterName:stewardName, waiterLogin:identity.loginId, covers:customerFields.covers||'', COVERS:customerFields.covers||'', guestNo:customerFields.guestNo||'', guestCount:customerFields.guestCount||'', guests:customerFields.guests||'', GUEST_NO:customerFields.guestNo||'', GUEST_COUNT:customerFields.guestCount||'', items, occasion:'None', customerName:customerFields.customerName, CUSTOMER_NAME:customerFields.customerName, customerMobile:customerFields.customerMobile, CUSTOMER_MOBILE:customerFields.customerMobile, mobile:customerFields.customerMobile, orderDate, orderTime, businessDate:orderDate, BUSINESS_DATE:orderDate,
     ...orderIdentityFields
-  }, 'V2_CORE');
+  };
+  bnxQueuePending('SAVE_ORDER',__orderPayload,requestId,'kot');
+  bnxDeferQueuedOrder_(requestId,Date.now()+120000);
+  const __saveP=gasApi('SAVE_ORDER',__orderPayload,'V2_CORE').finally(()=>bnxDeferQueuedOrder_(requestId,0));
   const __relT = setTimeout(function(){
+    if(String(CLIENT_ID||'')!==__orderClient)return;
     __released = true;
     try{ order={}; orderItemRemarks={}; updateOrderBadge(); refreshCurrentMenuView_(); bnxToggleOrderDrawer_(false); }catch(e){}
     try{ selectOccasion('None'); bnxClearOrderCustomerFields_(); }catch(e){}
@@ -12354,6 +12391,8 @@ async function bnxPlaceOrderImpl_(){
   }, 2500);
   const res = await __saveP;
   clearTimeout(__relT);
+  if(String(CLIENT_ID||'')!==__orderClient){toast('Original-client order retained for verification — refresh its Pending Sync list','error');return;}
+  if(res&&res.success)bnxConfirmQueuedOrder_(requestId);
 
   if(btn && !__released){ btn.disabled = false; btn.textContent = '📤 Send KOT'; }
 
@@ -12435,6 +12474,7 @@ async function bnxPlaceOrderImpl_(){
   // finish in the background without risking a duplicate order.
   const __kotSyncP = bnxSyncRealKotTickets_(entry, orderId, identity.locationId||window.BNX_LOCATION_ID||window.LOCATION_ID||'')
     .then(function(kotSync){
+      if(String(CLIENT_ID||'')!==__orderClient)return kotSync;
       if(kotSync && kotSync.failed) console.warn('[STEWARD KOT SYNC] pending:',kotSync.failed);
       /* keep each station's real KOT number (KITCHEN/BAR/HUKKA get their own) */
       try{
@@ -21710,14 +21750,16 @@ body.bnx-bulk-on.bnx-bulk-has #bnx-bulk-bar{display:flex}
   var NM={KITCHEN:'Kitchen',BAR:'Bar',HUKKA:'Hukka',BILL:'Bill'};
 
   /* batch: every station ticket of one KOT goes in ONE request */
-  var batch=[], timer=0, waiters=[];
+  var batch=[], timer=0, waiters=[], flushing=false;
   function pendKey(){ return 'bnx_pq_pending_'+cid(); }
   function pend(){ try{ return JSON.parse(localStorage.getItem(pendKey())||'[]')||[]; }catch(e){ return []; } }
-  function setPend(a){ try{ localStorage.setItem(pendKey(),JSON.stringify(a.slice(-60))); }catch(e){} }
+  function setPend(a){const seen=new Map();(a||[]).forEach(j=>{if(j&&j.id)seen.set(j.id,j);});try{localStorage.setItem(pendKey(),JSON.stringify(Array.from(seen.values())));}catch(e){t('Print queue could not be stored on this phone. Keep this screen open and tell the POS counter.','error');throw e;} }
   async function flush(){
-    timer=0; var jobs=batch.splice(0), ws=waiters.splice(0); if(!jobs.length) return;
+    timer=0;if(flushing)return;var jobs=batch.splice(0), ws=waiters.splice(0);if(!jobs.length)return;flushing=true;
+    try{
     var r=await post('PRINT_QUEUE_ADD',{jobs:jobs},40000);   /* 2026-10-14: 15 s cut off a slow-but-successful add */
     if(r&&r.success){
+      var confirmed=new Set(jobs.map(function(j){return j.id;}));setPend(pend().filter(function(j){return !confirmed.has(j.id);}));
       var roles=[]; jobs.forEach(function(j){ var n=NM[j.role]||j.role; if(roles.indexOf(n)<0) roles.push(n); });
       CFG.stationOnline=!!(r.data&&r.data.stationOnline); W.__bnxLastPosQueue={ok:true,online:CFG.stationOnline};
       t(CFG.stationOnline?'🖨️ KOT sent to POS printer — '+roles.join(' + '):'🖨️ KOT queued — POS print station is OFF; it prints as soon as the POS PC is open',CFG.stationOnline?'success':'error');
@@ -21729,6 +21771,8 @@ body.bnx-bulk-on.bnx-bulk-has #bnx-bulk-bar{display:flex}
       t('📴 KOT print queued on this phone — sends to the POS printer when the server answers','error');
       ws.forEach(function(f){ f(true); });     /* the KOT itself is saved; printing will follow */
     }
+    }catch(e){ws.forEach(function(f){f(false);});t('KOT print submission not confirmed — pending tickets retained on this phone','error');}
+    finally{flushing=false;if(batch.length&&!timer)timer=setTimeout(flush,120);}
   }
   function queue(type,d){
     var r=roleOf(d&&d.role||type), items=(d&&Array.isArray(d.items))?d.items:[];
@@ -21738,8 +21782,9 @@ body.bnx-bulk-on.bnx-bulk-has #bnx-bulk-bar{display:flex}
     if(W.__bnxStwCtl&&W.__bnxStwCtl.print===false){ if(!queue.__said||Date.now()-queue.__said>4000){ queue.__said=Date.now(); t('ℹ️ KOT saved — printing is switched off for your login by the POS','info'); } return Promise.resolve(true); }
     var id=['K',cid(),String(d.kotNo||d.orderNo||''),r,String(d.splitIndex||1),d.reprint?('R'+Date.now()):''].join('-').replace(/[^A-Za-z0-9_.:-]/g,'');
     if(!(d.kotNo||d.orderNo)) id+='-'+Date.now().toString(36);
-    batch.push({id:id,role:r,table:d.table||'',waiter:d.waiter||'',covers:d.covers||'',items:items.map(function(i){ return {name:i.name||i.n||i.ITEM_NAME||i.itemName||'Item',qty:i.qty||i.QUANTITY||1,size:i.size||i.SIZE||i.sizeName||'',note:i.note||i.notes||i.remark||i.remarks||i.SPECIAL_INSTRUCTIONS||i.itemRemark||i.ITEM_REMARKS||''}; }),
-      kotNo:d.kotNo||'',orderNo:d.orderNo||'',splitIndex:d.splitIndex||1,splitTotal:d.splitTotal||1,customerName:d.customerName||'',remarks:d.remarks||'',reprint:!!d.reprint,from:'STEWARD'});
+    var job={id:id,role:r,table:d.table||'',waiter:d.waiter||'',covers:d.covers||'',items:items.map(function(i){ return {name:i.name||i.n||i.ITEM_NAME||i.itemName||'Item',qty:i.qty||i.QUANTITY||1,size:i.size||i.SIZE||i.sizeName||'',note:i.note||i.notes||i.remark||i.remarks||i.SPECIAL_INSTRUCTIONS||i.itemRemark||i.ITEM_REMARKS||''}; }),
+      kotNo:d.kotNo||'',orderNo:d.orderNo||'',splitIndex:d.splitIndex||1,splitTotal:d.splitTotal||1,customerName:d.customerName||'',remarks:d.remarks||'',reprint:!!d.reprint,from:'STEWARD'};
+    setPend(pend().concat([job]));batch.push(job);
     if(!timer) timer=setTimeout(flush,120);   /* was 350 ms */
     return new Promise(function(res){ waiters.push(res); });
   }
@@ -21770,7 +21815,7 @@ body.bnx-bulk-on.bnx-bulk-has #bnx-bulk-bar{display:flex}
         if(!(r&&r.success)) return;                       /* server still not answering: keep them, try again later */
         ((r.data&&r.data.jobs)||[]).forEach(function(j){ if(j&&j.id) known[j.id]=1; }); }catch(e){ return; }
       var cur=pend(), send=cur.filter(function(j){ return !known[j.id]; });
-      setPend([]);
+      setPend(cur.filter(function(j){return !known[j.id];}));
       if(cur.length-send.length) t('🖨️ '+(cur.length-send.length)+' KOT'+(cur.length-send.length>1?'s were':' was')+' already at the POS printer — not sent again','info');
       send.forEach(function(j){ if(!batch.some(function(b){return b.id===j.id;})) batch.push(j); });
       if(send.length&&!timer) timer=setTimeout(flush,100);
@@ -21961,7 +22006,7 @@ body.bnx-bulk-on.bnx-bulk-has #bnx-bulk-bar{display:flex}
    Green = page + server are the current fix set. Amber = the server still runs old code → in Apps Script:
    Deploy › Manage deployments › ✏ › Version: NEW VERSION › Deploy. Tap the badge for details. */
 (function(){
-  var W=window, D=document, PAGE=(window.BNX_STEWARD_BUILD||'SM-2026.10.09-v8'), NEED='GS-2026.10.09-v10';
+  var W=window, D=document, PAGE=(window.BNX_STEWARD_BUILD||'SM-2026.10.20-v1'), NEED='GS-2026.10.09-v10';
   var SRV={build:'',ok:null,url:'',features:{}};
   function ids(){ var out=[], add=function(u){ var m=String(u||'').match(/AKfycb[A-Za-z0-9_-]{20,}/); if(m&&out.indexOf(m[0])<0) out.push(m[0]); };
     add('AKfycbwHdqrP4IvuVD2ZkupNybrEkiXu3kmuI6-tQoiHgYxoqr1KgUupeFsi3PIoFEbuv6XA');
@@ -22266,3 +22311,8 @@ body:has(#s-home.active) #bnx-ver-badge{display:block!important}
   window.addEventListener('load',paint); setTimeout(paint,500); setTimeout(paint,2000);
 })();
 </script>
+
+<style id="bnx-version-label-position">
+#bnx-ver-badge{left:auto!important;right:8px!important;font-size:10px!important;max-width:min(360px,88vw);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+@media print{#bnx-ver-badge{display:none!important}}
+</style>
