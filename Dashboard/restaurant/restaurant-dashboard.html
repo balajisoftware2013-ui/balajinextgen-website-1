@@ -1356,13 +1356,15 @@ async function bnxFetchJson_(endpoint, options){
   if (!urls.length) throw new Error('No API endpoint configured for ' + endpoint);
 
   /* Never let identical GET/read requests pile up while one is pending. */
-  const flightKey = bnxApiFlightKey_(endpoint, options);
-  if (BNX_API_FLIGHT.has(flightKey)) return BNX_API_FLIGHT.get(flightKey);
+  let flightKey = bnxApiFlightKey_(endpoint, options);
+  try{const body=JSON.parse(options.body||'{}');if(!/^(GET_|LIST_|CHECK_|FETCH_|LOAD_|READ_|RD_FETCH_)/.test(String(body.action||''))&&!(body.requestId||body.REQUEST_ID))flightKey='';}catch(e){flightKey='';}
+  if (flightKey && BNX_API_FLIGHT.has(flightKey)) return BNX_API_FLIGHT.get(flightKey);
 
   const work = (async()=>{
     /* If this endpoint has just returned a permanent 4xx (especially 405),
        fail immediately for a short period instead of repeatedly waiting. */
-    if (!isLocalFile && bnxApiCircuitOpen_(endpoint)) {
+    const transportAction=(()=>{try{return JSON.parse(options.body||'{}').action||'';}catch(e){return '';}})();
+    if (!isLocalFile && /^(GET_|LIST_|CHECK_|FETCH_|LOAD_|READ_|RD_FETCH_)/.test(transportAction) && bnxApiCircuitOpen_(endpoint)) {
       const err = new Error('API circuit open for ' + endpoint);
       err.status = 503;
       err.circuitOpen = true;
@@ -1424,9 +1426,10 @@ async function bnxFetchJson_(endpoint, options){
         }
         fetchOpts.signal=timeoutCtrl.signal;
 
-        let r;
+        let r, text;
         try{
           r=await fetch(url,fetchOpts);
+          text=await r.text();
         }catch(fetchErr){
           if(timedOut){
             const err=new Error('ERP request timed out after '+Math.round(timeoutMs/1000)+'s');
@@ -1440,8 +1443,6 @@ async function bnxFetchJson_(endpoint, options){
           throw fetchErr;
         }
         finally{ clearTimeout(timer); }
-
-        const text=await r.text();
 
         if(!r.ok){
           const err=new Error('API HTTP '+r.status+' at '+url);
@@ -1496,7 +1497,7 @@ async function bnxFetchJson_(endpoint, options){
     throw lastErr || new Error('API request failed');
   })();
 
-  BNX_API_FLIGHT.set(flightKey, work);
+  if(flightKey)BNX_API_FLIGHT.set(flightKey, work);
   try { return await work; }
   finally { BNX_API_FLIGHT.delete(flightKey); }
 }
@@ -1697,6 +1698,7 @@ const BNX_INFLIGHT_API = new Map();
    start and finish, so data is never stale after a save. Number allocators
    (NEXT_*, *NUMBER*, *SEQ*) are never cached. */
 const BNX_READ_CACHE = new Map();
+let BNX_READ_GENERATION=0;
 const BNX_READ_CACHE_TTL = 8000;
 /* SPEED (Oct 2026) — "page move slow": every page visit waited for Apps Script again once the 8 s cache expired.
    Masters/config (menu, staff, payment modes, tax, layout…) change rarely and every SAVE_/UPDATE_ clears this
@@ -1721,7 +1723,7 @@ function bnxFreshTtl_(a){ return BNX_LIVE_REPORT_RE.test(String(a||'')) ? 15000 
 function bnxSwrTtl_(a,p){ return (BNX_LIVE_REPORT_RE.test(String(a||'')) && !bnxIsClosedPeriodRead_(a,p)) ? 60000 : BNX_SWR_TTL; }
 function bnxIsCacheableRead_(a){ a=String(a||''); return /^(GET_|LIST_)/.test(a) && !/(NUMBER|SEQ|NEXT)/.test(a); }
 /* Read-type calls that must NOT wipe the cache (anything else — unknown actions included — clears it). */
-function bnxIsReadOnlyAction_(a){ return /^(GET_|LIST_|RD_FETCH_|NEXT_)/.test(String(a||'')); }
+function bnxIsReadOnlyAction_(a){ return /^(GET_|LIST_|RD_FETCH_)/.test(String(a||'')) && !/^(NEXT_|GET_NEXT_)/.test(String(a||'')); }
 
 // FIX (authorization): the confirmed backend returns a real,
 // distinguishable auth failure — respondError(401, 'Invalid or expired
@@ -1982,6 +1984,7 @@ function bnxSanitizeDue_(action, res){
   }catch(e){ console.warn('[DATA] due sanitizer failed',e); }
   return res;
 }
+window.addEventListener('storage',function(e){if(e.key==='bnx_data_changed_'+bnxCurrentClient_()){BNX_READ_CACHE.clear();BNX_READ_GENERATION++;try{_bnxBillsCovered.length=0;}catch(x){}}});
 let _bnxWarnedNoSession = false;
 async function gasApi(action, payload, endpoint) {
   /* While an import is running, only the heavy BACKGROUND reads wait (max 20 s, and never if the busy flag is older than 4 min).
@@ -2009,9 +2012,10 @@ async function gasApi(action, payload, endpoint) {
     inflightKey = ep + '|' + String(action||'') + '|' + JSON.stringify(payload) + '|' +
       bnxCurrentSession_() + '|' + bnxCurrentClient_();
   } catch(e) {}
+  if(!bnxIsReadOnlyAction_(action)&&!(payload.requestId||payload.REQUEST_ID))inflightKey='';
   if (inflightKey && BNX_INFLIGHT_API.has(inflightKey)) return BNX_INFLIGHT_API.get(inflightKey);
   const _bnxCacheable = !!inflightKey && bnxIsCacheableRead_(action);
-  if (!_bnxCacheable) { if (!bnxIsReadOnlyAction_(action)) BNX_READ_CACHE.clear(); }
+  if (!_bnxCacheable) { if (!bnxIsReadOnlyAction_(action)) {BNX_READ_CACHE.clear(); BNX_READ_GENERATION++;} }
   else {
     const hit = BNX_READ_CACHE.get(inflightKey);
     const clone = function(r){ try{ return structuredClone(r); }catch(e){ return JSON.parse(JSON.stringify(r)); } };
@@ -2028,16 +2032,18 @@ async function gasApi(action, payload, endpoint) {
     if (hit) BNX_READ_CACHE.delete(inflightKey);
   }
 
+  const requestClient=bnxCurrentClient_(), readGeneration=BNX_READ_GENERATION;
   const promise = new Promise((resolve) => {
     const task = async () => {
       try {
         let attempt = 0;
-        const isCriticalWrite = /^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(String(action||''));
-        const maxAttempts = /^(IMPORT_|UPLOAD_|SAVE_MENU_ITEM_IMAGE|SAVE_DUES_RECEIPT|SAVE_BILL|SETTLE_)/i.test(String(action||'')) ? 1 : API_RETRY_CONFIG.maxAttempts; /* SAVE_BILL: the caller retries with the SAME requestId (idempotent) — no hidden inner retries */ /* receipts: never blind-retry (a timed-out call may already be saved -> duplicate money entry) */ /* uploads: never auto-retry (avoids duplicate Drive files) */
+        const isCriticalWrite = !bnxIsReadOnlyAction_(action);
+        const maxAttempts = isCriticalWrite ? 1 : API_RETRY_CONFIG.maxAttempts; /* SAVE_BILL: the caller retries with the SAME requestId (idempotent) — no hidden inner retries */ /* receipts: never blind-retry (a timed-out call may already be saved -> duplicate money entry) */ /* uploads: never auto-retry (avoids duplicate Drive files) */
         while (attempt < maxAttempts) {
           try {
+            if(requestClient!==bnxCurrentClient_()) throw Object.assign(new Error('Client changed while request was queued'),{status:409});
             const session = bnxCurrentSession_();
-            const body = JSON.stringify(Object.assign({action:action, clientId:bnxCurrentClient_(), sessionToken:session}, payload));
+            const body = JSON.stringify(Object.assign({}, payload,{action:action,clientId:requestClient,sessionToken:session}));
             let data = await bnxFetchJson_(ep, {body:body});
             /* 2026-10-13 ("net slow then session timeout"): on a slow connection / busy Apps Script the server sometimes
                answers "Invalid or expired session" for a login that is still valid. A READ is now re-asked twice (3 s, 6 s)
@@ -2045,9 +2051,10 @@ async function gasApi(action, payload, endpoint) {
             if (!isCriticalWrite && bnxIsAuthText_(data)) {
               for (let _k=1; _k<=2 && bnxIsAuthText_(data); _k++) {
                 await new Promise(r=>setTimeout(r,3000*_k));
-                try{ data = await bnxFetchJson_(ep, {body:JSON.stringify(Object.assign({action:action, clientId:bnxCurrentClient_(), sessionToken:bnxCurrentSession_()}, payload))}); }catch(_e){ break; }
+                try{ data = await bnxFetchJson_(ep, {body:JSON.stringify(Object.assign({},payload,{action:action,clientId:requestClient,sessionToken:bnxCurrentSession_()}))}); }catch(_e){ break; }
               }
             }
+            if(requestClient!==bnxCurrentClient_()) {resolve({success:false,error:'Client changed while loading data',statusCode:409});return;}
             bnxCheckAuthFailure_(data);
             resolve(bnxSanitizeDue_(action,data));
             return;
@@ -2060,6 +2067,7 @@ async function gasApi(action, payload, endpoint) {
               return;
             }
             attempt++;
+            if(err && (err.timeout || err.name==='AbortError')) {resolve({success:false,error:err.message,timeout:true});return;}
             if (attempt >= maxAttempts) {
               resolve({success:false, error:err.message, statusCode:status});
               return;
@@ -2070,7 +2078,7 @@ async function gasApi(action, payload, endpoint) {
         }
       } catch(e){ resolve({success:false,error:e.message,statusCode:e.status||0}); }
     };
-    const critical = /^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(String(action||''));
+    const critical = !bnxIsReadOnlyAction_(action);
     /* SPEED 2026-10-08: the dashboard's own numbers (and day / client / menu basics) go to the FRONT of the read
        queue; slow background reads (ledgers, DSR, reports) may use at most 2 of the 5 parallel slots, so they can
        never hold up what is on screen ("Core is slow" with every card showing —). */
@@ -2078,7 +2086,7 @@ async function gasApi(action, payload, endpoint) {
     if (/^(LIST_BILLS|GET_BILLS|GET_DASHBOARD_SUMMARY|GET_DAY_STATUS|GET_CLIENT_INFO|GET_CONFIG|GET_BOOTSTRAP|GET_POS_MENU|GET_MENU_ITEMS|GET_BAR_MENU|GET_ACTIVE_ORDERS|GET_TABLE_FLOOR|GET_TABLE_LAYOUT|GET_TAX_CONFIG|HEARTBEAT)$/.test(_act)
         || (_act === 'GET_MASTER' && /^(item_master|bar_item_master)$/i.test(String((payload && payload.category) || '')))) task.__prio = true;   /* 2026-10-15: menu masters = POS menu basics */
     else if (/^(GET_CUSTOMER_LEDGER|GET_DSR_|GET_DUE_COLLECTION|GET_.*_REPORT$|GET_GSTR|GET_DAY_BOOK|GET_CASHBOOK|GET_BAR_PERFORMANCE|GET_ACCOUNTS_DAY|RD_FETCH|GET_CRM_)/.test(_act)) task.__heavy = true;
-    if (critical) { task.__crit = true; REQUEST_QUEUE.pending.unshift(task); }
+    if (critical) { task.__crit=true;let k=0;while(k<REQUEST_QUEUE.pending.length&&REQUEST_QUEUE.pending[k].__crit)k++;REQUEST_QUEUE.pending.splice(k,0,task); }
     else if (task.__prio) { let k = 0; while (k < REQUEST_QUEUE.pending.length && (REQUEST_QUEUE.pending[k].__crit || REQUEST_QUEUE.pending[k].__prio)) k++; REQUEST_QUEUE.pending.splice(k, 0, task); }
     else REQUEST_QUEUE.pending.push(task);
     processRequestQueue();
@@ -2088,9 +2096,9 @@ async function gasApi(action, payload, endpoint) {
     promise.finally(()=>{ if(BNX_INFLIGHT_API.get(inflightKey)===promise) BNX_INFLIGHT_API.delete(inflightKey); });
   }
   if (_bnxCacheable) {
-    promise.then(function(r){ if (r && r.success !== false) { try{ BNX_READ_CACHE.set(inflightKey, {t:Date.now(), r:structuredClone(r)}); }catch(e){} } });
+    promise.then(function(r){ if (r && r.success !== false && readGeneration===BNX_READ_GENERATION && requestClient===bnxCurrentClient_()) { try{ BNX_READ_CACHE.set(inflightKey, {t:Date.now(), r:structuredClone(r)}); }catch(e){} } });
   } else if (!bnxIsReadOnlyAction_(action)) {
-    promise.finally(function(){ BNX_READ_CACHE.clear(); });
+    promise.finally(function(){ BNX_READ_CACHE.clear(); BNX_READ_GENERATION++;try{localStorage.setItem('bnx_data_changed_'+requestClient,Date.now()+'-'+Math.random());}catch(e){} });
   }
   return promise;
 }
@@ -2112,6 +2120,7 @@ function processRequestQueue() {
        overlapping executions on the server = every answer (SAVE_BILL, menu, KOT) comes back sooner. */
     let slowSrv = false; try{ slowSrv = (typeof PERF_METRICS!=='undefined' && PERF_METRICS.responseTimes.length>=4 && PERF_METRICS.avgResponseTime>10000); }catch(e){}
     const cap = task.__prio ? REQUEST_QUEUE.maxConcurrent + 3 : (slowSrv ? 3 : REQUEST_QUEUE.maxConcurrent);
+    if (crit && REQUEST_QUEUE.critActive>=2) {i++;continue;}
     if (!crit && ((!task.__prio && critHold) || REQUEST_QUEUE.active >= cap)) { i++; continue; }
     if (task.__heavy && (REQUEST_QUEUE.heavyActive||0) >= 2) { i++; continue; }      /* keep 3 slots free for on-screen reads */
     P.splice(i, 1);
@@ -18237,7 +18246,7 @@ function bnxPosCalc_(){
   /* 2026-10-05 owner sign-off: GST on service charge @18% (HSN 998599) — the SAME rule the
      New Bill screen already applies (bmComputeTax 18% wrapper), so POS and New Bill agree. */
   const scTax=r2(sc*0.18);
-  if(scTax>0){ cgst=r2(cgst+scTax/2); sgst=r2(sgst+scTax/2);
+  if(scTax>0){ const scCgst=r2(scTax/2),scSgst=r2(scTax-scCgst);cgst=r2(cgst+scCgst); sgst=r2(sgst+scSgst);
     taxRowsMap.__SC={hsn:'998599', taxName:'GST @18% (Service Charge)', onAmt:sc, taxAmt:scTax}; }
   const grand=r2(taxBase+sc+cgst+sgst);
   const total=Math.round(grand);
@@ -28988,7 +28997,7 @@ function bnxDsrRowNum_(r, names){ const v = bnxDsrRowGet_(r, names); const n = N
    so categories like THE UNFORGETTABLES / LARGER THAN ALL / DRINK & DRIVE / CLAY & GRAIN fell into "Others".
    Now: (1) category -> group map of this restaurant's menu, (2) learned live from every row that has both a group and a category / item,
    (3) wider keyword fallback. */
-const BNX_DSR_CAT_GROUP = {"FOOD SALES": "FOOD", "CRAFT BEER": "LIQUOR", "GIN": "LIQUOR", "BEER": "LIQUOR", "SALES LIQUOR": "LIQUOR", "HUKKA": "HUKKA", "WHEAT & ARBORIO": "FOOD", "IRISH WHISKEY": "LIQUOR", "SOFT BEVERAGES": "BEVERAGE", "SCOTCH-I": "LIQUOR", "FILLED & FOLDED": "FOOD", "NOODLES & RICE": "FOOD", "CLAY & GRAIN": "FOOD", "THE DESI SOUL": "FOOD", "BITES & PICKS": "FOOD", "DRINK & DRIVE": "BEVERAGE", "SALES BEVERAGES": "BEVERAGE", "AMERICAN WHISKEY": "LIQUOR", "THE HASHTAG OPENER": "FOOD", "LARGER THAN ALL": "LIQUOR", "COCKTAILS - VODKA": "LIQUOR", "SPIRITS OF THE WORLD": "LIQUOR", "ADD-ONS": "FOOD", "ALL TIME FAVORITE": "LIQUOR", "TEQUILA": "LIQUOR", "SINGLE MALT": "LIQUOR", "SHOTS TIME": "LIQUOR", "RUM": "LIQUOR", "COCKTAILS - GIN": "LIQUOR", "DOUGH & FIRE": "FOOD", "VODKA": "LIQUOR", "THE UNFORGETTABLES": "FOOD", "COCKTAILS - WHISKEY": "LIQUOR", "ALCOPOPS": "LIQUOR", "INDIAN SINGLE MALT": "LIQUOR", "JAPANESE WHISKEY": "LIQUOR", "COCKTAILS - TEQUILA": "LIQUOR", "THE STEAMING BASKET": "FOOD", "COCKTAILS - RUM": "LIQUOR", "CHAMPAGNE/SPARKLING": "LIQUOR", "RUM IMPORTED": "LIQUOR", "DESSERT & ROSE WINE": "LIQUOR", "CLARIFIED COCKTAIL": "LIQUOR", "ASIAN STAPLE": "FOOD", "CHOPSTICK CHASERS": "FOOD", "SWEET INDULGENCE": "FOOD", "SMOKE & BOARDS": "FOOD", "LIQUOR SALES": "LIQUOR"};
+const BNX_DSR_CAT_GROUP = {"CLEAN & GREENS":"FOOD", "FOOD SALES": "FOOD", "CRAFT BEER": "LIQUOR", "GIN": "LIQUOR", "BEER": "LIQUOR", "SALES LIQUOR": "LIQUOR", "HUKKA": "HUKKA", "WHEAT & ARBORIO": "FOOD", "IRISH WHISKEY": "LIQUOR", "SOFT BEVERAGES": "BEVERAGE", "SCOTCH-I": "LIQUOR", "FILLED & FOLDED": "FOOD", "NOODLES & RICE": "FOOD", "CLAY & GRAIN": "FOOD", "THE DESI SOUL": "FOOD", "BITES & PICKS": "FOOD", "DRINK & DRIVE": "BEVERAGE", "SALES BEVERAGES": "BEVERAGE", "AMERICAN WHISKEY": "LIQUOR", "THE HASHTAG OPENER": "FOOD", "LARGER THAN ALL": "LIQUOR", "COCKTAILS - VODKA": "LIQUOR", "SPIRITS OF THE WORLD": "LIQUOR", "ADD-ONS": "FOOD", "ALL TIME FAVORITE": "LIQUOR", "TEQUILA": "LIQUOR", "SINGLE MALT": "LIQUOR", "SHOTS TIME": "LIQUOR", "RUM": "LIQUOR", "COCKTAILS - GIN": "LIQUOR", "DOUGH & FIRE": "FOOD", "VODKA": "LIQUOR", "THE UNFORGETTABLES": "FOOD", "COCKTAILS - WHISKEY": "LIQUOR", "ALCOPOPS": "LIQUOR", "INDIAN SINGLE MALT": "LIQUOR", "JAPANESE WHISKEY": "LIQUOR", "COCKTAILS - TEQUILA": "LIQUOR", "THE STEAMING BASKET": "FOOD", "COCKTAILS - RUM": "LIQUOR", "CHAMPAGNE/SPARKLING": "LIQUOR", "RUM IMPORTED": "LIQUOR", "DESSERT & ROSE WINE": "LIQUOR", "CLARIFIED COCKTAIL": "LIQUOR", "ASIAN STAPLE": "FOOD", "CHOPSTICK CHASERS": "FOOD", "SWEET INDULGENCE": "FOOD", "SMOKE & BOARDS": "FOOD", "LIQUOR SALES": "LIQUOR"};
 window.__bnxDsrLearn = window.__bnxDsrLearn || { cat:{}, item:{} };
 function bnxDsrLearnRow_(r){
   try{
@@ -33468,11 +33477,14 @@ function _buildReportExcelBlob_(table, title){
    coral (#FC7D72) header row, and both-side mismatch colouring — Excel/
    LibreOffice/Sheets render all of it natively since it's a real HTML
    table saved with an .xls extension, not a raw comma file. */
+function bnxLoadedReportRows_(table){
+ return Array.from(table.querySelectorAll('tr')).filter(r=>r.children.length && !(r.children.length===1 && Number(r.children[0].colSpan||1)>1));
+}
 function exportRpt(type, btnEl) {
   const card=btnEl?btnEl.closest('.card'):null, table=card?card.querySelector('table'):null;
   const title=(card?.querySelector('.card-title')?.textContent||type||'Report').replace(/\s+/g,' ').trim();
   if(!table){showNotif('⚠️ No report table available.','error');return;}
-  const rows=Array.from(table.querySelectorAll('tr')).filter(r=>r.children.length);
+  const rows=bnxLoadedReportRows_(table);
   if(rows.length<2){showNotif('⚠️ No live rows for the selected period. Nothing exported.','error');return;}
   /* Use the same professional HTML/CSS report builder as Print. This
      produces a genuinely formatted Excel-compatible workbook instead of
@@ -33491,7 +33503,7 @@ async function exportRptPDF(type, btnEl){
   const title=(card?.querySelector('.card-title')?.textContent||type||'Report').replace(/\s+/g,' ').trim();
   if(!card||!table){showNotif('⚠️ No report table available.','error');return;}
   if(typeof window.jspdf==='undefined'){showNotif('⚠️ PDF engine is not loaded. Check connection and retry.','error');return;}
-  const rows=Array.from(table.querySelectorAll('tr')).filter(r=>r.children.length).map(r=>Array.from(r.children).map(td=>String(td.innerText||td.textContent||'').replace(/\s+/g,' ').trim()));
+  const rows=bnxLoadedReportRows_(table).map(r=>Array.from(r.children).map(td=>String(td.innerText||td.textContent||'').replace(/\s+/g,' ').trim()));
   if(rows.length<2){showNotif('⚠️ No live rows for the selected period. Nothing exported.','error');return;}
   const {jsPDF}=window.jspdf, pdf=new jsPDF({orientation:'landscape',unit:'mm',format:'a4',compress:true});
   const PW=pdf.internal.pageSize.getWidth(),PH=pdf.internal.pageSize.getHeight(),M=9,HEADER=24,FOOT=8;
@@ -33518,7 +33530,7 @@ function printAllReportsHub(){
     const cards=[];
     root.querySelectorAll('.card').forEach(card=>{
       const table=card.querySelector('table'); if(!table) return;
-      const rows=Array.from(table.querySelectorAll('tr')).filter(r=>r.children.length); if(rows.length<2)return;
+      const rows=bnxLoadedReportRows_(table); if(rows.length<2)return;
       const title=(card.querySelector('.card-title')?.textContent||'Report').replace(/\s+/g,' ').trim();
       cards.push({title,rows:rows.map(r=>Array.from(r.children).map(c=>String(c.innerText||c.textContent||'').trim()))});
     });
@@ -33535,7 +33547,7 @@ async function rptExportAllLoaded(){
   const root=document.getElementById('page-reports');if(!root){showNotif('⚠️ Reports Hub is not open.','error');return;}
   if(typeof XLSX==='undefined'||!XLSX.utils){showNotif('⚠️ XLSX engine is not loaded.','error');return;}
   const meta=rptCompanyMeta(),period=(document.getElementById('rptFrom')?.value||'Selected')+' to '+(document.getElementById('rptTo')?.value||document.getElementById('rptFrom')?.value||'Selected'),reports=[];
-  root.querySelectorAll('.card').forEach(card=>{const table=card.querySelector('table');if(!table)return;const rows=Array.from(table.querySelectorAll('tr')).filter(r=>r.children.length).map(r=>Array.from(r.children).map(td=>String(td.innerText||td.textContent||'').replace(/\s+/g,' ').trim()));if(rows.length<2)return;reports.push({title:(card.querySelector('.card-title')?.textContent||'Report').replace(/\s+/g,' ').trim(),rows});});
+  root.querySelectorAll('.card').forEach(card=>{const table=card.querySelector('table');if(!table)return;const rows=bnxLoadedReportRows_(table).map(r=>Array.from(r.children).map(td=>String(td.innerText||td.textContent||'').replace(/\s+/g,' ').trim()));if(rows.length<2)return;reports.push({title:(card.querySelector('.card-title')?.textContent||'Report').replace(/\s+/g,' ').trim(),rows});});
   if(!reports.length){showNotif('⚠️ No loaded live report has rows to export.','error');return;}
   const wb=XLSX.utils.book_new(),used=new Set();reports.forEach((r,i)=>{let n=_rptTitleSlug_(r.title).slice(0,31)||('Report'+(i+1)),base=n,k=2;while(used.has(n))n=(base.slice(0,27)+'_'+k++).slice(0,31);used.add(n);const rows=[[bnxClientBrandName_()],[meta.brand],[r.title],['Period',period],['Financial Year',meta.fy],['Generated On',meta.genOn],[''],...r.rows];const ws=XLSX.utils.aoa_to_sheet(rows);ws['!cols']=rows[7].map((_,c)=>({wch:Math.min(42,Math.max(12,...rows.slice(7).map(x=>String(x[c]||'').length))+2)}));XLSX.utils.book_append_sheet(wb,ws,n)});XLSX.writeFile(wb,bnxClientBrandName_().replace(/[^A-Za-z0-9]+/g,'_').toUpperCase()+'_REPORTS_'+bnxReportBusinessDate_()+'.xlsx');showNotif('📦 Professional Export All complete · '+reports.length+' reports.','success');
 }
@@ -36851,10 +36863,15 @@ document.addEventListener('DOMContentLoaded',()=>{try{bnxClearKnownStaticTables_
   }catch(e){b.innerHTML='<tr><td colspan="8" class="rpt-pro-empty">⚠️ '+esc(e.message||'Location data unavailable')+'</td></tr>'}
 };
 
-window.bnxRenderMonthlyItemSalesReport=async function(from,to){const c=document.getElementById('rpt-anchor-monthly-item-sales');if(!c)return;const b=c.querySelector('tbody');b.innerHTML='<tr><td colspan="10" class="rpt-pro-empty">Loading live item sales…</td></tr>';try{const r=await gasApi('GET_ITEM_SALES_REPORT',Object.assign({},bnxDateRangePayload_(from,to),{from:from||'',to:to||''}),'V2_CORE'),rows=r?.data?.rows||[];if(!rows.length){b.innerHTML='<tr><td colspan="10" class="rpt-pro-empty">No item sales for selected period.</td></tr>';return}const tq=rows.reduce((a,x)=>a+Number(x.QUANTITY_SOLD||0),0),tt=rows.reduce((a,x)=>a+Number(x.TAX||0),0);b.innerHTML=rows.map(x=>'<tr><td>'+esc(x.ITEM_NAME)+'</td><td>'+esc(x.CATEGORY_NAME||x.CATEGORY||x.CATEGORY_ID||'Uncategorized')+'</td><td class="mono">'+Number(x.QUANTITY_SOLD||0)+'</td><td class="mono">'+money(x.GROSS_SALES)+'</td><td class="mono">'+money(x.DISCOUNT)+'</td><td class="mono">'+money(x.TAX)+'</td><td class="mono">'+money(x.NET_SALES)+'</td><td class="mono">'+money(x.FOOD_COST)+'</td><td class="mono">'+money(x.GROSS_PROFIT)+'</td><td class="mono">'+Number(x.MARGIN_PERCENT||0).toFixed(2)+'%</td></tr>').join('')+'<tr class="rpt-total-row"><td>TOTAL</td><td></td><td>'+tq+'</td><td></td><td></td><td>'+money(tt)+'</td><td>'+money(r.data.totalNetSales)+'</td><td></td><td></td><td></td></tr>';c.querySelector('.rpt-pro-note').textContent='Live item sales · '+rows.length+' item(s) · '+from+' to '+to+'.'}catch(e){b.innerHTML='<tr><td colspan="10" class="rpt-pro-empty">⚠️ '+esc(e.message||'Backend unavailable')+'</td></tr>'}}
- window.bnxRenderDepartmentCostReport=async function(kind,from,to){const c=document.getElementById('rpt-anchor-'+kind);if(!c)return;const b=c.querySelector('tbody'),act=kind==='food-cost'?'GET_FOOD_COST_REPORT':'GET_BAR_COST_REPORT';b.innerHTML='<tr><td colspan="'+(kind==='food-cost'?9:8)+'" class="rpt-pro-empty">Loading live cost report…</td></tr>';try{const r=await gasApi(act,Object.assign({},bnxDateRangePayload_(from,to),{from:from||'',to:to||''}),'V2_CORE'),x=r?.data?.row;if(!x){b.innerHTML='<tr><td colspan="9" class="rpt-pro-empty">No data returned.</td></tr>';return}const v=kind==='food-cost'?[x.OPENING_STOCK,x.PURCHASES,x.TRANSFER_IN,x.TRANSFER_OUT,x.CONSUMPTION,x.WASTAGE,x.CLOSING_STOCK,x.FOOD_COST,x.FOOD_COST_PERCENT]:[x.OPENING_STOCK,x.PURCHASES,x.CONSUMPTION,x.WASTAGE,x.BREAKAGE,x.CLOSING_STOCK,x.BAR_COST,x.BAR_COST_PERCENT];b.innerHTML='<tr>'+v.map((n,i)=>'<td class="mono">'+(i===v.length-1?Number(n||0).toFixed(2)+'%':money(n))+'</td>').join('')+'</tr>';c.querySelector('.rpt-pro-note').textContent='Live '+(kind==='food-cost'?'food':'bar')+' cost report · '+from+' to '+to+'.'}catch(e){b.innerHTML='<tr><td colspan="'+(kind==='food-cost'?9:8)+'" class="rpt-pro-empty">⚠️ '+esc(e.message||'Backend unavailable')+'</td></tr>'}}
- window.bnxRenderPerformanceReport=async function(kind,from,to){const c=document.getElementById('rpt-anchor-'+kind);if(!c)return;const b=c.querySelector('tbody'),act=kind==='kitchen-performance'?'GET_KITCHEN_PERFORMANCE_REPORT':'GET_BAR_PERFORMANCE_REPORT';b.innerHTML='<tr><td colspan="8" class="rpt-pro-empty">Loading live performance report…</td></tr>';try{const r=await gasApi(act,Object.assign({},bnxDateRangePayload_(from,to),{from:from||'',to:to||''}),'V2_CORE'),rows=r?.data?.rows||[];if(kind==='kitchen-performance'){const x=r?.data?.row;if(!x){b.innerHTML='<tr><td colspan="8" class="rpt-pro-empty">No KOT data for selected period.</td></tr>';return}b.innerHTML='<tr><td>'+esc(x.FROM_DATE)+'</td><td>'+esc(x.TO_DATE)+'</td><td>'+Number(x.KOT_COUNT||0)+'</td><td>'+Number(x.ITEM_COUNT||0)+'</td><td>'+(x.AVERAGE_PREP_TIME===''?'—':Number(x.AVERAGE_PREP_TIME).toFixed(1))+'</td><td>—</td><td>—</td><td>—</td></tr>'}else{b.innerHTML=rows.length?rows.map(x=>'<tr><td>'+esc(x.EMPLOYEE_NAME)+'</td><td>'+Number(x.BAR_ORDERS||0)+'</td><td>'+money(x.BAR_SALES)+'</td><td>'+money(x.BAR_COST)+'</td><td>'+Number(x.BAR_COST_PERCENT||0).toFixed(2)+'%</td><td>—</td></tr>').join(''):'<tr><td colspan="6" class="rpt-pro-empty">No bar performance data.</td></tr>'}c.querySelector('.rpt-pro-note').textContent=(r.data?.note||'Live ERP performance report')+' · '+from+' to '+to+'.'}catch(e){b.innerHTML='<tr><td colspan="8" class="rpt-pro-empty">⚠️ '+esc(e.message||'Backend unavailable')+'</td></tr>'}}
- window.bnxRenderHashFreezerReport=async function(from,to){const c=document.getElementById('rpt-anchor-hashfreezer-sales');if(!c)return;const b=c.querySelector('tbody');try{const r=await gasApi('GET_ITEM_SALES_REPORT',Object.assign({},bnxDateRangePayload_(from,to),{from:from||'',to:to||''}),'V2_CORE'),src=r?.data?.rows||[],
+window.bnxCheckedReportRead_=async function(action,payload,endpoint){
+ const r=await gasApi(action,payload,endpoint);
+ if(!r||r.success===false||r.error||r.authExpired)throw new Error(r&&r.error||'Report could not be loaded. Retry when the server is available.');
+ return r;
+};
+window.bnxRenderMonthlyItemSalesReport=async function(from,to){const c=document.getElementById('rpt-anchor-monthly-item-sales');if(!c)return;const b=c.querySelector('tbody');b.innerHTML='<tr><td colspan="10" class="rpt-pro-empty">Loading live item sales…</td></tr>';try{const r=await bnxCheckedReportRead_('GET_ITEM_SALES_REPORT',Object.assign({},bnxDateRangePayload_(from,to),{from:from||'',to:to||''}),'V2_CORE'),rows=r?.data?.rows||[];if(!rows.length){b.innerHTML='<tr><td colspan="10" class="rpt-pro-empty">No item sales for selected period.</td></tr>';return}const tq=rows.reduce((a,x)=>a+Number(x.QUANTITY_SOLD||0),0),tt=rows.reduce((a,x)=>a+Number(x.TAX||0),0);b.innerHTML=rows.map(x=>'<tr><td>'+esc(x.ITEM_NAME)+'</td><td>'+esc(x.CATEGORY_NAME||x.CATEGORY||x.CATEGORY_ID||'Uncategorized')+'</td><td class="mono">'+Number(x.QUANTITY_SOLD||0)+'</td><td class="mono">'+money(x.GROSS_SALES)+'</td><td class="mono">'+money(x.DISCOUNT)+'</td><td class="mono">'+money(x.TAX)+'</td><td class="mono">'+money(x.NET_SALES)+'</td><td class="mono">'+money(x.FOOD_COST)+'</td><td class="mono">'+money(x.GROSS_PROFIT)+'</td><td class="mono">'+Number(x.MARGIN_PERCENT||0).toFixed(2)+'%</td></tr>').join('')+'<tr class="rpt-total-row"><td>TOTAL</td><td></td><td>'+tq+'</td><td></td><td></td><td>'+money(tt)+'</td><td>'+money(r.data.totalNetSales)+'</td><td></td><td></td><td></td></tr>';c.querySelector('.rpt-pro-note').textContent='Live item sales · '+rows.length+' item(s) · '+from+' to '+to+'.'}catch(e){b.innerHTML='<tr><td colspan="10" class="rpt-pro-empty">⚠️ '+esc(e.message||'Backend unavailable')+'</td></tr>'}}
+ window.bnxRenderDepartmentCostReport=async function(kind,from,to){const c=document.getElementById('rpt-anchor-'+kind);if(!c)return;const b=c.querySelector('tbody'),act=kind==='food-cost'?'GET_FOOD_COST_REPORT':'GET_BAR_COST_REPORT';b.innerHTML='<tr><td colspan="'+(kind==='food-cost'?9:8)+'" class="rpt-pro-empty">Loading live cost report…</td></tr>';try{const r=await bnxCheckedReportRead_(act,Object.assign({},bnxDateRangePayload_(from,to),{from:from||'',to:to||''}),'V2_CORE'),x=r?.data?.row;if(!x){b.innerHTML='<tr><td colspan="9" class="rpt-pro-empty">No data returned.</td></tr>';return}const v=kind==='food-cost'?[x.OPENING_STOCK,x.PURCHASES,x.TRANSFER_IN,x.TRANSFER_OUT,x.CONSUMPTION,x.WASTAGE,x.CLOSING_STOCK,x.FOOD_COST,x.FOOD_COST_PERCENT]:[x.OPENING_STOCK,x.PURCHASES,x.CONSUMPTION,x.WASTAGE,x.BREAKAGE,x.CLOSING_STOCK,x.BAR_COST,x.BAR_COST_PERCENT];b.innerHTML='<tr>'+v.map((n,i)=>'<td class="mono">'+(i===v.length-1?Number(n||0).toFixed(2)+'%':money(n))+'</td>').join('')+'</tr>';c.querySelector('.rpt-pro-note').textContent='Live '+(kind==='food-cost'?'food':'bar')+' cost report · '+from+' to '+to+'.'}catch(e){b.innerHTML='<tr><td colspan="'+(kind==='food-cost'?9:8)+'" class="rpt-pro-empty">⚠️ '+esc(e.message||'Backend unavailable')+'</td></tr>'}}
+ window.bnxRenderPerformanceReport=async function(kind,from,to){const c=document.getElementById('rpt-anchor-'+kind);if(!c)return;const b=c.querySelector('tbody'),act=kind==='kitchen-performance'?'GET_KITCHEN_PERFORMANCE_REPORT':'GET_BAR_PERFORMANCE_REPORT';b.innerHTML='<tr><td colspan="8" class="rpt-pro-empty">Loading live performance report…</td></tr>';try{const r=await bnxCheckedReportRead_(act,Object.assign({},bnxDateRangePayload_(from,to),{from:from||'',to:to||''}),'V2_CORE'),rows=r?.data?.rows||[];if(kind==='kitchen-performance'){const x=r?.data?.row;if(!x){b.innerHTML='<tr><td colspan="8" class="rpt-pro-empty">No KOT data for selected period.</td></tr>';return}b.innerHTML='<tr><td>'+esc(x.FROM_DATE)+'</td><td>'+esc(x.TO_DATE)+'</td><td>'+Number(x.KOT_COUNT||0)+'</td><td>'+Number(x.ITEM_COUNT||0)+'</td><td>'+(x.AVERAGE_PREP_TIME===''?'—':Number(x.AVERAGE_PREP_TIME).toFixed(1))+'</td><td>—</td><td>—</td><td>—</td></tr>'}else{b.innerHTML=rows.length?rows.map(x=>'<tr><td>'+esc(x.EMPLOYEE_NAME)+'</td><td>'+Number(x.BAR_ORDERS||0)+'</td><td>'+money(x.BAR_SALES)+'</td><td>'+money(x.BAR_COST)+'</td><td>'+Number(x.BAR_COST_PERCENT||0).toFixed(2)+'%</td><td>—</td></tr>').join(''):'<tr><td colspan="6" class="rpt-pro-empty">No bar performance data.</td></tr>'}c.querySelector('.rpt-pro-note').textContent=(r.data?.note||'Live ERP performance report')+' · '+from+' to '+to+'.'}catch(e){b.innerHTML='<tr><td colspan="8" class="rpt-pro-empty">⚠️ '+esc(e.message||'Backend unavailable')+'</td></tr>'}}
+ window.bnxRenderHashFreezerReport=async function(from,to){const c=document.getElementById('rpt-anchor-hashfreezer-sales');if(!c)return;const b=c.querySelector('tbody');try{const r=await bnxCheckedReportRead_('GET_ITEM_SALES_REPORT',Object.assign({},bnxDateRangePayload_(from,to),{from:from||'',to:to||''}),'V2_CORE'),src=r?.data?.rows||[],
   /* FIX ("map with reports" audit, Sep 2026): this business's real
      ITEM_GROUP_MASTER only has FOOD/BEVERAGE/LIQUOR/TOBACCO/ADD-ONS —
      there is no "HashFreezer"/"frozen" item group, so the old
@@ -36867,8 +36884,9 @@ window.bnxRenderMonthlyItemSalesReport=async function(from,to){const c=document.
   rows=src.filter(x=>{
     const grpId=String(x.ITEM_GROUP_ID||'').toUpperCase();
     const grpName=String(x.ITEM_GROUP_NAME||'').toUpperCase();
-    if (grpId==='GRP00004' || grpName==='TOBACCO') return true;
-    return /hash\s*freezer|hashfreezer|frozen/i.test([x.ITEM_NAME,x.CATEGORY_NAME,x.ITEM_GROUP_NAME].join(' '));
+    if(grpId==='GRP00004'||grpId==='GRP00006'||/^(TOBACCO|HUKKA|HOOKAH)$/.test(grpName)) return true;
+    if(/^GRP0000[1235]$/.test(grpId)||/^(FOOD|BEVERAGE|LIQUOR|ADD-ONS)$/.test(grpName))return false;
+    return /hash\s*freez+er|hashfrezz+er|hashfreezer|hukka|hookah/i.test([x.ITEM_NAME,x.CATEGORY_NAME,x.ITEM_GROUP_NAME].join(' '));
   }).map(x=>({name:x.ITEM_NAME||'Unknown',cat:x.CATEGORY_NAME||x.ITEM_GROUP_NAME||'Tobacco',qty:Number(x.QUANTITY_SOLD)||0,sales:Number(x.NET_SALES)||0})).sort((a,z)=>z.sales-a.sales),tot=rows.reduce((a,x)=>a+x.sales,0);b.innerHTML=rows.length?rows.map(x=>'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.cat)+'</td><td>'+x.qty+'</td><td>'+money(x.sales)+'</td><td>'+money(x.sales)+'</td><td>'+((tot?x.sales/tot*100:0).toFixed(2))+'%</td></tr>').join('')+'<tr class="rpt-total-row"><td>TOTAL</td><td></td><td>'+rows.reduce((a,x)=>a+x.qty,0)+'</td><td></td><td>'+money(tot)+'</td><td>100.00%</td></tr>':'<tr><td colspan="6" class="rpt-pro-empty">No Tobacco/HashFreezer sales for selected period.</td></tr>';c.querySelector('.rpt-pro-note').textContent='Live server item-sales report · '+rows.length+' Tobacco (HashFreezer) item(s) · '+from+' to '+to+'.'}catch(e){b.innerHTML='<tr><td colspan="6" class="rpt-pro-empty">⚠️ '+esc(e.message||'Backend unavailable')+'</td></tr>'}}
  const om=REPORTS_META.find(x=>x.anchor==='online-orders');if(om){om.title='Online Sales & Settlement Report';om.desc='Zomato, Swiggy, ONDC & Magicpin sales, commission and receivable'}
  ensure();
@@ -47394,7 +47412,7 @@ function bnxOpenMasterHub(){
     var w=window.open('','_blank','width=420,height=640');
     if(!w){ if(typeof showNotif==='function') showNotif('⚠️ Print blocked — allow pop-ups for this site','error'); return; }
     w.document.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>'+esc(title)+'</title><style>'+css+'</style></head><body>'+body+'\n</body></html>');
-    w.document.close(); w.onload=function(){try{w.print();}catch(e){}}; setTimeout(function(){try{w.print();}catch(e){}},600);
+    w.document.close(); var printed=false;function once(){if(printed)return;printed=true;try{w.print();}catch(e){}}w.onload=once;setTimeout(once,600);
   }
   window.bnxPrintDoc_=printDoc;
 
@@ -48257,11 +48275,9 @@ function bnxOpenMasterHub(){
        cashier gets the message/fallback quickly. */
     const TMO=6000; let timer;
     const printP=qz.print(config,payload); printP.catch(function(){});
-    const tmoP=new Promise(function(_,rej){ timer=setTimeout(function(){
-      const er=new Error('Printer '+ip+' not reachable (no response in '+(TMO/1000)+'s). Check that the printer is on and this PC is on the restaurant Wi-Fi.');
-      er.bnxUnreachable=true; rej(er); },TMO); });
+    timer=setTimeout(function(){try{setStatus('Printer '+ip+' is still responding — do not print again yet',false);}catch(e){}},TMO);
     try{
-      return await Promise.race([printP,tmoP]);
+      return await printP;
     }catch(e){
       if((e&&e.bnxUnreachable) || /timed out|ConnectException|No route to host|unreachable/i.test(String(e&&e.message||e))){
         const er=(e&&e.bnxUnreachable)?e:Object.assign(new Error('Printer '+ip+' not reachable. Check that the printer is on and this PC is on the restaurant Wi-Fi.'),{bnxUnreachable:true});
@@ -50405,15 +50421,17 @@ function bnxOpenMasterHub(){
     var baseTax=W.bmComputeTax;
     var calc=function(items,discPct,scPct){
       var r=baseTax.apply(this,arguments);
-      if(!r||!Number(r.sc))return r;
-      var scTax=Number(r.sc)*0.18;
+      if(!r)return r;
+      var r2=function(v){return Math.round((Number(v)||0)*100)/100;};
+      ['sub','disc','taxBase','sc','cgst','sgst','igst'].forEach(function(k){r[k]=r2(r[k]);});
+      var scTax=r2(r.sc*0.18),scCgst=r2(scTax/2),scSgst=r2(scTax-scCgst);
       r.scTax=scTax;
-      r.cgst=(Number(r.cgst)||0)+scTax/2;
-      r.sgst=(Number(r.sgst)||0)+scTax/2;
-      r.tax=(Number(r.tax)||0)+scTax;
-      r.total=Math.round((Number(r.total)||0)+scTax);
-      r.roff=r.total-((Number(r.taxBase)||0)+(Number(r.sc)||0)+(Number(r.tax)||0));
-      r.taxRows=(r.taxRows||[]).concat([{hsn:'998599',taxName:'GST @18% (Service Charge)',onAmt:Number(r.sc),taxAmt:scTax}]);
+      r.cgst=r2(r.cgst+scCgst);r.sgst=r2(r.sgst+scSgst);
+      r.tax=r2(r.cgst+r.sgst+r.igst);
+      var grand=r2(r.taxBase+r.sc+r.tax);
+      r.total=Math.round(grand);r.roff=r2(r.total-grand);
+      r.taxRows=(r.taxRows||[]).map(function(x){return Object.assign({},x,{onAmt:r2(x.onAmt),taxAmt:r2(x.taxAmt)});});
+      if(scTax)r.taxRows.push({hsn:'998599',taxName:'GST @18% (Service Charge)',onAmt:r.sc,taxAmt:scTax});
       return r;
     };
     calc.__bnxScGst18=true;W.bmComputeTax=calc;
@@ -56682,7 +56700,7 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
     try{
       var parts=[]; D.querySelectorAll('[id^="bm-irow-"]').forEach(function(row){ var id=row.id.replace('bm-irow-','');
         parts.push([($('bm-iname-'+id)||{}).value,($('bm-iqty-'+id)||{}).value,($('bm-irate-'+id)||{}).value].join('~')); });
-      return parts.join('|')+'#'+(($('bm-bf-disc')||{}).value||'')+'#'+(($('bm-bf-sc')||{}).value||'');
+      return parts.join('|')+'#'+(($('bm-bf-disc')||{}).value||'')+'#'+(($('bm-bf-sc')||{}).value||'')+'#'+(($('bm-bf-taxtype')||{}).value||'')+'#'+(($('bm-bf-hsn')||{}).value||'');
     }catch(e){ return ''; }
   }
   var prevCompute=W.bmComputeTax;
@@ -56694,13 +56712,14 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
         if(Math.abs(r.sub-o.sub)>=1) return r;                                   /* items differ from the saved bill — leave the live calculation */
         /* 2026-10-14: a bill saved with WRONG GST (e.g. liquor taxed 5%) must be correctable — when the current
            item-master tax differs from the saved GST by more than ₹1, show the corrected live figures. */
-        if(Math.abs((Number(r.tax)||0)-(Number(o.gst)||0))>1) return r;
+        /* Historical totals stay unchanged until the operator edits the bill inputs. */
         var base=r.sub-o.disc, roff=o.total-(base+o.sc+o.gst);
         if(Math.abs(roff)>2) return r;                                           /* saved figures do not add up — do not force them */
         r.disc=o.disc; r.sc=o.sc; r.taxBase=base;
         var k=(r.tax>0)?o.gst/r.tax:0; r.cgst=(r.cgst||0)*k; r.sgst=(r.sgst||0)*k; r.igst=(r.igst||0)*k;
         if(!(r.tax>0)){ r.cgst=o.gst/2; r.sgst=o.gst/2; r.igst=0; }
         r.tax=o.gst; r.roff=roff; r.total=o.total;
+        r.taxRows=(o.taxRows&&o.taxRows.length)?o.taxRows.map(function(x){return Object.assign({},x);}):[{hsn:'',taxName:'Tax as originally billed',onAmt:base,taxAmt:o.gst}];
       }catch(e){}
       return r;
     };
@@ -56721,7 +56740,7 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
         E={ no:String(b.no), total:r2(b.total), pay:up(b.pay||'CASH'), customer:String(b.customer||''), mob:String(b.mob||''),
             date:isoDate(b.dt), businessDate:isoDate(b.businessDate||b.dt), table:String(b.table||''), status:b.status||'',
             items:(b.itemsDetail||[]).length, disc:disc, sub:sub, time:hhmm(b.tm),
-            orig:{ sub:sub, disc:disc, sc:sc, gst:Number(b.gst)||0, ro:Number(b.roundOff)||0, total:r2(b.total) } };
+            orig:{ sub:sub, disc:disc, sc:sc, gst:Number(b.gst)||0, ro:Number(b.roundOff)||0, total:r2(b.total),taxRows:Array.isArray(b.taxRows)?b.taxRows.map(function(x){return Object.assign({},x);}):null } };
         W.__bnxEditOrig=E;
         setVal('bm-bf-date',E.date); setVal('bm-bf-time',E.time||hhmm(b.tm));
         if(Number(b.pax)>0) setVal('bm-bf-pax',String(b.pax));
@@ -63109,7 +63128,7 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
   function ledger(){ try{ var o=JSON.parse(localStorage.getItem(LEDK())||'{}')||{}, now=Date.now(), ch=false; Object.keys(o).forEach(function(k){ if(now-o[k]>86400000){ delete o[k]; ch=true; } }); if(ch) localStorage.setItem(LEDK(),JSON.stringify(o)); return o; }catch(e){ return {}; } }
   function markPrinted(id){ try{ var o=ledger(); o[id]=Date.now(); localStorage.setItem(LEDK(),JSON.stringify(o)); }catch(e){} }
   function donePending(){ try{ return JSON.parse(localStorage.getItem(DONEK())||'[]')||[]; }catch(e){ return []; } }
-  function setDonePending(a){ try{ localStorage.setItem(DONEK(),JSON.stringify(a.slice(-200))); }catch(e){} }
+  function setDonePending(a){ try{ localStorage.setItem(DONEK(),JSON.stringify(a)); }catch(e){} }
   var TAB_ID=Math.random().toString(36).slice(2), LEASEK=function(){ return 'bnx_ps_lease_'+cid(); };
   function ownsStation(){   /* one tab per PC: a 12 s lease renewed by the tab that prints */
     try{ var l=JSON.parse(localStorage.getItem(LEASEK())||'null'), now=Date.now();
@@ -63123,10 +63142,19 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
     try{ var r=await api('PRINT_QUEUE_DONE',{results:all},45000); if(r&&r.success!==false) setDonePending(donePending().filter(function(x){ return !seen[x.id]; })); }catch(e){}
   }
   async function tick(){
+    if(navigator.locks&&typeof navigator.locks.request==='function'){
+      return navigator.locks.request('bnx-print-station-'+cid(),{ifAvailable:true},async function(lock){if(lock)return tickOwned_();});
+    }
+    return tickOwned_();
+  }
+  async function tickOwned_(){
     if(ST.busy||!cid()) return; ST.on=stationWanted(); if(!ST.on){ paintChip(); return; }
     if(!ownsStation()){ ST.otherTab=true; paintChip(); return; } ST.otherTab=false;
     ST.busy=true;
+    var leaseTimer=setInterval(function(){try{var l=JSON.parse(localStorage.getItem(LEASEK())||'null');if(l&&l.tab===TAB_ID)localStorage.setItem(LEASEK(),JSON.stringify({tab:TAB_ID,t:Date.now()}));}catch(e){}},3000);
     try{
+      await new Promise(function(r){setTimeout(r,60);});
+      try{var held=JSON.parse(localStorage.getItem(LEASEK())||'null');if(held&&held.tab!==TAB_ID)return;}catch(e){}
       if(!ST.qz){ ST.qz=await qzReady(); if(!ST.qz){ paintChip(); return; } if(!MASTER) await W.bnxLoadPrinterMaster(); }
       /* 2026-10-14: "[PRINTER MASTER] Load failed: Server timeout" left MASTER empty for the whole session — retry every minute (not blocking prints) */
       if(!MASTER && Date.now()-(ST.mTry||0)>60000){ ST.mTry=Date.now(); W.bnxLoadPrinterMaster().catch(function(){}); }
@@ -63148,7 +63176,7 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
       var byRole={}; jobs.forEach(function(j){ (byRole[j.role]=byRole[j.role]||[]).push(j); });
       await Promise.all(Object.keys(byRole).map(async function(k){
         for(var i=0;i<byRole[k].length;i++){ var j=byRole[k][i];
-          try{ await printJob(j); markPrinted(j.id); res.push({id:j.id,ok:true}); ST.printed++; ST.last=k+' · T'+(j.table||'-'); ST.lastAt=Date.now(); }
+          try{ if(!ownsStation())throw new Error('Print station ownership changed; ticket retained for retry');await printJob(j); markPrinted(j.id); res.push({id:j.id,ok:true}); ST.printed++; ST.last=k+' · T'+(j.table||'-'); ST.lastAt=Date.now(); }
           catch(e){ res.push({id:j.id,ok:false,error:String(e&&e.message||e)}); ST.failed++; ST.last='⚠️ '+k+': '+String(e&&e.message||e).slice(0,60); }
         } }));
       sendDone(res);                                      /* not awaited: the next tick can start printing new tickets */
@@ -63157,7 +63185,7 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
       if(ok) note('🖨️ '+ok+' steward KOT'+(ok>1?'s':'')+' printed','success');
       if(ok<res.length) note('⚠️ '+(res.length-ok)+' KOT not printed — '+ST.last+' (retrying)','error');
     }catch(e){ ST.qz=false; }
-    finally{ ST.busy=false; paintChip(); }
+    finally{ clearInterval(leaseTimer);ST.busy=false; paintChip(); }
   }
   function paintChip(){
     var c=D.getElementById('bnx-station-chip');
@@ -67258,9 +67286,12 @@ window.addEventListener('message',async function(e){
  if(location.protocol==='file:'?u.protocol!=='file:':(u.origin!==location.origin||e.origin!==location.origin))return;
  var allowed=['GET_CLIENT_INFO','GET_BILLS','GET_DSR_MATRIX','GET_DSR_RANGE','GET_DSR_YTD','GET_DUE_COLLECTION','GET_ITEM_SALES_REPORT','GET_SALES_DAY_BOOK_REPORT','GET_CASHBOOK_REPORT','GET_DSR_BANK_RECONCILIATION','DUES_LIST','BNX_DSR_DUES_AS_OF','BNX_DSR_RECEIPT_PERIOD'];
  if(!allowed.includes(m.action))return;
+ var requestedClient=String(m.clientId||u.searchParams.get('client')||bnxCurrentClient_());
+ if(requestedClient!==String(bnxCurrentClient_())){e.source.postMessage({type:'bnx-dsr-result-v1',id:m.id,result:{success:false,error:'DSR client does not match dashboard login'}},e.origin==='null'?'*':e.origin);return;}
  var payload=Object.assign({},m.payload||{});
  ['action','clientId','client','sessionToken','token','userId','loginId','bnxRole','bnxUser'].forEach(function(k){delete payload[k];});
  var result;try{result=m.action==='BNX_DSR_RECEIPT_PERIOD'?await window.bnxDsrReceiptPeriod_(payload.from,payload.to):m.action==='BNX_DSR_DUES_AS_OF'?await window.bnxDsrDuesAsOf_(String(payload.date||'').slice(0,10)):await window.bnxApprovalApi(m.action,payload,60000);}catch(_){result={success:false,error:'Dashboard report request failed. Refresh and try again.'};}
+ if(requestedClient!==String(bnxCurrentClient_()))result={success:false,error:'Dashboard client changed while loading DSR'};
  if(f.contentWindow===e.source)e.source.postMessage({type:'bnx-dsr-result-v1',id:m.id,result:result},e.origin==='null'?'*':e.origin);
 });
 </script>

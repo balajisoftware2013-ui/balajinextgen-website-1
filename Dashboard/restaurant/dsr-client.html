@@ -467,6 +467,7 @@ function getSessionToken_(){
 }
 
 function getClientId_(){
+  try{const requested=new URLSearchParams(window.location.search).get('client');if(requested&&/^[A-Za-z0-9_-]{1,64}$/.test(requested))return requested;}catch(e){}
   const c=bnxGetAuthContexts_();
   return c.length?String(c[0].client||'').trim():'';
 }
@@ -530,27 +531,32 @@ const BNX_API_FLIGHT_=new Map(), BNX_API_CACHE_=new Map();
 var BNX_NET_MAX_=2, BNX_NET_ACTIVE_=0; const BNX_NET_WAIT_=[];
 function bnxNetSlot_(){ return new Promise(function(res){ if(BNX_NET_ACTIVE_<BNX_NET_MAX_){BNX_NET_ACTIVE_++;res();} else BNX_NET_WAIT_.push(res); }); }
 function bnxNetRelease_(){ var n=BNX_NET_WAIT_.shift(); if(n) n(); else BNX_NET_ACTIVE_=Math.max(0,BNX_NET_ACTIVE_-1); }
-function bnxApiKey_(a,p,e){try{var ctx=bnxGetAuthContexts_()[0]||{};return JSON.stringify([e||'V2_CORE',a,ctx.client||getClientId_()||CLIENT_ID,ctx.token||'',p||{}]);}catch(x){return '';}}
+function bnxApiKey_(a,p,e){try{var target=getClientId_()||CLIENT_ID;var ctx=bnxGetAuthContexts_().find(c=>!c.client||c.client===target)||{};return JSON.stringify([e||'V2_CORE',a,ctx.client||getClientId_()||CLIENT_ID,ctx.token||'',p||{}]);}catch(x){return '';}}
 function bnxApiTtl_(p){var t=(typeof bnxToday_==='function')?bnxToday_():'';var s=JSON.stringify(p||{});var ds=s.match(/\d{4}-\d{2}-\d{2}/g)||[];var touchesToday=!ds.length||ds.some(function(d){return d>=t;});if(!touchesToday&&p&&p.year&&p.month){var n=new Date();touchesToday=(+p.year===n.getFullYear()&&+p.month===n.getMonth()+1);}return touchesToday?45000:600000;}
-function bnxApiClearCache_(){BNX_API_CACHE_.clear();try{if(typeof window.bnxTdbClear_==='function')window.bnxTdbClear_();}catch(e){}}
+var BNX_DSR_READ_GENERATION_=0;
+function bnxApiClearCache_(){BNX_DSR_READ_GENERATION_++;BNX_API_CACHE_.clear();try{if(typeof window.bnxTdbClear_==='function')window.bnxTdbClear_();}catch(e){}}
 window.addEventListener('storage',function(e){if(/^(ERP_SESSION|erp_session|erp_token|sessionToken|SESSION_TOKEN|ERP_SESSION_USER|ERP_USER|erpUser)$/.test(e.key||''))bnxApiClearCache_();});
+window.addEventListener('storage',function(e){if(e.key==='bnx_data_changed_'+getClientId_())bnxApiClearCache_();});
 async function gasApi(action,payload,endpoint){
   payload=payload||{};
   if(/^GET_/.test(String(action))){
     const k=bnxApiKey_(action,payload,endpoint);
     if(k){
       const c=BNX_API_CACHE_.get(k);
-      if(!payload.force&&!payload.refresh&&c&&Date.now()-c.t<c.ttl) return c.r;
-      if(BNX_API_FLIGHT_.has(k)) return BNX_API_FLIGHT_.get(k);
+      const clone=function(r){try{return structuredClone(r);}catch(e){return JSON.parse(JSON.stringify(r));}};
+      if(!payload.force&&!payload.refresh&&c&&Date.now()-c.t<c.ttl) return clone(c.r);
+      if(BNX_API_FLIGHT_.has(k)) return BNX_API_FLIGHT_.get(k).then(clone);
+      const generation=BNX_DSR_READ_GENERATION_;
       const p=gasApiRaw_(action,payload,endpoint).then(function(r){
-        if(r&&r.success===true&&!r.error&&!r.authExpired){ if(BNX_API_CACHE_.size>=100) BNX_API_CACHE_.delete(BNX_API_CACHE_.keys().next().value); BNX_API_CACHE_.set(k,{t:Date.now(),ttl:bnxApiTtl_(payload),r:r}); }
+        if(r&&r.success===true&&!r.error&&!r.authExpired&&generation===BNX_DSR_READ_GENERATION_){ if(BNX_API_CACHE_.size>=100) BNX_API_CACHE_.delete(BNX_API_CACHE_.keys().next().value); BNX_API_CACHE_.set(k,{t:Date.now(),ttl:bnxApiTtl_(payload),r:r}); }
         return r;
       }).finally(function(){BNX_API_FLIGHT_.delete(k);});
       BNX_API_FLIGHT_.set(k,p);
-      return p;
+      return p.then(clone);
     }
   }
-  return gasApiRaw_(action,payload,endpoint);
+  bnxApiClearCache_();
+  try{return await gasApiRaw_(action,payload,endpoint);}finally{bnxApiClearCache_();try{localStorage.setItem('bnx_data_changed_'+getClientId_(),Date.now()+'-'+Math.random());}catch(e){}}
 }
 
 /* Local file frames have opaque origins; use the signed-in dashboard for reads. */
@@ -566,7 +572,7 @@ function bnxDsrParentRead_(action,payload){
   const id=crypto.randomUUID();
   const timer=setTimeout(function(){BNX_DSR_RPC_.delete(id);resolve({success:false,error:'Dashboard report connection timed out. Check login and refresh DSR.'});},65000);
   BNX_DSR_RPC_.set(id,{resolve:resolve,timer:timer});
-  window.parent.postMessage({type:'bnx-dsr-read-v1',id:id,action:action,payload:payload||{}},'*');
+  window.parent.postMessage({type:'bnx-dsr-read-v1',id:id,clientId:CLIENT_ID,action:action,payload:payload||{}},'*');
  });
 }
 function bnxDsrAccessibleParent_(){
@@ -578,6 +584,8 @@ async function gasApiRaw_(action,payload,endpoint){
     await bnxNetSlot_();try{return await bnxDsrParentRead_(action,payload);}finally{bnxNetRelease_();}
   }
   payload=payload||{};
+  const requestClient=String(CLIENT_ID||getClientId_()||'');
+  if(requestClient!==String(getClientId_()||''))return{success:false,error:'Client changed. Refresh DSR before loading reports.'};
   /* FIX (Sep 2026, same audit as above): read window.GAS_APIS_DSR explicitly
      — never the bare `GAS_APIS_DSR` identifier — so this always uses the one
      merged-and-normalized object above, never whatever erp-config.js's own
@@ -594,7 +602,8 @@ async function gasApiRaw_(action,payload,endpoint){
   // DEBUG: Log API call initiation
   BNX_DBG_('[API_DEBUG] 📡 Starting API call:', {action, endpoint, url});
 
-  const contexts=bnxGetAuthContexts_();
+  const isRead=/^GET_/.test(String(action));
+  const contexts=bnxGetAuthContexts_().filter(c=>!c.client||String(c.client)===requestClient).slice(0,isRead?undefined:1);
   if(!contexts.length){
     bnxRedirectToLogin_('NO_SESSION');
     return {success:false,authExpired:false,error:'No saved login session. Open the Restaurant Dashboard and sign in, then refresh DSR.'};
@@ -610,11 +619,7 @@ async function gasApiRaw_(action,payload,endpoint){
   const _heavy=/^(GET_DSR_MATRIX|GET_DSR_YTD|GET_BILLS|GET_SALES_DAY_BOOK_REPORT|GET_ITEM_SALES_REPORT|GET_CASHBOOK_REPORT|GET_DUE_COLLECTION|GET_DSR_BANK_RECONCILIATION|GET_DSR_RANGE)$/.test(String(action));
   for(let i=0;i<contexts.length;i++){
     const ctx=contexts[i];
-    const body=Object.assign({
-      action:action,
-      clientId:ctx.client||getClientId_()||CLIENT_ID,
-      sessionToken:ctx.token
-    },payload);
+    const body=Object.assign({},payload,{action:action,clientId:ctx.client||getClientId_()||CLIENT_ID,sessionToken:ctx.token});
     try{
       BNX_DBG_('[API_DEBUG] 🔄 Fetching:', {url, attempt: i+1, totalContexts: contexts.length});
       
@@ -639,18 +644,19 @@ async function gasApiRaw_(action,payload,endpoint){
       
       if(j && !(j.error==='Invalid or expired session' || j.status===401)){
         BNX_DBG_('[API_DEBUG] ✅ Success:', action);
+        if(requestClient!==String(getClientId_()||''))return{success:false,error:'Client changed while loading report'};
         window.__bnxAuthOkAt=Date.now();
         return j;
       }
       /* 2026-10-13 ("net slow then session timeout"): a slow / busy server also answers "Invalid or expired session" for a login
          that is still valid. Ask again twice (3 s, 6 s) before treating it as a real expiry. */
-      if(j && (ctx.__authTry=(ctx.__authTry||0))<3){ ctx.__authTry++; await new Promise(r=>setTimeout(r,[3000,8000,20000][ctx.__authTry-1])); i--; continue; }
+      if(isRead && j && (ctx.__authTry=(ctx.__authTry||0))<3){ ctx.__authTry++; await new Promise(r=>setTimeout(r,[3000,8000,20000][ctx.__authTry-1])); i--; continue; }
     }catch(e){
       // Network errors are not authentication errors; preserve the final
       // error below instead of redirecting the user to login unnecessarily.
       /* FIX (console: "Failed to fetch" on the built-in V2_CORE): if that deployment cannot be reached at all, switch to the
          other known working ERP deployment (the one the dashboard itself uses) for this tab and retry once. */
-      if(e && e.name!=='AbortError' && !payload.__bnxAltUrlTried){
+      if(isRead && e && e.name!=='AbortError' && !payload.__bnxAltUrlTried){
         const alts=['AKfycbxYC6C2ltrcupaEexLJlvoJkISnAtgqE2p_o2KUInn1TaFh4IA2hQeq7cC9Q9ceFrOx','AKfycbz39r1zo4LGqHJXpwDsQFulHdp3qsjiLRxRiSIEBBObI_3310_n2izF_gAjofaIHgSJ']
           .map(id=>'https://script.google.com/macros/s/'+id+'/exec').filter(u=>u!==url);
         if(alts.length){
@@ -679,7 +685,7 @@ async function gasApiRaw_(action,payload,endpoint){
   // A temporary backend authentication error must not log out the DSR viewer.
   // The server remains authoritative: never fabricate or extend a token.
   // Re-read browser storage once in case another tab has just refreshed login.
-  const refreshed=bnxGetAuthContexts_();
+  const refreshed=bnxGetAuthContexts_().filter(c=>!c.client||String(c.client)===requestClient);
   const fresh=refreshed.find(c=>!contexts.some(old=>old.token===c.token && old.client===c.client));
   if(fresh && !payload.__bnxAuthRefreshAttempt){
     const again=Object.assign({},payload,{__bnxAuthRefreshAttempt:true});
@@ -690,7 +696,7 @@ async function gasApiRaw_(action,payload,endpoint){
   if(/^GET_/.test(String(action)) && !payload.__bnxParentTried){
     try{
       const P=bnxDsrAccessibleParent_();
-      if(P && typeof P.gasApi==='function' && P.gasApi!==window.gasApi){
+      if(P && typeof P.gasApi==='function' && P.gasApi!==window.gasApi && typeof P.bnxCurrentClient_==='function' && String(P.bnxCurrentClient_())===requestClient){
         const clean=Object.assign({},payload); delete clean.__bnxAuthRefreshAttempt; delete clean.__bnxAltUrlTried;
         const pr=await P.gasApi(action,clean,endpoint||'V2_CORE');
         if(pr && pr.success!==false && !/expired session/i.test(String(pr.error||''))){ window.__bnxAuthOkAt=Date.now(); return pr; }
@@ -849,7 +855,7 @@ function mapLiveDsrDay_(raw){
 var BNX_GRP_ID_ = {GRP00001:'FOOD',GRP00002:'BEVERAGE',GRP00003:'LIQUOR',GRP00004:'TOBACCO',GRP00005:'ADD-ONS',GRP00006:'HUKKA'};
 var BNX_GRP_LABEL_ = {liquor:'Liquor',liquormrp:'Liquor MRP',food:'Food',bev:'Beverage',hf:'Hashfreezer / Hukka',others:'Others'};
 /* item → group map built from the dashboard's live POS menu (same item master), plus CL00010 menu categories */
-var BNX_CAT_GRP_FALLBACK_={'THE UNFORGETTABLES':'FOOD','CLAY & GRAIN':'FOOD','THE HASHTAG OPENER':'FOOD','DOUGH & FIRE':'FOOD','WHEAT & ARBORIO':'FOOD',
+var BNX_CAT_GRP_FALLBACK_={'CLEAN & GREENS':'FOOD','THE UNFORGETTABLES':'FOOD','CLAY & GRAIN':'FOOD','THE HASHTAG OPENER':'FOOD','DOUGH & FIRE':'FOOD','WHEAT & ARBORIO':'FOOD',
   'ASIAN STAPLE':'FOOD','FILLED & FOLDED':'FOOD','CHOPSTICK CHASERS':'FOOD','THE STEAMING BASKET':'FOOD','SMOKE & BOARDS':'FOOD',
   'DRINK & DRIVE':'BEVERAGE','ALL TIME FAVORITE':'LIQUOR','ALCOPOPS':'LIQUOR','CHAMPAGNE/SPARKLING':'LIQUOR','LARGER THAN ALL':'LIQUOR','CLARIFIED COCKTAIL':'LIQUOR','APERITIF':'LIQUOR'};
 /* 2026-10-18 BLANK ITEM GROUP FIX: bill items saved with an empty ITEM_GROUP_NAME / ITEM_GROUP_ID used to fall to "Others".
