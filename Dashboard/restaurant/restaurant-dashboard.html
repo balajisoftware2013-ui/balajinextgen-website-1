@@ -12677,7 +12677,7 @@ async function bnxPullBillsFromServer(from, to){
         bnxPullBillsRange_(today,today).then(r=>{repaint();return r;}),
         bnxPullBillsRange_(f,yday).then(r=>{repaint();return r;})
       ]);
-      if(rs.every(r=>r.status==='rejected')) throw rs[0].reason;
+      if(rs.some(r=>r.status==='rejected')) throw rs.find(r=>r.status==='rejected').reason;
       return {success:true,split:true};
     }
   }
@@ -12694,6 +12694,13 @@ function bnxBillsFromGetBills_(g){
     customer: b.CUSTOMER_NAME||'GENERAL CUSTOMER', total: Number(b.GRAND_TOTAL)||0, sub: Number(b.SUBTOTAL)||0, gst: (Number(b.TAX_AMOUNT)||0)+(Number(b.SERVICE_CHARGE_GST_AMOUNT)||0), sc:Number(b.SERVICE_CHARGE_AMOUNT)||0, roundOff:Number(b.ROUND_OFF)||0,
     disc: (Number(b.ITEM_DISCOUNT)||0)+(Number(b.BILL_DISCOUNT)||0), status: (/CANCEL|VOID/i.test(String(b.BILL_STATUS))?'CANCELLED':(/UNPAID|PARTIAL/i.test(String(b.PAYMENT_STATUS))?'PENDING':((/^(NC|NO.?CHARGE|NON.?CHARGE|COMPLIMENT)/i.test(String(b.PAYMENT_MODE||b.PAY_MODE||b.BILL_STATUS||'')) || (Number(b.GRAND_TOTAL)===0 && Number(b.SUBTOTAL)>0))?'COMPLIMENTARY':'PAID'))),
     pay: String(b.PAYMENT_MODE||b.PAY_MODE||'').toUpperCase(), businessDate: day(b.BUSINESS_DATE||b.BILL_DATE), BILL_ID: b.BILL_ID })) };
+}
+/* Bound bill-list reads so a stalled API cannot keep Retry locked forever. */
+function bnxBillReadDeadline_(request, ms){
+  let timer;
+  return Promise.race([Promise.resolve().then(request),new Promise((_,reject)=>{
+    timer=setTimeout(()=>reject(new Error('Bill server request timed out. Please retry.')),ms);
+  })]).finally(()=>clearTimeout(timer));
 }
 async function bnxPullBillsRange_(from, to){
   // Range-aware authoritative sync. For an explicitly selected range,
@@ -12720,37 +12727,38 @@ async function bnxPullBillsRange_(from, to){
       const hasRange = !!(from || to);
       if (hasRange){ params.FROM_DATE = from || to; params.TO_DATE = to || from; }
       params.SUMMARY_ONLY = true;
-      /* 2026-10-19 BILLS LIST FIX: v1 raced LIST_BILLS against GET_BILLS (after 6 s) and gave up after 90 s. GET_BILLS rows have no
-         items / waiter / proper time, were accepted as "the" result and the period was marked covered, so the full LIST_BILLS answer
-         was thrown away - and a slow server ended on "Connecting...". Back to the proven restaurant-dashboard.html behaviour:
-         wait for LIST_BILLS; GET_BILLS is only the fallback below when LIST_BILLS fails or comes back empty. */
       let res;
-      try{ res = await gasApi('LIST_BILLS', params); }
-      catch(e){ res = { success:false, error:String(e&&e.message||e) }; }
-      /* 2026-10-15 ("Bills List Yesterday 0 while Reports/Dashboard show 10 bills"): LIST_BILLS can answer empty (server
-         cache built while BILL_MASTER was unreadable) or fail on a slow server, but GET_BILLS — used by the dashboard KPIs —
-         had the bills. An empty/failed LIST_BILLS for a date range is now checked against GET_BILLS before showing 0. */
-      try{
-        const lb = res && (res.bills || res.data);
-        if (hasRange && !(res && res.timedOut) && (!res || res.success === false || !Array.isArray(lb) || !lb.length)) {
-          const g = await gasApi('GET_BILLS', { FROM_DATE: params.FROM_DATE, TO_DATE: params.TO_DATE, BUSINESS_DATE: params.FROM_DATE===params.TO_DATE?params.FROM_DATE:undefined }, 'V2_CORE');
-          const rows = g && g.success !== false && Array.isArray(g.data) ? g.data : [];
-          if (rows.length) {
-            const day=v=>{ const t=String(v||''); return /^\d{4}-\d{2}-\d{2}/.test(t)?t.slice(0,10):t; };
-            res = { success:true, bills: rows.map(b=>({
-              no: b.BILL_NUMBER||b.billNo, dt: day(b.BILL_DATE), tm: String(b.BILL_TIME||'').slice(0,8), table: b.TABLE_ID||'-',
-              customer: b.CUSTOMER_NAME||'GENERAL CUSTOMER', total: Number(b.GRAND_TOTAL)||0, sub: Number(b.SUBTOTAL)||0, gst: (Number(b.TAX_AMOUNT)||0)+(Number(b.SERVICE_CHARGE_GST_AMOUNT)||0), sc:Number(b.SERVICE_CHARGE_AMOUNT)||0, roundOff:Number(b.ROUND_OFF)||0,
-              disc: (Number(b.ITEM_DISCOUNT)||0)+(Number(b.BILL_DISCOUNT)||0), status: (/CANCEL|VOID/i.test(String(b.BILL_STATUS))?'CANCELLED':(/UNPAID|PARTIAL/i.test(String(b.PAYMENT_STATUS))?'PENDING':((/^(NC|NO.?CHARGE|NON.?CHARGE|COMPLIMENT)/i.test(String(b.PAYMENT_MODE||b.PAY_MODE||b.BILL_STATUS||'')) || (Number(b.GRAND_TOTAL)===0 && Number(b.SUBTOTAL)>0))?'COMPLIMENTARY':'PAID'))),
-              pay: String(b.PAYMENT_MODE||b.PAY_MODE||'').toUpperCase(), businessDate: day(b.BUSINESS_DATE||b.BILL_DATE), BILL_ID: b.BILL_ID })) };
-            console.info('[BILLS] LIST_BILLS empty for '+params.FROM_DATE+'..'+params.TO_DATE+' — '+rows.length+' bill(s) loaded from GET_BILLS');
+      const requestClient = String(typeof CLIENT_ID!=='undefined'?CLIENT_ID:'');
+      try{ res = await bnxBillReadDeadline_(()=>gasApi('LIST_BILLS', params),15000); }
+      catch(e){ res = {success:false,error:String(e&&e.message||e)}; }
+      const listRows=res && (res.bills || res.data || (Array.isArray(res)?res:null));
+      if(hasRange && (!res || res.success===false || !Array.isArray(listRows) || !listRows.length)){
+        try{
+          const g=await bnxBillReadDeadline_(()=>gasApi('GET_BILLS',{
+            FROM_DATE:params.FROM_DATE,TO_DATE:params.TO_DATE,
+            BUSINESS_DATE:params.FROM_DATE===params.TO_DATE?params.FROM_DATE:undefined
+          },'V2_CORE'),20000);
+          const fallback=bnxBillsFromGetBills_(g);
+          if(fallback){res=fallback;res.summaryFallback=true;}
+          else if(!g || g.success===false || !Array.isArray(g.data)){
+            throw new Error(g&&g.error||'GET_BILLS returned invalid data');
+          }else if(!res || res.success===false || !Array.isArray(listRows)){
+            // A valid fallback may authoritatively confirm an empty period.
+            res={success:true,bills:[],summaryFallback:true};
           }
+        }catch(e){
+          // Do not clear cached bills when the empty primary cannot be verified.
+          throw new Error('Bills could not be refreshed: '+String(e&&e.message||e));
         }
-      }catch(e){ console.warn('[BILLS] GET_BILLS fallback failed', e && e.message); }
+      }
+      if(requestClient!==String(typeof CLIENT_ID!=='undefined'?CLIENT_ID:''))
+        throw new Error('Client changed while loading bills. Please retry.');
       if (!res || res.success === false) throw new Error(res?.error || 'LIST_BILLS failed');
       const serverBills = res && (res.bills || res.data || (Array.isArray(res) ? res : []));
       if (!Array.isArray(serverBills)) throw new Error('LIST_BILLS returned invalid data');
 
       let local = bnxGetBillRegister();
+      const previousBills = new Map(local.map(b=>[String(b.no),b]));
       const inRange = (b)=>{
         if(!hasRange) return true;
         const raw=String(b?.businessDate||b?.dt||b?.date||'').slice(0,10);
@@ -12777,6 +12785,7 @@ async function bnxPullBillsRange_(from, to){
           ? { CASH:Number(sb.payBreakdown.CASH)||0, CARD:Number(sb.payBreakdown.CARD)||0, UPI:Number(sb.payBreakdown.UPI)||0, OTHER:Number(sb.payBreakdown.OTHER)||0 }
           : { CASH:0, CARD:0, UPI:0, OTHER:0 };
         if (!sb.payBreakdown && bucket && fallbackTotal > 0) payBreakdown[bucket] = fallbackTotal;
+        const previous = previousBills.get(String(no)) || {};
         local.push({
           no,
           dt: sb.dt || sb.BILL_DATE || sb.date,
@@ -12786,8 +12795,8 @@ async function bnxPullBillsRange_(from, to){
           table: sb.table || sb.TABLE_ID || sb.tableNo || '-',
           customer: (window.bnxCleanImportNote_||(x=>x))(sb.customer || sb.CUSTOMER_NAME || sb.cname) || 'GENERAL CUSTOMER',
           mob: (window.bnxCleanImportNote_||(x=>x))(sb.mob || sb.mobile || ''),
-          items: sb.items ?? (Array.isArray(sb.itemsDetail)?sb.itemsDetail.length:0),
-          itemsDetail: sb.itemsDetail || (Array.isArray(sb.items)?sb.items:[]),
+          items: sb.items ?? (Array.isArray(sb.itemsDetail)?sb.itemsDetail.length:(previous.items||0)),
+          itemsDetail: sb.itemsDetail || (Array.isArray(sb.items)?sb.items:(previous.itemsDetail||[])),
           sub: sb.sub ?? sb.subtotal ?? sb.SUBTOTAL ?? 0,
           disc: sb.disc ?? sb.discount ?? sb.DISCOUNT ?? ((sb.ITEM_DISCOUNT!=null||sb.BILL_DISCOUNT!=null||sb.itemDiscount!=null||sb.billDiscount!=null)
                 ? ((Number(sb.ITEM_DISCOUNT??sb.itemDiscount)||0)+(Number(sb.BILL_DISCOUNT??sb.billDiscount)||0)) : 0),
@@ -12808,7 +12817,7 @@ async function bnxPullBillsRange_(from, to){
             if(st==='DRAFT') return 'Draft';
             return st ? st : 'Pending';
           })(),
-          waiter: sb.waiter || sb.CREATED_BY || '-',
+          waiter: sb.waiter || sb.CREATED_BY || previous.waiter || '-',
           billId: sb.BILL_ID || sb.billId || sb.id || '',
           kot: sb.kot || sb.ORDER_ID || '',
           businessDate: sb.businessDate || sb.BUSINESS_DATE || sb.BILL_DATE || sb.dt || sb.date || '',
@@ -12821,9 +12830,10 @@ async function bnxPullBillsRange_(from, to){
       local.forEach(b=>dedup.set(String(b.no),b));
       bnxSaveBillRegister(Array.from(dedup.values()));
       _bnxBillsSyncDoneKey=syncKey; _bnxBillsSyncDoneAt=Date.now();
-      if(hasRange){ const cf=String(from||to||'').slice(0,10), ct=String(to||from||'').slice(0,10); if(cf&&ct){ _bnxBillsCovered.push({f:cf,t:ct,at:Date.now()}); if(_bnxBillsCovered.length>40)_bnxBillsCovered.shift(); } }
+      if(hasRange && !res.summaryFallback){ const cf=String(from||to||'').slice(0,10), ct=String(to||from||'').slice(0,10); if(cf&&ct){ _bnxBillsCovered.push({f:cf,t:ct,at:Date.now()}); if(_bnxBillsCovered.length>40)_bnxBillsCovered.shift(); } }
       return {success:true,count:serverBills.length};
     }catch(e){
+      window.__blPullErr=true;
       console.warn('[bnxPullBillsFromServer] failed:', e.message);
       throw e;
     }
