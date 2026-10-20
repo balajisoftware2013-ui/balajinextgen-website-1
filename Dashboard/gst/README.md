@@ -1,32 +1,43 @@
-# Direct Tally purchase read — GST-2026.10.20-v2
+# Balaji GST Compliance Workspace — GST-2026.10.20-v3
 
-Reads purchase vouchers from the selected Tally company and month into Books for 2B reconciliation. It does not create, change or delete Tally purchases. This release is locally fixture-tested; no live TallyPrime 7.2 connection has been verified.
+Workflow upgrade informed by ExpressGST's published client, return activity, purchase reconciliation and exception-review workflows. This is Balaji software, not ExpressGST, and is not feature-equivalent to that connected commercial service.
 
-## Install
+## Added
 
-1. Keep a backup of the current GST HTML and connector folder.
-2. Replace gst.html on your website. Extract tally_connector.py and tally_purchase.py together into your existing connector folder, retaining tally_posting_journal.sqlite3.
-3. Stop the old connector, then run START_TALLY_CONNECTOR.bat. Python 3 is required. Open TallyPrime, load the company, enable its HTTP server on port 9000.
-4. Open GST page and import your client profile as before. Select the desired month and enter the exact Tally company name.
-5. Under Read purchases from Tally, enter comma-separated exact ledger names for Purchase taxable base, Input CGST, Input SGST, Input IGST, Cess and Round Off. Leave unused roles blank. Do not map one ledger into two roles.
-6. Enter the two-digit place-of-supply fallback only after verifying it. It is used where the export does not provide a state code; it does not alter recorded GST amounts.
-7. Click Sync purchases from Tally. If there are exceptions, existing Books remain unchanged. Review the invoice list and correct the mappings/data. No automatic retry occurs.
-8. Successful sync replaces Books for that selected period, preserving other periods. Open 2B vs Books Reconciliation.
+- Blue compliance workspace header, workflow steps and source/exception counts.
+- Client profile creation and a workspace scoped by client ID plus GSTIN. Save/restore is explicit and on this device only. Save/export before changing clients or closing the page. Server multi-user client management is not implemented.
+- Purchase/2B reconciliation for a month range; exact match, amount mismatch, missing-in-books, missing-in-2B, ambiguous duplicate and possible-date mismatch classifications. Date suggestions are not treated as matched.
+- Configurable Rs 0–10 tax-head tolerance, supplier/invoice search, status filter, supplier summary, per-head differences, filtered CSV and print.
+- Local review notes with Accept/Reject/Pending suggestions. These are NOT GST IMS actions and are never submitted to GSTN.
+- Purchase register CSV import and normalized JSON import; common GSTN GSTR-2B JSON docdata.b2b invoice structure, including recipient GSTIN and return-period checks. Other nonempty document sections are rejected rather than silently ignored. No Excel importer or full GSTN schema compatibility is claimed.
+- Previous v2 read-only Tally purchase sync retained, with explicit input-tax ledger mappings. Previous accounting/item-mode sales tools remain.
+- Return activity evidence, source workpapers and rule-based checks retained. Portal connection status stays disconnected.
 
-## What is read
+## Use
 
-Supplier invoice reference, supplier name/GSTIN, voucher date/number, supplier reference date where exported, taxable purchase ledger/inventory allocations, input tax amounts and round off. Supplier reference date is used for matching where available; otherwise voucher date is retained and labelled for verification. The selected month is the voucher/booking month, which can differ from the supplier invoice month.
+1. Back up your existing files. Replace gst.html on your website. Keep the existing server configuration; this upgrade does not add a GSTN/GSP backend.
+2. Use Client profile to enter client ID, company, GSTIN, state code and exact Tally company.
+3. Import purchase register and 2B. Or use the read-only Tally purchase tool on the dashboard.
+4. Open 2B reconciliation. Select month range, status and supplier/invoice search. Review differences; export the filtered report.
+5. Save on this device or export workpaper. Restore only after selecting the same client ID and GSTIN. Device storage is not an encrypted server backup; use the appropriate workstation access controls.
 
-Cancelled and optional vouchers are excluded by the Tally export filter. The filter uses Tally's purchase-voucher family. Credit notes, debit notes/reversals, missing supplier GSTIN, unknown charge ledgers and unbalanced vouchers require separate review; they are not silently treated as eligible ITC. This is not a complete statutory purchase register covering all voucher classes or RCM/import documents.
+CSV columns (one invoice per row): invoiceNo,date,gstin,name,pos,total,roundOff,taxable,cgst,sgst,igst,cess. Dates: YYYY-MM-DD or DD-MM-YYYY. All tax heads must be numeric, using explicit 0 where appropriate. Quoted commas and quoted newlines are supported. The CSV route is invoice-total based; use normalized JSON for multiple tax/item lines. Both imports replace the currently loaded source array, not append. Review/save current work before import.
 
-No GST is inferred from a rate or percentage split. Explicit ledger mappings must agree with your Tally GST configuration. Existing expense/freight/discount ledgers require a deliberate mapping and tax review; do not map them arbitrarily just to force a balance.
+Common 2B JSON: recipient gstin; rtnprd MMYYYY; docdata.b2b[] suppliers with ctin, inv[]; invoices have inum, dt, val, pos and items[] (txval,cgst,sgst,igst,cess). Variants and annual/credit-note/ISD/import sections require additional adapters. Unsupported nonempty sections cause rejection. Source identity and sums are checked; actual GST registration, GSTIN checksum and ITC eligibility are not verified.
 
-## Current limits
+## What is NOT connected
 
-Raw GSTN 2B JSON/Excel still needs conversion to the normalized source format documented in the v1 README. Portal downloads, IRN generation and return filing remain unconnected. Books/2B data is held in memory; export the workpaper before leaving the page. Multi-registration Tally companies and unusual TDL/custom voucher layouts need live validation before production use. Imports do not independently verify company GSTIN or supplier registration status.
+No GSTN portal download/upload, actual IMS Accept/Reject/Pending, IRN generation/cancellation, tax payment or final return filing. GSTR-1/3B and annual views are source workpapers, not complete return schemas. No fabricated statuses, GST splits or ITC eligibility. No full ExpressGST parity, 10,000-client capacity, live browser/phone compatibility or TallyPrime 7.2 compatibility certification.
 
-The connector allows only https://www.balajinextgen.in and https://balajinextgen.in origins. Direct sync does not work from file://. Purchase response limit is 8 MiB per request. For larger companies a paginated backend is required.
+An authorised IRP/GSP backend, secure server-side authentication, complete return schemas and live sandbox tests are still required for a connected filing service. Never store portal passwords or client secrets in this HTML.
 
 ## Tests
 
-Synthetic purchase fixture: taxable 100, CGST 2.50, SGST 2.50, supplier total 105. Passed balance checks, unmapped-ledger and missing-GSTIN rejection, month boundaries and read-only request construction. JavaScript compiles. Live Tally, browser local-network permissions, inventory-mode export variation and 10,000-client scale remain unverified.
+Three inline scripts compile. Synthetic tests cover exact/date/ambiguous/missing/amount mismatch results, quoted CSV, common 2B import, GSTIN scope and case-insensitive duplicate rejection. No live filing, Tally posting or browser visual tests were performed.
+
+## Product reference
+
+ExpressGST official feature and reconciliation workflows:
+https://www.expressgst.com/features-of-expressgst/
+https://www.expressgst.com/smart-reconciliation/
+https://www.expressgst.com/ims-console/

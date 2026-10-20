@@ -1,5 +1,5 @@
 'use strict';
-const GST={build:'GST-2026.10.20-v2',client:null,sales:[],books:[],portal2b:[],filings:[],irpPayloads:[],page:'dashboard',period:new Date().toISOString().slice(0,7),posting:false};
+const GST={build:'GST-2026.10.20-v3',client:null,sales:[],books:[],portal2b:[],filings:[],irpPayloads:[],page:'dashboard',period:new Date().toISOString().slice(0,7),posting:false};
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const cash=n=>'₹'+Number(n).toLocaleString('en-IN',{maximumFractionDigits:2});
 function finite(v){if(v===null||v===undefined||v===''||!Number.isFinite(Number(v)))throw Error('A numeric source amount is missing');return Number(v)}
@@ -18,7 +18,7 @@ function totals(list){return list.reduce((a,r)=>{a.total+=r.total;r.items.forEac
 function reconcile(books,portal){const key=r=>(r.gstin||'')+'|'+r.invoiceNo.trim().toUpperCase()+'|'+r.date,pm=new Map(portal.map(r=>[key(r),r])),result=[];books.forEach(b=>{const p=pm.get(key(b));pm.delete(key(b));const x=totals([b]),y=p&&totals([p]);result.push({invoice:b.invoiceNo,gstin:b.gstin,status:!p?'Missing in 2B':Object.keys(x).every(k=>Math.abs(x[k]-y[k])<=1)?'Matched':'Amount mismatch',books:x.total,portal:y?.total??null})});pm.forEach(p=>result.push({invoice:p.invoiceNo,gstin:p.gstin,status:'Missing in books',books:null,portal:p.total}));return result}
 function validateDataset(d){
  if(!d.client?.clientId||!validGstin(d.client.gstin))throw Error('Client ID and valid GSTIN format required');
- const o={client:d.client};for(const type of ['sales','books','portal2b']){const seen=new Set();o[type]=(d[type]||[]).map(r=>{if(r.clientId&&r.clientId!==d.client.clientId)throw Error('Cross-client row rejected');const n=invoice(r),key=(n.gstin||'')+'|'+n.invoiceNo+'|'+n.date;if(seen.has(key))throw Error('Duplicate '+type+' invoice '+n.invoiceNo);seen.add(key);return n});}
+ const o={client:d.client};for(const type of ['sales','books','portal2b']){const seen=new Set();o[type]=(d[type]||[]).map(r=>{if(r.clientId&&r.clientId!==d.client.clientId)throw Error('Cross-client row rejected');const n=invoice(r),key=String(n.gstin||'').toUpperCase()+'|'+n.invoiceNo.trim().toUpperCase()+'|'+n.date;if(seen.has(key))throw Error('Duplicate '+type+' invoice '+n.invoiceNo);seen.add(key);return n});}
  o.filings=d.filings||[];for(const f of o.filings)if(f.gstin!==d.client.gstin||!/^\d{4}-(0[1-9]|1[0-2])$/.test(f.period))throw Error('Filing evidence GSTIN/period mismatch');
  o.irpPayloads=d.irpPayloads||[];return o;
 }
