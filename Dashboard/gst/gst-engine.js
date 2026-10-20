@@ -1,5 +1,5 @@
 'use strict';
-const GST={build:'GST-2026.10.20-v1',client:null,sales:[],books:[],portal2b:[],filings:[],irpPayloads:[],page:'dashboard',period:new Date().toISOString().slice(0,7),posting:false};
+const GST={build:'GST-2026.10.20-v2',client:null,sales:[],books:[],portal2b:[],filings:[],irpPayloads:[],page:'dashboard',period:new Date().toISOString().slice(0,7),posting:false};
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const cash=n=>'₹'+Number(n).toLocaleString('en-IN',{maximumFractionDigits:2});
 function finite(v){if(v===null||v===undefined||v===''||!Number.isFinite(Number(v)))throw Error('A numeric source amount is missing');return Number(v)}
@@ -22,7 +22,7 @@ function validateDataset(d){
  o.filings=d.filings||[];for(const f of o.filings)if(f.gstin!==d.client.gstin||!/^\d{4}-(0[1-9]|1[0-2])$/.test(f.period))throw Error('Filing evidence GSTIN/period mismatch');
  o.irpPayloads=d.irpPayloads||[];return o;
 }
-function dataRows(type){return GST[type].filter(r=>r.date?.slice(0,7)===GST.period)}
+function dataRows(type){return GST[type].filter(r=>(r.sourcePeriod||r.date?.slice(0,7))===GST.period)}
 function table(head,rows){return '<div style="overflow:auto"><table><thead><tr>'+head.map(h=>'<th>'+esc(h)+'</th>').join('')+'</tr></thead><tbody>'+(rows.length?rows.map(r=>'<tr>'+r.map(v=>'<td>'+esc(v??'—')+'</td>').join('')+'</tr>').join(''):'<tr><td colspan="'+head.length+'">No imported records for this period.</td></tr>')+'</tbody></table></div>'}
 function summary(list){const t=totals(list);return table(['Invoices','Taxable','CGST','SGST','IGST','Cess','Invoice total'],[[list.length,...['taxable','cgst','sgst','igst','cess','total'].map(k=>cash(t[k]))]])}
 function lines(list){return table(['Date','Invoice','Counterparty GSTIN','Name','Total'],list.map(r=>[r.date,r.invoiceNo,r.gstin,r.name,cash(r.total)]))}
@@ -34,6 +34,7 @@ function drawGST(){
  for(let i=0;i<12;i++){const period=new Date(Date.UTC(fy,3+i,1)).toISOString().slice(0,7);for(const type of ['GSTR-1','GSTR-2A','GSTR-2B','GSTR-3B']){const f=GST.filings.find(x=>x.period===period&&x.returnType===type);records.push([period,type,f?.correctionsNeeded??'Unknown',f?.pendingUpload??'Unknown',f?.reconciliationExceptions??'Unknown',f?.arn?'Imported evidence: '+f.arn:'Unknown']);}}
  h+='<h2>GST Return Activities</h2><p>Filing status requires imported portal evidence. A downloaded workpaper is not a filed return.</p>'+table(['Period','Return','Corrections','Pending upload','Reconciliation exceptions','Filing evidence'],records);
  h+='<h3>TallyPrime 7.2 — sales voucher tools</h3><label>Exact company name <input id="tallyCompany" value="'+esc(GST.client?.tallyCompany||'')+'"></label> <select id="tallyMode"><option value="ACCOUNTING">Without items</option><option value="ITEM">With items</option></select> <button onclick="tallyDownload()">Download voucher XML</button><button onclick="tallyTest()">Test local connection</button><button onclick="tallyPost()">Post month sales</button><p id="tallyStatus">Not tested. Required masters must already exist in Tally.</p>';
+ h+='<h3>Read purchases from Tally</h3><p>Comma-separated exact ledger names. Ledger mappings are required; unknown charges stop the import.</p><div class="gst-tools">'+['base','cgst','sgst','igst','cess','roundOff'].map(k=>'<label>'+esc(k)+' ledgers <input id="purchase_'+k+'" value="'+esc((GST.client?.purchaseLedgers?.[k]||[]).join(', '))+'"></label>').join('')+'<label>Fallback place-of-supply code (verify)<input id="purchasePos" maxlength="2" value="'+esc(GST.client?.stateCode||'')+'"></label><button onclick="syncTallyPurchases()">Sync purchases from Tally</button></div><p id="purchaseStatus">No purchase sync performed</p><div id="purchaseIssues"></div>';
  h+='<h3>E-invoice and return filing</h3><p>IRN generation, cancellation, portal upload, tax payment and final filing are not connected. Import IRP acknowledgement to retain it with your source records.</p><button onclick="exportIrpDraft()">Export IRP draft payloads</button> <a href="https://www.gst.gov.in/" target="_blank" rel="noopener">Open GST Portal</a>';
  }else if(GST.page==='recon')h+='<h2>2B versus books reconciliation</h2>'+table(['Invoice','GSTIN','Result','Books','Portal'],reconcile(dataRows('books'),dataRows('portal2b')).map(r=>[r.invoice,r.gstin,r.status,r.books,r.portal]));
  else if(['gstr1','uploadsales'].includes(GST.page))h+='<h2>Outward sales workpaper</h2><p>Only imported sales appear here; purchases never populate GSTR-1.</p>'+summary(dataRows('sales'))+lines(dataRows('sales'));
@@ -66,3 +67,29 @@ async function tallyTest(){try{await tallyRelay('<ENVELOPE><HEADER><TALLYREQUEST
 async function tallyPost(){if(GST.posting)return;try{const s=postingSelection();GST.posting=true;let done=0;for(const row of s.records){const d=await tallyRelay(tallyXML(s.client,[row],s.mode));if(d.querySelector('LINEERROR')||Number(d.querySelector('ERRORS')?.textContent||0)||Number(d.querySelector('CREATED')?.textContent)!==1)throw Error('Creation not confirmed for '+row.invoiceNo+'; check Tally Day Book before retrying');done++}alert(done+' vouchers confirmed. Review GST classification in Tally.')}catch(e){alert('Posting stopped: '+e.message)}finally{GST.posting=false}}
 window.GSTCore={invoice,totals,reconcile,validateDataset,tallyXML};
 const input=document.createElement('input');input.type='file';input.accept='.json';input.id='gstImport';input.hidden=true;input.onchange=async()=>{try{if(!input.files[0])return;const d=validateDataset(JSON.parse(await input.files[0].text()));Object.assign(GST,d,{importedAt:new Date().toLocaleString('en-IN')});drawGST()}catch(e){alert('Import rejected: '+e.message)}finally{input.value=''}};document.body.appendChild(input);drawGST();
+
+let purchaseSyncBusy=false;
+async function syncTallyPurchases(){
+ if(purchaseSyncBusy)return;
+ const status=document.getElementById('purchaseStatus'),issues=document.getElementById('purchaseIssues');
+ try{
+  requireClient();const scope=GST.client.clientId+'|'+GST.client.gstin,period=GST.period,company=document.getElementById('tallyCompany').value.trim();
+  if(!company)throw Error('Enter the exact Tally company');
+  const mapping={};for(const k of ['base','cgst','sgst','igst','cess','roundOff'])mapping[k]=document.getElementById('purchase_'+k).value.split(',').map(x=>x.trim()).filter(Boolean);
+  const fallbackPos=document.getElementById('purchasePos').value.trim();
+  if(!/^\d{2}$/.test(fallbackPos))throw Error('Enter and verify the two-digit place-of-supply fallback');
+  purchaseSyncBusy=true;status.textContent='Reading purchases — Tally data will not be changed';
+  const response=await fetch('http://127.0.0.1:9001/purchases',{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({company,period,mapping})});
+  const text=await response.text();if(!response.ok)throw Error(text);
+  const data=JSON.parse(text);
+  if(scope!==GST.client.clientId+'|'+GST.client.gstin||period!==GST.period)throw Error('Client or period changed: purchase response discarded');
+  if(data.company!==company||data.period!==period||!Array.isArray(data.rows)||!Array.isArray(data.issues))throw Error('Unexpected purchase response');
+  issues.innerHTML=table(['Supplier invoice','Review required'],data.issues.map(x=>[x.invoice,x.error]));
+  if(!data.complete||data.issues.length)throw Error('Purchase read has exceptions. Existing books retained; review the list below.');
+  const imported=data.rows.map(r=>invoice({...r,clientId:GST.client.clientId,sourcePeriod:period,pos:/^\d{2}$/.test(r.pos||'')?r.pos:fallbackPos}));
+  const keys=new Set();for(const r of imported){const k=r.gstin+'|'+r.invoiceNo+'|'+r.date;if(keys.has(k))throw Error('Duplicate supplier invoice');keys.add(k);}
+  GST.books=GST.books.filter(r=>(r.sourcePeriod||r.date.slice(0,7))!==period).concat(imported);
+  GST.client.purchaseLedgers=mapping;GST.client.tallyCompany=company;GST.client.stateCode=fallbackPos;
+  status.textContent=imported.length+' purchase invoices read from '+company+' for '+period+'. Books for this period replaced. Open 2B vs Books Reconciliation.';
+ }catch(e){status.textContent='Sync not completed: '+e.message;}finally{purchaseSyncBusy=false;}
+}

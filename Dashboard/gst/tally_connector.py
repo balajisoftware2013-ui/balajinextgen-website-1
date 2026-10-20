@@ -3,6 +3,7 @@ import hashlib, json, sqlite3, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import xml.etree.ElementTree as ET
+from tally_purchase import request_xml, parse_purchases
 
 ALLOWED = {'https://www.balajinextgen.in', 'https://balajinextgen.in'}
 DB = Path(__file__).resolve().with_name('tally_posting_journal.sqlite3')
@@ -33,6 +34,17 @@ class Handler(BaseHTTPRequestHandler):
             size=int(self.headers.get('Content-Length','0'))
             if not 0<size<=8*1024*1024:raise ValueError('Invalid request size')
             data=self.rfile.read(size)
+            if self.path=='/purchases':
+                payload=json.loads(data)
+                company=str(payload.get('company','')).strip();period=str(payload.get('period',''))
+                query=request_xml(company,period)
+                req=urllib.request.Request(TALLY,data=query,headers={'Content-Type':'text/xml; charset=utf-8'},method='POST')
+                with urllib.request.urlopen(req,timeout=120) as r:
+                    raw=r.read(8*1024*1024+1)
+                    if len(raw)>8*1024*1024:raise ValueError('Purchase response too large; narrow the period')
+                    text=raw.decode('utf-8-sig')
+                result=parse_purchases(text,company,period,payload.get('mapping',{}))
+                return self.reply(200,json.dumps(result))
             if b'<!DOCTYPE' in data.upper() or b'<!ENTITY' in data.upper():raise ValueError('XML entities are not accepted')
             root=ET.fromstring(data)
             vouchers=root.findall('.//VOUCHER')
