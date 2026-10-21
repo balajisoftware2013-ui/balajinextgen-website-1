@@ -72478,3 +72478,172 @@ D.addEventListener('click',function(e){var row=e.target.closest&&e.target.closes
 })(window,document);
 
 </script>
+
+<script id="bnx-instant-lists-20261021">
+/* ═══ INSTANT BILLS LIST + REPORTS · 2026-10-21 ════════════════════════════════════════════════════
+   Problem: any period/filter that is not already on this device waited for ONE huge LIST_BILLS call on the slow
+   Apps Script server (timeouts -> "Connecting…" / "Server is slow"), and "already on this device" was forgotten
+   after 10 minutes, so every filter click went back to the server.
+   Fix (client side only, nothing on the server changes):
+     1. Which DAYS are already downloaded is remembered on this device (past days 6 h, today 20 s).
+        A fully-saved period opens at once, with no server call and no "Connecting…".
+     2. A period that is not saved is downloaded in small 4-day windows (today first, then newest -> oldest),
+        2 at a time. The list / report is redrawn after EACH window, so bills appear within seconds.
+     3. A window that times out is split in half and retried once; days that failed stay "not saved" so the next
+        open retries them. Days that did load are kept (no more all-or-nothing).
+     4. Quietly pre-loads the last 7 days and the month so Yesterday / Week / Month are already here when clicked.
+   ═══════════════════════════════════════════════════════════════════════════════════════════════════ */
+(function(){
+'use strict';
+var W=window, D=document;
+if(typeof W.bnxPullBillsRange_!=='function' || typeof W.bnxPullBillsFromServer!=='function') return;   /* nothing to patch */
+
+var PAST_TTL=6*3600*1000, TODAY_TTL=20000, WIN=4, CONC=2;
+function client(){ try{ return String(typeof CLIENT_ID!=='undefined'?CLIENT_ID:'default'); }catch(e){ return 'default'; } }
+function dkey(){ return 'bnx_bills_days_'+client(); }
+function today(){ try{ return getBusinessDate(); }catch(e){ return new Date().toISOString().slice(0,10); } }
+function addDays(s,n){ var d=new Date(s+'T00:00:00Z'); d.setUTCDate(d.getUTCDate()+n); return d.toISOString().slice(0,10); }
+function span(a,b){ return Math.round((new Date(b+'T00:00:00Z')-new Date(a+'T00:00:00Z'))/86400000); }
+function eachDay(f,t,cap){ var o=[],c=f,i=0; while(c<=t&&i<(cap||800)){ o.push(c); c=addDays(c,1); i++; } return o; }
+function isYmd(s){ return /^\d{4}-\d{2}-\d{2}$/.test(s); }
+function regLen(){ try{ return (bnxGetBillRegister()||[]).length; }catch(e){ return 0; } }
+
+/* ── 1. remembered days (persisted) ── */
+var days=null, daysFor='';
+function load(){
+  if(days && daysFor===client()) return days;
+  days={}; daysFor=client();
+  try{
+    var raw=localStorage.getItem(dkey());
+    if(raw){ var o=JSON.parse(raw);
+      /* only trust it if the saved bill list is still (about) as big as when it was recorded — a trimmed/cleared list means days are NOT really on this device */
+      if(o && o.d && regLen()>0 && regLen()>=Math.floor((o.n||0)*0.98)) days=o.d;
+    }
+  }catch(e){}
+  return days;
+}
+var saveT=0;
+function persist(){ clearTimeout(saveT); saveT=setTimeout(function(){ try{
+  var m=load(), ks=Object.keys(m); if(ks.length>900){ ks.sort(); ks.slice(0,ks.length-900).forEach(function(k){ delete m[k]; }); }
+  localStorage.setItem(dkey(),JSON.stringify({n:regLen(),d:m}));
+}catch(e){} },1500); }
+function mark(f,t){ var m=load(), now=Date.now(); eachDay(f,t,800).forEach(function(d){ m[d]=now; }); persist(); }
+function forget(f,t){ if(!isYmd(f)) return; var m=load(); eachDay(f,isYmd(t)?t:f,800).forEach(function(d){ delete m[d]; }); persist(); }
+W.addEventListener('pagehide',function(){ try{ clearTimeout(saveT); var m=load(); localStorage.setItem(dkey(),JSON.stringify({n:regLen(),d:m})); }catch(e){} });
+
+W.bnxBillsCovered_=function(f,t){
+  if(!isYmd(f)||!isYmd(t)||t<f) return false;
+  var m=load(), td=today(), now=Date.now(), L=eachDay(f,t,800);
+  if(!L.length) return false;
+  for(var i=0;i<L.length;i++){ var at=m[L[i]]; if(!at) return false; if(now-at>(L[i]<td?PAST_TTL:TODAY_TTL)) return false; }
+  return true;
+};
+
+/* record a day as saved whenever a real server read of that window succeeds */
+var origRange=W.bnxPullBillsRange_;
+W.bnxPullBillsRange_=async function(from,to){
+  var r=await origRange.apply(this,arguments);
+  try{ var f=String(from||'').slice(0,10), t=String(to||from||'').slice(0,10);
+    if(r&&r.success!==false&&!r.cached&&isYmd(f)&&isYmd(t)&&t>=f) mark(f,t); }catch(e){}
+  return r;
+};
+
+/* reports: "covered" (even with zero bills) also counts as already on this device -> paint at once */
+var oldHave=W.bnxHaveLocalBillsFor_;
+W.bnxHaveLocalBillsFor_=function(f,t){
+  try{ var a=String(f||'').slice(0,10), b=String(t||f||'').slice(0,10); if(W.bnxBillsCovered_(a,b)) return true; }catch(e){}
+  return typeof oldHave==='function'?oldHave(f,t):false;
+};
+
+/* ── 2. progressive repaint ── */
+var lastRpt=0, rptCount=0;
+function repaint(final){
+  try{
+    var p=D.getElementById('page-bills-list');
+    if(p&&p.classList.contains('active')&&typeof W.blFilterBills==='function'){ var q=D.getElementById('blSearch'); W.blFilterBills(q?q.value:''); }
+  }catch(e){}
+  try{   /* open Reports Hub report: redraw as days arrive (throttled so it never storms) */
+    var rp=D.getElementById('page-reports');
+    if(rp&&rp.classList.contains('active')&&typeof rptActiveAnchor!=='undefined'&&rptActiveAnchor&&typeof W.rptRenderOne==='function'){
+      var now=Date.now();
+      if(!final&&(now-lastRpt<2500||rptCount>=4)) return;
+      lastRpt=now; rptCount++; W.rptRenderOne(rptActiveAnchor,false);
+    }
+  }catch(e){}
+}
+
+/* ── 3. chunked pull ── */
+async function pullWin(a,b,depth){
+  try{ await W.bnxPullBillsRange_(a,b); return {ok:[[a,b]],bad:[]}; }
+  catch(e){
+    if(a<b && depth<1){   /* split once and retry each half after a short pause (don't hammer an overloaded server) */
+      await new Promise(function(r){ setTimeout(r,1500); });
+      var mid=addDays(a,Math.floor(span(a,b)/2));
+      var r1=await pullWin(a,mid,depth+1), r2=await pullWin(addDays(mid,1),b,depth+1);
+      return {ok:r1.ok.concat(r2.ok),bad:r1.bad.concat(r2.bad)};
+    }
+    return {ok:[],bad:[[a,b,String(e&&e.message||e)]]};
+  }
+}
+async function pullChunked(f,t){
+  if(W.bnxBillsCovered_(f,t)) return {success:true,cached:true};
+  var td=today(), jobs=[];
+  if(t>=td && f<=td && !W.bnxBillsCovered_(td<f?f:td,t)) jobs.push([td<f?f:td,t]);          /* today first: tiny and the most wanted */
+  if(f<td){
+    var pe=t<td?t:addDays(td,-1), c=pe;                                                            /* then newest -> oldest windows */
+    while(c>=f){ var a=addDays(c,-(WIN-1)); if(a<f) a=f; if(!W.bnxBillsCovered_(a,c)) jobs.push([a,c]); c=addDays(a,-1); }
+  }
+  if(!jobs.length) return {success:true,cached:true};
+  rptCount=0;
+  var okN=0, bad=[], idx=0, firstErr='';
+  async function worker(){
+    while(idx<jobs.length){
+      var j=jobs[idx++], r=await pullWin(j[0],j[1],0);
+      okN+=r.ok.length; bad=bad.concat(r.bad); if(r.bad.length&&!firstErr) firstErr=r.bad[0][2];
+      if(r.ok.length) repaint(false);
+    }
+  }
+  var ws=[]; for(var i=0;i<Math.min(CONC,jobs.length);i++) ws.push(worker());
+  await Promise.all(ws);
+  if(!okN){ W.__blPullErr=true; throw new Error(firstErr||'Server is slow - bills not loaded yet. Press Retry in a moment.'); }
+  W.__blPullErr=false;
+  if(bad.length){ try{ if(typeof showNotif==='function') showNotif('⚠️ '+bad.length+' day-range(s) could not load (server slow) — they will retry on the next open','warning'); }catch(e){} }
+  repaint(true);
+  return {success:true,chunked:true,partial:bad.length>0,count:okN};
+}
+var inflight={};
+W.bnxPullBillsFromServer=function(from,to){
+  var f=String(from||'').slice(0,10), t=String(to||from||'').slice(0,10);
+  if(!isYmd(f)||!isYmd(t)||t<f) return W.bnxPullBillsRange_(from,to);
+  var k=f+'|'+t; if(inflight[k]) return inflight[k];
+  var p=pullChunked(f,t); inflight[k]=p;
+  var done=function(){ delete inflight[k]; setTimeout(function(){ try{ var tb=D.getElementById('blTableBody'); if(tb&&tb.querySelector('.bl-connecting-row')&&typeof W.blRenderTable==='function') W.blRenderTable(); }catch(e){} },60); };
+  p.then(done,done); return p;
+};
+
+/* the Retry buttons must really re-download the shown period (forget its saved days first) */
+var oldRel=W.blReloadPeriod_;
+W.blReloadPeriod_=function(){
+  try{ var r=W.BNX_GLOBAL_DATE_RANGE||{}; forget(r.from,r.to||r.from); }catch(e){}
+  return typeof oldRel==='function'?oldRel.apply(this,arguments):undefined;
+};
+
+/* ── 4. quiet pre-load so Yesterday / Week / Month are already on this device ── */
+function idle(){ try{ return !D.hidden && navigator.onLine!==false && (typeof REQUEST_QUEUE==='undefined' || (REQUEST_QUEUE.active===0 && !REQUEST_QUEUE.pending.length)); }catch(e){ return false; } }
+function warm(){
+  var td=today(); if(!isYmd(td)) return;
+  var ys=addDays(td,-1), wk=addDays(td,-7), ms=td.slice(0,8)+'01', fy=[];
+  var ranges=[[ys,ys],[wk,ys]]; if(ms<wk) ranges.push([ms,addDays(wk,-1)]);
+  var i=0;
+  (function next(){
+    if(i>=ranges.length) return;
+    if(!idle()){ setTimeout(next,15000); return; }
+    var r=ranges[i++];
+    if(W.bnxBillsCovered_(r[0],r[1])){ setTimeout(next,500); return; }
+    W.bnxPullBillsFromServer(r[0],r[1]).catch(function(){}).then(function(){ setTimeout(next,8000); });
+  })();
+}
+W.addEventListener('load',function(){ setTimeout(warm,9000); },{once:true});
+console.info('[BNX] instant bills/reports: chunked + remembered days active');
+})();
+</script>
