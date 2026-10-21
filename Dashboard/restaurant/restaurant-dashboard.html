@@ -85,6 +85,47 @@ window._erpNavigating=true;
 ['beforeunload','pagehide'].forEach(function(ev){window.addEventListener(ev,function(){window._erpNavigating=true;},true);});
 </script>
 <meta charset="utf-8">
+<script id="bnx-api-dedupe-20261021">
+/* ONE-REQUEST GUARD (2026-10-21, "cloud fast"): on open the dashboard fired ~100 Apps Script calls in 3 minutes, many of them the
+   SAME read again (GET_ACTIVE_ORDERS 19x, BNX_WHOAMI 6x, TALLY_CFG_GET / PRINTER_MASTER_GET / DUES_LIST / GET_DUE_COLLECTION 3-4x) from
+   different modules. With avg answer 9 s and a 5-slot queue, the person's own Bills List / report waited behind them ("request did not
+   start within 30s", "summary timed out after 45s"). Every identical READ now shares one network call while it is in flight and re-uses
+   a good answer for a few seconds. Writes always go straight through and clear the shared answers. */
+(function(){try{
+  var F=window.fetch; if(!F||F.__bnxDedupe) return;
+  var WRITE=/^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_|DELETE_|CANCEL_|VOID_|IMPORT_|ADD_|EDIT_|MARK_|DAY_OPEN|DAY_CLOSE|CLOSE_|REOPEN_|APPROVE_|REJECT_|TRANSFER_|MERGE_|SPLIT_|CHANGE_|LOGOUT|LOGIN|SET_|NEXT_|RESERVE_|SEND_|UPLOAD_|BULK_|BATCH_|REPAIR_|CLEAR_|REFRESH_|SYNC_|TALLY_POST|PRINT|SEAT_)/;
+  var LONG={BNX_WHOAMI:600000,TALLY_CFG_GET:300000,PRINTER_MASTER_GET:300000,APPROVAL_SETTINGS_GET:120000,GET_ROLE_ACCESS:300000,GET_CLIENT_ASSETS:300000,
+    GET_INVOICE_SETTINGS:300000,GET_CLIENT_POS_PROFILE:300000,GET_CLIENT_DATABASE_STATUS:300000,GET_PAYMENT_MODES:300000,GET_TAX_CONFIG:300000,GET_STAFF_LIST:60000,GET_CONFIG:300000};
+  var LIVE=/^(GET_ACTIVE_ORDERS|GET_TABLE_FLOOR|GET_KOT|GET_TABLE_LAYOUT|GET_DAY_STATUS|PING|HEARTBEAT|GET_CLIENT_INFO)$/;
+  var cache=new Map(), flight=new Map();
+  function ttl(a){ return LONG[a]||(LIVE.test(a)?5000:12000); }
+  function mk(text){ return new Response(text,{status:200,headers:{'Content-Type':'application/json'}}); }
+  var w=function(input,init){
+    try{
+      var url=typeof input==='string'?input:(input&&input.url)||'';
+      if(url.indexOf('script.google.com')<0) return F.apply(this,arguments);
+      var body=init&&typeof init.body==='string'?init.body:'', action='';
+      if(body){ try{ action=String(JSON.parse(body).action||''); }catch(e){ return F.apply(this,arguments); } }
+      else { var m=/[?&]action=([A-Z0-9_]+)/.exec(url); action=m?m[1]:''; }
+      if(!action||(init&&init.keepalive)) return F.apply(this,arguments);
+      if(WRITE.test(action)){ cache.clear(); return F.apply(this,arguments); }
+      var key=url.replace(/([?&])(t|_|ts|nocache)=\d+/g,'$1')+'|'+body.replace(/"(requestId|REQUEST_ID|_t|ts|nonce)":"?[^,"}]*"?,?/g,'');
+      var hit=cache.get(key); if(hit&&Date.now()-hit.t<ttl(action)) return Promise.resolve(mk(hit.text));
+      if(flight.has(key)) return flight.get(key).then(function(t){ if(t===null) return F.call(window,input,init); return mk(t); });
+      var p=F.apply(this,arguments);
+      var share=p.then(function(r){ if(!r.ok) return null; return r.clone().text().then(function(t){
+          try{ var j=JSON.parse(t); if(j&&j.success!==false&&!j.error) cache.set(key,{t:Date.now(),text:t}); }catch(e){ return null; }
+          return t; }); },function(){ return null; });
+      flight.set(key,share); share.then(function(){ flight.delete(key); });
+      return p;
+    }catch(e){ return F.apply(this,arguments); }
+  };
+  w.__bnxDedupe=true; window.fetch=w;
+  window.bnxApiDedupeClear_=function(){ cache.clear(); };
+  if(cache.size>400) cache.clear();
+  setInterval(function(){ var n=Date.now(); cache.forEach(function(v,k){ if(n-v.t>600000) cache.delete(k); }); },60000);
+}catch(e){ try{console.warn('[api dedupe]',e);}catch(_){} }})();
+</script>
 <script id="bnx-speed-guard-20261018">
 /* SPEED GUARD (2026-10-18): ~120 background timers share one thread with every click. This wraps setInterval so that
    (1) fast timers (<10 s) skip a tick while the person is tapping/typing (last 300 ms) or the tab is hidden,
@@ -1991,6 +2032,14 @@ function bnxSanitizeDue_(action, res){
 }
 window.addEventListener('storage',function(e){if(e.key==='bnx_data_changed_'+bnxCurrentClient_()){BNX_READ_CACHE.clear();BNX_READ_GENERATION++;try{_bnxBillsCovered.length=0;}catch(x){}}});
 let _bnxWarnedNoSession = false;
+/* 2026-10-21: last person interaction (click / key / touch) — reads for the on-screen page are prioritised for 2 min after it */
+try{ ['pointerdown','keydown','touchstart'].forEach(function(ev){ document.addEventListener(ev,function(){ window.__bnxPageOpenedAt=Date.now(); },{capture:true,passive:true}); }); }catch(e){}
+function bnxOnScreenRead_(act){
+  const pg=(document.querySelector('.page.active')||{}).id||'';
+  return /^(page-reports|page-bills-list|page-dsr-reports|page-accounts-ledger|page-order-register|page-due-collection|page-customer-credit)$/.test(pg)
+    && /^(LIST_BILLS|GET_BILLS|GET_.*REPORT|GET_REPORT_|GET_GSTR|GET_DAY_BOOK|GET_SALES_|GET_CASHBOOK|GET_CASH_BANK|GET_PETTY_CASH|GET_DSR_|DSR_|GET_ACCOUNTS_|GET_DUE_|DUES_LIST|GET_CUSTOMER_|BILL_PAYMENTS|GET_ORDERS|GET_LEDGER|GET_TRIAL|GET_PROFIT|GET_STOCK|GET_PURCHASE|GET_SUPPLIER|GET_WASTAGE|GET_ONLINE_ORDER|GET_KOT_REGISTER|GET_RECON)/.test(act)
+    && (Date.now()-(window.__bnxPageOpenedAt||0))<120000;
+}
 async function gasApi(action, payload, endpoint) {
   /* While an import is running, only the heavy BACKGROUND reads wait (max 20 s, and never if the busy flag is older than 4 min).
      Reports / DSR requests (GET_DSR_*, DSR_*) are what the person is looking at — they are never held back. */
@@ -2018,7 +2067,12 @@ async function gasApi(action, payload, endpoint) {
       bnxCurrentSession_() + '|' + bnxCurrentClient_();
   } catch(e) {}
   if(!bnxIsReadOnlyAction_(action)&&!(payload.requestId||payload.REQUEST_ID))inflightKey='';
-  if (inflightKey && BNX_INFLIGHT_API.has(inflightKey)) return BNX_INFLIGHT_API.get(inflightKey);
+  if (inflightKey && BNX_INFLIGHT_API.has(inflightKey)) {
+    /* 2026-10-21: the screen now needs a read that a background warm-up already queued -> promote that queued task */
+    try{ const qt=window.__bnxInflightTask&&window.__bnxInflightTask.get(inflightKey); if(qt&&!qt.__prio&&!qt.__crit&&bnxOnScreenRead_(String(action||'').toUpperCase())){ qt.__prio=true; qt.__heavy=false;
+      const P=REQUEST_QUEUE.pending, ix=P.indexOf(qt); if(ix>=0){ P.splice(ix,1); let k=0; while(k<P.length&&(P[k].__crit||P[k].__prio))k++; P.splice(k,0,qt); if(qt.__retime) qt.__retime(); processRequestQueue(); } } }catch(_e){}
+    return BNX_INFLIGHT_API.get(inflightKey);
+  }
   const _bnxCacheable = !!inflightKey && bnxIsCacheableRead_(action);
   if (!_bnxCacheable) { if (!bnxIsReadOnlyAction_(action)) {BNX_READ_CACHE.clear(); BNX_READ_GENERATION++;} }
   else {
@@ -2090,24 +2144,31 @@ async function gasApi(action, payload, endpoint) {
        queue; slow background reads (ledgers, DSR, reports) may use at most 2 of the 5 parallel slots, so they can
        never hold up what is on screen ("Core is slow" with every card showing —). */
     const _act = String(action||'').toUpperCase();
-    if (/^(LIST_BILLS|GET_BILLS|GET_DASHBOARD_SUMMARY|GET_DAY_STATUS|GET_CLIENT_INFO|GET_CONFIG|GET_BOOTSTRAP|GET_POS_MENU|GET_MENU_ITEMS|GET_BAR_MENU|GET_ACTIVE_ORDERS|GET_TABLE_FLOOR|GET_TABLE_LAYOUT|GET_TAX_CONFIG|HEARTBEAT)$/.test(_act)
+    if (/^(LIST_BILLS|GET_BILLS|GET_STAFF_LIST|GET_DASHBOARD_SUMMARY|GET_DAY_STATUS|GET_CLIENT_INFO|GET_CONFIG|GET_BOOTSTRAP|GET_POS_MENU|GET_MENU_ITEMS|GET_BAR_MENU|GET_ACTIVE_ORDERS|GET_TABLE_FLOOR|GET_TABLE_LAYOUT|GET_TAX_CONFIG|HEARTBEAT)$/.test(_act)
         || (_act === 'GET_MASTER' && /^(item_master|bar_item_master)$/i.test(String((payload && payload.category) || '')))) task.__prio = true;   /* 2026-10-15: menu masters = POS menu basics */
-    else if (/^(GET_CUSTOMER_LEDGER|GET_DSR_|GET_DUE_COLLECTION|GET_.*_REPORT$|GET_GSTR|GET_DAY_BOOK|GET_CASHBOOK|GET_BAR_PERFORMANCE|GET_ACCOUNTS_DAY|RD_FETCH|GET_CRM_)/.test(_act)) task.__heavy = true;
+    else if (/^(GET_CUSTOMER_LEDGER|GET_DSR_|GET_DUE_COLLECTION|GET_.*_REPORT(_V\d+)?$|GET_GSTR|GET_DAY_BOOK|GET_CASHBOOK|GET_BAR_PERFORMANCE|GET_ACCOUNTS_DAY|RD_FETCH|GET_CRM_)/.test(_act)) task.__heavy = true;
+    /* 2026-10-21 ("instant report not generates"): a report the person just opened was queued as a BACKGROUND heavy
+       read (max 2 slots) behind DSR / dues / RD_FETCH warm-ups, never started within 30 s and failed with "Server busy".
+       Reads for the page that is ON SCREEN (Reports Hub, Bills List, DSR, Accounts) now go to the front of the queue. */
+    try{ if(!task.__prio && bnxOnScreenRead_(_act)){ task.__prio=true; task.__heavy=false; } }catch(_e){}
+    try{ if(inflightKey){ (window.__bnxInflightTask=window.__bnxInflightTask||new Map()).set(inflightKey,task); } }catch(_e){}
     if (critical) { task.__crit=true;let k=0;while(k<REQUEST_QUEUE.pending.length&&REQUEST_QUEUE.pending[k].__crit)k++;REQUEST_QUEUE.pending.splice(k,0,task); }
     else if (task.__prio) { let k = 0; while (k < REQUEST_QUEUE.pending.length && (REQUEST_QUEUE.pending[k].__crit || REQUEST_QUEUE.pending[k].__prio)) k++; REQUEST_QUEUE.pending.splice(k, 0, task); }
     else REQUEST_QUEUE.pending.push(task);
-    if (!critical) queueTimer = setTimeout(function(){
+    const _arm=function(ms){ clearTimeout(queueTimer); queueTimer = setTimeout(function(){
       const index=REQUEST_QUEUE.pending.indexOf(task);
       if(index<0)return;
       REQUEST_QUEUE.pending.splice(index,1);
-      resolve({success:false,timeout:true,queued:true,error:'Server busy: request did not start within 30s. Please retry.'});
+      resolve({success:false,timeout:true,queued:true,error:'Server busy: request did not start within '+Math.round(ms/1000)+'s. Please retry.'});
       processRequestQueue();
-    },30000);
+    },ms); };
+    task.__retime=function(){ _arm(90000); };
+    if (!critical) _arm(task.__prio?90000:30000);
     processRequestQueue();
   });
   if (inflightKey) {
     BNX_INFLIGHT_API.set(inflightKey, promise);
-    promise.finally(()=>{ if(BNX_INFLIGHT_API.get(inflightKey)===promise) BNX_INFLIGHT_API.delete(inflightKey); });
+    promise.finally(()=>{ if(BNX_INFLIGHT_API.get(inflightKey)===promise) BNX_INFLIGHT_API.delete(inflightKey); try{ window.__bnxInflightTask&&window.__bnxInflightTask.delete(inflightKey); }catch(_e){} });
   }
   if (_bnxCacheable) {
     promise.then(function(r){ if (r && r.success !== false && readGeneration===BNX_READ_GENERATION && requestClient===bnxCurrentClient_()) { try{ BNX_READ_CACHE.set(inflightKey, {t:Date.now(), r:structuredClone(r)}); }catch(e){} } });
@@ -14424,6 +14485,9 @@ window.addEventListener('pageshow', function(ev){
 //      flow is implemented below instead of a blind logout.
 function bnxDoLogoutNow_(){
   try{ localStorage.setItem('bnx_explicit_logout_at', String(Date.now())); localStorage.removeItem('bnx_sess_backup'); }catch(e){}
+  /* STAY-LOGIN 2026-10-21: the login stays valid on every device until this explicit Logout — tell the server so this token stops at once. */
+  try{ var _lt=(typeof bnxCurrentSession_==='function')?bnxCurrentSession_():''; var _lu=(typeof GAS_APIS_DASH!=='undefined'&&GAS_APIS_DASH.V2_CORE)||'';
+    if(_lt&&_lu) fetch(_lu,{method:'POST',keepalive:true,headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:'LOGOUT_SESSION',sessionToken:_lt})}).catch(function(){}); }catch(e){}
   try{
     var u = (typeof ERP!=='undefined' && ERP.getUser) ? ERP.getUser() : null;
     var loginId = u && (u.LOGIN_ID||u.loginId||u.EMAIL||u.MOBILE);
@@ -36332,7 +36396,9 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
   window.loadWaiterList = function(){
     const scope=String(typeof bnxCurrentClient_==='function'?bnxCurrentClient_():(typeof CLIENT_ID!=='undefined'?CLIENT_ID:''))+'|'+String(typeof bnxCurrentSession_==='function'?bnxCurrentSession_():'');
     const targets=['bm-bf-waiter','waiterSel'];
-    if(scope!==_staffScope){_staffScope=scope;_staffRows=[];_staffPending=null;}
+    if(scope!==_staffScope){_staffScope=scope;_staffRows=[];_staffPending=null;
+      /* 2026-10-21 ("steward name not show"): instant list from this device's last good USER_MASTER copy; the server refresh follows */
+      try{ const c=JSON.parse(localStorage.getItem('bnx_staff_cache_v1_'+String(typeof bnxCurrentClient_==='function'?bnxCurrentClient_():''))||'null'); if(c&&Array.isArray(c.rows)&&c.rows.length) _staffRows=c.rows; }catch(_e){} }
     function paint(staff,message){
       if(scope!==_staffScope)return;
       targets.forEach(id=>{
@@ -36345,7 +36411,7 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
       });
     }
     if(_staffPending)return _staffPending;
-    paint(_staffRows,_staffRows.length?'':'Select Steward — refreshing staff');
+    paint(_staffRows,_staffRows.length?'':'Loading stewards…');
     const pending=Promise.resolve().then(async function(){
       try{
         const res=await gasApi('GET_STAFF_LIST',{roles:['STEWARD','WAITER','CAPTAIN']},'V2_CORE');
@@ -36353,7 +36419,9 @@ document.addEventListener('DOMContentLoaded', warmBillingCache, { once: true });
         let rows=arrayFrom(res,['staff','users','userMaster','USER_MASTER','rows']);
         if(rows.length&&Array.isArray(rows[0])){const head=rows[0].map(x=>txt(x).toUpperCase());rows=rows.slice(1).map(r=>{const o={};head.forEach((h,i)=>{if(h)o[h]=r[i];});return o;});}
         if(scope!==_staffScope)return;
-        _staffRows=normalizeStaff(rows);
+        const _fresh=normalizeStaff(rows);
+        if(_fresh.length||!_staffRows.length) _staffRows=_fresh;
+        try{ if(_fresh.length) localStorage.setItem('bnx_staff_cache_v1_'+String(typeof bnxCurrentClient_==='function'?bnxCurrentClient_():''),JSON.stringify({t:Date.now(),rows:_fresh})); }catch(_e){}
         paint(_staffRows,_staffRows.length?'':'No steward found in USER_MASTER');
       }catch(e){
         if(scope!==_staffScope)return;
@@ -56884,7 +56952,7 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
 (function(){
   'use strict';
   var W=window;
-  var TTL=10000, cache=new Map(), pending=new Map(), stats={}, lastOk=0, started=Date.now();
+  var TTL=10000, cache=new Map(), pending=new Map(), running=new Map(), stats={}, lastOk=0, started=Date.now();
   /* 2026-10-09 SPEED ROOT FIX ("sync then all system delay"): 48 calls/min from ONE dashboard queued every request on
      Apps Script (25-30 s each). (a) master data was re-downloaded every 10 s, (b) EVERY save (KOT, order, table)
      wiped the whole cache so the item master downloaded again, (c) hidden background tabs kept polling.
@@ -56920,6 +56988,11 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
       if(!isRead){ if(masterWrite(A)){ cache.clear(); idbClear(); } else cache.forEach(function(v,kk){ if(!MASTER.test(v.a||'')) cache.delete(kk); }); }
       else{
         k=key(A,p,e);
+        /* 2026-10-21 ROOT FIX ("report not generates / loading forever"): wrap() re-runs every second for 30 s, so this
+           governor sits in the gasApi chain 2-3 times with other layers between. All copies share `pending`: the OUTER
+           copy registered the call, the INNER copy found it in `pending` and awaited it — the request waited on itself
+           and never reached the server. An inner copy now passes a call that an outer copy is already running straight through. */
+        if(k && running.get(k)) return base.call(this,a,p,e);
         var c=k&&cache.get(k);
         if(c && Date.now()-c.t<(c.ttl||TTL) && !(W.__bnxMenuLiveNow&&W.__bnxMenuLiveNow(A,k))){ s.hit++; return c.r; }
         if(c && document.hidden && Date.now()-c.t<300000 && !(W.__bnxMenuLiveNow&&W.__bnxMenuLiveNow(A,k))){ s.hit++; return c.r; }   /* background tab: last copy, no server call */
@@ -56945,8 +57018,10 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
     };
     async function run(A,a,p,e,s,isRead,k){
       var t0=performance.now(), r;
+      if(k) running.set(k,(running.get(k)||0)+1);
       try{ r=await base.call(this,a,p,e); }
       catch(err){ s.n++; s.fail++; throw err; }
+      finally{ if(k){ var n=(running.get(k)||1)-1; if(n>0) running.set(k,n); else running.delete(k); } }
       var ms=performance.now()-t0; s.n++; s.ms+=ms; if(ms>s.max) s.max=ms; if(isRead){ recent.push(ms); if(recent.length>10) recent.shift(); }
       var ok=!!(r&&r.success!==false);
       if(ok){ lastOk=Date.now(); if(isRead&&k){ cache.set(k,{t:Date.now(),r:r,a:A,ttl:ttlFor(A)}); try{ W.__bnxMenuFresh&&W.__bnxMenuFresh(A,k); }catch(_m){} if(MASTER.test(A)) idbPut('m|'+k,{t:Date.now(),r:r}); } } else s.fail++;
@@ -57175,12 +57250,16 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
       try{ var r=indexedDB.open('bnx_rpt_swr',1);
         r.onupgradeneeded=function(){ r.result.createObjectStore('r'); };
         r.onsuccess=function(){ res(r.result); }; r.onerror=function(){ res(null); };
+        r.onblocked=function(){ res(null); };   /* 2026-10-21: another tab held the DB -> reports used to hang forever */
+        setTimeout(function(){ res(null); },1500);
       }catch(e){ res(null); }
     });
     return dbP;
   }
   function idb(mode,fn){ return db().then(function(d){ if(!d) return null; return new Promise(function(res){ try{ var t=d.transaction('r',mode), st=t.objectStore('r'), q=fn(st); t.oncomplete=function(){ res(q&&q.result); }; t.onerror=t.onabort=function(){ res(null); }; }catch(e){ res(null); } }); }); }
-  function getE(k){ var m=MEM.get(k); if(m) return Promise.resolve(m); return idb('readonly',function(st){ return st.get(k); }).then(function(v){ if(v&&Date.now()-v.t<MAX_AGE){ MEM.set(k,v); return v; } return null; }); }
+  function getE(k){ var m=MEM.get(k); if(m) return Promise.resolve(m);
+    /* never let the device cache hold up a live report: 1.2 s max, then go to the server */
+    return Promise.race([idb('readonly',function(st){ return st.get(k); }),new Promise(function(r){ setTimeout(function(){ r(null); },1200); })]).then(function(v){ if(v&&Date.now()-v.t<MAX_AGE){ MEM.set(k,v); return v; } return null; },function(){ return null; }); }
   function putE(k,r){ var v={t:Date.now(),r:r,j:JSON.stringify(r)}; MEM.set(k,v); idb('readwrite',function(st){ return st.put(v,k); }); return v; }
   function clearAll(){ MEM.clear(); idb('readwrite',function(st){ return st.clear(); }); try{ W.BNX_REPORT_ENGINE&&W.BNX_REPORT_ENGINE.clear(); }catch(e){} }
   W.bnxReportCacheClear_=clearAll;
@@ -67693,7 +67772,7 @@ html body #page-pos .cart-body .ci {height:auto!important; min-height:49px!impor
    Same layout as the counter's Order Management screen: category rail with round photos on the left,
    filter chips + item cards in the middle, orange order header / item cards / yellow
    Place Order (Alt+A) · Bill and Print (Alt+B) on the right. Desktop / counter PC only (≥ 1000 px);
-   phones keep the existing layout. Switch back any time: "🎨 Classic look" in the action bar. */
+   phones keep the existing layout. (Classic look toggle removed 2026-10-21.) */
 html body.bnx-eb #page-pos#page-pos{--eb-or:#f39a1e;--eb-or2:#f7b733;--eb-ye:#f6c514;--eb-bg:#f1f2f5;--eb-ink:#1f2937;--eb-mut:#6b7280;--eb-line:#e5e7eb;}
 html body.bnx-eb #page-pos#page-pos .qa-panel{display:flex!important;flex-wrap:wrap!important;gap:6px!important;padding:6px 8px!important;margin:0 0 8px!important;background:#fff!important;border:1px solid var(--eb-line)!important;border-radius:12px!important;box-shadow:0 1px 3px rgba(0,0,0,.05)!important;}
 html body.bnx-eb #page-pos#page-pos .qa-panel .qa-btn{display:inline-flex!important;flex-direction:row!important;align-items:center!important;gap:5px!important;min-height:32px!important;padding:5px 11px!important;font:700 11.5px/1.1 'DM Sans',system-ui,sans-serif!important;color:var(--eb-ink)!important;background:#fff!important;border:1px solid var(--eb-line)!important;border-radius:8px!important;box-shadow:none!important;width:auto!important;}
@@ -67786,14 +67865,15 @@ html body.bnx-eb #bnxEbActions{display:grid;grid-template-columns:1fr 1fr;gap:8p
 #bnxEbActions button:hover{filter:brightness(.96);}
 #bnxEbActions button:disabled{opacity:.55;cursor:wait;}
 #bnxEbActions .eb-hold{grid-column:1/-1;background:#fff;border:1px solid var(--eb-line);box-shadow:none;padding:8px;font-size:11.5px;}
-#bnxEbSkinBtn.qa-btn{border-style:dashed!important;}
+#bnxEbSkinBtn{display:none!important;}
 </style>
 <script id="bnx-pos-eb-skin-js-20261014">
 (function(){
   'use strict';
   var W=window, D=document;
   function cid(){ try{ return String((typeof CLIENT_ID!=='undefined'&&CLIENT_ID)||'default'); }catch(e){ return 'default'; } }
-  function skinOn(){ try{ return localStorage.getItem('bnx_pos_skin_'+cid())!=='classic'; }catch(e){ return true; } }
+  /* 2026-10-21: "Classic look" switch removed — the Order Management look is the only POS look (old classic toggle retired). */
+  function skinOn(){ try{ localStorage.removeItem('bnx_pos_skin_'+cid()); }catch(e){} return true; }
   function wide(){ return (W.innerWidth||1200)>=1000; }
   function esc(v){ return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
   function up(v){ return String(v==null?'':v).trim().toUpperCase(); }
@@ -67839,7 +67919,7 @@ html body.bnx-eb #bnxEbActions{display:grid;grid-template-columns:1fr 1fr;gap:8p
       }
     }
     var qa=D.getElementById('qaPanel');
-    if(qa&&!D.getElementById('bnxEbSkinBtn')){ var sb=D.createElement('button'); sb.type='button'; sb.id='bnxEbSkinBtn'; sb.className='qa-btn'; sb.onclick=function(){ toggleSkin(); }; qa.appendChild(sb); }
+    { var oldSb=D.getElementById('bnxEbSkinBtn'); if(oldSb&&oldSb.parentNode) oldSb.parentNode.removeChild(oldSb); }
     return true;
   }
   function act(what,btn){
@@ -67909,7 +67989,7 @@ html body.bnx-eb #bnxEbActions{display:grid;grid-template-columns:1fr 1fr;gap:8p
     if(sm.__h!==html){ sm.innerHTML=html; sm.__h=html; }
     if(!D.getElementById('bnxEbColHead')){ var ch=D.createElement('div'); ch.id='bnxEbColHead'; ch.innerHTML='<span>Item / Rate</span><span>Qty</span><span>Amount</span><span></span>'; sm.parentNode.insertBefore(ch,sm.nextSibling); }
   }
-  function paintBtn(){ var b=D.getElementById('bnxEbSkinBtn'); if(b) b.innerHTML='<span class="qa-ic">🎨</span>'+(skinOn()?'Classic look':'New look'); }
+  function paintBtn(){}
   function paint(){
     var on=skinOn()&&wide();
     D.body.classList.toggle('bnx-eb',on);
@@ -67921,7 +68001,6 @@ html body.bnx-eb #bnxEbActions{display:grid;grid-template-columns:1fr 1fr;gap:8p
     paintRail(); paintChips(); paintHead(); paintSummary();
   }
   function toggleSkin(){
-    try{ localStorage.setItem('bnx_pos_skin_'+cid(),skinOn()?'classic':'new'); }catch(e){}
     paint(); try{ if(typeof W.buildMenu==='function') W.buildMenu(); }catch(e){}
   }
   /* clicks */
@@ -71994,6 +72073,183 @@ setInterval(function(){hook();refresh();},30000);
   setTimeout(render,1500);
 })();
 </script>
+<style id="bnx-pulse-banner-20261021">
+/* ═══ DASHBOARD PULSE BANNER (2026-10-21 v2: slim + light) — one compact, live Target / Achievement banner.
+   Replaces the tall hero banner, the cramped Target chip in the DATE / PERIOD bar and the block in the quick-button row. */
+html body:not(#_pb) #bnxHeroTargetStrip#bnxHeroTargetStrip,html body:not(#_pb) #bnxTopTarget#bnxTopTarget,html body:not(#_pb) #heroBannerWrap{display:none!important}
+#bnxPulse{--pb-ink:#fff;--pb-mut:rgba(255,236,214,.78);--pb-line:rgba(255,220,180,.22);--pb-gold:#ffc14d;--pb-good:#5ef0a0;--pb-warn:#ffd36b;--pb-bad:#ffb0a3;
+  position:relative;display:grid;grid-template-columns:minmax(220px,300px) minmax(0,1fr) auto;align-items:center;gap:14px;
+  margin:0 0 10px;padding:6px 12px;min-height:0;border-radius:12px;color:var(--pb-ink);overflow:hidden;isolation:isolate;
+  background:linear-gradient(110deg,#5a1f05 0%,#8a3608 45%,#b9560c 80%,#d9740f 100%);border:1px solid rgba(255,190,120,.25);
+  box-shadow:0 2px 10px -4px rgba(120,50,5,.45);font-family:'DM Sans',system-ui,-apple-system,'Segoe UI',sans-serif}
+#bnxPulse .pb-bgs{position:absolute;inset:0;z-index:-1;overflow:hidden;border-radius:inherit}
+#bnxPulse .pb-bgs i{position:absolute;inset:-6%;background-size:cover;background-position:center;opacity:0;transform:scale(1.06);transition:opacity 1.4s ease,transform 9s ease-out}
+#bnxPulse .pb-bgs i.on{opacity:1;transform:scale(1)}
+#bnxPulse .pb-bgs::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,rgba(90,31,5,.94) 0%,rgba(122,46,7,.86) 45%,rgba(160,72,10,.72) 75%,rgba(200,100,14,.55) 100%)}
+#bnxPulse .pb-brand{display:flex;align-items:center;gap:9px;min-width:0}
+#bnxPulse .pb-logo{flex:0 0 34px;width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;overflow:hidden;
+  background:linear-gradient(135deg,#ffb733,#e8860b);box-shadow:0 0 0 1px rgba(255,255,255,.25)}
+#bnxPulse .pb-logo img{width:100%;height:100%;object-fit:cover;background:#fff}
+#bnxPulse .pb-logo span{font-size:17px!important;font-weight:900;color:#fff}
+#bnxPulse .pb-name{font-size:13.5px;font-weight:800;line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#bnxPulse .pb-meta{display:flex;align-items:center;gap:6px;margin-top:2px;min-width:0}
+#bnxPulse .pb-pill{display:inline-flex;align-items:center;height:17px;padding:0 7px;border-radius:999px;font-size:10px;font-weight:700;
+  background:rgba(255,255,255,.12);border:1px solid var(--pb-line);color:var(--pb-mut);white-space:nowrap;cursor:pointer;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+#bnxPulse .pb-pill.open{color:#c9f7dc;border-color:rgba(94,240,160,.4);background:rgba(94,240,160,.14)}
+#bnxPulse .pb-pill.closed{color:#ffe0da;border-color:rgba(255,176,163,.45);background:rgba(255,120,100,.18)}
+#bnxPulse .pb-live{display:inline-flex;align-items:center;gap:4px;font-size:9.5px;font-weight:700;letter-spacing:.06em;color:var(--pb-mut);text-transform:uppercase;white-space:nowrap}
+#bnxPulse .pb-dot{width:6px;height:6px;border-radius:50%;background:#22b765;animation:pbPing 2s infinite}
+#bnxPulse.stale .pb-dot{background:#a8a29e;animation:none}
+@keyframes pbPing{0%{box-shadow:0 0 0 0 rgba(34,183,101,.5)}70%{box-shadow:0 0 0 6px rgba(34,183,101,0)}100%{box-shadow:0 0 0 0 rgba(34,183,101,0)}}
+#bnxPulse .pb-goal{display:flex;align-items:center;gap:12px;min-width:0;padding:0 14px;border-left:1px solid var(--pb-line);border-right:1px solid var(--pb-line)}
+#bnxPulse .pb-ring{flex:0 0 40px;width:40px;height:40px;position:relative}
+#bnxPulse .pb-ring svg{width:100%;height:100%;transform:rotate(-90deg)}
+#bnxPulse .pb-ring circle{fill:none;stroke-width:6}
+#bnxPulse .pb-ring .bg{stroke:rgba(255,255,255,.18)}
+#bnxPulse .pb-ring .fg{stroke:var(--pb-c,var(--pb-gold));stroke-linecap:round;transition:stroke-dashoffset .8s cubic-bezier(.2,.8,.2,1),stroke .3s}
+#bnxPulse .pb-ring b{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:900;font-variant-numeric:tabular-nums;color:var(--pb-c,var(--pb-ink))}
+#bnxPulse .pb-gbody{flex:1 1 auto;min-width:0}
+#bnxPulse .pb-row{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
+#bnxPulse .pb-row>div{display:flex;align-items:baseline;gap:6px;min-width:0}
+#bnxPulse .pb-k{font-size:9.5px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--pb-mut);white-space:nowrap}
+#bnxPulse .pb-v{font-size:16px;font-weight:900;line-height:1.15;font-variant-numeric:tabular-nums;white-space:nowrap}
+#bnxPulse .pb-bar{position:relative;height:6px;margin:4px 0 3px;border-radius:99px;background:rgba(255,255,255,.18);overflow:hidden}
+#bnxPulse .pb-bar i{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:inherit;background:linear-gradient(90deg,#ffc14d,var(--pb-c,#ffc14d));transition:width .8s cubic-bezier(.2,.8,.2,1)}
+#bnxPulse .pb-foot{display:flex;gap:4px 12px;flex-wrap:wrap;font-size:10.5px;color:var(--pb-mut);font-weight:600;line-height:1.2}
+#bnxPulse .pb-foot b{color:var(--pb-ink);font-weight:800}
+#bnxPulse .pb-foot .ok{color:var(--pb-good)} #bnxPulse .pb-foot .bad{color:var(--pb-bad)}
+#bnxPulse .pb-side{display:flex;align-items:center;gap:8px}
+#bnxPulse .pb-mini{display:flex;flex-direction:column;gap:0;padding:3px 10px;border-radius:9px;background:rgba(255,255,255,.10);border:1px solid var(--pb-line);min-width:62px}
+#bnxPulse .pb-mini .pb-k{font-size:8.5px}
+#bnxPulse .pb-mini .pb-v{font-size:14px}
+#bnxPulse .pb-btn{all:unset;box-sizing:border-box;cursor:pointer;display:inline-flex;align-items:center;gap:5px;height:30px;padding:0 12px;border-radius:9px;font-size:12px;font-weight:800;
+  color:#4a1a03;background:linear-gradient(180deg,#ffd36b,#ffb21f);box-shadow:0 1px 4px rgba(0,0,0,.25);white-space:nowrap}
+#bnxPulse .pb-btn:hover{filter:brightness(1.05)} #bnxPulse .pb-btn:focus-visible{outline:2px solid #fff;outline-offset:2px}
+#bnxPulse.loading .pb-v,#bnxPulse.loading .pb-ring b{opacity:.5}
+html[data-theme="dark"] #bnxPulse,body.dark #bnxPulse,body.dark-mode #bnxPulse{--pb-ink:#f6ead9;--pb-mut:#c4a98c;--pb-line:rgba(255,200,140,.18);background:linear-gradient(110deg,#3a2614,#4a2f16 60%,#5c3a18)}
+html[data-theme="dark"] #bnxPulse .pb-bgs::after,body.dark #bnxPulse .pb-bgs::after,body.dark-mode #bnxPulse .pb-bgs::after{background:linear-gradient(90deg,rgba(58,38,20,.95),rgba(74,47,22,.78))}
+html[data-theme="dark"] #bnxPulse .pb-mini,html[data-theme="dark"] #bnxPulse .pb-pill,body.dark #bnxPulse .pb-mini,body.dark #bnxPulse .pb-pill{background:rgba(255,255,255,.08)}
+@media (max-width:1180px){ #bnxPulse{grid-template-columns:minmax(0,1fr) auto;row-gap:6px} #bnxPulse .pb-goal{grid-column:1/-1;grid-row:2;border:0;border-top:1px solid var(--pb-line);padding:6px 0 0} }
+@media (max-width:640px){
+  #bnxPulse{grid-template-columns:minmax(0,1fr);gap:6px;padding:8px 10px;margin:0 0 8px}
+  #bnxPulse .pb-goal{grid-row:auto}
+  #bnxPulse .pb-v{font-size:14px}
+  #bnxPulse .pb-row{flex-wrap:wrap;row-gap:0}
+  #bnxPulse .pb-ring{flex-basis:38px;width:38px;height:38px}
+  #bnxPulse .pb-bgs::after{background:linear-gradient(180deg,rgba(90,31,5,.92),rgba(140,56,9,.88))}
+  #bnxPulse .pb-side{display:grid;grid-template-columns:1fr 1fr auto;gap:6px}
+  #bnxPulse .pb-mini{min-width:0}
+}
+@media (prefers-reduced-motion:reduce){#bnxPulse .pb-bgs i{transition:none;transform:none}}
+@media print{#bnxPulse{display:none!important}}
+</style>
+<script id="bnx-pulse-banner-js-20261021">
+(function(){
+  'use strict';
+  var D=document, W=window, C=2*Math.PI*25, last='', changedAt=0;
+  function $(id){ return D.getElementById(id); }
+  function t(id){ var e=$(id); return e?String(e.textContent||'').replace(/\s+/g,' ').trim():''; }
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+  function num(s){ var n=Number(String(s||'').replace(/[^0-9.-]/g,'')); return isFinite(n)?n:0; }
+  function money0(n){ return '₹'+Math.round(Number(n)||0).toLocaleString('en-IN'); }
+  function build(){
+    var pg=$('page-dashboard'); if(!pg) return null;
+    var b=$('bnxPulse');
+    if(!b){
+      b=D.createElement('section'); b.id='bnxPulse'; b.className='loading'; b.setAttribute('aria-label','Sales target and achievement');
+      b.innerHTML='<div class="pb-brand"><div class="pb-logo" id="pbLogo"></div><div style="min-width:0"><div class="pb-name" id="pbName">Restaurant</div>'
+        +'<div class="pb-meta"><span class="pb-pill" id="pbDay" title="Business day">…</span><span class="pb-live"><i class="pb-dot"></i><span id="pbUpd">Live</span></span></div></div></div>'
+        +'<div class="pb-goal"><div class="pb-ring" aria-hidden="true"><svg viewBox="0 0 60 60"><circle class="bg" cx="30" cy="30" r="25"/><circle class="fg" id="pbRingFg" cx="30" cy="30" r="25" stroke-dasharray="'+C.toFixed(2)+'" stroke-dashoffset="'+C.toFixed(2)+'"/></svg><b id="pbPct">—</b></div>'
+        +'<div class="pb-gbody"><div class="pb-row"><div><div class="pb-k" id="pbLabel">Today\'s Target</div><div class="pb-v" id="pbTarget">—</div></div>'
+        +'<div><div class="pb-k">Achieved</div><div class="pb-v" id="pbActual">—</div></div></div>'
+        +'<div class="pb-bar" role="progressbar" aria-label="Target achievement" aria-valuemin="0" aria-valuemax="100" id="pbBar"><i id="pbBarFill"></i></div>'
+        +'<div class="pb-foot"><span id="pbRemain">—</span><span id="pbPace"></span></div></div></div>'
+        +'<div class="pb-side"><div class="pb-mini"><span class="pb-k">Bills</span><span class="pb-v" id="pbBills">—</span></div>'
+        +'<div class="pb-mini"><span class="pb-k">Avg Bill</span><span class="pb-v" id="pbAvg">—</span></div>'
+        +'<button type="button" class="pb-btn" id="pbEdit" title="Set daily / monthly / yearly sales target">✎ Target</button></div>';
+      var bgs=D.createElement('div'); bgs.className='pb-bgs'; bgs.setAttribute('aria-hidden','true'); bgs.innerHTML='<i></i><i></i>'; b.insertBefore(bgs,b.firstChild);
+      b.querySelector('#pbEdit').addEventListener('click',function(){ var e=$('bnxHeroTargetEdit'); if(e) e.click(); else if(typeof W.bnxOpenTargetDialog==='function') W.bnxOpenTargetDialog(); });
+      b.querySelector('#pbDay').addEventListener('click',function(){ var e=$('dayStatusBadge'); if(e) e.click(); });
+    }
+    var anchor=$('bnxDashQuick');
+    var want=anchor&&anchor.parentNode===pg?anchor:null;
+    if(want){ if(b.nextElementSibling!==want||b.parentNode!==pg) pg.insertBefore(b,want); }
+    else if(b.parentNode!==pg) pg.insertBefore(b,pg.firstChild);
+    return b;
+  }
+  function brand(b){
+    var ri={}; try{ ri=(typeof W.bnxGetRestaurantInfo==='function'?W.bnxGetRestaurantInfo():{})||{}; }catch(e){}
+    var name=ri.displayName||ri.name||t('heroRestaurantName')||'Restaurant';
+    var n=$('pbName'); if(n&&n.textContent!==name) n.textContent=name;
+    var lg=$('pbLogo'), src=ri.logoUrl||ri.logoLocal||ri.logoDataUrl||'';
+    if(!src){ try{ var bk=JSON.parse(localStorage.getItem('erp_restaurant_brand_'+(W.CLIENT_ID||'default'))||'null')||{}; src=bk.logoLocal||bk.logoDataUrl||bk.logoUrl||''; }catch(e){} }
+    if(!src){ var hi=D.querySelector('#heroLogo img'); if(hi) src=hi.getAttribute('src')||''; }
+    var key=src||('L:'+name.charAt(0));
+    if(lg&&lg.__k!==key){ lg.__k=key; lg.innerHTML=src?'<img alt="" src="'+esc(src)+'">':'<span>'+esc(name.charAt(0).toUpperCase())+'</span>';
+      var im=lg.querySelector('img'); if(im) im.onerror=function(){ lg.__k=''; lg.innerHTML='<span>'+esc(name.charAt(0).toUpperCase())+'</span>'; }; }
+  }
+  function sync(){
+    var b=build(); if(!b) return;
+    brand(b);
+    var day=t('dayStatusBadge')||t('heroDayBadgeTxt')||'Business day';
+    var dp=$('pbDay'); if(dp){ var dd=day.replace(/\s*\(\d{4}-\d{2}-\d{2}\)\s*/,' ').replace(/\s*·\s*Tap to[^·]*$/i,'').trim(); dp.title=day+' — tap to open the business day panel'; if(dp.textContent!==dd) dp.textContent=dd;
+      dp.className='pb-pill '+(/open|started|running|live/i.test(day)&&!/not started|closed/i.test(day)?'open':/closed|not started/i.test(day)?'closed':''); }
+    var label=(function(){ var s=$('bnxHeroTargetStrip'); var l=s&&s.querySelector('.bnx-ht'); return l?l.textContent.trim():"Today's Target"; })();
+    var target=t('bnxHeroTarget'), actual=t('bnxHeroActual'), pctTxt=t('bnxHeroAchievement'), rem=t('bnxHeroRemaining'), pace=t('bnxHeroSub');
+    var bills=t('d-ord'), avg=t('d-avgbill');
+    var sig=[label,target,actual,pctTxt,rem,pace,bills,avg,day].join('|');
+    if(sig===last){ var age=changedAt?Math.round((Date.now()-changedAt)/60000):0; b.classList.toggle('stale',age>=10); return; }
+    last=sig; changedAt=Date.now();
+    var ready=/[0-9]/.test(actual), pct=ready?num(pctTxt):0;
+    b.classList.toggle('loading',!ready); b.classList.remove('stale');
+    var col=pct>=100?'var(--pb-good)':pct>=75?'var(--pb-warn)':'var(--pb-bad)';
+    b.style.setProperty('--pb-c',ready?col:'var(--pb-gold)');
+    var set=function(id,v){ var e=$(id); if(e&&e.textContent!==v) e.textContent=v; };
+    set('pbLabel',label); set('pbTarget',target||'—'); set('pbActual',ready?actual:'—'); set('pbPct',ready?(pct>=1000?Math.round(pct)+'%':pct.toFixed(pct>=100?0:1)+'%'):'—');
+    var fg=$('pbRingFg'); if(fg) fg.setAttribute('stroke-dashoffset',(C*(1-Math.max(0,Math.min(100,pct))/100)).toFixed(2));
+    var bf=$('pbBarFill'); if(bf) bf.style.width=Math.max(0,Math.min(100,pct))+'%';
+    var bar=$('pbBar'); if(bar) bar.setAttribute('aria-valuenow',String(Math.round(Math.min(100,pct))));
+    var re=$('pbRemain'); if(re){ var good=/exceed|achieved/i.test(rem); re.innerHTML=ready?('<b class="'+(good?'ok':'')+'">'+esc(rem||'')+'</b>'):'Waiting for live sales…'; }
+    var pc=$('pbPace'); if(pc){ pc.innerHTML=pace?esc(pace).replace(/(Ahead [^·]+)/,'<b class="ok">$1</b>').replace(/(Behind [^·]+)/,'<b class="bad">$1</b>'):''; }
+    set('pbBills',/[0-9]/.test(bills)?bills:'—');
+    set('pbAvg',/[0-9]/.test(avg)?money0(num(avg)):'—');
+    var up=$('pbUpd'); if(up){ var d=new Date(); up.textContent='Live · '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'); }
+  }
+  /* ---- auto-changing banner image ---- */
+  var GRADS=['linear-gradient(115deg,#0f0500,#4a1800 30%,#9b3d00 60%,#d4720a 85%,#f5a623)','linear-gradient(115deg,#1a0a2e,#4a1259 35%,#8a2f6e 65%,#c94f7c 90%,#e88a6e)',
+    'linear-gradient(115deg,#031420,#0d3b4f 30%,#1a6b7d 60%,#4a9b8e 85%,#e8b04f)','linear-gradient(115deg,#170a03,#3d1f0a 30%,#6b3a10 60%,#a85c1a 85%,#d4a04a)',
+    'linear-gradient(115deg,#0a0511,#2e1145 30%,#5c1e5e 60%,#9b2d5e 85%,#d4574a)','linear-gradient(115deg,#0d1017,#1c2b3d 30%,#2f4d5e 60%,#5a7a6e 85%,#c9a84f)'];
+  var pics=[], picsAt=0, slide=0, ok={};
+  function itemImg(it){ try{ var u=typeof W.bnxResolveItemImageUrl_==='function'?W.bnxResolveItemImageUrl_(it):''; if(u) return u; }catch(e){}
+    return String((it&&(it.imageUrl||it.productImageUrl||it.PRODUCT_IMAGE_URL||it.IMAGE_URL||it.ITEM_IMAGE||it.image))||'').trim(); }
+  function collect(){
+    if(pics.length>=4&&Date.now()-picsAt<600000) return;
+    var src=[]; try{ src=(Array.isArray(W.menuData)&&W.menuData.length?W.menuData:(Array.isArray(W.MENU)?W.MENU:[])); }catch(e){}
+    var seen={}, out=[];
+    for(var i=0;i<src.length&&out.length<24;i++){ var u=itemImg(src[i]); if(u&&/^(https?:|data:image|blob:|\/)/.test(u)&&!seen[u]){ seen[u]=1; out.push(u); } }
+    for(var k=out.length-1;k>0;k--){ var j=Math.floor(Math.random()*(k+1)), t0=out[k]; out[k]=out[j]; out[j]=t0; }
+    pics=out.slice(0,12); picsAt=Date.now();
+  }
+  function rotate(){
+    var b=$('bnxPulse'); if(!b) return; var L=b.querySelectorAll('.pb-bgs i'); if(L.length<2) return;
+    collect();
+    var next=L[slide%2], cur=L[(slide+1)%2], n=pics.length;
+    var show=function(bg){ next.style.backgroundImage=bg; next.classList.add('on'); cur.classList.remove('on'); slide++; };
+    if(n){ var u=pics[slide%n]; if(ok[u]===false){ pics=pics.filter(function(x){return x!==u;}); return rotate(); }
+      if(ok[u]) show('url("'+u.replace(/"/g,'%22')+'")');
+      else { var im=new Image(); im.onload=function(){ ok[u]=true; show('url("'+u.replace(/"/g,'%22')+'")'); }; im.onerror=function(){ ok[u]=false; show(GRADS[slide%GRADS.length]); }; im.src=u; } }
+    else show(GRADS[slide%GRADS.length]);
+  }
+  setInterval(function(){ var p=$('page-dashboard'); if(p&&p.classList.contains('active')&&!D.hidden) rotate(); },7000);
+  function boot(){ try{ if(typeof W.bnxRenderPeriodTarget==='function') W.bnxRenderPeriodTarget(); }catch(e){} sync(); if(!slide) rotate(); }
+  if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',boot); else boot();
+  W.addEventListener('load',function(){ setTimeout(boot,500); setTimeout(boot,2500); });
+  W.addEventListener('bnx:date-range-change',function(){ setTimeout(boot,50); });
+  setInterval(function(){ var p=$('page-dashboard'); if(p&&p.classList.contains('active')&&!D.hidden) sync(); },1000);
+  W.bnxPulseSync=sync;
+})();
+</script>
+
 </body></html>
 
 <style id="bnx-achievement-actual-fix">
