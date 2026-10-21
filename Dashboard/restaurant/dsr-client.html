@@ -529,7 +529,18 @@ const BNX_API_FLIGHT_=new Map(), BNX_API_CACHE_=new Map();
    shared Apps Script; all of them queued, hit the 60 s abort, and each was auto-retried (doubling the load).
    Now at most 2 requests are on the wire at once; the rest wait their turn (timeout starts only when sent). */
 var BNX_NET_MAX_=2, BNX_NET_ACTIVE_=0; const BNX_NET_WAIT_=[];
-function bnxNetSlot_(){ return new Promise(function(res){ if(BNX_NET_ACTIVE_<BNX_NET_MAX_){BNX_NET_ACTIVE_++;res();} else BNX_NET_WAIT_.push(res); }); }
+function bnxNetSlot_(){ return new Promise(function(res,reject){
+  if(BNX_NET_ACTIVE_<BNX_NET_MAX_){BNX_NET_ACTIVE_++;res();return;}
+  let timer;
+  const grant=function(){clearTimeout(timer);res();};
+  BNX_NET_WAIT_.push(grant);
+  timer=setTimeout(function(){
+    const i=BNX_NET_WAIT_.indexOf(grant);if(i<0)return;
+    BNX_NET_WAIT_.splice(i,1);
+    const error=new Error('Report server busy: request did not start within 30s. Please retry.');
+    error.name='AbortError';reject(error);
+  },30000);
+}); }
 function bnxNetRelease_(){ var n=BNX_NET_WAIT_.shift(); if(n) n(); else BNX_NET_ACTIVE_=Math.max(0,BNX_NET_ACTIVE_-1); }
 function bnxApiKey_(a,p,e){try{var target=getClientId_()||CLIENT_ID;var ctx=bnxGetAuthContexts_().find(c=>!c.client||c.client===target)||{};return JSON.stringify([e||'V2_CORE',a,ctx.client||getClientId_()||CLIENT_ID,ctx.token||'',p||{}]);}catch(x){return '';}}
 function bnxApiTtl_(p){var t=(typeof bnxToday_==='function')?bnxToday_():'';var s=JSON.stringify(p||{});var ds=s.match(/\d{4}-\d{2}-\d{2}/g)||[];var touchesToday=!ds.length||ds.some(function(d){return d>=t;});if(!touchesToday&&p&&p.year&&p.month){var n=new Date();touchesToday=(+p.year===n.getFullYear()&&+p.month===n.getMonth()+1);}return touchesToday?45000:600000;}
@@ -625,7 +636,7 @@ async function gasApiRaw_(action,payload,endpoint){
       
       /* 60s hard timeout so a slow/dead server can never freeze the report screen */
       await bnxNetSlot_();
-      const _ac=new AbortController(); const _t=isRead?null:setTimeout(()=>{try{_ac.abort();}catch(_){}},_heavy?120000:60000);
+      const _ac=new AbortController(); const _t=setTimeout(()=>{try{_ac.abort();}catch(_){}},isRead?(_heavy?90000:45000):(_heavy?120000:60000));
       let r,j; try{
         r=await fetch(url,{
           method:'POST',
@@ -672,12 +683,12 @@ async function gasApiRaw_(action,payload,endpoint){
       /* BNX FIX 2026-10-05b: a heavy report that hit our 120 s timeout is STILL running on Apps Script;
          re-sending it queues a second copy behind the first and slows everything further. Only retry
          quick reads / real network drops, never a timed-out heavy report (callers split it instead). */
-      if(!_bnxRetried && /^GET_/.test(String(action)) && !(_heavy && e && e.name==='AbortError')){
+      if(!_bnxRetried && /^GET_/.test(String(action)) && !(e && e.name==='AbortError')){
         _bnxRetried=true; await new Promise(r=>setTimeout(r,2000)); i--; continue;
       }
       if(i===contexts.length-1){
         console.error('[API_DEBUG] ❌ All attempts failed. Last error:', e.message);
-        return {success:false,error:e.message};
+        return {success:false,error:e&&e.name==='AbortError'?'Report request timed out or server is busy. Please retry.':e.message,timeout:!!(e&&e.name==='AbortError')};
       }
     }
   }
@@ -9098,31 +9109,33 @@ html.bnx-embedded body .chip-val{font-size:clamp(14px,1.15vw,19px)!important}
     if(OFF) return null;
     var tok='', cid=''; try{ tok=getSessionToken_(); cid=getClientId_()||CLIENT_ID; }catch(e){}
     var body=JSON.stringify({action:'DSR_TDB',clientId:cid,sessionToken:tok,from:from,to:to});
+    var attempts=new Set(),launchTimers=[];
+    function cleanup(){launchTimers.forEach(clearTimeout);attempts.forEach(function(ac){try{ac.abort();}catch(_){}});attempts.clear();}
     function one(dep,ms){
-      var ac=new AbortController(), tm=null; /* Read waits for its actual response. */
+      var ac=new AbortController(), tm=setTimeout(function(){ac.abort();},ms);attempts.add(ac);
       return fetch('https://script.google.com/macros/s/'+dep+'/exec',{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:body,signal:ac.signal})
         .then(function(r){ return r.json(); }).then(function(j){ clearTimeout(tm); return {dep:dep,j:j}; })
-        .catch(function(){ clearTimeout(tm); return {dep:dep,j:null}; });
+        .catch(function(){ clearTimeout(tm); return {dep:dep,j:null}; }).finally(function(){attempts.delete(ac);});
     }
     /* SPEED 2026-10-18: first good answer wins. Deployment 2 / 3 start after 10 s / 20 s (or at once when one fails). */
     return new Promise(function(resolve){
       var done=false, pending=0, started=0;
-      function fail(){ if(done) return; done=true; OFF=true; setTimeout(function(){ OFF=false; },45000); console.warn('[DSR] DSR_TDB not answered — old DSR feed for now, retry in 45 s'); resolve(null); }
+      function fail(){ if(done) return; done=true; cleanup(); OFF=true; setTimeout(function(){ OFF=false; },45000); console.warn('[DSR] DSR_TDB not answered — old DSR feed for now, retry in 45 s'); resolve(null); }
       function launch(i){
         if(done||i>=DEPS.length||started>i) return; started=i+1; pending++;
         one(DEPS[i],i===0?60000:45000).then(function(o){
           pending--; if(done) return; var j=o.j;
           if(j&&j.success&&j.data&&j.data.byDate){
-            done=true; try{ localStorage.setItem('bnx_dsrtdb_dep',o.dep); }catch(e){}
+            done=true; cleanup(); try{ localStorage.setItem('bnx_dsrtdb_dep',o.dep); }catch(e){}
             if(complete(j.data.byDate)){ COVER.push([from,to]); console.info('[DSR] '+from+'..'+to+' from TRANSACTION DB (DSR_TDB)'); }
             else { console.warn('[DSR] '+from+'..'+to+' DSR_TDB has no item-group / payment-mode split for some days — filling Revenue from BILL_ITEMS groups and Collections from payment modes'); }
             resolve(j.data); return;
           }
-          if(j&&/session/i.test(String(j.error||''))){ done=true; resolve(null); return; }
+          if(j&&/session/i.test(String(j.error||''))){ done=true; cleanup(); resolve(null); return; }
           launch(i+1);
           if(pending===0&&started>=DEPS.length) fail();
         });
-        setTimeout(function(){ launch(i+1); },5000);
+        launchTimers.push(setTimeout(function(){ launch(i+1); },20000));
       }
       launch(0);
     });
@@ -10769,7 +10782,7 @@ html:not(#_t1):not(#_t2):not(#_t3):not(#_t4):not(#_t5) body .dsr-matrix .diff-ro
       try{ if(Date.now()-Number(localStorage.getItem('bnx_igc_direct_fail')||0)<1800000) return Promise.resolve(null); }catch(_){}
       return deps.reduce(function(chain,dep){ return chain.then(function(got){
         if(got) return got;
-        var ac=new AbortController(), tm=null; /* DSR calculation read: no client timer. */
+        var ac=new AbortController(), tm=setTimeout(function(){ac.abort();},30000); /* Bound each calculation-source attempt. */
         return fetch('https://script.google.com/macros/s/'+dep+'/exec',{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:'DSR_ITEM_GROUP_CALC',clientId:cid,sessionToken:tok}),signal:ac.signal})
           .then(function(x){ return x.json(); }).then(function(j){ clearTimeout(tm); return (j&&j.success&&rowsOf(j).length)?j:null; })
           .catch(function(){ clearTimeout(tm); return null; });

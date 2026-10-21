@@ -1392,6 +1392,7 @@ async function bnxFetchJson_(endpoint, options){
            /^(UPLOAD_|SAVE_MENU_ITEM_IMAGE|SAVE_[A-Z_]*(IMAGE|LOGO|FILE|DRIVE|ASSETS?|BRAND|BRANDING|PHOTO|POSTER|VIDEO|BANNER)|QR_PROMO_)/i.test(parsedAction) ? 90000 :
            /^(SAVE_BILL|SETTLE_|SAVE_ORDER|SAVE_KOT|CREATE_ORDER)/i.test(parsedAction) ? BNX_BILL_WRITE_TIMEOUT_MS :
            /^(SAVE_|SETTLE_|POST_|CREATE_|UPDATE_)/i.test(parsedAction) ? BNX_WRITE_TIMEOUT_MS :
+           /^(LIST_BILLS|GET_BILLS)$/i.test(parsedAction) ? 60000 :
            /^GET_DASHBOARD_SUMMARY$/i.test(parsedAction) ? BNX_DASHBOARD_TIMEOUT_MS : (/^(GET_|LIST_|RD_)/i.test(parsedAction) ? BNX_REPORT_TIMEOUT_MS : BNX_READ_TIMEOUT_MS));
         delete fetchOpts.timeoutMs;
 
@@ -1409,8 +1410,8 @@ async function bnxFetchJson_(endpoint, options){
          */
         const timeoutCtrl = new AbortController();
         let timedOut = false;
-        /* v4: read requests have no automatic client-side deadline. */
-        const timer = bnxIsReadOnlyAction_(parsedAction) ? null : setTimeout(()=>{
+        /* Read deadlines release transport and queue slots as well as the loading UI. */
+        const timer = setTimeout(()=>{
           timedOut = true;
           try {
             timeoutCtrl.abort(new DOMException('ERP request timed out after '+timeoutMs+'ms','TimeoutError'));
@@ -1686,8 +1687,8 @@ const BNX_BILL_WRITE_TIMEOUT_MS = 180000; /* 3 min */
 // Heavy Tally-style reports may scan BILL/PAYMENT/BILL_ITEMS/MASTER sheets.
 // Give report reads enough time to complete instead of falsely presenting
 // a timeout as an empty/demo report.
-const BNX_REPORT_TIMEOUT_MS = 300000; /* 5 min */
-const BNX_DASHBOARD_TIMEOUT_MS = 300000; /* 5 min */
+const BNX_REPORT_TIMEOUT_MS = 90000; /* bounded heavy report read */
+const BNX_DASHBOARD_TIMEOUT_MS = 45000; /* visible dashboard read */
 // Dashboard summary is a heavy live read on Google Sheets; allow the live
 // client request to finish instead of aborting a healthy ~20s response.
 // HANG FIX: identical GET/summary requests fired by multiple startup listeners
@@ -2038,7 +2039,9 @@ async function gasApi(action, payload, endpoint) {
 
   const requestClient=bnxCurrentClient_(), readGeneration=BNX_READ_GENERATION;
   const promise = new Promise((resolve) => {
+    let queueTimer = null;
     const task = async () => {
+      clearTimeout(queueTimer);
       try {
         let attempt = 0;
         const isCriticalWrite = !bnxIsReadOnlyAction_(action);
@@ -2093,6 +2096,13 @@ async function gasApi(action, payload, endpoint) {
     if (critical) { task.__crit=true;let k=0;while(k<REQUEST_QUEUE.pending.length&&REQUEST_QUEUE.pending[k].__crit)k++;REQUEST_QUEUE.pending.splice(k,0,task); }
     else if (task.__prio) { let k = 0; while (k < REQUEST_QUEUE.pending.length && (REQUEST_QUEUE.pending[k].__crit || REQUEST_QUEUE.pending[k].__prio)) k++; REQUEST_QUEUE.pending.splice(k, 0, task); }
     else REQUEST_QUEUE.pending.push(task);
+    if (!critical) queueTimer = setTimeout(function(){
+      const index=REQUEST_QUEUE.pending.indexOf(task);
+      if(index<0)return;
+      REQUEST_QUEUE.pending.splice(index,1);
+      resolve({success:false,timeout:true,queued:true,error:'Server busy: request did not start within 30s. Please retry.'});
+      processRequestQueue();
+    },30000);
     processRequestQueue();
   });
   if (inflightKey) {
@@ -10356,14 +10366,14 @@ if(D.readyState==='loading')D.addEventListener('DOMContentLoaded',watch);else wa
          first time DSR Reports is opened. Client comes from the session, not the URL
          (hard-coded client=CL00010 removed). -->
     <iframe id="dsrFrame"
-      data-src="dsr-client.html?v=20261020-outstanding-v3"
+      data-src="dsr-client.html?v=20261021-loadfast-v1"
       title="DSR Client — Live DSR / Swift Transaction Report"
       style="width:100%;height:100%;border:0;display:block;background:transparent;"
       onload="window.bnxDsrFrameLoaded&&window.bnxDsrFrameLoaded();"
       onerror="document.getElementById('dsrFrameFallback').style.display='flex'"></iframe>
     <div id="dsrFrameFallback" style="display:none;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:40px;color:var(--text3);font-size:13px;text-align:center;">
       ⚠️ Could not load dsr-client.html here.<br>Make sure dsr-client.html is uploaded in the same folder as this dashboard file, then
-      <button class="btn btn-sm btn-primary" onclick="window.open('dsr-client.html?v=20261020-outstanding-v3','_blank')">Open Full DSR Client</button>
+      <button class="btn btn-sm btn-primary" onclick="window.open('dsr-client.html?v=20261021-loadfast-v1','_blank')">Open Full DSR Client</button>
     </div>
   </div>
 </div>
@@ -12679,26 +12689,6 @@ function bnxBillsCovered_(f,t){
 /* SPEED: a wide period (Quarter / Year / Month) = ONE cached pull for the past days + ONE tiny pull for today,
    so switching periods or coming back to the page no longer re-downloads the whole quarter every time. */
 async function bnxPullBillsFromServer(from, to){
-  const f=String(from||'').slice(0,10), t=String(to||from||'').slice(0,10);
-  const today=(typeof getBusinessDate==='function')?getBusinessDate():'';
-  if(f&&t&&/^\d{4}-\d{2}-\d{2}$/.test(f)&&/^\d{4}-\d{2}-\d{2}$/.test(t)&&today&&f<today&&t>=today){
-    const yday=(typeof bnxBusinessDateOffset_==='function')?bnxBusinessDateOffset_(today,-1):'';
-    const __slow=(function(){ try{ return typeof PERF_METRICS!=='undefined' && PERF_METRICS.responseTimes.length>=3 && PERF_METRICS.avgResponseTime>10000; }catch(e){ return false; } })();
-    /* 2026-10-21: every LIST_BILLS makes the server read the WHOLE bill sheet (11,700+ rows). While the server is slow (avg > 10 s)
-       two parallel reads just double the load and BOTH time out -> ONE request for the whole period instead. */
-    if(__slow) return bnxPullBillsRange_(from,to);
-    if(yday&&f<=yday){
-      /* FIX 2026-10-19: same proven method as restaurant-dashboard_Workfine - two requests IN PARALLEL (past days + today),
-         and the list repaints the moment EACH one answers (today's bills first, no waiting for the slow past-days call). */
-      const repaint=()=>{ try{ const pg=document.getElementById('page-bills-list'); if(pg&&pg.classList.contains('active')&&typeof blRenderTable==='function') blRenderTable(); }catch(e){} };
-      const rs=await Promise.allSettled([
-        bnxPullBillsRange_(today,today).then(r=>{repaint();return r;}),
-        bnxPullBillsRange_(f,yday).then(r=>{repaint();return r;})
-      ]);
-      if(rs.some(r=>r.status==='rejected')) throw rs.find(r=>r.status==='rejected').reason;
-      return {success:true,split:true};
-    }
-  }
   return bnxPullBillsRange_(from,to);
 }
 /* SPEED 2026-10-18: GET_BILLS (the dashboard's own call) often answers while LIST_BILLS is still busy on the slow server.
@@ -12754,11 +12744,11 @@ async function bnxPullBillsRange_(from, to){
       catch(e){ res = {success:false,error:String(e&&e.message||e)}; }
       const listRows=res && (res.bills || res.data || (Array.isArray(res)?res:null));
       const __slowSrv=(function(){ try{ return typeof PERF_METRICS!=='undefined' && PERF_METRICS.responseTimes.length>=3 && PERF_METRICS.avgResponseTime>10000; }catch(e){ return false; } })();
-      if(hasRange && res && res.success===false && res.timeout && __slowSrv){
+      if(hasRange && res && res.success===false && (res.timeout || res.authExpired || res.statusCode===401 || res.statusCode===403)){
         /* the server is already overloaded: a second full-sheet read (GET_BILLS) would only slow it more - show "server slow + Retry" at once */
         throw new Error('Server is slow - bills not loaded yet. Press Retry in a moment.');
       }
-      if(hasRange && (!res || res.success===false || !Array.isArray(listRows) || !listRows.length)){
+      if(hasRange && (!res || res.success===false || !Array.isArray(listRows))){
         try{
           const g=await gasApi('GET_BILLS',{
             FROM_DATE:params.FROM_DATE,TO_DATE:params.TO_DATE,
@@ -12856,7 +12846,7 @@ async function bnxPullBillsRange_(from, to){
       local.forEach(b=>dedup.set(String(b.no),b));
       bnxSaveBillRegister(Array.from(dedup.values()));
       _bnxBillsSyncDoneKey=syncKey; _bnxBillsSyncDoneAt=Date.now();
-      if(hasRange && !res.summaryFallback){ const cf=String(from||to||'').slice(0,10), ct=String(to||from||'').slice(0,10); if(cf&&ct){ _bnxBillsCovered.push({f:cf,t:ct,at:Date.now()}); if(_bnxBillsCovered.length>40)_bnxBillsCovered.shift(); } }
+      if(hasRange){ const cf=String(from||to||'').slice(0,10), ct=String(to||from||'').slice(0,10); if(cf&&ct){ _bnxBillsCovered.push({f:cf,t:ct,at:Date.now()}); if(_bnxBillsCovered.length>40)_bnxBillsCovered.shift(); } }
       window.__blPullErr=false;
       return {success:true,count:serverBills.length};
     }catch(e){
@@ -31274,7 +31264,7 @@ const REPORTS_META = [
   {cat:'sales', accent:'#B8690E', icon:'📒', title:'Debtors Report', desc:'Outstanding dues aging 0-30 / 30-60 / 60+ days', anchor:'debtors'},
   {cat:'sales', accent:'#B8690E', icon:'💎', title:'Tips & Swipe Report', desc:'Steward-wise tips, card swipes & UPI collections', anchor:'tips'},
   {cat:'dsr', accent:'#2563EB', icon:'📅', title:'Daily Sales Report', desc:'Full day-end breakdown for selected period', anchor:'daily-sales'},
-  {cat:'dsr', accent:'#2563EB', icon:'👤', title:'Client DSR', desc:'Per-client daily sales view', href:'dsr-client.html?v=20261020-outstanding-v3'},
+  {cat:'dsr', accent:'#2563EB', icon:'👤', title:'Client DSR', desc:'Per-client daily sales view', href:'dsr-client.html?v=20261021-loadfast-v1'},
   {cat:'dsr', accent:'#2563EB', icon:'📊', title:'Monthly DSR Report', desc:'Day-by-day DSR matrix for the whole month', anchor:'dsr-csv'},
   {cat:'recon', accent:'#0891B2', icon:'🔄', title:'Sale vs Bank Reconciliation', desc:'Match DSR sales against bank/UPI settlement', anchor:'recon-csv'},
   {cat:'cancel', accent:'#DC2626', icon:'❌', title:'Cancelled Bill Report', desc:'Every cancelled bill with reason & authoriser', anchor:'cancelled-bills'},
@@ -45933,7 +45923,7 @@ body:has(#page-customer-credit.active) #bnxGlobalPeriodBar{display:none!importan
     var f=frame();if(!f)return;
     if(f.dataset.parked==='1'||!f.getAttribute('src')){ if(active()) ensure(); return; }
     if(!hard){try{var w=f.contentWindow;if(w&&typeof w.bnxFinalDsrReload_==='function'){w.bnxFinalDsrReload_();last=Date.now();return;}}catch(e){}}
-    var base=f.getAttribute('data-src')||'dsr-client.html?v=20261020-outstanding-v3';
+    var base=f.getAttribute('data-src')||'dsr-client.html?v=20261021-loadfast-v1';
     try{window.bnxDsrLoader&&window.bnxDsrLoader(true);}catch(e){} f.src=base+(base.indexOf('?')>-1?'&':'?')+'t='+Date.now();last=Date.now();
   };
   /* 2026-10-08 ROOT FIX (console full of "[API_DEBUG] Fetch error" from dsr-client.html while on Settings / Home):
@@ -45947,7 +45937,7 @@ body:has(#page-customer-credit.active) #bnxGlobalPeriodBar{display:none!importan
     var f=frame();if(!f)return;
     clearTimeout(parkT);
     var src=f.getAttribute('src')||'';
-    if(!src||f.dataset.parked==='1'||/^about:blank/.test(src)){ f.dataset.parked=''; try{window.bnxDsrLoader&&window.bnxDsrLoader(true);}catch(e){} f.src=f.getAttribute('data-src')||'dsr-client.html?v=20261020-outstanding-v3'; }
+    if(!src||f.dataset.parked==='1'||/^about:blank/.test(src)){ f.dataset.parked=''; try{window.bnxDsrLoader&&window.bnxDsrLoader(true);}catch(e){} f.src=f.getAttribute('data-src')||'dsr-client.html?v=20261021-loadfast-v1'; }
     fit();
   }
   function park(){
@@ -66748,7 +66738,7 @@ html body #page-dashboard .bnxd-kpi .stat-chg{flex:0 0 auto!important;margin-top
   /* ---- one entry point for every "open DSR" click: opens inside the dashboard, never navigates away ---- */
   window.bnxOpenDsrClient=function(){
     var nav=document.querySelector('.nav-item[onclick*="dsr-reports"]');
-    try{ showPage('dsr-reports',nav); }catch(e){ try{ window._erpNavigating=true; location.href='dsr-client.html?v=20261020-outstanding-v3&client='+encodeURIComponent(window.CLIENT_ID||''); }catch(_){} }
+    try{ showPage('dsr-reports',nav); }catch(e){ try{ window._erpNavigating=true; location.href='dsr-client.html?v=20261021-loadfast-v1&client='+encodeURIComponent(window.CLIENT_ID||''); }catch(_){} }
   };
   /* ---- warm the DSR in the background shortly after the dashboard is up (and on hover/touch) so a click is instant ---- */
   function warm(){ try{ window.bnxDsrEnsure&&window.bnxDsrEnsure(); }catch(e){} }
@@ -71190,6 +71180,8 @@ html:not(#_t) body #bmQuickAddModal #bmQuickProdGrid.prod-grid .prod-cat{
    startup (priority lane) so the list is already on this device when you open it. */
 (function(){
   function go(){ try{
+    const active=document.querySelector('.page.active');
+    if(document.hidden||!active||active.id!=='page-dashboard'||REQUEST_QUEUE.active>0||REQUEST_QUEUE.pending.length) return;
     if(typeof bnxPullBillsFromServer!=='function'||typeof getBusinessDate!=='function'||typeof bnxBusinessDateOffset_!=='function') return;
     var t=getBusinessDate(), y=bnxBusinessDateOffset_(t,-1); if(!t||!y) return;
     bnxPullBillsFromServer(y,y).catch(function(){});
