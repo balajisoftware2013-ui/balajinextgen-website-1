@@ -39,10 +39,20 @@ function make(){
   fr.style.cssText='position:fixed;left:-9999px;top:0;width:320px;height:480px;border:0;opacity:0;pointer-events:none;background:#fff';
   (document.body||document.documentElement).appendChild(fr);
   var win=fr.contentWindow,doc=win.document,printed=false,lastPrint=0,timer=null,closed=false,wrote=false;
-  var shown=null;
+  var shown=null, noDirect=false;
   function realPrint(){
     var now=Date.now(); if(now-lastPrint<2500)return; lastPrint=now; printed=true;
     if(timer){clearTimeout(timer);timer=null;}
+    /* 2026-10-22: an 80 mm REPORT goes straight to the BILL (POS) printer as ESC/POS — no print dialog. Falls back to the
+       normal print when no BILL printer is set or it does not answer. */
+    if(!noDirect&&typeof window.bnxReportDirectPrint_==='function'){
+      var job=null; try{ job=window.bnxReportDirectPrint_(doc); }catch(e){ job=null; }
+      if(job&&typeof job.then==='function'){
+        job.then(function(ok){ if(ok){ closed=true; if(shown&&shown.parentNode) shown.parentNode.removeChild(shown); setTimeout(cleanup,1500); } else { noDirect=true; lastPrint=0; realPrint(); } },
+                 function(){ noDirect=true; lastPrint=0; realPrint(); });
+        return;
+      }
+    }
     if(isMobile()){
       var html=serialize(doc);
       if(tapFresh()&&openPrintWindow(html)){setTimeout(cleanup,60000);return;}
@@ -24663,6 +24673,21 @@ function bnxBillDisc_(b){
   return 0;
 }
 function bnxBillDiscFix_(b){
+  /* 2026-10-22 ("HT/2627/00007746: Grand Total ₹8,892, actual bill ₹10,593"): imported POS bills store SUBTOTAL already
+     AFTER the discount (₹9,639 = ₹11,340 items − ₹1,701), while every screen / print does Subtotal − Discount. When
+     net-subtotal + SC + GST + round-off equals the saved total (and Subtotal − Discount does not), Subtotal is put back
+     to the before-discount amount, so View / Reprint / PDF / WhatsApp show 11,340 − 1,701 + SC + GST = 10,593.
+     Runs once per bill (after the fix the second test no longer matches). */
+  try{
+    if(b&&!b.__subGross){
+      const sub=bnxBillN_(b.sub), disc=bnxBillN_(b.disc), sc=bnxBillN_(b.sc), gst=bnxBillN_(b.gst), ro=bnxBillN_(b.roundOff), tot=bnxBillN_(b.total);
+      const sro=Math.abs(ro)<=1.01?ro:0;
+      if(disc>1.01&&tot>0&&sub>0&&Math.abs((sub-disc)+sc+gst+sro-tot)>1.01&&Math.abs(sub+sc+gst+sro-tot)<=1.01){
+        b.subNet=sub; b.sub=Math.round((sub+disc)*100)/100; b.__subGross=true;
+        if(b.discPct) b.discPct=Math.round(disc/b.sub*10000)/100;
+      }
+    }
+  }catch(e){}
   if(!b||bnxBillN_(b.disc)>0.004){ if(b&&!b.discPct&&bnxBillN_(b.sub)>0&&bnxBillN_(b.disc)>0) b.discPct=Math.round(b.disc/b.sub*10000)/100; return b; }
   const d=bnxBillDisc_(b);
   if(d>0){ b.disc=d; b.discSrc='derived'; if(!b.discPct&&bnxBillN_(b.sub)>0) b.discPct=Math.round(d/b.sub*10000)/100; }
@@ -51017,7 +51042,7 @@ if(typeof W.bnxSaveBillRegister==='function'&&!W.bnxSaveBillRegister.__bnxKeep){
       /* same total safety rule the Bills List row uses */
       var sub=num(b.sub),disc=num(b.disc),sc=num(b.sc),gst=num(b.gst),ro=num(b.roundOff);
       var exp=(sub-disc)+sc+gst+(Math.abs(ro)<=1.01?ro:0),raw=num(b.total);
-      var tot=Math.abs(raw-exp)>1.01?Math.round(exp):raw;
+      var tot=(raw>0&&Math.abs(ro)>1.01&&Math.abs(raw-exp)>1.01)?Math.round(exp):(typeof W.bnxBillTotal_==='function'?num(W.bnxBillTotal_(b)):raw);   /* 2026-10-22: saved GRAND_TOTAL (see bnxBillDiscFix_) */
       [].slice.call(body.querySelectorAll('div')).forEach(function(r){
         var sp=r.children;
         if(sp.length===2&&sp[0].tagName==='SPAN'&&/^Grand Total$/.test(sp[0].textContent.trim()))sp[1].textContent=inr(tot);
@@ -73496,6 +73521,113 @@ html body #page-reports .card[id^="rpt-anchor-"] .card-title{font-family:Inter,"
   window.addEventListener('load',soon);
   try{ new MutationObserver(function(ms){ for(var i=0;i<ms.length;i++){ var a=ms[i].addedNodes; for(var j=0;j<a.length;j++){ var n=a[j]; if(n.nodeName==='STYLE'||(n.nodeName==='LINK'&&/stylesheet/i.test(n.rel||''))){ soon(); return; } } } })
     .observe(document.documentElement,{childList:true,subtree:true}); }catch(e){}
+})();
+</script>
+
+<script id="bnx-report-direct-pos-20261022">
+/* 2026-10-22 ("any report items direct POS printer print — bill printer"): every "🧾 POS · 80mm" report print (Reports Hub,
+   report cards, dashboard card snapshots, Order Register …) builds an 80 mm page. Instead of opening the browser print dialog,
+   that page is turned into ESC/POS text and sent to the BILL printer (same QZ/IP path as bills and receipt vouchers).
+   Bills, KOTs, receipts, QR and test prints are NOT touched (they have their own direct paths).
+   Turn off on a device: localStorage.bnx_report_direct_pos='0'. Uses the BILL printer IP from Printer Settings. */
+(function(){
+  'use strict';
+  var W=window;
+  var SKIP=/\b(KOT|Bill\b|Bill No|Invoice|Reprint|QR|Test Print|Receipt|Voucher|Token|Label|Barcode)/i;
+  function on(){ try{ return localStorage.getItem('bnx_report_direct_pos')!=='0' && localStorage.getItem('bnx_direct_ip_print')!=='0'; }catch(e){ return true; } }
+  function billIp(){ try{ return (typeof W.bnxIpSettings_==='function'?(W.bnxIpSettings_()||{}):{}).BILL||''; }catch(e){ return ''; } }
+  function width(){ try{ return String(typeof W.bnxPaperSize==='function'?W.bnxPaperSize():'80')==='58'?32:42; }catch(e){ return 42; } }
+  function ascii(t){
+    return String(t==null?'':t).replace(/₹\s?/g,'Rs ').replace(/[—–−]/g,'-').replace(/[·•]/g,'.').replace(/…/g,'...').replace(/[“”]/g,'"').replace(/[‘’]/g,"'")
+      .replace(/×/g,'x').normalize('NFKD').replace(/[^\x20-\x7E]/g,'').replace(/\s+/g,' ').trim();
+  }
+  function isThermal(doc){
+    var css=''; try{ [].forEach.call(doc.querySelectorAll('style'),function(s){ css+=s.textContent; }); }catch(e){}
+    var title=String(doc.title||'');
+    var narrow=/size\s*:\s*(80|58|72)\s*mm/i.test(css)||/width\s*:\s*(72|58|80)mm/i.test(css);
+    if(!narrow && !/\bPOS\b/i.test(title)) return false;
+    if(SKIP.test(title.replace(/\bPOS Print\b/i,''))) return false;
+    return true;
+  }
+  /* page → lines {t:text, c:center, b:bold, rule:true, cols:[...]} */
+  function lines(doc){
+    var out=[], body=doc.body; if(!body) return out;
+    var win=doc.defaultView;
+    function st(el){ try{ return win.getComputedStyle(el); }catch(e){ return null; } }
+    function txt(el){ return ascii(el.textContent||''); }
+    function isRule(el){ var c=st(el); return !txt(el) && c && /dashed|solid|dotted/.test(c.borderTopStyle) && parseFloat(c.borderTopWidth)>0; }
+    function bold(el){ var c=st(el); return !!(c && (parseInt(c.fontWeight,10)>=700)); }
+    function center(el){ var c=st(el); return !!(c && c.textAlign==='center'); }
+    function walk(el){
+      if(el.nodeType!==1) return;
+      var tag=el.tagName;
+      if(/^(SCRIPT|STYLE|BUTTON|SELECT|INPUT|SVG|CANVAS|NOSCRIPT)$/.test(tag)) return;
+      var c=st(el); if(!c||c.display==='none'||c.visibility==='hidden') return;
+      if(tag==='HR'||isRule(el)){ out.push({rule:true}); return; }
+      if(tag==='IMG') return;
+      if(tag==='TABLE'){
+        [].forEach.call(el.querySelectorAll('tr'),function(tr){
+          var cells=[].map.call(tr.children,function(td){ return txt(td); });
+          if(!cells.some(Boolean)) return;
+          out.push({cols:cells, b:!!tr.closest('thead')||/\bt\b|total/i.test(tr.className)||/^(total|grand|net)/i.test(cells[0]||'')});
+        });
+        return;
+      }
+      var kids=[].filter.call(el.children,function(k){ var kc=st(k); return kc&&kc.display!=='none'; });
+      /* label … value row: a flex / small row whose children are all leaf texts */
+      if(kids.length>=2 && kids.length<=4 && kids.every(function(k){ return !k.querySelector('div,table,p'); }) && (c.display.indexOf('flex')>=0||c.display.indexOf('grid')>=0)){
+        var vals=kids.map(txt).filter(Boolean);
+        if(vals.length>=2){ out.push({cols:[vals.slice(0,-1).join(' '),vals[vals.length-1]], b:bold(el)||kids.some(bold)}); return; }
+      }
+      var blockKids=kids.filter(function(k){ var kc=st(k); return kc&&!/^inline/.test(kc.display); });
+      if(!blockKids.length){ var t=txt(el); if(t) out.push({t:t,c:center(el),b:bold(el)}); return; }
+      kids.forEach(walk);
+    }
+    [].forEach.call(body.children,walk);
+    return out;
+  }
+  function wrap(t,w){ var o=[]; t=String(t); while(t.length>w){ var i=t.lastIndexOf(' ',w); if(i<w*0.5) i=w; o.push(t.slice(0,i)); t=t.slice(i).replace(/^ /,''); } if(t) o.push(t); return o; }
+  function render(L,w){
+    var ESC='\x1B', out=ESC+'@'+ESC+'t\x00', lastRule=true;
+    function put(s,b,ctr){ out+=(ctr?ESC+'a\x01':ESC+'a\x00')+(b?ESC+'E\x01':'')+s+'\n'+(b?ESC+'E\x00':''); lastRule=false; }
+    /* fixed widths for multi-column tables: numeric columns right-aligned at the end */
+    L.forEach(function(x){
+      if(x.rule){ if(!lastRule){ out+=ESC+'a\x00'+'-'.repeat(w)+'\n'; lastRule=true; } return; }
+      if(x.cols){
+        var cs=x.cols.map(function(v){ return v||''; });
+        while(cs.length>1&&!cs[cs.length-1]) cs.pop();
+        if(cs.length===1){ wrap(cs[0],w).forEach(function(s){ put(s,x.b,false); }); return; }
+        var rest=cs.slice(1), restW=rest.map(function(v){ return Math.min(14,Math.max(v.length,1)); });
+        var used=restW.reduce(function(a,b){ return a+b+1; },0);
+        if(w-used<8){                         /* too many columns: label line, then the values */
+          wrap(cs[0],w).forEach(function(s){ put(s,x.b,false); });
+          var line=rest.join('  '); wrap(line,w).forEach(function(s){ put(' '.repeat(Math.max(0,w-s.length))+s,x.b,false); });
+          return;
+        }
+        var lw=w-used, first=wrap(cs[0],lw);
+        var tail=rest.map(function(v,i){ v=v.slice(0,restW[i]); return ' '+' '.repeat(restW[i]-v.length)+v; }).join('');
+        first.forEach(function(s,i){ put(i===first.length-1?(s+' '.repeat(lw-s.length)+tail):s,x.b,false); });
+        return;
+      }
+      wrap(x.t,w).forEach(function(s){ put(s,x.b,x.c); });
+    });
+    var hasStamp=L.some(function(x){ return x.t&&/^Printed\b|^Generated\b/i.test(x.t); });
+    out+=ESC+'a\x01'+'\n'+(hasStamp?'':ascii('Printed '+new Date().toLocaleString('en-IN'))+'\n')+'\n\n\n'+'\x1DVA\x00';
+    return out;
+  }
+  /* called by the Quick Print layer: null = not a direct report job; otherwise Promise<true|false> */
+  W.bnxReportDirectPrint_=function(doc){
+    if(!doc||!on()||!isThermal(doc)) return null;
+    if(typeof W.bnxDirectPrintRaw_!=='function'||!billIp()) return null;
+    var L=lines(doc); if(!L.length) return null;
+    var raw=render(L,width()), title=ascii(doc.title||'Report').replace(/\s*-\s*POS Print$/i,'');
+    var note=function(m,t){ try{ if(typeof W.showNotif==='function') W.showNotif(m,t||'success'); }catch(e){} };
+    note('🧾 Printing "'+title+'" on the BILL printer…');
+    return Promise.resolve(W.bnxDirectPrintRaw_('BILL',[{type:'raw',format:'command',flavor:'plain',data:raw}],'Report · '+title))
+      .then(function(){ note('✅ '+title+' printed on the BILL printer'); return true; },
+            function(e){ note('⚠️ BILL printer did not answer ('+String(e&&e.message||e).slice(0,80)+') — opening normal print','error'); return false; });
+  };
+  W.bnxReportPosText_=function(doc){ return render(lines(doc),width()); };   /* for checking a layout in the console */
 })();
 </script>
 </body></html>
