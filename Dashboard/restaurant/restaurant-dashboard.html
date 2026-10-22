@@ -20117,6 +20117,9 @@ function bnxGetKotStore(){
    order updates/creates its card instead of duplicating on every sync.
    Locally-recorded KOTs not yet reflected server-side are left alone. */
 async function bnxPullKotsFromServer(){
+  try{ return await bnxPullKotsFromServer_(); } finally { try{ if(typeof window.bnxCloseBilledKots_==='function') window.bnxCloseBilledKots_(); }catch(e){} }
+}
+async function bnxPullKotsFromServer_(){
   if (typeof gasApi !== 'function' || !CLIENT_ID) return false;
   try{
     /* SPEED FIX: start the KOT_ITEMS read at the same time as GET_KOT instead of after it. */
@@ -51202,11 +51205,14 @@ function retrySlot(slot,no,message){
  slot.textContent=message+' ';var button=D.createElement('button');button.type='button';button.className='btn btn-ghost';button.textContent='Retry items';button.onclick=function(){delete miss[no];viewRetry(no);};slot.appendChild(button);
 }
 function viewRetry(no){if(typeof W.blViewBill==='function')W.blViewBill(no);}
-function warmBillItems(){var p=D.getElementById('page-bills-list');if(p&&p.classList.contains('active'))preloadItemIndex().then(function(){
+/* 2026-10-22 SPEED ("slow work"): opening Bills List downloaded the WHOLE BILL_ITEMS sheet (45,000+ rows, RD_FETCH_SHEET 286 s of
+   server time) every 2 min, and moving the mouse over the list sent one GET_BILL_ITEMS per row (238 s). Both queued in front of
+   SAVE_BILL / KOT. Items are now fetched only for the bill that is actually opened (View / Reprint / Edit). */
+function warmBillItems(){return;var p=D.getElementById('page-bills-list');if(p&&p.classList.contains('active'))preloadItemIndex().then(function(){
  var no=W.__bnxActiveBillViewNo;if(!no)return;var items=indexedItems(no);if(!items.length)return;saveItems(no,items);if(W.__bnxActiveBillViewNo===no&&billStillOpen(no))viewRetry(no);
  });}
 W.addEventListener('hashchange',function(){setTimeout(warmBillItems,250);});
-var hoverBusy=false,hoverLast=0;D.addEventListener('pointerover',function(e){if(hoverBusy||Date.now()-hoverLast<300)return;var tr=e.target.closest&&e.target.closest('#blTableBody tr');if(!tr||!tr.cells||!tr.cells[0])return;var no=tr.cells[0].textContent.trim();if(no&&!itemCache[no]&&!inflight[no]){hoverBusy=true;hoverLast=Date.now();fetchBillItems(no).finally(function(){hoverBusy=false;});}},{passive:true});
+var hoverBusy=false,hoverLast=0;if(false)D.addEventListener('pointerover',function(e){if(hoverBusy||Date.now()-hoverLast<300)return;var tr=e.target.closest&&e.target.closest('#blTableBody tr');if(!tr||!tr.cells||!tr.cells[0])return;var no=tr.cells[0].textContent.trim();if(no&&!itemCache[no]&&!inflight[no]){hoverBusy=true;hoverLast=Date.now();fetchBillItems(no).finally(function(){hoverBusy=false;});}},{passive:true});
 setTimeout(warmBillItems,1200);
 if(typeof W.blViewBill==='function'&&!W.blViewBill.__bnxItems){
   var origView=W.blViewBill;
@@ -53665,8 +53671,11 @@ window.bnxQrGen=qrcode;
   async function flush(){
     var patch=queue; queue={}; if(!Object.keys(patch).length||!cid()) return;
     var r=await api('SAVE_CLIENT_ASSETS',{itemimgs:{patch:patch}});
-    if(!(r&&r.success&&r.saved&&r.saved.ITEMIMGS)){ Object.keys(patch).forEach(function(k){ queue[k]=patch[k]; }); clearTimeout(qt); qt=setTimeout(flush,60000); }
-    else { var S=ld(SK()); S.stamp=r.saved.ITEMIMGS; sv(SK(),S); }
+    /* 2026-10-22 SPEED: a server that saved the photo links but did not echo "saved.ITEMIMGS" was treated as a failure and the SAME
+       patch was re-sent every 60 s for ever (SAVE_CLIENT_ASSETS 361 s of server time). success = saved; real failures retry 3× max
+       with growing gaps (2, 8, 30 min). */
+    if(r&&r.success){ var S=ld(SK()); S.stamp=(r.saved&&r.saved.ITEMIMGS)||S.stamp||new Date().toISOString(); sv(SK(),S); flush.fails=0; }
+    else { flush.fails=(flush.fails||0)+1; if(flush.fails<=3){ Object.keys(patch).forEach(function(k){ queue[k]=patch[k]; }); clearTimeout(qt); qt=setTimeout(flush,[0,120000,480000,1800000][flush.fails]); } }
   }
 
   /* 1) cache clear on every successful photo / menu write (also the promo-post route) */
@@ -68717,6 +68726,20 @@ function reconcileBilledTables(res){
   console.info('[TABLE] closed already-billed tables: '+Object.keys(closed).join(', '));
 }
 W.bnxReconcileBilledTables_=reconcileBilledTables;
+/* 2026-10-22 (KOT page 00:11: 16 tickets incl. KOT-44510 F19 "1h53m · Urgent" — F19 was billed at 22:33): KOT_MASTER rows stay
+   PRINTED after the bill, so every KOT of a billed table kept coming back from GET_KOT as "New / Delayed". A ticket placed before
+   its table's latest bill is closed (billed) on this screen; tickets placed after the bill stay. */
+function closeBilledKots(){
+  try{
+    var reg=(typeof W.bnxGetBillRegister==='function'?W.bnxGetBillRegister():[])||[]; if(!reg.length) return;
+    var last={}; reg.forEach(function(b){ if(!b||/cancel|void/i.test(String(b.status||''))) return; var t=T(b.table); if(!t) return; var ms=billMoment(b); if(isFinite(ms)&&(!last[t]||ms>last[t].ms)) last[t]={ms:ms,no:String(b.no||'')}; });
+    var open=openKots(), ch=0;
+    open.forEach(function(k){ if(!k||k.billed||T(k.status)==='CANCELLED') return; var lb=last[T(k.table)]; if(!lb) return; var km=Date.parse(k.time||''); if(!isFinite(km)||km>lb.ms+60000) return;
+      k.billed=true; k.billNo=k.billNo||lb.no; k.status='SERVED'; k.__lst=Date.now(); ch++; if(typeof bnxKotOverride_==='function') bnxKotOverride_(k.kotNo,'SERVED'); });
+    if(ch){ if(typeof bnxSetOpenKotsRaw==='function') bnxSetOpenKotsRaw(JSON.stringify(open)); try{ if(typeof bnxSyncKotBadge==='function') bnxSyncKotBadge(); if(typeof buildDashKotList==='function') buildDashKotList(); if(typeof buildKOT==='function'&&D.getElementById('page-kot')&&D.getElementById('page-kot').classList.contains('active')) buildKOT(); }catch(e){} }
+  }catch(e){ console.warn('[KOT billed close]',e); }
+}
+W.bnxCloseBilledKots_=closeBilledKots;
 /* ── 5. one gasApi guard for every write path (POS, New Bill, steward re-sync, outbox replay) ── */
 function wire(){
   if(typeof W.gasApi!=='function' || W.gasApi.__bnx1014) return;
@@ -68770,7 +68793,8 @@ function boot(){
   setTimeout(function(){ wire(); purgeKotAsOrder(); },1500); setTimeout(function(){ wire(); purgeKotAsOrder(); },5000);
 }
 if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',boot); else boot();
-setInterval(function(){ wire(); rememberQz(); purgeKotAsOrder(); },20000);
+setInterval(function(){ wire(); rememberQz(); purgeKotAsOrder(); closeBilledKots(); },20000);
+setTimeout(closeBilledKots,4000);
 })();
 </script>
 <!-- FIX 2026-10-14 — POS TOUCH / MOBILE LAYOUT (final override; measured in headless Chromium at 1366×768, 820×1180, 390×844) -->
