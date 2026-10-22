@@ -12466,6 +12466,8 @@ async function erpApi(payload, type='V2_AUTH'){
       if(!data.data && data.todaySales!==undefined) data.data=data;
     }
     if(typeof bnxCheckAuthFailure_==='function') bnxCheckAuthFailure_(data);
+    /* 2026-10-22: already-billed tables leave the running list (see reconcileBilledTables) */
+    if(payload && payload.action==='GET_ACTIVE_ORDERS' && data && data.success!==false && typeof window.bnxReconcileBilledTables_==='function'){ try{ window.bnxReconcileBilledTables_(data); }catch(_e){} }
     return bnxSanitizeDue_(payload&&payload.action,data);
   }catch(e){
     const aborted=!!(e && (e.name==='AbortError' || /aborted|abort/i.test(String(e.message||''))));
@@ -68638,6 +68640,83 @@ function closeTableTickets(TBL, billNo, kotRefs){
   }catch(e){ console.warn('[BILL→KOT close]',e); }
 }
 
+/* ── 4b. 2026-10-22 ("if bill then auto clear table"): the bill closed the KOT tickets on THIS PC only. The table's orders stayed
+   open on the server (TRANSACTION_DB: ORD00797 table F20 still SERVED after bill 00008073; UPDATE_ORDER_STATUS was sent only when the
+   Order Register page had been opened), so the table stayed "Running" on the floor, in "Orders · Incl. active / unbilled" and on
+   every steward phone. After a confirmed bill every open order of that table (created before the bill) is marked BILLED on the
+   server, the table is set Available and the floor / table cards are redrawn at once. ── */
+function closeTableEverywhere(TBL, billNo){
+  try{
+    var cut=Date.now()+60000;
+    try{ if(Array.isArray(tableData)){ var td=tableData.find(function(x){ return T(x.n)===TBL; }); if(td){ td.s='available'; td.c=''; td.t='0'; } } }catch(_){}
+    try{ if(typeof bnxSaveTableStatus==='function') bnxSaveTableStatus(TBL,{s:'available',c:'',t:''}).catch(function(){}); }catch(_){}
+    var mineOpen=function(o){ if(!o) return false; var t=T(o.TABLE_ID||o.tableId||o.table); if(t!==TBL) return false;
+      if(typeof W.bnxIsLiveOpenOrder_==='function'){ if(!W.bnxIsLiveOpenOrder_(o)) return false; }
+      else if(/^(BILLED|CANCELLED|CLOSED|SETTLED|PAID|VOID)$/i.test(String(o.ORDER_STATUS||o.status||''))) return false;
+      var c=Date.parse(o.CREATED_AT||o.createdAt||''); return !isFinite(c)||c<=cut; };
+    var done={};
+    var mark=function(list){ (list||[]).forEach(function(o){ if(!mineOpen(o)) return; var id=String(o.ORDER_ID||o.orderId||'').trim(); if(!id||done[id]) return; done[id]=1;
+      try{ o.ORDER_STATUS='BILLED'; o.status='BILLED'; }catch(_){}
+      if(typeof bnxGuaranteedSync==='function') bnxGuaranteedSync('UPDATE_ORDER_STATUS',{orderId:id,status:'BILLED',remarks:billNo?('Billed as '+billNo):''},true); }); };
+    try{ mark(W._activeOrders); mark(W.orderRegData||(typeof orderRegData!=='undefined'?orderRegData:null)); }catch(_){}
+    try{ if(Array.isArray(W._activeOrders)) W._activeOrders=W._activeOrders.filter(function(o){ return !(T(o.TABLE_ID||o.tableId||o.table)===TBL && done[String(o.ORDER_ID||o.orderId||'')]); }); }catch(_){}
+    var redraw=function(){ try{ if(typeof buildRichTbls==='function') buildRichTbls(); if(typeof buildFloor==='function'){ ['floorMap','dashMap'].forEach(function(g){ if(D.getElementById(g)) buildFloor(g); }); } if(typeof bnxUpdateTableStats==='function') bnxUpdateTableStats(); if(typeof W.bnxInstantKpi_==='function') W.bnxInstantKpi_(true); }catch(_){} };
+    redraw();
+    /* orders this PC has not loaded yet (placed from a steward phone): ask the server once, a moment after the bill */
+    setTimeout(function(){
+      Promise.resolve(W.gasApi('GET_ACTIVE_ORDERS',{noCache:true},'V2_CORE')).then(function(r){
+        var a=r&&r.data&&(Array.isArray(r.data.orders)?r.data.orders:(Array.isArray(r.data)?r.data:null)); if(a){ mark(a); redraw(); }
+      }).catch(function(){});
+    },1500);
+  }catch(e){ console.warn('[BILL→TABLE close]',e); }
+}
+/* ── 4c. tables that were ALREADY billed before this fix (screen 00:03: F17, F19, F20, OD3, OD7, OD8, OD9, OD11 … all "Running"
+   though each has its bill): an open order whose table has a bill saved AFTER the order was placed is that bill's order — it is
+   marked BILLED on the server once and left off the running list, and the table goes back to Available. A table that got a NEW
+   order after its bill keeps running. ── */
+function billMoment(b){
+  try{
+    var d=String(b.businessDate||b.dt||'').slice(0,10); if(!/^\d{4}-\d{2}-\d{2}$/.test(d)) return NaN;
+    var c=(typeof W.bnxBillClock_==='function')?W.bnxBillClock_({tm:b.tm}):null, h=c?c.h:NaN, m=c?c.m:0;
+    if(!isFinite(h)){ var mm=/(\d{1,2}):(\d{2})/.exec(String(b.tm||'')); if(!mm) return NaN; h=+mm[1]; m=+mm[2]; }
+    var x=new Date(d+'T00:00:00'); x.setHours(h,m,59,0); if(h<6) x.setDate(x.getDate()+1);   /* business day runs to 05:59 next morning */
+    return x.getTime();
+  }catch(e){ return NaN; }
+}
+function orderMoment(o){
+  var c=Date.parse(o.CREATED_AT||o.createdAt||''); if(isFinite(c)) return c;
+  try{ var d=String(o.ORDER_DATE||'').slice(0,10), t=String(o.ORDER_TIME||'').slice(0,8); if(d&&t){ var x=Date.parse(d+'T'+(t.length===5?t+':00':t)); if(isFinite(x)) return x; } }catch(e){}
+  return NaN;
+}
+function reconcileBilledTables(res){
+  var list=res&&res.data&&(Array.isArray(res.data.orders)?res.data.orders:null); if(!list||!list.length) return;
+  var reg=[]; try{ reg=(typeof W.bnxGetBillRegister==='function'?W.bnxGetBillRegister():(typeof bnxGetBillRegister==='function'?bnxGetBillRegister():[]))||[]; }catch(e){}
+  if(!reg.length) return;
+  var lastBill={};
+  reg.forEach(function(b){ if(!b||/cancel|void/i.test(String(b.status||''))) return; var t=T(b.table); if(!t||/^(COUNTER|DELIVERY|#QB|TAKEAWAY|-)$/.test(t)) return; var ms=billMoment(b); if(!isFinite(ms)) return; if(!lastBill[t]||ms>lastBill[t].ms) lastBill[t]={ms:ms,no:String(b.no||'')}; });
+  var sent={}; try{ sent=JSON.parse(sessionStorage.getItem('bnx_tbl_reconciled')||'{}')||{}; }catch(e){}
+  var closed={}, keep=[];
+  list.forEach(function(o){
+    var t=T(o.TABLE_ID||o.tableId||o.table), lb=lastBill[t], om=orderMoment(o), id=String(o.ORDER_ID||o.orderId||'').trim();
+    if(t && lb && isFinite(om) && om<=lb.ms+60000 && !/^(BILLED|CANCELLED|CLOSED|SETTLED|PAID|VOID)$/i.test(String(o.ORDER_STATUS||''))){
+      closed[t]=lb.no;
+      if(id && !sent[id] && typeof bnxGuaranteedSync==='function'){ sent[id]=1; bnxGuaranteedSync('UPDATE_ORDER_STATUS',{orderId:id,status:'BILLED',remarks:lb.no?('Billed as '+lb.no):''},true); }
+      return;
+    }
+    keep.push(o);
+  });
+  if(keep.length===list.length) return;
+  try{ sessionStorage.setItem('bnx_tbl_reconciled',JSON.stringify(sent)); }catch(e){}
+  res.data.orders=keep;
+  var still={}; keep.forEach(function(o){ still[T(o.TABLE_ID||o.tableId||o.table)]=1; });
+  Object.keys(closed).forEach(function(t){
+    if(still[t]) return;
+    try{ closeTableTickets(t, closed[t], []); clearTableOrder(t); }catch(e){}
+    try{ if(Array.isArray(tableData)){ var td=tableData.find(function(x){ return T(x.n)===t; }); if(td&&td.s!=='available'){ td.s='available'; td.c=''; td.t='0'; if(typeof bnxSaveTableStatus==='function') bnxSaveTableStatus(t,{s:'available',c:'',t:''}).catch(function(){}); } } }catch(e){}
+  });
+  console.info('[TABLE] closed already-billed tables: '+Object.keys(closed).join(', '));
+}
+W.bnxReconcileBilledTables_=reconcileBilledTables;
 /* ── 5. one gasApi guard for every write path (POS, New Bill, steward re-sync, outbox replay) ── */
 function wire(){
   if(typeof W.gasApi!=='function' || W.gasApi.__bnx1014) return;
@@ -68662,11 +68741,12 @@ function wire(){
       }
     }catch(x){ console.warn('[BNX 1014 guard]',x); }
     var res=await base.call(this,a,p,e);
+    try{ if(a==='GET_ACTIVE_ORDERS' && res && res.success!==false) reconcileBilledTables(res); }catch(x){ console.warn('[TABLE reconcile]',x); }
     try{
       if(a==='SAVE_BILL' && p && p.bill && res && res.success!==false && !p.bill.no){
         var TB=T(p.bill.table);
         var refs=String(p.bill.kot||p.bill.kotRef||p.bill.kotNo||'').split('+').map(function(x){ return x.trim(); }).filter(Boolean);
-        if(TB){ closeTableTickets(TB, res.billNumber||res.billNo||res.transactionId||'', refs); clearTableOrder(TB); }
+        if(TB){ closeTableTickets(TB, res.billNumber||res.billNo||res.transactionId||'', refs); clearTableOrder(TB); closeTableEverywhere(TB, (res.data&&res.data.BILL_NUMBER)||res.billNumber||res.billNo||''); }
       }
     }catch(x){}
     return res;
