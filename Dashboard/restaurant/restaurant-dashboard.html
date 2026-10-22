@@ -24938,7 +24938,11 @@ function blRenderTable(data){
     const roN=Number(b.roundOff)||0, safeRo=Math.abs(roN)<=1.01?roN:0;
     const expectedN=(subN-discN)+scN+gstN+safeRo;
     const rawTotalN=Number(b.total)||0;
-    const displayTotalN=Math.abs(rawTotalN-expectedN)>1.01 ? Math.round(expectedN) : rawTotalN;
+    /* 2026-10-22 ("HT/2627/00007746 shows ₹8,892, DB GRAND_TOTAL ₹10,593"): imported POS bills store SUBTOTAL already after
+       the item discount, so Sub − Disc + GST took the discount off twice and replaced a correct saved total. The saved
+       GRAND_TOTAL is used (bnxBillTotal_, same as reprint / PDF); the arithmetic total is shown only when the stored
+       round-off itself is corrupt (more than ₹1), which was the case this guard was written for. */
+    const displayTotalN=(rawTotalN>0&&Math.abs(roN)>1.01&&Math.abs(rawTotalN-expectedN)>1.01) ? Math.round(expectedN) : (typeof bnxBillTotal_==='function'?bnxBillTotal_(b):rawTotalN);
     return `
     <tr>
       <td class="mono" style="font-weight:700;color:var(--gold);white-space:nowrap;">${b.no}</td>
@@ -25169,7 +25173,7 @@ function blBuildWaText_(b){
   const subN=Number(b.sub)||0, discN=Number(b.disc)||0, scN=Number(b.sc)||0, gstN=Number(b.gst)||0;
   const roN=Number(b.roundOff)||0, safeRo=Math.abs(roN)<=1.01?roN:0;
   const expectedN=(subN-discN)+scN+gstN+safeRo, rawTotalN=Number(b.total)||0;
-  const total=Math.abs(rawTotalN-expectedN)>1.01?Math.round(expectedN):rawTotalN;
+  const total=(rawTotalN>0&&Math.abs(roN)>1.01&&Math.abs(rawTotalN-expectedN)>1.01)?Math.round(expectedN):(typeof bnxBillTotal_==='function'?bnxBillTotal_(b):rawTotalN);   /* 2026-10-22: saved GRAND_TOTAL, see Bills List row */
   const when=(typeof bnxDisplayBillDate_==='function')?bnxDisplayBillDate_(b.dt,b.tm):((b.dt||'')+' '+(b.tm||''));
   return [
     '🧾 *'+(rName?rName+' — ':'')+'Bill '+b.no+'*',
@@ -47308,12 +47312,20 @@ function bnxOpenMasterHub(){
   function loadMasterGroups(){
     if(MG.p||(MG.at&&Date.now()-MG.at<1800000))return MG.p||Promise.resolve(MG);
     if(MG.failAt&&Date.now()-MG.failAt<300000)return Promise.resolve(MG);   /* failed / slow read: wait 5 min, never once per row */
-    MG.p=api('RD_FETCH_SHEET',{tab:'CUSTOMER_MASTER'}).then(function(r){
-      var d=r&&r.success!==false&&r.data, rows=Array.isArray(d)?d:(d&&Array.isArray(d.rows)?d.rows:[]);
-      var id={},nm={},n=0;
-      rows.forEach(function(o){ var g=realG(o.CUSTOMER_GROUP||o.CUSTOMER_GROUP_NAME||o.GROUP_NAME||o.GROUP||o.group||o.groupName||o.customerGroup); if(!g)return;
-        var k=String(o.CUSTOMER_ID||o.customerId||'').trim(), nn=norm(o.CUSTOMER_NAME||o.NAME||o.customer||'');
-        if(k)id[k]=g; if(nn)nm[nn]=g; n++; });
+    /* groups live in CUSTOMER_DUES_BILLWISE.GROUP (PM SIR / GM SIR / MD SIR …, one row per bill, by CUSTOMER_ID + PARTY);
+       CUSTOMER_MASTER has no group column. A customer listed under two groups takes the group of most of its bills. */
+    var rowsOf=function(r){ var d=r&&r.success!==false&&r.data; return Array.isArray(d)?d:(d&&Array.isArray(d.rows)?d.rows:[]); };
+    MG.p=api('RD_FETCH_SHEET',{tab:'CUSTOMER_DUES_BILLWISE'}).then(function(r){
+      var rows=rowsOf(r);
+      if(!rows.length) return api('RD_FETCH_SHEET',{tab:'CUSTOMER_MASTER'}).then(rowsOf,function(){ return []; });
+      return rows;
+    }).then(function(rows){
+      var cnt={},n=0;
+      rows.forEach(function(o){ var g=realG(o.GROUP||o.CUSTOMER_GROUP||o.CUSTOMER_GROUP_NAME||o.GROUP_NAME||o.group||o.groupName||o.customerGroup); if(!g)return;
+        var k=String(o.CUSTOMER_ID||o.customerId||'').trim(), nn=norm(o.PARTY||o.CUSTOMER_NAME||o.NAME||o.customer||'');
+        [k?'i:'+k:'', nn?'n:'+nn:''].forEach(function(key){ if(!key)return; var c=cnt[key]||(cnt[key]={}); c[g]=(c[g]||0)+1; }); n++; });
+      var id={},nm={};
+      Object.keys(cnt).forEach(function(key){ var c=cnt[key], best=Object.keys(c).sort(function(a,b){ return c[b]-c[a]; })[0]; if(key.charAt(0)==='i') id[key.slice(2)]=best; else nm[key.slice(2)]=best; });
       if(rows.length){MG.id=id;MG.nm=nm;MG.at=Date.now();MG.failAt=0;}else MG.failAt=Date.now();
       MG.p=null; if(n){ try{ if(typeof W.bnx79RenderParty==='function')W.bnx79RenderParty(); }catch(e){} }
       return MG;
@@ -68602,6 +68614,10 @@ function compute(rows,P){
     var id=b.BILL_ID||b.billId||b.id;if(id){var key=String(b.CLIENT_ID||'')+'|'+String(b.LOCATION_ID||'')+'|'+id;if(seen.has(key))return;seen.add(key);}
     var grand=num(b.GRAND_TOTAL!=null?b.GRAND_TOTAL:b.total),tax=num(b.TAX_AMOUNT!=null?b.TAX_AMOUNT:(b.gst!=null?b.gst:b.tax)),rnd=num(b.ROUND_OFF!=null?b.ROUND_OFF:b.roundOff);
     var sc=num(b.SERVICE_CHARGE_AMOUNT!=null?b.SERVICE_CHARGE_AMOUNT:b.serviceChargeAmount),scTax=num(b.SERVICE_CHARGE_GST_AMOUNT!=null?b.SERVICE_CHARGE_GST_AMOUNT:b.serviceChargeGstAmount);
+    /* 2026-10-22: BILL_MASTER has no SERVICE_CHARGE_GST_AMOUNT column — the service-charge GST is only in
+       GST_BREAKUP.SERVICE_CHARGE_GST (21-10-2026: ₹854.36 on 16 bills), so GST showed ₹9,986.94 instead of ₹10,841.30. */
+    if(!scTax){ try{ var gb0=b.GST_BREAKUP; if(typeof gb0==='string'&&gb0.trim()) gb0=JSON.parse(gb0); if(gb0&&typeof gb0==='object'){ scTax=num(gb0.SERVICE_CHARGE_GST!=null?gb0.SERVICE_CHARGE_GST:gb0.SC_GST); if(!sc&&scTax) sc=num(gb0.SERVICE_CHARGE!=null?gb0.SERVICE_CHARGE:gb0.SERVICE_CHARGE_AMOUNT); } }catch(e){} }
+    if(scTax&&!sc&&b.SUBTOTAL_AFTER_ITEM_DISCOUNT!=null){ var sc0=grand-tax-scTax-rnd-(num(b.SUBTOTAL_AFTER_ITEM_DISCOUNT)-num(b.BILL_DISCOUNT)); if(sc0>0.004) sc=Math.round(sc0*100)/100; }
     // Raw BILL_MASTER separates service-charge GST from TAX_AMOUNT.
     if(b.TAX_AMOUNT!=null) tax+=scTax;
     if(grand===0){tax=0;rnd=0;} // NC bills are not taxable sales.
@@ -73401,7 +73417,20 @@ html body #page-reports .card[id^="rpt-anchor-"] .card-title{font-family:Inter,"
   function val(id){ var e=$(id); if(!e) return NaN; var t=String(e.textContent||'').trim(); if(!/\d/.test(t)) return NaN; var neg=/^-|−/.test(t); var n=Number(t.replace(/[^0-9.]/g,'')); return isFinite(n)?(neg?-n:n):NaN; }
   function inr(n){ return (n<0?'-₹':'₹')+Math.abs(n).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}); }
   var last='';
+  /* 2026-10-22 ("Gross + GST is ₹860.67 short of Net"): four older scripts write the GST card from TAX_AMOUNT only, which
+     leaves out the GST on service charge. The bill-wise KPI (bnxComputeBillKpis_) includes it and already drives Gross Sale
+     and the CGST/SGST line, so for the same period the GST card follows it — Gross + GST + Round off = Net again. */
+  function own(){
+    try{
+      var sb=window.__bnxSalesBreakup, o=sb&&sb.data; if(!o||!(o.bills>0)) return;
+      var k=JSON.stringify(typeof bnxDashRangeParams_==='function'?bnxDashRangeParams_():{}); if(sb.key!==k) return;
+      var e=$('d-gst'); if(!e) return;
+      var cur=val('d-gst');
+      if(!isFinite(cur)||Math.abs(cur-o.tax)>0.009){ e.textContent=(typeof bnxDashMoney_==='function'?bnxDashMoney_(o.tax):inr(o.tax)); e.dataset.bnxLive='1'; e.dataset.bnxSrc='bills'; }
+    }catch(x){}
+  }
   function paint(){
+    own();
     var box=$('d-net-recon'); if(!box) return;
     var g=val('d-rev'), t=val('d-gst'), n=val('d-gross'), b=val('d-ord');
     var txt='', col='var(--text3)', tip='Net Sale = Gross Sale (before GST, after discount, incl. service charge) + GST + Round Off';
