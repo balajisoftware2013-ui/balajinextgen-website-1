@@ -33,23 +33,36 @@ function openPrintWindow(html){
     return true;
   }catch(e){try{w.close();}catch(_){}return false;}
 }
+function bnxPrintCopy_(html){
+  if(!html)return;
+  try{
+    var f2=document.createElement('iframe');
+    f2.setAttribute('aria-hidden','true');
+    f2.style.cssText='position:fixed;left:-9999px;top:0;width:320px;height:480px;border:0;opacity:0;pointer-events:none;background:#fff';
+    (document.body||document.documentElement).appendChild(f2);
+    var w2=f2.contentWindow; w2.document.open(); w2.document.write(html); w2.document.close();
+    setTimeout(function(){ try{ w2.focus(); (w2.__bnxNativePrint||w2.print).call(w2); }catch(e){ console.warn('print copy failed',e); } setTimeout(function(){ try{ f2.parentNode&&f2.parentNode.removeChild(f2); }catch(e){} },60000); },300);
+  }catch(e){ console.warn('print copy failed',e); }
+}
 function make(){
   var fr=document.createElement('iframe');
   fr.setAttribute('aria-hidden','true');
   fr.style.cssText='position:fixed;left:-9999px;top:0;width:320px;height:480px;border:0;opacity:0;pointer-events:none;background:#fff';
   (document.body||document.documentElement).appendChild(fr);
   var win=fr.contentWindow,doc=win.document,printed=false,lastPrint=0,timer=null,closed=false,wrote=false;
-  var shown=null, noDirect=false;
+  var shown=null, noDirect=false, savedHtml='';
   function realPrint(){
+    if(!savedHtml){ try{ savedHtml=serialize(doc); }catch(e){} }
     var now=Date.now(); if(now-lastPrint<2500)return; lastPrint=now; printed=true;
     if(timer){clearTimeout(timer);timer=null;}
     /* 2026-10-22: an 80 mm REPORT goes straight to the BILL (POS) printer as ESC/POS — no print dialog. Falls back to the
        normal print when no BILL printer is set or it does not answer. */
     if(!noDirect&&typeof window.bnxReportDirectPrint_==='function'){
+      try{ savedHtml=serialize(doc)||savedHtml; }catch(e){}
       var job=null; try{ job=window.bnxReportDirectPrint_(doc); }catch(e){ job=null; }
       if(job&&typeof job.then==='function'){
-        job.then(function(ok){ if(ok){ closed=true; if(shown&&shown.parentNode) shown.parentNode.removeChild(shown); setTimeout(cleanup,1500); } else { noDirect=true; lastPrint=0; realPrint(); } },
-                 function(){ noDirect=true; lastPrint=0; realPrint(); });
+        var fb=function(){ try{ noDirect=true; lastPrint=0; realPrint(); }catch(e){ console.warn('print fallback failed',e); } };
+        job.then(function(ok){ try{ if(ok){ closed=true; if(shown&&shown.parentNode) shown.parentNode.removeChild(shown); setTimeout(cleanup,1500); } else fb(); }catch(e){ fb(); } }, fb);
         return;
       }
     }
@@ -59,8 +72,12 @@ function make(){
       if(!shown)preview(true);
       return;
     }
+    /* 2026-10-23: the print frame can be gone (removed / reloaded) by the time a slow direct-print falls back —
+       printing it then throws "callback is no longer runnable". Re-print the saved copy in a fresh frame instead. */
+    var alive=false; try{ alive=fr.isConnected&&!!fr.contentWindow&&fr.contentWindow===win&&!win.closed; }catch(e){ alive=false; }
+    if(!alive){ bnxPrintCopy_(savedHtml); return; }
     try{win.focus();}catch(e){}
-    try{win.__bnxNativePrint?win.__bnxNativePrint():win.print();}catch(e){console.warn('print failed',e);}
+    try{win.__bnxNativePrint?win.__bnxNativePrint():win.print();}catch(e){ console.warn('print failed — retrying with a fresh copy',e); bnxPrintCopy_(savedHtml); }
     setTimeout(cleanup,60000);
   }
   function cleanup(){try{if(fr.parentNode)fr.parentNode.removeChild(fr);}catch(e){}}
@@ -12935,8 +12952,17 @@ async function bnxPullBillsRange_(from, to){
       const listRows=res && (res.bills || res.data || (Array.isArray(res)?res:null));
       const __slowSrv=(function(){ try{ return typeof PERF_METRICS!=='undefined' && PERF_METRICS.responseTimes.length>=3 && PERF_METRICS.avgResponseTime>10000; }catch(e){ return false; } })();
       if(hasRange && res && res.success===false && (res.timeout || res.authExpired || res.statusCode===401 || res.statusCode===403)){
-        /* the server is already overloaded: a second full-sheet read (GET_BILLS) would only slow it more - show "server slow + Retry" at once */
-        throw new Error('Server is slow - bills not loaded yet. Press Retry in a moment.');
+        /* 2026-10-23 BILLS LIST EMPTY ("Showing 0 of 0") while the dashboard had already painted the same day's bills from
+           GET_BILLS: LIST_BILLS timed out and the list threw at once. Now (1) reuse a GET_BILLS answer for this period that
+           any screen received in the last 15 min, else (2) try GET_BILLS once (at most once a minute per period). */
+        let _gb=null;
+        try{ const c=window.__bnxLastGetBills||{}; const k=String(params.FROM_DATE)+'|'+String(params.TO_DATE);
+             Object.keys(c).forEach(ck=>{ const e=c[ck]; if(!_gb&&e&&Date.now()-e.at<15*60000&&e.from<=params.FROM_DATE&&e.to>=params.TO_DATE) _gb=e.res; });
+             if(!_gb){ window.__bnxGbTry=window.__bnxGbTry||{}; if(!(Date.now()-(window.__bnxGbTry[k]||0)<60000)){ window.__bnxGbTry[k]=Date.now();
+               try{ _gb=await gasApi('GET_BILLS',{FROM_DATE:params.FROM_DATE,TO_DATE:params.TO_DATE,BUSINESS_DATE:params.FROM_DATE===params.TO_DATE?params.FROM_DATE:undefined},'V2_CORE'); }catch(e){ _gb=null; } } } }catch(e){ _gb=null; }
+        const _fb=_gb&&_gb.success!==false?bnxBillsFromGetBills_(_gb):null;
+        if(_fb&&Array.isArray(_fb.bills||_fb.data)&&(_fb.bills||_fb.data).length){ res=_fb; res.summaryFallback=true; res.partialFromGetBills=true; }
+        else throw new Error('Server is slow - bills not loaded yet. Press Retry in a moment.');
       }
       if(hasRange && (!res || res.success===false || !Array.isArray(listRows))){
         try{
@@ -12975,7 +13001,9 @@ async function bnxPullBillsRange_(from, to){
       // range before inserting the server's current rows. On a successful
       // empty server result this intentionally leaves zero rows for the
       // selected period, rather than resurrecting stale local data.
-      if(hasRange) local = local.filter(b=>!inRange(b));
+      /* a remembered/partial GET_BILLS copy is NOT authoritative: keep local bills (e.g. saved after that copy), only add missing ones */
+      if(hasRange && !res.partialFromGetBills) local = local.filter(b=>!inRange(b));
+      if(res.partialFromGetBills){ const _have=new Set(local.map(b=>String(b.no))); serverBills.splice(0,serverBills.length,...serverBills.filter(sb=>!_have.has(String(sb.no||sb.BILL_NUMBER||'')))); }
 
       serverBills.forEach(sb=>{
         const no = sb.no || sb.billNo || sb.bill_no || sb.BILL_NO || sb.BILL_NUMBER || sb.billNumber;
@@ -13036,9 +13064,9 @@ async function bnxPullBillsRange_(from, to){
       local.forEach(b=>dedup.set(String(b.no),b));
       bnxSaveBillRegister(Array.from(dedup.values()));
       _bnxBillsSyncDoneKey=syncKey; _bnxBillsSyncDoneAt=Date.now();
-      if(hasRange){ const cf=String(from||to||'').slice(0,10), ct=String(to||from||'').slice(0,10); if(cf&&ct){ _bnxBillsCovered.push({f:cf,t:ct,at:Date.now()}); if(_bnxBillsCovered.length>40)_bnxBillsCovered.shift(); } }
+      if(hasRange && !res.partialFromGetBills){ const cf=String(from||to||'').slice(0,10), ct=String(to||from||'').slice(0,10); if(cf&&ct){ _bnxBillsCovered.push({f:cf,t:ct,at:Date.now()}); if(_bnxBillsCovered.length>40)_bnxBillsCovered.shift(); } }
       window.__blPullErr=false;
-      return {success:true,count:serverBills.length};
+      return res.partialFromGetBills?{success:true,count:serverBills.length,cached:true,partial:true}:{success:true,count:serverBills.length};
     }catch(e){
       window.__blPullErr=true;
       console.warn('[bnxPullBillsFromServer] failed:', e.message);
@@ -75148,4 +75176,26 @@ html:not(#_va):not(#_vb) body .app-toast{top:auto!important;bottom:20px!importan
   };
   try{ choosePrintFormat=W.choosePrintFormat; }catch(e){}
 })();
+</script>
+<script id="bnx-getbills-memo-20261023">
+/* Remember every good GET_BILLS answer (any screen) for 15 min so the Bills list can show the same bills when LIST_BILLS times out. */
+(function(W){
+  function wrap(){
+    var g=W.gasApi; if(typeof g!=='function'||g.__bnxGbMemo) return !!g;
+    var nw=function(action,params){
+      var p=g.apply(this,arguments);
+      try{ if(action==='GET_BILLS'&&p&&typeof p.then==='function'){ p.then(function(r){ try{
+        if(r&&r.success!==false&&Array.isArray(r.data)&&r.data.length&&params&&params.FROM_DATE){
+          var f=String(params.FROM_DATE).slice(0,10), t=String(params.TO_DATE||params.FROM_DATE).slice(0,10);
+          var c=W.__bnxLastGetBills=W.__bnxLastGetBills||{}; c[f+'|'+t]={from:f,to:t,at:Date.now(),res:r};
+          var ks=Object.keys(c); if(ks.length>6){ ks.sort(function(a,b){return c[a].at-c[b].at;}); delete c[ks[0]]; }
+        } }catch(e){} },function(){}); } }catch(e){}
+      return p;
+    };
+    for(var k in g){ try{ nw[k]=g[k]; }catch(e){} }
+    nw.__bnxGbMemo=true; W.gasApi=nw; return true;
+  }
+  if(!wrap()) document.addEventListener('DOMContentLoaded',wrap);
+  setTimeout(wrap,3000);
+})(window);
 </script>
