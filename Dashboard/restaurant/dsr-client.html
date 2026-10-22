@@ -678,7 +678,17 @@ async function gasApiRaw_(action,payload,endpoint){
           url=alt; i--; continue;
         }
       }
-      console.error('[API_DEBUG] ❌ Fetch error '+action+' (attempt '+(i+1)+'/'+ contexts.length+'): '+(e&&e.name==='AbortError'?'timed out (server too slow)':(e&&e.message)||e)+' — '+String(url).slice(0,80));
+      /* FIX 2026-10-22 ("fix errors": every RD_FETCH_SHEET / GET_DUE_COLLECTION logged "attempt 1/2" then "attempt 2/2"):
+         a timeout or a full request queue is NOT a login problem, yet the loop re-sent the same read with the 2nd stored
+         session — a second copy of an already-slow read, queued behind the first on the busy Apps Script. Now a
+         timeout / busy queue ends the call at once (one warning, no duplicate); the caller's own retry / cache handles it.
+         Other sessions are still tried for real auth failures (handled above). */
+      if(e && e.name==='AbortError'){
+        const busy=/did not start/i.test(String(e.message||''));
+        console.warn('[API] '+action+': '+(busy?'waiting queue full (too many report calls at once)':'server too slow — timed out')+' · not re-sent');
+        return {success:false,error:busy?'Report server busy: request did not start within 30s. Please retry.':'Report request timed out or server is busy. Please retry.',timeout:true,busy:busy};
+      }
+      console.error('[API_DEBUG] ❌ Fetch error '+action+' (attempt '+(i+1)+'/'+ contexts.length+'): '+((e&&e.message)||e)+' — '+String(url).slice(0,80));
       /* BNX FIX 2026-10-05: with a single stored session there was no second try, so one slow/aborted
          call returned success:false and the month fell back to payments-only (Gross/Net = 0).
          Read calls now get ONE automatic retry on the same session before giving up. */
@@ -10340,6 +10350,77 @@ html:not(#_t1):not(#_t2):not(#_t3):not(#_t4):not(#_t5) body .dsr-matrix .diff-ro
   }
   /* a day that could not be split is tried again after 10 min (new payments / server back) */
   setInterval(scan,3000);
+})();
+</script>
+<script id="bnx-dsr-credit-gap-20261022">
+/* 2026-10-22 ("Report Check: payment modes total 14,02,435 ≠ Net Sale 15,18,435 — days with a gap: 20/10 1,16,000, 03/10 1,89,816,
+   11/10 1,83,140, 08/10 1,46,684, 10/10 94,447, 18/10 77,615 …"): every gap is EXACTLY that day's CREDIT payment lines in
+   PAYMENT_MASTER (checked on CL00010, 01-20 Oct: Guest Due Sales 12,17,726 = owner DSR). The older DSR feed only counted the
+   outstanding of unpaid bills as Guest Due Sales; credit bills imported as PAYMENT_STATUS PAID with a CREDIT payment line were
+   left out, and the bill total later set Net Sale, so Net − tenders = the credit sale.
+   Fix: for a day whose tenders are SHORT of Net Sale, Guest Due Sales = the day's CREDIT / DUE payment lines (by payment date),
+   and the same amount is taken back out of the "Other / EazyDine" residual if it had been parked there. Applied only when it
+   closes the gap (to within ₹2 or 0.1 %) — otherwise nothing changes and the Report Check keeps flagging it.
+   With the 2026-10-21+ core Code.gs deployed (DSR_TDB counts CREDIT lines) there are no short days and this never runs. */
+(function(){
+  var W=window, pmCache=null, pmAt=0, busy=false;
+  function N(v){ v=Number(String(v==null?'':v).replace(/[,₹\s]/g,'')); return isFinite(v)?v:0; }
+  function r2(v){ return Math.round((Number(v)||0)*100)/100; }
+  function day(v){ try{ return bnxIsoDay_(v); }catch(e){ return String(v||'').slice(0,10); } }
+  function G(r,ks){ for(var i=0;i<ks.length;i++){ if(r[ks[i]]!=null&&r[ks[i]]!=='') return r[ks[i]]; } return ''; }
+  function rowsOf(res){ if(!res) return []; var d=res.data!=null?res.data:res.rows; if(Array.isArray(d)) return d; if(d&&typeof d==='object'){ var ks=['rows','data','payments']; for(var i=0;i<ks.length;i++) if(Array.isArray(d[ks[i]])) return d[ks[i]]; } return []; }
+  function netOf(e){ var n=N(e.gross)+N(e.svc)+N(e.tax)+N(e.round); return n>0?n:N(e.net); }
+  function shortDays(){
+    if(typeof STANDARD_DATA!=='object'||typeof bnxDsrTender_!=='function') return [];
+    return Object.keys(STANDARD_DATA).filter(function(ds){ var e=STANDARD_DATA[ds]; if(!e||e._snap||e._crFix) return false;
+      if(e.__crTry&&Date.now()-e.__crTry<600000) return false;
+      return /^\d{4}-\d{2}-\d{2}$/.test(ds) && (netOf(e)-bnxDsrTender_(e)>2 || N(e.otherResid)>2); });   /* short, or the shortfall was parked in Other / EazyDine */
+  }
+  async function creditByDay(){
+    if(pmCache&&Date.now()-pmAt<300000) return pmCache;
+    if(typeof W.bnxDsrSheet_!=='function') return null;
+    var r=await W.bnxDsrSheet_('PAYMENT_MASTER').catch(function(){ return null; }), rows=rowsOf(r); if(!rows.length) return null;
+    var cid=''; try{ cid=String(getClientId_()||W.CLIENT_ID||''); }catch(e){}
+    var by={};
+    rows.forEach(function(p){
+      if(cid&&p.CLIENT_ID&&String(p.CLIENT_ID)!==cid) return;
+      var st=String(G(p,['PAYMENT_STATUS'])||'').toUpperCase(); if(/VOID|CANCEL|REFUND|REVERS|FAIL/.test(st)) return;
+      var m=String(G(p,['PAYMENT_MODE','MODE'])||'').trim().toUpperCase().replace(/[\s_-]+/g,' ');
+      if(!/^(CREDIT|DUE|CREDIT SALES|HOUSE ACCOUNT)$/.test(m)) return;
+      var k=day(G(p,['PAYMENT_DATE','DATE','BUSINESS_DATE'])); if(!k) return;
+      by[k]=r2((by[k]||0)+N(G(p,['AMOUNT'])));
+    });
+    pmCache=by; pmAt=Date.now(); return by;
+  }
+  async function scan(){
+    if(busy) return; var todo=shortDays(); if(!todo.length) return;
+    busy=true;
+    try{
+      todo.forEach(function(ds){ try{ STANDARD_DATA[ds].__crTry=Date.now(); }catch(_){} });
+      var by=await creditByDay(); if(!by) return;
+      var changed=[], left=[];
+      todo.forEach(function(ds){
+        var e=STANDARD_DATA[ds]; if(!e) return;
+        var cr=N(by[ds]), old=N(e.credit), add=r2(cr-old); if(!(add>0.5)){ left.push(ds); return; }
+        var net=netOf(e), gap=r2(net-bnxDsrTender_(e));
+        var fromResid=Math.min(N(e.otherResid),N(e.eazydine),Math.max(0,add-gap));   /* credit that had been parked in Other / EazyDine */
+        var after=r2(gap-add+fromResid);
+        if(Math.abs(after)>Math.max(2,net*0.001)||Math.abs(after)>=Math.abs(gap)+N(fromResid)-0.5){ left.push(ds); return; }   /* must close the gap (paisa / few-rupee rounding left is still flagged) */
+        e.credit=cr; if(fromResid>0){ e.eazydine=r2(N(e.eazydine)-fromResid); e.otherResid=r2(N(e.otherResid)-fromResid); }
+        e._crFix={credit:cr,was:old,resid:fromResid}; try{ bnxRmTotalCash_(e); }catch(_){}
+        changed.push(ds);
+      });
+      if(changed.length){
+        console.info('[DSR] Guest Due Sales filled from CREDIT payment lines for '+changed.length+' day(s): '+changed.map(function(d){ return d.slice(8,10)+'/'+d.slice(5,7)+' ₹'+Math.round(STANDARD_DATA[d].credit).toLocaleString('en-IN'); }).join(', '));
+        var cur=(document.getElementById('repDate')||{}).value||'';
+        try{ if(typeof bnxDsrPaint_==='function') bnxDsrPaint_(cur); }catch(e){} try{ recalcAll(); }catch(e){}
+        try{ if(typeof W.bnxDsrPaintCheck_==='function') W.bnxDsrPaintCheck_(); }catch(e){}
+      }
+      if(left.length) console.warn('[DSR] tenders still short of Net Sale on '+left.join(', ')+' — not a credit sale (unsettled bill / unmapped mode); left flagged in Report Check');
+    }finally{ busy=false; }
+  }
+  W.bnxDsrCreditGapFix_=function(){ pmCache=null; Object.keys(STANDARD_DATA||{}).forEach(function(k){ var e=STANDARD_DATA[k]; if(e){ delete e.__crTry; } }); return scan(); };
+  setInterval(scan,4000);
 })();
 </script>
 <script id="bnx-dsr-nosplit-fill-20261016">
