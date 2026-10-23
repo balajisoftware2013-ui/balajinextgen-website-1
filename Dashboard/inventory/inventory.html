@@ -14626,4 +14626,132 @@ window.handlePhyUpload=function(input){
 })();
 </script>
 </body>
+
+<script id="bnx-inv-store-ledger-import-20261023">
+/* 2026-10-23 ("update purchase liquor and issued to Bar department and store stock and bar stock"):
+   Data Import › upload the liquor STORE STOCK LEDGER (columns Date · ItemName · UOM · OpQty · OpRate · OpVal · RecQty ·
+   RecRate · RecVal · IssQtr · IssRate · IssVal · ClQty · ClRate · ClVal — one row per item per period) and it posts:
+     · items        — any liquor item not in Item Master is created (category LIQUOR, unit, latest rate)
+     · Main Store   — opening stock (first period), every receipt (purchase) and every issue to Bar
+     · Bar          — every issue arrives in the Bar warehouse (transfer in), so store stock and bar stock both show
+     · purchase_invoices (one per period with receipts) and dept_issues (one per period, department Bar)
+   Every record gets a fixed id from period + item, so importing the same file again never doubles anything.
+   The TAX line (value only, no stock) is kept on the purchase invoice and not posted to stock. */
+(function(W){
+  'use strict';
+  function U(s){ return String(s==null?'':s).toUpperCase().replace(/[^A-Z0-9]+/g,''); }
+  function N(v){ v=Number(v); return isFinite(v)?v:0; }
+  function day(v){
+    if(typeof v==='number'&&typeof excelDateToStr==='function') return excelDateToStr(v);
+    var t=String(v==null?'':v).trim(); if(/^\d{4}-\d{2}-\d{2}/.test(t)) return t.slice(0,10);
+    var m=t.match(/^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{4})/); if(m) return m[3]+'-'+('0'+m[2]).slice(-2)+'-'+('0'+m[1]).slice(-2);
+    var d=new Date(t); return isNaN(d)?'':d.getFullYear()+'-'+('0'+(d.getMonth()+1)).slice(-2)+'-'+('0'+d.getDate()).slice(-2);
+  }
+  function addDays(d,n){ var x=new Date(d+'T12:00:00'); x.setDate(x.getDate()+n); return x.getFullYear()+'-'+('0'+(x.getMonth()+1)).slice(-2)+'-'+('0'+x.getDate()).slice(-2); }
+  function parseStoreLedger(rows){
+    for(var i=0;i<Math.min(15,rows.length);i++){
+      var h=(rows[i]||[]).map(function(c){ return U(c); });
+      var ci=function(){ for(var a=0;a<arguments.length;a++){ var k=h.indexOf(arguments[a]); if(k>-1) return k; } return -1; };
+      var C={date:ci('DATE'),item:ci('ITEMNAME','ITEM'),uom:ci('UOM','UNIT'),opq:ci('OPQTY'),opr:ci('OPRATE'),rq:ci('RECQTY'),rr:ci('RECRATE'),rv:ci('RECVAL'),iq:ci('ISSQTR','ISSQTY'),ir:ci('ISSRATE'),iv:ci('ISSVAL'),cq:ci('CLQTY'),cr:ci('CLRATE')};
+      if(C.item<0||C.opq<0||C.iq<0||C.cq<0||C.date<0) continue;
+      var out=[];
+      for(var r=i+1;r<rows.length;r++){ var x=rows[r]||[]; var nm=String(x[C.item]==null?'':x[C.item]).trim(); var d=day(x[C.date]); if(!nm||!d) continue;
+        out.push({date:d,name:nm,uom:String(x[C.uom]||'').trim(),opq:N(x[C.opq]),opr:N(x[C.opr]),rq:N(x[C.rq]),rr:N(x[C.rr]),rv:N(x[C.rv]),iq:N(x[C.iq]),ir:N(x[C.ir]),iv:N(x[C.iv]),cq:N(x[C.cq]),cr:N(x[C.cr])}); }
+      return out.length?{type:'storeledger',records:out}:null;
+    }
+    return null;
+  }
+  var oldParse=W.parseTallyReport;
+  W.parseTallyReport=function(rows){ var s=null; try{ s=parseStoreLedger(rows); }catch(e){ console.warn('[store ledger]',e); } return s||(typeof oldParse==='function'?oldParse.apply(this,arguments):null); };
+  try{ parseTallyReport=W.parseTallyReport; }catch(e){}
+
+  function warehouse(kind){
+    var whs=DB.all('warehouses'), re=kind==='bar'?/\bbar\b/i:/main|store|godown|central/i;
+    var w=whs.find(function(x){ return re.test(String(x.name||''))&&!(kind!=='bar'&&/\bbar\b/i.test(String(x.name||''))); });
+    if(!w&&kind!=='bar') w=whs.find(function(x){ return x._id==='WH001'; });
+    if(w) return w;
+    w={_id:kind==='bar'?'WH-BAR':'WH-MAIN-STORE',name:kind==='bar'?'Bar':'Main Store',type:kind==='bar'?'Bar':'Store',address:'',_ts:new Date().toISOString()};
+    DB.save('warehouses',whs.concat([w])); return w;
+  }
+  function commitStoreLedger(recs){
+    var store=warehouse('store'), bar=warehouse('bar');
+    var dates=Array.from(new Set(recs.map(function(r){ return r.date; }))).sort();
+    var pstart={}; dates.forEach(function(d,i){ pstart[d]=i?addDays(dates[i-1],1):d.slice(0,8)+'01'; });
+    var items=DB.all('items').slice(), byName={}; items.forEach(function(it){ byName[U(it.name)]=it; });
+    var created=0, seq=0;
+    var byItem={}; recs.forEach(function(r){ (byItem[r.name]=byItem[r.name]||[]).push(r); });
+    Object.keys(byItem).forEach(function(n){
+      if(U(n)==='TAX') return; var v=byItem[n], last=v[v.length-1];
+      if(!byName[U(n)]){ var it={_id:'ITM-SLG-'+U(n).slice(0,40),item_code:(typeof nextItemCode==='function'?nextItemCode():''),name:n,cat:'LIQUOR',unit:last.uom||'BTL',hsn:'2208',gst:0,purchase_price:last.cr||last.ir||last.rr||last.opr||0,sale_price:0,min_stock:0,_ts:new Date().toISOString()};
+        items.push(it); byName[U(n)]=it; created++; }
+      else { var e=byName[U(n)]; var rate=last.cr||last.ir||last.rr; if(rate&&!N(e.purchase_price)) e.purchase_price=rate; }
+    });
+    DB.save('items',items);
+    var ledger=DB.all('stock_ledger'), have=new Set(ledger.map(function(l){ return l._id; })), add=[], bal={};
+    function post(id,itemId,wh,date,type,qin,qout,rate,ref,extra){
+      var k=itemId+'|'+wh; bal[k]=(bal[k]||0)+qin-qout; if(have.has(id)) return;
+      var row=Object.assign({_id:id,item_id:itemId,wh_id:wh,date:date,txn_type:type,qty_in:qin,qty_out:qout,balance:+bal[k].toFixed(3),rate:rate,value:+((qin||qout)*rate).toFixed(2),ref_type:'store_ledger',ref_id:ref,
+        _ts:new Date(date+'T06:00:00').toISOString().replace(/\.\d+Z$/,'.'+('00'+(++seq%1000)).slice(-3)+'Z')},extra||{});
+      add.push(row);
+    }
+    var gaps=0;
+    Object.keys(byItem).sort().forEach(function(n){
+      if(U(n)==='TAX') return; var v=byItem[n].slice().sort(function(a,b){ return a.date<b.date?-1:1; }), it=byItem&&byName[U(n)], id=it._id, key=U(n).slice(0,30), prev=null;
+      if(v[0].opq) post('SLG-OP-'+key,id,store._id,dates[0].slice(0,8)+'01','opening',Math.max(0,v[0].opq),Math.max(0,-v[0].opq),v[0].opr,'OPENING');
+      v.forEach(function(r){
+        var tag=r.date.replace(/-/g,'');
+        if(prev&&Math.abs(prev.cq-r.opq)>1e-9){ var d=r.opq-prev.cq; gaps++; post('SLG-ADJ-'+tag+'-'+key,id,store._id,pstart[r.date],'adjustment',Math.max(0,d),Math.max(0,-d),r.opr,'LEDGER GAP',{note:'Ledger opening did not match previous closing'}); }
+        if(r.rq) post('SLG-PUR-'+tag+'-'+key,id,store._id,r.date,'purchase',r.rq,0,r.rr,'PI-SLG-'+tag);
+        if(r.iq){ post('SLG-ISS-'+tag+'-'+key,id,store._id,r.date,'issue',Math.max(0,-r.iq),Math.max(0,r.iq),r.ir,'ISS-SLG-'+tag,{dept:'Bar'});
+                  post('SLG-BAR-'+tag+'-'+key,id,bar._id,r.date,'transfer_in',Math.max(0,r.iq),Math.max(0,-r.iq),r.ir,'ISS-SLG-'+tag,{dept:'Bar'}); }
+        prev=r;
+      });
+    });
+    if(add.length) DB.save('stock_ledger',ledger.concat(add));
+    /* purchase invoices + dept issues, one per period */
+    var pis=DB.all('purchase_invoices'), pids=new Set(pis.map(function(p){ return p._id; })), npi=0;
+    var iss=DB.all('dept_issues'), iids=new Set(iss.map(function(p){ return p._id; })), nis=0;
+    dates.forEach(function(d){
+      var tag=d.replace(/-/g,''), rows=recs.filter(function(r){ return r.date===d; });
+      var rec=rows.filter(function(r){ return r.rq; }), out=rows.filter(function(r){ return r.iq&&U(r.name)!=='TAX'; });
+      if(rec.length&&!pids.has('PI-SLG-'+tag)){ var tot=rec.reduce(function(a,r){ return a+r.rv; },0);
+        pis.push({_id:'PI-SLG-'+tag,inv_no:'SLG-'+tag,inv_date:d,party_id:null,party_name:'Liquor receipts (store ledger)',status:'unpaid',due_date:'',wh_id:store._id,
+          taxable:+tot.toFixed(2),cgst:0,sgst:0,igst:0,total:+tot.toFixed(2),notes:'Receipts '+pstart[d]+' to '+d+' from the store stock ledger — supplier / bill no. not in the ledger',
+          items:rec.map(function(r){ var it=byName[U(r.name)]; return {item_id:it?it._id:null,item_name:r.name,hsn:'2208',qty:r.rq,rate:r.rr,gst_rate:0,cgst:0,sgst:0,amount:+r.rv.toFixed(2)}; }),_ts:new Date(d+'T06:00:00').toISOString()}); npi++; }
+      if(out.length&&!iids.has('ISS-SLG-'+tag)){
+        iss.push({_id:'ISS-SLG-'+tag,date:d,dept:'Bar',issued_to:'Bar',wh_id:store._id,to_wh_id:bar._id,purpose:'Liquor issued store → bar, '+pstart[d]+' to '+d+' (store ledger)',ack_required:'no',ack_status:'acknowledged',
+          items:out.map(function(r){ var it=byName[U(r.name)]; return {item_id:it?it._id:null,item_name:r.name,qty:r.iq,rate:r.ir,value:+r.iv.toFixed(2)}; }),total:out.reduce(function(a,r){ return a+r.iq; },0),issued_by:'Import',_ts:new Date(d+'T06:00:00').toISOString()}); nis++; }
+    });
+    if(npi) DB.save('purchase_invoices',pis);
+    if(nis) DB.save('dept_issues',iss);
+    var storeQty=0, barQty=0; Object.keys(bal).forEach(function(k){ if(k.split('|')[1]===store._id) storeQty+=bal[k]; else barQty+=bal[k]; });
+    return {created:created,posted:add.length,skipped:0,npi:npi,nis:nis,gaps:gaps,store:store.name,bar:bar.name,storeQty:storeQty,barQty:barQty,periods:dates.length};
+  }
+  var oldCommit=W.commitParsedImport;
+  W.commitParsedImport=function(){
+    if(typeof _importParsedRows!=='undefined'&&_importParsedRows&&_importParsedRows.type==='storeledger'){
+      var r; try{ r=commitStoreLedger(_importParsedRows.records); }catch(e){ console.error(e); toast('Store ledger import failed: '+e.message,'e'); return; }
+      _importParsedRows=null;
+      var el=document.getElementById('imp-preview');
+      if(el) el.innerHTML='<div class="alert g">✅ Store ledger imported — '+r.periods+' period(s): '+r.posted+' stock movement(s) posted, '+r.created+' new item(s), '+r.npi+' purchase invoice(s), '+r.nis+' bar issue(s)'+(r.gaps?', '+r.gaps+' ledger gap adjustment(s)':'')+'.<br>'+
+        'Stock now: <b>'+r.store+'</b> '+r.storeQty.toFixed(2)+' units · <b>'+r.bar+'</b> received '+r.barQty.toFixed(2)+' units (bar consumption is not in the ledger — enter the bar physical count to close bar stock). Importing the same file again adds nothing.</div>';
+      try{ if(typeof loadDashboard==='function') loadDashboard(); if(typeof loadPurchaseRegister==='function') loadPurchaseRegister(); if(typeof populateDropdowns==='function') populateDropdowns(); }catch(e){}
+      toast('Store ledger imported ✓','s');
+      return;
+    }
+    return oldCommit.apply(this,arguments);
+  };
+  try{ commitParsedImport=W.commitParsedImport; }catch(e){}
+  /* preview label for the new type */
+  var oldHandle=W.handleImport;
+  W.handleImport=function(input){
+    var r=oldHandle.apply(this,arguments);
+    var tries=0, tm=setInterval(function(){ if(++tries>40) clearInterval(tm); try{ if(_importParsedRows&&_importParsedRows.type==='storeledger'){ clearInterval(tm); var el=document.getElementById('imp-preview'); if(el){ var recs=_importParsedRows.records, ds=Array.from(new Set(recs.map(function(x){return x.date;}))).sort(), it=new Set(recs.map(function(x){return x.name;}));
+      el.innerHTML='<div class="alert g">✅ Recognized as <strong>Liquor Store Stock Ledger</strong> — '+it.size+' items · '+ds.length+' periods ('+ds[0]+' → '+ds[ds.length-1]+'). Receipts post to the Main Store as purchases; issues move to the Bar warehouse.</div><button class="btn p" onclick="commitParsedImport()">📥 Import Now</button>'; } } }catch(e){} },250);
+    return r;
+  };
+  try{ handleImport=W.handleImport; }catch(e){}
+  W.bnxCommitStoreLedger_=commitStoreLedger; W.bnxParseStoreLedger_=parseStoreLedger;
+})(window);
+</script>
 </html>
