@@ -3047,13 +3047,14 @@ function make(){
   fr.setAttribute('aria-hidden','true');
   fr.style.cssText='position:fixed;left:-9999px;top:0;width:320px;height:480px;border:0;opacity:0;pointer-events:none;background:#fff';
   (document.body||document.documentElement).appendChild(fr);
-  var win=fr.contentWindow,doc=win.document,printed=false,lastPrint=0,timer=null,closed=false,wrote=false;
+  var win=fr.contentWindow,doc=win.document,printed=false,lastPrint=0,timer=null,closed=false,wrote=false,previewOpen=false;
   function realPrint(){
+    if(/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)&&!previewOpen){preview();return;}
     var now=Date.now(); if(now-lastPrint<2500)return; lastPrint=now; printed=true;
     if(timer){clearTimeout(timer);timer=null;}
     try{win.focus();}catch(e){}
-    try{win.__bnxNativePrint?win.__bnxNativePrint():win.print();}catch(e){console.warn('print failed',e);}
-    setTimeout(cleanup,60000);
+    Promise.race([Promise.all([doc.fonts?doc.fonts.ready:Promise.resolve()].concat(Array.from(doc.images).map(function(im){return im.complete?Promise.resolve():new Promise(function(resolve){im.addEventListener('load',resolve,{once:true});im.addEventListener('error',resolve,{once:true});});}))),new Promise(function(resolve){setTimeout(resolve,2500);})]).then(function(){try{win.__bnxNativePrint?win.__bnxNativePrint():win.print();}catch(e){printed=false;preview();console.warn('print failed',e);}});
+    if(!previewOpen)setTimeout(cleanup,60000);
   }
   function cleanup(){try{if(fr.parentNode)fr.parentNode.removeChild(fr);}catch(e){}}
   function hook(){
@@ -3063,6 +3064,7 @@ function make(){
     if(!timer&&!printed){timer=setTimeout(function(){timer=null;if(!printed&&!closed)preview();},4000);}
   }
   function preview(){
+    if(previewOpen)return;previewOpen=true;
     var ov=document.createElement('div');
     ov.style.cssText='position:fixed;inset:0;z-index:2147483647;background:#fff;display:flex;flex-direction:column';
     ov.innerHTML='<div style="display:flex;gap:8px;padding:8px 12px;background:#1f2937;align-items:center"><b style="color:#fff;flex:1;font:600 14px Arial">Preview</b><button data-p style="background:#f97316;color:#fff;border:0;border-radius:6px;padding:8px 16px;font:700 13px Arial;cursor:pointer">🖨 Print</button><button data-c style="background:#fff;border:0;border-radius:6px;padding:8px 16px;font:700 13px Arial;cursor:pointer">✕ Close</button></div>';
@@ -3085,7 +3087,7 @@ function make(){
     document:docProxy,
     focus:function(){},blur:function(){},
     print:realPrint,
-    close:function(){closed=true;if(timer){clearTimeout(timer);timer=null;}setTimeout(cleanup,printed?60000:0);},
+    close:function(){if(previewOpen)return;closed=true;if(timer){clearTimeout(timer);timer=null;}setTimeout(cleanup,printed?60000:0);},
     get closed(){return closed;},
     get location(){return win.location;},
     get window(){return api;},
@@ -8151,11 +8153,8 @@ function bnxUpdateSyncBadge(){
         if(!left && !failed) toast('All queued transactions confirmed by server','success');
         else{
           toast(left+' pending, '+failed+' sync issues.'+why,'error');
-          if(left && confirm('Still stuck: '+left+' item(s).'+why+'\n\nOK = remove stuck item(s) from the queue (backup kept on this phone).\nCancel = keep retrying.')){
-            try{ localStorage.setItem('bnx_outbox_discarded_'+(CLIENT_ID||'default'), JSON.stringify(bnxGetOutbox())); }catch(_){}
-            bnxSetOutbox([]); try{ bnxSetLiveStatus(navigator.onLine?'live':'offline'); }catch(_){}
-            toast('Cleared stuck item(s). Check the order register that nothing is missing.','info');
-          }
+          // Retain unconfirmed writes; retry/review only.
+
         }
       }).catch(function(e){ toast('Sync could not finish: '+String(e&&e.message||e).slice(0,100),'error'); });
     } : null;
@@ -8269,7 +8268,7 @@ async function flushOutbox_impl_(force){
     // progress and the whole status badge along with it.
     let res;
     try {
-      res = await gasApi(entry.action, entry.payload, 'V2_CORE');
+      res = await gasApi(entry.action, Object.assign({},entry.payload,{requestId:entry.requestId||(entry.payload||{}).requestId}), 'V2_CORE');
     } catch (e) {
       console.error('[OUTBOX] gasApi threw for entry', entry.action, e && e.message ? e.message : e);
       entry.lastError = String((e && e.message) || e || 'Network request failed').slice(0,400);
@@ -15293,8 +15292,14 @@ function bnxFireKOTPrint_(entry, orderRef){
       if(/HUKKA|HOOKAH|SHEESHA|SHISHA|CIGARETTE|TOBACCO/.test(t)) return 'Hukka';
       if(/BAR|BEVERAGE|LIQUOR|SPIRITS|ALCOHOL|COCKTAIL|MOCKTAIL|JUICE|BEER|WINE|WHISK|VODKA|RUM|GIN|TEQUILA/.test(t)) return 'Bar';
       return 'Kitchen'; };
+    window.__bnxKotDispatchFlight=window.__bnxKotDispatchFlight||{};
+    const dk='bnx_kot_dispatch_'+CLIENT_ID;
     const jobs=parts.map(function(p,idx){
-      return Promise.resolve(bnxDirectKOTPrint_(p.type,{
+      const key=String(entry.kotNo||entry.kotNumber||orderRef||'')+'|'+String(p.type)+'|'+String(idx);
+      let accepted={};try{accepted=JSON.parse(localStorage.getItem(dk)||'{}');}catch(e){}
+      if(accepted[key]&&Date.now()-accepted[key]<86400000)return Promise.resolve({label:label(p.type),ok:true});
+      if(window.__bnxKotDispatchFlight[key])return window.__bnxKotDispatchFlight[key];
+      const task=Promise.resolve(bnxDirectKOTPrint_(p.type,{
         title:String(p.type||'KITCHEN')+' KOT',
         table:entry.table||'', waiter:entry.waiter||entry.steward||'', covers:entry.covers||'',
         items:p.items||[],
@@ -15302,7 +15307,10 @@ function bnxFireKOTPrint_(entry, orderRef){
         splitIndex:idx+1, splitTotal:parts.length,
         customerName:entry.customerName||'GENERAL CUSTOMER', remarks:entry.remarks||''
       })).then(function(ok){ if(!ok) console.warn('[KOT PRINT PART] not printed',p.type); return {label:label(p.type),ok:!!ok}; })
-        .catch(function(e){ console.error('[KOT PRINT PART]',p.type,e); return {label:label(p.type),ok:false}; });
+        .catch(function(e){ console.error('[KOT PRINT PART]',p.type,e); return {label:label(p.type),ok:false}; })
+        .then(function(result){if(result.ok){try{let m=JSON.parse(localStorage.getItem(dk)||'{}');Object.keys(m).forEach(function(k){if(Date.now()-m[k]>86400000)delete m[k];});m[key]=Date.now();localStorage.setItem(dk,JSON.stringify(m));}catch(e){}}return result;})
+        .finally(function(){delete window.__bnxKotDispatchFlight[key];});
+      window.__bnxKotDispatchFlight[key]=task;return task;
     });
     /* never awaited by the caller; one summary toast when every station printed */
     return Promise.all(jobs).then(function(res){
@@ -15444,13 +15452,14 @@ async function bnxPlaceOrderImpl_(){
   };
   /* DIRECT PRINT FIX: the KOT goes to the printer the moment Send is tapped — it no longer waits for the
      cloud save (8-15 s on a slow network). The server save continues in the background as before. */
-  const __localRef = 'L'+String(requestId).replace(/[^A-Za-z0-9]/g,'').slice(0,5).toUpperCase();
+  const __localRef = 'L'+String(requestId).replace(/[^A-Za-z0-9]/g,'').toUpperCase();
   const __earlyEntry = { kotNo:__localRef, kotNumber:__localRef, orderNo:__localRef, table:__tbl.id, type:'KITCHEN',
     waiter:stewardName, steward:stewardName, covers:customerFields.covers||'', items:items,
     customerName:customerFields.customerName||'GENERAL CUSTOMER', remarks:customerFields.remarks||'' };
   let __printedEarly = false;
-  try{ bnxFireKOTPrint_(__earlyEntry, __localRef); __printedEarly = true; }catch(e){ console.error('[KOT EARLY PRINT]',e); }
   bnxQueuePending('SAVE_ORDER',__orderPayload,requestId,'kot');
+  try{ bnxFireKOTPrint_(__earlyEntry, __localRef); __printedEarly = true; }catch(e){ console.error('[KOT EARLY PRINT]',e); }
+
   bnxDeferQueuedOrder_(requestId,Date.now()+120000);
   const __saveP=gasApi('SAVE_ORDER',__orderPayload,'V2_CORE').finally(()=>bnxDeferQueuedOrder_(requestId,0));
   const __relT = setTimeout(function(){
@@ -24799,8 +24808,8 @@ body.bnx-bulk-on.bnx-bulk-has #bnx-bulk-bar{display:flex}
   try{ var c0=JSON.parse(localStorage.getItem('bnx_pm_'+cid())||'null'); if(c0) CFG=Object.assign(CFG,c0); }catch(e){}
   function urls(){
     var ids=[], add=function(u){ var m=String(u||'').match(/AKfycb[A-Za-z0-9_-]{20,}/); if(m&&ids.indexOf(m[0])<0) ids.push(m[0]); };
+    try{ add(localStorage.getItem('bnx_api_core')); add(localStorage.getItem('bnx_pq_api_ok')); }catch(e){}
     try{ add(typeof BNX_BOOTSTRAP_CORE_ID!=='undefined'?BNX_BOOTSTRAP_CORE_ID:''); }catch(e){}
-    try{ add(localStorage.getItem('bnx_pq_api_ok')); add(localStorage.getItem('bnx_api_core')); }catch(e){}
     return ids.map(function(id){ return 'https://script.google.com/macros/s/'+id+'/exec'; });
   }
   async function post(action,p,ms){
@@ -24853,7 +24862,7 @@ body.bnx-bulk-on.bnx-bulk-has #bnx-bulk-bar{display:flex}
       W.__bnxLastPosQueue={ok:false};
       setPend(pend().concat(jobs));
       t('📴 KOT print queued on this phone — sends to the POS printer when the server answers','error');
-      ws.forEach(function(f){ f(true); });     /* the KOT itself is saved; printing will follow */
+      ws.forEach(function(f){ f(false); });     /* retained locally, not accepted by printer/server yet */
     }
     }catch(e){ws.forEach(function(f){f(false);});t('KOT print submission not confirmed — pending tickets retained on this phone','error');}
     finally{flushing=false;if(batch.length&&!timer)timer=setTimeout(flush,120);}
@@ -24878,7 +24887,7 @@ body.bnx-bulk-on.bnx-bulk-has #bnx-bulk-bar{display:flex}
     (function poll(){
       if(Date.now()-t0>90000) return;
       post('PRINT_QUEUE_STATUS',{ids:ids},12000).then(function(r){
-        var js=(r&&r.success&&r.data&&r.data.jobs)||[], left=false;
+        var js=(r&&r.success&&r.data&&r.data.jobs)||[], left=!(r&&r.success)||js.length<ids.length;
         js.forEach(function(j){ if(said[j.id]) return;
           if(j.st==='DONE'){ said[j.id]=1; t('✅ Printed at '+(NM[j.role]||j.role)+(j.table?' · '+j.table:''),'success'); }
           else if(j.st==='FAIL'){ said[j.id]=1; t('⚠️ '+(NM[j.role]||j.role)+' KOT NOT printed: '+(j.err||'printer problem')+' — tell the POS counter','error'); }
@@ -25357,19 +25366,7 @@ body:has(#s-home.active) #bnx-ver-badge{display:block!important}
   W.printKOTTicket=function(){ msg(); return Promise.resolve(false); };
   try{ printKOTTicket=W.printKOTTicket; }catch(e){}
   W.bnxPrintAllKOT=function(){ msg(); return Promise.resolve([]); };
-  /* one automatic print per KOT: a second "send" of the same ticket (retry, double tap, re-render) never prints again */
-  var KEY=function(){ return 'bnx_kot_autoprinted_'+cid(); };
-  function load(){ try{ var o=JSON.parse(localStorage.getItem(KEY())||'{}')||{}, now=Date.now(), n={}; Object.keys(o).forEach(function(k){ if(now-o[k]<20*3600e3) n[k]=o[k]; }); return n; }catch(e){ return {}; } }
-  function wrap(){
-    var O=W.bnxFireKOTPrint_; if(typeof O!=='function'||O.__once) return;
-    var w=function(entry,ref){
-      var id=String((entry&&(entry.kotNo||entry.kotNumber||entry.orderNo))||ref||'').trim();
-      if(id){ var m=load(); if(m[id]){ console.info('[KOT] '+id+' already printed — not printed again'); return Promise.resolve([]); } m[id]=Date.now(); try{ localStorage.setItem(KEY(),JSON.stringify(m)); }catch(e){} }
-      return O.apply(this,arguments);
-    };
-    w.__once=true; W.bnxFireKOTPrint_=w; try{ bnxFireKOTPrint_=w; }catch(e){}
-  }
-  wrap(); setTimeout(wrap,1500); setTimeout(wrap,5000);
+  /* Dispatch deduplication is handled per station only AFTER acceptance. */
 })();
 </script>
 <style id="bnx-line-icons-20261018">
@@ -25398,7 +25395,7 @@ body:has(#s-home.active) #bnx-ver-badge{display:block!important}
 (function(){
   'use strict';
   var SKIP=/print|::?(before|after)|\bsvg\b|\btext\b|avatar|veg-dot|-icon\b|\.ico\b/i;
-  function target(px){ return px<=8.5?10.5:px<10?11:px<11?11.5:0; }
+  function target(px){ return px>0?(px<=8.5?10.5:px<10?11:px<11?11.5:0):0; }
   function fixRules(rules, inPrint){
     for(var i=0;i<rules.length;i++){
       var r=rules[i];
@@ -25438,7 +25435,78 @@ html:not(#_sa) body #hspStrip .hx-pp *{text-overflow:clip!important;overflow:vis
 html:not(#_sa) body #bnx-ver-badge{opacity:.55;pointer-events:none!important;font-size:10px!important}
 @media (max-width:760px){html:not(#_sa) body #bnx-ver-badge{bottom:calc(76px + env(safe-area-inset-bottom,0px))!important}}
 </style>
+<style id="bnx-mobile-final-20261023">
+@media(max-width:640px){
+html,body{max-width:100%;} .topbar,.db-bar{max-width:100vw;}
+.db-bar{overflow-x:auto!important;flex-wrap:nowrap!important;scrollbar-width:thin;}
+.topbar{overflow-x:auto!important;} .topbar>*{flex-shrink:0;}
+#page-pos .pos-head-actions,#page-pos .cart-panel>.pos-head-actions{height:auto!important;min-height:42px!important;flex-basis:auto!important;overflow-x:auto!important;justify-content:flex-start!important;gap:6px!important;}
+#page-pos .pos-head-actions .btn{flex:0 0 auto!important;min-width:max-content!important;width:auto!important;max-width:none!important;padding:7px 10px!important;font-size:12px!important;white-space:nowrap!important;overflow:visible!important;}
+.tm-kpi .l,.tm-kpi .p{white-space:normal!important;overflow:visible!important;text-overflow:clip!important;font-size:11px!important;} .tm-kpi{min-width:0!important;}
+.tm-tools{flex-wrap:wrap!important;margin-left:0!important;max-width:100%;} .tm-seg button{padding:7px 10px!important;}
+#page-tables .fbar .search{flex:1 1 100%!important;min-width:0!important;} .fbar{gap:8px!important;flex-wrap:wrap!important;}
+#bnx-pending-badge,#bnx-failed-badge,#bnx-live-badge{font-size:11px!important;max-width:calc(100vw - 24px)!important;white-space:normal!important;line-height:1.35!important;}
+}
+</style><script id="bnx-sync-review-20261023">
+(function(){
+function notice(s){if(typeof toast==='function')toast(s,'info');else if(typeof showNotif==='function')showNotif(s,'info');}
+window.bnxHandleFailedBadgeTap=function(){
+ var failed=bnxGetFailedOutbox();if(!failed.length)return;
+ var old=document.getElementById('bnx-sync-review');if(old)old.remove();
+ var box=document.createElement('dialog');box.id='bnx-sync-review';box.style.cssText='max-width:92vw;width:480px;max-height:80dvh;overflow:auto;border:0;border-radius:14px;padding:18px;color:#222;background:#fff';
+ var title=document.createElement('h3');title.textContent='Server sync needs attention';box.appendChild(title);
+ failed.forEach(function(e){var p=document.createElement('p');p.textContent=String(e.action)+' · '+String(e.requestId||'')+' — '+String(e.lastError||'No server confirmation');box.appendChild(p);});
+ var retry=document.createElement('button');retry.textContent='Retry pending transactions';retry.style.cssText='padding:12px;margin:6px';retry.onclick=function(){bnxRetryFailedOutbox();box.close();};box.appendChild(retry);
+ var close=document.createElement('button');close.textContent='Close';close.style.cssText='padding:12px;margin:6px';close.onclick=function(){box.close();};box.appendChild(close);document.body.appendChild(box);box.showModal();
+};
+window.bnxClearFailedOutbox=function(){notice('Unsynced transactions are retained. Open sync issues to review or retry.');window.bnxHandleFailedBadgeTap();};
+var last=0;
+function paint(){try{var pending=bnxGetOutbox().length,failed=bnxGetFailedOutbox().length;var b=document.getElementById('bnx-live-badge');if(b&&(pending||failed)){b.textContent=navigator.onLine?(failed?'⚠ SYNC ISSUES · '+failed:'🟡 SYNCING · '+pending):'🔴 OFFLINE';}var f=document.getElementById('bnx-failed-badge');if(f&&failed)f.onclick=window.bnxHandleFailedBadgeTap;}catch(e){}}
+setInterval(paint,1500);
+function wake(){if(document.visibilityState==='hidden'||!navigator.onLine||Date.now()-last<10000)return;last=Date.now();try{Promise.resolve(flushOutbox(true)).catch(function(e){console.warn('[SYNC]',e);});}catch(e){}}
+window.addEventListener('online',wake);window.addEventListener('focus',wake);document.addEventListener('visibilitychange',wake);
+})();</script>
 </body>
+<style id="bnx-final-mobile-audit-20261023">
+/* Last mobile rules intentionally follow the old compact-desktop overrides. */
+@media(max-width:760px){
+html:not(#_va):not(#_vb):not(#_vc) body #page-pos #qaPanel{overflow-x:auto!important;overflow-y:hidden!important;flex-wrap:nowrap!important;scrollbar-width:thin!important;padding:6px!important;gap:6px!important;}
+html:not(#_va):not(#_vb):not(#_vc) body #page-pos #qaPanel .qa-btn{flex:0 0 auto!important;min-width:max-content!important;width:auto!important;height:42px!important;min-height:42px!important;max-height:none!important;padding:0 12px!important;overflow:visible!important;text-overflow:clip!important;font-size:12px!important;line-height:1.2!important;}
+html:not(#_va):not(#_vb):not(#_vc) body #page-pos #qaPanel.bnx-qa-icons .qa-btn{min-width:42px!important;}
+html:not(#_va):not(#_vb):not(#_vc) body #page-tables #tmKpis{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:7px!important;}
+html:not(#_va):not(#_vb):not(#_vc) body #page-tables #tmKpis .tm-kpi{min-height:62px!important;gap:7px!important;padding:8px!important;}
+html:not(#_va):not(#_vb):not(#_vc) body #page-tables #tmKpis .tm-kpi>span:last-child{flex-wrap:wrap!important;align-items:center!important;column-gap:6px!important;row-gap:2px!important;}
+html:not(#_va):not(#_vb):not(#_vc) body #page-tables #tmKpis .tm-kpi .l{white-space:normal!important;overflow:visible!important;text-overflow:clip!important;overflow-wrap:anywhere!important;font-size:12px!important;line-height:1.25!important;}
+html:not(#_va):not(#_vb):not(#_vc) body #page-tables #tmTools{flex-wrap:wrap!important;width:100%!important;margin-left:0!important;gap:7px!important;}
+html:not(#_va):not(#_vb):not(#_vc) body #page-tables #tableFilterBar{flex-wrap:wrap!important;}
+html:not(#_va):not(#_vb):not(#_vc) body #page-tables #tmTools .tm-seg button,html:not(#_va):not(#_vb):not(#_vc) body #page-tables .tm-ib{min-height:40px!important;}
+html:not(#_t) body .db-bar{overflow-x:auto!important;overflow-y:hidden!important;}
+html body #bnxStatusDock{max-width:100vw!important;overflow-x:auto!important;overflow-y:hidden!important;scrollbar-width:thin!important;box-sizing:border-box!important;}
+html body #bnxStatusDock .bnx-status-wrap{flex:0 0 auto!important;}
+html body #page-pos #menuGrid .bnx-flag-btn,html body #page-pos #menuGrid .bnx-status-btn{font-size:0!important;line-height:1!important;min-height:30px!important;max-height:30px!important;height:30px!important;min-width:30px!important;padding:2px!important;}
+html body #page-pos #menuGrid .bnx-flag-btn::before,html body #page-pos #menuGrid .bnx-status-btn::before{font-size:14px!important;}
+html body #page-pos #menuGrid .bnx-flag-row,html body #page-pos #menuGrid .bnx-status-row{gap:4px!important;}
+html body #bnx-sync-review{max-width:calc(100vw - 24px)!important;width:480px!important;max-height:80dvh!important;box-sizing:border-box!important;overflow-wrap:anywhere!important;}
+html body #bnx-sync-review button{min-height:44px!important;white-space:normal!important;}
+}
+</style>
+<script id="bnx-final-save-feedback-20261023">
+(function(W){
+ var hooked=false;
+ function wrap(){var g=W.gasApi;if(typeof g!=='function'||g.__bnxLedgerFeedback)return;
+  function f(action,payload,endpoint){var p=g.apply(this,arguments);return Promise.resolve(p).then(function(r){
+   if(action==='SAVE_BILL'&&r&&r.success&&r.ledgerPosted===false){
+    var msg='Bill saved. Ledger posting needs repair; do not save this bill again.';
+    if(typeof W.showNotif==='function')W.showNotif(msg,'error');else if(typeof W.toast==='function')W.toast(msg,'error');
+   }return r;
+  });}
+  Object.keys(g).forEach(function(k){try{f[k]=g[k];}catch(e){}});f.__bnxLedgerFeedback=true;W.gasApi=f;try{gasApi=f;}catch(e){}hooked=true;
+ }
+ wrap();if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',wrap);
+ // Wrap once more after startup installers; no permanent extra polling loop.
+ setTimeout(wrap,6000);
+})(window);
+</script>
 </html>
 
 <script>
