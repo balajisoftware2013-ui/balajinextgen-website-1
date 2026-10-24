@@ -8294,7 +8294,10 @@ async function flushOutbox_impl_(force){
       if(res && !res.success && res.data && res.data.requestId===entry.requestId && res.data.ORDER_ID)res=Object.assign({},res,{success:true});
       if(entry.action==='SAVE_ORDER' && res && res.success && !bnxSavedOrderRef_(res))
         res=Object.assign({},res,{success:false,error:'Order reference not returned; verifying with the same request ID'});
+      if(entry.action==='SAVE_KOT' && res && res.success && !(res.kotNumber||(res.data&&res.data.KOT_NUMBER)))
+        res=Object.assign({},res,{success:false,error:'Saved KOT number not returned; retrying original request ID'});
       if(res && res.success){
+        if(entry.action==='SAVE_KOT' && entry.payload && entry.payload.kotSource==='STEWARD')bnxPrintSavedKot_(entry.payload,res);
         // Successfully synced late — apply any follow-up UI update tagged on this entry
         if(entry.requestId)bnxConfirmQueuedOrder_(entry.requestId);
         // Save is confirmed: badge must not wait for KOT/report follow-up calls.
@@ -12008,6 +12011,21 @@ function bnxKOTGroupType_(item, menuItem){
    server generates the authoritative KOT_NUMBER itself (kotNumber is
    intentionally not sent) — never invented client-side, avoiding any
    chance of two devices handing out the same number. */
+// Shared foreground/recovery print path. Never use an order ID as a KOT number.
+function bnxPrintSavedKot_(payload,response){
+ const d=response&&response.data||{};
+ const kot=String(response&&response.kotNumber||d.KOT_NUMBER||'').trim();
+ const orderNo=String(payload.orderNo||'').trim();
+ if(!kot||!orderNo)return false;
+ const station=String(payload.kotType||payload.STATION||'KITCHEN').toUpperCase();
+ const ticket={kotNo:kot,kotNumber:kot,orderNo:orderNo,table:payload.table||payload.TABLE_ID||'',
+ waiter:payload.waiter||payload.steward||'',covers:payload.covers||'',items:payload.items||[],
+ customerName:payload.customerName||'',remarks:payload.remarks||'',kotNumbersByType:{[station]:kot}};
+ Promise.resolve(bnxFireKOTPrint_(ticket,orderNo)).then(function(r){
+   if(!r.length||r.some(function(x){return !x.ok;}))toast('KOT '+kot+' saved; print not confirmed — check pending print jobs before reprinting','error');
+ }).catch(function(e){console.error('[SAVED KOT PRINT]',e);});
+ return true;
+}
 async function bnxSyncRealKotTickets_(entry, orderId, locationId){
   /* FINAL STEWARD KOT SERVER-SAVE FIX
      - waits for SAVE_KOT instead of fire-and-forget
@@ -12072,7 +12090,8 @@ async function bnxSyncRealKotTickets_(entry, orderId, locationId){
       if(!kotReq.items.length) return {ok:false,queued:false};
       try{
         const kres=await gasApi('SAVE_KOT',kotReq,'V2_CORE');
-        if(kres&&kres.success){
+        if(kres&&kres.success&&(kres.kotNumber||(kres.data&&kres.data.KOT_NUMBER))){
+          bnxPrintSavedKot_(kotReq,kres);
           return {ok:true,queued:false,ticket:{type:part.type,kotNumber:kres.kotNumber||'',transactionId:kres.transactionId||''}};
         }
         if(typeof bnxQueuePending==='function')bnxQueuePending('SAVE_KOT',kotReq,kotRequestId,'kot');
@@ -15477,25 +15496,10 @@ async function bnxPlaceOrderImpl_(){
     requestId, stewardApp:true, tableId:selTable.id, locationId:identity.locationId||'', orderSource:'POS', orderType:'DINEIN', waiter:stewardName, steward:stewardName, waiterName:stewardName, waiterLogin:identity.loginId, covers:customerFields.covers||'', COVERS:customerFields.covers||'', guestNo:customerFields.guestNo||'', guestCount:customerFields.guestCount||'', guests:customerFields.guests||'', GUEST_NO:customerFields.guestNo||'', GUEST_COUNT:customerFields.guestCount||'', items, occasion:'None', customerName:customerFields.customerName, CUSTOMER_NAME:customerFields.customerName, customerMobile:customerFields.customerMobile, CUSTOMER_MOBILE:customerFields.customerMobile, mobile:customerFields.customerMobile, orderDate, orderTime, businessDate:orderDate, BUSINESS_DATE:orderDate,
     ...orderIdentityFields
   };
-  /* DIRECT PRINT FIX: the KOT goes to the printer the moment Send is tapped — it no longer waits for the
-     cloud save (8-15 s on a slow network). The server save continues in the background as before. */
-  const __localRef = 'L'+String(requestId).replace(/[^A-Za-z0-9]/g,'').toUpperCase();
-  const __earlyEntry = { kotNo:__localRef, kotNumber:__localRef, orderNo:__localRef, table:__tbl.id, type:'KITCHEN',
-    waiter:stewardName, steward:stewardName, covers:customerFields.covers||'', items:items,
-    customerName:customerFields.customerName||'GENERAL CUSTOMER', remarks:customerFields.remarks||'' };
-  let __printDispatched = false;
+  // Persist the save first. Real Order/KOT numbers must arrive before any print dispatch.
   bnxQueuePending('SAVE_ORDER',__orderPayload,requestId,'kot');
   bnxDeferQueuedOrder_(requestId,Date.now()+120000);
-  // Start the authoritative save before preparing any printer payload.
   const __saveP=gasApi('SAVE_ORDER',__orderPayload,'V2_CORE').finally(()=>bnxDeferQueuedOrder_(requestId,0));
-  try{
-    __printDispatched = true;
-    Promise.resolve(bnxFireKOTPrint_(__earlyEntry,__localRef)).then(function(results){
-      if(String(CLIENT_ID||'')!==__orderClient)return;
-      if(!results.length || results.some(function(r){return !r.ok;}))
-        toast('⚠️ KOT print not confirmed — check Printer Setup / pending print jobs before reprinting','error');
-    }).catch(function(e){console.error('[KOT EARLY PRINT]',e);});
-  }catch(e){ console.error('[KOT EARLY PRINT]',e); }
   const __relT = setTimeout(function(){
     if(String(CLIENT_ID||'')!==__orderClient)return;
     __released = true;
@@ -15524,7 +15528,7 @@ async function bnxPlaceOrderImpl_(){
     const localTag = { kotNo:'PENDING-'+requestId.slice(0,8), orderNo:'', orderId:'', table:__tbl.id, type:'KITCHEN', time:new Date().toISOString(),
       waiter:stewardName, steward:stewardName, covers:customerFields.covers||'', COVERS:customerFields.covers||'', guestNo:customerFields.guestNo||'', guestCount:customerFields.guestCount||'', guests:customerFields.guests||'', GUEST_NO:customerFields.guestNo||'', GUEST_COUNT:customerFields.guestCount||'', items, amount, customerName:customerFields.customerName, CUSTOMER_NAME:customerFields.customerName, customerMobile:customerFields.customerMobile, CUSTOMER_MOBILE:customerFields.customerMobile, mobile:customerFields.customerMobile, orderTime, status:'PENDING_SYNC', userId:identity.userId, USER_ID:identity.userId, createdById:identity.userId, CREATED_BY_ID:identity.userId, loginId:identity.loginId, LOGIN_ID:identity.loginId, createdByLogin:identity.loginId, CREATED_BY_LOGIN:identity.loginId, createdByName:stewardName, CREATED_BY_NAME:stewardName };
     bnxLoadOpenKots(); KOT.unshift(localTag); bnxSetOpenKotsRaw(JSON.stringify(KOT));
-    if(!__printDispatched) bnxFireKOTPrint_(localTag, localTag.kotNo);   /* already printed at tap; fallback only */
+    // Pending orders print after server recovery returns their real station KOT numbers.
     if(!__released){ order={}; orderItemRemarks={}; }
     if(!__released){ try{ updateOrderBadge(); refreshCurrentMenuView_(); bnxToggleOrderDrawer_(false); }catch(e){} }
     if(!__released) setTimeout(() => showScreen('s-home'), 1200);
@@ -15606,20 +15610,7 @@ async function bnxPlaceOrderImpl_(){
     })
     .catch(function(e){ console.warn('[STEWARD KOT SYNC]',e); return null; });
 
-  // FIX ("send kot direct kot printer print kot"): sending an order used
-  // to only push it to the Kitchen Display — printing the physical KOT
-  // ticket required a separate manual tap on the KOT list's own Print
-  // button afterward. Auto-fire the same printKOTTicket() the manual
-  // button already uses, right after the order is confirmed on the
-  // server, so "Send to KDS" also sends straight to the KOT printer.
-  // Wrapped so a print failure (no printer connected, popup blocked)
-  // never breaks the order that has already been successfully placed.
-  /* KOT NUMBER FIX: the printed ticket showed the ORDER number in "KOT No"
-     because printing started before SAVE_KOT returned the station KOT numbers.
-     Wait for them (max 3 s — printing never waits longer than that). */
-  Promise.race([__kotSyncP, new Promise(function(r){ setTimeout(r,1500); })])   /* was 3 s — KOT reaches the printer sooner */
-    
-    .then(function(){ if(!__printDispatched) bnxFireKOTPrint_(entry, orderId); }, function(){ if(!__printDispatched) bnxFireKOTPrint_(entry, orderId); });
+  // Each station prints immediately when its own SAVE_KOT completes; no arbitrary delay or number fallback.
   PLACED_ORDERS[orderId] = {
     id: orderId, table: __tbl.id, items: JSON.parse(JSON.stringify(items)), amount, steward: stewardName,
     status: 'PLACED', timestamp: Date.now(), originalItems: JSON.parse(JSON.stringify(items)), hasServerId: true
@@ -25628,4 +25619,4 @@ W.BNX_STEWARD_BUILD='SM-2026.10.24-nav-search-v3';
 })(window,document);
 </script>
 
-<script>window.BNX_MOBILE_PRINT_BUILD='2026.10.24-audited-live-kot-v6';</script>
+<script>window.BNX_MOBILE_PRINT_BUILD='2026.10.24-real-kot-order-v7';</script>
