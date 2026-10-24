@@ -8043,7 +8043,7 @@ function bnxQueuePending(action, payload, requestId, onSuccess){
   if(rid && list.some(e=>String(e.requestId||'')===rid)) return;
   list.push({ requestId:rid||requestId, action, payload, attempts:0, queuedAt:new Date().toISOString(), onSuccessTag: onSuccess||null });
   bnxSetOutbox(list);
-  if(String(action||'').toUpperCase()==='SAVE_KOT' && !(payload&&payload.kotSource==='STEWARD')){
+  if(String(action||'').toUpperCase()==='SAVE_KOT'){
     const k = list.filter(e=>String(e.action||'').toUpperCase()==='SAVE_KOT').length;
     if(typeof toast==='function') toast('⚠️ KOT pending server sync ('+k+') — auto-retry active','error');
   }
@@ -12014,8 +12014,8 @@ function bnxKOTGroupType_(item, menuItem){
 // Shared foreground/recovery print path. Never use an order ID as a KOT number.
 function bnxPrintSavedKot_(payload,response){
  const d=response&&response.data||{};
- const kot=String(response&&(response.kotNumber||response.KOT_NUMBER)||d.kotNumber||d.KOT_NUMBER||'').trim();
- const orderNo=String(payload.orderNo||payload.ORDER_NUMBER||'').trim();
+ const kot=String(response&&response.kotNumber||d.KOT_NUMBER||'').trim();
+ const orderNo=String(payload.orderNo||'').trim();
  if(!kot||!orderNo)return false;
  const station=String(payload.kotType||payload.STATION||'KITCHEN').toUpperCase();
  const ticket={kotNo:kot,kotNumber:kot,orderNo:orderNo,table:payload.table||payload.TABLE_ID||'',
@@ -12037,16 +12037,16 @@ async function bnxSyncRealKotTickets_(entry, orderId, locationId){
   const result={success:true,count:0,failed:0,tickets:[]};
   try{
     window.__BNX_KOT_SYNCED_ = window.__BNX_KOT_SYNCED_ || {};
-    const syncKey=String(CLIENT_ID||'')+'|'+String(orderId||entry.orderNo||entry.kotNo||'');
+    const syncKey=String(orderId||entry.orderNo||entry.kotNo||'');
     if(syncKey && window.__BNX_KOT_SYNCED_[syncKey]){ console.warn('[STEWARD KOT SYNC] skipped duplicate call for',syncKey); return {success:true,count:0,failed:0,tickets:[],skipped:true}; }
     if(syncKey) window.__BNX_KOT_SYNCED_[syncKey]=true;
     const parts=bnxKOTParts_(entry);
-    if(!parts.length){delete window.__BNX_KOT_SYNCED_[syncKey];result.success=false;result.failed=1;toast('No KOT items found — order requires verification','error');return result;}
+    if(!parts.length){result.success=false;result.failed=1;return result;}
     const identity=getCurrentStaffIdentity();
     // SPEED FIX: Kitchen/Bar/Beverage station tickets are independent.
     // Save them concurrently instead of waiting one-by-one.
     const results = await Promise.all(parts.map(async function(part){
-      const kotRequestId='KOT-'+String(orderId||entry.orderNo||entry.kotNo||'')+'-'+String(part.type||'KITCHEN');   // same order+station => server dedupes
+      const kotRequestId='KOT-'+syncKey+'-'+String(part.type||'KITCHEN');   // same order+station => server dedupes
       const kotReq={
         requestId:kotRequestId,
         /* 2026-10-05: KOT carries the 06:00→05:59 business date explicitly (server time is calendar) */
@@ -12087,16 +12087,12 @@ async function bnxSyncRealKotTickets_(entry, orderId, locationId){
           SPECIAL_INSTRUCTIONS:String(i.SPECIAL_INSTRUCTIONS||i.itemRemark||i.ITEM_REMARKS||i.REMARKS||i.remark||i.remarks||i.note||i.notes||'').trim()
         })).filter(i=>i.ITEM_ID&&i.QUANTITY>0)
       };
-      if(!kotReq.items.length){toast('KOT not sent: '+part.type+' items have missing IDs or quantities','error');return {ok:false,queued:false};}
+      if(!kotReq.items.length) return {ok:false,queued:false};
       try{
-        // Durable before network: closing the phone must not lose a saved order's kitchen ticket.
-        bnxQueuePending('SAVE_KOT',kotReq,kotRequestId,'kot');
-        bnxDeferQueuedOrder_(kotRequestId,Date.now()+120000);
-        const kres=await gasApi('SAVE_KOT',kotReq,'V2_CORE').finally(()=>bnxDeferQueuedOrder_(kotRequestId,0));
-        if(kres&&kres.success&&(kres.kotNumber||kres.KOT_NUMBER||(kres.data&&(kres.data.kotNumber||kres.data.KOT_NUMBER)))){
-          bnxConfirmQueuedOrder_(kotRequestId);
+        const kres=await gasApi('SAVE_KOT',kotReq,'V2_CORE');
+        if(kres&&kres.success&&(kres.kotNumber||(kres.data&&kres.data.KOT_NUMBER))){
           bnxPrintSavedKot_(kotReq,kres);
-          return {ok:true,queued:false,ticket:{type:part.type,kotNumber:kres.kotNumber||(kres.data&&(kres.data.kotNumber||kres.data.KOT_NUMBER))||'',transactionId:kres.transactionId||''}};
+          return {ok:true,queued:false,ticket:{type:part.type,kotNumber:kres.kotNumber||'',transactionId:kres.transactionId||''}};
         }
         if(typeof bnxQueuePending==='function')bnxQueuePending('SAVE_KOT',kotReq,kotRequestId,'kot');
         return {ok:false,queued:true};
@@ -12105,7 +12101,6 @@ async function bnxSyncRealKotTickets_(entry, orderId, locationId){
         return {ok:false,queued:true};
       }
     }));
-    if(results.some(function(r){return !r||!r.ok;}))delete window.__BNX_KOT_SYNCED_[syncKey];
     results.forEach(function(r){
       if(r && r.ok){ result.count++; if(r.ticket) result.tickets.push(r.ticket); }
       else { result.failed++; result.success=false; }
@@ -13488,8 +13483,8 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
     o.push(LEFT);
     const kv=function(k,v){ return padRight_(k,9)+': '+text_(v); };
     const kvLine=function(k,v){ const lab=padRight_(k,9)+': '; wrap_(v,W-lab.length).forEach(function(l,ix){ o.push((ix?new Array(lab.length+1).join(' '):lab)+l+NL); }); };
-    kvLine('KOT No',d.kotNo||d.kotNumber||d.KOT_NUMBER||'Not confirmed');
-    kvLine('Order No',(d.orderNo||d.ORDER_NUMBER||'Not confirmed')+(d.splitTotal>1?'  (Part '+(d.splitIndex||1)+'/'+d.splitTotal+')':''));
+    if(d.kotNo)   kvLine('KOT No',d.kotNo);
+    if(d.orderNo) kvLine('Order No',d.orderNo+(d.splitTotal>1?'  (Part '+(d.splitIndex||1)+'/'+d.splitTotal+')':''));
     if(W>=42){
       o.push(cols_(W,'Date: '+dt,'Time: '+tm)+NL);
       o.push(cols_(W,'Steward: '+text_(d.waiter||d.steward||'-'),'Pax: '+text_(d.covers||d.pax||'-'))+NL);
@@ -13754,7 +13749,7 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
      every direct KOT job while preserving the station split. */
   window.__bnxStewardKotPrintQueue=window.__bnxStewardKotPrintQueue||Promise.resolve();
   window.bnxDirectKOTPrint_=function(type,d){
-    const payload=Object.assign({},d,{type,kotNo:d&&(d.kotNo||d.kotNumber||d.KOT_NUMBER)||'',orderNo:d&&(d.orderNo||d.ORDER_NUMBER)||''});
+    const payload=Object.assign({},d,{type});
     const run=async function(){
       try{
         const role=role_(type);
@@ -24906,7 +24901,7 @@ body.bnx-bulk-on.bnx-bulk-has #bnx-bulk-bar{display:flex}
     var id=['K',cid(),String(d.kotNo||d.orderNo||''),r,String(d.splitIndex||1),d.reprint?('R'+Date.now()):''].join('-').replace(/[^A-Za-z0-9_.:-]/g,'');
     if(!(d.kotNo||d.orderNo)) id+='-'+Date.now().toString(36);
     var job={id:id,role:r,table:d.table||'',waiter:d.waiter||'',covers:d.covers||'',items:items.map(function(i){ return {name:i.name||i.n||i.ITEM_NAME||i.itemName||'Item',qty:i.qty||i.QUANTITY||1,size:i.size||i.SIZE||i.sizeName||'',note:i.note||i.notes||i.remark||i.remarks||i.SPECIAL_INSTRUCTIONS||i.itemRemark||i.ITEM_REMARKS||''}; }),
-      kotNo:d.kotNo||d.kotNumber||d.KOT_NUMBER||'',orderNo:d.orderNo||d.ORDER_NUMBER||'',splitIndex:d.splitIndex||1,splitTotal:d.splitTotal||1,customerName:d.customerName||'',remarks:d.remarks||'',reprint:!!d.reprint,from:'STEWARD'};
+      kotNo:d.kotNo||'',orderNo:d.orderNo||'',splitIndex:d.splitIndex||1,splitTotal:d.splitTotal||1,customerName:d.customerName||'',remarks:d.remarks||'',reprint:!!d.reprint,from:'STEWARD'};
     setPend(pend().concat([job]));batch.push(job);
     if(!timer) timer=setTimeout(flush,0);   /* 2026-10-24: sent at once (was 120 ms) */
     return new Promise(function(res){ waiters.push(res); });
@@ -25624,4 +25619,4 @@ W.BNX_STEWARD_BUILD='SM-2026.10.24-nav-search-v3';
 })(window,document);
 </script>
 
-<script>window.BNX_MOBILE_PRINT_BUILD='2026.10.24-place-order-kot-v22';</script>
+<script>window.BNX_MOBILE_PRINT_BUILD='2026.10.24-real-kot-order-v7';</script>
