@@ -1786,7 +1786,7 @@ const BNX_WRITE_TIMEOUT_MS = 180000; /* 3 min */
    answers in ~18-30 s on a busy day (BN_HEALTH avg_response). Every attempt was cut off just before
    the server finished, then retried 3x inside gasApi x 4x in bmSaveBill = up to 12 tries (~2.5 min)
    before the invoice printed. Bill/settle writes now get one long wait instead of many short ones. */
-const BNX_BILL_WRITE_TIMEOUT_MS = 180000; /* 3 min */
+const BNX_BILL_WRITE_TIMEOUT_MS = 90000; /* bounded confirmation window; uncertain writes stay in outbox */
 // Heavy Tally-style reports may scan BILL/PAYMENT/BILL_ITEMS/MASTER sheets.
 // Give report reads enough time to complete instead of falsely presenting
 // a timeout as an empty/demo report.
@@ -2312,9 +2312,9 @@ function processRequestQueue() {
        5 slow report reads. While Apps Script is slow (avg > 10 s) background reads drop to 3 at a time: fewer
        overlapping executions on the server = every answer (SAVE_BILL, menu, KOT) comes back sooner. */
     let slowSrv = false; try{ slowSrv = (typeof PERF_METRICS!=='undefined' && PERF_METRICS.responseTimes.length>=4 && PERF_METRICS.avgResponseTime>10000); }catch(e){}
-    const cap = task.__prio ? REQUEST_QUEUE.maxConcurrent + 3 : (slowSrv ? 3 : REQUEST_QUEUE.maxConcurrent);
+    const cap = task.__prio ? 3 : (slowSrv ? 1 : 2); // avoid flooding the shared Apps Script execution pool
     if (crit && REQUEST_QUEUE.critActive>=2) {i++;continue;}
-    if (!crit && ((!task.__prio && critHold) || REQUEST_QUEUE.active >= cap)) { i++; continue; }
+    if (!crit && (critHold || REQUEST_QUEUE.active >= cap)) { i++; continue; }
     if (task.__heavy && (REQUEST_QUEUE.heavyActive||0) >= 2) { i++; continue; }      /* keep 3 slots free for on-screen reads */
     P.splice(i, 1);
     if (task.__heavy){ REQUEST_QUEUE.heavyActive=(REQUEST_QUEUE.heavyActive||0)+1; task.__heavyDone=function(){ REQUEST_QUEUE.heavyActive=Math.max(0,(REQUEST_QUEUE.heavyActive||0)-1); }; }
@@ -10560,14 +10560,14 @@ if(D.readyState==='loading')D.addEventListener('DOMContentLoaded',watch);else wa
          first time DSR Reports is opened. Client comes from the session, not the URL
          (hard-coded client=CL00010 removed). -->
     <iframe id="dsrFrame"
-      data-src="dsr-client.html?v=20261023-dsr-v2"
+      data-src="dsr-client.html?v=20261024-save-report-v3"
       title="DSR Client — Live DSR / Swift Transaction Report"
       style="width:100%;height:100%;border:0;display:block;background:transparent;"
       onload="window.bnxDsrFrameLoaded&&window.bnxDsrFrameLoaded();"
       onerror="document.getElementById('dsrFrameFallback').style.display='flex'"></iframe>
     <div id="dsrFrameFallback" style="display:none;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:40px;color:var(--text3);font-size:13px;text-align:center;">
       ⚠️ Could not load dsr-client.html here.<br>Make sure dsr-client.html is uploaded in the same folder as this dashboard file, then
-      <button class="btn btn-sm btn-primary" onclick="window.open('dsr-client.html?v=20261023-dsr-v2','_blank')">Open Full DSR Client</button>
+      <button class="btn btn-sm btn-primary" onclick="window.open('dsr-client.html?v=20261024-save-report-v3','_blank')">Open Full DSR Client</button>
     </div>
   </div>
 </div>
@@ -23140,7 +23140,7 @@ async function bmSaveBill(reprintAfter){
     /* FIX 2026-10-12: remember the split-payment lines now — the SAVE_BILL wrapper empties them once the server confirms */
     const _splitSnap = (function(){ try{ const L=(Array.isArray(window.__BNX_BM_PAYMENT_LINES)?window.__BNX_BM_PAYMENT_LINES:[]).map(function(x){ return {mode:String(x.mode||'CASH').toUpperCase(),amount:Math.round((Number(x.amount)||0)*100)/100}; }).filter(function(x){return x.amount>0;}); const t=L.reduce(function(a,x){return a+x.amount;},0); return (L.length>1 && Math.abs(t-(Number(d.total)||0))<=1.01) ? L : null; }catch(e){ return null; } })();
     let res = null, lastSaveError = null;
-    const maxSaveAttempts = 2;   // each attempt now waits up to 45 s (was 4 x 3 x 12 s)
+    const maxSaveAttempts = 1;   // never submit a second long write while the first may still be committing
     for (let attempt = 1; attempt <= maxSaveAttempts; attempt++) {
       try {
         if (typeof bnxResetApiCircuit_ === 'function') bnxResetApiCircuit_('V2_CORE');
@@ -31688,7 +31688,7 @@ const REPORTS_META = [
   {cat:'sales', accent:'#B8690E', icon:'📒', title:'Debtors Report', desc:'Outstanding dues aging 0-30 / 30-60 / 60+ days', anchor:'debtors'},
   {cat:'sales', accent:'#B8690E', icon:'💎', title:'Tips & Swipe Report', desc:'Steward-wise tips, card swipes & UPI collections', anchor:'tips'},
   {cat:'dsr', accent:'#2563EB', icon:'📅', title:'Daily Sales Report', desc:'Full day-end breakdown for selected period', anchor:'daily-sales'},
-  {cat:'dsr', accent:'#2563EB', icon:'👤', title:'Client DSR', desc:'Per-client daily sales view', href:'dsr-client.html?v=20261023-dsr-v2'},
+  {cat:'dsr', accent:'#2563EB', icon:'👤', title:'Client DSR', desc:'Per-client daily sales view', href:'dsr-client.html?v=20261024-save-report-v3'},
   {cat:'dsr', accent:'#2563EB', icon:'📊', title:'Monthly DSR Report', desc:'Day-by-day DSR matrix for the whole month', anchor:'dsr-csv'},
   {cat:'recon', accent:'#0891B2', icon:'🔄', title:'Sale vs Bank Reconciliation', desc:'Match DSR sales against bank/UPI settlement', anchor:'recon-csv'},
   {cat:'cancel', accent:'#DC2626', icon:'❌', title:'Cancelled Bill Report', desc:'Every cancelled bill with reason & authoriser', anchor:'cancelled-bills'},
@@ -46045,7 +46045,8 @@ body:not(.pos-machine) #bmProductGrid,
     syncing[p.requestId] = false;
     if (r && r.success) {
       pendDel(p.requestId);
-      const d = r.data || {}; W.__bnx72LastRcpt = d;
+      const d = bnxReceiptDocument_(r.data || r, p);
+      W.__bnx72LastRcpt = d;
       const v = document.getElementById('rv79Vno'); if (v && fromUser) {
         v.textContent = (d.voucherNo || '') + ' saved';
         const n = document.getElementById('rv79SyncNote');
@@ -46085,6 +46086,21 @@ body:not(.pos-machine) #bmProductGrid,
   let LASTOPT = null;
   const SHOWMODE = m => (String(m || '').toUpperCase() === 'DUES_DISCOUNT' ? 'Credit Note (CN)' : String(m || ''));
   const actLine = (id, html) => { const box = document.getElementById('rv79Acts'); if (!box) return; let e = document.getElementById(id); if (!e) { e = document.createElement('div'); e.id = id; box.appendChild(e); } e.innerHTML = html; };
+  // Normalize a confirmed receipt only. Submission details survive partial API replies.
+  function bnxReceiptDocument_(raw, p){
+    raw = raw && typeof raw === 'object' ? raw : {}; p = p || {};
+    const d = Object.assign({}, raw);
+    const pick = (...xs) => xs.find(x => x !== undefined && x !== null && x !== '');
+    d.voucherNo = pick(raw.voucherNo, raw.VOUCHER_NO, raw.RECEIPT_NO, raw.receiptNo, raw.ref, '');
+    d.customer = pick(raw.customer, raw.CUSTOMER_NAME, p.customerName, '');
+    d.customerId = pick(raw.customerId, raw.CUSTOMER_ID, p.customerId, '');
+    d.amount = Number(pick(raw.amount, raw.AMOUNT, p.amount));
+    d.mode = pick(raw.mode, raw.PAYMENT_MODE, raw.paymentMode, p.paymentMode, '');
+    d.date = pick(raw.date, raw.RECEIPT_DATE, raw.DATE, p.date, '');
+    d.time = pick(raw.time, raw.RECEIPT_TIME, '');
+    d.allocations = Array.isArray(raw.allocations) ? raw.allocations : [];
+    return d;
+  }
   function rcptRaw(d, o){
     const width = Number((typeof bnxPaperSize === 'function' ? bnxPaperSize() : 80)) === 58 ? 32 : 42;
     const line = ch => ch.repeat(width) + '\n', fit = (l, r) => { l = String(l); r = String(r); return l + ' '.repeat(Math.max(1, width - l.length - r.length)) + r + '\n'; };
@@ -46110,6 +46126,9 @@ body:not(.pos-machine) #bmProductGrid,
   }
   /* PRINT DIRECT: thermal BILL printer (QZ/IP, no dialog) first; else a hidden frame (no pop-up window) */
   async function rcptPrint(d, o){
+    if (!d || !d.voucherNo || !d.customer || !d.mode || !d.date || !(Number(d.amount) > 0)) {
+      return {ok:false,error:'Confirmed voucher details are incomplete. Reload the receipt from the customer ledger before printing.'};
+    }
     try {
       const ip = (typeof W.bnxIpSettings_ === 'function' ? (W.bnxIpSettings_() || {}) : {}).BILL;
       if (ip && localStorage.getItem('bnx_direct_ip_print') !== '0' && typeof W.bnxDirectPrintRaw_ === 'function') {
@@ -46422,7 +46441,7 @@ body:has(#page-customer-credit.active) #bnxGlobalPeriodBar{display:none!importan
     var f=frame();if(!f)return;
     if(f.dataset.parked==='1'||!f.getAttribute('src')){ if(active()) ensure(); return; }
     if(!hard){try{var w=f.contentWindow;if(w&&typeof w.bnxFinalDsrReload_==='function'){w.bnxFinalDsrReload_();last=Date.now();return;}}catch(e){}}
-    var base=f.getAttribute('data-src')||'dsr-client.html?v=20261023-dsr-v2';
+    var base=f.getAttribute('data-src')||'dsr-client.html?v=20261024-save-report-v3';
     try{window.bnxDsrLoader&&window.bnxDsrLoader(true);}catch(e){} f.src=base+(base.indexOf('?')>-1?'&':'?')+'t='+Date.now();last=Date.now();
   };
   /* 2026-10-08 ROOT FIX (console full of "[API_DEBUG] Fetch error" from dsr-client.html while on Settings / Home):
@@ -46442,8 +46461,14 @@ body:has(#page-customer-credit.active) #bnxGlobalPeriodBar{display:none!importan
     try{
       var f=frame(), w=f&&f.contentWindow; if(!w||w.__bnxNetHold||typeof w.fetch!=='function') return;
       var of=w.fetch; w.__bnxNetHold=1;
-      w.fetch=function(){ var a=arguments, self=this; if(netOk()) return of.apply(self,a);
-        return new Promise(function(res,rej){ HOLDQ.push(function(){ try{ of.apply(self,a).then(res,rej); }catch(e){ rej(e); } }); }); };
+      w.fetch=function(){ var a=arguments, self=this;
+        var signal=a[1]&&a[1].signal;
+        if(signal&&signal.aborted)return Promise.reject(new DOMException('Request cancelled','AbortError'));
+        if(netOk()) return of.apply(self,a);
+        return new Promise(function(res,rej){ var released=false;
+          var run=function(){if(released)return;released=true;if(signal)signal.removeEventListener('abort',cancel);try{of.apply(self,a).then(res,rej);}catch(e){rej(e);}};
+          var cancel=function(){if(released)return;released=true;var i=HOLDQ.indexOf(run);if(i>=0)HOLDQ.splice(i,1);rej(new DOMException('Request cancelled','AbortError'));};
+          HOLDQ.push(run);if(signal)signal.addEventListener('abort',cancel,{once:true}); }); };
       if(w.XMLHttpRequest&&w.XMLHttpRequest.prototype&&!w.XMLHttpRequest.prototype.__bnxHold){
         var XP=w.XMLHttpRequest.prototype, os=XP.send; XP.__bnxHold=1;
         XP.send=function(){ var a=arguments, x=this; if(netOk()) return os.apply(x,a); HOLDQ.push(function(){ try{ os.apply(x,a); }catch(e){} }); };
@@ -46460,7 +46485,7 @@ body:has(#page-customer-credit.active) #bnxGlobalPeriodBar{display:none!importan
     var f=frame();if(!f)return;
     clearTimeout(parkT);
     var src=f.getAttribute('src')||'';
-    if(!src||f.dataset.parked==='1'||/^about:blank/.test(src)){ f.dataset.parked=''; try{window.bnxDsrLoader&&window.bnxDsrLoader(true);}catch(e){} f.src=f.getAttribute('data-src')||'dsr-client.html?v=20261023-dsr-v2'; }
+    if(!src||f.dataset.parked==='1'||/^about:blank/.test(src)){ f.dataset.parked=''; try{window.bnxDsrLoader&&window.bnxDsrLoader(true);}catch(e){} f.src=f.getAttribute('data-src')||'dsr-client.html?v=20261024-save-report-v3'; }
     fit();
   }
   function park(){
@@ -67433,7 +67458,7 @@ html body #page-dashboard .bnxd-kpi .stat-chg{flex:0 0 auto!important;margin-top
   /* ---- one entry point for every "open DSR" click: opens inside the dashboard, never navigates away ---- */
   window.bnxOpenDsrClient=function(){
     var nav=document.querySelector('.nav-item[onclick*="dsr-reports"]');
-    try{ showPage('dsr-reports',nav); }catch(e){ try{ window._erpNavigating=true; location.href='dsr-client.html?v=20261023-dsr-v2&client='+encodeURIComponent(window.CLIENT_ID||''); }catch(_){} }
+    try{ showPage('dsr-reports',nav); }catch(e){ try{ window._erpNavigating=true; location.href='dsr-client.html?v=20261024-save-report-v3&client='+encodeURIComponent(window.CLIENT_ID||''); }catch(_){} }
   };
   /* ---- warm the DSR in the background shortly after the dashboard is up (and on hover/touch) so a click is instant ---- */
   function warm(){ try{ window.bnxDsrEnsure&&window.bnxDsrEnsure(); }catch(e){} }
