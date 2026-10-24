@@ -549,10 +549,18 @@ function bnxNetSlot_(){ return new Promise(function(res,reject){
   arm();
 }); }
 function bnxNetRelease_(){ var n=BNX_NET_WAIT_.shift(); if(n) n(); else BNX_NET_ACTIVE_=Math.max(0,BNX_NET_ACTIVE_-1); }
-function bnxApiKey_(a,p,e){try{var target=getClientId_()||CLIENT_ID;var ctx=bnxGetAuthContexts_().find(c=>!c.client||c.client===target)||{};return JSON.stringify([e||'V2_CORE',a,ctx.client||getClientId_()||CLIENT_ID,ctx.token||'',p||{}]);}catch(x){return '';}}
+function bnxApiKey_(a,p,e){try{
+ var target=getClientId_()||CLIENT_ID,ctx=bnxGetAuthContexts_().find(c=>!c.client||c.client===target)||{};
+ var q=Object.assign({},p||{});delete q.force;delete q.refresh;
+ if(q.from&&q.FROM_DATE===q.from)delete q.FROM_DATE;if(q.to&&q.TO_DATE===q.to)delete q.TO_DATE;
+ function ordered(v){if(Array.isArray(v))return v.map(ordered);if(v&&typeof v==='object'&&!(v instanceof Date)){var o={};Object.keys(v).sort().forEach(k=>o[k]=ordered(v[k]));return o;}return v;}
+ return JSON.stringify([e||'V2_CORE',a,ctx.client||target,ctx.token||'',ordered(q)]);
+}catch(x){return '';}}
+var BNX_READ_BACKOFF_=new Map();
+
 function bnxApiTtl_(p){var t=(typeof bnxToday_==='function')?bnxToday_():'';var s=JSON.stringify(p||{});var ds=s.match(/\d{4}-\d{2}-\d{2}/g)||[];var touchesToday=!ds.length||ds.some(function(d){return d>=t;});if(!touchesToday&&p&&p.year&&p.month){var n=new Date();touchesToday=(+p.year===n.getFullYear()&&+p.month===n.getMonth()+1);}return touchesToday?45000:600000;}
 var BNX_DSR_READ_GENERATION_=0;
-function bnxApiClearCache_(){BNX_DSR_READ_GENERATION_++;BNX_API_CACHE_.clear();try{if(typeof window.bnxTdbClear_==='function')window.bnxTdbClear_();}catch(e){}}
+function bnxApiClearCache_(){BNX_READ_BACKOFF_.clear();BNX_DSR_READ_GENERATION_++;BNX_API_CACHE_.clear();try{if(typeof window.bnxTdbClear_==='function')window.bnxTdbClear_();}catch(e){}}
 window.addEventListener('storage',function(e){if(/^(ERP_SESSION|erp_session|erp_token|sessionToken|SESSION_TOKEN|ERP_SESSION_USER|ERP_USER|erpUser)$/.test(e.key||''))bnxApiClearCache_();});
 window.addEventListener('storage',function(e){if(e.key==='bnx_data_changed_'+getClientId_())bnxApiClearCache_();});
 async function gasApi(action,payload,endpoint){
@@ -561,12 +569,15 @@ async function gasApi(action,payload,endpoint){
     const k=bnxApiKey_(action,payload,endpoint);
     if(k){
       const c=BNX_API_CACHE_.get(k);
+      const failed=BNX_READ_BACKOFF_.get(k);if(!payload.force&&!payload.refresh&&failed&&Date.now()-failed.at<15000)return Object.assign({},failed.result,{retryAfterMs:15000-(Date.now()-failed.at)});
       const clone=function(r){try{return structuredClone(r);}catch(e){return JSON.parse(JSON.stringify(r));}};
       if(!payload.force&&!payload.refresh&&c&&Date.now()-c.t<c.ttl) return clone(c.r);
       if(BNX_API_FLIGHT_.has(k)) return BNX_API_FLIGHT_.get(k).then(clone);
       const generation=BNX_DSR_READ_GENERATION_;
       const p=gasApiRaw_(action,payload,endpoint).then(function(r){
         if(r&&r.success===true&&!r.error&&!r.authExpired&&generation===BNX_DSR_READ_GENERATION_){ if(BNX_API_CACHE_.size>=100) BNX_API_CACHE_.delete(BNX_API_CACHE_.keys().next().value); BNX_API_CACHE_.set(k,{t:Date.now(),ttl:bnxApiTtl_(payload),r:r}); }
+        if(r&&r.success===false&&(r.timeout||r.busy||/busy|timeout|timed out/i.test(String(r.error||''))))BNX_READ_BACKOFF_.set(k,{at:Date.now(),result:r});
+        else if(r&&r.success===true)BNX_READ_BACKOFF_.delete(k);
         return r;
       }).finally(function(){BNX_API_FLIGHT_.delete(k);});
       BNX_API_FLIGHT_.set(k,p);
@@ -598,6 +609,13 @@ function bnxDsrAccessibleParent_(){
 }
 
 async function gasApiRaw_(action,payload,endpoint){
+  // All report reads share this frame's flight/cache gate and the signed-in dashboard's scheduler.
+  const parentApi=bnxDsrAccessibleParent_();
+  if(/^GET_/.test(String(action))&&parentApi&&typeof parentApi.gasApi==='function'){
+    try{return await parentApi.gasApi(action,payload||{},endpoint||'V2_CORE');}
+    catch(e){return {success:false,error:String(e&&e.message||e),busy:true};}
+  }
+
   if(location.protocol==='file:'&&window.parent!==window&&/^GET_/.test(action)){
     await bnxNetSlot_();try{return await bnxDsrParentRead_(action,payload);}finally{bnxNetRelease_();}
   }
@@ -1060,9 +1078,8 @@ async function bnxRmCallSplit_(action,from,to){
 }
 async function bnxRmCall_(action,from,to){
   var t0=Date.now(), r;
-  try{ var _P=bnxDsrAccessibleParent_(); if(_P&&typeof _P.gasApi==='function'){ r=await _P.gasApi(action,{range:'custom',from:from,to:to},'V2_CORE'); if(!(r&&r.success!==false&&!r.error)) r=null; } }catch(_e){ r=null; }   /* 2026-10-16: the dashboard's signed-in API first (this page's own call kept timing out) */
-  if(!r){ try{ r=await gasApi(action,{range:'custom',from:from,to:to},'V2_CORE'); }
-  catch(e){ r={success:false,error:String(e&&e.message||e)}; } }
+  try{r=await gasApi(action,{range:'custom',from:from,to:to},'V2_CORE');}
+  catch(e){r={success:false,error:String(e&&e.message||e)};}
   var ok=!!(r&&r.success!==false&&!r.error);
   var rows=ok?bnxRmRows_(r):[];
   var keys=Object.keys(BNX_RM_.diag); if(keys.length>40) delete BNX_RM_.diag[keys[0]];
@@ -11602,3 +11619,5 @@ W.bnxDsrSourceDrillOpen=function(pre,key){if(labels[key])launch({pre:pre,key:key
 }
 @media print{#itab-cashbook .cb-tbl-wrap{max-height:none!important;overflow:visible!important}#itab-cashbook .cb-tbl thead{display:table-header-group}#itab-cashbook .cb-tbl thead th{position:static!important}}
 </style>
+
+<script>window.BNX_DSR_BUILD="2026.10.25-shared-reads-v25";</script>
