@@ -8051,6 +8051,11 @@ function bnxQueuePending(action, payload, requestId, onSuccess){
 function bnxDeferQueuedOrder_(rid,until){
  const list=bnxGetOutbox();const e=list.find(x=>String(x.requestId)===String(rid));if(e){e.deferUntil=until||0;bnxSetOutbox(list);}
 }
+// An acknowledgement must include the saved order identity before removing its durable retry record.
+function bnxSavedOrderRef_(res){
+ const d=res&&res.data||{};
+ return String(d.ORDER_NUMBER||d.ORDER_NO||d.ORDER_ID||(res&&(res.orderId||res.orderNumber||res.transactionId))||'').trim();
+}
 function bnxConfirmQueuedOrder_(rid){bnxSetOutbox(bnxGetOutbox().filter(e=>String(e.requestId)!==String(rid)));}
 // P0 FIX (external audit #5 — "KOT status updates need the same
 // guaranteed outbox treatment everywhere"): gasApi() here already
@@ -8286,7 +8291,9 @@ async function flushOutbox_impl_(force){
     }
     try {
       // A duplicate error alone does not prove this request was saved. Keep it visible for verification.
-      if(res && !res.success && (res.alreadyProcessed===true || (res.data&&res.data.requestId===entry.requestId&&res.data.ORDER_ID)))res=Object.assign({},res,{success:true});
+      if(res && !res.success && res.data && res.data.requestId===entry.requestId && res.data.ORDER_ID)res=Object.assign({},res,{success:true});
+      if(entry.action==='SAVE_ORDER' && res && res.success && !bnxSavedOrderRef_(res))
+        res=Object.assign({},res,{success:false,error:'Order reference not returned; verifying with the same request ID'});
       if(res && res.success){
         // Successfully synced late — apply any follow-up UI update tagged on this entry
         if(entry.requestId)bnxConfirmQueuedOrder_(entry.requestId);
@@ -8336,8 +8343,12 @@ async function flushOutbox_impl_(force){
     const seen=new Set(list.map(e=>String(e.requestId||'')));
     bnxGetOutbox().forEach(e=>{ if(!seen.has(String(e.requestId||''))) remaining.push(e); });
   }catch(e){}
-  bnxSetOutbox(remaining);
-  if(!remaining.length && !bnxGetFailedOutbox().length) bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
+  // A foreground save may have confirmed an entry while this snapshot was awaiting another write.
+  // Never resurrect that removed entry; also preserve entries added during the flush.
+  const currentIds=new Set(bnxGetOutbox().map(e=>String(e.requestId||'')));
+  const next=remaining.filter(e=>currentIds.has(String(e.requestId||'')));
+  bnxSetOutbox(next);
+  if(!next.length && !bnxGetFailedOutbox().length) bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
   else bnxSetLiveStatus(navigator.onLine ? 'syncing' : 'offline');
   bnxUpdateSyncBadge();
 }
@@ -15332,7 +15343,7 @@ function bnxFireKOTPrint_(entry, orderRef){
     return Promise.all(jobs).then(function(res){
       if(res.length && res.every(function(r){return r.ok;})){
         const names=[]; res.forEach(function(r){ if(names.indexOf(r.label)<0) names.push(r.label); });
-        try{ if(!(window.bnxPrintRoute_&&window.bnxPrintRoute_().k==='pos')) toast('🖨️ KOT printed — '+names.join(' + '),'success'); }catch(_){}   /* POS route: the POS station reports "printed" */
+        try{ if(!(window.bnxPrintRoute_&&window.bnxPrintRoute_().k==='pos')) toast('🖨️ KOT accepted by print route — '+names.join(' + '),'success'); }catch(_){}   /* POS route: the POS station reports "printed" */
       }
       return res;
     });
@@ -15472,12 +15483,19 @@ async function bnxPlaceOrderImpl_(){
   const __earlyEntry = { kotNo:__localRef, kotNumber:__localRef, orderNo:__localRef, table:__tbl.id, type:'KITCHEN',
     waiter:stewardName, steward:stewardName, covers:customerFields.covers||'', items:items,
     customerName:customerFields.customerName||'GENERAL CUSTOMER', remarks:customerFields.remarks||'' };
-  let __printedEarly = false;
+  let __printDispatched = false;
   bnxQueuePending('SAVE_ORDER',__orderPayload,requestId,'kot');
   bnxDeferQueuedOrder_(requestId,Date.now()+120000);
   // Start the authoritative save before preparing any printer payload.
   const __saveP=gasApi('SAVE_ORDER',__orderPayload,'V2_CORE').finally(()=>bnxDeferQueuedOrder_(requestId,0));
-  try{ bnxFireKOTPrint_(__earlyEntry, __localRef); __printedEarly = true; }catch(e){ console.error('[KOT EARLY PRINT]',e); }
+  try{
+    __printDispatched = true;
+    Promise.resolve(bnxFireKOTPrint_(__earlyEntry,__localRef)).then(function(results){
+      if(String(CLIENT_ID||'')!==__orderClient)return;
+      if(!results.length || results.some(function(r){return !r.ok;}))
+        toast('⚠️ KOT print not confirmed — check Printer Setup / pending print jobs before reprinting','error');
+    }).catch(function(e){console.error('[KOT EARLY PRINT]',e);});
+  }catch(e){ console.error('[KOT EARLY PRINT]',e); }
   const __relT = setTimeout(function(){
     if(String(CLIENT_ID||'')!==__orderClient)return;
     __released = true;
@@ -15491,7 +15509,7 @@ async function bnxPlaceOrderImpl_(){
   const res = await __saveP;
   clearTimeout(__relT);
   if(String(CLIENT_ID||'')!==__orderClient){toast('Original-client order retained for verification — refresh its Pending Sync list','error');return;}
-  if(res&&res.success)bnxConfirmQueuedOrder_(requestId);
+  if(res&&res.success&&bnxSavedOrderRef_(res))bnxConfirmQueuedOrder_(requestId);
 
   if(btn && !__released){ btn.disabled = false; btn.textContent = '📤 Send KOT'; }
 
@@ -15506,15 +15524,14 @@ async function bnxPlaceOrderImpl_(){
     const localTag = { kotNo:'PENDING-'+requestId.slice(0,8), orderNo:'', orderId:'', table:__tbl.id, type:'KITCHEN', time:new Date().toISOString(),
       waiter:stewardName, steward:stewardName, covers:customerFields.covers||'', COVERS:customerFields.covers||'', guestNo:customerFields.guestNo||'', guestCount:customerFields.guestCount||'', guests:customerFields.guests||'', GUEST_NO:customerFields.guestNo||'', GUEST_COUNT:customerFields.guestCount||'', items, amount, customerName:customerFields.customerName, CUSTOMER_NAME:customerFields.customerName, customerMobile:customerFields.customerMobile, CUSTOMER_MOBILE:customerFields.customerMobile, mobile:customerFields.customerMobile, orderTime, status:'PENDING_SYNC', userId:identity.userId, USER_ID:identity.userId, createdById:identity.userId, CREATED_BY_ID:identity.userId, loginId:identity.loginId, LOGIN_ID:identity.loginId, createdByLogin:identity.loginId, CREATED_BY_LOGIN:identity.loginId, createdByName:stewardName, CREATED_BY_NAME:stewardName };
     bnxLoadOpenKots(); KOT.unshift(localTag); bnxSetOpenKotsRaw(JSON.stringify(KOT));
-    if(!__printedEarly) bnxFireKOTPrint_(localTag, localTag.kotNo);   /* already printed at tap; fallback only */
+    if(!__printDispatched) bnxFireKOTPrint_(localTag, localTag.kotNo);   /* already printed at tap; fallback only */
     if(!__released){ order={}; orderItemRemarks={}; }
     if(!__released){ try{ updateOrderBadge(); refreshCurrentMenuView_(); bnxToggleOrderDrawer_(false); }catch(e){} }
     if(!__released) setTimeout(() => showScreen('s-home'), 1200);
     return;
   }
 
-  bnxSetLiveStatus('live');
-  bnxMarkAttemptDone_(fp);
+  // Live/attempt completion follows the authoritative reference check below.
   // FIX ("new orders show KOT number 'undefined'"): res.serverId and
   // res.orderId have never existed on bnxSaveOrder's response — the
   // backend actually returns {success, transactionId, data: {...,
@@ -15530,19 +15547,20 @@ async function bnxPlaceOrderImpl_(){
                    res.orderId || res.orderNumber || res.transactionId;
   // A successful SAVE_ORDER without an authoritative identifier is not
   // safe to treat as a normal KOT: retrying it could duplicate a real order.
-  // Do not enqueue it again; refresh the server state and ask the steward
-  // to verify the ticket instead.
+  // Retain the existing retry record and its original request ID for idempotent verification.
   if(!orderId){
     console.error('[ORDER] SAVE_ORDER succeeded but returned no authoritative order ID:', res);
     bnxSetLiveStatus('offline');
-    toast('⚠️ Server accepted the order but returned no KOT number — refreshing kitchen status','error');
-    await loadKOTFromServer().catch(()=>{});
+    toast('⚠️ Order reference not returned — Pending Sync retained for verification; do not re-enter this order','error');
+    Promise.resolve(loadKOTFromServer()).catch(()=>{});
     if(!__released){ order={}; orderItemRemarks={}; }
     if(!__released){ selectOccasion('None');
     bnxClearOrderCustomerFields_(); }
     if(!__released) setTimeout(() => showScreen('s-home'), 1200);
     return;
   }
+  bnxMarkAttemptDone_(fp);
+  bnxSetLiveStatus(bnxGetOutbox().length?'syncing':'live');
   lastOrderId = orderId;
   bnxLoadOpenKots();
   const entry = { kotNo:orderId, orderNo:(res.data&&res.data.ORDER_NUMBER)||orderId, orderId:(res.data&&res.data.ORDER_ID)||res.transactionId||orderId, table:__tbl.id, type:'KITCHEN', time:res.serverTimestamp||new Date().toISOString(), waiter:stewardName, steward:stewardName, covers:customerFields.covers||'', COVERS:customerFields.covers||'', guestNo:customerFields.guestNo||'', guestCount:customerFields.guestCount||'', guests:customerFields.guests||'', GUEST_NO:customerFields.guestNo||'', GUEST_COUNT:customerFields.guestCount||'', items, amount, customerName:customerFields.customerName, CUSTOMER_NAME:customerFields.customerName, customerMobile:customerFields.customerMobile, CUSTOMER_MOBILE:customerFields.customerMobile, mobile:customerFields.customerMobile, orderTime, status:'NEW', userId:identity.userId, USER_ID:identity.userId, createdById:identity.userId, CREATED_BY_ID:identity.userId, loginId:identity.loginId, LOGIN_ID:identity.loginId, createdByLogin:identity.loginId, CREATED_BY_LOGIN:identity.loginId, createdByName:stewardName, CREATED_BY_NAME:stewardName };
@@ -15601,13 +15619,13 @@ async function bnxPlaceOrderImpl_(){
      Wait for them (max 3 s — printing never waits longer than that). */
   Promise.race([__kotSyncP, new Promise(function(r){ setTimeout(r,1500); })])   /* was 3 s — KOT reaches the printer sooner */
     
-    .then(function(){ if(!__printedEarly) bnxFireKOTPrint_(entry, orderId); }, function(){ if(!__printedEarly) bnxFireKOTPrint_(entry, orderId); });
+    .then(function(){ if(!__printDispatched) bnxFireKOTPrint_(entry, orderId); }, function(){ if(!__printDispatched) bnxFireKOTPrint_(entry, orderId); });
   PLACED_ORDERS[orderId] = {
     id: orderId, table: __tbl.id, items: JSON.parse(JSON.stringify(items)), amount, steward: stewardName,
     status: 'PLACED', timestamp: Date.now(), originalItems: JSON.parse(JSON.stringify(items)), hasServerId: true
   };
 
-  toast('✅ KOT sent to kitchen — confirmed on server','success');
+  toast('✅ Order saved — kitchen sync and printer status update separately','success');
   if(!__released){ order={}; orderItemRemarks={}; }
   if(!__released){ selectOccasion('None');
   bnxClearOrderCustomerFields_(); }
@@ -15631,7 +15649,7 @@ async function bnxPlaceOrderImpl_(){
   setTimeout(()=>loadTablesLive().catch(()=>{}),250);
 
   if(!__released){ showOrderPlacedModal(orderId);
-  setTimeout(() => showScreen('s-home'), 1500); } else toast('✅ '+__tbl.id+': KOT '+orderId+' confirmed on server','success');
+  setTimeout(() => showScreen('s-home'), 1500); } else toast('✅ '+__tbl.id+': order '+orderId+' saved','success');
 }
 /* Same shared overlay the dashboard's bnxSaveTableStatus() writes to —
    updates immediately here, and best-effort syncs to the backend
@@ -25610,4 +25628,4 @@ W.BNX_STEWARD_BUILD='SM-2026.10.24-nav-search-v3';
 })(window,document);
 </script>
 
-<script>window.BNX_MOBILE_PRINT_BUILD='2026.10.24-fast-save-kot-v5';</script>
+<script>window.BNX_MOBILE_PRINT_BUILD='2026.10.24-audited-live-kot-v6';</script>
