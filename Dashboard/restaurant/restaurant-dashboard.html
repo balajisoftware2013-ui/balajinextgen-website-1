@@ -2163,12 +2163,10 @@ function bnxEnrichItems_(payload){
 }
 window.bnxEnrichItems_=bnxEnrichItems_;
 async function gasApi(action, payload, endpoint) {
-  /* While an import is running, only the heavy BACKGROUND reads wait (max 20 s, and never if the busy flag is older than 4 min).
-     Reports / DSR requests (GET_DSR_*, DSR_*) are what the person is looking at — they are never held back. */
-  if (window.__bnxImportBusy && /^(LIST_BILLS|RD_FETCH_SHEET|GET_DASHBOARD_SUMMARY)$/i.test(String(action||''))) {
-    var __w0 = Date.now(), __b0 = window.__bnxImportBusyAt || __w0;
-    while (window.__bnxImportBusy && Date.now() - __w0 < 20000 && Date.now() - __b0 < 240000) { await new Promise(function(r){ setTimeout(r, 1000); }); }
-  }
+  // Import owns the data-write path. Defer nonessential reports without occupying request slots.
+  if(window.__bnxImportBusy && Date.now()-(window.__bnxImportBusyAt||Date.now())<240000 &&
+     /^(GET_ITEM_SALES_REPORT|GET_DSR_.*|DSR_.*|GET_DUE_COLLECTION|GET_CLIENT_ASSETS|GET_DASHBOARD_SUMMARY|LIST_BILLS|RD_FETCH_SHEET)$/i.test(String(action||'')))
+    return {success:false,busy:true,deferred:true,error:'Report refresh paused while import is running',retryAfterMs:15000};
   payload = payload || {};
   if (/^SAVE_BILL$/i.test(String(action||''))) bnxNormBillPay_(payload);   /* 2026-10-22: never send a PMD id as the pay mode */
   if (/^(SAVE_BILL|SAVE_ORDER|SAVE_KOT|UPDATE_ORDER_ITEMS|ADD_ORDER_ITEMS|ADD_ITEMS_TO_ORDER)$/i.test(String(action||''))) bnxEnrichItems_(payload);   /* 2026-10-22: item category / group / id on every line */
@@ -66221,7 +66219,17 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
   function plainData(d){ var o={}; Object.keys(d||{}).forEach(function(k){ var v=d[k];
       if(v instanceof Date&&!isNaN(v)) v=v.getFullYear()+'-'+p2(v.getMonth()+1)+'-'+p2(v.getDate())+'T'+p2(v.getHours())+':'+p2(v.getMinutes())+':'+p2(v.getSeconds());
       o[k]=v; }); return o; }
-  function invOf(t){ var d=t.data||{}; return String(d.invoiceNumber||d.invoicenumber||t.ref||'').trim(); }
+  function invOf(t){ var d=t.data||{},ref=d.invoiceNumber||d.invoicenumber||d['Invoice Number']||d['Bill No']||t.ref||'';return String(ref).trim().toUpperCase().replace(/\s*\/\s*/g,'/'); }
+  function normalizeStoredSale_(t){
+    if(t.type!=='sales')return t;
+    t.fmt=Number(t.fmt);
+    if(t.fmt===1&&t.data){
+      const h=Object.keys(t.data),values=h.map(k=>t.data[k]);
+      const repaired=bnxRepairLegacyBillColumns_([h,values],0);
+      if(repaired[1]!==values){const d={};h.forEach((k,i)=>d[k]=repaired[1][i]);t.data=d;t.ref=d.invoiceNumber;}
+    }
+    return t;
+  }
   /* One bill settled in several modes comes as several Format-1 rows with the same Bill No (e.g. Hdfc Bank 4080 + Cash 6513).
      Only the first used to be sent -> the bill was short. Now the legs of the newest upload are summed and the split is sent as PAYMENTS. */
   function mergeBillLegs_(list){
@@ -66259,7 +66267,7 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
       if(!window.__bnxImportBusy && window.__bnxImportPendingCheck){ window.__bnxImportPendingCheck=0;
         setTimeout(function(){ try{ if(window.bnxSessionSuspect_) window.bnxSessionSuspect_('after-import'); }catch(e){} },20000); } } }
   async function syncViaImporterCore_(onProgress,mode){
-    var all=await dbAll('tx'), ok=0, fail=0, lastErr='', res={written:[],warnings:[],checks:[],newItems:[],newCustomers:[],imported:0,skipped:0,replaced:0,conflicts:[]};
+    var all=(await dbAll('tx')).map(normalizeStoredSale_), ok=0, fail=0, lastErr='', res={written:[],warnings:[],checks:[],newItems:[],newCustomers:[],imported:0,skipped:0,replaced:0,conflicts:[]};
     var want=function(t){ return mode==='reimport'?true:(t.status!=='SYNCED'||!!t.reimport); };
     /* sales: complete bills only (needs both files) */
     var F1={},F2={};
@@ -66274,7 +66282,7 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
     var waiting=[];
     all.forEach(function(t){ if(t.type!=='sales'||!want(t)) return; var no=invOf(t);
       if(t.fmt===2&&!F1[no]){ t.syncError='Waiting for the bill-wise file (Format 1) for '+no; waiting.push(t); }
-      else if(t.fmt===1&&!F2[no]){ t.syncError='Waiting for the item-wise file (Format 2) for '+no; waiting.push(t); } });
+      else if(t.fmt===1&&!F2[no]){ t.syncError='No matching item-wise records (Format 2) for '+no+' — upload both source sheets together'; waiting.push(t); } });
     nos=nos.filter(function(no){ return F2[no]; });
     if(waiting.length) await dbPut('tx',waiting);
     var total=nos.length+all.filter(function(t){return t.type!=='sales'&&want(t);}).length, done=0;
@@ -66282,7 +66290,7 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
     var queue=nos.filter(isRep).map(function(no){return [no,'reimport'];}).concat(nos.filter(function(no){return !isRep(no);}).map(function(no){return [no,'import'];})), stop=false;
     var BATCH=8, failStreak=0;   /* 10 bills per call (was 40) — each call must finish well inside the Apps Script limit */
     for(var i=0;i<queue.length&&!stop;i+=BATCH){ var md=queue[i][1], part=[]; for(var q=i;q<queue.length&&q<i+BATCH&&queue[q][1]===md;q++) part.push(queue[q][0]); i=q-BATCH; var bills=[], lines=[];
-      part.forEach(function(no){ bills.push(mergeBillLegs_(F1[no])); F2[no].forEach(function(t){ lines.push(plainData(t.data)); }); });
+      part.forEach(function(no){ var bill=mergeBillLegs_(F1[no]);bill.invoiceNumber=no;bills.push(bill); F2[no].forEach(function(t){ var line=plainData(t.data);line.invoiceNumber=no;lines.push(line); }); });
       var r=await postBills_(md,bills,lines);
       var conf={}; (r&&r.conflicts||[]).forEach(function(n){conf[n]=1;});
       var upd=[]; part.forEach(function(no){ var good=!!(r&&r.success)&&!conf[no];
@@ -76518,3 +76526,5 @@ D.addEventListener('pointerover',warm,{passive:true});
 W.BNX_PRINT_BUILD='2026.10.24-print-station-v19';
 })(window,document);
 </script>
+
+<script>window.BNX_IMPORT_BUILD="2026.10.25-import-queue-v26";</script>
