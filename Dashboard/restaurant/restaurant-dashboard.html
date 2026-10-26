@@ -16101,7 +16101,7 @@ function bnxNormalizeActiveOrder(o){
   // them to yyyy-mm-dd for a straight string comparison against the date input.
   const dateRaw = o.dt ?? o.date ?? o.ORDER_DATE ?? o.orderDate ?? o.BUSINESS_DATE ?? o.businessDate ?? o.CREATED_AT ?? o.createdAt ?? '';
   const dt = bnxActiveOrderDateYmd_(dateRaw) || (typeof getBusinessDate==='function'?getBusinessDate():'');
-  return { tbl, w, tm, amt, st, dt };
+  return { tbl, w, tm, amt, st, dt, orderId:o.ORDER_ID||o.orderId||o.ORDER_NO||o.ORDER_NUMBER||o.id||'' };
 }
 function bnxActiveOrderDateYmd_(raw){
   if (raw===undefined||raw===null||raw==='') return '';
@@ -16683,12 +16683,13 @@ function bnxLastWaiterForTable(num){
    genuinely don't have a live figure yet, so callers can tell "known
    zero" apart from "unknown" and avoid showing a false ₹0. */
 function bnxAmountForTable(num){
-  try{
-    const list = window._activeOrders || [];
-    const hit = list.find(o => String(o.tbl||'').toUpperCase() === String(num).toUpperCase());
-    if (hit && hit.amt && hit.amt !== '—') return hit.amt;
-  }catch(e){}
-  return null;
+  var sum=0,found=false,seen=new Set(),key=String(num||'').trim().toUpperCase();
+  (window._activeOrders||[]).forEach(function(o){
+    if(String(o.tbl||'').trim().toUpperCase()!==key||/^(CANCELLED|VOID|COMPLETED|BILLED|PAID|SETTLED|CLOSED)$/i.test(String(o.st||'')))return;
+    var id=String(o.orderId||'');if(id&&seen.has(id))return;if(id)seen.add(id);
+    var amount=Number(String(o.amt||'').replace(/[,₹\s]/g,''));if(o.amt!=='—'&&isFinite(amount)){sum+=amount;found=true;}
+  });
+  return found?'₹'+Math.round(sum).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}):null;
 }
 /* FIX (companion to bnxAmountForTable above): Table Management can be
    opened directly (bottom nav / sidebar) without ever visiting the
@@ -23751,6 +23752,10 @@ function bmPickerToggle(kind, idx, checked){
 function bmConfirmKotPicker(){
   const p = window._bmPicker || {kots:[],orders:[],sel:new Set()};
   if (!p.sel || !p.sel.size){ showNotif('Select at least one KOT or order first.', 'error'); return; }
+  const chosenTables=new Set();
+  p.sel.forEach(function(key){var x=key[0]==='o'?p.orders[parseInt(key.slice(1),10)]:p.kots[parseInt(key.slice(1),10)];if(x){var t=String(x.TABLE_ID||x.table||'').trim().toUpperCase();if(t)chosenTables.add(t);}});
+  var selectedTable=String(document.getElementById('bm-bf-table')?.value||'').trim().toUpperCase();
+  if(chosenTables.size>1||(selectedTable&&chosenTables.size&& !chosenTables.has(selectedTable))){showNotif('Select tickets for one matching table. Use Merge Tables for a combined bill.','error');return;}
   const refs = [];
   const pickedTables = [];
   const rawItems = []; // every line from every selected ticket, unmerged
@@ -23767,7 +23772,7 @@ function bmConfirmKotPicker(){
     const o=p.orders[parseInt(key.slice(1),10)];
     if(!o) return;
     selectedOrderKeys.add(String(o.ORDER_ID||o.ORDER_NO||'').trim());
-    selectedOrderKeys.add(String(o.ORDER_NO||'').trim());
+    selectedOrderKeys.add(String(o.ORDER_NO||o.ORDER_NUMBER||'').trim());
   });
   p.sel.forEach(key=>{
     const kind = key[0], idx = parseInt(key.slice(1),10);
@@ -23786,7 +23791,7 @@ function bmConfirmKotPicker(){
       }
     } else {
       const o = p.orders[idx]; if (!o) return;
-      refs.push(o.ORDER_NO||o.ORDER_ID);
+      refs.push(o.ORDER_NO||o.ORDER_NUMBER||o.ORDER_ID);
       pickedOrderIds.push(o.ORDER_ID);
       if (o.TABLE_ID) pickedTables.push(o.TABLE_ID);
       (o.items||[]).forEach(it=>{
@@ -24220,8 +24225,7 @@ function bnxIsAlreadySavedOutboxError_(msg){
   return /already exists|already been (saved|added|created|recorded|processed)|duplicate (request|entry|item|bill|order|kot)|already (saved|recorded|processed|synced)/i.test(String(msg||''));
 }
 /* failed store: drop entries that were in fact saved (old "already exists" failures) */
-function bnxCleanSavedFailures_(){ try{ if(typeof bnxGetFailedOutbox!=='function') return; const f=bnxGetFailedOutbox(), k=f.filter(e=>!bnxIsAlreadySavedOutboxError_(e&&e.lastError));
-  if(k.length!==f.length){ bnxSetFailedOutbox(k); console.info('[OUTBOX] cleared '+(f.length-k.length)+' "already exists" entr'+(f.length-k.length>1?'ies':'y')+' — they were saved on the server.'); if(typeof bnxUpdateSyncBadge==='function') bnxUpdateSyncBadge(); } }catch(e){} }
+function bnxCleanSavedFailures_(){ /* Server request-ID reconciliation owns confirmed retries. */ }
 setTimeout(bnxCleanSavedFailures_,3000);
 function bnxIsNonRetryableOutboxError_(msg){
   const m=String(msg||'');
@@ -24234,20 +24238,8 @@ async function bnxDayBillsOnServer_(day){
   const p=(async()=>{ try{ const r=await gasApi('LIST_BILLS',{FROM_DATE:day,TO_DATE:day,SUMMARY_ONLY:true},'V2_CORE'); const a=r&&(r.bills||r.data); return Array.isArray(a)?a:null; }catch(e){ return null; } })();
   __bnxDayBills[day]={t:Date.now(),p:p}; return p;
 }
-async function bnxBillAlreadyOnServer_(entry){
-  const b=entry&&entry.payload&&entry.payload.bill; if(!b||b.no) return false;          /* edits always go through */
-  const day=String(b.businessDate||b.billDate||b.dt||'').slice(0,10); if(!/^\d{4}-\d{2}-\d{2}$/.test(day)) return false;
-  const list=await bnxDayBillsOnServer_(day); if(!list) return false;                  /* server unreachable → keep it queued */
-  const T=String(b.table||'').trim().toUpperCase(), tot=Number(b.total)||0, nc=/^NC$|NON.?CHARGE/i.test(String(b.paymode||b.payMode||b.pay||''));
-  const used=entry.__matched||(window.__bnxMatchedBills=window.__bnxMatchedBills||{});
-  const hit=list.find(x=>{ const no=String(x.no||x.BILL_NUMBER||''); if(!no||used[no]) return false;
-    if(String(x.table||x.TABLE_ID||'').trim().toUpperCase()!==T) return false;
-    const st=String(x.status||x.BILL_STATUS||'').toUpperCase(); if(/CANCEL|VOID/.test(st)) return false;
-    const xt=Number(x.total??x.GRAND_TOTAL??0)||0;
-    return Math.abs(xt-tot)<=1 || (nc && (/NON.?CHARGE|NC/.test(st) || xt===0)); });
-  if(hit){ used[String(hit.no||hit.BILL_NUMBER)]=1; return true; }
-  return false;
-}
+async function bnxBillAlreadyOnServer_(entry){return false;} // Table/amount similarity is not proof of request identity.
+
 /* on start: queued / failed bills that are already on the server leave the "pending sync" / "sync issues" badges */
 setTimeout(async function(){ try{
   const failed=bnxGetFailedOutbox(); if(failed.length){ const keep=[]; for(const e of failed){ let dup=false; try{ dup=String(e.action).toUpperCase()==='SAVE_BILL' && await bnxBillAlreadyOnServer_(e); }catch(x){} if(!dup) keep.push(e); } if(keep.length!==failed.length){ bnxSetFailedOutbox(keep); console.info('[OUTBOX] '+(failed.length-keep.length)+' failed bill(s) were already on the server — cleared'); } }
@@ -24269,7 +24261,7 @@ function bnxRetryFailedOutbox(){
     return;
   }
   const live = bnxGetOutbox();
-  retryable.forEach(e=>{ e.attempts=0; e.lastAttemptAt=0; live.push(e); });
+  retryable.forEach(e=>{if(live.some(x=>String(x.action)===String(e.action)&&String(x.requestId)===String(e.requestId)))return;e.attempts=0;e.lastAttemptAt=0;e.deferUntil=0;live.push(e);});
   bnxSetOutbox(live);
   if (typeof showNotif === 'function') showNotif('Retrying '+retryable.length+' failed sync item(s)…'+(stuck.length?(' ('+stuck.length+' need a backend fix, left as-is)'):''), 'info');
   flushOutbox(true);
@@ -24308,6 +24300,7 @@ function bnxUpdateSyncBadge(){
 }
 let __bnxFlushing = false;
 async function flushOutbox(force){
+  if(navigator.onLine===false)return;
   if(__bnxFlushing) return;               /* interval + online + manual retry must not run in parallel */
   const list = bnxGetOutbox();
   if(!list.length) return;
@@ -51645,21 +51638,22 @@ function ticketsFor(tbl,includeBilled){
   var open=[];try{open=JSON.parse(W.bnxGetOpenKotsRaw()||'[]');}catch(e){}
   var orders=(typeof W.orderRegData!=='undefined'&&Array.isArray(W.orderRegData)?W.orderRegData:[]).filter(function(o){
     return !DEAD.test(String(o.ORDER_STATUS||o.status||''))&&sameTable(o.TABLE_ID||o.table,tbl);});
-  var withItems={};orders.forEach(function(o){if(Array.isArray(o.items)&&o.items.length){[o.ORDER_NO,o.ORDER_ID].forEach(function(x){if(x)withItems[String(x).trim()]=1;});}});
+  var withItems={};orders.forEach(function(o){if(Array.isArray(o.items)&&o.items.length){[o.ORDER_NO,o.ORDER_NUMBER,o.ORDER_ID].forEach(function(x){if(x)withItems[String(x).trim()]=1;});}});
   var cutoff=Date.now()-36*3600*1000, flaggedBilled=0;
   var kots=open.filter(function(k){
     if(!sameTable(k.table,tbl))return false;
     if(DEAD.test(String(k.status||'')))return false;               /* READY / SERVED are still unbilled */
     var t=Date.parse(k.time);if(Number.isFinite(t)&&t<cutoff&&!k.syncPending)return false;
-    if(k.orderNo&&withItems[String(k.orderNo).trim()])return false; /* parent order already carries these items */
+    if([k.orderNo,k.orderId,k.ORDER_ID,k.ORDER_NUMBER].some(function(v){return v&&withItems[String(v).trim()];}))return false; /* parent order already carries these items */
     if(k.billed&&k.billNo)return false;                              /* really billed on a saved invoice */
     if(k.billed&&!includeBilled){flaggedBilled++;return false;}   /* only loaded into an unsaved draft earlier */
     return true;});
   return {kots:kots,orders:orders,flaggedBilled:flaggedBilled};
 }
 function resetDraft(){
+  if(typeof W.bmResetBillForm==='function')W.bmResetBillForm();
   var rows=$('bmItemRows');if(rows)rows.innerHTML='';
-  ['bm-bf-kot','bm-bf-advresid'].forEach(function(id){var e=$(id);if(e)e.value='';});
+  ['bm-bf-kot','bm-bf-advresid','bm-bf-cname','bm-bf-mobile','bm-bf-pax','bm-bf-waiter'].forEach(function(id){var e=$(id);if(e)e.value='';});
   var d=$('bm-bf-disc');if(d)d.value='0';var s=$('bm-bf-discscope');if(s)s.value='ALL';try{if(typeof W.bnxDiscClearRules_==='function')W.bnxDiscClearRules_('bm');}catch(e){}
   try{W.__bnxNC=false;}catch(e){}
 }
@@ -51673,6 +51667,7 @@ W.bnxLoadTableIntoBill=async function(tbl,opts){
     var pg=$('page-billing');
     if(!pg||!pg.classList.contains('active')){return false;}       /* role lock blocked it - showPage already told the user */
     await sleep(30);
+    if(my!==token)return false;
     resetDraft();
     var tEl=$('bm-bf-table');if(tEl)tEl.value=tbl;
     var T=ticketsFor(tbl,false);
@@ -51698,6 +51693,7 @@ W.bnxLoadTableIntoBill=async function(tbl,opts){
     if(!T.kots.length&&!T.orders.length&&T.flaggedBilled){
       if(W.confirm(T.flaggedBilled+' ticket(s) of '+tbl+' were loaded into an earlier bill that was never saved.\n\nLoad them again?'))T=ticketsFor(tbl,true);
     }
+    if(my!==token||!$('page-billing')?.classList.contains('active'))return false;
     var raw=[],refs=[],waiter='',cust='',pax='';
     T.orders.forEach(function(o){
       refs.push(o.ORDER_NO||o.ORDER_ID);
@@ -51712,7 +51708,7 @@ W.bnxLoadTableIntoBill=async function(tbl,opts){
     var n=0;merged.forEach(function(it){if(it&&it.name){W.bmAddOrIncreaseItemRow_(it.name,it.qty,it.rate);n++;}});
     if(!n&&typeof W.bmAddItemRow==='function')W.bmAddItemRow('',1,0);
     var kEl=$('bm-bf-kot');if(kEl)kEl.value=refs.filter(function(v,i,a){return v&&a.indexOf(v)===i;}).join(' + ');
-    var on=T.orders[0]&&(T.orders[0].ORDER_NO||T.orders[0].ORDER_ID);
+    var on=T.orders[0]&&(T.orders[0].ORDER_NO||T.orders[0].ORDER_NUMBER||T.orders[0].ORDER_ID);
     if(on){try{W.posOrderNo=on;W.__bnxPosOrderTbl=String(tbl||'').trim().toUpperCase();try{posOrderNo=on;}catch(_e){}var oe=$('posOrderNo');if(oe)oe.textContent=on;}catch(e){}}
     var cn=$('bm-bf-cname');if(cn&&cust&&!/default/i.test(cust))cn.value=cust;
     var px=$('bm-bf-pax');if(px&&pax&&!px.value)px.value=pax;
@@ -63683,6 +63679,7 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
      and re-sent until the server accepts them. Only ONE dashboard tab per PC runs the station (two tabs = two printers). */
   var LEDK=function(){ return 'bnx_ps_printed_'+cid(); }, DONEK=function(){ return 'bnx_ps_done_pending_'+cid(); };
   function ledger(){ try{ var o=JSON.parse(localStorage.getItem(LEDK())||'{}')||{}, now=Date.now(), ch=false; Object.keys(o).forEach(function(k){ if(now-o[k]>86400000){ delete o[k]; ch=true; } }); if(ch) localStorage.setItem(LEDK(),JSON.stringify(o)); return o; }catch(e){ return {}; } }
+  function paperKey(j){return 'KOT|'+String(j.kotNo||j.id)+'|'+String(j.role||'KITCHEN').toUpperCase()+'|'+String(j.splitIndex||j.si||1);}
   function markPrinted(id){ try{ var o=ledger(); o[id]=Date.now(); localStorage.setItem(LEDK(),JSON.stringify(o)); }catch(e){} }
   function donePending(){ try{ return JSON.parse(localStorage.getItem(DONEK())||'[]')||[]; }catch(e){ return []; } }
   function setDonePending(a){ try{ localStorage.setItem(DONEK(),JSON.stringify(a)); }catch(e){} }
@@ -63734,7 +63731,7 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
       var led=ledger(), res=[], seenNow={};
       jobs=jobs.filter(function(j){
         if(!j||!j.id||seenNow[j.id]) return false; seenNow[j.id]=1;
-        if(led[j.id]){ res.push({id:j.id,ok:true,dup:true}); return false; }   /* already printed here — never print twice */
+        if(led[j.id]||(!j.reprint&&led[paperKey(j)])){ res.push({id:j.id,ok:true,dup:true}); return false; }   /* already printed here — never print twice */
         return true;
       });
       if(!jobs.length){ if(res.length) sendDone(res); return; }
@@ -63742,7 +63739,8 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
       var byRole={}; jobs.forEach(function(j){ (byRole[j.role]=byRole[j.role]||[]).push(j); });
       await Promise.all(Object.keys(byRole).map(async function(k){
         for(var i=0;i<byRole[k].length;i++){ var j=byRole[k][i];
-          try{ if(!ownsStation())throw new Error('Print station ownership changed; ticket retained for retry');await printJob(j); markPrinted(j.id); res.push({id:j.id,ok:true}); ST.printed++; ST.last=k+' · T'+(j.table||'-'); ST.lastAt=Date.now(); }
+          if(!j.reprint&&ledger()[paperKey(j)]){res.push({id:j.id,ok:true,dup:true});continue;}
+          try{ if(!ownsStation())throw new Error('Print station ownership changed; ticket retained for retry');await printJob(j); markPrinted(j.id); if(!j.reprint)markPrinted(paperKey(j)); res.push({id:j.id,ok:true}); ST.printed++; ST.last=k+' · T'+(j.table||'-'); ST.lastAt=Date.now(); }
           catch(e){ res.push({id:j.id,ok:false,error:String(e&&e.message||e)}); ST.failed++; ST.last='⚠️ '+k+': '+String(e&&e.message||e).slice(0,60); }
         } }));
       sendDone(res);                                      /* not awaited: the next tick can start printing new tickets */
@@ -76527,6 +76525,80 @@ W.bnxOpenOrderKpiDetail_=async function(){
 };
 W.addEventListener('bnx:date-range-change',function(){seq++;cache.clear();});
 W.BNX_DETAIL_BUILD='2026.10.26-orders-receipts-v28';
+})(window,document);
+
+</script>
+
+<script>window.BNX_LINK_BUILD="2026.10.26-table-kot-v28";</script>
+
+<script id="bnx-confirmed-sync-table-v29">
+(function(W,D){
+'use strict';var active=new Set(),okAt=0,reconcileFlight=null,lastCheck=0,tableFlight=null,lastTable=0,painting=false;
+var TYPES={SAVE_ORDER:'ORDER',SAVE_KOT:'KOT',SAVE_BILL:'BILL',SAVE_PAYMENT:'PAYMENT'};
+function cid(){try{return String(typeof bnxCurrentClient_==='function'?bnxCurrentClient_():typeof getClientId==='function'?getClientId():W.CLIENT_ID||'');}catch(e){return '';}}
+function token(){try{return String(typeof bnxCurrentSession_==='function'?bnxCurrentSession_():typeof getSessionToken==='function'?getSessionToken():'');}catch(e){return '';}}
+function scope(){return cid()+'|'+token();}
+function signature(e){return String(e.action||'').toUpperCase()+'|'+String(e.requestId||e.payload&&e.payload.requestId||'');}
+function queues(){try{return {pending:bnxGetOutbox(),failed:bnxGetFailedOutbox()};}catch(e){return {pending:[],failed:[]};}}
+function counts(){var q=queues(),sending=0;var pending=q.pending.filter(function(e){if(active.has(scope()+'|'+signature(e))){sending++;return false;}return true;});return {sending:sending,pending:pending.length,failed:q.failed.length};}
+function put(id,text,title){var e=D.getElementById(id);if(!e)return;if(e.textContent!==text)e.textContent=text;if(title)e.title=title;}
+function paint(){if(painting)return;painting=true;try{
+ var n=counts(),healthy=okAt&&Date.now()-okAt<90000,offline=navigator.onLine===false;
+ put('bnx-live-badge',offline?'🔴 OFFLINE':healthy?'🟢 LIVE':'⚪ Checking connection',healthy?'Connected to server. Transaction delivery is shown separately.':'Waiting for a successful server response.');
+ var p=D.getElementById('bnx-pending-badge'),msg=n.sending?'Sending '+n.sending+(n.pending?' · '+n.pending+' pending':''):(n.pending?n.pending+' pending sync':'');
+ if(p){if(p.textContent!==msg)p.textContent=msg;p.style.display=msg?'inline-flex':'none';p.title='Unconfirmed records are retained until the server acknowledges them.';}
+ var f=D.getElementById('bnx-failed-badge');if(f){var txt=n.failed?'⚠ '+n.failed+' need review':'';if(f.textContent!==txt)f.textContent=txt;f.style.display=n.failed?'':'none';}
+ }finally{painting=false;}}
+function visibleTables(){return ['page-tables','page-dashboard','s-tables','s-home'].some(function(id){var p=D.getElementById(id);return p&&p.classList.contains('active');});}
+function refreshTables(force){if(D.hidden||!token()||!visibleTables()||tableFlight||!force&&Date.now()-lastTable<8000)return tableFlight;lastTable=Date.now();
+ var fn=typeof W.loadTablesLive==='function'?W.loadTablesLive:W.bnxSyncTableMasterFromBackend;if(typeof fn!=='function')return;
+ tableFlight=Promise.resolve().then(function(){return fn(false);}).catch(function(e){console.warn('[LIVE TABLE]',e);}).finally(function(){tableFlight=null;});return tableFlight;}
+function transient(e){return /timeout|timed out|network|failed to fetch|offline|lock|busy|temporar|HTTP 5\d\d|expired session|session.*expired|invalid.*session/i.test(String(e.lastError||''));}
+function applyProof(result,sc,snapshot){
+ if(sc!==scope()||!result||!result.success||!result.data||result.data.complete!==true||!Array.isArray(result.data.rows))return false;
+ var proof=new Map(result.data.rows.filter(function(p){return p.clientId===cid()&&p.synced===true&&p.transactionId&&p.status==='SYNCED';}).map(function(p){return [p.requestId,p];}));
+ var q=queues(),pending=q.pending.slice(),keep=[],changed=false,eligible=new Set(snapshot.map(signature));
+ q.failed.forEach(function(e){var sig=signature(e),p=proof.get(String(e.requestId||'')),type=TYPES[String(e.action||'').toUpperCase()];
+  if(!eligible.has(sig)||(Number(e.recoveryCount)||0)>=3){keep.push(e);return;}
+  // A confirmed request is replayed with the SAME ID through normal save/KOT recovery.
+  // Do not delete the record or skip its print/ledger follow-up based on status alone.
+  var confirmed=p&&type&&p.transactionType===type;
+  if(!confirmed&&!transient(e)){keep.push(e);return;}
+  var existing=pending.find(function(x){return signature(x)===sig;});
+  if(existing&&JSON.stringify(existing.payload)!==JSON.stringify(e.payload)){keep.push(e);return;}
+  if(!existing)pending.push(Object.assign({},e,{attempts:0,lastAttemptAt:0,deferUntil:0,recoveryCount:(Number(e.recoveryCount)||0)+1}));changed=true;
+ });
+ if(changed){bnxSetFailedOutbox(keep);bnxSetOutbox(pending);}return changed;
+}
+W.bnxApplySyncProofV29_=applyProof;W.bnxSyncCountsV29_=counts;
+function reconcile(force){
+ if(D.hidden||navigator.onLine===false||!token()||reconcileFlight||!force&&Date.now()-lastCheck<30000)return reconcileFlight;
+ var q=queues(),snapshot=q.pending.concat(q.failed),ids=Array.from(new Set(snapshot.filter(function(e){return TYPES[String(e.action||'').toUpperCase()];}).map(function(e){return String(e.requestId||'');}).filter(Boolean))).slice(0,20);
+ if(!snapshot.length){paint();return;}lastCheck=Date.now();var sc=scope();
+ reconcileFlight=Promise.resolve().then(async function(){
+  var r=await W.gasApi('GET_SYNC_STATUS',{REQUEST_IDS:ids},'V2_CORE');
+  if(sc!==scope())return;
+  var changed=applyProof(r,sc,snapshot);
+  var ready=queues().pending.some(function(e){return !active.has(sc+'|'+signature(e))&&!(e.deferUntil>Date.now());});
+  if((changed||ready)&&typeof W.flushOutbox==='function')await W.flushOutbox(true);
+ }).catch(function(e){console.warn('[SYNC VERIFY]',e);}).finally(function(){reconcileFlight=null;paint();});return reconcileFlight;
+}
+function hook(){var base=W.gasApi;if(typeof base!=='function'||base.__bnxLiveSync29)return;
+ var call=function(action,payload){var sc=scope(),rid=payload&&(payload.requestId||payload.REQUEST_ID),sig=sc+'|'+String(action||'').toUpperCase()+'|'+String(rid||''),write=!/^(GET_|LIST_|CHECK_|FETCH_|LOAD_|READ_|RD_FETCH)/i.test(String(action||'')),args=arguments,self=this;
+  if(write&&rid)active.add(sig);paint();
+  return Promise.resolve().then(function(){return base.apply(self,args);}).then(function(r){
+   if(sc===scope()&&r&&r.success===true){okAt=Date.now();if(write){lastCheck=0;setTimeout(function(){refreshTables(true);},0);}}
+   return r;
+  }).finally(function(){active.delete(sig);paint();});
+ };Object.keys(base).forEach(function(k){call[k]=base[k];});call.__bnxLiveSync29=true;W.gasApi=call;try{gasApi=call;}catch(e){}
+}
+function boot(){hook();paint();reconcile(true);refreshTables(true);var ids=['bnx-live-badge','bnx-pending-badge','bnx-failed-badge'];
+ if(typeof MutationObserver==='function'){var o=new MutationObserver(paint);ids.forEach(function(id){var e=D.getElementById(id);if(e)o.observe(e,{childList:true,subtree:true,characterData:true});});}}
+if(D.readyState==='loading')D.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
+setInterval(function(){if(!D.hidden){hook();paint();reconcile(false);refreshTables(false);}},8000);
+W.addEventListener('online',function(){lastCheck=0;reconcile(true);refreshTables(true);});
+D.addEventListener('visibilitychange',function(){if(!D.hidden){hook();reconcile(true);refreshTables(true);}});
+W.BNX_LIVE_SYNC_BUILD='2026.10.26-confirmed-sync-table-v29';
 })(window,document);
 
 </script>
