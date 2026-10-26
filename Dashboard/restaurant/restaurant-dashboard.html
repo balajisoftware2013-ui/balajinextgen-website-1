@@ -2141,7 +2141,7 @@ function bnxOnScreenRead_(act){
    so SAVE_BILL sent pay:"PMD00002". The server stores that text as the mode NAME and cannot resolve an id from it → every report /
    DSR / payment summary that reads CASH / UPI / CARD / CREDIT missed those bills, and a CREDIT bill (PMD00008) was never seen as
    credit (/^(DUE|CREDIT)$/ fails) → saved as PAID with no due. Every mode is now sent as its canonical NAME code. */
-window.__BNX_PMD_STATIC={PMD00001:'CASH',PMD00002:'UPI',PMD00003:'CARD',PMD00004:'ZOMATO',PMD00005:'SWIGGY',PMD00006:'EAZY DINE',PMD00007:'ONLINE',PMD00008:'CREDIT'};
+window.__BNX_PMD_STATIC={PMD00001:'CASH',PMD00002:'UPI',PMD00003:'CARD',PMD00004:'ZOMATO',PMD00005:'SWIGGY',PMD00006:'EAZY DINE',PMD00007:'ONLINE',PMD00008:'CREDIT',PMD00009:'NC'};
 function bnxPayCode_(v){
   var s=String(v==null?'':v).trim(); if(!s) return '';
   var u=s.toUpperCase();
@@ -2151,11 +2151,27 @@ function bnxPayCode_(v){
   return window.__BNX_PMD_STATIC[u]||u;
 }
 window.bnxPayCode_=bnxPayCode_;
+function bnxPayId26_(mode){
+ var code=bnxPayCode_(mode),norm=function(x){return String(x||'').toUpperCase().replace(/[^A-Z0-9]/g,'');};
+ if(norm(code)==='DUE')code='CREDIT';
+ var names=window.__BNX_PAYMENT_MODE_NAMES||{};
+ for(var id in names)if(/^PMD\d+$/.test(id)&&norm(names[id])===norm(code))return id;
+ var opts=document.querySelectorAll('#bm-bf-paymode option[data-id]');
+ for(var i=0;i<opts.length;i++){var o=opts[i],v=o.getAttribute('data-id');if(/^PMD\d+$/.test(v||'')&&(norm(o.value)===norm(code)||norm(o.textContent)===norm(code)))return v;}
+ // Existing master mapping already shipped with this dashboard.
+ var m=window.__BNX_PMD_STATIC||{};for(var k in m)if(norm(m[k])===norm(code))return k;
+ return '';
+}
 function bnxNormBillPay_(payload){
   try{
     var b=payload&&payload.bill; if(!b) return payload;
     ['pay','paymode','paymentMode','PAYMENT_MODE'].forEach(function(k){ if(b[k]!=null&&b[k]!=='') b[k]=bnxPayCode_(b[k]); });
     ['payments','paymentLines','splitLines'].forEach(function(k){ if(Array.isArray(b[k])) b[k].forEach(function(x){ if(x){ ['mode','paymentMode','PAYMENT_MODE'].forEach(function(m){ if(x[m]!=null&&x[m]!=='') x[m]=bnxPayCode_(x[m]); }); } }); });
+    var masterId=bnxPayId26_(b.pay||b.paymode||b.paymentMode||b.PAYMENT_MODE);
+    if(masterId){b.paymentModeId=masterId;b.PAYMENT_MODE_ID=masterId;}
+    ['payments','paymentLines','splitLines'].forEach(function(k){if(Array.isArray(b[k]))b[k].forEach(function(x){if(!x)return;var id=bnxPayId26_(x.mode||x.paymentMode||x.PAYMENT_MODE);if(id){x.paymentModeId=id;x.PAYMENT_MODE_ID=id;}});});
+    try{var u=JSON.parse(sessionStorage.getItem('ERP_USER')||localStorage.getItem('ERP_USER')||'{}');var loc=payload.locationId||payload.LOCATION_ID||b.locationId||b.LOCATION_ID||u.LOCATION_ID||u.locationId;if(loc){payload.locationId=loc;payload.LOCATION_ID=loc;b.locationId=loc;}}
+    catch(e){}
     if(/^(DUE|CREDIT)$/.test(String(b.pay||'')) && /^paid$/i.test(String(b.status||''))) b.status='Pending';
   }catch(e){}
   return payload;
@@ -22741,6 +22757,8 @@ function bmSwitchPrint(format,btn){
   }
 }
 async function bmDoPrint(){
+  const invoiceSnapshot=JSON.parse(JSON.stringify(bmGetBillData()));
+  try{window.bnxWarmBillPrint_&&window.bnxWarmBillPrint_();}catch(e){}
   /*
    * INVOICE-FIRST PRINT FLOW:
    * 1) Open the print window immediately from the user's click (avoids popup blocking).
@@ -22794,7 +22812,7 @@ async function bmDoPrint(){
   // server was saving could otherwise print a different customer's data.
   let printData = null;
   try{
-    const dNow = bmGetBillData();
+    const dNow = invoiceSnapshot;
     printData = Object.assign({}, dNow, {
       billno: saved.billno || dNow.billno,
       billNo: saved.billno || dNow.billno,
@@ -48447,13 +48465,15 @@ function bnxOpenMasterHub(){
          bill print. Handlers are now attached BEFORE src is set (failure is instant),
          and local data: images are tried before network URLs. */
       candidates.sort((a,b)=>(/^data:/i.test(b)?1:0)-(/^data:/i.test(a)?1:0));
+      const logoDeadline=Date.now()+3500;
       for(const src of candidates){
+        if(Date.now()>=logoDeadline)break;
         try{
           const img=new Image();
           img.decoding='async'; img.referrerPolicy='no-referrer';
           if(/^https?:/i.test(src)) img.crossOrigin='anonymous';
           await new Promise((resolve,reject)=>{
-            const t=setTimeout(()=>reject(new Error('logo load timeout')),4000);
+            const t=setTimeout(()=>reject(new Error('logo load timeout')),Math.max(1,logoDeadline-Date.now()));
             img.onload=()=>{clearTimeout(t);resolve();};
             img.onerror=()=>{clearTimeout(t);reject(new Error('logo not loadable (blocked/404): '+String(src).slice(0,60)));};
             img.src=src;
@@ -48508,12 +48528,22 @@ function bnxOpenMasterHub(){
     out.push({type:'raw',format:'command',flavor:'plain',data:'\x1Ba1'+b});
     return out;
   }
+  // Decode/cache receipt logo before save completes, without sending a print job.
+  window.bnxWarmBillPrint_=function(){
+    try{if(typeof bnxInvoiceLogoOn_!=='function'||bnxInvoiceLogoOn_())bnxBillLogoHex_().catch(function(){});}catch(e){}
+  };
+  window.addEventListener('load',function(){setTimeout(window.bnxWarmBillPrint_,1200);},{once:true});
+  document.addEventListener('pointerdown',function(e){if(e.target.closest&&e.target.closest('[onclick*="bmDoPrint"],[onclick*="bmSaveBill"],[onclick*="settleOrder"],[onclick*="blReprintBill"]'))window.bnxWarmBillPrint_();},true);
   async function billRawDirect_(d){
     d=d||{};
     const id=bnxBillIdentity_(d);
     const text=billRaw(d);
     const fullText=text.join('');
-    const logoHex=(typeof bnxInvoiceLogoOn_==='function'&&!bnxInvoiceLogoOn_())?'':await bnxBillLogoHex_();
+    const logoHex=(typeof bnxInvoiceLogoOn_==='function'&&!bnxInvoiceLogoOn_())?'':
+      (bnxBillLogoHexCache_!==null?bnxBillLogoHexCache_:await new Promise(function(resolve){
+        var timer=setTimeout(function(){resolve('');},500);
+        bnxBillLogoHex_().then(function(hex){clearTimeout(timer);resolve(hex);},function(){clearTimeout(timer);resolve('');});
+      }));
     if(!logoHex) return bnxUpiChunks_(fullText,d);
     // IMPORTANT: printer INIT must happen before the raster logo; many ESC/POS
     // firmwares clear the image buffer when ESC @ is received. Keep the initial
@@ -74270,7 +74300,13 @@ html body .fp-t.res,html body .fp-side.res{--s:#f97316!important;--sd:#c2410c!im
 html body .fp-t.run .fp-top,html body .fp-t.occ .fp-top{background:#2563eb!important;box-shadow:0 0 0 2px #bfdbfe!important;animation:none!important}
 html body .fp-top{height:auto;min-height:44px;padding:6px;min-width:74px}
 html body .fp-top em{font-size:10px;white-space:normal;text-align:center}
-</style></body></html>
+</style><script id="bnx-bill-print-lock-20261026">
+(function(W){var base=W.bmDoPrint,flight=null;if(typeof base!=='function')return;
+ W.bmDoPrint=function(){if(flight)return flight;var result;
+ try{result=base.apply(this,arguments);}catch(e){return Promise.reject(e);}
+ flight=Promise.resolve(result).finally(function(){flight=null;});return flight;};
+})(window);
+</script></body></html>
 
 <style id="bnx-achievement-actual-fix">
 #bnxHeroTargetStrip{flex-wrap:wrap!important;overflow:visible!important;gap:12px 24px!important}
