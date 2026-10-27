@@ -9616,9 +9616,11 @@ async function loadBootstrapOrFallback(){
   /* FAST LOAD: tables never depend on the menu — start them now instead of
      after the (large) GET_BOOTSTRAP menu download finishes. */
   try{ loadTablesLive().catch(()=>{}); }catch(e){}
+  const bootstrapClient=String(typeof CLIENT_ID!=='undefined'?CLIENT_ID:'');
   const res = await gasApi('GET_BOOTSTRAP', {}, 'V2_CORE');
+  if(bootstrapClient!==String(typeof CLIENT_ID!=='undefined'?CLIENT_ID:''))return;
   if(res && res.success && res.data){
-    if(Array.isArray(res.data.menu) && res.data.menu.length){
+    if((!Array.isArray(MENU)||!MENU.length||bnxMenuSource!=='live') && Array.isArray(res.data.menu) && res.data.menu.length){
       MENU = res.data.menu.map(m=>bnxMapMenuRow_(m, !!(m.isBar||m.IS_BAR||m.menuType==='BAR'||m.MENU_TYPE==='BAR'))).filter(m=>m.id&&m.name);
       bnxMenuSource = 'live';
       bnxMenuLastUpdated = new Date();
@@ -15461,7 +15463,7 @@ async function bnxPlaceOrderImpl_(){
   const items = Object.entries(order).map(([id,qty])=>{
     const m = MENU.find(x=>String(x.id)===String(id));
     if(!m || !m.id || !m.name) throw new Error('Menu item could not be resolved. Please refresh Menu.');
-    const itemId=String(m.id), itemQty=Number(qty)||0, rate=Number(m.price)||0, rawTax=Number(m.gst)||0, taxRate=rawTax>0&&rawTax<1?rawTax*100:rawTax;
+    const itemId=String(m.parentItemId||m.ITEM_ID||m.itemId||m.id), itemQty=Number(qty)||0, rate=Number(m.price)||0, rawTax=Number(m.gst)||0, taxRate=rawTax>0&&rawTax<1?rawTax*100:rawTax;
     if(itemQty<=0) throw new Error('Invalid quantity for '+String(m.name));
     // FIX ("kot send auto split item group ... backend error"): the KOT
     // screen's auto-split-by-group (bnxKOTParts_/bnxKOTGroups_) works
@@ -16649,7 +16651,7 @@ if(getClientId() && getSessionToken()){
       productIconKey || categoryIcon || bnxGroupIcon_(grp,groupType) || bnxDefaultIcon(category);
     return Object.assign({},m,{
       id,name,cat:category,categoryId,group:grp,itemGroupId,groupType,
-      price:Number(String(firstField(m,['price','PRICE','p','rate','RATE','SELLING_PRICE','SALE_PRICE'])).replace(/[,₹\s]/g,''))||0,
+      price:Number(String(firstField(m,['price','PRICE','p','rate','RATE','SELLING_RATE','sellingRate','SELLING_PRICE','sellingPrice','SALE_PRICE','SERVING_PRICE'])).replace(/[,₹\s]/g,''))||0,
       size:S(firstField(m,['size','SIZE','sizeName','SIZE_NAME','servingSize','SERVING_SIZE'])),
       menuActive:![false,0,'false','FALSE','0','NO','No'].includes(m.menuActive??m.MENU_ACTIVE??m.IS_ACTIVE??m.isActive??true),
       icon, categoryIcon, productIconKey, imageUrl, productImageUrl:imageUrl,
@@ -16685,6 +16687,13 @@ if(getClientId() && getSessionToken()){
     loadP=(async function(){
       const old=Array.isArray(MENU)?MENU.slice():[];
       const clientAtStart=String(typeof CLIENT_ID!=='undefined'?CLIENT_ID:'');
+      // POS also supplements its published menu with the live item/serving masters.
+      // Start these reads together; the published menu can still paint immediately.
+      const extraPayload=force?{force:true,noCache:true}:{};
+      const extras=Promise.allSettled([
+        gasApi('GET_MASTER',Object.assign({category:'item_master'},extraPayload),'V2_CORE'),
+        gasApi('GET_MASTER',Object.assign({category:'bar_item_master'},extraPayload),'V2_CORE')
+      ]);
       const pos=await call('GET_POS_MENU',force);
       if(clientAtStart!==String(typeof CLIENT_ID!=='undefined'?CLIENT_ID:''))return false;
       const payload=pos&&pos.success?bnxMenuPayload26_(pos):null;
@@ -16693,6 +16702,8 @@ if(getClientId() && getSessionToken()){
       const barRaw=payload&&Array.isArray(payload.bar)?payload.bar:[];
       const food=foodRaw.map(x=>mapRow(x,false)).filter(x=>x.id&&x.name);
       const bar=barRaw.map(x=>mapRow(x,true)).filter(x=>x.id&&x.name);
+      if(pos&&pos.available&&pos.available.food===false) old.filter(x=>!x.isBar).forEach(x=>food.push(x));
+      if(pos&&pos.available&&pos.available.bar===false) old.filter(x=>x.isBar).forEach(x=>bar.push(x));
 
       barIds=new Set(bar.map(x=>S(x.id)).filter(Boolean));
       foodIds=new Set(food.map(x=>S(x.id)).filter(Boolean));
@@ -16735,6 +16746,59 @@ if(getClientId() && getSessionToken()){
       }catch(e){}
 
       if(document.getElementById('s-new-order')?.classList.contains('active')) window.renderMenu();
+      const er=await extras;
+      if(clientAtStart!==String(typeof CLIENT_ID!=='undefined'?CLIENT_ID:''))return false;
+      const master=er[0].status==='fulfilled'?rowsFromResponse(er[0].value):[];
+      const sizes=er[1].status==='fulfilled'?rowsFromResponse(er[1].value):[];
+      const barWord=/\b(bar|beer|beverage|liquor|alcohol|spirits|scotch|vodka|whisky|whiskey|rum|gin|tequila|brandy|cognac|wine|cocktail|champagne|liqueur)\b/i;
+      const active=v=>!(v===false||['0','FALSE','NO','N','INACTIVE','DISABLED','OFF'].includes(S(v).toUpperCase()));
+      const barKeys=new Set();MENU.filter(x=>x.isBar||barish(x)).forEach(x=>[x.id,x.itemCode,x.name].forEach(v=>{if(S(v))barKeys.add(S(v).toUpperCase());}));
+      let added=0;
+      master.forEach(row=>{
+        const id=S(firstField(row,['ITEM_ID','itemId','ITEM_CODE','itemCode','id','code']));
+        const name=S(firstField(row,['ITEM_NAME','itemName','name','n']));
+        const cat=S(firstField(row,['CATEGORY_NAME','categoryName','category','MENU_SECTION','MENU_CATEGORY','CATEGORY']));
+        const group=S(firstField(row,['ITEM_GROUP_NAME','itemGroupName','itemGroup','GROUP_NAME','groupName']));
+        const type=S(firstField(row,['MENU_TYPE','menuType','TYPE','ITEM_TYPE']));
+        if(!id||!name||!active(row.IS_ACTIVE??row.isActive??row.ACTIVE??row.MENU_ACTIVE??row.menuActive))return;
+        if(!bool(row.IS_BAR??row.isBar??row.BAR_ITEM??row.IS_BAR_ITEM)&&!barWord.test([name,cat,group,type].join(' ')))return;
+        if(barKeys.has(id.toUpperCase())||barKeys.has(name.toUpperCase()))return;
+        const x=mapRow(Object.assign({},row,{id:id,name:name,category:cat||group||'BEER',group:group}),true);
+        if(!x.id||!x.name||!x.menuActive)return;
+        MENU.push(x);barKeys.add(id.toUpperCase());barKeys.add(name.toUpperCase());added++;
+      });
+      // Fill an omitted menu price from the same ITEM_MASTER rates used by POS.
+      const rates=new Map();master.forEach(row=>{
+        const id=S(firstField(row,['ITEM_ID','itemId','ITEM_CODE','itemCode'])).toUpperCase();
+        const p=Number(String(firstField(row,['SELLING_RATE','sellingRate','SELLING_PRICE','SALE_PRICE','PRICE','price','RATE'])).replace(/[,₹\s]/g,''));
+        if(id&&Number.isFinite(p)&&p>0)rates.set(id,p);
+      });
+      MENU.forEach(x=>{const p=rates.get(S(x.parentItemId||x.ITEM_ID||x.itemId||x.id).toUpperCase());if(!(Number(x.price)>0)&&p)x.price=p;});
+      // Separate price/size selections keep their parent ITEM_ID for the saved order.
+      const bySize=new Map();
+      sizes.forEach(row=>{
+        const id=S(firstField(row,['ITEM_ID','itemId'])).toUpperCase();
+        const size=S(firstField(row,['SERVING_SIZE','servingSize'])).toUpperCase().replace(/\s+/g,'');
+        const price=Number(String(firstField(row,['SELLING_PRICE','sellingPrice','price'])).replace(/[,₹\s]/g,''));
+        if(!id||!size||!Number.isFinite(price)||price<=0||!active(row.IS_ACTIVE??row.isActive??row.STATUS))return;
+        if(!bySize.has(id))bySize.set(id,[]);
+        if(!bySize.get(id).some(x=>x.size===size))bySize.get(id).push({size:size,price:price});
+      });
+      if(bySize.size){
+        const expanded=[];
+        MENU.forEach(x=>{
+          const parent=S(x.parentItemId||x.ITEM_ID||x.itemId||x.id);
+          const variants=(x.isBar||barish(x))&&bySize.get(parent.toUpperCase());
+          if(!variants||!variants.length || x.parentItemId){expanded.push(x);return;}
+          // A still-open cart may reference the old base tile; retain it until cleared.
+          if(typeof order!=='undefined' && Number(order[String(x.id)]||0)>0)expanded.push(x);
+          const base=S(x.name).replace(/\s*\(?(?:30|60|90|330|500|600|1100)\s*ML\)?\s*$/i,'').trim();
+          variants.forEach(v=>expanded.push(Object.assign({},x,{id:parent+'::size::'+v.size,parentItemId:parent,name:base+' ('+v.size+')',size:v.size,price:v.price})));
+        });
+        const ids=new Set();MENU=expanded.filter(x=>{const k=S(x.id);if(ids.has(k))return false;ids.add(k);return true;});
+      }
+      try{localStorage.setItem('bnx_steward_menu_v7_'+clientAtStart,JSON.stringify(MENU));}catch(e){}
+      if((added||bySize.size)&&document.getElementById('s-new-order')?.classList.contains('active')) window.renderMenu();
       return MENU.length>0;
     })().catch(e=>{
       console.error('[STEWARD_MENU]',e);
