@@ -2172,6 +2172,18 @@ function bnxPayCode_(v){
   return window.__BNX_PMD_STATIC[u]||u;
 }
 window.bnxPayCode_=bnxPayCode_;
+/* 2026-10-27 SPLIT PAYMENT -> "OTHER" FIX: one place decides CASH / UPI / CARD / OTHER for a payment-mode text.
+   Exact-match tests missed GPAY / PHONE PE / DEBIT CARD / "Card Payment" etc. and a bill whose mode text is SPLIT or "CASH + UPI"
+   went entirely to OTHER. Returns '' for SPLIT / compound text (caller must use the per-line amounts instead). */
+window.bnxPayBucket_=function(m){
+  var s=bnxPayCode_(String(m==null?'':m).trim()); if(!s) return '';
+  var n=s.replace(/[\s_\-\/\.]+/g,' ').trim(), c=n.replace(/ /g,'');
+  if(n==='SPLIT'||/\+|,|&/.test(n)) return '';
+  if(/^CASH\b/.test(n)) return 'CASH';
+  if(/(^| )(UPI|GPAY|G PAY|GOOGLE PAY|PHONEPE|PHONE PE|PAYTM|BHIM|QR)( |$)/.test(n)||/GPAY|GOOGLEPAY|PHONEPE/.test(c)) return 'UPI';
+  if(/(^| )(CARD|DEBIT|POS|SWIPE|BANK|NEFT|RTGS|IMPS)( |$)/.test(n)) return 'CARD';
+  return 'OTHER';
+};
 function bnxPayId26_(mode){
  var code=bnxPayCode_(mode),norm=function(x){return String(x||'').toUpperCase().replace(/[^A-Z0-9]/g,'');};
  if(norm(code)==='DUE')code='CREDIT';
@@ -13083,13 +13095,20 @@ async function bnxPullBillsRange_(from, to, options){
         // must remain blank/—, not become a false cash receipt.
         const rawMode = String(sb.pay || sb.paymode || sb.PAYMENT_MODE || '').trim().toUpperCase();
         const mode = rawMode || '';
-        const bucket = mode === 'CASH' ? 'CASH' : mode === 'UPI' ? 'UPI' : (mode === 'CARD' || mode === 'BANK' || mode === 'DEBIT CARD' || mode === 'CREDIT CARD' ? 'CARD' : (mode ? 'OTHER' : ''));
+        const bucket = window.bnxPayBucket_(mode);   /* 2026-10-27: '' for SPLIT / 'CASH + UPI' - never dumped into OTHER */
         const fallbackTotal = Number(sb.total ?? sb.grand ?? sb.GRAND_TOTAL ?? 0) || 0;
         const payBreakdown = sb.payBreakdown
           ? { CASH:Number(sb.payBreakdown.CASH)||0, CARD:Number(sb.payBreakdown.CARD)||0, UPI:Number(sb.payBreakdown.UPI)||0, OTHER:Number(sb.payBreakdown.OTHER)||0 }
           : { CASH:0, CARD:0, UPI:0, OTHER:0 };
-        if (!sb.payBreakdown && bucket && fallbackTotal > 0) payBreakdown[bucket] = fallbackTotal;
         const previous = previousBills.get(String(no)) || {};
+        if (!sb.payBreakdown && bucket && fallbackTotal > 0) payBreakdown[bucket] = fallbackTotal;
+        else if (!sb.payBreakdown && !bucket && mode && fallbackTotal > 0) {   /* split bill without a server breakdown: reuse the split already known on this device */
+          try{
+            const kp=(window.__bnxBillPays||{})[String(no)], pb=previous.payBreakdown;
+            if(kp&&kp.m){ Object.keys(kp.m).forEach(function(k){ const b=window.bnxPayBucket_(k)||'OTHER'; payBreakdown[b]+=Number(kp.m[k])||0; }); }
+            else if(pb && ((Number(pb.CASH)||0)+(Number(pb.UPI)||0)+(Number(pb.CARD)||0)+(Number(pb.OTHER)||0))>0){ ['CASH','UPI','CARD','OTHER'].forEach(function(k){ payBreakdown[k]=Number(pb[k])||0; }); }
+          }catch(e){}
+        }
         local.push({
           no,
           dt: sb.dt || sb.BILL_DATE || sb.date,
@@ -23304,7 +23323,7 @@ async function bmSaveBill(reprintAfter){
       table: d.table, customer: d.cname, mob: d.cmob, items: d.items, sub: d.sub, gst: d.tax, total: d.total,
       pay: d.paymode, waiter: d.waiter, kot: d.kot, businessDate: d.businessDate, pax: d.pax,
       advanceAdjusted: d.advanceAdjusted, balanceDue: d.balanceDue,
-      disc: d.disc, sc: d.sc, roundOff: d.roff, splitLines: _splitSnap
+      disc: d.disc, sc: d.sc, roundOff: d.roff, splitLines: _splitSnap || (/^SPLIT$/i.test(String(d.paymode||'')) ? (draftBill.payments||null) : null), payments: draftBill.payments
     });
     /* FIX 2026-10-12: the Bills List showed the OLD split (cached payment ledger) after an edit — refresh it from what was just saved */
     try{ window.__bnxBillPays = window.__bnxBillPays || {}; if(_splitSnap){ const m={}; _splitSnap.forEach(function(x){ const k=(x.mode==='BANK'?'CARD':x.mode); m[k]=(m[k]||0)+x.amount; }); window.__bnxBillPays[String(d.billno)]={m:m}; } else { delete window.__bnxBillPays[String(d.billno)]; } }catch(e){}
@@ -24511,7 +24530,7 @@ function bnxRecordBill(d){
   // created on THIS device, before ever round-tripping through LIST_
   // BILLS), so every bill in the register carries payBreakdown either
   // way, regardless of which of the two paths created it.
-  const bnxBucket = payMode === 'CASH' ? 'CASH' : payMode === 'UPI' ? 'UPI' : payMode === 'CARD' ? 'CARD' : 'OTHER';
+  const bnxBucket = window.bnxPayBucket_(payMode) || 'OTHER';   /* SPLIT is replaced by the per-line breakdown below */
   const entry = {
     no: d.no, billId:d.billId||'', orderId:d.orderId||'', dt: d.dt, tm: d.tm, startTime: d.startTime||(window.__bnxStartByTable&&window.__bnxStartByTable[String(d.table||'').trim().toUpperCase()])||'', endTime: d.endTime||d.tm||'', table: d.table||'-', customer: d.customer||'GENERAL CUSTOMER',
     mob: d.mob||'', items: (d.items||[]).length, itemsDetail: d.items||[], sub: d.sub||0, gst: d.gst||0,
@@ -24530,10 +24549,13 @@ function bnxRecordBill(d){
   if (d.disc!=null) entry.disc = Number(d.disc)||0;
   if (d.sc!=null) entry.sc = Number(d.sc)||0;
   if (d.roundOff!=null && isFinite(Number(d.roundOff))) entry.roundOff = Number(d.roundOff);
-  if (Array.isArray(d.splitLines) && d.splitLines.length>1){
-    entry.pay = 'SPLIT'; entry.isSplitPayment = true; entry.payments = d.splitLines.map(function(x){ return {mode:x.mode,amount:x.amount}; });
+  /* 2026-10-27: a SPLIT bill whose snapshot was lost (or edited) used to put the whole total under OTHER - fall back to the lines sent to the server */
+  const _spl = (Array.isArray(d.splitLines) && d.splitLines.length>1) ? d.splitLines
+             : ((payMode==='SPLIT' || (Array.isArray(d.payments) && d.payments.length>1)) ? (d.payments||d.paymentLines||[]) : null);
+  if (Array.isArray(_spl) && _spl.length>1){
+    entry.pay = 'SPLIT'; entry.isSplitPayment = true; entry.payments = _spl.map(function(x){ return {mode:String(x.mode||x.paymentMode||x.PAYMENT_MODE||'CASH').toUpperCase(),amount:Number(x.amount!=null?x.amount:x.AMOUNT)||0}; });
     entry.payBreakdown = { CASH:0, CARD:0, UPI:0, OTHER:0 };
-    d.splitLines.forEach(function(x){ const k = x.mode==='CASH'?'CASH':x.mode==='UPI'?'UPI':(x.mode==='CARD'||x.mode==='BANK')?'CARD':'OTHER'; entry.payBreakdown[k]+=x.amount; });
+    entry.payments.forEach(function(x){ const k = window.bnxPayBucket_(x.mode)||'OTHER'; entry.payBreakdown[k]+=x.amount; });
     entry.status = 'Paid';
   }
   try{ window.bnxSaveBillTimes_(entry.no, entry.startTime, entry.endTime); }catch(e){}
