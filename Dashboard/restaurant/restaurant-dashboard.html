@@ -35341,6 +35341,12 @@ const ORDER_TYPE_LIST = ['DINEIN','TAKEAWAY','DELIVERY'];
 const ORDER_REG_SCHEMA_DEFAULTS = { ORDER_DATE:'—', INVOICE_NO:'', TEMP_ORDER_ID:'—', SCAN_KEY:'', END_TIME:'', MOBILE_NO:'—', NOTES:'', CREATED_BY:'—' };
 
 async function loadOrderRegister(){
+  /* INSTANT OPEN: first visit paints the last good list saved on this device at once; the server refresh runs behind it. */
+  if(!(Array.isArray(window.orderRegData)&&window.orderRegData.length)){
+    try{ const sv=JSON.parse(localStorage.getItem('bnx_order_reg_last_'+(window.CLIENT_ID||''))||'null');
+      if(sv&&Array.isArray(sv.rows)&&sv.rows.length){ window.orderRegData=sv.rows; window._orFromDevice=sv.t; }
+    }catch(_e){}
+  }
   // SPEED: if we already have orders in memory, paint them NOW and refresh quietly in the background.
   if(Array.isArray(window.orderRegData) && window.orderRegData.length){
     try{ renderOrderRegFilters(); renderOrderRegList(); }catch(e){}
@@ -36123,15 +36129,8 @@ async function saveOrderRegEdit(orderId){
   const saveBtn=document.querySelector('#orderRegModalBody button[onclick^="saveOrderRegEdit"]');
   const saveBtnTxt=saveBtn?saveBtn.textContent:'';
   if (saveBtn){ if (saveBtn.disabled) return; saveBtn.disabled=true; saveBtn.textContent='Saving…'; }
-  const res=await bnxGuaranteedSync('UPDATE_ORDER_ITEMS', payload, true);
-  if (!res || !res.success) {
-    /* FIX (item alter → error): keep the edit form + draft open so the change can be retried,
-       re-enable Save, and show the real reason instead of a generic message. */
-    if (saveBtn){ saveBtn.disabled=false; saveBtn.textContent=saveBtnTxt; }
-    const why=String((res&&(res.error||res.message))||'no response from server (connection slow)').slice(0,140);
-    showNotif && showNotif('⚠️ Order update not saved: '+why+'. Your edits are kept — tap Save again. (Queued in Pending Sync.)','error');
-    return;
-  }
+  /* INSTANT SAVE: show the change in the list and close the editor now; the server write (same requestId, same
+     outbox/retry as before) runs in the background. Only a real rejection (not approved / no permission) is rolled back. */
   const idx=orders.findIndex(x=>x.ORDER_ID===orderId);
   if(idx>=0){
     const merged=JSON.parse(JSON.stringify(original));
@@ -36143,9 +36142,22 @@ async function saveOrderRegEdit(orderId){
   window._oreEditingOrder=null;
   renderOrderRegList();
   closeOrderRegModal();
-  showNotif && showNotif('✅ Order '+original.ORDER_NO+' updated successfully','success');
-  // Refresh live order state so server-normalized fields are used immediately.
-  try{ await loadOrderRegister(); }catch(e){}
+  showNotif && showNotif('✅ Order '+original.ORDER_NO+' saved — syncing in background','success');
+  bnxGuaranteedSync('UPDATE_ORDER_ITEMS', payload, true).then(function(res){
+    if(res && res.success){
+      /* quiet refresh a moment later (not awaited) so server-normalised fields replace the local copy */
+      setTimeout(function(){ try{ if(!window._orLoading){ window._orSilent=true; Promise.resolve(loadOrderRegister()).catch(function(){}).finally(function(){ window._orSilent=false; }); } }catch(e){} },2500);
+      return;
+    }
+    const why=String((res&&(res.error||res.message))||'no response from server').slice(0,140);
+    if(/not approved|denied|permission|not allowed|forbidden|unauthori/i.test(why)){
+      const i2=(window.orderRegData||[]).findIndex(x=>x.ORDER_ID===orderId);
+      if(i2>=0){ window.orderRegData[i2]=oldSnapshot; try{ renderOrderRegList(); }catch(e){} }
+      showNotif && showNotif('⚠️ Order change not accepted: '+why+'. Original order restored.','error');
+    } else {
+      showNotif && showNotif('⏳ Order '+original.ORDER_NO+' will finish syncing automatically ('+why+'). See Pending Sync.','info');
+    }
+  }).catch(function(e){ showNotif && showNotif('⏳ Order update queued for retry (Pending Sync).','info'); });
 }
 async function cancelOrderReg(orderId){
   const o = orderRegData.find(x=>x.ORDER_ID===orderId); if (!o) return;
