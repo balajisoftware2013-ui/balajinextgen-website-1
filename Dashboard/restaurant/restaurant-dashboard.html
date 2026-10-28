@@ -16470,6 +16470,7 @@ async function bnxSyncTableMasterFromBackend(silent){
         barStatus: r[9] || '',
         kotCount: Number(r[10])||0,
         billAmount: Number(r[11])||0,
+        taxable: Number(r[14])||0,
       };
     });
     // re-merge any table added locally that the sheet doesn't have yet
@@ -30390,7 +30391,9 @@ async function bnxLoadLiveBillsForDetail_(from,to){
        Use it instantly only when it has at least as many bills as the dashboard counted for the same range; otherwise wait for the server (max 25 s). */
     let _need=0; try{ const dr=bnxDashCurrentFromTo_(); if(dr&&dr.from===from&&(dr.to||dr.from)===(to||from)){ _need=Number(String((document.getElementById('d-ord')||{}).textContent||'').replace(/[^0-9]/g,''))||0; } }catch(e){}
     const _have=reg().filter(b=>_inR(b)&&!/cancel|void/i.test(String(b.status||''))).length;
-    if(from&&_have&&_need&&_have<_need){ try{ await Promise.race([pull(),new Promise(r=>setTimeout(r,25000))]); }catch(e){} return reg(); }
+    /* 2026-10-28: a partial on-device list no longer blocks for up to 25 s — it shows at once and the pop-up refreshes itself
+       (bnx:detail-data) the moment the server list arrives. */
+    if(from&&_have&&_need&&_have<_need){ const pp0=pull(); Promise.resolve(pp0).then(()=>{ try{ window.dispatchEvent(new CustomEvent('bnx:detail-data',{detail:{from:from,to:to}})); }catch(e){} }).catch(()=>{}); return reg(); }
     if(from&&reg().some(_inR)){ const pp=pull(); Promise.resolve(pp).then(()=>{ try{ window.dispatchEvent(new CustomEvent('bnx:detail-data',{detail:{from:from,to:to}})); }catch(e){} }).catch(()=>{}); return reg(); }
   }catch(e){}
   await pull();
@@ -50935,6 +50938,7 @@ function bnxOpenMasterHub(){
           barStatus:t.barStatus||t.BAR_STATUS||'',
           kotCount:Number(t.kotCount||t.KOT_COUNT)||0,
           billAmount:Number(t.amount||t.billAmount||t.BILL_AMOUNT)||0,
+          taxable:Number(t.taxable||t.TAXABLE_AMOUNT)||0,
           startedAt:t.openedAt||t.startedAt||t.startTime||t.START_TIME||t.orderTime||t.ORDER_TIME||t.occupiedSince||'',
           orderId:t.orderId||t.ORDER_ID||'',
           orderNo:t.orderNo||t.ORDER_NO||'',
@@ -52689,7 +52693,15 @@ function cardHtml(t){
     var cap=(typeof W.bnxResolveStaffDisplayName_==='function'?W.bnxResolveStaffDisplayName_(t.captain||''):t.captain)||'';
     if(cap==='Unassigned'||cap==='-')cap='';
     var kot=t.kot?String(t.kot).replace(/^\S+\s/,''):'';
-    right=amt?'<span style="text-align:right"><span class="tm-amt" title="'+esc(amountLabel)+'">'+esc(amt)+'</span><span style="display:block;font-size:9px;color:#536276">'+esc(amountLabel)+'</span></span>':(kot?'<span>'+esc(kot)+'</span>':(cap?'<span>'+esc(cap)+'</span>':''));
+    /* 2026-10-28: bill amount (incl. GST) AND taxable value, both on the card */
+    var billAmt=Number(raw.billAmount||0), taxV=Number(raw.taxable||0);
+    if(!taxV&&itemSummary&&itemSummary.count&&!itemSummary.missing)taxV=Number(itemSummary.total)||0;
+    var money2=function(v){return '₹'+Number(v).toLocaleString('en-IN',{maximumFractionDigits:2});};
+    if(billAmt>0||taxV>0){
+      right='<span style="text-align:right;line-height:1.25"><span class="tm-amt" title="Bill amount incl. GST">'+esc(money2(billAmt>0?billAmt:taxV))+'</span>'
+        +'<span style="display:block;font-size:9px;color:#536276">Bill amt'+(billAmt>0?'':' (est.)')+'</span>'
+        +(taxV>0?'<span style="display:block;font-size:10.5px;font-weight:800;color:#374151">'+esc(money2(taxV))+' <span style="font-weight:600;font-size:9px;color:#536276">taxable</span></span>':'')+'</span>';
+    }else right=amt?'<span style="text-align:right"><span class="tm-amt" title="'+esc(amountLabel)+'">'+esc(amt)+'</span><span style="display:block;font-size:9px;color:#536276">'+esc(amountLabel)+'</span></span>':(kot?'<span>'+esc(kot)+'</span>':(cap?'<span>'+esc(cap)+'</span>':''));
   }else if(k==='res'){
     var rt=(raw.reservation&&raw.reservation.time)||raw.t||'';
     left='<span><b>'+esc(rt||'Reserved')+'</b></span>';
@@ -77148,18 +77160,46 @@ function rows(res){if(!res||res.success!==true)throw Error(res&&res.error||'Orde
 function normalized(rs,r,cid){var seen=new Set();return rs.filter(function(o){var dt=day(o.BUSINESS_DATE||o.ORDER_DATE);if(o.CLIENT_ID&&cid&&String(o.CLIENT_ID)!==cid||!dt||dt<r.from||dt>r.to)return false;var id=o.ORDER_ID;if(!id||seen.has(String(id)))return false;seen.add(String(id));return true;});}
 W.bnxOrderPopupRows_=normalized;
 W.bnxOpenOrderKpiDetail_=async function(){
+ /* 2026-10-28 ("orders pop-up: instant, amounts, every row links to billing"):
+    - opens AT ONCE with the last list for this period (any age < 10 min), refreshes quietly underneath;
+    - amount = bill total, else the order's running value (open orders showed ₹0);
+    - every row is a link: open/unbilled → 🧾 Bill (table straight into billing), billed → 👁 View bill; KOT / table / register one tap. */
  var my=++seq,r=range(),sc=scope(),cid=sc.split('|')[0],key=sc+'|'+r.from+'|'+r.to;
- W.bnxShowDetailLoading_('Orders',esc(r.from===r.to?r.from:r.from+' → '+r.to));
+ var label=esc(r.from===r.to?r.from:r.from+' → '+r.to);
  function current(){return my===seq&&sc===scope()&&JSON.stringify(range())===JSON.stringify(r)&&D.getElementById('detailModal').style.display!=='none';}
- try{
-  var hit=cache.get(key),rs;if(hit&&Date.now()-hit.at<30000)rs=hit.rows;
-  else{if(!flight.has(key)){var p=Promise.resolve().then(function(){return W.gasApi('GET_ORDERS',{FROM_DATE:r.from,TO_DATE:r.to,SUMMARY_ONLY:true},'V2_CORE');}).then(rows).then(function(a){cache.set(key,{at:Date.now(),rows:a});return a;}).finally(function(){flight.delete(key);});flight.set(key,p);}rs=await flight.get(key);}
-  if(!current())return;rs=normalized(rs,r,cid).sort(function(a,b){return String(b.ORDER_DATE).localeCompare(String(a.ORDER_DATE));});
-  var host=D.getElementById('detailModalBody'),active=rs.filter(function(o){return !/^(BILLED|COMPLETED|SETTLED|PAID|CLOSED|CANCELLED|VOID|VOIDED)$/i.test(String(o.ORDER_STATUS||''));}).length;
-  host.innerHTML='<div style="display:flex;justify-content:space-between"><b>Orders</b><button type="button" data-order-close>✕</button></div><p>'+esc(r.from===r.to?r.from:r.from+' → '+r.to)+'</p><p><b>'+rs.length+' orders</b> · '+active+' active / unbilled</p><div style="max-height:45vh;overflow:auto">'+(rs.length?'<table style="width:100%;font-size:12px"><thead><tr><th>Order</th><th>Customer / Table</th><th>Status</th><th>Amount</th></tr></thead><tbody>'+rs.map(function(o){return '<tr><td>'+esc(o.ORDER_NO||o.ORDER_NUMBER||o.ORDER_ID)+'</td><td>'+esc(o.CUSTOMER_NAME||'')+' '+esc(o.TABLE_ID||'')+'</td><td>'+esc(o.ORDER_STATUS||'')+'</td><td>₹'+number(o.BILL_TOTAL!=null?o.BILL_TOTAL:o.ORDER_AMOUNT!=null?o.ORDER_AMOUNT:o.ORDER_TOTAL!=null?o.ORDER_TOTAL:o.amt).toLocaleString('en-IN')+'</td></tr>';}).join('')+'</tbody></table>':'No orders saved for these dates.')+'</div><button type="button" class="btn btn-primary" data-order-register style="width:100%;margin-top:12px">Open Order Register</button>';
-  host.querySelector('[data-order-close]').onclick=W.closeDetailModal;host.querySelector('[data-order-register]').onclick=function(){W.closeDetailModal();W.__bnxOrdChip=false;W.goToDetail('order-register');};
- }catch(e){if(!current())return;var h=D.getElementById('detailModalBody');h.textContent='Orders could not be loaded: '+String(e.message||e);var b=D.createElement('button');b.className='btn btn-primary';b.textContent='Retry';b.onclick=W.bnxOpenOrderKpiDetail_;h.appendChild(b);var close=D.createElement('button');close.textContent='Close';close.onclick=W.closeDetailModal;h.appendChild(close);}
+ function amt(o){var c=[o.BILL_TOTAL,o.amt,o.ORDER_AMOUNT,o.ORDER_TOTAL,o.TOTAL_AMOUNT];for(var i=0;i<c.length;i++){if(c[i]!==''&&c[i]!=null&&number(c[i])>0)return number(c[i]);}return 0;}
+ function open(o){return !/^(BILLED|COMPLETED|SETTLED|PAID|CLOSED|CANCELLED|CANCELED|VOID|VOIDED|NC)$/i.test(String(o.ORDER_STATUS||''));}
+ function paint(rs,refreshing){
+  rs=normalized(rs,r,cid).sort(function(a,b){return String(b.ORDER_NUMBER||b.ORDER_NO||'').localeCompare(String(a.ORDER_NUMBER||a.ORDER_NO||''));});
+  var host=D.getElementById('detailModalBody'),active=rs.filter(open).length,total=rs.reduce(function(t,o){return t+amt(o);},0);
+  var btn='border:1px solid #e5d3b8;background:#fff8ec;color:#7a4a00;border-radius:7px;padding:3px 8px;font-weight:800;font-size:11px;cursor:pointer;white-space:nowrap';
+  host.innerHTML='<div style="display:flex;justify-content:space-between;align-items:center"><div><b style="font-size:16px">Orders</b><div style="font-size:12px;color:#888">'+label+(refreshing?' · <span style="color:#b45309">updating…</span>':'')+'</div></div><button type="button" data-order-close style="border:none;background:var(--thm-soft,#f2ede5);width:28px;height:28px;border-radius:8px;cursor:pointer">✕</button></div>'
+   +'<p style="margin:8px 0"><b>'+rs.length+' orders</b> · '+active+' active / unbilled · ₹'+total.toLocaleString('en-IN')+'</p>'
+   +'<div style="max-height:52vh;overflow:auto">'+(rs.length?'<table style="width:100%;font-size:12.5px;border-collapse:collapse"><thead><tr style="position:sticky;top:0;background:#f59e0b;color:#fff"><th style="padding:6px;text-align:left">Order</th><th style="text-align:left">Table / Customer</th><th style="text-align:left">Status</th><th style="text-align:right">Amount</th><th></th></tr></thead><tbody>'
+   +rs.map(function(o){var no=o.ORDER_NUMBER||o.ORDER_NO||o.ORDER_ID,t=String(o.TABLE_ID||''),bill=String(o.BILL_NUMBER||''),op=open(o);
+     var act=op&&t?'<button type="button" data-ob="'+esc(t)+'" style="'+btn+'">🧾 Bill</button>':(bill?'<button type="button" data-ov="'+esc(bill)+'" style="'+btn+'">👁 Bill '+esc(bill.split('/').pop())+'</button>':'');
+     return '<tr style="border-bottom:1px solid #f1ebe2'+(op?';background:#fffdf7':'')+'"><td style="padding:6px 4px;font-weight:700">'+esc(no)+'</td><td>'+esc(t)+(o.CUSTOMER_NAME&&!/^(general|default)/i.test(o.CUSTOMER_NAME)?' · '+esc(o.CUSTOMER_NAME):'')+'</td><td><span style="font-weight:800;color:'+(op?'#b45309':'#15803d')+'">'+esc(o.ORDER_STATUS||'')+'</span></td><td style="text-align:right;font-variant-numeric:tabular-nums">₹'+amt(o).toLocaleString('en-IN')+'</td><td style="text-align:right;padding-left:6px">'+act+'</td></tr>';}).join('')+'</tbody></table>':'No orders saved for these dates.')+'</div>'
+   +'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:12px"><button type="button" class="btn btn-primary" data-order-register>📋 Order Register</button><button type="button" class="btn" data-go="tables">🪑 Tables</button><button type="button" class="btn" data-go="kot">🎫 KOT</button></div>';
+  host.querySelector('[data-order-close]').onclick=W.closeDetailModal;
+  host.querySelector('[data-order-register]').onclick=function(){W.closeDetailModal();W.__bnxOrdChip=false;W.goToDetail('order-register');};
+  host.onclick=function(e){var x=e.target.closest&&e.target.closest('[data-ob],[data-ov],[data-go]');if(!x)return;
+   if(x.hasAttribute('data-ob')){W.closeDetailModal();if(typeof W.bnxLoadTableIntoBill==='function')W.bnxLoadTableIntoBill(x.getAttribute('data-ob'));return;}
+   if(x.hasAttribute('data-ov')){W.closeDetailModal();if(typeof W.blViewBill==='function')W.blViewBill(x.getAttribute('data-ov'));return;}
+   var g=x.getAttribute('data-go');W.closeDetailModal();try{W.showPage(g==='tables'?'tables':'kot',D.querySelector('[onclick*="'+(g==='tables'?'tables':'kot')+'"]'));}catch(_){}};
+ }
+ function load(){if(!flight.has(key)){var p=Promise.resolve().then(function(){return W.gasApi('GET_ORDERS',{FROM_DATE:r.from,TO_DATE:r.to,SUMMARY_ONLY:true},'V2_CORE');}).then(rows).then(function(a){cache.set(key,{at:Date.now(),rows:a});return a;}).finally(function(){flight.delete(key);});flight.set(key,p);}return flight.get(key);}
+ var hit=cache.get(key);
+ if(hit&&Date.now()-hit.at<600000){
+  D.getElementById('detailModal').style.display='flex';paint(hit.rows,Date.now()-hit.at>=20000);
+  if(Date.now()-hit.at>=20000)load().then(function(a){if(current())paint(a,false);},function(){});
+  return;
+ }
+ W.bnxShowDetailLoading_('Orders',label);
+ try{var rs=await load();if(!current())return;paint(rs,false);}
+ catch(e){if(!current())return;var h=D.getElementById('detailModalBody');h.textContent='Orders could not be loaded: '+String(e.message||e);var b2=D.createElement('button');b2.className='btn btn-primary';b2.textContent='Retry';b2.onclick=W.bnxOpenOrderKpiDetail_;h.appendChild(b2);var close=D.createElement('button');close.textContent='Close';close.onclick=W.closeDetailModal;h.appendChild(close);}
 };
+/* warm the list in the background so the first tap is instant too */
+setTimeout(function(){try{var r=range(),sc=scope();if(sc.split('|')[1]&&r&&r.from)Promise.resolve(W.gasApi('GET_ORDERS',{FROM_DATE:r.from,TO_DATE:r.to||r.from,SUMMARY_ONLY:true},'V2_CORE')).then(rows).then(function(a){cache.set(sc+'|'+r.from+'|'+(r.to||r.from),{at:Date.now(),rows:a});}).catch(function(){});}catch(e){}},6000);
 W.addEventListener('bnx:date-range-change',function(){seq++;cache.clear();});
 W.BNX_DETAIL_BUILD='2026.10.26-orders-receipts-v28';
 })(window,document);
