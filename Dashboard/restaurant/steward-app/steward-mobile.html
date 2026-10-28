@@ -7416,18 +7416,37 @@ function bnxIsReadAction_(a){ return /^(GET_|LIST_|CHECK_|FETCH_|LOAD_|READ_|RD_
 function bnxApiCacheClear_(){ __bnxReadCache.clear(); __bnxReadInflight.clear(); window.__bnxWriteGen++; }
 function bnxClone_(v){ try{ return typeof structuredClone==='function'?structuredClone(v):JSON.parse(JSON.stringify(v)); }catch(e){ return v; } }
 window.addEventListener('storage',function(e){if(e.key==='bnx_data_changed_'+getClientId())bnxApiCacheClear_();});
+function bnxOp28ReadReady_(){
+  if(!(window.__bnxOp28SaveCount>0))return Promise.resolve();
+  return new Promise(function(resolve){
+    let timer;
+    const done=function(){clearTimeout(timer);window.removeEventListener('bnx:operation-ready',ready);resolve();};
+    const ready=function(){if(!(window.__bnxOp28SaveCount>0))done();};
+    window.addEventListener('bnx:operation-ready',ready);
+    // A failed/hung request must not leave the floor refresh permanently blocked.
+    timer=setTimeout(done,95000);ready();
+  });
+}
 async function gasApi(action,payload,endpoint){
   if(!bnxIsReadAction_(action)){
     const rid=String(payload&&(payload.requestId||payload.REQUEST_ID)||'');
     const writeKey=rid?[getClientId(),getSessionToken(),endpoint||'V2_CORE',action,rid].join('|'):'';
     if(writeKey&&__bnxWriteInflight.has(writeKey))return __bnxWriteInflight.get(writeKey);
     bnxApiCacheClear_();window.__bnxForegroundWrites=(window.__bnxForegroundWrites||0)+1;
-    const send=Promise.resolve().then(()=>bnxGasApiNet_(action,payload,endpoint)).finally(()=>{
+    const operationWrite=/^(SAVE_ORDER|SAVE_KOT|SAVE_BILL)$/.test(String(action||''));
+    const operationStart=Date.now();
+    if(operationWrite)window.__bnxOp28SaveCount=(window.__bnxOp28SaveCount||0)+1;
+    const send=Promise.resolve().then(()=>bnxGasApiNet_(action,payload,endpoint)).then(function(res){
+      if(operationWrite){const row={action:action,roundTripMs:Date.now()-operationStart,confirmed:!!(res&&res.success),server:res&&res.timing||null};const list=window.bnxOperationTimings||(window.bnxOperationTimings=[]);list.push(row);if(list.length>30)list.shift();console.info('[OP28 save]',row);}
+      return res;
+    }).finally(()=>{
       if(writeKey)__bnxWriteInflight.delete(writeKey);
+      if(operationWrite){window.__bnxOp28SaveCount=Math.max(0,(window.__bnxOp28SaveCount||1)-1);if(!window.__bnxOp28SaveCount)window.dispatchEvent(new Event('bnx:operation-ready'));}
       window.__bnxForegroundWrites=Math.max(0,(window.__bnxForegroundWrites||1)-1);bnxApiCacheClear_();try{localStorage.setItem('bnx_data_changed_'+getClientId(),Date.now()+'-'+Math.random());}catch(e){}
     });
     if(writeKey)__bnxWriteInflight.set(writeKey,send);return send;
   }
+  const readClient=getClientId(),readSession=getSessionToken();
   let key;
   try{ key=(endpoint||'V2_CORE')+'|'+action+'|'+JSON.stringify(payload||{})+'|'+getClientId()+'|'+getSessionToken(); }
   catch(e){ return bnxGasApiNet_(action,payload,endpoint); }
@@ -7435,8 +7454,14 @@ async function gasApi(action,payload,endpoint){
   if(hit && Date.now()-hit.at<4000) return bnxClone_(hit.res);
   let p=__bnxReadInflight.get(key);
   if(!p){
-    const gen=window.__bnxWriteGen;
-    p=bnxGasApiNet_(action,payload,endpoint).then(function(res){
+    let gen=window.__bnxWriteGen;
+    // One pending read per key waits for the save; the write never waits
+    // for these reads. Printer traffic uses its separate dispatch path.
+    p=bnxOp28ReadReady_().then(function(){
+      if(readClient!==getClientId()||readSession!==getSessionToken())return {success:false,retryable:true,error:'Client or session changed while refresh waited'};
+      gen=window.__bnxWriteGen;
+      return bnxGasApiNet_(action,payload,endpoint);
+    }).then(function(res){
       if(res && res.success && gen===window.__bnxWriteGen) __bnxReadCache.set(key,{at:Date.now(),res:res});
       return res;
     }).finally(function(){ if(__bnxReadInflight.get(key)===p) __bnxReadInflight.delete(key); });
@@ -8670,6 +8695,8 @@ window.bnxResvForCard_=function(t){
   return t.reservationDate?{date:String(t.reservationDate).slice(0,10),time:t.reservationTime,customer:t.reservationCustomer,pax:t.reservationPax}:null;
 };
 async function loadTablesLive(){
+  const floorClient=String(getClientId()),floorGeneration=window.__bnxWriteGen||0;
+  const currentFloor=()=>String(getClientId())===floorClient&&(window.__bnxWriteGen||0)===floorGeneration;
   // FIX ("steward table floor never loads live data"): this called an
   // action named 'fetchSheet' that has never existed in the backend —
   // the real handler is registered as 'RD_FETCH_SHEET' (see
@@ -8684,6 +8711,7 @@ async function loadTablesLive(){
     const __resvP = gasApi('LIST_RESERVATIONS', {}, 'V2_CORE').catch(e=>({success:false,error:String(e&&e.message||e)}));
     const __activeP = gasApi('GET_ACTIVE_ORDERS', {}, 'V2_CORE').catch(e=>({success:false,error:String(e&&e.message||e)}));
     const res = await gasApi('RD_FETCH_SHEET', { tab: '04_TABLE_MASTER' });
+    if(!currentFloor())return false;
     if(!res || !res.success || !Array.isArray(res.data) || !res.data.length){
       // IMPORTANT: an unsuccessful/empty response is a completed attempt,
       // not an endless "Loading" state. Keep any real table data already
@@ -8766,6 +8794,11 @@ async function loadTablesLive(){
        exist; local extras are used only if the server list is empty. */
     if(extra.length && fromSheet.length) console.info('[TABLE_LOAD] ignored '+extra.length+' local-only table record(s) not in TABLE_MASTER');
     TABLES = fromSheet.length ? fromSheet : fromSheet.concat(extra);
+    // Paint the real base floor as soon as it arrives; reservations and item
+    // enrichment can finish afterwards instead of holding an empty screen.
+    bnxTablesSource='live';bnxTablesLastUpdated=new Date();
+    if(document.getElementById('s-tables')?.classList.contains('active'))renderMobTables();
+    if(document.getElementById('s-home')?.classList.contains('active'))renderMyTables();
     // Live reservations: reservation date/time/customer must come from the
     // transaction database, not only from the last local booking action.
     // A reservation for the current calendar date marks an otherwise-free
@@ -8785,6 +8818,7 @@ async function loadTablesLive(){
          • date/field names are read the same way the dashboard writes them. */
     try{
       const rr = await __resvP;
+      if(!currentFloor())return false;
       const reservations = rr && rr.success ? (Array.isArray(rr.reservations) ? rr.reservations : Array.isArray(rr.data) ? rr.data : (rr.data && Array.isArray(rr.data.reservations)) ? rr.data.reservations : (rr.data && Array.isArray(rr.data.rows)) ? rr.data.rows : []) : [];
       const serverOk = !!(rr && rr.success);
       const today = bnxResvToday_();
@@ -8830,6 +8864,7 @@ async function loadTablesLive(){
     // truth for a table currently in service.
     try{
       const ao = await __activeP;
+      if(!currentFloor())return false;
       const rawActiveOrders = ao && ao.success && Array.isArray(ao.data?.orders) ? ao.data.orders : [];
       /* FINAL TABLE STATUS FIX — never let stale/closed orders turn free tables
          into RUNNING during the 20-second refresh. Some deployments return
@@ -15710,10 +15745,11 @@ async function bnxPlaceOrderImpl_(){
   // data from the backend today). Tagging steward here means the
   // table is correctly recognized as "mine" the instant the KOT is
   // sent, with zero dependency on that backend gap.
-  bnxUpdateTableOverlay(__tbl.id, { status:'RUNNING', covers: __tbl.covers||0, bill: (__tbl.bill||0)+amount, steward: stewardName, stewardId:getCurrentStaffIdentity().userId||'', stewardLogin:getCurrentStaffIdentity().loginId||'' }).catch(()=>{});
-  // Refresh from the shared server projection after the write so this device
-  // uses exactly the same Running Table / Map state that other devices use.
-  setTimeout(()=>loadTablesLive().catch(()=>{}),250);
+  // Refresh only after the table-status write completes. The old 250ms
+  // timer raced that write and could replace RUNNING with its earlier state.
+  Promise.resolve(bnxUpdateTableOverlay(__tbl.id, { status:'RUNNING', covers: customerFields.covers||__tbl.covers||0, bill: (__tbl.bill||0)+amount, steward: stewardName, stewardId:identity.userId||'', stewardLogin:identity.loginId||'' }))
+    .catch(e=>console.warn('[TABLE UPDATE]',e))
+    .finally(()=>{if(String(CLIENT_ID||'')===__orderClient)loadTablesLive().catch(()=>{});});
 
   if(!__released){ showOrderPlacedModal(orderId);
   setTimeout(() => showScreen('s-home'), 1500); } else toast('✅ '+__tbl.id+': order '+orderId+' saved','success');
