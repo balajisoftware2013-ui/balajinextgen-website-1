@@ -7499,7 +7499,10 @@ async function bnxGasApiNet_(action,payload,endpoint){
    */
   for(let attempt=0; attempt<(readOnly?2:1)+1; attempt++){
     const controller=new AbortController();
-    const timeoutMs=readOnly?25000:30000;
+    /* 2026-10-28 ("sync pending -> KOT print late"): a slow-but-successful SAVE_ORDER was cut off at 30 s, turned into
+       'pending sync', and the KOT printed only after the retry chain. The order screen is already released at 0.7 s,
+       so order / KOT / bill saves now wait up to 75 s for the server's answer instead of giving up. */
+    const timeoutMs=readOnly?25000:(/^(SAVE_ORDER|SAVE_KOT|SAVE_BILL)$/.test(String(action||''))?75000:30000);
     const timer=setTimeout(()=>controller.abort(),timeoutMs);
 
     let url=bnxApiUrl_(ep);
@@ -8318,7 +8321,12 @@ async function flushOutbox_impl_(force){
     // backend that's down for a while gets progressively less traffic
     // instead of a constant drumbeat of doomed requests.
     /* LIVE SYNC FIX: manual/foreground retries (force) ignore the wait; auto backoff now caps at 60s (was 5 min) */
-    const dueAt = force ? 0 : (entry.lastAttemptAt||0) + Math.min(5000 * Math.pow(2, Math.min(entry.attempts||0,6)), 30000);
+    /* 2026-10-28: a queued order / KOT is a ticket the kitchen is waiting for — retry at 3 s, 6 s, then every 12 s
+       (other updates keep the slower 10-30 s back-off). Same request ID every time, so the server never saves it twice. */
+    const kitchenTicket=/^(SAVE_ORDER|SAVE_KOT)$/.test(String(entry.action||''));
+    const dueAt = force ? 0 : (entry.lastAttemptAt||0) + (kitchenTicket
+      ? Math.min(3000 * Math.pow(2, Math.max(0,(entry.attempts||0)-1)), 12000)
+      : Math.min(5000 * Math.pow(2, Math.min(entry.attempts||0,6)), 30000));
     if(now < dueAt){ remaining.push(entry); continue; }
     entry.attempts++;
     entry.lastAttemptAt = now;
@@ -15636,7 +15644,9 @@ async function bnxPlaceOrderImpl_(){
     // Genuine failure or offline — queue it, tell the truth about the
     // state ("Pending Sync"), never pretend it's on the dashboard yet.
     bnxQueuePending('SAVE_ORDER',__orderPayload,requestId,'kot');
-    toast('📴 Could not reach server — order queued, will send when back online','error');
+    /* 2026-10-28: retry this ticket in 3 s (not at the next back-off step) so its KOT prints as soon as the server answers */
+    try{ setTimeout(function(){ try{ const ob=bnxGetOutbox(),e=ob.find(x=>String(x.requestId)===String(requestId)); if(e){ e.lastAttemptAt=0; e.deferUntil=0; bnxSetOutbox(ob); } flushOutbox(true).catch(function(){}); }catch(_){} },3000); }catch(_){}
+    toast(res&&res.offline===false?'⏳ Server busy — order kept, retrying in 3 s':'📴 Could not reach server — order queued, will send when back online','error');
     bnxSetLiveStatus('offline');
     // Still reflected locally so THIS device's own screens are usable
     // offline, but tagged pending — never shown as a confirmed KOT.
