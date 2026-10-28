@@ -2343,6 +2343,8 @@ async function gasApi(action, payload, endpoint) {
        queue; slow background reads (ledgers, DSR, reports) may use at most 2 of the 5 parallel slots, so they can
        never hold up what is on screen ("Core is slow" with every card showing —). */
     const _act = String(action||'').toUpperCase();
+    task.__floor=_act==='GET_TABLE_FLOOR'||_act==='GET_PENDING_TABLE_BILLS'||(_act==='RD_FETCH_SHEET'&&payload&&payload.tab==='04_TABLE_MASTER');
+    if(task.__floor){task.__prio=true;task.__heavy=false;}
     task.__print=/^(GET_BILL_FOR_REPRINT|GET_BILL_DETAIL|GET_BILL_ITEMS|BILL_ITEMS)$/.test(_act);
     task.__billCrit=/^(SAVE_BILL|SAVE_ORDER|SAVE_KOT|SETTLE_)/.test(_act);
     if(_act==='RD_FETCH_SHEET'&&payload&&payload.tab==='DUES_RECEIPT'&&document.getElementById('detailModal')&&document.getElementById('detailModal').style.display!=='none')task.__prio=true;
@@ -2357,6 +2359,7 @@ async function gasApi(action, payload, endpoint) {
     try{ if(inflightKey){ (window.__bnxInflightTask=window.__bnxInflightTask||new Map()).set(inflightKey,task); } }catch(_e){}
     if (critical) { task.__crit=true;let k=0;while(k<REQUEST_QUEUE.pending.length&&REQUEST_QUEUE.pending[k].__crit)k++;REQUEST_QUEUE.pending.splice(k,0,task); }
     else if(task.__print){let k=0;while(k<REQUEST_QUEUE.pending.length&&(REQUEST_QUEUE.pending[k].__crit||REQUEST_QUEUE.pending[k].__print))k++;REQUEST_QUEUE.pending.splice(k,0,task);}
+    else if(task.__floor){let k=0;while(k<REQUEST_QUEUE.pending.length&&(REQUEST_QUEUE.pending[k].__crit||REQUEST_QUEUE.pending[k].__print||REQUEST_QUEUE.pending[k].__floor))k++;REQUEST_QUEUE.pending.splice(k,0,task);}
     else if (task.__prio) { let k = 0; while (k < REQUEST_QUEUE.pending.length && (REQUEST_QUEUE.pending[k].__crit || REQUEST_QUEUE.pending[k].__print || REQUEST_QUEUE.pending[k].__prio)) k++; REQUEST_QUEUE.pending.splice(k, 0, task); }
     else REQUEST_QUEUE.pending.push(task);
     const _arm=function(ms){ clearTimeout(queueTimer); queueTimer = setTimeout(function(){
@@ -2401,16 +2404,17 @@ function processRequestQueue() {
     const cap = task.__print ? 4 : task.__prio ? 3 : (slowSrv ? 1 : 2); // avoid flooding the shared Apps Script execution pool
     // Reserve billing lanes even if a slow asset/settings write is running.
     if (crit && (task.__billCrit ? (REQUEST_QUEUE.billActive||0)>=2 : (REQUEST_QUEUE.otherWriteActive||0)>=1)) {i++;continue;}
-    if(!crit&&!task.__print&&((REQUEST_QUEUE.printActive||0)>0||P.some(function(x){return x.__print;}))){i++;continue;}
+    if(!crit&&!task.__print&&!task.__floor&&((REQUEST_QUEUE.printActive||0)>0||P.some(function(x){return x.__print;}))){i++;continue;}
     if(task.__print&&(REQUEST_QUEUE.printActive||0)>=1){i++;continue;}
-    if (!crit && ((window.__bnxReceiptWriteActive>0) || critHold || REQUEST_QUEUE.active >= cap)) { i++; continue; }
-    if (task.__heavy && (REQUEST_QUEUE.heavyActive||0) >= 2) { i++; continue; }      /* keep 3 slots free for on-screen reads */
+    if (!crit && ((window.__bnxReceiptWriteActive>0) || critHold || (task.__floor ? (REQUEST_QUEUE.floorActive||0)>=1 : REQUEST_QUEUE.active >= cap))) { i++; continue; }
+    if (task.__heavy && !task.__floor && (REQUEST_QUEUE.heavyActive||0) >= 2) { i++; continue; }      /* keep 3 slots free for on-screen reads */
     P.splice(i, 1);
+    if(task.__floor)REQUEST_QUEUE.floorActive=(REQUEST_QUEUE.floorActive||0)+1;
     if(task.__print)REQUEST_QUEUE.printActive=(REQUEST_QUEUE.printActive||0)+1;
     if (task.__heavy){ REQUEST_QUEUE.heavyActive=(REQUEST_QUEUE.heavyActive||0)+1; task.__heavyDone=function(){ REQUEST_QUEUE.heavyActive=Math.max(0,(REQUEST_QUEUE.heavyActive||0)-1); }; }
     REQUEST_QUEUE.active++; if(crit){if(task.__billCrit) REQUEST_QUEUE.billActive=(REQUEST_QUEUE.billActive||0)+1; else REQUEST_QUEUE.otherWriteActive=(REQUEST_QUEUE.otherWriteActive||0)+1;} if (crit) { if (!REQUEST_QUEUE.critActive) { REQUEST_QUEUE.critSince = Date.now(); clearTimeout(REQUEST_QUEUE.__holdT); REQUEST_QUEUE.__holdT = setTimeout(processRequestQueue, 10050); } REQUEST_QUEUE.critActive++; }
     Promise.resolve().then(task).catch(function(e){ console.warn('Queue task error:', e); }).finally(function(){
-      REQUEST_QUEUE.active--; if(task.__print)REQUEST_QUEUE.printActive=Math.max(0,(REQUEST_QUEUE.printActive||0)-1); if(crit){if(task.__billCrit) REQUEST_QUEUE.billActive=Math.max(0,(REQUEST_QUEUE.billActive||0)-1);else REQUEST_QUEUE.otherWriteActive=Math.max(0,(REQUEST_QUEUE.otherWriteActive||0)-1);} if (crit) REQUEST_QUEUE.critActive--; if (task.__heavyDone) task.__heavyDone();
+      REQUEST_QUEUE.active--; if(task.__floor)REQUEST_QUEUE.floorActive=Math.max(0,(REQUEST_QUEUE.floorActive||0)-1); if(task.__print)REQUEST_QUEUE.printActive=Math.max(0,(REQUEST_QUEUE.printActive||0)-1); if(crit){if(task.__billCrit) REQUEST_QUEUE.billActive=Math.max(0,(REQUEST_QUEUE.billActive||0)-1);else REQUEST_QUEUE.otherWriteActive=Math.max(0,(REQUEST_QUEUE.otherWriteActive||0)-1);} if (crit) REQUEST_QUEUE.critActive--; if (task.__heavyDone) task.__heavyDone();
       processRequestQueue();
     });
   }
@@ -52947,6 +52951,12 @@ W.bnxUpdateTableStats=function(){
   });
   var tot=src.length||rows.length||0, pct=function(n){return tot?(n/tot*100).toFixed(1)+'%':'0.0%';};
   var set=function(id,v,p){var e=$(id);if(e)e.textContent=v;var q=$(id+'-p');if(q&&p!==undefined)q.textContent=p;};
+  if(!tot&&(!W.__bnxTblSync||W.__bnxTblSync.state!=='ok')){
+    var label=W.__bnxTblSync&&W.__bnxTblSync.state==='error'?'Unavailable':'Loading';
+    ['tm-a','tm-r','tm-o','tm-rv','tm-total','tm-pax'].forEach(function(id){set(id,'—',label);});
+    ['tmTotTables','tmTotPax','floorMapTableCount'].forEach(function(id){var e=$(id);if(e)e.textContent='—';});
+    markKpi();return;
+  }
   /* plain counts ("0", "16") — the old pad2 showed "00" */
   set('tm-a',String(c.a),pct(c.a)+' of '+tot);set('tm-r',String(c.r),pct(c.r));set('tm-o',String(c.o),pct(c.o));set('tm-rv',String(c.rv),pct(c.rv));
   set('tm-total',String(tot),!tot?'—':c.x?(c.x+' cleaning'):'All zones');set('tm-pax',String(pax),'Capacity');

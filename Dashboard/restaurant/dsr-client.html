@@ -563,9 +563,10 @@ var BNX_DSR_READ_GENERATION_=0;
 function bnxApiClearCache_(){try{BNX_ATOMIC_MONTHS_.clear();}catch(e){}BNX_READ_BACKOFF_.clear();BNX_DSR_READ_GENERATION_++;BNX_API_CACHE_.clear();try{if(typeof window.bnxTdbClear_==='function')window.bnxTdbClear_();}catch(e){}}
 window.addEventListener('storage',function(e){if(/^(ERP_SESSION|erp_session|erp_token|sessionToken|SESSION_TOKEN|ERP_SESSION_USER|ERP_USER|erpUser)$/.test(e.key||''))bnxApiClearCache_();});
 window.addEventListener('storage',function(e){if(e.key==='bnx_data_changed_'+getClientId_())bnxApiClearCache_();});
+function bnxDsrReadAction_(a){return /^(GET_|LIST_|RD_FETCH_)/.test(String(a))||/^(BNX_DSR_RECEIPT_PERIOD|BNX_DSR_DUES_AS_OF|DUES_LIST)$/.test(String(a));}
 async function gasApi(action,payload,endpoint){
   payload=payload||{};
-  if(/^GET_/.test(String(action))){
+  if(bnxDsrReadAction_(action)){
     const k=bnxApiKey_(action,payload,endpoint);
     if(k){
       const c=BNX_API_CACHE_.get(k);
@@ -610,13 +611,25 @@ function bnxDsrAccessibleParent_(){
 
 async function gasApiRaw_(action,payload,endpoint){
   // All report reads share this frame's flight/cache gate and the signed-in dashboard's scheduler.
+  const read=bnxDsrReadAction_(action);
+  if(read&&bnxDsrOffscreen_())return {success:false,deferred:true,error:'Report is off screen. Refresh when visible.'};
   const parentApi=bnxDsrAccessibleParent_();
-  if(/^GET_/.test(String(action))&&parentApi&&typeof parentApi.gasApi==='function'){
-    try{return await parentApi.gasApi(action,payload||{},endpoint||'V2_CORE');}
-    catch(e){return {success:false,error:String(e&&e.message||e),busy:true};}
+  if(read&&parentApi&&typeof parentApi.gasApi==='function'){
+    const client=String(getClientId_()||CLIENT_ID||'');
+    const contextOk=()=>client===String(getClientId_()||CLIENT_ID||'')&&String(CLIENT_ID||client)===client&&(typeof parentApi.bnxCurrentClient_!=='function'||String(parentApi.bnxCurrentClient_())===client);
+    if(!contextOk())return {success:false,error:'Client changed. Refresh DSR.'};
+    let slot=false;
+    try{await bnxNetSlot_();slot=true;
+      if(bnxDsrOffscreen_())return {success:false,deferred:true,error:'Report is off screen. Refresh when visible.'};
+      if(!contextOk())return {success:false,error:'Client changed. Refresh DSR.'};
+      const r=await parentApi.gasApi(action,payload||{},endpoint||'V2_CORE');
+      if(!contextOk())return {success:false,error:'Client changed while loading DSR.'};
+      return r;
+    }catch(e){return {success:false,error:String(e&&e.message||e),busy:true};}
+    finally{if(slot)bnxNetRelease_();}
   }
 
-  if(location.protocol==='file:'&&window.parent!==window&&/^GET_/.test(action)){
+  if(location.protocol==='file:'&&window.parent!==window&&read){
     await bnxNetSlot_();try{return await bnxDsrParentRead_(action,payload);}finally{bnxNetRelease_();}
   }
   payload=payload||{};
@@ -638,7 +651,7 @@ async function gasApiRaw_(action,payload,endpoint){
   // DEBUG: Log API call initiation
   BNX_DBG_('[API_DEBUG] 📡 Starting API call:', {action, endpoint, url});
 
-  const isRead=/^(GET_|LIST_|RD_FETCH_)/.test(String(action));
+  const isRead=read;
   const contexts=bnxGetAuthContexts_().filter(c=>!c.client||String(c.client)===requestClient).slice(0,isRead?undefined:1);
   if(!contexts.length){
     bnxRedirectToLogin_('NO_SESSION');
@@ -824,8 +837,14 @@ function bnxLogShape_(tag,r){
     console.log('[DSR SHAPE] '+tag,{success:r&&r.success,error:r&&r.error,dataKeys:keys,days:sk.length,sampleDay:sk.length?m[sk[sk.length-1]]:undefined});
   }catch(e){}
 }
+function bnxDsrNumber_(v){
+ if(typeof v==='number')return Number.isFinite(v)?v:0;
+ let s=String(v==null?'':v).trim();if(!s||/^[—–-]$/.test(s))return 0;
+ const negative=/^\(.*\)$/.test(s);s=s.replace(/[₹,\s()]/g,'');
+ const n=Number(s);return Number.isFinite(n)?(negative?-Math.abs(n):n):0;
+}
 function mapLiveDsrDay_(raw){
- raw=bnxNormRaw_(raw||{});const n=v=>Number(v)||0;
+ raw=bnxNormRaw_(raw||{});const n=bnxDsrNumber_;
  return {liquor:n(raw.liquor),liquormrp:n(raw.liquorMrp),food:n(raw.food),bev:n(raw.beverage),hf:n(raw.hashFreezer),others:n(raw.others)-n(raw.serviceCharge),nosplit:n(raw.noItemSale),
  gross:n(raw.grossSale),net:n(raw.netSale),svc:n(raw.serviceCharge),tax:n(raw.tax),round:n(raw.roundOff),cash:n(raw.cash),card:n(raw.iciciCard),gpay:n(raw.iciciGpay),credit:n(raw.guestDueSales),
  zomato:n(raw.zomato),swiggy:n(raw.swiggy),eazydine:n(raw.eazydine),otherpay:n(raw.other),unalloc:n(raw.unallocatedPaid),pvt:0,
@@ -1556,12 +1575,13 @@ const BNX_ATOMIC_MONTHS_=new Map();
 let BNX_ATOMIC_CONTEXT_='';
 async function fetchDsrMonthLive_(year,month){
  const key=String(year)+'-'+String(month).padStart(2,'0'),tenant=getClientId_(),token=getSessionToken_();
+ const generation=BNX_DSR_READ_GENERATION_;
  const scope=tenant+'|'+token+'|'+key,old=BNX_ATOMIC_MONTHS_.get(scope);
  if(old&&old.promise)return old.promise;
  if(old&&Date.now()-old.at<60000)return true;
  const promise=(async()=>{
   const r=await gasApi('GET_DSR_MATRIX',{year:Number(year),month:Number(month)},'V2_CORE');
-  if(tenant!==getClientId_()||token!==getSessionToken_())return false;
+  if(tenant!==getClientId_()||token!==getSessionToken_()||generation!==BNX_DSR_READ_GENERATION_)throw Error('Report context changed while loading. Refresh DSR. Existing report retained.');
   if(!r||r.success!==true||!r.data||!r.data.byDay||typeof r.data.byDay!=='object'||Array.isArray(r.data.byDay))throw Error(r&&r.error||'Server did not return a DSR month. Check the core deployment and retry.');
   const next={};Object.keys(r.data.byDay).forEach(day=>{
    const n=Number(day),raw=r.data.byDay[day];
@@ -3051,7 +3071,7 @@ details.bnx-default-fold:not([open])>.bnx-fold-content{display:none!important}
           <div class="dsr-row"><label id="lbl_hf">Hukka</label><input class="dsr-val editable" id="d_hf" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row"><label>Service Charges</label><input class="dsr-val editable" id="d_svc" title="Actual charged bill amount; already included in Gross Sale" value="0" oninput="recalcAll()"/></div>
           <details class="bnx-default-fold"><summary>Other item revenue details</summary><div class="dsr-row"><label id="lbl_others">Other item revenue</label><input class="dsr-val editable" id="d_others" value="0" oninput="recalcAll()"/></div></details>
-          <div class="dsr-row" title="Sale on bills that have no item rows — not part of any item group"><label style="color:#b42318">No Item Detail</label><input class="dsr-val" id="d_nosplit" value="0" readonly/></div>
+          <div class="dsr-row" title="Sale with missing item rows or non-positive item totals — check original item values"><label style="color:#b42318">No Item Detail</label><input class="dsr-val" id="d_nosplit" value="0" readonly/></div>
           <div class="dsr-row gross"><label>Gross Sale</label><span class="dsr-val" id="d_gross">0</span></div>
           <div class="dsr-row"><label>Tax</label><input class="dsr-val editable" id="d_tax" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row"><label>Round Off</label><input class="dsr-val editable" id="d_round" value="0" oninput="recalcAll()"/></div>
@@ -3097,7 +3117,7 @@ details.bnx-default-fold:not([open])>.bnx-fold-content{display:none!important}
           <div class="dsr-row"><label>Hukka</label><input class="dsr-val editable" id="m_hf" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row"><label>Service Charges</label><input class="dsr-val editable" id="m_svc" title="Actual charged bill amount; already included in Gross Sale" value="0" oninput="recalcAll()"/></div>
           <details class="bnx-default-fold"><summary>Other item revenue details</summary><div class="dsr-row"><label>Other item revenue</label><input class="dsr-val editable" id="m_others" value="0" oninput="recalcAll()"/></div></details>
-          <div class="dsr-row" title="Sale on bills that have no item rows — not part of any item group"><label style="color:#b42318">No Item Detail</label><input class="dsr-val" id="m_nosplit" value="0" readonly/></div>
+          <div class="dsr-row" title="Sale with missing item rows or non-positive item totals — check original item values"><label style="color:#b42318">No Item Detail</label><input class="dsr-val" id="m_nosplit" value="0" readonly/></div>
           <div class="dsr-row gross"><label>Gross Sale</label><span class="dsr-val" id="m_gross">0</span></div>
           <div class="dsr-row"><label>Tax</label><input class="dsr-val editable" id="m_tax" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row"><label>Round Off</label><input class="dsr-val editable" id="m_round" value="0" oninput="recalcAll()"/></div>
@@ -3143,7 +3163,7 @@ details.bnx-default-fold:not([open])>.bnx-fold-content{display:none!important}
           <div class="dsr-row"><label>Hukka</label><input class="dsr-val editable" id="y_hf" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row"><label>Service Charges</label><input class="dsr-val editable" id="y_svc" title="Actual charged bill amount; already included in Gross Sale" value="0" oninput="recalcAll()"/></div>
           <details class="bnx-default-fold"><summary>Other item revenue details</summary><div class="dsr-row"><label>Other item revenue</label><input class="dsr-val editable" id="y_others" value="0" oninput="recalcAll()"/></div></details>
-          <div class="dsr-row" title="Sale on bills that have no item rows — not part of any item group"><label style="color:#b42318">No Item Detail</label><input class="dsr-val" id="y_nosplit" value="0" readonly/></div>
+          <div class="dsr-row" title="Sale with missing item rows or non-positive item totals — check original item values"><label style="color:#b42318">No Item Detail</label><input class="dsr-val" id="y_nosplit" value="0" readonly/></div>
           <div class="dsr-row gross"><label>Gross Sale</label><span class="dsr-val" id="y_gross">0</span></div>
           <div class="dsr-row"><label>Tax</label><input class="dsr-val editable" id="y_tax" value="0" oninput="recalcAll()"/></div>
           <div class="dsr-row"><label>Round Off</label><input class="dsr-val editable" id="y_round" value="0" oninput="recalcAll()"/></div>
@@ -8408,7 +8428,7 @@ W.bnxDsrCheck_=function(){
     var ig=(W.__bnxIgInfo||{})[p];
     if(ig&&ig.ds===ds){
       if(!ig.ok) add('warn',[p+'_liquor',p+'_food',p+'_bev',p+'_hf',p+'_others'],nm+': item-group report did not load — Liquor/Food/Beverage/HashFreezer/Others are from the DSR matrix, not item groups');
-      if(ig.ok&&v('nosplit')>TOL) add('err',[p+'_nosplit'],nm+': ₹'+money(v('nosplit'))+' of sale is on bills that have NO item rows — shown as "No Item Detail", not hidden in Others / Round Off. Re-import BILL_ITEMS for those bills');
+      if(ig.ok&&v('nosplit')>TOL) add('err',[p+'_nosplit'],nm+': ₹'+money(v('nosplit'))+' of sale has missing item rows or non-positive item totals — shown as "No Item Detail". Check original quantities and values before repairing BILL_ITEMS');
       if(ig.ok&&ig.scaled>TOL) add('warn',[],nm+': item-group total was ₹'+money(ig.scaled)+' above the bills\' after-discount sale — bill-level discount spread over the groups in proportion');
     }
     [['zomato','Zomato'],['swiggy','Swiggy'],['eazydine','EazyDine']].forEach(function(a){ if(v(a[0]+'coll')-v(a[0])>TOL) add('warn',[p+'_'+a[0]+'coll'],nm+': '+a[1]+' collection '+money(v(a[0]+'coll'))+' is more than '+a[1]+' sales '+money(v(a[0]))); });
