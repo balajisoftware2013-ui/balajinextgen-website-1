@@ -1802,6 +1802,8 @@ const CLIENT_INDUSTRY=(function(){
    • Auto-archive: old bills (>7 days) cleaned from sessionStorage
 ═══════════════════════════════════════════════════════ */
 const REQUEST_QUEUE = { pending: [], active: 0, maxConcurrent: 5 };
+/* a time-limited hold must release itself even when no other request finishes */
+setInterval(function(){ try{ if(REQUEST_QUEUE.pending.length && typeof processRequestQueue==='function') processRequestQueue(); }catch(e){} }, 400);
 const API_RETRY_CONFIG = { maxAttempts: 3, baseDelay: 250, maxDelay: 2500 };
 const BNX_READ_TIMEOUT_MS = 8000;
 const BNX_IMPORT_TIMEOUT_MS = 300000; /* IMPORT_* (Import Center) — Apps Script needs 10-80 s per batch; was wrongly cut at 8 s */
@@ -2401,7 +2403,10 @@ function processRequestQueue() {
   for (let i = 0; i < P.length; ) {
     const task = P[i];
     const crit = !!task.__crit;
-    const critHold = (REQUEST_QUEUE.billActive||0)>0 || (REQUEST_QUEUE.critActive > 0 && (Date.now() - (REQUEST_QUEUE.critSince||0)) < (window.bnxCritHoldMs_?window.bnxCritHoldMs_():10000));   // reads yield to a write for max 10 s
+    /* SPEED 2026-10-28: a running SAVE_BILL used to hold EVERY read (tables, POS order, KOT) with no time limit. On-screen
+       reads now wait at most 1.5 s for a save, background reads at most the normal hold. */
+    const __onScreenRead = !!(task.__floor||task.__tableContext||task.__detail||task.__prio);
+    const critHold = ((REQUEST_QUEUE.billActive||0)>0 || REQUEST_QUEUE.critActive > 0) && (Date.now() - (REQUEST_QUEUE.critSince||0)) < (__onScreenRead ? 1500 : (window.bnxCritHoldMs_?window.bnxCritHoldMs_():10000));   // reads yield to a write for max 10 s
     /* 2026-10-15 SPEED: on-screen basics (menu, day status, tables, tax) get 3 reserved lanes — they never wait behind
        5 slow report reads. While Apps Script is slow (avg > 10 s) background reads drop to 3 at a time: fewer
        overlapping executions on the server = every answer (SAVE_BILL, menu, KOT) comes back sooner. */
@@ -24417,7 +24422,7 @@ function bnxSetLiveStatus(s){
 }
 function bnxUpdateSyncBadge(){
   const n = bnxGetOutbox().length;
-  const el = document.getElementById('bnx-pending-badge');
+  const el = window.bnxSyncCountsV29_ ? null : document.getElementById('bnx-pending-badge');   /* 2026-10-28: v29 painter owns the chip */
   if(el){
     el.textContent = n ? n+' pending sync' : '';
     el.style.display = n ? '' : 'none';
@@ -24456,7 +24461,7 @@ async function __bnxFlushOutboxInner(list, force){
   const one = async (entry) => {
     if(window.bnxIsArchivedSync_ && window.bnxIsArchivedSync_(entry)) return;
     if(authStop){ remaining.push(entry); return; }   /* session expired: leave the rest untouched */
-    const dueAt = (entry.lastAttemptAt||0) + Math.min(15000 * Math.pow(2, entry.attempts), 300000);
+    const dueAt = (entry.lastAttemptAt||0) + Math.min(5000 * Math.pow(2, entry.attempts), 30000);   /* 2026-10-28: was up to 5 min -> 'pending sync' stayed long after the server was back */
     if(!force && now < dueAt){ remaining.push(entry); return; }
     /* 2026-10-15 DUPLICATE GUARD: a queued bill whose save actually reached the server (or was recovered there) must not
        be saved a second time — check that business day's bills first; a match (same table + same amount, or same NC
@@ -24493,7 +24498,7 @@ async function __bnxFlushOutboxInner(list, force){
          tries the save was reported as failed (and the "1 pending sync" chip never cleared). The record is on the
          server → this is a success, not a failure. */
       if (res && res.alreadyProcessed===true && res.transactionId) { console.info('[OUTBOX] '+entry.action+' was already saved by an earlier try ('+entry.lastError+') — done.'); return; }
-      const nonRetryable = bnxIsNonRetryableOutboxError_(entry.lastError);
+      const nonRetryable = bnxIsNonRetryableOutboxError_(entry.lastError) || !!(res && (res.definitive===true || res.statusCode===400 || res.statusCode===404));
       if(entry.attempts < 10 && !nonRetryable){
         remaining.push(entry);
         anyFailed = true;
@@ -24530,7 +24535,7 @@ async function __bnxFlushOutboxInner(list, force){
   if(!remaining.length && !bnxGetFailedOutbox().length) bnxSetLiveStatus(navigator.onLine ? 'live' : 'offline');
   else if(anyFailed) bnxSetLiveStatus('syncing');
 }
-setInterval(flushOutbox, 15000);
+setInterval(flushOutbox, 8000);
 window.addEventListener('online', ()=>{ bnxSetLiveStatus(bnxGetOutbox().length?'syncing':'live'); setTimeout(()=>flushOutbox(true),800); });
 window.addEventListener('offline', ()=> bnxSetLiveStatus('offline'));
 (function(){ function f(){ try{ document.documentElement.classList.toggle('bnx-on-dsr',/dsr/i.test(location.hash)); }catch(e){} } f(); window.addEventListener('hashchange',f); setInterval(f,1500); })();
@@ -77169,7 +77174,8 @@ function token(){try{return String(typeof bnxCurrentSession_==='function'?bnxCur
 function scope(){return cid()+'|'+token();}
 function signature(e){return String(e.action||'').toUpperCase()+'|'+String(e.requestId||e.payload&&e.payload.requestId||'');}
 function queues(){try{return {pending:bnxGetOutbox(),failed:bnxGetFailedOutbox()};}catch(e){return {pending:[],failed:[]};}}
-function counts(){var q=queues(),sending=0;var pending=q.pending.filter(function(e){if(active.has(scope()+'|'+signature(e))){sending++;return false;}return true;});return {sending:sending,pending:pending.length,failed:q.failed.length};}
+function counts(){var q=queues(),sending=0,now=Date.now();var pending=q.pending.filter(function(e){if(active.has(scope()+'|'+signature(e))){sending++;return false;}
+ if(e&&!e.lastError&&((e.deferUntil&&e.deferUntil>now)||(now-new Date(e.queuedAt||0).getTime()<20000))){sending++;return false;}return true;});return {sending:sending,pending:pending.length,failed:q.failed.length};}
 function put(id,text,title){var e=D.getElementById(id);if(!e)return;if(e.textContent!==text)e.textContent=text;if(title)e.title=title;}
 function paint(){if(painting)return;painting=true;try{
  var n=counts(),healthy=okAt&&Date.now()-okAt<90000,offline=navigator.onLine===false;
@@ -77231,6 +77237,35 @@ W.BNX_LIVE_SYNC_BUILD='2026.10.26-confirmed-sync-table-v29';
 })(window,document);
 
 </script>
+<script id="bnx-tap-busy-bar-20261028">
+/* INSTANT FEEDBACK (2026-10-28, "order register / bill list / print — show loading at once"): whatever a tap starts
+   (open register, bill list, print, save, KOT move) shows a thin moving bar + "Loading…" chip within 0.15 s and
+   until the server answers. Background polls never show it. Screens keep painting their saved copy underneath. */
+(function(W,D){
+'use strict';
+var lastTap=0,fg=0,shownAt=0,timer=0,el=null;
+['pointerdown','keydown'].forEach(function(ev){D.addEventListener(ev,function(){lastTap=Date.now();},{capture:true,passive:true});});
+function ensure(){if(el)return el;el=D.createElement('div');el.id='bnx-busy-bar';el.setAttribute('role','status');el.setAttribute('aria-live','polite');
+ el.innerHTML='<i></i><span>Loading…</span>';var st=D.createElement('style');
+ st.textContent='#bnx-busy-bar{position:fixed;left:0;right:0;top:0;height:0;z-index:2147483600;pointer-events:none;opacity:0;transition:opacity .12s}'
+ +'#bnx-busy-bar.on{opacity:1}#bnx-busy-bar i{position:absolute;left:0;top:0;height:3px;width:35%;background:linear-gradient(90deg,#f59e0b,#d97706);border-radius:0 3px 3px 0;animation:bnxBusy 1s ease-in-out infinite}'
+ +'#bnx-busy-bar span{position:absolute;right:10px;top:calc(6px + env(safe-area-inset-top,0px));background:rgba(17,17,17,.78);color:#fff;font:700 11px/1 system-ui,sans-serif;padding:5px 9px;border-radius:999px}'
+ +'@keyframes bnxBusy{0%{transform:translateX(-100%)}100%{transform:translateX(290%)}}@media (prefers-reduced-motion:reduce){#bnx-busy-bar i{animation:none;width:100%}}';
+ (D.head||D.documentElement).appendChild(st);(D.body||D.documentElement).appendChild(el);return el;}
+function label(a){a=String(a||'');return /PRINT|REPRINT/.test(a)?'Printing…':/^(SAVE_|SETTLE|APPLY_|TRANSFER|CANCEL|VOID|UPDATE_|DELETE_)/.test(a)?'Saving…':'Loading…';}
+function paint(a){clearTimeout(timer);if(fg>0){timer=setTimeout(function(){var e=ensure();if(a)e.querySelector('span').textContent=label(a);e.classList.add('on');shownAt=Date.now();},150);}
+ else{if(el)el.classList.remove('on');}}
+function hook(){var base=W.gasApi;if(typeof base!=='function'||base.__bnxBusy)return;
+ var f=function(action){var mine=Date.now()-lastTap<1500;if(mine){fg++;paint(action);}
+  var p;try{p=Promise.resolve(base.apply(this,arguments));}catch(e){p=Promise.reject(e);}
+  if(mine)p.then(function(){},function(){}).then(function(){fg=Math.max(0,fg-1);paint();});
+  return p;};
+ Object.keys(base).forEach(function(k){try{f[k]=base[k];}catch(e){}});f.__bnxBusy=true;W.gasApi=f;try{gasApi=f;}catch(e){}}
+hook();setInterval(hook,1000);
+W.bnxBusyBar={get count(){return fg;}};
+})(window,document);
+</script>
+
 
 <style id="bnx-table-available-display-20261027">
 /* Compact, readable seating diagram. The table size follows the selected S/M/L setting. */

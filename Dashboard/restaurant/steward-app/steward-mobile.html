@@ -7424,7 +7424,9 @@ function bnxOp28ReadReady_(){
     const ready=function(){if(!(window.__bnxOp28SaveCount>0))done();};
     window.addEventListener('bnx:operation-ready',ready);
     // A failed/hung request must not leave the floor refresh permanently blocked.
-    timer=setTimeout(done,95000);ready();
+    /* SPEED 2026-10-28: was 95 s — one slow save froze every table / order / KOT load behind it. Reads wait at
+       most 0.3 s here (the speed layer adds a 1.5 s head start) for a save (fresh data when the save is quick), then go; the refresh after the save follows anyway. */
+    timer=setTimeout(done,300);ready();
   });
 }
 async function gasApi(action,payload,endpoint){
@@ -7484,7 +7486,7 @@ async function bnxGasApiNet_(action,payload,endpoint){
 
   const readOnly=bnxIsReadAction_(action);
   // Give confirmed-save traffic priority over dashboard/menu polling.
-  if(readOnly){while(window.__bnxForegroundWrites>0){await new Promise(r=>setTimeout(r,120));if(String(getClientId()||'')!==requestClient)return {success:false,error:'Client changed'};}}
+  if(readOnly){const __w0=Date.now();while(window.__bnxForegroundWrites>0&&Date.now()-__w0<0){   /* 2026-10-28: the outer speed layer already gives saves a 1.5 s head start; waits here only stacked on top */await new Promise(r=>setTimeout(r,120));if(String(getClientId()||'')!==requestClient)return {success:false,error:'Client changed'};}}
   let lastErr=null;
   let deploymentRecovered=false;
 
@@ -8174,7 +8176,7 @@ function bnxUpdateSyncBadge(){
   const pending = bnxGetOutbox().filter(function(e){ return !(e && e.deferUntil && e.deferUntil>Date.now() && !e.lastError) && !bnxYoung_(e); });
   const n = pending.length;
   const kotPending = pending.filter(e => String(e.action||'').toUpperCase()==='SAVE_KOT').length;
-  const el = document.getElementById('bnx-pending-badge');
+  const el = window.bnxSyncCountsV29_ ? null : document.getElementById('bnx-pending-badge');   /* v29 painter owns the chip */
   if(el){
     // Always surface the real queue state to the steward. KOT saves are
     // called out separately because a steward must know when a ticket
@@ -8364,7 +8366,7 @@ async function flushOutbox_impl_(force){
           const k = KOT.find(x=>x.kotNo===kotNo);
           if(k){ k.pendingLocalEdit = false; bnxSetOpenKotsRaw(JSON.stringify(KOT)); }
         }
-      } else if(entry.attempts < 30 && !(entry.attempts>=3 && /unknown action|not handled|invalid (payload|request|action)|missing (required|field)/i.test(String((res&&(res.error||res.message))||'')))
+      } else if(!(res && (res.definitive===true || res.statusCode===400 || res.statusCode===403 || res.statusCode===404)) && entry.attempts < 30 && !(entry.attempts>=3 && /unknown action|not handled|invalid (payload|request|action)|missing (required|field)/i.test(String((res&&(res.error||res.message))||'')))
                 && !(entry.attempts>=8 && Date.now()-new Date(entry.queuedAt||Date.now()).getTime()>172800000)){
         entry.lastError = String((res && (res.error || res.message || res.errorCode)) || 'Server did not confirm save').slice(0,400);
         // FIX ("KOT not save" — confirmed against the client's real
@@ -11115,6 +11117,11 @@ function bnxBillToHistRow(b){
 // the fetch succeed?") — renderOrderHistory uses these to tell a
 // genuine offline/server failure apart from an honest "you have zero
 // orders in this range" (spec #10/#20).
+/* SPEED 2026-10-28: GET_ORDERS with no dates read the WHOLE order history (12k orders + 49k item rows) on every
+   Order History / register open — the slowest call in the app. A steward's register is this business day + yesterday. */
+function bnxStwRegWindow_(){ try{ const t=businessDate(); const d=new Date(t+'T12:00:00'); d.setDate(d.getDate()-1);
+  const y=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  return {FROM_DATE:y,TO_DATE:t,fromDate:y,toDate:t}; }catch(e){ return {}; } }
 let bnxHistLastSyncOk = null;
 let bnxHistLastSyncTime = null;
 async function bnxPullBillsForHistory(){
@@ -11124,8 +11131,8 @@ async function bnxPullBillsForHistory(){
     // while LIST_BILLS contains the final billing record. Pull both so a steward
     // can see HIS order from the moment it is placed through billing.
     const results = await Promise.all([
-      gasApi('GET_ORDERS', {}, 'V2_CORE'),
-      gasApi('LIST_BILLS', {}, 'V2_CORE')
+      gasApi('GET_ORDERS', bnxStwRegWindow_(), 'V2_CORE'),
+      gasApi('LIST_BILLS', bnxStwRegWindow_(), 'V2_CORE')
     ]);
     // History must also refresh the KOT projection. GET_ORDERS/LIST_BILLS can
     // legitimately lag behind a newly created KOT, while the KOT screen already
@@ -12609,7 +12616,7 @@ ${k.remarks?`<div class="note">NOTE: ${bnxEscapeHtml_(k.remarks)}</div>`:''}
 
   /* ---------- history: orders + bills, server first ---------- */
   async function loadHistoryLive(){
-    const [or,br]=await Promise.all([api('GET_ORDERS',{}),api('LIST_BILLS',{})]);
+    const [or,br]=await Promise.all([api('GET_ORDERS',bnxStwRegWindow_()),api('LIST_BILLS',bnxStwRegWindow_())]);
     const orders=(or&&or.success)?(or.data||[]):[];
     const bills=(br&&br.success)?(br.bills||br.data||[]):[];
     HUB.bills=bills;
@@ -25297,7 +25304,7 @@ body.bnx-bulk-on.bnx-bulk-has #bnx-bulk-bar{display:flex}
       if(writes && c && !force){ stats.saved++; return clone(c.res); }          /* an order is being saved: it goes first */
       if(inflight[key]){ stats.shared++; return clone(await inflight[key]); }
       var self=this, args=arguments;
-      inflight[key]=(async function(){ await waitWrites(8000); stats.net++; return base.apply(self,args); })();
+      inflight[key]=(async function(){ await waitWrites(1500); stats.net++; return base.apply(self,args); })();   /* 2026-10-28: was 8 s — tables / orders froze behind a slow save */
       try{ var res=await inflight[key]; if(res&&res.success!==false) cache[key]={at:Date.now(),res:res}; return clone(res); }
       finally{ delete inflight[key]; }
     };
@@ -25871,7 +25878,9 @@ function token(){try{return String(typeof bnxCurrentSession_==='function'?bnxCur
 function scope(){return cid()+'|'+token();}
 function signature(e){return String(e.action||'').toUpperCase()+'|'+String(e.requestId||e.payload&&e.payload.requestId||'');}
 function queues(){try{return {pending:bnxGetOutbox(),failed:bnxGetFailedOutbox()};}catch(e){return {pending:[],failed:[]};}}
-function counts(){var q=queues(),sending=0;var pending=q.pending.filter(function(e){if(active.has(scope()+'|'+signature(e))){sending++;return false;}return true;});return {sending:sending,pending:pending.length,failed:q.failed.length};}
+function counts(){var q=queues(),sending=0,now=Date.now();var pending=q.pending.filter(function(e){if(active.has(scope()+'|'+signature(e))){sending++;return false;}
+ /* 2026-10-28: an order being sent by the order screen (deferred) or queued < 20 s ago without an error is SENDING, not pending */
+ if(e&&!e.lastError&&((e.deferUntil&&e.deferUntil>now)||(now-new Date(e.queuedAt||0).getTime()<20000))){sending++;return false;}return true;});return {sending:sending,pending:pending.length,failed:q.failed.length};}
 function put(id,text,title){var e=D.getElementById(id);if(!e)return;if(e.textContent!==text)e.textContent=text;if(title)e.title=title;}
 function paint(){if(painting)return;painting=true;try{
  var n=counts(),healthy=okAt&&Date.now()-okAt<90000,offline=navigator.onLine===false;
@@ -25933,6 +25942,122 @@ W.BNX_LIVE_SYNC_BUILD='2026.10.26-confirmed-sync-table-v29';
 })(window,document);
 
 </script>
+
+<script id="bnx-kot-print-anywhere-v30">
+/* ═══ KOT PRINTS EVEN WHEN THE POS IS CLOSED (2026-10-28) ═══
+   Before: every steward KOT went into the POS print-station queue. With the restaurant dashboard closed nobody
+   picked the queue up, so NO KOT printed until someone opened the POS (then all of them at once).
+   Now: SAVE_ORDER tells the phone whether the POS station is alive (it asked for tickets in the last 60 s).
+   • POS alive  → unchanged: printed at the POS printers.
+   • POS closed → the server does NOT queue the tickets; this phone prints them straight away on its own printer
+     route (HappyServe printer app, Print Relay, RawBT on Android, or an Epson ePOS printer).
+   • POS closed and this phone has no printer route → the tickets go to the POS queue as before (printed the moment
+     a POS / KOT Print Station opens) and the steward is told exactly that.
+   A ticket is only ever sent to ONE route, so it never prints twice. */
+(function(W,D){
+'use strict';
+var ST=W.__bnxStationState||(W.__bnxStationState={online:null,at:0});
+function cid(){try{return String(getClientId()||'');}catch(e){return String(W.CLIENT_ID||'');}}
+function say(m,k){try{if(typeof toast==='function')toast(m,k||'info');}catch(e){}}
+function NM(t){t=String(t||'').toUpperCase();return /HUKKA/.test(t)?'Hukka':/BAR/.test(t)?'Bar':'Kitchen';}
+function learn(v){if(typeof v==='boolean'){ST.online=v;ST.at=Date.now();}}
+function hookApi(){var base=W.gasApi;if(typeof base!=='function'||base.__bnxV30)return;
+ var f=function(action){return Promise.resolve(base.apply(this,arguments)).then(function(r){try{
+   if(r&&r.success){var s=r.mobileKotSync;if(s)learn(s.stationOnline);
+    if(/^(PRINT_QUEUE_ADD|PRINTER_MASTER_GET)$/.test(String(action||''))&&r.data)learn(r.data.stationOnline);}
+  }catch(e){}return r;});};
+ Object.keys(base).forEach(function(k){try{f[k]=base[k];}catch(e){}});f.__bnxV30=true;W.gasApi=f;try{gasApi=f;}catch(e){}
+}
+function posClosed(){if(ST.online===false&&Date.now()-ST.at<120000)return true;
+ try{var c=W.bnxPosPrint&&W.bnxPosPrint.cfg&&W.bnxPosPrint.cfg();if(ST.online===null&&c&&c.at&&Date.now()-c.at<300000&&c.stationOnline===false)return true;}catch(e){}
+ return false;}
+function wrap(){var base=W.bnxDirectKOTPrint_;
+ /* only on top of the POS-route printer (installed ~1.2 s after load); the PHONE_APP route already prints on the phone */
+ if(typeof base!=='function'||base.__bnxV30||!base.__bnxPos||!base.__bnxPhoneAuto)return;
+ var f=async function(type,data){
+  var d=data||{},items=Array.isArray(d.items)?d.items:[],ctl=W.__bnxStwCtl||{};
+  if(d.reprint||!items.length||ctl.locked===true||ctl.print===false)return base.apply(this,arguments);
+  var native=false;try{native=!!(W.bnxHasNative_&&W.bnxHasNative_());}catch(e){}
+  var pc=false;try{pc=!!(W.bnxPcDirectOn_&&W.bnxPcDirectOn_());}catch(e){}
+  if(native||pc||!posClosed()||typeof W.bnxQzDirectKot_!=='function')return base.apply(this,arguments);
+  var why='';
+  try{
+   await Promise.race([W.bnxQzDirectKot_(type,d),new Promise(function(_,j){setTimeout(function(){j(new Error('printer did not answer in 20 s'));},20000);})]);
+   W.__bnxLastPosQueue={ok:true,online:false,direct:true,phone:true};
+   say('🖨️ '+NM(d.role||type)+' KOT printed from this phone (POS is closed)','success');
+   return true;
+  }catch(e){why=String(e&&e.message||e||'no printer route').slice(0,140);}
+  if(/did not answer/.test(why)){say('⚠️ '+NM(d.role||type)+' KOT sent to the printer but not confirmed — check the paper before reprinting','error');return false;}
+  say('POS is closed and this phone cannot reach the printer ('+why+'). KOT kept for the POS printer — open the POS or KOT Print Station','error');
+  return base.apply(this,arguments);
+ };
+ Object.keys(base).forEach(function(k){try{f[k]=base[k];}catch(e){}});
+ f.__bnxV30=true;f.__bnxPos=true;f.__bnxPhoneAuto=true;W.bnxDirectKOTPrint_=f;try{bnxDirectKOTPrint_=f;}catch(e){}
+}
+/* Printer view on the phone: how this phone prints when the POS is closed */
+function rawbtKey(){return 'bnx_rawbt_'+cid();}
+function relayKey(){return 'bnx_print_relay_'+cid();}
+function ls(k,v){try{if(v===undefined)return localStorage.getItem(k)||'';if(v===null)localStorage.removeItem(k);else localStorage.setItem(k,v);}catch(e){}return '';}
+function routeText(){var n=false;try{n=!!(W.bnxHasNative_&&W.bnxHasNative_());}catch(e){}
+ if(n)return 'HappyServe printer app (prints to each station printer)';
+ if(ls(relayKey()))return 'Print Relay '+ls(relayKey());
+ if(ls(rawbtKey())==='1'&&/Android/i.test(navigator.userAgent||''))return 'RawBT app (one printer)';
+ return 'none set — KOTs wait for the POS';}
+function inject(){var v=D.getElementById('bnx-pm-view');if(!v||v.querySelector('#bnx-v30-phone'))return;var box=v.firstElementChild;if(!box)return;
+ var c=D.createElement('div');c.id='bnx-v30-phone';c.style.cssText='margin-top:12px;padding:10px 11px;border:1px solid #e5e7eb;border-radius:12px;background:#f9fafb';
+ var android=/Android/i.test(navigator.userAgent||'');
+ c.innerHTML='<b>📱 When the POS is closed</b><div style="font-size:12.5px;color:#555;margin:4px 0 8px">This phone prints the KOT itself. Route now: <b data-rt></b></div>'
+  +(android?'<label style="display:flex;gap:8px;align-items:center;font-size:13px;margin-bottom:8px"><input type="checkbox" data-rb'+(ls(rawbtKey())==='1'?' checked':'')+'> Use RawBT app on this phone (install RawBT, set the Kitchen printer IP in it)</label>':'')
+  +'<div style="display:flex;gap:6px"><input data-rl placeholder="Print Relay PC, e.g. https://192.168.0.50:9191" value="'+String(ls(relayKey())).replace(/"/g,'&quot;')+'" style="flex:1;min-width:0;padding:8px;border:1px solid #ddd;border-radius:9px;font-size:12.5px"><button type="button" data-sv style="padding:8px 10px;border-radius:9px;border:0;background:#4a1d06;color:#fff;font-weight:800">Save</button></div>'
+  +'<button type="button" data-ts style="margin-top:8px;width:100%;padding:9px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:800">🧪 Test Kitchen KOT from this phone</button>';
+ box.appendChild(c);
+ var paint=function(){var e=c.querySelector('[data-rt]');if(e)e.textContent=routeText();};paint();
+ c.addEventListener('click',function(ev){
+  var t=ev.target;
+  if(t.matches('[data-rb]')){ls(rawbtKey(),t.checked?'1':'0');paint();}
+  if(t.matches('[data-sv]')){var u=String(c.querySelector('[data-rl]').value||'').trim().replace(/\/+$/,'');
+   if(u&&typeof W.bnxPrinterUrlProblem_==='function'&&W.bnxPrinterUrlProblem_(u)){say('That is a printer address, not the Print Relay PC','error');return;}
+   ls(relayKey(),u||null);paint();say(u?'Print Relay saved':'Print Relay removed','success');}
+  if(t.matches('[data-ts]')){if(typeof W.bnxQzDirectKot_!=='function'){say('Printer engine not loaded yet','error');return;}
+   W.bnxQzDirectKot_('KITCHEN',{items:[{name:'TEST KOT',qty:1}],table:'TEST',kotNo:'TEST-'+Date.now().toString(36).slice(-4),orderNo:'TEST',waiter:'Printer test'})
+    .then(function(){say('✅ Test KOT sent from this phone','success');},function(e){say('⚠️ Phone cannot print: '+String(e&&e.message||e).slice(0,140),'error');});}
+ });
+}
+function tick(){hookApi();wrap();inject();}
+tick();setInterval(tick,1000);
+W.BNX_KOT_ANYWHERE_BUILD='2026.10.28-v30';
+})(window,document);
+</script>
+<script id="bnx-tap-busy-bar-20261028">
+/* INSTANT FEEDBACK (2026-10-28, "order register / bill list / print — show loading at once"): whatever a tap starts
+   (open register, bill list, print, save, KOT move) shows a thin moving bar + "Loading…" chip within 0.15 s and
+   until the server answers. Background polls never show it. Screens keep painting their saved copy underneath. */
+(function(W,D){
+'use strict';
+var lastTap=0,fg=0,shownAt=0,timer=0,el=null;
+['pointerdown','keydown'].forEach(function(ev){D.addEventListener(ev,function(){lastTap=Date.now();},{capture:true,passive:true});});
+function ensure(){if(el)return el;el=D.createElement('div');el.id='bnx-busy-bar';el.setAttribute('role','status');el.setAttribute('aria-live','polite');
+ el.innerHTML='<i></i><span>Loading…</span>';var st=D.createElement('style');
+ st.textContent='#bnx-busy-bar{position:fixed;left:0;right:0;top:0;height:0;z-index:2147483600;pointer-events:none;opacity:0;transition:opacity .12s}'
+ +'#bnx-busy-bar.on{opacity:1}#bnx-busy-bar i{position:absolute;left:0;top:0;height:3px;width:35%;background:linear-gradient(90deg,#f59e0b,#d97706);border-radius:0 3px 3px 0;animation:bnxBusy 1s ease-in-out infinite}'
+ +'#bnx-busy-bar span{position:absolute;right:10px;top:calc(6px + env(safe-area-inset-top,0px));background:rgba(17,17,17,.78);color:#fff;font:700 11px/1 system-ui,sans-serif;padding:5px 9px;border-radius:999px}'
+ +'@keyframes bnxBusy{0%{transform:translateX(-100%)}100%{transform:translateX(290%)}}@media (prefers-reduced-motion:reduce){#bnx-busy-bar i{animation:none;width:100%}}';
+ (D.head||D.documentElement).appendChild(st);(D.body||D.documentElement).appendChild(el);return el;}
+function label(a){a=String(a||'');return /PRINT|REPRINT/.test(a)?'Printing…':/^(SAVE_|SETTLE|APPLY_|TRANSFER|CANCEL|VOID|UPDATE_|DELETE_)/.test(a)?'Saving…':'Loading…';}
+function paint(a){clearTimeout(timer);if(fg>0){timer=setTimeout(function(){var e=ensure();if(a)e.querySelector('span').textContent=label(a);e.classList.add('on');shownAt=Date.now();},150);}
+ else{if(el)el.classList.remove('on');}}
+function hook(){var base=W.gasApi;if(typeof base!=='function'||base.__bnxBusy)return;
+ var f=function(action){var mine=Date.now()-lastTap<1500;if(mine){fg++;paint(action);}
+  var p;try{p=Promise.resolve(base.apply(this,arguments));}catch(e){p=Promise.reject(e);}
+  if(mine)p.then(function(){},function(){}).then(function(){fg=Math.max(0,fg-1);paint();});
+  return p;};
+ Object.keys(base).forEach(function(k){try{f[k]=base[k];}catch(e){}});f.__bnxBusy=true;W.gasApi=f;try{gasApi=f;}catch(e){}}
+hook();setInterval(hook,1000);
+W.bnxBusyBar={get count(){return fg;}};
+})(window,document);
+</script>
+
+
 
 <style id="bnx-order-menu-overlap-fix-20261027">
 /* The current order menu owns this screen. Hide the retired renderer even
