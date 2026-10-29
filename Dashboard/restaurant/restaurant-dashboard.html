@@ -74879,7 +74879,10 @@ function readTable(table){
  var key=scope()+'|'+String(table).trim().toUpperCase(),hit=recent.get(key);
  if(hit&&Date.now()-hit.at<2000)return Promise.resolve(hit.r);
  if(flights.has(key))return flights.get(key);
- var sc=scope(),p=Promise.resolve().then(function(){return W.gasApi('GET_TABLE_BILL_CONTEXT',{table:table},'V2_CORE');}).then(function(r){
+ /* 2026-10-29 ("Core has not returned confirmed items yet" stayed for ever): each try is capped at 25 s and retried twice */
+ function once(){return Promise.race([W.gasApi('GET_TABLE_BILL_CONTEXT',{table:table},'V2_CORE'),new Promise(function(res){setTimeout(function(){res({success:false,error:'server did not answer in 25 s',timeout:true});},25000);})]);}
+ function tryN(n){return Promise.resolve().then(once).then(function(r){if(r&&r.success===true)return r;if(n<3&&(!r||r.timeout||r.retryable||/busy|timeout|lock/i.test(String(r&&(r.error||r.message)||'')))){try{status(table+': server slow — retrying ('+(n+1)+'/3)…',true);}catch(e){}return new Promise(function(res){setTimeout(res,1500);}).then(function(){return tryN(n+1);});}return r;});}
+ var sc=scope(),p=Promise.resolve().then(function(){return tryN(1);}).then(function(r){
   if(sc===scope()&&r&&r.success===true&&r.data&&r.data.complete===true)recent.set(key,{r:r,at:Date.now()});return r;
  }).finally(function(){if(flights.get(key)===p)flights.delete(key);});flights.set(key,p);return p;
 }
@@ -75015,7 +75018,7 @@ W.bnxLoadTableIntoBill=async function(table){
   var estN=L.items.filter(function(i){return i.estRate;}).length;
   status(n?(table+': '+n+' cached item(s) shown'+(noRate?' ('+noRate+' without rate — waiting for server)':'')+(estN?' ('+estN+' at menu rate, est.)':'')+' — confirming with server…'):('Loading live items for '+table+'…'));
   waiting(true,table,n>0);
-  var slow=setTimeout(function(){if(my===seq)status(table+': Core has not returned confirmed items yet. Cached items, if shown, are a preview. Save remains blocked.',true);},10000);
+  var slow=setTimeout(function(){if(my===seq){status(table+': server is slow to confirm the items — still trying. Cached items are a preview; Save waits for the server.',true);try{W.bnxTableBillActions_&&W.bnxTableBillActions_(table);}catch(e){}}},10000);
   var v=confirmFromServer(table,my,snap,n>0).finally(function(){clearTimeout(slow);if(my===seq){waiting(!!W.__bnxTablePreviewUnconfirmed,table,n>0);var notice=$('bnxTableWaitingPreview36');if(W.__bnxTablePreviewUnconfirmed&&notice)notice.textContent='Table items are not confirmed. Retry the table Bill action; no invoice has been saved.';}});
   W.__bnxTbVerify=v;v.finally(function(){if(W.__bnxTbVerify===v)W.__bnxTbVerify=null;});
   return n>0?true:await v;
@@ -78854,5 +78857,49 @@ function hook(){var g=W.gasApi;if(typeof g!=='function'||g.__bnxMenuSync)return;
  Object.keys(g).forEach(function(k){try{f[k]=g[k];}catch(e){}});f.__bnxMenuSync=true;W.gasApi=f;try{gasApi=f;}catch(e){}}
 hook();setInterval(hook,2000);
 W.addEventListener('storage',function(e){if(e.key==='bnx_menu_changed')reload('edited in another tab');});
+})(window,document);
+</script>
+<script id="bnx-bill-autoclear-20261029">
+/* NEW BILL (2026-10-29): "IF BACK AUTO CLEAR" — leaving New Bill (back button, sidebar, another page) clears the unsaved bill,
+   so the next table / next bill never starts with the old items (RD4 stayed on the screen). A bill that is being saved is
+   never cleared. When the server is slow to confirm a table's items, 🔄 Retry and (Owner / Admin / Manager) "Bill these items"
+   buttons appear under the message instead of leaving Save blocked for ever. */
+(function(W,D){
+'use strict';
+if(W.__bnxBillAutoClear)return;W.__bnxBillAutoClear=1;
+function $(i){return D.getElementById(i);}
+function role(){try{return String((W.ERP&&ERP.getRole&&ERP.getRole())||(JSON.parse(localStorage.getItem('ERP_USER')||'{}').ROLE)||'').toUpperCase();}catch(e){return '';}}
+function clearSilently(){
+  if(W._isSavingBill)return;
+  try{W.__BNX_BM_PAYMENT_LINES=[];}catch(e){}
+  try{var sm=$('bnxSplitPaymentModal');if(sm)sm.classList.remove('open');}catch(e){}
+  try{var pm=$('bm-bf-paymode');if(pm&&pm.value==='SPLIT')pm.value='CASH';}catch(e){}
+  try{if(typeof W.bmResetBillForm==='function')W.bmResetBillForm();}catch(e){console.warn('[bill auto-clear]',e);}
+  try{W.__bnxTablePreviewUnconfirmed=false;W.__bnxTableBillSource=null;}catch(e){}
+  ['bnxTableBillLoadState','bnxTbActions'].forEach(function(id){var e=$(id);if(e)e.remove();});
+  try{var at=$('bm-actionbar-total');if(at)at.textContent='₹0.00';}catch(e){}
+}
+W.bnxBillClearSilently_=clearSilently;
+function hook(){
+  var sp=W.showPage;if(typeof sp!=='function'||sp.__bnxAC)return;
+  var f=function(id){var was=W._navCurrentPage||(($('page-billing')||{}).classList&&$('page-billing').classList.contains('active')?'billing':'');
+    var r=sp.apply(this,arguments);
+    try{if(was==='billing'&&id!=='billing'&&!(($('page-billing')||{}).classList||{contains:function(){return false;}}).contains('active'))clearSilently();}catch(e){}
+    return r;};
+  Object.keys(sp).forEach(function(k){try{f[k]=sp[k];}catch(e){}});f.__bnxAC=1;W.showPage=f;try{showPage=f;}catch(e){}
+}
+hook();setInterval(hook,3000);
+/* retry / override under the "server slow" message */
+W.bnxTableBillActions_=function(table){
+  var st=$('bnxTableBillLoadState');if(!st)return;var a=$('bnxTbActions');if(a)a.remove();
+  a=D.createElement('div');a.id='bnxTbActions';a.style.cssText='display:flex;gap:8px;flex-wrap:wrap;margin:6px 0';
+  a.innerHTML='<button type="button" class="btn btn-sm btn-primary" data-r>🔄 Retry</button>'+
+    (/^(OWNER|ADMIN|SUPER_ADMIN|SUPER ADMIN|MANAGER|MD|CEO|DEVELOPER)$/.test(role())?'<button type="button" class="btn btn-sm btn-ghost" data-o style="color:#b42318">✔ Bill these items (I checked the KOTs)</button>':'');
+  st.parentNode.insertBefore(a,st.nextSibling);
+  a.querySelector('[data-r]').onclick=function(){a.remove();if(typeof W.bnxLoadTableIntoBill==='function')W.bnxLoadTableIntoBill(table);};
+  var o=a.querySelector('[data-o]');if(o)o.onclick=function(){if(!confirm('Server has not confirmed '+table+'. Bill with the items shown here?\n\nCheck them against the KOTs first.'))return;
+    W.__bnxTablePreviewUnconfirmed=false;try{var w=$('bnxTableWaitingPreview36');if(w)w.remove();}catch(e){}
+    st.textContent=table+': billing with the items shown (checked by '+(role()||'manager')+').';st.style.color='#6b4700';a.remove();};
+};
 })(window,document);
 </script>
