@@ -13143,6 +13143,7 @@ async function bnxPullBillsRange_(from, to, options){
                 ? ((Number(sb.ITEM_DISCOUNT??sb.itemDiscount)||0)+(Number(sb.BILL_DISCOUNT??sb.billDiscount)||0)) : 0),
           discPct: Number(sb.discPct ?? sb.DISCOUNT_PCT ?? sb.discountPct ?? 0) || 0,
           sc: sb.sc ?? sb.serviceChargeAmount ?? sb.SERVICE_CHARGE_AMOUNT ?? sb.serviceCharge ?? sb.SERVICE_CHARGE ?? 0,
+          scGst: sb.scGst ?? sb.SERVICE_CHARGE_GST_AMOUNT ?? previous.scGst ?? 0,
           gst: sb.gst ?? sb.tax ?? ((Number(sb.TAX_AMOUNT)||0)+(Number(sb.SERVICE_CHARGE_GST_AMOUNT)||0)),
           roundOff: sb.roundOff ?? sb.ROUND_OFF ?? sb.roff ?? 0,
           total: sb.total ?? sb.grand ?? sb.GRAND_TOTAL ?? 0,
@@ -64286,6 +64287,13 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
     var tax={}; Object.keys(b.gst||{}).forEach(function(k){ var m=k.match(/(CGST|SGST|IGST)\s*@\s*([\d.]+)%/i); if(!m) return; var v=p2(b.gst[k]); if(!v) return;
       var tr=String(Math.round(Number(m[2])*(m[1].toUpperCase()==='IGST'?1:2)*100)/100); tax[tr]=tax[tr]||{c:0,s:0,i:0}; tax[tr][m[1].toUpperCase()==='CGST'?'c':m[1].toUpperCase()==='SGST'?'s':'i']+=v; });
     var taxSum=0; Object.keys(tax).forEach(function(r){ taxSum+=tax[r].c+tax[r].s+tax[r].i; });
+    /* 2026-10-29: bills saved by this ERP before the per-rate fix carry only flat CGST/SGST + LINES ("GST @5%", "GST @18% (Service Charge)").
+       Use those lines for the rate split instead of posting every rupee of tax at 5%. */
+    if(!taxSum && b.gst && Array.isArray(b.gst.LINES) && b.gst.LINES.length){
+      var lt={},ls=0; b.gst.LINES.forEach(function(t){ var m=String(t&&t.taxName||'').match(/([\d.]+)\s*%/), v=p2(t&&t.taxAmt); if(!m||!v) return; var r=String(Number(m[1])); lt[r]=(lt[r]||0)+v; ls+=v; });
+      if(ls && Math.abs(ls-p2(b.tax))<=100){ var adj=p2(b.tax)-ls, ks=Object.keys(lt); if(ks.length) lt[ks[0]]+=adj;
+        ks.forEach(function(r){ var c=Math.floor(lt[r]/2); tax[r]={c:c,s:lt[r]-c,i:0}; }); taxSum=p2(b.tax); }
+    }
     if(!taxSum && p2(b.tax)){ warn.push('Missing GST breakup: tax allocation requires review'); tax['5']={c:Math.floor(p2(b.tax)/2),s:p2(b.tax)-Math.floor(p2(b.tax)/2),i:0}; taxSum=p2(b.tax); }
     /* taxable per rate = tax / rate; service charge sits in its own rate bucket (usually 18%) */
     var taxable={}; Object.keys(tax).forEach(function(r){ var t=tax[r].c+tax[r].s+tax[r].i; taxable[r]=Math.round(t*100/Number(r)); });
@@ -72173,20 +72181,27 @@ html body .bnx-bill-actionbar .btn-full{flex:1 1 0!important;min-width:0!importa
       if(!isFinite(rt)&&typeof bnxItemTaxRateFraction_==='function'){ var f=Number(bnxItemTaxRateFraction_(name,live)); if(isFinite(f)) rt=f*100; }
       if(meta&&meta.hsn) hsn=String(meta.hsn); }catch(e){}
     if(!isFinite(rt)) rt=5; if(it.hsn) hsn=String(it.hsn);
-    return {amt:amt,rt:slab(rt),hsn:hsn||'996331'}; }
+    /* 2026-10-29: liquor is outside GST (state VAT) — it belongs in "Non-GST supplies", not "Exempt" */
+    var liq=false; try{ liq=(/^22/.test(hsn))||(typeof W.bnxLooksLiquor_==='function'&&W.bnxLooksLiquor_(name,String(it.cat||it.category||it.group||it.itemGroup||''))); }catch(e){}
+    return {amt:amt,rt:slab(rt),hsn:hsn||(liq&&rt<=0?'2208':'996331'),liq:liq&&slab(rt)===0}; }
   function split(b,flags){
     var sub=num(b.sub!=null?b.sub:b.subtotal), disc=num(b.disc!=null?b.disc:b.discount), sc=num(b.sc), gst=num(b.gst!=null?b.gst:b.tax), tot=num(b.total);
-    var base=n2((sub>0?sub-disc:tot-gst)+sc), rows={}, lines=(Array.isArray(b.itemsDetail)?b.itemsDetail:[]).map(line).filter(function(l){return l.amt>0;});
+    /* 2026-10-29: service charge carries its own GST rate (18%) — reported as its own line instead of being spread over the
+       food rate (which turned 5% food into odd rates). Needs scGst from the server (LIST_BILLS); without it, the old way. */
+    var scg=num(b.scGst);
+    var scRow=null; if(sc>0.004&&scg>0.004&&scg<gst+0.01){ scRow={rt:slab(scg/sc*100),tx:n2(sc),tax:n2(scg)}; gst=n2(gst-scg); sc=0; }
+    var base=n2((sub>0?sub-disc:tot-gst-(scRow?scRow.tx+scRow.tax:0))+sc), rows={}, lines=(Array.isArray(b.itemsDetail)?b.itemsDetail:[]).map(line).filter(function(l){return l.amt>0;});
     var sum=lines.reduce(function(t,l){return t+l.amt;},0);
-    function add(rt,hsn,tx,tax){ var k=rt+'|'+hsn; var r=rows[k]||(rows[k]={rt:rt,hsn:hsn,txval:0,tax:0}); r.txval+=tx; r.tax+=tax; }
+    function add(rt,hsn,tx,tax,liq){ var k=rt+'|'+hsn+'|'+(liq?1:0); var r=rows[k]||(rows[k]={rt:rt,hsn:hsn,txval:0,tax:0,liq:!!liq}); r.txval+=tx; r.tax+=tax; }
     if(lines.length&&sum>0&&base>0){
       var k=base/sum, w=0; lines.forEach(function(l){ l.tx=l.amt*k; l.w=l.tx*l.rt/100; w+=l.w; });
-      if(w>0.004){ if(Math.abs(w-gst)>Math.max(1,0.02*gst)) flags.push('GST by item master '+inr(w)+' vs bill '+inr(gst)+' — spread over rates to match the bill'); var kk=gst/w; lines.forEach(function(l){ add(l.rt,l.hsn,l.tx,l.w*kk); }); }
-      else if(gst>0.004){ lines.length=0; } else lines.forEach(function(l){ add(l.rt,l.hsn,l.tx,0); });
+      if(w>0.004){ if(Math.abs(w-gst)>Math.max(1,0.02*gst)) flags.push('GST by item master '+inr(w)+' vs bill '+inr(gst)+' — spread over rates to match the bill'); var kk=gst/w; lines.forEach(function(l){ add(l.rt,l.hsn,l.tx,l.w*kk,l.liq); }); }
+      else if(gst>0.004){ lines.length=0; } else lines.forEach(function(l){ add(l.rt,l.hsn,l.tx,0,l.liq); });
     }
     if(!Object.keys(rows).length){ var eff=base>0?gst/base*100:0, rt=slab(eff); if(gst>0.004&&Math.abs(eff-rt)>0.3) flags.push('effective GST '+eff.toFixed(2)+'% is not a GST slab (no usable item lines)'); add(rt,'996331',base,gst); }
     var arr=Object.keys(rows).map(function(x){return rows[x];}), tx=0, tg=0; arr.forEach(function(r){ r.txval=n2(r.txval); r.tax=n2(r.tax); tx+=r.txval; tg+=r.tax; });
     if(arr.length){ arr.sort(function(a,b){return b.txval-a.txval;}); arr[0].txval=n2(arr[0].txval+(base-tx)); arr[0].tax=n2(arr[0].tax+(gst-tg)); }
+    if(scRow) arr.push({rt:scRow.rt,hsn:'996331',txval:scRow.tx,tax:scRow.tax,liq:false});
     return {rows:arr,total:tot,base:base,gst:gst};
   }
   function build(bills,from,to){
@@ -72204,9 +72219,9 @@ html body .bnx-bill-actionbar .btn-full{flex:1 1 0!important;min-width:0!importa
       var itms=[];
       s.rows.forEach(function(r){
         var c=0,sg2=0,ig=0; if(r.tax>0){ if(inter) ig=r.tax; else { c=n2(r.tax/2); sg2=n2(r.tax-c); } }
-        if(r.rt===0&&r.tax<=0.004){ var ng=/^22/.test(r.hsn), nk=(isB2B?(inter?'INTRB2B':'INTRAB2B'):(inter?'INTRB2C':'INTRAB2C')), n=out.nil[nk]||(out.nil[nk]={nil:0,expt:0,ngsup:0}); if(ng) n.ngsup+=r.txval; else n.expt+=r.txval; out.cnt.nil++; return; }
+        if(r.rt===0&&r.tax<=0.004){ var ng=r.liq||/^22/.test(r.hsn), nk=(isB2B?(inter?'INTRB2B':'INTRAB2B'):(inter?'INTRB2C':'INTRAB2C')), n=out.nil[nk]||(out.nil[nk]={nil:0,expt:0,ngsup:0}); if(ng) n.ngsup+=r.txval; else n.expt+=r.txval; out.cnt.nil++; return; }
         out.tot.tx+=r.txval; out.tot.c+=c; out.tot.s+=sg2; out.tot.i+=ig;
-        var hk=r.hsn+'|'+r.rt, h=out.hsn[hk]||(out.hsn[hk]={hsn:r.hsn,rt:r.rt,val:0,tx:0,i:0,c:0,s:0}); h.val+=r.txval+r.tax; h.tx+=r.txval; h.i+=ig; h.c+=c; h.s+=sg2;
+        var hk=(isB2B?'B2B':'B2C')+'|'+r.hsn+'|'+r.rt, h=out.hsn[hk]||(out.hsn[hk]={b2b:isB2B,hsn:r.hsn,rt:r.rt,val:0,tx:0,i:0,c:0,s:0}); h.val+=r.txval+r.tax; h.tx+=r.txval; h.i+=ig; h.c+=c; h.s+=sg2;
         if(isB2B) itms.push({rt:r.rt,tx:r.txval,i:ig,c:c,s:sg2});
         else { var k2=(inter?'INTER':'INTRA')+'|'+pos+'|'+r.rt, x=out.b2cs[k2]||(out.b2cs[k2]={ty:inter?'INTER':'INTRA',pos:pos,rt:r.rt,tx:0,i:0,c:0,s:0}); x.tx+=r.txval; x.i+=ig; x.c+=c; x.s+=sg2; out.cnt.b2cs++; }
       });
@@ -72215,6 +72230,9 @@ html body .bnx-bill-actionbar .btn-full{flex:1 1 0!important;min-width:0!importa
     });
     nos.sort(function(a,b){ return a.localeCompare(b,undefined,{numeric:true}); });
     out.docs={from:nos[0]||'',to:nos[nos.length-1]||'',n:bills.length,cancel:out.cancel};
+    /* 2026-10-29: Table 13 — one line per invoice SERIES (HT/…, SW/…, ZM/… were mixed into one from–to range) */
+    var ser={}; bills.forEach(function(b){ var no=String(b.no||'').trim(); if(!no) return; var p=no.replace(/\d+$/,''), x=ser[p]||(ser[p]={nos:[],cancel:0}); x.nos.push(no); if(/cancel|void/i.test(String(b.status||''))) x.cancel++; });
+    out.series=Object.keys(ser).sort().map(function(p){ var x=ser[p]; x.nos.sort(function(a,b){ return a.localeCompare(b,undefined,{numeric:true}); }); return {from:x.nos[0],to:x.nos[x.nos.length-1],n:x.nos.length,cancel:x.cancel}; });
     return out;
   }
   function json(o){
@@ -72224,8 +72242,10 @@ html body .bnx-bill-actionbar .btn-full{flex:1 1 0!important;min-width:0!importa
     var b2cs=Object.keys(o.b2cs).map(function(k){ var x=o.b2cs[k], d={sply_ty:x.ty,rt:x.rt,typ:'OE',pos:x.pos,txval:n2(x.tx),csamt:0}; if(x.ty==='INTER') d.iamt=n2(x.i); else { d.camt=n2(x.c); d.samt=n2(x.s); } return d; });
     if(b2cs.length) J.b2cs=b2cs;
     var nk=Object.keys(o.nil); if(nk.length) J.nil={inv:nk.map(function(k){ var n=o.nil[k]; return {sply_ty:k,expt_amt:n2(n.expt),nil_amt:0,ngsup_amt:n2(n.ngsup)}; })};
-    var hk=Object.keys(o.hsn); if(hk.length) J.hsn={data:hk.map(function(k,i){ var h=o.hsn[k]; return {num:i+1,hsn_sc:h.hsn,desc:/^9963/.test(h.hsn)?'Restaurant service':'Goods',uqc:'NA',qty:0,rt:h.rt,txval:n2(h.tx),iamt:n2(h.i),camt:n2(h.c),samt:n2(h.s),csamt:0,val:n2(h.val)}; })};
-    if(o.docs.n) J.doc_issue={doc_det:[{doc_num:1,doc_typ:'Invoices for outward supply',docs:[{num:1,from:o.docs.from,to:o.docs.to,totnum:o.docs.n,cancel:o.docs.cancel,net_issue:o.docs.n-o.docs.cancel}]}]};
+    /* 2026-10-29: Table 12 is split into B2B and B2C (GSTN Phase-III, from April 2025) — JSON "hsn":{hsn_b2b:[…],hsn_b2c:[…]} */
+    var hk=Object.keys(o.hsn); if(hk.length){ var mk=function(flag){ var n=0; return hk.filter(function(k){ return !!o.hsn[k].b2b===flag; }).map(function(k){ var h=o.hsn[k],svc=/^99/.test(h.hsn); return {num:++n,hsn_sc:h.hsn,desc:svc?'RESTAURANT SERVICE':'GOODS',uqc:svc?'NA':'OTH',qty:0,rt:h.rt,txval:n2(h.tx),iamt:n2(h.i),camt:n2(h.c),samt:n2(h.s),csamt:0}; }); };
+      J.hsn={hsn_b2b:mk(true),hsn_b2c:mk(false)}; }
+    if(o.series&&o.series.length) J.doc_issue={doc_det:[{doc_num:1,doc_typ:'Invoices for outward supply',docs:o.series.map(function(x,i){ return {num:i+1,from:x.from,to:x.to,totnum:x.n,cancel:x.cancel,net_issue:x.n-x.cancel}; })}]};
     return J;
   }
   function csv(o){
@@ -72237,9 +72257,9 @@ html body .bnx-bill-actionbar .btn-full{flex:1 1 0!important;min-width:0!importa
     Object.keys(o.b2cs).forEach(function(k){ var x=o.b2cs[k]; row([x.ty,x.pos,x.rt,n2(x.tx),n2(x.i),n2(x.c),n2(x.s)]); });
     row([]); row(['NIL / EXEMPT / NON-GST']); row(['Supply type','Exempted','Nil rated','Non-GST']);
     Object.keys(o.nil).forEach(function(k){ var n=o.nil[k]; row([k,n2(n.expt),0,n2(n.ngsup)]); });
-    row([]); row(['HSN SUMMARY']); row(['HSN/SAC','Rate %','Total value','Taxable','IGST','CGST','SGST']);
-    Object.keys(o.hsn).forEach(function(k){ var h=o.hsn[k]; row([h.hsn,h.rt,n2(h.val),n2(h.tx),n2(h.i),n2(h.c),n2(h.s)]); });
-    row([]); row(['DOCUMENTS ISSUED']); row(['From','To','Total','Cancelled','Net']); row([o.docs.from,o.docs.to,o.docs.n,o.docs.cancel,o.docs.n-o.docs.cancel]);
+    row([]); row(['HSN SUMMARY (Table 12)']); row(['B2B/B2C','HSN/SAC','Rate %','Total value','Taxable','IGST','CGST','SGST']);
+    Object.keys(o.hsn).forEach(function(k){ var h=o.hsn[k]; row([h.b2b?'B2B':'B2C',h.hsn,h.rt,n2(h.val),n2(h.tx),n2(h.i),n2(h.c),n2(h.s)]); });
+    row([]); row(['DOCUMENTS ISSUED (Table 13)']); row(['From','To','Total','Cancelled','Net']); (o.series||[]).forEach(function(x){ row([x.from,x.to,x.n,x.cancel,x.n-x.cancel]); });
     row([]); row(['NEEDS REVIEW']); row(['Invoice','Date','Value','Reason']); o.exc.forEach(function(e){ row([e.no,e.dt,n2(e.amt),e.why]); });
     return L.join('\r\n');
   }
@@ -72270,7 +72290,7 @@ html body .bnx-bill-actionbar .btn-full{flex:1 1 0!important;min-width:0!importa
       tr('&nbsp;&nbsp;7 · B2C small (by rate)',Object.keys(o.b2cs).length+' rows','','','')+
       tr('&nbsp;&nbsp;8 · Nil / exempt / non-GST',Object.keys(o.nil).length+' rows',inr(nilTx),'','')+
       tr('&nbsp;&nbsp;12 · HSN summary',Object.keys(o.hsn).length+' rows','','','')+
-      tr('&nbsp;&nbsp;13 · Documents issued',o.docs.n,'','',esc(o.docs.from)+' → '+esc(o.docs.to))+
+      tr('&nbsp;&nbsp;13 · Documents issued',o.docs.n,'','',(o.series||[]).map(function(x){return esc(x.from)+' → '+esc(x.to);}).join('<br>'))+
       '<tr style="font-weight:800"><td>Tax split</td><td></td><td>CGST '+inr(o.tot.c)+'</td><td>SGST '+inr(o.tot.s)+'</td><td>IGST '+inr(o.tot.i)+'</td></tr>'+
       '<tr style="color:'+(o.exc.length?'#b36b00':'#1a9456')+';font-weight:700"><td>Needs review</td><td>'+o.exc.length+'</td><td colspan="3"></td></tr></tbody></table>'+
       (hsnRows?'<div style="font-weight:800;font-size:12px;margin:10px 0 4px">HSN summary</div><table class="tbl" style="width:100%;font-size:12px"><thead><tr><th style="text-align:left">HSN/SAC</th><th>Rate</th><th>Taxable</th><th>Tax</th><th>Value</th></tr></thead><tbody>'+hsnRows+'</tbody></table>':'')+
@@ -78018,4 +78038,336 @@ function button(){if(D.getElementById('bnxSpeedCheck43'))return;var host=D.query
 button();D.addEventListener('DOMContentLoaded',button);W.BNX_OPERATION_BUILD='OP43';
 })(window,document);
 
+</script>
+<script id="bnx-report-excel-format-20261029">
+/* REPORT EXCEL — ONE FORMAT FOR EVERY REPORT (2026-10-29: "report hub export same format, same type as Details_Sale_Report").
+   Every report Excel downloaded from this dashboard is written like the old POS file:
+     A1 "Report Export: <report name>"   A2 "Date: <export time>" (+ period)   row 3 blank
+     row 4 = column headers (bold white on blue #0D6EFD, centred, thin border)   data rows   last row "Total" (bold on yellow #FFC300)
+   Templates / import files / instructions are left untouched. Colours need the styled writer (xlsx-js-style, loaded on first
+   export); without it the same layout is written without colours. */
+(function(W,D){
+'use strict';
+var SKIP=/template|import|instruction|opening_balance|menu_items|backup/i;
+var STYLE_URL='https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js',styled=null,loading=null;
+function loadStyled(){
+ if(styled)return Promise.resolve(styled);if(loading)return loading;
+ loading=new Promise(function(res){
+  var keep=W.XLSX,s=D.createElement('script');s.src=STYLE_URL;s.async=true;
+  var done=function(ok){var lib=ok&&W.XLSX&&W.XLSX!==keep?W.XLSX:null;W.XLSX=keep;try{XLSX=keep;}catch(e){}styled=lib;res(lib);};
+  s.onload=function(){done(true);};s.onerror=function(){done(false);};setTimeout(function(){done(false);},12000);
+  D.head.appendChild(s);
+ });
+ return loading;
+}
+function filled(r){return (r||[]).filter(function(v){return v!==''&&v!=null;}).length;}
+function titleOf(name){return String(name||'Report').replace(/\.xlsx?$/i,'').replace(/_\d{4}-\d{2}-\d{2}.*$/,'').replace(/_?(to_)?\d{4}-\d{2}-\d{2}/g,'').replace(/[_]+/g,' ').trim()||'Report';}
+var NOSUM=/phone|mobile|gstin|gst ?no|gst ?number|pan|pin|invoice|bill ?no|number$|^no\b|\bno$|\bid\b|_id$|code|date|time|year|month|%|rate|percent|hsn|sac|sl\.?|s\.?no|serial|voucher|ref/i;
+function num(v){if(typeof v==='number')return isFinite(v)?v:null;var s=String(v==null?'':v).trim();if(!s||!/^[-−]?₹?\s*[\d,]+(\.\d+)?$/.test(s))return null;var n=Number(s.replace(/[₹,\s]/g,'').replace('−','-'));return isFinite(n)?n:null;}
+function normalize(XL,ws,sheetTitle){
+ var aoa=XL.utils.sheet_to_json(ws,{header:1,defval:'',raw:true});
+ if(!aoa.length)return null;
+ if(String(aoa[0][0]||'').indexOf('Report Export:')===0&&aoa.length>3){var hr0=3;}
+ /* header = first row with 2+ filled cells that is followed by data; the lines above it are title / period text */
+ var hr=hr0!=null?hr0:-1;if(hr<0){for(var i=0;i<aoa.length;i++){if(filled(aoa[i])>=2){hr=i;break;}}}
+ if(hr<0)return null;
+ var above=aoa.slice(0,hr).map(function(r){return r.filter(function(v){return v!==''&&v!=null;}).join(' ');}).filter(Boolean);
+ if(hr0!=null)above=[String(aoa[0][0]||'').replace(/^Report Export:\s*/,''),String(aoa[1]&&aoa[1][0]||'')];
+ var period=above.filter(function(t){return /period|from|to\b|\d{4}-\d{2}-\d{2}|\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}/i.test(t)&&!/^date:/i.test(t);}).map(function(t){return t.replace(/^period:?\s*/i,'');})[0]||'';
+ var name=above.filter(function(t){return !/period|printed|generated|financial year|^date:|filter/i.test(t);}).slice(-1)[0]||sheetTitle;
+ var head=aoa[hr].map(function(v){return String(v==null?'':v);}),data=aoa.slice(hr+1);
+ while(data.length&&!filled(data[data.length-1]))data.pop();
+ var width=Math.max.apply(null,[head.length].concat(data.map(function(r){return r.length;})));
+ var hasTotal=data.some(function(r){return /^\s*(grand\s+)?total\b/i.test(String(r[0]||''))||/^\s*(grand\s+)?total\b/i.test(String(r[1]||''));});
+ var rows=data.map(function(r){var o=[];for(var c=0;c<width;c++){var v=r[c]==null?'':r[c];var n=num(v);o.push(n!=null&&typeof v!=='number'&&!NOSUM.test(head[c]||'')?n:v);}return o;});
+ var total=null;
+ if(!hasTotal&&rows.length>1){total=['Total'];var any=false;for(var c=1;c<width;c++){if(NOSUM.test(head[c]||'')){total.push(null);continue;}var s=0,k=0;rows.forEach(function(r){if(typeof r[c]==='number'){s+=r[c];k++;}});
+   if(k&&k>=rows.length*0.6){total.push(Math.round(s*100)/100);any=true;}else total.push(null);}if(!any)total=null;}
+ var out=[['Report Export: '+String(name).replace(/^Report Export:\s*/i,'')],['Date: '+new Date().toLocaleString('en-US')+(period?' · Period: '+period:'')],[],head].concat(rows);if(total)out.push(total);
+ var nws=XL.utils.aoa_to_sheet(out);
+ nws['!cols']=head.map(function(h,c){var m=String(h).length;rows.slice(0,300).forEach(function(r){m=Math.max(m,String(r[c]==null?'':r[c]).length);});return {wch:Math.max(6,Math.min(40,m+2))};});
+ return {ws:nws,width:width,headRow:3,lastRow:out.length-1,hasTotalRow:!!total};
+}
+function paint(info){
+ var ws=info.ws,thin={style:'thin',color:{rgb:'FFBFBFBF'}};
+ for(var c=0;c<info.width;c++){
+  var h=ws[XLSX.utils.encode_cell({r:info.headRow,c:c})];if(h)h.s={font:{bold:true,color:{rgb:'FFFFFFFF'},name:'Calibri',sz:11},fill:{patternType:'solid',fgColor:{rgb:'FF0D6EFD'}},alignment:{horizontal:'center',vertical:'center',wrapText:true},border:{top:thin,bottom:thin,left:thin,right:thin}};
+  if(info.hasTotalRow){var a=XLSX.utils.encode_cell({r:info.lastRow,c:c}),t=ws[a];if(!t){t=ws[a]={t:'s',v:''};}t.s={font:{bold:true,name:'Calibri',sz:11},fill:{patternType:'solid',fgColor:{rgb:'FFFFC300'}}};}
+ }
+}
+function wrap(){
+ var XL=W.XLSX;if(!XL||!XL.writeFile||XL.writeFile.__bnxFmt)return;
+ var orig=XL.writeFile;
+ var f=function(wb,filename,opts){
+  try{
+   if(!wb||!wb.SheetNames||SKIP.test(String(filename||''))||wb.SheetNames.some(function(n){return SKIP.test(n);}))return orig.apply(this,arguments);
+   var names=wb.SheetNames.slice(),single=names.length===1||(names.length===2&&/check|note/i.test(names[1]));
+   var nb=XL.utils.book_new(),infos=[];
+   names.forEach(function(n,i){
+    var info=(i===0||!single)?normalize(XL,wb.Sheets[n],single?titleOf(filename):n):null;
+    if(info){infos.push(info);XL.utils.book_append_sheet(nb,info.ws,single&&i===0?'Report Data':n);}
+    else XL.utils.book_append_sheet(nb,wb.Sheets[n],n);
+   });
+   var self=this,args=[nb,filename,opts];
+   loadStyled().then(function(S){
+    try{if(S){infos.forEach(paint);return S.writeFile(nb,filename,Object.assign({cellStyles:true},opts||{}));}}catch(e){console.warn('[report excel] styled write failed',e);}
+    orig.apply(self,args);
+   });
+   return;
+  }catch(e){console.warn('[report excel] format skipped',e);return orig.apply(this,arguments);}
+ };
+ Object.keys(orig).forEach(function(k){try{f[k]=orig[k];}catch(e){}});f.__bnxFmt=true;XL.writeFile=f;
+}
+wrap();var iv=setInterval(function(){wrap();if(W.XLSX&&W.XLSX.writeFile&&W.XLSX.writeFile.__bnxFmt)clearInterval(iv);},700);
+W.addEventListener('load',function(){setTimeout(wrap,500);});
+W.bnxReportExcelFormat={normalize:normalize,loadStyled:loadStyled};
+setTimeout(function(){try{loadStyled();}catch(e){}},15000);   /* fetch the styled writer early, so the first export is instant */
+})(window,document);
+</script>
+<script id="bnx-collection-recon-20261029">
+/* COLLECTION RECONCILIATION (2026-10-29: "cross-check DSR collection-wise vs Swift / swipe / bank transactions — import,
+   view and map, fast and easy"). Report Hub → 🔄 Sale vs Bank → "Collection reconciliation", or W.bnxCollectionRecon().
+   1) 📥 Import the bank statement / card-swipe (EDC) settlement / UPI / aggregator file (.xlsx / .xls / .csv). Columns are found
+      by name (Date · Particulars/Narration · Credit/Deposit/Amount); the two-account side-by-side bank layout also works.
+      Each credit is classed by its narration — Card (CCARD / MID / POS / settlement), UPI (UPI / Google / PhonePe / Paytm),
+      Cash deposit, Zomato, Swiggy, Other — and given the business date it belongs to (card / Google settlement = previous day,
+      or the date written in the narration). Already-imported lines are skipped.
+   2) Day-wise table: DSR collection (Cash · Card · UPI · Zomato · Swiggy) next to the bank amount mapped to that day and mode,
+      difference and status. Tap any cell to see its transactions and re-map them (date / mode / ignore) in one tap.
+   Imports and mappings are saved on the server (BANK_TXN_REGISTER), so every PC sees the same reconciliation. */
+(function(W,D){
+'use strict';
+var MODES=[['CASH','💵 Cash'],['CARD','💳 Card'],['UPI','📱 UPI'],['ZOMATO','🛵 Zomato'],['SWIGGY','🛵 Swiggy'],['OTHER','🔹 Other']];
+var LABEL={};MODES.forEach(function(m){LABEL[m[0]]=m[1];});
+var st={from:'',to:'',dsr:{},tx:[],busy:false,sel:null,tab:'days'};
+function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function n(v){var x=Number(String(v==null?'':v).replace(/[,₹\s]/g,''));return isFinite(x)?x:0;}
+function inr(v){v=Math.round(n(v));return (v<0?'-₹':'₹')+Math.abs(v).toLocaleString('en-IN');}
+function say(m,k){try{W.showNotif?W.showNotif(m,k||'info'):alert(m);}catch(e){}}
+function api(a,p,ms){return Promise.resolve(W.gasApi(a,p||{},'V2_CORE'));}
+function iso(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
+function shift(k,days){var d=new Date(k+'T12:00:00');d.setDate(d.getDate()+days);return iso(d);}
+/* ---------- file parsing ---------- */
+var MON={JAN:1,FEB:2,MAR:3,APR:4,MAY:5,JUN:6,JUL:7,AUG:8,SEP:9,OCT:10,NOV:11,DEC:12};
+function pdate(v){
+ if(v==null||v==='')return '';
+ if(v instanceof Date&&!isNaN(v))return iso(v);
+ if(typeof v==='number'&&v>20000&&v<80000){var d=new Date(Math.round((v-25569)*86400000));return d.toISOString().slice(0,10);}
+ var s=String(v).trim(),m;
+ if((m=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/)))return m[1]+'-'+m[2].padStart(2,'0')+'-'+m[3].padStart(2,'0');
+ if((m=s.match(/^(\d{1,2})[\/\-. ](\d{1,2})[\/\-. ](\d{2,4})/))){var y=m[3].length===2?'20'+m[3]:m[3];return y+'-'+m[2].padStart(2,'0')+'-'+m[1].padStart(2,'0');}
+ if((m=s.match(/^(\d{1,2})[\/\-. ]([A-Za-z]{3})[A-Za-z]*[\/\-. ,]+(\d{2,4})/))){var mo=MON[m[2].toUpperCase()];if(mo){var y2=m[3].length===2?'20'+m[3]:m[3];return y2+'-'+String(mo).padStart(2,'0')+'-'+m[1].padStart(2,'0');}}
+ return '';
+}
+function classify(t){
+ var u=String(t||'').toUpperCase();
+ if(/ZOMATO/.test(u))return 'ZOMATO';
+ if(/SWIGGY|BUNDL TECH/.test(u))return 'SWIGGY';
+ if(/CASH ?DEP|CASH DEPOSIT|BY CASH|CDM/.test(u))return 'CASH';
+ if(/CCARD|\bMID\b|\bTID\b|POS SETL|CARD SETT|SETTLEMENT|\bMSF\b|PINE ?LABS|MOSAMBEE|EDC|SWIPE|VISA|MASTERCARD|RUPAY/.test(u))return 'CARD';
+ if(/^UPI|\bUPI\b|GOOGLE|GPAY|PHONEPE|PAYTM|BHARATPE|\bVPA\b|@[A-Z]+/.test(u))return 'UPI';
+ return 'OTHER';
+}
+/* business date a credit belongs to: date written in the narration (CCARD PMT 310325 / CASH DEP 01-04-25), else bank date − lag */
+function lagOf(mode){var L={CARD:1,UPI:0,CASH:0,ZOMATO:0,SWIGGY:0,OTHER:0};try{var s=JSON.parse(localStorage.getItem('bnx_recon_lag')||'{}');Object.keys(s).forEach(function(k){L[k]=Number(s[k])||0;});}catch(e){}return L[mode]||0;}
+function mapDateOf(row){
+ var u=String(row.narration||'').toUpperCase(),m;
+ if(row.mode==='CARD'&&(m=u.match(/CCARD PMT (\d{2})(\d{2})(\d{2})\b/)))return '20'+m[3]+'-'+m[2]+'-'+m[1];
+ if(row.mode==='UPI'&&/GOOGLE/.test(u))return shift(row.date,-1);
+ if(row.mode==='CASH'&&(m=u.match(/CASH ?DEP[^\/]*\/(\d{2})-(\d{2})-(\d{2,4})\b/)))return (m[3].length===2?'20'+m[3]:m[3])+'-'+m[2]+'-'+m[1];
+ if(row.mode==='ZOMATO'||row.mode==='SWIGGY'||row.mode==='OTHER')return '';      /* weekly payouts / others: map by hand */
+ return shift(row.date,-lagOf(row.mode));
+}
+function hashKey(s){var h1=0x811c9dc5,h2=0;for(var i=0;i<s.length;i++){var c=s.charCodeAt(i);h1^=c;h1=Math.imul(h1,16777619)>>>0;h2=(h2*31+c)>>>0;}return h1.toString(36)+h2.toString(36);}
+function parseSheet(aoa,file){
+ var out=[];
+ for(var r=0;r<Math.min(aoa.length,40);r++){
+  var row=aoa[r].map(function(v){return String(v==null?'':v).trim().toUpperCase();});
+  var dcols=[];row.forEach(function(v,i){if(/^(TXN |TRANSACTION |VALUE |POSTING |SETTLEMENT |TRAN )?DATE$|^DATE$/.test(v))dcols.push(i);});
+  if(!dcols.length)continue;
+  var blocks=dcols.map(function(dc,bi){var end=bi+1<dcols.length?dcols[bi+1]:row.length,cols={date:dc};
+   for(var c=dc+1;c<end;c++){var h=row[c];if(!h)continue;
+    if(cols.nar==null&&/PARTICULAR|NARRATION|DESCRIPTION|REMARK|DETAILS/.test(h))cols.nar=c;
+    else if(cols.cr==null&&/^CREDIT|^DEPOSIT|^CR\b|CR AMOUNT|NET AMOUNT|SETTLE.*AMOUNT|NET SETTLE/.test(h))cols.cr=c;
+    else if(cols.dr==null&&/^DEBIT|^WITHDRAW|^DR\b|DR AMOUNT|MDR|CHARGES/.test(h))cols.dr=c;
+    else if(cols.amt==null&&/^AMOUNT|TXN AMOUNT|TRANSACTION AMOUNT|GROSS/.test(h))cols.amt=c;
+    else if(cols.ref==null&&/REF|CHEQUE|CHQ|RRN|UTR|APPROVAL/.test(h))cols.ref=c;
+    else if(cols.type==null&&/CARD TYPE|PAYMENT MODE|MODE|TYPE/.test(h))cols.type=c;}
+   var acct='';for(var k=r-1;k>=0&&k>=r-3;k--){var a=String((aoa[k]||[])[dc]||(aoa[k]||[])[dc+1]||(aoa[k]||[])[Math.max(0,dc-1)]||'').trim();if(a){acct=a.replace(/\s+/g,' ').slice(0,60);break;}}
+   cols.acct=acct||(dcols.length>1?'Account '+(bi+1):'');return cols;});
+  var cardFile=row.some(function(h){return /\bMID\b|\bTID\b|CARD TYPE|CARD NO|MDR/.test(h);});
+  for(var i=r+1;i<aoa.length;i++){var a2=aoa[i]||[];
+   blocks.forEach(function(b){
+    var d=pdate(a2[b.date]);if(!d)return;
+    var nar=String(b.nar!=null?a2[b.nar]:'').trim(),cr=n(b.cr!=null?a2[b.cr]:(b.amt!=null?a2[b.amt]:0)),dr=b.dr!=null&&b.cr!=null?n(a2[b.dr]):0;
+    if(/OPENING BALANCE|CLOSING BALANCE|^TOTAL/i.test(nar))return;
+    if(!(cr>0)&&!(dr>0))return;
+    var typ=b.type!=null?String(a2[b.type]||''):'',mode=cardFile&&!/UPI/i.test(typ)?'CARD':classify(nar+' '+typ);
+    var line={account:b.acct,date:d,narration:nar||typ||'',credit:cr>0?cr:0,debit:dr>0?dr:0,mode:mode,ref:b.ref!=null?String(a2[b.ref]||''):''};
+    out.push(line);});
+  }
+  break;
+ }
+ /* stable key: account|date|narration|amounts|n-th identical line in this file */
+ var seen={};out.forEach(function(x){var base=[x.account,x.date,x.narration,x.credit,x.debit,x.ref].join('|');seen[base]=(seen[base]||0)+1;x.key='BT'+hashKey(base+'#'+seen[base]);if(x.credit>0)x.mapDate=mapDateOf(x);});
+ return out;
+}
+function readFile(file){
+ return new Promise(function(res,rej){
+  if(!W.XLSX)return rej(Error('Excel reader is still loading — try again in a moment'));
+  var fr=new FileReader();fr.onerror=function(){rej(Error('Could not read the file'));};
+  fr.onload=function(){try{var wb=W.XLSX.read(new Uint8Array(fr.result),{type:'array',cellDates:true}),all=[];
+    wb.SheetNames.forEach(function(sn){var aoa=W.XLSX.utils.sheet_to_json(wb.Sheets[sn],{header:1,defval:'',raw:true});all=all.concat(parseSheet(aoa,file.name));});
+    res(all);}catch(e){rej(e);}};
+  fr.readAsArrayBuffer(file);
+ });
+}
+/* ---------- data ---------- */
+function dsrDay(x){x=x||{};return {CASH:n(x.cash)+n(x.dueReceivedCash),CARD:n(x.iciciCard),UPI:n(x.iciciGpay)+n(x.dueReceivedIcici),ZOMATO:n(x.zomato),SWIGGY:n(x.swiggy),OTHER:n(x.other)+n(x.eazydine)};}
+function bankOf(day,mode){return st.tx.filter(function(t){return t.credit>0&&t.status!=='IGNORED'&&t.mapDate===day&&(t.mapMode||t.mode)===mode;});}
+function days(){var out=[],d=st.from;while(d&&d<=st.to){out.push(d);d=shift(d,1);}return out;}
+async function load(){
+ st.busy=true;paint();
+ try{
+  var r=await Promise.all([api('GET_DSR_RANGE',{from:st.from,to:st.to}),api('BANK_TXN_LIST',{from:st.from,to:st.to})]);
+  if(!r[0]||r[0].success===false)throw Error(r[0]&&r[0].error||'DSR could not be read');
+  st.dsr=(r[0].data&&r[0].data.byDate)||{};
+  if(r[1]&&r[1].success===false&&/unknown action|not handled/i.test(String(r[1].error||'')))throw Error('Deploy the new Code.gs (BANK_TXN_LIST missing)');
+  st.tx=(r[1]&&r[1].data&&r[1].data.rows)||[];
+ }catch(e){say('⚠️ '+(e.message||e),'error');}
+ st.busy=false;paint();
+}
+async function save(maps){
+ var r=await api('BANK_TXN_MAP',{maps:maps});
+ if(!r||r.success===false)throw Error(r&&r.error||'Mapping not saved');
+ maps.forEach(function(m){var t=st.tx.find(function(x){return x.key===m.key;});if(t){t.mapDate=m.mapDate||'';t.mapMode=m.mapMode||'';t.status=m.status||'';}});
+}
+/* ---------- UI ---------- */
+function css(){if(D.getElementById('bnxRcCss'))return;var s=D.createElement('style');s.id='bnxRcCss';s.textContent=
+ '#bnxRc{position:fixed;inset:0;z-index:100000;background:#f8fafc;display:flex;flex-direction:column;font:13px/1.35 inherit}'+
+ '#bnxRc .hd{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 14px;background:#fff;border-bottom:1px solid #e5e7eb}'+
+ '#bnxRc .hd b{font-size:16px;margin-right:auto}#bnxRc input[type=date]{border:1px solid #d1d5db;border-radius:8px;padding:5px 8px}'+
+ '#bnxRc .b{border:1px solid #d1d5db;background:#fff;border-radius:9px;padding:6px 11px;font-weight:800;cursor:pointer;white-space:nowrap}#bnxRc .b.p{background:#0d6efd;border-color:#0d6efd;color:#fff}'+
+ '#bnxRc .sum{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;padding:10px 14px}'+
+ '#bnxRc .k{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:8px 10px}#bnxRc .k small{color:#64748b;font-weight:700}#bnxRc .k div{display:flex;justify-content:space-between;font-variant-numeric:tabular-nums}'+
+ '#bnxRc .tabs{display:flex;gap:6px;padding:0 14px 8px}#bnxRc .tabs .b.on{background:#1e293b;color:#fff;border-color:#1e293b}'+
+ '#bnxRc .body{flex:1;overflow:auto;padding:0 14px 14px}#bnxRc table{border-collapse:collapse;width:100%;background:#fff;font-variant-numeric:tabular-nums}'+
+ '#bnxRc th{position:sticky;top:0;background:#0d6efd;color:#fff;padding:6px;font-size:11.5px;white-space:nowrap;z-index:1}#bnxRc th.g{background:#0b5ed7}'+
+ '#bnxRc td{border-bottom:1px solid #eef2f7;padding:5px 6px;text-align:right;white-space:nowrap}#bnxRc td:first-child{text-align:left;font-weight:800}'+
+ '#bnxRc td.c{cursor:pointer}#bnxRc td.c:hover{background:#eff6ff}#bnxRc .ok{color:#15803d}#bnxRc .bad{color:#dc2626;font-weight:800}#bnxRc .mut{color:#94a3b8}'+
+ '#bnxRc tr.tot td{background:#fff3c4;font-weight:900}#bnxRc thead tr:nth-child(2) th{top:28px}'+
+ '#bnxRcSide{position:fixed;top:0;right:0;bottom:0;width:min(560px,100%);background:#fff;z-index:100001;box-shadow:-10px 0 30px rgba(0,0,0,.2);display:flex;flex-direction:column}'+
+ '#bnxRcSide .sh{padding:10px 12px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;gap:8px}#bnxRcSide .sb{flex:1;overflow:auto;padding:8px 12px}'+
+ '#bnxRcSide .tx{border:1px solid #e5e7eb;border-radius:10px;padding:7px 9px;margin-bottom:6px}#bnxRcSide .tx.on{border-color:#16a34a;background:#f0fdf4}'+
+ '#bnxRcSide .tx .r1{display:flex;gap:8px;align-items:center}#bnxRcSide .tx .r1 b{margin-left:auto}#bnxRcSide .tx .nr{font-size:11.5px;color:#475569;word-break:break-all;margin:3px 0}'+
+ '#bnxRcSide select,#bnxRcSide input{border:1px solid #d1d5db;border-radius:7px;padding:3px 5px;font-size:12px}';D.head.appendChild(s);}
+function root(){return D.getElementById('bnxRc');}
+function paint(){
+ var el=root();if(!el)return;
+ var ds=days(),tot={},bt={};MODES.forEach(function(m){tot[m[0]]=0;bt[m[0]]=0;});
+ ds.forEach(function(d){var x=dsrDay(st.dsr[d]);MODES.forEach(function(m){tot[m[0]]+=x[m[0]];bankOf(d,m[0]).forEach(function(t){bt[m[0]]+=t.credit;});});});
+ var unm=st.tx.filter(function(t){return t.credit>0&&!t.mapDate&&t.status!=='IGNORED';});
+ el.querySelector('.sum').innerHTML=MODES.filter(function(m){return m[0]!=='OTHER'||tot.OTHER||bt.OTHER;}).map(function(m){var df=bt[m[0]]-tot[m[0]];
+   return '<div class="k"><small>'+m[1]+'</small><div><span>DSR</span><b>'+inr(tot[m[0]])+'</b></div><div><span>Bank</span><b>'+inr(bt[m[0]])+'</b></div><div><span>Diff</span><b class="'+(Math.abs(df)<1?'ok':'bad')+'">'+inr(df)+'</b></div></div>';}).join('')+
+  '<div class="k" style="cursor:pointer" data-tab="unmapped"><small>⚠️ Not mapped</small><div><span>'+unm.length+' credits</span><b class="'+(unm.length?'bad':'ok')+'">'+inr(unm.reduce(function(a,t){return a+t.credit;},0))+'</b></div><div><span>Imported</span><b>'+st.tx.length+'</b></div></div>';
+ el.querySelectorAll('.tabs .b').forEach(function(b){b.classList.toggle('on',b.getAttribute('data-tab')===st.tab);});
+ var body=el.querySelector('.body');
+ if(st.busy&&!st.tx.length&&!Object.keys(st.dsr).length){body.innerHTML='<div style="padding:30px;text-align:center;color:#64748b">⏳ Loading DSR and bank transactions…</div>';return;}
+ if(st.tab==='unmapped'||st.tab==='all'){
+  var list=(st.tab==='unmapped'?unm:st.tx.slice()).sort(function(a,b){return (a.date+a.key).localeCompare(b.date+b.key);});
+  body.innerHTML='<table><thead><tr><th>Bank date</th><th style="text-align:left">Narration</th><th>Account</th><th>Credit</th><th>Mode</th><th>Business date</th><th>Status</th></tr></thead><tbody>'+
+   (list.length?list.map(function(t){return '<tr data-key="'+esc(t.key)+'"><td>'+esc(t.date)+'</td><td style="text-align:left;white-space:normal;max-width:420px">'+esc(t.narration)+'</td><td style="font-size:11px">'+esc(t.account)+'</td><td>'+(t.credit?inr(t.credit):'<span class="mut">dr '+inr(t.debit)+'</span>')+'</td>'+
+     '<td><select data-mm>'+MODES.map(function(m){return '<option value="'+m[0]+'"'+((t.mapMode||t.mode)===m[0]?' selected':'')+'>'+m[1]+'</option>';}).join('')+'</select></td>'+
+     '<td><input type="date" data-md value="'+esc(t.mapDate||'')+'"></td><td>'+(t.status==='IGNORED'?'<span class="mut">ignored</span> <button class="b" data-un>undo</button>':t.mapDate?'<span class="ok">✔ '+esc(t.status||'mapped')+'</span>':'<button class="b" data-ig title="Not a sale collection (transfer, refund…)">Ignore</button>')+'</td></tr>';}).join('')
+    :'<tr><td colspan="7" style="text-align:center;padding:20px" class="ok">✔ Nothing left to map.</td></tr>')+'</tbody></table>';
+  return;
+ }
+ var h='<table><thead><tr><th rowspan="2">Date</th>'+MODES.filter(function(m){return m[0]!=='OTHER';}).map(function(m){return '<th colspan="3" class="g">'+m[1]+'</th>';}).join('')+'<th rowspan="2">Total diff</th></tr><tr>'+
+  MODES.filter(function(m){return m[0]!=='OTHER';}).map(function(){return '<th>DSR</th><th>Bank</th><th>Diff</th>';}).join('')+'</tr></thead><tbody>';
+ ds.forEach(function(d){var x=dsrDay(st.dsr[d]),td=0;
+  h+='<tr><td>'+esc(d.slice(8)+'-'+d.slice(5,7))+'</td>'+MODES.filter(function(m){return m[0]!=='OTHER';}).map(function(m){var k=m[0],b=bankOf(d,k).reduce(function(a,t){return a+t.credit;},0),df=b-x[k];
+    if(k!=='ZOMATO'&&k!=='SWIGGY')td+=df;
+    return '<td class="c" data-d="'+d+'" data-m="'+k+'">'+(x[k]?inr(x[k]):'<span class="mut">–</span>')+'</td><td class="c" data-d="'+d+'" data-m="'+k+'">'+(b?inr(b):'<span class="mut">–</span>')+'</td><td class="c '+(Math.abs(df)<1?'ok':'bad')+'" data-d="'+d+'" data-m="'+k+'">'+(x[k]||b?(Math.abs(df)<1?'✔':inr(df)):'')+'</td>';}).join('')+
+   '<td class="'+(Math.abs(td)<1?'ok':'bad')+'">'+(Math.abs(td)<1?'✔':inr(td))+'</td></tr>';});
+ h+='<tr class="tot"><td>Total</td>'+MODES.filter(function(m){return m[0]!=='OTHER';}).map(function(m){var df=bt[m[0]]-tot[m[0]];return '<td>'+inr(tot[m[0]])+'</td><td>'+inr(bt[m[0]])+'</td><td>'+inr(df)+'</td>';}).join('')+'<td></td></tr></tbody></table>'+
+  '<div style="font-size:11.5px;color:#64748b;margin-top:8px">Card / Google-UPI settlements are put on the previous business day (or the date in the narration); bank charges (MDR) show as a small minus. Zomato / Swiggy pay weekly — compare the period total or map each payout to its days. Cash = cash sales + cash due received vs cash deposited.</div>';
+ body.innerHTML=h;
+}
+function side(day,mode){
+ var old=D.getElementById('bnxRcSide');if(old)old.remove();
+ var el=D.createElement('div');el.id='bnxRcSide';D.body.appendChild(el);
+ function draw(){
+  var x=dsrDay(st.dsr[day])[mode],mine=bankOf(day,mode),lo=shift(day,-3),hi=shift(day,7);
+  var cand=st.tx.filter(function(t){return t.credit>0&&t.status!=='IGNORED'&&mine.indexOf(t)<0&&(t.mode===mode||t.mapMode===mode)&&((!t.mapDate&&t.date>=lo&&t.date<=hi)||(t.mapDate&&t.mapDate>=lo&&t.mapDate<=hi));});
+  var got=mine.reduce(function(a,t){return a+t.credit;},0);
+  function card(t,on){return '<label class="tx'+(on?' on':'')+'"><div class="r1"><input type="checkbox" data-k="'+esc(t.key)+'"'+(on?' checked':'')+'><span>🏦 '+esc(t.date)+(t.mapDate&&!on?' · now on '+esc(t.mapDate):'')+'</span><b>'+inr(t.credit)+'</b></div><div class="nr">'+esc(t.narration)+'</div><small class="mut">'+esc(t.account)+'</small></label>';}
+  el.innerHTML='<div class="sh"><b style="flex:1">'+esc(LABEL[mode])+' · '+esc(day)+'</b><button class="b" data-x>✕</button></div>'+
+   '<div class="sh" style="justify-content:space-between;font-variant-numeric:tabular-nums"><span>DSR <b>'+inr(x)+'</b></span><span>Bank <b>'+inr(got)+'</b></span><span>Diff <b class="'+(Math.abs(got-x)<1?'ok':'bad')+'">'+inr(got-x)+'</b></span></div>'+
+   '<div class="sb"><div style="font-weight:800;margin:4px 0">✔ Mapped to this day ('+mine.length+')</div>'+(mine.map(function(t){return card(t,true);}).join('')||'<div class="mut">None</div>')+
+   '<div style="font-weight:800;margin:10px 0 4px">Nearby '+esc(LABEL[mode])+' credits — tick to put on '+esc(day)+'</div>'+(cand.map(function(t){return card(t,false);}).join('')||'<div class="mut">No other credits of this mode within −3 / +7 days.</div>')+'</div>';
+  el.querySelector('[data-x]').onclick=function(){el.remove();};
+  el.querySelectorAll('[data-k]').forEach(function(cb){cb.onchange=async function(){var k=cb.getAttribute('data-k');cb.disabled=true;
+   try{await save([cb.checked?{key:k,mapDate:day,mapMode:mode,status:'MAPPED'}:{key:k,mapDate:'',mapMode:'',status:''}]);}catch(e){say('⚠️ '+e.message,'error');}
+   draw();paint();};});
+ }
+ draw();
+}
+async function doImport(){
+ var inp=D.createElement('input');inp.type='file';inp.accept='.xlsx,.xls,.csv';inp.multiple=true;
+ inp.onchange=async function(){var files=[].slice.call(inp.files||[]);if(!files.length)return;
+  for(var i=0;i<files.length;i++){var f=files[i];
+   try{say('⏳ Reading '+f.name+'…');var rows=await readFile(f);
+    if(!rows.length){say('⚠️ '+f.name+': no Date / Credit (or Amount) columns found','error');continue;}
+    var cr=rows.filter(function(r){return r.credit>0;}),by={};cr.forEach(function(r){by[r.mode]=(by[r.mode]||0)+r.credit;});
+    if(!confirm(f.name+'\n\n'+rows.length+' lines ('+cr.length+' credits)\n'+Object.keys(by).map(function(k){return (LABEL[k]||k)+': '+inr(by[k]);}).join('\n')+'\n\nImport?'))continue;
+    var tot={added:0,duplicates:0,invalid:0};
+    for(var j=0;j<rows.length;j+=4000){var r=await api('BANK_TXN_IMPORT',{rows:rows.slice(j,j+4000),file:f.name},120000);
+     if(!r||r.success===false)throw Error(r&&r.error||'Import failed');['added','duplicates','invalid'].forEach(function(k){tot[k]+=n(r.data&&r.data[k]);});}
+    say('✅ '+f.name+': '+tot.added+' new · '+tot.duplicates+' already imported'+(tot.invalid?' · '+tot.invalid+' skipped':''),'success');
+   }catch(e){say('⚠️ '+f.name+': '+(e.message||e),'error');}
+  }
+  load();
+ };
+ inp.click();
+}
+function exportXl(){
+ if(!W.XLSX){say('Excel library still loading','error');return;}
+ var hd=['Date'];MODES.forEach(function(m){hd.push(m[0]+' DSR',m[0]+' Bank',m[0]+' Diff');});
+ var aoa=[hd];days().forEach(function(d){var x=dsrDay(st.dsr[d]),r=[d];MODES.forEach(function(m){var b=bankOf(d,m[0]).reduce(function(a,t){return a+t.credit;},0);r.push(Math.round(x[m[0]]*100)/100,Math.round(b*100)/100,Math.round((b-x[m[0]])*100)/100);});aoa.push(r);});
+ var wb=W.XLSX.utils.book_new();W.XLSX.utils.book_append_sheet(wb,W.XLSX.utils.aoa_to_sheet(aoa),'Collection Recon');
+ W.XLSX.writeFile(wb,'Collection_Reconciliation_'+st.from+'_to_'+st.to+'.xlsx');
+}
+W.bnxCollectionRecon=function(from,to){
+ css();var old=root();if(old)old.remove();
+ var t=new Date();st.to=to||(typeof W.getBusinessDate==='function'?W.getBusinessDate():iso(t));st.from=from||st.to.slice(0,8)+'01';st.tab='days';
+ var el=D.createElement('div');el.id='bnxRc';
+ el.innerHTML='<div class="hd"><b>🔄 Collection reconciliation — DSR vs Bank / Swipe</b><input type="date" data-f value="'+st.from+'"><span>→</span><input type="date" data-t value="'+st.to+'">'+
+  '<button class="b" data-r>↻ Load</button><button class="b p" data-imp>📥 Import bank / swipe file</button><button class="b" data-auto title="Map every unmapped credit to its usual business day">⚡ Auto-map</button><button class="b" data-xl>📊 Excel</button><button class="b" data-x>✕</button></div>'+
+  '<div class="sum"></div><div class="tabs"><button class="b" data-tab="days">📅 Day-wise</button><button class="b" data-tab="unmapped">⚠️ Not mapped</button><button class="b" data-tab="all">🏦 All transactions</button></div><div class="body"></div>';
+ D.body.appendChild(el);
+ el.addEventListener('click',async function(e){var t=e.target,b;
+  if(t.closest('[data-x]')){el.remove();var s=D.getElementById('bnxRcSide');if(s)s.remove();return;}
+  if(t.closest('[data-r]')){st.from=el.querySelector('[data-f]').value;st.to=el.querySelector('[data-t]').value;if(st.from>st.to){say('From date is after To date','error');return;}load();return;}
+  if(t.closest('[data-imp]')){doImport();return;}
+  if(t.closest('[data-xl]')){exportXl();return;}
+  if((b=t.closest('[data-tab]'))){st.tab=b.getAttribute('data-tab');paint();return;}
+  if(t.closest('[data-auto]')){var maps=st.tx.filter(function(x){return x.credit>0&&!x.mapDate&&x.status!=='IGNORED';}).map(function(x){var md=mapDateOf(x);return md?{key:x.key,mapDate:md,mapMode:x.mode,status:'AUTO'}:null;}).filter(Boolean);
+   if(!maps.length){say('Nothing to auto-map (Zomato / Swiggy / Other are mapped by hand)','info');return;}
+   try{await save(maps);say('⚡ '+maps.length+' credits mapped','success');}catch(err){say('⚠️ '+err.message,'error');}paint();return;}
+  var c=t.closest('td.c');if(c){side(c.getAttribute('data-d'),c.getAttribute('data-m'));return;}
+  var tr=t.closest('tr[data-key]');if(tr&&(t.closest('[data-ig]')||t.closest('[data-un]'))){var k=tr.getAttribute('data-key');
+   try{await save([t.closest('[data-ig]')?{key:k,mapDate:'',mapMode:'',status:'IGNORED'}:{key:k,mapDate:'',mapMode:'',status:''}]);}catch(err){say('⚠️ '+err.message,'error');}paint();}
+ });
+ el.addEventListener('change',async function(e){var tr=e.target.closest('tr[data-key]');if(!tr)return;var k=tr.getAttribute('data-key'),md=tr.querySelector('[data-md]').value,mm=tr.querySelector('[data-mm]').value;
+  try{await save([{key:k,mapDate:md,mapMode:mm,status:md?'MAPPED':''}]);}catch(err){say('⚠️ '+err.message,'error');}paint();});
+ paint();load();
+};
+/* entry points: Report Hub reconciliation card + its header */
+function hookBtn(){var card=D.getElementById('rpt-anchor-recon-csv');if(!card||card.querySelector('[data-bnx-rc]'))return;
+ var bar=card.querySelector('.card-header>div')||card.querySelector('.card-header');if(!bar)return;
+ var b=D.createElement('button');b.type='button';b.className='btn btn-sm btn-primary';b.setAttribute('data-bnx-rc','1');b.textContent='🔄 Collection reconciliation (import & map)';
+ b.onclick=function(){W.bnxCollectionRecon();};bar.insertBefore(b,bar.firstChild);}
+hookBtn();setInterval(hookBtn,2500);
+W.__bnxReconParse={parseSheet:parseSheet,classify:classify,pdate:pdate,mapDateOf:mapDateOf};
+})(window,document);
 </script>
