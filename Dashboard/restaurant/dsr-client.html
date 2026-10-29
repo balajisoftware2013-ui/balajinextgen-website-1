@@ -3965,6 +3965,15 @@ function swiftDate_(row){
   if(m)return `${m[1]}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}`;
   return bnxIsoDay_(d);   /* FIX 2026-10-14: toISOString() moved IST dates one day back */
 }
+/* 2026-10-29: business day of a swipe (06:00 cutoff) — the Reconciliation totals used the calendar date, so night swipes
+   (00:00–05:59) were counted on the next day and CARD / UPI "DSR vs Swift" showed false differences the Swift tab did not. */
+function bnxSwiftBiz_(row){
+  const d=swiftDate_(row);if(!d)return '';
+  const t=swiftText_(row,'date').match(/[ T](\d{1,2}):(\d{2})/);
+  if(!t||Number(t[1])>=6)return d;
+  const x=new Date(d+'T12:00:00');x.setDate(x.getDate()-1);
+  return x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0');
+}
 function swiftMode_(row){
   const x=swiftText_(row,'mode').toUpperCase();
   if(/UPI|QR|GPAY|GOOGLE|PHONEPE|PAYTM/.test(x))return 'UPI';
@@ -5270,7 +5279,7 @@ async function _loadDsrReconciliationImpl_(force){
      Before, the table stayed on "Loading…" until the slow / expired live call came back (or forever), so Reconciliation looked empty. */
   const paint=async()=>{
     // Local Swift fallback remains available when the backend reconciliation endpoint is unavailable.
-    const swiftTxnRows=(typeof swiftRows!=='undefined'&&Array.isArray(swiftRows)?swiftRows:[]).map(r=>({date:swiftDate_(r),mode:swiftMode_(r),amount:swiftNum_(r,'amount'),net:swiftMap.settle?swiftNum_(r,'settle'):swiftNum_(r,'amount')-swiftNum_(r,'charge'),charge:swiftNum_(r,'charge'),ref:swiftText_(r,'ref')})).filter(r=>(!rf||!r.date||r.date>=rf)&&(!rt||!r.date||r.date<=rt));
+    const swiftTxnRows=(typeof swiftRows!=='undefined'&&Array.isArray(swiftRows)?swiftRows:[]).filter(r=>{const st=String((swiftMap.status&&r[swiftMap.status])||r['Transaction Status']||r['Status']||r['TRANSACTION STATUS']||'');return !/FAIL|DECLIN|REVERS|REFUND|VOID|CANCEL|PENDING|TIMEOUT/i.test(st);}).map(r=>({date:bnxSwiftBiz_(r),mode:swiftMode_(r),amount:swiftNum_(r,'amount'),net:swiftMap.settle?swiftNum_(r,'settle'):swiftNum_(r,'amount')-Math.abs(swiftNum_(r,'charge'))-Math.abs(swiftNum_(r,'tax')),charge:Math.abs(swiftNum_(r,'charge'))+Math.abs(swiftNum_(r,'tax')),ref:swiftText_(r,'ref')})).filter(r=>(!rf||!r.date||r.date>=rf)&&(!rt||!r.date||r.date<=rt));
     const swiftCard=swiftTxnRows.filter(r=>r.mode==='CARD').reduce((s,r)=>s+r.amount,0);
     const swiftUpi=swiftTxnRows.filter(r=>r.mode==='UPI').reduce((s,r)=>s+r.amount,0);
     const swiftTotal=swiftCard+swiftUpi;
@@ -7622,8 +7631,24 @@ html.bnx-embedded #step-4 .dsr-row *{font-size:inherit}
   /* map store */
   function mkey(){ return 'bnx_swift_map_'+cid(); }
   var MAP=null;
-  function maps(){ if(MAP) return MAP; try{ MAP=JSON.parse(localStorage.getItem(mkey())||'{}')||{}; }catch(e){ MAP={}; } return MAP; }
-  function saveMaps(){ try{ localStorage.setItem(mkey(),JSON.stringify(MAP||{})); }catch(e){ showToast('⚠️ Could not save mapping on this device','err'); } }
+  /* 2026-10-29: mappings (+ payer name / status) are shared through the server (SWIFT_MAP_LIST / SWIFT_MAP_SAVE): every PC
+     sees the same mapping. This PC's copy shows at once; the server copy is merged in (newest change wins). */
+  var SRV={loaded:false,busy:false,dirty:{}};
+  function pullServer(){ if(SRV.busy||typeof gasApi!=='function') return; SRV.busy=true;
+    Promise.resolve(gasApi('SWIFT_MAP_LIST',{},'V2_CORE')).then(function(r){ if(!r||!r.success||!r.data||!r.data.maps) return;
+      var M=maps(),ch=false,srv=r.data.maps,up=[];
+      Object.keys(srv).forEach(function(k){ var a=srv[k],b=M[k]; if(!b||(Number(a.at)||0)>(Number(b.at)||0)){ if(!a.to&&!a.payer&&!a.status){ if(b){delete M[k];ch=true;} return; } M[k]={to:a.to,date:a.date,payer:a.payer,status:a.status,note:a.note,at:Number(a.at)||Date.now()}; ch=true; } });
+      Object.keys(M).forEach(function(k){ var a=srv[k]; if(!a||(Number(M[k].at)||0)>(Number(a.at)||0)) up.push(Object.assign({key:k},M[k])); });   /* this PC's older local-only mappings go up once */
+      SRV.loaded=true; if(ch){ try{ localStorage.setItem(mkey(),JSON.stringify(M)); }catch(e){} try{ W.renderSwiftReport(); W.bnxSwiftDsrStrip_&&W.bnxSwiftDsrStrip_(); }catch(e){} }
+      if(up.length) gasApi('SWIFT_MAP_SAVE',{maps:up.slice(0,2000)},'V2_CORE');
+    }).catch(function(){}).finally(function(){ SRV.busy=false; }); }
+  function maps(){ if(MAP) return MAP; try{ MAP=JSON.parse(localStorage.getItem(mkey())||'{}')||{}; }catch(e){ MAP={}; } setTimeout(pullServer,0); return MAP; }
+  setInterval(function(){ if(!D.hidden) pullServer(); },60000);
+  W.bnxSwiftSetMap_=function(key,patch){ var M=maps(); M[key]=Object.assign({},M[key]||{},patch||{},{at:Date.now()}); if(patch&&patch.date===null){ delete M[key].date; } saveMaps([key]); };
+  function saveMaps(keys){ try{ localStorage.setItem(mkey(),JSON.stringify(MAP||{})); }catch(e){ showToast('⚠️ Could not save mapping on this device','err'); }
+    (keys||[]).forEach(function(k){ var m=(MAP||{})[k]; SRV.dirty[k]=m?Object.assign({key:k},m):{key:k,remove:true,at:Date.now()}; });
+    var list=Object.keys(SRV.dirty).map(function(k){ return SRV.dirty[k]; }); if(!list.length||typeof gasApi!=='function') return;
+    Promise.resolve(gasApi('SWIFT_MAP_SAVE',{maps:list},'V2_CORE')).then(function(r){ if(r&&r.success){ list.forEach(function(x){ if(SRV.dirty[x.key]===x) delete SRV.dirty[x.key]; }); } else showToast('⚠️ Mapping saved on this PC; server not updated yet ('+((r&&r.error)||'no answer')+')','err'); }).catch(function(){}); }
   var CACHE={sig:'',list:[]};
   W.bnxSwiftTxns_=function(){
     var rows=(typeof swiftRows!=='undefined'&&Array.isArray(swiftRows))?swiftRows:[];
@@ -7659,7 +7684,7 @@ html.bnx-embedded #step-4 .dsr-row *{font-size:inherit}
     return CACHE.list.map(function(t){
       var m=M[t.key];
       var to=m&&m.to?m.to:(t.sale?(t.legacy==='-'?'REVIEW':'POS'):'FEE');
-      return Object.assign({},t,{to:to,cdate:(m&&m.date)||t.biz,manual:!!m});
+      return Object.assign({},t,{to:to,cdate:(m&&m.date)||t.biz,manual:!!(m&&m.to),payer:(m&&m.payer)||'',ustat:(m&&m.status)||''});
     });
   };
 
@@ -7726,7 +7751,7 @@ html.bnx-embedded #step-4 .dsr-row *{font-size:inherit}
     if(!all.length){ body.innerHTML='<tr><td colspan="10" style="text-align:center;color:var(--muted)">Upload a Swift Transaction file (Settings → Swift Transaction &amp; Settlement Upload) to view and map transactions.</td></tr>'; if(foot) foot.innerHTML=''; renderMatch(from,to,all); return; }
     var LIM=1500, shown=rows.slice(0,LIM);
     body.innerHTML=shown.length?shown.map(function(t){
-      return '<tr data-k="'+esc(t.key)+'"><td><b>'+esc(t.to==='FEE'?t.biz:t.cdate)+'</b>'+(t.manual?' <span title="mapped by hand">✎</span>':'')+'</td><td>'+esc(t.date)+(t.time?' · '+esc(t.time):'')+'</td><td style="font-family:monospace;font-size:10.5px">'+esc(t.ref||'—')+'</td><td>'+esc(t.mode)+'</td><td class="r">'+money(t.amount)+'</td><td class="r">'+money(t.charge)+'</td><td class="r"><b>'+money(t.net)+'</b></td><td>'+esc(t.settle||'—')+'</td><td>'+badge(t)+'</td><td><button type="button" class="bnx-sw-ico" title="Map this transaction (POS sale / Due received bank / exclude) and set its collection date" data-map="'+esc(t.key)+'">🔗</button></td></tr>';
+      return '<tr data-k="'+esc(t.key)+'"><td><b>'+esc(t.to==='FEE'?t.biz:t.cdate)+'</b>'+(t.manual?' <span title="mapped by hand">✎</span>':'')+'</td><td>'+esc(t.date)+(t.time?' · '+esc(t.time):'')+'</td><td style="font-family:monospace;font-size:10.5px">'+esc(t.ref||'—')+'</td><td>'+esc(t.mode)+'</td><td class="r">'+money(t.amount)+'</td><td class="r">'+money(t.charge)+'</td><td class="r"><b>'+money(t.net)+'</b></td><td>'+esc(t.settle||'—')+'</td><td>'+badge(t)+(t.payer?'<div style="font-size:10.5px;font-weight:700;margin-top:2px">👤 '+esc(t.payer)+'</div>':'')+(t.ustat?'<div style="font-size:10px;font-weight:800;margin-top:2px;color:'+({Pending:'#b45309',Received:'#15803d',Verified:'#15803d',Disputed:'#b42318',Refunded:'#6b7280'}[t.ustat]||'#374151')+'">● '+esc(t.ustat)+'</div>':'')+(/FAIL|DECLIN|REVERS/.test(t.status||'')?'<div style="font-size:10px;font-weight:800;color:#b42318">✖ '+esc(t.status)+'</div>':'')+'</td><td><button type="button" class="bnx-sw-ico" title="Map this transaction (POS sale / Due received bank / exclude) and set its collection date" data-map="'+esc(t.key)+'">🔗</button></td></tr>';
     }).join('')+(rows.length>LIM?'<tr><td colspan="10" style="text-align:center;color:var(--muted)">Showing first '+LIM+' of '+rows.length+' — narrow the date range.</td></tr>':'')
       :'<tr><td colspan="10" style="text-align:center;color:var(--muted)">No Swift transactions for '+esc(from)+(to!==from?' → '+esc(to):'')+(FILTER!=='ALL'?' in this filter':'')+'.</td></tr>';
     var tot={a:0,c:0,n:0}; rows.forEach(function(t){ tot.a+=t.amount; tot.c+=t.charge; tot.n+=t.net; });
@@ -7770,6 +7795,9 @@ html.bnx-embedded #step-4 .dsr-row *{font-size:inherit}
       '<label class="opt"><input type="radio" name="bnxSwTo" value="DUE"'+(t.to==='DUE'?' checked':'')+'> Due Received (Bank)</label>'+
       '<label class="opt"><input type="radio" name="bnxSwTo" value="EXCL"'+(t.to==='EXCL'?' checked':'')+'> Exclude (not this DSR)</label>'+
       '<div style="margin-top:8px;font-weight:700">Collection date (DSR date)</div><input type="date" id="bnxSwDate" class="fi" style="width:100%;margin-top:4px" value="'+esc(t.cdate||t.biz)+'">'+
+      '<div style="margin-top:8px;font-weight:700">Payer name</div><input type="text" id="bnxSwPayer" class="fi" maxlength="80" style="width:100%;margin-top:4px" placeholder="Guest / company (for due received)" value="'+esc(t.payer||'')+'">'+
+      '<div style="margin-top:8px;font-weight:700">Status</div><select id="bnxSwStat" class="fi" style="width:100%;margin-top:4px">'+['','Pending','Received','Verified','Disputed','Refunded'].map(function(x){ return '<option value="'+x+'"'+((t.ustat||'')===x?' selected':'')+'>'+(x||'— (not set)')+'</option>'; }).join('')+'</select>'+
+      '<div style="font-size:10px;color:var(--muted);margin-top:4px">Swift status: '+esc(t.status||'—')+(t.settle?' · settled '+esc(t.settle):' · not settled yet')+'</div>'+
       '<div style="font-size:10px;color:var(--muted);margin-top:4px">Business date of the swipe: '+esc(t.biz)+(t.biz!==t.date?' (before 06:00 → previous day)':'')+'</div>'+
       '<div class="row"><button type="button" data-act="reset" title="Back to automatic mapping">Auto</button><button type="button" data-act="unmatch" title="Remove from DSR match (not counted anywhere)" style="color:#b42318">Unmatch</button><button type="button" data-act="cancel">Cancel</button><button type="button" class="prim" data-act="save">Match</button></div>';
     D.body.appendChild(p);
@@ -7780,15 +7808,16 @@ html.bnx-embedded #step-4 .dsr-row *{font-size:inherit}
       var a=ev.target.closest('button[data-act]'); if(!a) return;
       var M=maps();
       if(a.dataset.act==='cancel'){ closePop(); return; }
-      if(a.dataset.act==='reset'){ delete M[key]; }
-      if(a.dataset.act==='unmatch'){ M[key]={to:'REVIEW',date:((p.querySelector('#bnxSwDate')||{}).value)||t.cdate||t.biz,at:Date.now()}; }
+      var pay=String((p.querySelector('#bnxSwPayer')||{}).value||'').trim(),ust=String((p.querySelector('#bnxSwStat')||{}).value||'');
+      if(a.dataset.act==='reset'){ if(pay||ust) M[key]={payer:pay,status:ust,at:Date.now()}; else delete M[key]; }
+      if(a.dataset.act==='unmatch'){ M[key]={to:'REVIEW',date:((p.querySelector('#bnxSwDate')||{}).value)||t.cdate||t.biz,payer:pay,status:ust,at:Date.now()}; }
       if(a.dataset.act==='save'){
         var to=(p.querySelector('input[name=bnxSwTo]:checked')||{}).value, dt=(p.querySelector('#bnxSwDate')||{}).value;
         if(!to){ showToast('Choose POS Sale, Due Received or Exclude','err'); return; }
         if(!/^\d{4}-\d{2}-\d{2}$/.test(dt||'')){ showToast('Enter the collection date','err'); return; }
-        M[key]={to:to,date:dt,at:Date.now()};
+        M[key]={to:to,date:dt,payer:pay,status:ust,at:Date.now()};
       }
-      saveMaps(); closePop(); W.renderSwiftReport(); try{ W.bnxSwiftDsrStrip_(); }catch(_){}
+      saveMaps([key]); closePop(); W.renderSwiftReport(); try{ W.bnxSwiftDsrStrip_(); }catch(_){}
       showToast(a.dataset.act==='reset'?'Mapping set back to automatic':a.dataset.act==='unmatch'?'Unmatched — removed from DSR match':'✅ Matched — DSR match updated','ok');
     });
   });
@@ -8675,7 +8704,7 @@ html:not(#_t1):not(#_t2):not(#_t3) body .dsr-matrix .metric{background:rgba(var(
     return orig.apply(this,arguments).map(function(t){
       var r=rows[t.idx]||{}, m={}; Object.keys(r).forEach(function(k){ m[nh(k)]=k; });
       function g(names){ for(var i=0;i<names.length;i++){ var k=m[names[i]]; if(k!==undefined&&String(r[k]).trim()!=='') return String(r[k]).trim(); } return ''; }
-      var payer=g(['payername','payer','remittername','beneficiaryname','customername','name','narration','description','particulars']);
+      var payer=t.payer||g(['payername','payer','remittername','beneficiaryname','customername','name','narration','description','particulars']);   /* 2026-10-29: payer typed in the mapping wins over the sheet */
       var o=Object.assign({},t,{payer:payer,sheetStatus:g(['settlementstatus','status'])});
       var cd=parseD(g(['collectiondate','collectiondt']));
       o.biz=bizOwn(t,+OPT.hour||0); o.sheetCd=cd; o.base=OPT.auto?o.biz:t.date; if(!t.manual) o.cdate=o.base;
@@ -8820,7 +8849,7 @@ html:not(#_t1):not(#_t2):not(#_t3) body .dsr-matrix .metric{background:rgba(var(
       var r=o.querySelector('input[name="bnxCdR"]:checked'); var v=r?r.value:'';
       if(v==='custom') v=o.querySelector('#bnxCdCustom').value;
       if(!/^\d{4}-\d{2}-\d{2}$/.test(v||'')){ if(typeof showToast==='function') showToast('Choose a date','err'); return; }
-      var m=cdOv(); if(v===def) delete m[key]; else m[key]=v; cdSave(m); o.remove(); refreshAll();
+      var m=cdOv(); if(v===def) delete m[key]; else m[key]=v; cdSave(m); try{ if(W.bnxSwiftSetMap_) W.bnxSwiftSetMap_(key,{to:t.to,date:v}); }catch(_){} o.remove(); refreshAll();   /* 2026-10-29: shared with every PC */
       if(typeof showToast==='function') showToast('Collection date '+dmy(v)+' saved','ok');
     };
     var db=o.querySelector('#bnxCdDel'); if(db) db.onclick=function(){ var m=cdOv(); delete m[key]; cdSave(m); o.remove(); refreshAll(); if(typeof showToast==='function') showToast('Edit removed — back to '+(t.sheetCd?'sheet / ':'')+'auto date','ok'); };
@@ -10073,7 +10102,9 @@ var dueSeq=0;
 async function loadDueOnce(asOf){
  var ds=String(asOf||D.getElementById('repDate')?.value||'').slice(0,10),tenant=getClientId_(),token=getSessionToken_(),run=++dueSeq;
  if(!/^\d{4}-\d{2}-\d{2}$/.test(ds))return false;
- unavailable(ds,'A current balance snapshot does not establish historical opening outstanding.');
+ /* 2026-10-29 ("opening / closing outstanding sometimes shown, sometimes not"): every 10-s refresh blanked them first.
+    Now they are blanked only when a different date is chosen; the last good figures for this date stay on screen. */
+ if(W.__bnxDuesShownFor!==tenant+'|'+ds)unavailable(ds,'Loading dated balances…');
  paintReceiptTotals();
  var cached=outstandingCache[tenant];
  try{var parent=bnxDsrAccessibleParent_();if(!cached&&parent&&typeof parent.bnxCurrentClient_==='function'&&String(parent.bnxCurrentClient_())===String(tenant)){var saved=parent.__bnxDuesSheet||parent.__bnxDueLive;if(saved&&saved.totalOutstanding!=null&&Number.isFinite(Number(saved.totalOutstanding)))cached={value:Number(saved.totalOutstanding)};}}catch(e){}
@@ -10091,14 +10122,27 @@ async function loadDueOnce(asOf){
   if(hasLive){outstandingCache[tenant]={value:Number(live),at:Date.now()};paintCurrent(ds,live,false);}
   paintReceiptTotals();
   var msg=hasLive?'Current outstanding (now): ₹'+Number(live).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})+'. ':'';
-  if(closing!==null){['d','m','y'].forEach(function(p){var cl=D.getElementById(p+'_currgd');if(cl){cl.textContent=fmt(closing);cl.dataset.live='1';cl.dataset.asOf=ds;cl.title=dated?'Server balance dated '+ds:'Current outstanding as of refresh; today is still in progress.';}});msg+='Closing is '+(dated?'dated '+ds:'current as of refresh')+'. ';}
-  msg+='Historical opening is unavailable unless a dated ledger/opening snapshot is returned. Current outstanding is not substituted for historical opening.';
+  /* dated opening figures from the server roll-back: day opening, month opening (end of last month), year opening (31 Mar) */
+  var opn={d:x.openingAsOf,m:x.monthOpening,y:x.yearOpening},anyOpen=false;
+  ['d','m','y'].forEach(function(p){var v=opn[p],op=D.getElementById(p+'_opengd');if(!op||v===undefined||v===null||!Number.isFinite(Number(v)))return;anyOpen=true;
+   var t=String(Math.round(Number(v)*100)/100);if('value' in op){op.value=t;op.placeholder='';}else op.textContent=fmt(Number(v));op.dataset.live='1';op.readOnly=true;op.title=(p==='d'?'Opening of '+ds:p==='m'?'Month opening (end of previous month)':'Year opening (31 March)')+' — rolled back from the live balance by the DSR dues movement';});
+  W.__bnxDuesVals=W.__bnxDuesVals||{};W.__bnxDuesVals[tenant+'|'+ds]={open:opn,close:closing,dated:dated};
+  if(anyOpen||closing!==null){try{BNX_DUE_CONTROL_={date:ds,daily:{opening:opn.d,closing:closing},mtd:{opening:opn.m,closing:closing},ytd:{opening:opn.y,closing:closing},currentOutstanding:hasLive?Number(live):null,loaded:true};}catch(_){}}
+  if(anyOpen){W.__bnxDuesShownFor=tenant+'|'+ds;try{['d','m','y'].forEach(function(p){var op=D.getElementById(p+'_opengd');if(op&&op.dispatchEvent)op.dispatchEvent(new Event('input',{bubbles:true}));});}catch(_){}}
+  if(closing!==null){W.__bnxDuesShownFor=tenant+'|'+ds;['d','m','y'].forEach(function(p){var cl=D.getElementById(p+'_currgd');if(cl){cl.textContent=fmt(closing);cl.dataset.live='1';cl.dataset.asOf=ds;cl.title=dated?'Server balance dated '+ds:'Current outstanding as of refresh; today is still in progress.';}});msg+='Closing is '+(dated?'dated '+ds:'current as of refresh')+'. ';}
+  msg+=anyOpen?'Opening and closing outstanding are dated '+ds+'.':'Historical opening is unavailable unless a dated ledger/opening snapshot is returned (deploy the latest Code.gs).';
   note(msg);return closing!==null;
- }catch(e){if(run===dueSeq&&tenant===getClientId_()&&D.getElementById('repDate')?.value===ds){unavailable(ds,String(e.message||e));note('Dues could not refresh: '+String(e.message||e)+'. Historical balances are not estimated.');}return false;}
+ }catch(e){if(run===dueSeq&&tenant===getClientId_()&&D.getElementById('repDate')?.value===ds){if(W.__bnxDuesShownFor!==tenant+'|'+ds)unavailable(ds,String(e.message||e));note('Dues could not refresh: '+String(e.message||e)+'. Historical balances are not estimated.');}return false;}
 };
 loadDsrDueControl_=function(asOf){var key=getClientId_()+'|'+getSessionToken_()+'|'+String(asOf||D.getElementById('repDate')?.value||'');if(dueFlights.has(key))return dueFlights.get(key);var task=loadDueOnce(asOf).finally(function(){dueFlights.delete(key);});dueFlights.set(key,task);return task;};
 // Old parent rollback must not repaint an unverified opening after recalc/exports.
-bnxAtomicPaintDues_=function(){paintReceiptTotals();var ds=D.getElementById('repDate')?.value,c=outstandingCache[getClientId_()];if(c)paintCurrent(ds,c.value,false);return false;};
+bnxAtomicPaintDues_=function(){paintReceiptTotals();var ds=D.getElementById('repDate')?.value,c=outstandingCache[getClientId_()];if(c)paintCurrent(ds,c.value,false);
+ /* 2026-10-29: the day repaint (loadDayData) wipes opening / closing to "Unavailable" — put the dated figures for this date back */
+ try{var dv=(W.__bnxDuesVals||{})[getClientId_()+'|'+ds];if(dv){['d','m','y'].forEach(function(p){var v=dv.open&&dv.open[p],op=D.getElementById(p+'_opengd'),cl=D.getElementById(p+'_currgd');
+   if(op&&v!=null&&Number.isFinite(Number(v))){op.value=String(Math.round(Number(v)*100)/100);op.placeholder='';op.dataset.live='1';}
+   if(cl&&dv.close!=null&&Number.isFinite(Number(dv.close))){cl.textContent=fmt(Number(dv.close));cl.dataset.live='1';cl.dataset.asOf=ds;}});
+   try{if(typeof recalcAll==='function'&&!W.__bnxDuesRecalc){W.__bnxDuesRecalc=1;try{recalcAll();}finally{W.__bnxDuesRecalc=0;}}}catch(_){}}}catch(_){}
+ return false;};
 async function refresh(force){
  if(stopped||!visible()||(!force&&editing()))return false;
  try{if(W.parent!==W&&W.parent._isSavingBill)return false;}catch(e){}
@@ -10119,16 +10163,105 @@ async function refresh(force){
 }
 W.bnxDsrLiveRefresh_=refresh;W.bnxFinalDsrReload_=function(){return refresh(true);};
 D.querySelectorAll('button[onclick="recalcAll()"]') .forEach(function(b){b.setAttribute('onclick','bnxDsrLiveRefresh_(true)');b.title='Fetch fresh sales and dues from server';});
-D.addEventListener('visibilitychange',function(){if(visible())refresh(false);});
+D.addEventListener('visibilitychange',function(){if(visible())verCheck();});
 W.addEventListener('online',function(){refresh(true);});
-W.addEventListener('focus',function(){refresh(false);});
+W.addEventListener('focus',function(){verCheck();});
 W.addEventListener('storage',function(e){if(e.key==='bnx_data_changed_'+getClientId_())refresh(true);});
 W.addEventListener('message',function(e){if(e.source!==W.parent||e.origin!==W.location.origin)return;var m=e.data;if(!m||typeof m!=='object')return;if(m.clientId&&String(m.clientId)!==String(getClientId_()))return;if(['BNX_DATA_CHANGED','BNX_SAVE_CONFIRMED','BNX_DSR_REFRESH'].indexOf(m.type)>=0)refresh(true);});
 W.addEventListener('pagehide',function(){stopped=true;});W.addEventListener('pageshow',function(){stopped=false;});
-setInterval(function(){refresh(false);},10000);
+/* 2026-10-29 ("any change in sales / payment / due receipt → DSR changes automatically", and no constant reloading):
+   every 15 s ask the server for its data version (tiny read). Only when a bill, payment, pay-mode change or due receipt
+   was saved anywhere does the DSR reload — at once. Was: the whole DSR + dues chain every 10 s, which kept the slow
+   server busy and blanked the outstanding boxes in between. */
+var lastVer=null;
+async function verCheck(){
+ if(stopped||!visible())return;
+ try{var r=await gasApi('GET_DATA_VERSION',{},'V2_CORE');if(!r||!r.success||!r.data)return refresh(false);
+  var v=String(r.data.v||'');if(lastVer!==null&&v!==lastVer){lastVer=v;W.__bnxDuesShownFor=W.__bnxDuesShownFor;return refresh(true);}lastVer=v;}catch(e){}
+}
+W.bnxDsrVersionCheck_=verCheck;
+setInterval(verCheck,15000);setTimeout(verCheck,4000);
+setInterval(function(){var ds=D.getElementById('repDate')?.value;if(ds&&ds===bnxToday_())refresh(false);},300000);   /* safety: today re-read every 5 min */
 setTimeout(function(){if(visible()){loadDsrDueControl_(D.getElementById('repDate')?.value).catch(function(){});}},1500);
 })(window,document);
 
+</script>
+
+<script id="bnx-daywise-recon-20261029">
+/* DAY-WISE RECONCILIATION in the restaurant's own sheet format (2026-10-29):
+   Sale Date | DSR Sale: UPI Sale · Card Sale · Due Bank · Total | Bank Transaction received with chgs: UPI · Cards · Bank · Total | Diff
+   with an "In Lac" totals row on top. DSR = live POS (UPI / card sales + due received in bank). Received = Swift
+   transactions by collection date (successful UPI / card swipes mapped as POS sale or due received) + due receipts paid
+   straight into the bank (NEFT / IMPS / RTGS / cheque vouchers). Tap a day to open its Swift transactions. */
+(function(W,D){
+'use strict';
+var seq=0;
+function n(v){var x=Number(String(v==null?'':v).replace(/[,₹\s]/g,''));return isFinite(x)?x:0;}
+function f0(v){v=Math.round(n(v));return v<0?'('+Math.abs(v).toLocaleString('en-IN')+')':v.toLocaleString('en-IN');}
+function lac(v){return (Math.round(n(v)/1000)/100).toFixed(2);}
+function dmy(d){return d.slice(8,10)+'/'+d.slice(5,7)+'/'+d.slice(0,4);}
+function days(a,b){var o=[],x=new Date(a+'T12:00:00'),e=new Date(b+'T12:00:00');for(var g=0;x<=e&&g<400;g++){o.push(x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0'));x.setDate(x.getDate()+1);}return o;}
+function bankMode(m){m=String(m||'').toUpperCase().replace(/[^A-Z]/g,'');return /NEFT|RTGS|IMPS|BANK|CHEQUE|CHQ|TRANSFER/.test(m)&&!/UPI|CARD|GPAY|PHONEPE|PAYTM/.test(m);}
+async function monthDays(from,to){
+ var out={},y=+from.slice(0,4),m=+from.slice(5,7),ty=+to.slice(0,4),tm=+to.slice(5,7);
+ for(var g=0;g<14&&(y<ty||(y===ty&&m<=tm));g++){
+  var mm=String(m).padStart(2,'0'),have=Object.keys(STANDARD_DATA||{}).filter(function(k){return k.slice(0,7)===y+'-'+mm&&STANDARD_DATA[k]&&STANDARD_DATA[k]._atomic;});
+  if(have.length){have.forEach(function(k){out[k]=STANDARD_DATA[k];});}
+  else{try{var r=await gasApi('GET_DSR_MATRIX',{year:y,month:m},'V2_CORE');if(r&&r.success&&r.data&&r.data.byDay)Object.keys(r.data.byDay).forEach(function(d){out[y+'-'+mm+'-'+String(d).padStart(2,'0')]=mapLiveDsrDay_(r.data.byDay[d]);});}catch(e){}}
+  if(++m>12){m=1;y++;}
+ }
+ return out;
+}
+async function build(){
+ var host=D.getElementById('bnxDayRecon');if(!host)return;
+ var my=++seq,ds=(D.getElementById('repDate')||{}).value||'';
+ var from=(D.getElementById('reconFrom')||{}).value||ds,to=(D.getElementById('reconTo')||{}).value||from;
+ if(!from)return;if(from===to)from=to.slice(0,8)+'01';           /* one day picked → show its month to date */
+ if(from>to){var t0=from;from=to;to=t0;}
+ host.innerHTML='<div style="padding:12px;color:var(--muted)">⏳ Building day-wise reconciliation…</div>';
+ var dsr=await monthDays(from,to);
+ var recBank={};try{var r=await gasApi('GET_DUES_RECEIPT_PERIOD',{from:from,to:to},'V2_CORE');((r&&r.data&&r.data.rows)||[]).forEach(function(x){if(/CANCEL|VOID|REVERS|REJECT/i.test(String(x.STATUS||'')))return;var d=String(x.RECEIPT_DATE||'').slice(0,10);if(d<from||d>to||!bankMode(x.PAYMENT_MODE))return;recBank[d]=(recBank[d]||0)+n(x.AMOUNT);});}catch(e){}
+ if(my!==seq)return;
+ var sw={};try{(W.bnxSwiftTxns_?W.bnxSwiftTxns_():[]).forEach(function(t){if(!(t.amount>0)||!/^(POS|DUE)$/.test(t.to)||/FAIL|DECLIN|REVERS|REFUND|VOID/.test(String(t.status||'')))return;var d=t.cdate;if(!d||d<from||d>to)return;var o=sw[d]||(sw[d]={upi:0,card:0});if(t.mode==='CARD')o.card+=t.amount;else o.upi+=t.amount;});}catch(e){}
+ var T={u:0,c:0,b:0,t:0,ru:0,rc:0,rb:0,rt:0,d:0},rows='';
+ days(from,to).forEach(function(d){
+  var x=dsr[d]||{},u=n(x.gpay),c=n(x.card),b=n(x.duerecvbank),t=u+c+b,s=sw[d]||{upi:0,card:0},ru=s.upi,rc=s.card,rb=recBank[d]||0,rt=ru+rc+rb,df=rt-t;
+  if(!t&&!rt)return;
+  T.u+=u;T.c+=c;T.b+=b;T.t+=t;T.ru+=ru;T.rc+=rc;T.rb+=rb;T.rt+=rt;T.d+=df;
+  rows+='<tr data-dday="'+d+'"><td class="sd">'+dmy(d)+'</td><td class="ds">'+f0(u)+'</td><td class="ds">'+f0(c)+'</td><td class="ds">'+f0(b)+'</td><td class="ds tot">'+f0(t)+'</td><td class="bk">'+f0(ru)+'</td><td class="bk">'+f0(rc)+'</td><td class="bk">'+f0(rb)+'</td><td class="bk tot">'+f0(rt)+'</td><td class="df'+(Math.abs(df)>=1?' bad':'')+'">'+(Math.abs(df)<1?'0':f0(df))+'</td></tr>';
+ });
+ host.innerHTML='<div class="bnx-dr-head"><b>📅 Day-wise — DSR Sale vs Bank Transaction received (with chgs)</b><span>'+dmy(from)+' → '+dmy(to)+'</span><button type="button" class="btn btn-sm" id="bnxDrXl">📊 Excel</button></div>'+
+  '<div style="overflow:auto;max-height:70vh"><table class="bnx-dr"><thead>'+
+  '<tr><th class="sd" rowspan="1"></th><th colspan="4" class="hd-ds">DSR Sale</th><th colspan="4" class="hd-bk">Bank Transaction received with chgs</th><th class="hd-df"></th></tr>'+
+  '<tr class="lac"><th class="sd">In Lac</th><th>'+lac(T.u)+'</th><th>'+lac(T.c)+'</th><th>'+lac(T.b)+'</th><th>'+lac(T.t)+'</th><th>'+lac(T.ru)+'</th><th>'+lac(T.rc)+'</th><th>'+lac(T.rb)+'</th><th>'+lac(T.rt)+'</th><th class="'+(Math.abs(T.d)>=1000?'bad':'')+'">'+lac(T.d)+'</th></tr>'+
+  '<tr class="cols"><th class="sd">Sale Date</th><th>UPI Sale</th><th>Card Sale</th><th>Due Bank</th><th>Total</th><th>UPI</th><th>Cards</th><th>Bank</th><th>Total</th><th>Diff</th></tr></thead><tbody>'+
+  (rows||'<tr><td colspan="10" style="text-align:center;padding:14px;color:#64748b">No DSR or bank amounts in this range.</td></tr>')+'</tbody>'+
+  (rows?'<tfoot><tr><td class="sd">TOTAL</td><td>'+f0(T.u)+'</td><td>'+f0(T.c)+'</td><td>'+f0(T.b)+'</td><td>'+f0(T.t)+'</td><td>'+f0(T.ru)+'</td><td>'+f0(T.rc)+'</td><td>'+f0(T.rb)+'</td><td>'+f0(T.rt)+'</td><td class="'+(Math.abs(T.d)>=1?'bad':'')+'">'+f0(T.d)+'</td></tr></tfoot>':'')+'</table></div>'+
+  '<div style="font-size:11px;color:#64748b;margin-top:6px">Diff = received − DSR (bracket = less received). Received UPI / Cards are Swift swipes by collection date (map any swipe in the Swift tab); Bank = due receipts paid by NEFT / IMPS / RTGS / cheque. Tap a date to see its Swift transactions.</div>';
+ var xl=D.getElementById('bnxDrXl');if(xl)xl.onclick=function(){
+  if(typeof XLSX==='undefined'){alert('Excel library not loaded');return;}
+  var aoa=[['','DSR Sale','','','','Bank Transaction received with chgs','','','',''],['In Lac',+lac(T.u),+lac(T.c),+lac(T.b),+lac(T.t),+lac(T.ru),+lac(T.rc),+lac(T.rb),+lac(T.rt),+lac(T.d)],['Sale Date','UPI Sale','Card Sale','Due Bank','Total','UPI','Cards','Bank','Total','Diff']];
+  [].forEach.call(host.querySelectorAll('tbody tr[data-dday]'),function(tr){var d=tr.getAttribute('data-dday'),c=tr.children;aoa.push([dmy(d)].concat([].slice.call(c,1).map(function(td){var t=td.textContent.trim(),neg=/^\(/.test(t),v=Number(t.replace(/[(),]/g,''))||0;return neg?-v:v;})));});
+  var ws=XLSX.utils.aoa_to_sheet(aoa);ws['!merges']=[{s:{r:0,c:1},e:{r:0,c:4}},{s:{r:0,c:5},e:{r:0,c:8}}];ws['!cols']=[{wch:12}].concat(Array(9).fill({wch:12}));
+  var wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'DSR vs Bank');XLSX.writeFile(wb,'DSR_vs_Bank_'+from+'_to_'+to+'.xlsx');};
+}
+function css(){if(D.getElementById('bnxDrCss'))return;var st=D.createElement('style');st.id='bnxDrCss';st.textContent=
+ '#bnxDayRecon{margin-top:14px;border:1.5px solid var(--border,#ddd);border-radius:10px;padding:10px;background:#fff}'+
+ '#bnxDayRecon .bnx-dr-head{display:flex;gap:10px;align-items:center;margin-bottom:8px;flex-wrap:wrap}#bnxDayRecon .bnx-dr-head span{color:#64748b;font-size:12px;margin-right:auto}'+
+ '.bnx-dr{border-collapse:collapse;width:100%;font-size:12.5px;font-variant-numeric:tabular-nums}.bnx-dr th,.bnx-dr td{border:1px solid #c9d3df;padding:4px 7px;text-align:right;white-space:nowrap}'+
+ '.bnx-dr th{position:sticky;top:0}.bnx-dr .hd-ds{background:#22d3ee!important;color:#111!important;font-size:15px;text-align:center;border:2px solid #2563eb}.bnx-dr .hd-bk{background:#7dd3fc!important;color:#111!important;font-size:15px;text-align:center}.bnx-dr .hd-df{background:#fde047!important}'+
+ '.bnx-dr tr.lac th{background:#a5f3fc!important;color:#111!important;font-weight:900}.bnx-dr tr.cols th{background:#67e8f9!important;color:#111!important;font-weight:900;text-align:center}'+
+ '.bnx-dr td.sd,.bnx-dr th.sd{text-align:left;background:#fde7c7;font-weight:700}.bnx-dr td.ds{background:#e0f7fb}.bnx-dr td.bk{background:#fff4dc}.bnx-dr td.tot{font-weight:800}'+
+ '.bnx-dr td.df{background:#fecaca;font-weight:800}.bnx-dr td.df:not(.bad){background:#dcfce7;color:#15803d}.bnx-dr .bad{color:#b42318}.bnx-dr tbody tr{cursor:pointer}.bnx-dr tbody tr:hover td{filter:brightness(.96)}'+
+ '.bnx-dr tfoot td{background:#fff3c4!important;font-weight:900}';D.head.appendChild(st);}
+function mount(){var panel=D.getElementById('itab-recon');if(!panel)return;css();if(!D.getElementById('bnxDayRecon')){var c=panel.querySelector('.card');var h=D.createElement('div');h.id='bnxDayRecon';(c||panel).insertBefore(h,(c||panel).querySelector('#dsrReconSummary')||null);}}
+W.bnxBuildDayRecon_=function(){mount();return build();};
+var prev=W.loadDsrReconciliation_;
+W.loadDsrReconciliation_=async function(){var r=prev?await prev.apply(this,arguments):null;try{mount();build();}catch(e){}return r;};
+try{loadDsrReconciliation_=W.loadDsrReconciliation_;}catch(e){}
+D.addEventListener('click',function(e){var tr=e.target.closest&&e.target.closest('#bnxDayRecon tr[data-dday]');if(!tr)return;var d=tr.getAttribute('data-dday');
+ try{if(typeof W.bnxRcShow_==='function'){W.bnxRcShow_('upi',d,d,'');return;}}catch(_){}});
+})(window,document);
 </script>
 </body>
 </html>
@@ -10383,12 +10516,12 @@ function date(){return (D.getElementById('repDate')||{}).value||'';}
 function scope(){return getClientId_()+'|'+getSessionToken_()+'|'+date();}
 function num(v){var n=Number(String(v==null?'':v).replace(/[,₹\s]/g,''));if(!Number.isFinite(n))throw Error('Invalid receipt amount');return n;}
 function mode(v){var s=String(v||'').toUpperCase().replace(/[^A-Z0-9]/g,'');try{var p=bnxDsrAccessibleParent_();if(p&&typeof p.bnxPayCode_==='function')s=String(p.bnxPayCode_(v)||s).toUpperCase().replace(/[^A-Z0-9]/g,'');}catch(e){}if(/DISCOUNT|CREDITNOTE|^CN$/.test(s))return 'CN';if(s==='CASH')return 'CASH';if(/UPI|GPAY|PHONEPE|PAYTM|BHIM|CARD|BANK|NEFT|RTGS|IMPS|CHEQUE/.test(s))return 'BANK';return 'UNKNOWN';}
-function totals(rows,from,to){var out={cash:0,bank:0,cn:0,unknown:0},seen=new Set();rows.forEach(function(r){if(r.CLIENT_ID&&String(r.CLIENT_ID)!==String(getClientId_()))return;if(/CANCEL|VOID|DELET|REVERSE|REJECT|FAIL|PENDING/i.test(String(r.STATUS||'')))return;var ds=String(r.RECEIPT_DATE||'').slice(0,10);if(ds<from||ds>to)return;var id=r.DUES_RECEIPT_ID;if(!id||seen.has(String(id)))throw Error('Missing/duplicate receipt ID');seen.add(String(id));var n=num(r.AMOUNT);if(n<0)throw Error('Negative receipt needs review');var m=mode(r.PAYMENT_MODE);out[m==='CASH'?'cash':m==='BANK'?'bank':m==='CN'?'cn':'unknown']+=n;});return out;}
+function totals(rows,from,to){var out={cash:0,bank:0,cn:0,unknown:0},seen=new Set();rows.forEach(function(r){if(r.CLIENT_ID&&String(r.CLIENT_ID)!==String(getClientId_()))return;if(/CANCEL|VOID|DELET|REVERSE|REJECT|FAIL|PENDING/i.test(String(r.STATUS||'')))return;var ds=String(r.RECEIPT_DATE||'').slice(0,10);if(ds<from||ds>to)return;var id=r.DUES_RECEIPT_ID;if(!id||seen.has(String(id)))throw Error('Missing/duplicate receipt ID');seen.add(String(id));var n=num(r.AMOUNT);var m=mode(r.PAYMENT_MODE);if(n<0)out.neg=(out.neg||0)+1;out[m==='CASH'?'cash':m==='BANK'?'bank':m==='CN'?'cn':'unknown']+=n;});return out;}   /* 2026-10-29: a negative row (credit-note / discount reversal from the FY register) is netted in and counted — it no longer blanks every receipt total */
 W.bnxReceiptTotalsByDate39_=totals;
 function set(id,v){var e=D.getElementById(id);if(!e)return;v=String(Math.round(v*100)/100);if('value' in e){if(e.value!==v)e.value=v;}else if(e.textContent!==v)e.textContent=v;}
 function paint(){if(!snapshot||snapshot.scope!==scope())return;['d','m','y'].forEach(function(p){var t=snapshot[p];set(p+'_duerecvcash',t.cash);set(p+'_duerecvbank',t.bank);set(p+'_due_total',t.cash+t.bank+t.unknown);var total=D.getElementById(p+'_due_total');if(total)total.title=t.unknown?'Includes '+t.unknown+' receipts with an unmapped payment mode; review the vouchers.':'Saved receipts for the selected period';var cash=D.getElementById(p+'_cash');if(cash)set(p+'_totalcash',num('value' in cash?cash.value:cash.textContent)+t.cash);});}
 async function refresh(){var ds=date(),sc=scope();if(!/^\d{4}-\d{2}-\d{2}$/.test(ds))return false;if(flight.has(sc))return flight.get(sc);var my=++seq,fy=(+ds.slice(0,4)-(+ds.slice(5,7)<4?1:0))+'-04-01';
- var p=Promise.resolve().then(function(){return gasApi('GET_DUES_RECEIPT_PERIOD',{from:fy,to:ds},'V2_CORE');}).then(function(r){if(my!==seq||sc!==scope())return false;if(!r||r.success!==true||!r.data||!Array.isArray(r.data.rows)||r.data.hasMore||r.data.totalCount>r.data.rows.length)throw Error(r&&r.error||'Complete receipt period unavailable');var rows=r.data.rows;snapshot={scope:sc,d:totals(rows,ds,ds),m:totals(rows,ds.slice(0,8)+'01',ds),y:totals(rows,fy,ds)};paint();return true;}).catch(function(e){if(sc===scope()){var n=D.getElementById('bnxLiveDueNotice');if(n)n.textContent='Receipt totals could not refresh for '+ds+': '+e.message;}return false;}).finally(function(){flight.delete(sc);});flight.set(sc,p);return p;
+ var p=Promise.resolve().then(function(){return gasApi('GET_DUES_RECEIPT_PERIOD',{from:fy,to:ds},'V2_CORE');}).then(function(r){if(my!==seq||sc!==scope())return false;if(!r||r.success!==true||!r.data||!Array.isArray(r.data.rows)||r.data.hasMore||r.data.totalCount>r.data.rows.length)throw Error(r&&r.error||'Complete receipt period unavailable');var rows=r.data.rows;snapshot={scope:sc,d:totals(rows,ds,ds),m:totals(rows,ds.slice(0,8)+'01',ds),y:totals(rows,fy,ds)};paint();try{var nn=D.getElementById('bnxLiveDueNotice');if(nn&&/Receipt totals could not refresh/.test(nn.textContent||''))nn.textContent='';if(nn&&snapshot.y.neg)nn.textContent='ℹ️ '+snapshot.y.neg+' negative receipt row(s) this year (discount / credit-note reversals) are netted into the totals.';}catch(_){}return true;}).catch(function(e){if(sc===scope()){var n=D.getElementById('bnxLiveDueNotice');if(n)n.textContent='Receipt totals could not refresh for '+ds+': '+e.message;}return false;}).finally(function(){flight.delete(sc);});flight.set(sc,p);return p;
 }
 var old=typeof loadDsrDueControl_==='function'?loadDsrDueControl_:null;
 loadDsrDueControl_=function(){var args=arguments,self=this;return Promise.all([old?old.apply(self,args):Promise.resolve(false),refresh()]).then(function(x){return x[0];});};
