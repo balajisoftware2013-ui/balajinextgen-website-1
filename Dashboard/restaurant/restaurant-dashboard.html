@@ -79502,6 +79502,27 @@ function db(){ if(dbp) return dbp; dbp=new Promise(function(res){ setTimeout(fun
 function get(k){ return db().then(function(d){ if(!d) return null; return new Promise(function(res){ setTimeout(function(){ res(null); },800); try{ var q=d.transaction('kv').objectStore('kv').get(k); q.onsuccess=function(){ res(q.result||null); }; q.onerror=function(){ res(null); }; }catch(e){ res(null); } }); }); }
 function put(k,v){ db().then(function(d){ if(!d) return; try{ d.transaction('kv','readwrite').objectStore('kv').put(v,k); }catch(e){} }); }
 function clearAll(){ db().then(function(d){ if(!d) return; try{ d.transaction('kv','readwrite').objectStore('kv').clear(); }catch(e){} }); }
+function allKeys(){ return db().then(function(d){ if(!d) return []; return new Promise(function(res){ setTimeout(function(){ res([]); },800); try{ var q=d.transaction('kv').objectStore('kv').getAllKeys(); q.onsuccess=function(){ res(q.result||[]); }; q.onerror=function(){ res([]); }; }catch(e){ res([]); } }); }); }
+function dk(v){ var x=String(v==null?'':v), m=x.match(/^(\d{4})-(\d{2})-(\d{2})/); if(m) return m[1]+'-'+m[2]+'-'+m[3]; m=x.match(/^(\d{2})[-\/](\d{2})[-\/](\d{4})/); return m?m[3]+'-'+m[2]+'-'+m[1]:''; }
+/* no saved answer for exactly this period -> use a saved WIDER period (e.g. This Month) cut down to the dates asked */
+function cover(A,p){
+  var f=dk(p&&(p.FROM_DATE||p.from)), t=dk(p&&(p.TO_DATE||p.to))||f; if(!f) return Promise.resolve(null);
+  var pre=cid()+'|'+A+'|', rest={}; Object.keys(p||{}).forEach(function(k){ if(!/^(FROM_DATE|TO_DATE|from|to|sessionToken|requestId|_ts|ts|nonce|force|noCache)$/.test(k)&&p[k]!==undefined) rest[k]=p[k]; });
+  return allKeys().then(function(keys){
+    var best=null;
+    keys.forEach(function(k){ if(typeof k!=='string'||k.indexOf(pre)!==0) return; var o; try{ o=JSON.parse(k.slice(pre.length)); }catch(e){ return; }
+      var of=dk(o.FROM_DATE||o.from), ot=dk(o.TO_DATE||o.to)||of; if(!of||of>f||ot<t) return;
+      if(!Object.keys(rest).every(function(x){ return JSON.stringify(o[x])===JSON.stringify(rest[x]); })) return;
+      var span=Date.parse(ot)-Date.parse(of); if(!best||span<best.span) best={k:k,span:span}; });
+    if(!best) return null;
+    return get(best.k).then(function(c){
+      if(!c||!c.r) return null; var r=JSON.parse(JSON.stringify(c.r)), arr=Array.isArray(r.data)?r.data:Array.isArray(r.bills)?r.bills:null; if(!arr) return null;
+      var ok=true, cut=arr.filter(function(x){ var d=dk(x&&(x.ORDER_DATE||x.BILL_DATE||x.BUSINESS_DATE||x.dt||x.date)); if(!d){ ok=false; return false; } return d>=f&&d<=t; });
+      if(!ok) return null; if(Array.isArray(r.data)) r.data=cut; else r.bills=cut; if(r.count!=null) r.count=cut.length;
+      return {t:c.t,r:r,s:'cover'};
+    });
+  }).catch(function(){ return null; });
+}
 function cid(){ try{ return (typeof bnxCurrentClient_==='function'&&bnxCurrentClient_())||W.CLIENT_ID||''; }catch(e){ return ''; } }
 function keyOf(a,p){ var o={}; Object.keys(p||{}).sort().forEach(function(k){ if(!/^(sessionToken|requestId|_ts|ts|nonce|force|noCache)$/.test(k)) o[k]=p[k]; }); return cid()+'|'+a+'|'+JSON.stringify(o); }
 function sig(r){ try{ var a=(r&&(r.data||r.bills))||[]; return a.length+'|'+JSON.stringify(a.slice(0,3)).length+'|'+JSON.stringify(a.slice(-3)).length+'|'+a.reduce(function(t,x){ return t+(Number(x.GRAND_TOTAL||x.total||x.amt||0)||0); },0); }catch(e){ return Math.random(); } }
@@ -79522,6 +79543,7 @@ function hook(){
     function live(){ if(inflight[k]) return inflight[k];
       var pr=Promise.resolve().then(function(){ return base.apply(self,args); }).then(function(r){ if(r&&(r.success===true||r.ok===true)) put(k,{t:Date.now(),r:r,s:sig(r)}); return r; }).finally(function(){ delete inflight[k]; });
       inflight[k]=pr; return pr; }
+    if(!(c&&c.r&&now-c.t<MAXAGE)){ var cv=await cover(A,payload); if(cv) c=cv; }
     if(c&&c.r&&now-c.t<MAXAGE){
       if(now-c.t>BG_AFTER||c.t<(W.__bnxIrStale||0)){ live().then(function(r){ if(r&&(r.success===true||r.ok===true)&&sig(r)!==c.s) repaint(A,payload); }).catch(function(){}); }
       var out=JSON.parse(JSON.stringify(c.r)); out.fromDevice=true; out.deviceAgeMs=now-c.t; return out;
@@ -79531,5 +79553,14 @@ function hook(){
   Object.keys(base).forEach(function(x){ try{ f[x]=base[x]; }catch(e){} }); f.__bnxInstant=true; W.gasApi=f; try{ gasApi=f; }catch(e){}
 }
 hook(); var n=0, t=setInterval(function(){ hook(); if(++n>30) clearInterval(t); },1000);
+/* warm-up: 20 s after the page opens and every 10 min while it is visible, the Order Register list for the selected
+   period is fetched quietly, so opening Order Register shows it at once instead of waiting for the server */
+function warm(){
+  try{ if(D.hidden||typeof W.bnxOrderRegWindow_!=='function'||D.querySelector('#page-order-register.active')) return;
+    var win=W.bnxOrderRegWindow_(); if(!win) return;
+    Promise.resolve(W.gasApi('GET_ORDERS',Object.assign({LOCATION_ID:(W.BNX_LOCATION_ID||W.LOCATION_ID||undefined),SUMMARY_ONLY:true},win),'V2_CORE')).catch(function(){});
+  }catch(e){}
+}
+setTimeout(warm,20000); setInterval(warm,600000);
 })(window,document);
 </script>
