@@ -170,6 +170,9 @@ window._erpNavigating=true;
       if(body){ try{ action=String(JSON.parse(body).action||''); }catch(e){ return F.apply(this,arguments); } }
       else { var m=/[?&]action=([A-Z0-9_]+)/.exec(url); action=m?m[1]:''; }
       if(!action||(init&&init.keepalive)) return F.apply(this,arguments);
+      /* 2026-11-10: NEXT_BILL_NO only PEEKS the next invoice number (backend bnxPeekBillNumber_, nothing written) — it matched NEXT_
+         and wiped every shared answer 3x while the page opened, so the same reads went to the server again. Always live, never a wipe. */
+      if(/^(NEXT_BILL_NO|GET_KOT_NUMBER_BATCH|PING|HEARTBEAT|BNX_WHOAMI)$/.test(action)) return F.apply(this,arguments);
       if(WRITE.test(action)){ cache.clear(); return F.apply(this,arguments); }
       var key=url.replace(/([?&])(t|_|ts|nocache)=\d+/g,'$1')+'|'+body.replace(/"(requestId|REQUEST_ID|_t|ts|nonce)":"?[^,"}]*"?,?/g,'');
       var hit=cache.get(key); if(hit&&Date.now()-hit.t<ttl(action)) return Promise.resolve(mk(hit.text));
@@ -2250,8 +2253,11 @@ function bnxEnrichItems_(payload){
 window.bnxEnrichItems_=bnxEnrichItems_;
 async function gasApi(action, payload, endpoint) {
   // Import owns the data-write path. Defer nonessential reports without occupying request slots.
+  /* 2026-11-10 ("server busy · queue:34" while 679 import rows were syncing): every report widget kept asking during the import,
+     filled this page's request slots and the server, so bills and the import itself waited. While an import runs, report-only
+     reads wait (screens keep their last figures); bills, KOTs, orders, tables, menu and day status are never held. */
   if(window.__bnxImportBusy && Date.now()-(window.__bnxImportBusyAt||Date.now())<240000 &&
-     /^(GET_ITEM_SALES_REPORT|GET_DSR_.*|DSR_.*|GET_DUE_COLLECTION|GET_CLIENT_ASSETS|GET_DASHBOARD_SUMMARY|LIST_BILLS|RD_FETCH_SHEET)$/i.test(String(action||'')))
+     /^(GET_ITEM_SALES_REPORT|GET_.*_REPORT(_V2)?|GET_DSR_.*|DSR_.*|GET_DUE_COLLECTION|DUES_LIST|DASH_FIN|GET_ACCOUNTS_DAY|GET_CLIENT_ASSETS|GET_DASHBOARD_SUMMARY|LIST_BILLS|GET_BILLS|RD_FETCH_SHEET|SWIFT_.*|GET_CUSTOMER_LEDGER|GET_OUTSTANDING_BILLS|GET_DUES_RECEIPT_PERIOD|LIST_ADVANCE_LEDGER|LIST_RESERVATIONS)$/i.test(String(action||'')))
     return {success:false,busy:true,deferred:true,error:'Report refresh paused while import is running',retryAfterMs:15000};
   payload = payload || {};
   if (/^SAVE_BILL$/i.test(String(action||''))) bnxNormBillPay_(payload);   /* 2026-10-22: never send a PMD id as the pay mode */
@@ -57998,8 +58004,11 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
   function idbPut(k,v){ idb().then(function(db){ if(!db) return; try{ db.transaction('kv','readwrite').objectStore('kv').put(v,k); }catch(e){} }); }
   function idbClear(){ idb().then(function(db){ if(!db) return; try{ db.transaction('kv','readwrite').objectStore('kv').clear(); }catch(e){} }); }
 
-  var READ=/^(GET_|LIST_|FETCH_|RD_FETCH|SEARCH_|LOAD_|REPORT_|DASHBOARD)/i;
-  var NEVER=/^(GET_CONFIG|GET_NEXT|NEXT_BILL_NO|HEARTBEAT|GET_SEQUENCE|GET_KOT_NO)/i;   /* must always be live */
+  /* 2026-11-10 ROOT FIX ("for fast"): reads named DUES_LIST / DASH_FIN / *_GET (PRINTER_MASTER_GET, TALLY_CFG_GET,
+     APPROVAL_SETTINGS_GET…) did not match READ, so they were treated as WRITES — every one of them wiped the whole report
+     cache and was never shared. On opening the page the same reads went to the server 2-3 times (92 calls in 20 s). */
+  var READ=/^(GET_|LIST_|FETCH_|RD_FETCH|SEARCH_|LOAD_|REPORT_|DASHBOARD|DUES_LIST$|DASH_FIN$)|_(GET|LIST)$/i;
+  var NEVER=/^(GET_CONFIG|GET_NEXT|NEXT_BILL_NO|HEARTBEAT|GET_SEQUENCE|GET_KOT_NO|PING|BNX_WHOAMI|GET_KOT_NUMBER)/i;   /* must always be live */
   function key(a,p,e){ try{ var c=''; try{ c=(typeof bnxCurrentClient_==='function'?bnxCurrentClient_():'')||''; }catch(y){} return c+'|'+(e||'V2_CORE')+'|'+a+'|'+JSON.stringify(p||{}); }catch(x){ return ''; } }
   function st(a){ return stats[a]||(stats[a]={n:0,hit:0,fail:0,ms:0,max:0}); }
   function wrap(){
@@ -58007,7 +58016,8 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
     var w=async function(a,p,e){
       var A=String(a||''), s=st(A), k='';
       var isRead=READ.test(A)&&!NEVER.test(A)&&!(p&&(p.force||p.noCache));
-      if(!isRead){ if(masterWrite(A)){ cache.clear(); idbClear(); } else cache.forEach(function(v,kk){ if(!MASTER.test(v.a||'')) cache.delete(kk); }); }
+      if(!isRead && /^(NEXT_BILL_NO|GET_KOT_NUMBER_BATCH|PING|HEARTBEAT|BNX_WHOAMI|GET_CONFIG|GET_NEXT|GET_SEQUENCE|GET_KOT_NO)/i.test(A)){ /* live, but not a write: keep the shared answers */ }
+      else if(!isRead){ if(masterWrite(A)){ cache.clear(); idbClear(); } else cache.forEach(function(v,kk){ if(!MASTER.test(v.a||'')) cache.delete(kk); }); }
       else{
         k=key(A,p,e);
         /* 2026-10-21 ROOT FIX ("report not generates / loading forever"): wrap() re-runs every second for 30 s, so this
@@ -58057,7 +58067,23 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
   /* writes sent through erpApi (e.g. SETTLE_DUE_BILL) must also clear the read cache */
   var prevErp=W.erpApi;
   if(typeof prevErp==='function' && !prevErp.__bnxGov){
-    var we=function(payload){ var A=String(payload&&payload.action||''); if(!(READ.test(A)&&!NEVER.test(A))){ if(masterWrite(A)) cache.clear(); else cache.forEach(function(v,kk){ if(!MASTER.test(v.a||'')) cache.delete(kk); }); } return prevErp.apply(this,arguments); };
+    /* 2026-11-10: erpApi reads are shared too — the same read already on its way (or answered in the last seconds) is reused */
+    var DEFER_RX=/^(GET_ITEM_SALES_REPORT|GET_.*_REPORT(_V2)?|GET_DSR_.*|DSR_.*|GET_DUE_COLLECTION|DUES_LIST|DASH_FIN|GET_ACCOUNTS_DAY|GET_CLIENT_ASSETS|GET_DASHBOARD_SUMMARY|LIST_BILLS|GET_BILLS|RD_FETCH_SHEET|SWIFT_.*|GET_CUSTOMER_LEDGER|GET_OUTSTANDING_BILLS|GET_DUES_RECEIPT_PERIOD|LIST_ADVANCE_LEDGER|LIST_RESERVATIONS)$/i;
+    var we=function(payload,type){ var A=String(payload&&payload.action||''), self=this, args=arguments;
+      if(W.__bnxImportBusy && Date.now()-(W.__bnxImportBusyAt||Date.now())<240000 && DEFER_RX.test(A) && !(payload&&payload.force===true)){
+        return Promise.resolve({success:false,busy:true,deferred:true,error:'Report refresh paused while import is running',retryAfterMs:15000}); }
+      var isRead=READ.test(A)&&!NEVER.test(A)&&!(payload&&(payload.force===true||payload.noCache));
+      if(!isRead){ if(!/^(NEXT_BILL_NO|GET_KOT_NUMBER_BATCH|PING|HEARTBEAT|BNX_WHOAMI|GET_CONFIG|GET_NEXT|GET_SEQUENCE|GET_KOT_NO)/i.test(A)){ if(masterWrite(A)) cache.clear(); else cache.forEach(function(v,kk){ if(!MASTER.test(v.a||'')) cache.delete(kk); }); } return prevErp.apply(self,args); }
+      var p2=Object.assign({},payload); delete p2.action; var k='erp|'+key(A,p2,type||'V2_AUTH'), s=st(A);
+      var c=cache.get(k); if(c&&Date.now()-c.t<Math.min(c.ttl||TTL,60000)){ s.hit++; return Promise.resolve(c.r); }
+      if(pending.has(k)){ s.hit++; return pending.get(k); }
+      var t0=performance.now();
+      var pr=Promise.resolve().then(function(){ return prevErp.apply(self,args); }).then(function(r){
+        var ms=performance.now()-t0; s.n++; s.ms+=ms; if(ms>s.max) s.max=ms;
+        if(r&&r.success!==false){ lastOk=Date.now(); cache.set(k,{t:Date.now(),r:r,a:A,ttl:ttlFor(A)}); } else s.fail++;
+        return r; });
+      pending.set(k,pr); pr.then(function(){ pending.delete(k); },function(){ pending.delete(k); });
+      return pr; };
     we.__bnxGov=true; W.erpApi=we; try{ erpApi=we; }catch(x){}
   }
   W.bnxApiCacheClear=function(){ cache.clear(); idbClear(); };
@@ -66676,6 +66702,7 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
     var BATCH=8, failStreak=0;   /* 10 bills per call (was 40) — each call must finish well inside the Apps Script limit */
     for(var i=0;i<queue.length&&!stop;i+=BATCH){ await yieldToLiveBills_(); var md=queue[i][1], part=[]; for(var q=i;q<queue.length&&q<i+(queue[i][2]?1:BATCH)&&queue[q][1]===md&&!((q>i)&&queue[q][2]);q++) part.push(queue[q][0]); i=q-BATCH; var bills=[], lines=[];
       part.forEach(function(no){ var bill=mergeBillLegs_(F1[no]);bill.invoiceNumber=no;bills.push(bill); F2[no].forEach(function(t){ var line=plainData(t.data);line.invoiceNumber=no;lines.push(line); }); });
+      window.__bnxImportBusyAt=Date.now();   /* long import: keep report reads paused for its whole run, not only its first 4 min */
       var r=await postBills_(md,bills,lines);
       /* A rejected validation batch has no accepted writes. Isolate its bills,
          preserving every disputed source row until explicitly accepted. */
