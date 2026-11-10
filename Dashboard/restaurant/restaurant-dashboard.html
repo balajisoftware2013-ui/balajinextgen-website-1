@@ -1864,6 +1864,10 @@ function bnxSwrTtl_(a,p){ return (BNX_LIVE_REPORT_RE.test(String(a||'')) && !bnx
 function bnxIsCacheableRead_(a){ a=String(a||''); return /^(GET_|LIST_)/.test(a) && !/(NUMBER|SEQ|NEXT)/.test(a); }
 /* Read-type calls that must NOT wipe the cache (anything else — unknown actions included — clears it). */
 function bnxIsReadOnlyAction_(a){ return /^(GET_|LIST_|RD_FETCH_)/.test(String(a||'')) && !/^(NEXT_|GET_NEXT_)/.test(String(a||'')); }
+/* 2026-11-10 ("for fast"): calls that change nothing on the server. They are not cached here, but they must NOT clear the read
+   cache or send "data changed" — that signal made the DSR frame reload the WHOLE DSR after every invoice-number peek / ping /
+   dues list (3x on every page open, again on every bill form reset). */
+function bnxIsNeutralAction_(a){ return /^(NEXT_BILL_NO|GET_KOT_NUMBER_BATCH|PING|HEARTBEAT|BNX_WHOAMI|DUES_LIST|DASH_FIN|SWIFT_MAP_LIST|SWIFT_[A-Z_]*_REPORT|BNX_DSR_RECEIPT_PERIOD|BNX_DSR_DUES_AS_OF)$|_(GET|LIST)$/.test(String(a||'')); }
 
 // FIX (authorization): the confirmed backend returns a real,
 // distinguishable auth failure — respondError(401, 'Invalid or expired
@@ -2288,7 +2292,7 @@ async function gasApi(action, payload, endpoint) {
     return BNX_INFLIGHT_API.get(inflightKey);
   }
   const _bnxCacheable = !!inflightKey && bnxIsCacheableRead_(action);
-  if (!_bnxCacheable) { if (!bnxIsReadOnlyAction_(action)) {BNX_READ_CACHE.clear(); BNX_READ_GENERATION++;} }
+  if (!_bnxCacheable) { if (!bnxIsReadOnlyAction_(action) && !bnxIsNeutralAction_(action)) {BNX_READ_CACHE.clear(); BNX_READ_GENERATION++;} }
   else {
     const hit = BNX_READ_CACHE.get(inflightKey);
     const clone = function(r){ try{ return structuredClone(r); }catch(e){ return JSON.parse(JSON.stringify(r)); } };
@@ -2399,7 +2403,7 @@ async function gasApi(action, payload, endpoint) {
   }
   if (_bnxCacheable) {
     promise.then(function(r){ if (r && r.success !== false && readGeneration===BNX_READ_GENERATION && requestClient===bnxCurrentClient_()) { try{ BNX_READ_CACHE.set(inflightKey, {t:Date.now(), r:structuredClone(r)}); }catch(e){} } });
-  } else if (!bnxIsReadOnlyAction_(action)) {
+  } else if (!bnxIsReadOnlyAction_(action) && !bnxIsNeutralAction_(action)) {
     promise.finally(function(){ BNX_READ_CACHE.clear(); BNX_READ_GENERATION++;try{localStorage.setItem('bnx_data_changed_'+requestClient,Date.now()+'-'+Math.random());}catch(e){} });
   }
   return promise;
@@ -6631,7 +6635,7 @@ details.bnx-default-fold>summary .bnx-fold-label:after{content:"Show ▾";font-s
 details.bnx-default-fold[open]>summary .bnx-fold-label:after{content:"Hide ▴"}
 details.bnx-default-fold:not([open])>.bnx-fold-content{display:none!important}
 </style>
-<meta name="bnx-build" content="RD-2026.11.10-v11">
+<meta name="bnx-build" content="RD-2026.11.10-v12">
 </head>
 <body>
 <script id="bnx-final-runtime-guard-20261001">
@@ -64365,7 +64369,7 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
    Green = page + server are the current fix set. Amber = the server still runs old code → in Apps Script:
    Deploy › Manage deployments › ✏ › Version: NEW VERSION › Deploy. Tap the badge for details. */
 (function(){
-  var W=window, D=document, PAGE='RD-2026.11.10-v11', NEED='GS-2026.10.09-v16';
+  var W=window, D=document, PAGE='RD-2026.11.10-v12', NEED='GS-2026.10.09-v16';
   var SRV={build:'',ok:null,url:'',features:{}};
   function ids(){ var out=[], add=function(u){ var m=String(u||'').match(/AKfycb[A-Za-z0-9_-]{20,}/); if(m&&out.indexOf(m[0])<0) out.push(m[0]); };
     add('AKfycbwHdqrP4IvuVD2ZkupNybrEkiXu3kmuI6-tQoiHgYxoqr1KgUupeFsi3PIoFEbuv6XA');
@@ -66629,8 +66633,9 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
   /* A call that timed out / failed may already have half-written some of its bills on the server. Retrying in 'import' mode would
      SKIP those half-written bills as 'already imported' — so every retry goes in 'reimport' mode (delete + write again = clean, repeatable). */
   async function postBills_(md,bills,lines){
-    var r,m=md;
+    var r,m=md,hard=0;
     for(var a=0;a<4;a++){
+      if(hard>=2) break;   /* 2026-11-10: a batch the server failed twice is left PENDING for the next Sync — not sent 4× (console: IMPORT_TRANSACTIONS 3635 s, 85 of 118 calls failed) */
       try{ r=await impPost({action:'IMPORT_POS_SALES',mode:m,bills:bills,lines:lines}); }catch(e){ r={success:false,error:e.message}; }
       if(r&&r.success) return r;
       var er=String((r&&r.error)||'');
@@ -66641,7 +66646,8 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
         await new Promise(function(z){ setTimeout(z,[5000,15000,30000][a]||30000); });
         continue;
       }
-      m='reimport';
+      if(/IMPORT_RECONCILIATION_FAILED|ambiguous charged\/NC|validation|unknown item|item.*not.*found/i.test(er)) return r;   /* data problem: retrying cannot fix it */
+      hard++; m='reimport';
       await new Promise(function(z){ setTimeout(z,2500*(a+1)); });
     }
     return r; }
@@ -66723,7 +66729,7 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
       if(r&&r.success){ res.imported+=r.bills||0; res.skipped+=(r.skipped||[]).length; res.replaced+=r.replaced||0; res.conflicts=res.conflicts.concat(r.conflicts||[]);
         ['written','warnings','checks','newItems','newCustomers'].forEach(function(k){ res[k]=res[k].concat(r[k]||[]); }); }
       done+=part.length; if(onProgress) onProgress(done,total);
-      if(validationRejected){ failStreak=0; } else if(!(r&&r.success)){ failStreak++; if(!/session|auth|unauthor|add-on|unknown action|401|403/i.test(String((r&&r.error)||''))&&failStreak<6){ await new Promise(function(z){ setTimeout(z,10000*failStreak); }); } if(failStreak>=6||/session|auth|unauthor|add-on|unknown action|401|403/i.test(String((r&&r.error)||''))) stop=true; } else failStreak=0; }
+      if(validationRejected){ failStreak=0; } else if(!(r&&r.success)){ failStreak++; if(!/session|auth|unauthor|add-on|unknown action|401|403/i.test(String((r&&r.error)||''))&&failStreak<2){ await new Promise(function(z){ setTimeout(z,10000*failStreak); }); } if(failStreak>=2||/session|auth|unauthor|add-on|unknown action|401|403/i.test(String((r&&r.error)||''))) stop=true; } else failStreak=0; }
     /* other types: raw rows into IMPORT_TRANSACTIONS */
     var groups={}; all.forEach(function(t){ if(t.type==='sales'||!want(t)) return; var k=t.batchId+'|'+t.type+'|'+t.fmt; (groups[k]=groups[k]||[]).push(t); });
     for(var g in groups){ var list=groups[g];
@@ -66808,7 +66814,7 @@ html body #page-customer-credit.page #bnxGroupBar .bnxgc.tot b{color:#ffd9a0}
       '<div style="font-size:12px;margin:8px 0">Leave empty to use the ERP backend.</div>'+
       '<div class="bi-row"><label class="f" style="flex:1;min-width:260px">Web app URL<input type="text" id="biImpUrl" value="'+E(c.url||'')+'" placeholder="https://script.google.com/macros/s/…/exec" style="width:100%"></label>'+
       '<label class="f">Import key<input type="text" id="biImpKey" value="'+E(c.key||'')+'"></label><button class="bi-btn p" data-act="imp-save">Save</button><button class="bi-btn" data-act="imp-test">Test</button>'+(c.url?'<button class="bi-btn" data-act="imp-clear">Remove</button>':'')+'</div></details>';
-    if(L){ h+='<div class="bi-note '+(L.fail?'wa':'ok')+'"><b>Last '+(L.mode==='reimport'?'re-import':'import')+'</b> ('+E(new Date(L.at).toLocaleString('en-IN'))+'): '+L.imported+' bill(s) written'+(L.replaced?' · '+L.replaced+' old bill(s) replaced':'')+(L.skipped?' · '+L.skipped+' already imported (skipped — use Re-import to replace)':'')+(L.waiting?' · '+L.waiting+' row(s) waiting for the other file':'')+(L.fail?' · ⚠ '+E(L.err):'')+
+    if(L){ h+='<div class="bi-note '+((L.fail||L.waiting||!L.imported&&!L.skipped&&!L.replaced)?'wa':'ok')+'"><b>Last '+(L.mode==='reimport'?'re-import':'import')+'</b> ('+E(new Date(L.at).toLocaleString('en-IN'))+'): '+L.imported+' bill(s) written'+(L.replaced?' · '+L.replaced+' old bill(s) replaced':'')+(L.skipped?' · '+L.skipped+' already imported (skipped — use Re-import to replace)':'')+(L.waiting?' · '+L.waiting+' row(s) waiting for the other file — <b>select the bill-wise (Details Sale) AND item-wise file together</b>, then Save':'')+(L.fail?' · ⚠ '+E(L.err):'')+
       (L.newItems.length?'<div>New items: '+E(L.newItems.join(', '))+'</div>':'')+(L.newCustomers.length?'<div>New customers: '+E(L.newCustomers.join(', '))+'</div>':'')+
       (L.warnings.length?'<div style="color:#92400e">'+L.warnings.map(E).join('<br>')+'</div>':'')+(L.checks.length?'<div style="color:#92400e">Checks: '+L.checks.map(E).join('<br>')+'</div>':'')+
       (L.written.length?'<div style="opacity:.75;font-size:11px;margin-top:4px">'+L.written.map(E).join(' · ')+'</div>':'')+'</div>'; }
