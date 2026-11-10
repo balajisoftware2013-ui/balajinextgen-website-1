@@ -2169,6 +2169,13 @@ function bnxOnScreenRead_(act){
   window.__bnxPageOpenedAt=Math.max(window.__bnxPageOpenedAt||0, window.__bnxLastUserActAt||0);
   /* New Bill / POS: the customer list + dues the cashier is typing into are on-screen data too */
   if(/^(page-billing|page-pos|page-tables)$/.test(pg) && /^(RD_FETCH_SHEET|GET_DUE_COLLECTION|GET_CRM_CUSTOMERS|DUES_LIST|GET_CUSTOMER_)/.test(act) && (Date.now()-(window.__bnxPageOpenedAt||0))<120000) return true;
+  /* 2026-11-10 ("bill-wise not shown", "open bills take too long", queue:39): Customer Credit / Due Collection / Bills List reads
+     were not all on-screen — GET_OUTSTANDING_BILLS, GET_DUES_RECEIPT_PERIOD (GET_DUES_, not GET_DUE_), the dues sheet reads —
+     and the priority lasted only 2 min, so they waited in the single slow background lane behind dashboard widgets.
+     While one of these pages is visible, its own reads always go first. */
+  try{ var _dm=document.getElementById('detailModal'); if(_dm && _dm.style.display!=='none' && _dm.offsetParent!==null && /^(GET_OUTSTANDING_BILLS|DUES_LIST|GET_DUE_COLLECTION|GET_CUSTOMER_)/.test(act)) return true; }catch(_e){}   /* Receive Payment / statement window open */
+  if(/^(page-customer-credit|page-due-collection|page-bills-list|page-accounts-ledger)$/.test(pg) && document.visibilityState==='visible'
+     && /^(GET_OUTSTANDING_BILLS|GET_DUES_|GET_DUE_|DUES_LIST|GET_CUSTOMER_|GET_LEDGER|RD_FETCH_SHEET|LIST_BILLS|GET_BILLS|GET_BILL_|BILL_PAYMENTS|GET_ACCOUNTS_)/.test(act)) return true;
   return /^(page-reports|page-bills-list|page-dsr-reports|page-accounts-ledger|page-order-register|page-due-collection|page-customer-credit)$/.test(pg)
     && /^(LIST_BILLS|GET_BILLS|GET_BILL_FOR_REPRINT|GET_BILL_ITEMS|GET_BILL_DETAIL|BILL_ITEMS|GET_.*REPORT|GET_REPORT_|GET_GSTR|GET_DAY_BOOK|GET_SALES_|GET_CASHBOOK|GET_CASH_BANK|GET_PETTY_CASH|GET_DSR_|DSR_|GET_ACCOUNTS_|GET_DUE_|DUES_LIST|GET_CUSTOMER_|BILL_PAYMENTS|GET_ORDERS|GET_LEDGER|GET_TRIAL|GET_PROFIT|GET_STOCK|GET_PURCHASE|GET_SUPPLIER|GET_WASTAGE|GET_ONLINE_ORDER|GET_KOT_REGISTER|GET_RECON)/.test(act)
     && (Date.now()-(window.__bnxPageOpenedAt||0))<120000;
@@ -2259,9 +2266,10 @@ async function gasApi(action, payload, endpoint) {
   // Import owns the data-write path. Defer nonessential reports without occupying request slots.
   /* 2026-11-10 ("server busy · queue:34" while 679 import rows were syncing): every report widget kept asking during the import,
      filled this page's request slots and the server, so bills and the import itself waited. While an import runs, report-only
-     reads wait (screens keep their last figures); bills, KOTs, orders, tables, menu and day status are never held. */
+     reads wait (screens keep their last figures); bills, KOTs, orders, tables, menu and day status are never held.
+     Customer / bill screens a person opens (Bill-wise, ledger, dues, Bills List, receipts) are never held either. */
   if(window.__bnxImportBusy && Date.now()-(window.__bnxImportBusyAt||Date.now())<240000 &&
-     /^(GET_ITEM_SALES_REPORT|GET_.*_REPORT(_V2)?|GET_DSR_.*|DSR_.*|GET_DUE_COLLECTION|DUES_LIST|DASH_FIN|GET_ACCOUNTS_DAY|GET_CLIENT_ASSETS|GET_DASHBOARD_SUMMARY|LIST_BILLS|GET_BILLS|RD_FETCH_SHEET|SWIFT_.*|GET_CUSTOMER_LEDGER|GET_OUTSTANDING_BILLS|GET_DUES_RECEIPT_PERIOD|LIST_ADVANCE_LEDGER|LIST_RESERVATIONS)$/i.test(String(action||'')))
+     /^(GET_ITEM_SALES_REPORT|GET_.*_REPORT(_V2)?|GET_DSR_.*|DSR_.*|DASH_FIN|GET_ACCOUNTS_DAY|GET_CLIENT_ASSETS|GET_DASHBOARD_SUMMARY|RD_FETCH_SHEET|SWIFT_.*)$/i.test(String(action||'')))
     return {success:false,busy:true,deferred:true,error:'Report refresh paused while import is running',retryAfterMs:15000};
   payload = payload || {};
   if (/^SAVE_BILL$/i.test(String(action||''))) bnxNormBillPay_(payload);   /* 2026-10-22: never send a PMD id as the pay mode */
@@ -6635,7 +6643,7 @@ details.bnx-default-fold>summary .bnx-fold-label:after{content:"Show ▾";font-s
 details.bnx-default-fold[open]>summary .bnx-fold-label:after{content:"Hide ▴"}
 details.bnx-default-fold:not([open])>.bnx-fold-content{display:none!important}
 </style>
-<meta name="bnx-build" content="RD-2026.11.10-v12">
+<meta name="bnx-build" content="RD-2026.11.10-v13">
 </head>
 <body>
 <script id="bnx-final-runtime-guard-20261001">
@@ -44245,18 +44253,22 @@ body:not(.pos-machine) #bmProductGrid,
     box.querySelector('#bnx75Who').innerHTML = BW.customerId ? `<span class="bnx75-chip">${esc(BW.customerName || BW.customerId)}</span>` : '';
     box.querySelector('#bnx75Clear').style.display = BW.customerId ? '' : 'none';
   }
-  async function load(){
-    ensureUi(); BW.loading = true; render();
-    const r = await api('GET_OUTSTANDING_BILLS', BW.customerId ? { customerId: BW.customerId } : {});
-    BW.loading = false;
-    if (!r || !r.success) { BW.rows = []; render(); notify('⚠️ Bill-wise outstanding could not load: ' + (r?.error || ''), 'error'); return; }
-    /* 2026-10-22: (1) rows come without "age" -> AGE showed "undefinedd"; it is now worked out from the bill date.
-       (2) the server ignores customerId and returns every party -> one party's Bill-wise list showed other parties.
-       Rows are filtered by party id first, by party name only when no row carries the id. */
+  /* 2026-11-10 ("bill-wise not shown" — stuck on Loading… while Core was not answering): the last good list is kept on this
+     device and shown at once (marked as a saved copy); the live list replaces it when the server answers. A failed refresh
+     keeps the saved copy on screen instead of an empty table. */
+  const BW_KEY = () => 'bnx_bw_rows_' + String((typeof W.bnxCurrentClient_ === 'function' && W.bnxCurrentClient_()) || W.CLIENT_ID || '');
+  function bwSaved(){ try{ const o = JSON.parse(localStorage.getItem(BW_KEY()) || 'null'); return o && Array.isArray(o.rows) ? o : null; }catch(e){ return null; } }
+  function bwStore(rows){ try{ localStorage.setItem(BW_KEY(), JSON.stringify({ at: Date.now(), rows: rows })); }catch(e){} }
+  /* one customer's open bills from the saved copy (used by Receive Payment) */
+  W.bnxBwSavedFor_ = function(customerId, name){ const o = bwSaved(); if (!o) return null; const nk = v => String(v == null ? '' : v).toUpperCase().replace(/[^A-Z0-9]+/g, '');
+    const id = String(customerId || ''), byId = o.rows.filter(x => id && String(x.customerId == null ? '' : x.customerId) === id);
+    const rows = byId.length ? byId : (name ? o.rows.filter(x => nk(x.customer) === nk(name)) : []); return { at: o.at, rows: rows }; };
+  W.bnxBwStore_ = bwStore;
+  function bwApply(raw){
     const bd = String((typeof W.bnxReportBusinessDate_ === 'function' ? W.bnxReportBusinessDate_() : '') || new Date().toISOString().slice(0,10)).slice(0,10);
     const ageOf = d => { d = String(d || '').slice(0,10); if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return 0; const n = Math.round((new Date(bd + 'T00:00:00') - new Date(d + 'T00:00:00')) / 86400000); return n > 0 ? n : 0; };
     const nk = v => String(v == null ? '' : v).toUpperCase().replace(/[^A-Z0-9]+/g, '');
-    let rows = (r.data.rows || []).map(x => Object.assign({}, x, {
+    let rows = (raw || []).map(x => Object.assign({}, x, {
       age: Number.isFinite(Number(x.age)) && x.age !== '' && x.age != null ? Number(x.age) : ageOf(x.date),
       billAmount: Number(x.billAmount != null ? x.billAmount : x.amount) || 0,
       due: Number(x.due) || 0, paidAtBill: Number(x.paidAtBill) || 0, received: Number(x.received) || 0, adjusted: Number(x.adjusted) || 0
@@ -44269,6 +44281,25 @@ body:not(.pos-machine) #bmProductGrid,
     BW.rows = rows;
     if (BW.customerId && BW.rows[0] && !BW.customerName) BW.customerName = BW.rows[0].customer;
     const keep = {}; BW.rows.forEach(x => { if (BW.sel[key(x)]) keep[key(x)] = x; }); BW.sel = keep;
+  }
+  function bwNote(t){ try{ const box = ensureUi(), w = box && box.querySelector('#bnx75Who'); if (!w) return; let n = box.querySelector('#bnx75Saved'); if (!n){ n = document.createElement('span'); n.id = 'bnx75Saved'; n.style.cssText = 'margin-left:8px;font-size:11px;font-weight:600;color:#92400e'; w.parentNode.insertBefore(n, w.nextSibling); } n.textContent = t || ''; }catch(e){} }
+  async function load(){
+    ensureUi();
+    const my = (BW.__seq = (BW.__seq || 0) + 1), saved = bwSaved();
+    if (saved && saved.rows.length){ bwApply(saved.rows); BW.loading = false; render(); bwNote('📋 saved copy ' + new Date(saved.at).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}) + ' · ⟳ refreshing…'); }
+    else { BW.loading = true; render(); bwNote('⟳ loading from server…'); }
+    const r = await api('GET_OUTSTANDING_BILLS', {});   /* server returns every party; one party is filtered here (same as before) */
+    if (my !== BW.__seq) return;   /* a newer load (other party / view) already started */
+    BW.loading = false;
+    if (!r || !r.success) {
+      if (saved && saved.rows.length){ render(); bwNote('📋 saved copy ' + new Date(saved.at).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}) + ' · server not answering (' + String(r && r.error || 'no reply').slice(0,60) + ') — open again to retry'); return; }
+      BW.rows = []; render(); bwNote(''); notify('⚠️ Bill-wise outstanding could not load: ' + (r?.error || ''), 'error'); return;
+    }
+    /* 2026-10-22: (1) rows come without "age" -> AGE showed "undefinedd"; it is now worked out from the bill date.
+       (2) the server ignores customerId and returns every party -> one party's Bill-wise list showed other parties.
+       Rows are filtered by party id first, by party name only when no row carries the id. */
+    const raw = (r.data && r.data.rows) || [];
+    bwStore(raw); bwApply(raw); bwNote('');
     render();
   }
   W.bnx75SetView = function(v){
@@ -46210,7 +46241,16 @@ body:not(.pos-machine) #bmProductGrid,
       r=Math.abs(sum-bnxCreditNumber_(c.outstanding))<=0.01?{success:true,data:{rows}}:
         {success:false,error:'Bill detail differs from the current customer balance. Refresh the dues data; use oldest-first allocation until the bill detail is corrected.'};
     }else{
+      /* 2026-11-10 ("open bills take too long"): the saved bill-wise copy is used AT ONCE when its open bills add up to this
+         customer's current due (same check as the CUSTOMER_DUES path above). A stale copy never matches the due, so it is never used. */
+      let cached = null; try{ const sv = typeof W.bnxBwSavedFor_ === 'function' ? W.bnxBwSavedFor_(want, c.customer || c.name || '') : null;
+        if (sv && sv.rows.length){ const sum = r2(sv.rows.reduce((n, b) => n + (Number(b.due) || 0), 0)); if (Math.abs(sum - bnxCreditNumber_(c.outstanding)) <= 1) cached = { success:true, data:{ rows: sv.rows }, fromSaved: true }; } }catch(_e){}
+      if (cached){ r = cached;
+        api('GET_OUTSTANDING_BILLS', {}).then(function(x){ try{ if (x && x.success && x.data && Array.isArray(x.data.rows) && typeof W.bnxBwStore_ === 'function') W.bnxBwStore_(x.data.rows); }catch(_e){} });   /* refresh the copy quietly */
+      } else
       r = await Promise.race([api('GET_OUTSTANDING_BILLS', { customerId: want }), new Promise(res => setTimeout(() => res({ success:false, timeout:true, error:'Server is slow' }), 12000))]);
+      /* keep the copy fresh from this answer too (server returns every party) */
+      try{ if (r && r.success && !r.fromSaved && r.data && Array.isArray(r.data.rows) && r.data.rows.some(x => String(x.customerId||'') !== String(want)) && typeof W.bnxBwStore_ === 'function') W.bnxBwStore_(r.data.rows); }catch(_e){}
     }
     if (seq !== RV.loadSeq || !RV.cust || RV.cust.customerId !== want) return;
     RV.loading = false;
@@ -58072,7 +58112,7 @@ html body #page-customer-credit.page .card-header,html body #page-due-collection
   var prevErp=W.erpApi;
   if(typeof prevErp==='function' && !prevErp.__bnxGov){
     /* 2026-11-10: erpApi reads are shared too — the same read already on its way (or answered in the last seconds) is reused */
-    var DEFER_RX=/^(GET_ITEM_SALES_REPORT|GET_.*_REPORT(_V2)?|GET_DSR_.*|DSR_.*|GET_DUE_COLLECTION|DUES_LIST|DASH_FIN|GET_ACCOUNTS_DAY|GET_CLIENT_ASSETS|GET_DASHBOARD_SUMMARY|LIST_BILLS|GET_BILLS|RD_FETCH_SHEET|SWIFT_.*|GET_CUSTOMER_LEDGER|GET_OUTSTANDING_BILLS|GET_DUES_RECEIPT_PERIOD|LIST_ADVANCE_LEDGER|LIST_RESERVATIONS)$/i;
+    var DEFER_RX=/^(GET_ITEM_SALES_REPORT|GET_.*_REPORT(_V2)?|GET_DSR_.*|DSR_.*|DASH_FIN|GET_ACCOUNTS_DAY|GET_CLIENT_ASSETS|GET_DASHBOARD_SUMMARY|RD_FETCH_SHEET|SWIFT_.*)$/i;
     var we=function(payload,type){ var A=String(payload&&payload.action||''), self=this, args=arguments;
       if(W.__bnxImportBusy && Date.now()-(W.__bnxImportBusyAt||Date.now())<240000 && DEFER_RX.test(A) && !(payload&&payload.force===true)){
         return Promise.resolve({success:false,busy:true,deferred:true,error:'Report refresh paused while import is running',retryAfterMs:15000}); }
@@ -64369,7 +64409,7 @@ if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ s
    Green = page + server are the current fix set. Amber = the server still runs old code → in Apps Script:
    Deploy › Manage deployments › ✏ › Version: NEW VERSION › Deploy. Tap the badge for details. */
 (function(){
-  var W=window, D=document, PAGE='RD-2026.11.10-v12', NEED='GS-2026.10.09-v16';
+  var W=window, D=document, PAGE='RD-2026.11.10-v13', NEED='GS-2026.10.09-v16';
   var SRV={build:'',ok:null,url:'',features:{}};
   function ids(){ var out=[], add=function(u){ var m=String(u||'').match(/AKfycb[A-Za-z0-9_-]{20,}/); if(m&&out.indexOf(m[0])<0) out.push(m[0]); };
     add('AKfycbwHdqrP4IvuVD2ZkupNybrEkiXu3kmuI6-tQoiHgYxoqr1KgUupeFsi3PIoFEbuv6XA');
