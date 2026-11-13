@@ -3895,6 +3895,9 @@ window.addEventListener('pageshow', e=>{ if(e.persisted){ try{ bnxRetryMenu(); }
     STATE.customerPhone=String(r.mobile); STATE.customerName=String(r.customerName||''); STATE.points=Number(r.points||0); STATE.isNewCustomer=!!r.isNew;
     if(r.tableId && !STATE.tableId) STATE.tableId=String(r.tableId).replace(/[^A-Za-z0-9_-]/g,'').slice(0,12);
     STATE.gateOk=true; STATE.afterIdentify='';
+    /* 2026-11-13 order + pay: a WhatsApp-verified guest may order from the phone (unless the owner's LIVE control says No) */
+    if(r.canOrder===true){ STATE.__waOrder=true; try{ applyOrderMode(); renderMenu(); }catch(e){} }
+    try{ if(window.bnxPaySet_) bnxPaySet_(r); }catch(e){}
     try{ localStorage.setItem('bnx_guest_phone',STATE.customerPhone); }catch(e){}
     try{ gxSave({phone:STATE.customerPhone,name:STATE.customerName,points:r.points,visits:r.visitCount,crn:r.crn||'',optIn:r.optIn!==false,saved:true,welcomed:true}); }catch(e){}
     try{ sessionStorage.setItem('bnx_ask_'+STATE.clientId+'_'+STATE.scanKey,'wa'); }catch(e){}
@@ -3902,6 +3905,135 @@ window.addEventListener('pageshow', e=>{ if(e.persisted){ try{ bnxRetryMenu(); }
     try{ var cur=document.querySelector('.screen.active'); if(cur && /^(s-phone|s-name)$/.test(cur.id)) enterMenu(); }catch(e){}
     setTimeout(function(){ try{ gxPaint(); }catch(e){} },300);
   })();
+})();
+</script>
+<script id="bnx-pay-direct-20261113">
+/* ═══ ORDER + PAY DIRECT (2026-11-13) ═══
+   • WhatsApp-verified guest (STATE.__waOrder): ADD / cart / Place order are on, unless Dashboard › Table QR › LIVE control
+     "order" = No (that still wins).
+   • After Place order: "Pay ₹X now" → UPI app (GPay / PhonePe / Paytm / BHIM) with the amount, the restaurant's UPI ID and
+     "Table B5 · ORD-123" filled in. Guest comes back → "I have paid" (+ UTR, optional) → GUEST_CHECKIN&mode=PAY_CLAIM →
+     Growth Hub › Payments, where staff tick Received after checking the bank app (a plain UPI link has no automatic
+     confirmation — that needs a payment gateway).
+   • "💳 Pay bill ₹X" stays on the menu for every unpaid order of this visit, so guests can pay once at the end.
+   UPI ID = Growth Hub › Settings › "UPI ID" (same as event tickets), from the WA_TOKEN answer or GUEST_CHECKIN&mode=PAY_INFO. */
+(function(){
+  'use strict';
+  /* ordering for WhatsApp-verified guests */
+  try{
+    var _enf=bnxEnforceLiveCtl_;
+    bnxEnforceLiveCtl_=function(){ var L=_enf.apply(this,arguments); if(STATE.__waOrder && L.ord!==false) STATE.canOrder=true; return L; };
+  }catch(e){}
+
+  var PAY={upi:'',name:'',asked:false};
+  function okUpi(v){ return /^[A-Za-z0-9._-]{2,256}@[A-Za-z][A-Za-z0-9.]{1,63}$/.test(String(v||'').trim()); }
+  window.bnxPaySet_=function(r){ if(r && okUpi(r.upiId)){ PAY.upi=String(r.upiId).trim(); PAY.name=String(r.upiName||STATE.restaurantName||'').trim().slice(0,50); paintPill(); } };
+  async function payInfo(){
+    if(PAY.upi||PAY.asked) return; PAY.asked=true;
+    try{ var r=await bnxGuestMode_('PAY_INFO',{},15000); if(r && r.success!==false) bnxPaySet_(r); }catch(e){}
+    paintPill(); var c=document.getElementById('cf-pay'); if(c) paintCard(c);
+  }
+  /* unpaid orders of this visit (this phone) */
+  var OK='bnx_orders_'+STATE.clientId+'_'+STATE.scanKey;
+  function list(){ try{ return JSON.parse(sessionStorage.getItem(OK)||localStorage.getItem(OK)||'[]')||[]; }catch(e){ return []; } }
+  function save(a){ a=a.slice(-20); try{ sessionStorage.setItem(OK,JSON.stringify(a)); localStorage.setItem(OK,JSON.stringify(a)); }catch(e){} }
+  function unpaid(){ return list().filter(function(o){ return !o.paid; }); }
+  function due(){ return Math.round(unpaid().reduce(function(a,o){ return a+(Number(o.amt)||0); },0)*100)/100; }
+  function rs(n){ return '₹'+Number(n||0).toLocaleString('en-IN',{maximumFractionDigits:2}); }
+
+  var _g=gasApi;
+  gasApi=async function(action,payload){
+    var r=await _g.apply(this,arguments);
+    try{
+      if(action==='SAVE_ORDER' && r && r.success!==false && payload){
+        var d=r.data||{}, no=String(r.orderNo||d.ORDER_NO||payload.requestId||'').slice(0,40);
+        var amt=Number(r.grandTotal||r.totalAmount||d.GRAND_TOTAL||d.TOTAL_AMOUNT||payload.billAmount)||0;
+        var a=list().filter(function(o){ return o.no!==no; }); a.push({no:no,amt:amt,t:Date.now(),paid:false,table:STATE.tableId||''}); save(a);
+        setTimeout(function(){ payInfo(); paintPill(); },50);
+      }
+    }catch(e){}
+    return r;
+  };
+
+  function upiLink(amt){
+    var nos=unpaid().map(function(o){ return o.no; }).filter(Boolean).join(',');
+    var note=((STATE.tableId?'Table '+STATE.tableId+' ':'')+(nos||'Order')).replace(/[^A-Za-z0-9 ,._-]/g,'').slice(0,60);
+    var tr=('BNX'+STATE.clientId+Date.now().toString(36)).replace(/[^A-Za-z0-9]/g,'').slice(0,35);
+    return 'upi://pay?pa='+encodeURIComponent(PAY.upi)+'&pn='+encodeURIComponent(PAY.name||'Restaurant')+'&am='+Number(amt).toFixed(2)+'&cu=INR&tn='+encodeURIComponent(note)+'&tr='+tr;
+  }
+  function paintCard(box){
+    var amt=due();
+    if(!(amt>0)){ var paidAny=list().some(function(o){ return o.paid; });
+      box.innerHTML=paidAny?'<div style="font-weight:900;color:#14532d;font-size:15px">✅ Payment sent — staff are confirming it.</div>':''; box.style.display=paidAny?'block':'none'; return; }
+    box.style.display='block';
+    var n=unpaid().length;
+    if(!PAY.upi){
+      box.innerHTML='<div style="font-weight:900;font-size:15px">Bill so far: '+rs(amt)+'</div><div class="hint" style="margin:4px 0 0">'+(PAY.asked?'Pay at the table or the counter when you are done.':'Loading payment options…')+'</div>';
+      return;
+    }
+    box.innerHTML='<div style="font-weight:900;font-size:15px;margin-bottom:2px">'+(n>1?n+' orders · ':'')+'To pay '+rs(amt)+'</div>'
+      +'<div class="hint" style="margin:0 0 10px">Pay now or after your meal — this button stays on the menu.</div>'
+      +'<a class="btn btn-primary" id="pay-upi" style="text-decoration:none;display:flex;justify-content:center" href="'+escH(upiLink(amt))+'">💳 Pay '+rs(amt)+' now · UPI</a>'
+      +'<div class="hint" style="margin:6px 0 0;font-size:12px">Opens GPay / PhonePe / Paytm / BHIM. UPI ID <b>'+escH(PAY.upi)+'</b> <button type="button" id="pay-copy" style="border:0;background:none;color:var(--a1,#c2570a);font-weight:800;padding:2px 4px;cursor:pointer">Copy</button></div>'
+      +'<div id="pay-claim" style="display:none;margin-top:12px;text-align:left"><div style="font-size:13px;font-weight:800;margin-bottom:6px">Done paying?</div>'
+      +'<input id="pay-utr" inputmode="numeric" maxlength="22" placeholder="UPI ref / UTR no. (optional, 12 digits)" style="width:100%;box-sizing:border-box;padding:11px 12px;border:1.5px solid #e0c48a;border-radius:11px;font-weight:700;font-size:14px">'
+      +'<button type="button" class="btn btn-primary" id="pay-done" style="margin-top:8px;background:#15803d">✅ I have paid '+rs(amt)+'</button><div class="err-msg" id="pay-err"></div></div>'
+      +'<button type="button" class="btn btn-ghost" id="pay-cash" style="margin-top:8px;box-shadow:none">Pay at table / counter instead</button>';
+    var showClaim=function(){ var c=box.querySelector('#pay-claim'); if(c) c.style.display='block'; };
+    box.querySelector('#pay-upi').addEventListener('click',function(){ try{ sessionStorage.setItem(OK+'_tap',String(Date.now())); }catch(e){} setTimeout(showClaim,800); });
+    try{ if(Number(sessionStorage.getItem(OK+'_tap')||0)>0) showClaim(); }catch(e){}
+    box.querySelector('#pay-copy').onclick=function(){ try{ navigator.clipboard.writeText(PAY.upi).then(function(){ bnxToast('UPI ID copied'); }); }catch(e){ prompt('UPI ID',PAY.upi); } };
+    box.querySelector('#pay-cash').onclick=function(){ closeSheet(); bnxToast('No problem — pay the steward or at the counter.'); };
+    box.querySelector('#pay-done').onclick=async function(){
+      var b=this, utr=String(box.querySelector('#pay-utr').value||'').replace(/\s/g,''), err=box.querySelector('#pay-err');
+      if(utr && !/^\d{10,22}$/.test(utr) && !/^[A-Za-z0-9]{10,22}$/.test(utr)){ err.textContent='That reference looks wrong — check it or leave it empty.'; return; }
+      b.disabled=true; b.textContent='Sending…'; err.textContent='';
+      var u=unpaid(), nos=u.map(function(o){ return o.no; }).join(',');
+      var r=await bnxGuestMode_('PAY_CLAIM',{amount:amt,utr:utr,orderNos:nos,mobileNo:STATE.customerPhone||'',customerName:STATE.customerName||'',tableId:STATE.tableId||'',
+        scanKey:STATE.scanKey,upiId:PAY.upi,requestId:'pay-'+STATE.clientId+'-'+STATE.scanKey+'-'+nos.replace(/[^A-Za-z0-9]/g,'').slice(-40)},20000);
+      if(!r || r.success===false){ b.disabled=false; b.textContent='✅ I have paid '+rs(amt); err.textContent=(r&&r.error&&!r.offline)?r.error:'Could not reach the restaurant — please show the payment screen to the steward.'; return; }
+      var a=list(); a.forEach(function(o){ if(u.some(function(x){ return x.no===o.no; })){ o.paid=true; o.claim=r.claimId||''; } }); save(a);
+      try{ sessionStorage.removeItem(OK+'_tap'); }catch(e){}
+      bnxHaptic&&bnxHaptic([20,40,20]);
+      box.innerHTML='<div style="font-weight:900;color:#14532d;font-size:16px">✅ Thank you! Payment of '+rs(amt)+' sent.</div><div class="hint" style="margin:4px 0 0">The staff confirm it from the bank app'+(r.claimId?' · ref '+escH(r.claimId):'')+'. You can show this screen to the steward.</div>';
+      paintPill();
+    };
+  }
+  /* confirmation screen card */
+  function confirmCard(){
+    var cf=document.getElementById('s-confirm'); if(!cf) return;
+    var box=document.getElementById('cf-pay');
+    if(!box){ box=document.createElement('div'); box.id='cf-pay'; box.style.cssText='width:100%;max-width:420px;margin:14px auto 0;background:#fff;border:1.5px solid #86efac;border-radius:16px;padding:14px;text-align:center;box-sizing:border-box';
+      var anchor=document.getElementById('cf-summary')||document.getElementById('cf-channel'); if(anchor&&anchor.parentNode) anchor.parentNode.insertBefore(box,anchor.nextSibling); else cf.querySelector('.center-col').appendChild(box); }
+    paintCard(box); payInfo();
+  }
+  var scr=document.getElementById('s-confirm');
+  if(scr && window.MutationObserver) new MutationObserver(function(){ if(scr.classList.contains('active')) setTimeout(confirmCard,150); }).observe(scr,{attributes:true,attributeFilter:['class']});
+  /* cart: "To pay at table" → "To pay" when UPI is available */
+  try{ var _rc=renderCart; renderCart=function(){ _rc.apply(this,arguments); try{ var l=document.querySelector('#bill-total'); if(l&&PAY.upi) l.previousElementSibling.textContent='To pay (UPI or at table)'; }catch(e){} }; }catch(e){}
+
+  /* "💳 Pay bill" pill on the menu + bottom sheet */
+  var pill=document.createElement('button'); pill.type='button'; pill.id='bnx-paypill';
+  pill.style.cssText='position:fixed;right:max(12px,calc(50% - 218px));top:calc(env(safe-area-inset-top,0px) + 66px);z-index:60;display:none;border:0;border-radius:999px;padding:9px 14px;background:#15803d;color:#fff;font:900 13.5px "DM Sans",system-ui,sans-serif;box-shadow:0 8px 22px rgba(21,128,61,.35);cursor:pointer';
+  document.body.appendChild(pill);
+  pill.onclick=function(){ openSheet(); };
+  function paintPill(){
+    var amt=due(), m=document.getElementById('s-menu'), on=amt>0 && m && m.classList.contains('active') && !document.getElementById('bnx-paysheet');
+    pill.style.display=on?'block':'none'; if(on) pill.textContent='💳 Pay bill '+rs(amt);
+  }
+  setInterval(paintPill,1000);
+  function openSheet(){
+    closeSheet(); payInfo();
+    var w=document.createElement('div'); w.id='bnx-paysheet'; w.style.cssText='position:fixed;inset:0;z-index:9991;background:rgba(20,14,8,.5);display:flex;align-items:flex-end;justify-content:center';
+    w.innerHTML='<div style="background:#fff;width:100%;max-width:520px;border-radius:22px 22px 0 0;padding:20px 18px calc(env(safe-area-inset-bottom,0px) + 18px);max-height:92vh;overflow:auto;text-align:center">'
+      +'<div style="font-weight:900;font-size:18px;margin-bottom:8px">Your bill'+(STATE.tableId?' · Table '+escH(STATE.tableId):'')+'</div>'
+      +unpaid().map(function(o){ return '<div style="display:flex;justify-content:space-between;font-size:13.5px;padding:4px 0;border-bottom:1px dashed #eee"><span>'+escH(o.no||'Order')+'</span><b>'+rs(o.amt)+'</b></div>'; }).join('')
+      +'<div id="ps-box" style="margin-top:12px"></div><button type="button" class="btn btn-ghost" id="ps-x" style="margin-top:8px;box-shadow:none">Close</button></div>';
+    w.addEventListener('click',function(e){ if(e.target===w||e.target.id==='ps-x') closeSheet(); });
+    document.body.appendChild(w); paintCard(w.querySelector('#ps-box')); paintPill();
+  }
+  function closeSheet(){ var o=document.getElementById('bnx-paysheet'); if(o) o.remove(); paintPill(); }
+  if(due()>0) setTimeout(payInfo,3000);
 })();
 </script>
 </body>
