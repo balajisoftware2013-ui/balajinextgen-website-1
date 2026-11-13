@@ -656,7 +656,8 @@ function bnxGgTicketStatus_(p) {
 function bnxGgQrFirst_(text) {
   text = String(text || '');
   if (!/send me the menu/i.test(text)) return null;
-  var m = text.match(/#CI-([A-Za-z0-9_]+?)-(T([A-Za-z0-9]{1,12})|C)(?:-E([A-Za-z0-9_]{1,30}))?(?:\s|$)/);
+  /* also the menu page's own code: #CI-<client>-T5[-P<party>][-E<event>][-D<device>] (2026-11-13 direct WhatsApp, no form) */
+  var m = text.match(/#CI-([A-Za-z0-9_]+?)-(T([A-Za-z0-9]{1,12})|C)(?:-P[A-Za-z0-9_]{1,30})?(?:-E([A-Za-z0-9_]{1,30}))?(?:-D[A-Za-z0-9]{4,20})?(?:\s|$)/);
   if (!m) return null;
   try { return { clientId: bnxGgCid_(m[1]), tableId: m[3] || '', eventName: m[4] ? m[4].replace(/_/g, ' ') : '' }; } catch (e) { return null; }
 }
