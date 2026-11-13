@@ -60,7 +60,19 @@
  *     WA_HOOK_SECRET             add ?k=<secret> to the Meta callback URL (blocks fake webhook posts)
  * ════════════════════════════════════════════════════════════════════════════════════════════════════════════
  */
-var BNX_GG_BUILD = '2026-11-09-v1';
+/* v1.1 (2026-11-13) WHATSAPP-FIRST QR · ORDER · PAY (like the Zillout "Scan for menu" card)
+ *   Table QR → wa.me/91<API number>?text=Hi, Send me the menu of <REST>, I am Seated on Table Number B5 #CI-<client>-TB5
+ *   → webhook saves mobile + WhatsApp name (existing #CI check-in) → reply card: logo + "You have checked in…" + [Explore our menu]
+ *   → customer-order.html?client=…&table=B5&order=1&wt=<token>  (GUEST_CHECKIN&mode=WA_TOKEN → name + number, ordering on, UPI ID)
+ *   → ADD → Place order (SAVE_ORDER) → "Pay ₹X · UPI" → "I have paid" (mode PAY_CLAIM → TRANSACTION DB › GUEST_PAYMENTS)
+ *   → Growth Hub › Payments: Received → WhatsApp "Payment received" + thank-you queued
+ *   → bill settled (CUSTOMER_CHECKIN with billNo / CRM_BILL_CAPTURE) or payment received → after N min (5-minute campaign
+ *     trigger) "Thank you for visiting!" + [Rate Now!] → restaurant-landing.html?…&wt=<token>#feedback (name + number filled).
+ *   Settings (Growth Hub › Settings): siteUrl (website folder), waOrder, waCheckinText, waMenuBtn, waThanksText, waRateBtn,
+ *   waThanksDelayMin, upiId, upiName. Optional Script property META_WA_THANKS_TEMPLATE (24-h window closed): body {{1}} = first
+ *   name, one URL button whose dynamic suffix {{1}} = token (button URL in Meta = <site>/restaurant-landing.html?wt={{1}}).
+ */
+var BNX_GG_BUILD = '2026-11-13-v1.1';
 
 /* ─────────────────────────── tab layouts ─────────────────────────── */
 var GG_FB_TAB = 'GUEST_FEEDBACK';
@@ -79,8 +91,13 @@ var GG_CP_HEAD = ['CAMPAIGN_ID', 'CREATED_AT', 'CLIENT_ID', 'NAME', 'TEMPLATE', 
   'QUEUED', 'SENT', 'FAILED', 'DELIVERED', 'READ', 'STATUS', 'CREATED_BY', 'STARTED_AT', 'FINISHED_AT', 'LAST_ERROR'];
 var GG_CL_TAB = 'WA_CAMPAIGN_LOG';
 var GG_CL_HEAD = ['CAMPAIGN_ID', 'MOBILE', 'NAME', 'CRN', 'STATUS', 'MSG_ID', 'ERROR', 'SENT_AT', 'CLIENT_ID', 'UPDATED_AT', 'META'];
+var GG_PY_TAB = 'GUEST_PAYMENTS';
+var GG_PY_HEAD = ['CLAIM_ID', 'CREATED_AT', 'BUSINESS_DAY', 'CLIENT_ID', 'MOBILE', 'NAME', 'TABLE', 'ORDER_NOS', 'AMOUNT', 'UTR', 'UPI_ID', 'STATUS',
+  'HANDLED_BY', 'HANDLED_AT', 'REQUEST_ID', 'DEVICE_ID', 'NOTIFY_RESULT'];
+var GG_TQ_TAB = 'WA_THANKS_QUEUE';
+var GG_TQ_HEAD = ['KEY', 'CREATED_AT', 'CLIENT_ID', 'MOBILE', 'NAME', 'TABLE', 'BILL_NO', 'DUE_MS', 'STATUS', 'RESULT', 'SENT_AT', 'SOURCE'];
 var GG_TEXT_COLS = ['CREATED_AT', 'BUSINESS_DAY', 'DATE', 'TIME', 'EVENT_DATE', 'MOBILE', 'HANDLED_AT', 'RESOLVED_AT', 'PAID_AT',
-  'CHECKED_IN_AT', 'UPDATED_AT', 'STARTED_AT', 'FINISHED_AT', 'SENT_AT', 'CODE', 'ORDER_NO', 'TABLE'];
+  'CHECKED_IN_AT', 'UPDATED_AT', 'STARTED_AT', 'FINISHED_AT', 'SENT_AT', 'CODE', 'ORDER_NO', 'TABLE', 'UTR', 'ORDER_NOS', 'BILL_NO', 'DUE_MS', 'KEY'];
 
 /* ─────────────────────────── small helpers ─────────────────────────── */
 function bnxGgJson_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
@@ -165,13 +182,16 @@ function bnxGgTypesSh_(cid) { return bnxGgTab_(cid, 'MASTER', GG_TT_TAB, GG_TT_H
 function bnxGgBookSh_(cid) { return bnxGgTab_(cid, 'TRANSACTIONS', GG_TB_TAB, GG_TB_HEAD); }
 function bnxGgCampSh_(cid) { return bnxGgTab_(cid, 'TRANSACTIONS', GG_CP_TAB, GG_CP_HEAD); }
 function bnxGgCampLogSh_(cid) { return bnxGgTab_(cid, 'TRANSACTIONS', GG_CL_TAB, GG_CL_HEAD); }
+function bnxGgPaySh_(cid) { return bnxGgTab_(cid, 'TRANSACTIONS', GG_PY_TAB, GG_PY_HEAD); }
+function bnxGgThanksSh_(cid) { return bnxGgTab_(cid, 'TRANSACTIONS', GG_TQ_TAB, GG_TQ_HEAD); }
 
 /* ─────────────────────────── per-client settings (Script property GG_CFG_<clientId>) ─────────────────────────── */
 var GG_CFG_DEFAULT = {
   resvOn: true, resvAuto: false, resvOpen: '12:00', resvClose: '23:00', slotMin: 30, slotCap: 40, dayCap: 0, maxPax: 20,
   maxDays: 60, leadMin: 60, closedDays: '', areas: 'Indoor, Outdoor, Bar, Private dining', occasions: 'Birthday, Anniversary, Date night, Business, Party',
   ticketsOn: true, ticketHoldMin: 0, upiId: '', upiName: '', fbOn: true, fbLowAlert: 3, alertEmail: '', reviewUrl: '',
-  tagline: '', about: '', hours: '', instagram: '', facebook: '', mapUrl: '', coverUrl: '', brandColor: '', menuOrderOn: false
+  tagline: '', about: '', hours: '', instagram: '', facebook: '', mapUrl: '', coverUrl: '', brandColor: '', menuOrderOn: false,
+  siteUrl: '', waOrder: true, waCheckinText: '', waMenuBtn: '', waThanksText: '', waRateBtn: '', waThanksDelayMin: 30
 };
 function bnxGgCfg_(cid) {
   var o = {}; try { o = JSON.parse(PropertiesService.getScriptProperties().getProperty('GG_CFG_' + cid) || '{}') || {}; } catch (e) { o = {}; }
@@ -179,18 +199,19 @@ function bnxGgCfg_(cid) {
   return out;
 }
 function bnxGgCfgSave_(cid, inp) {
-  var cur = bnxGgCfg_(cid), num = { slotMin: [15, 240], slotCap: [1, 2000], dayCap: [0, 20000], maxPax: [1, 500], maxDays: [1, 365], leadMin: [0, 2880], ticketHoldMin: [0, 2880], fbLowAlert: [1, 5] };
+  var cur = bnxGgCfg_(cid), num = { slotMin: [15, 240], slotCap: [1, 2000], dayCap: [0, 20000], maxPax: [1, 500], maxDays: [1, 365], leadMin: [0, 2880], ticketHoldMin: [0, 2880], fbLowAlert: [1, 5], waThanksDelayMin: [0, 240] };
   Object.keys(GG_CFG_DEFAULT).forEach(function (k) {
     if (inp[k] === undefined) return;
     var d = GG_CFG_DEFAULT[k];
     if (typeof d === 'boolean') cur[k] = bnxGgBool_(inp[k], d);
     else if (typeof d === 'number') { var n = Math.round(bnxGgNum_(inp[k], d)), r = num[k] || [0, 1e6]; cur[k] = Math.min(r[1], Math.max(r[0], n)); }
     else if (k === 'resvOpen' || k === 'resvClose') cur[k] = bnxGgTime_(inp[k]) || d;
-    else if (/Url$|instagram|facebook/.test(k)) { var u = String(inp[k] || '').trim(); cur[k] = (!u || /^https:\/\/\S+$/i.test(u)) ? u.slice(0, 400) : cur[k]; }
+    else if (/Url$|instagram|facebook/.test(k)) { var u = String(inp[k] || '').trim(); if (k === 'siteUrl' && u && !/\/$/.test(u)) u += '/'; cur[k] = (!u || /^https:\/\/\S+$/i.test(u)) ? u.slice(0, 400) : cur[k]; }
     else if (k === 'upiId') { var up = String(inp[k] || '').trim(); cur[k] = (!up || /^[A-Za-z0-9._-]{2,64}@[A-Za-z0-9.-]{2,64}$/.test(up)) ? up : cur[k]; }
     else if (k === 'alertEmail') { var em = String(inp[k] || '').trim(); cur[k] = (!em || /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)) ? em.slice(0, 120) : cur[k]; }
     else if (k === 'brandColor') { var bc = String(inp[k] || '').trim(); cur[k] = (!bc || /^#[0-9a-f]{6}$/i.test(bc)) ? bc : cur[k]; }
-    else cur[k] = bnxGgTxt_(inp[k], k === 'about' ? 1200 : 300);
+    else if (k === 'waMenuBtn' || k === 'waRateBtn') cur[k] = bnxGgTxt_(inp[k], 20);
+    else cur[k] = bnxGgTxt_(inp[k], k === 'about' ? 1200 : /^wa.*Text$/.test(k) ? 600 : 300);
   });
   PropertiesService.getScriptProperties().setProperty('GG_CFG_' + cid, JSON.stringify(cur));
   return cur;
@@ -317,7 +338,11 @@ function bnxWaHandle_(body, log) {
           var r = bnxWaCheckinFromMessage_({ from: m.from, name: names[m.from] || '', text: text, msgId: m.id, phoneId: phoneId }, P);
           if (!r) ent.result = 'IGNORED — no valid #CI-<client>-<table> code, or sender is not an Indian mobile';
           else if (r.success === false) { ent.result = 'FAILED — ' + String(r.error || ''); cache.remove('wam_' + m.id); }
-          else { n++; ent.result = r.command ? ('command ' + r.command) : ('SAVED crn=' + (r.crn || '') + ' name=' + (r.customerName || '(none)') + ' visits=' + (r.visitCount || 1) + (r.reply ? ' reply=' + String(r.reply).slice(0, 40) : '')); }
+          else { n++; ent.result = r.command ? ('command ' + r.command) : ('SAVED crn=' + (r.crn || '') + ' name=' + (r.customerName || '(none)') + ' visits=' + (r.visitCount || 1) + (r.reply ? ' reply=' + String(r.reply).slice(0, 40) : ''));
+            /* 2026-11-13 WhatsApp-first table QR ("Send me the menu … #CI-…") → menu card with the one-visit link */
+            var qf = !r.command && bnxGgQrFirst_(text);
+            if (qf) { try { var mr = bnxGgMenuReply_(qf.clientId, bnxGgMobile_(m.from), r.customerName || names[m.from] || '', qf); ent.result += ' · MENU CARD ' + (mr.sent ? 'sent' : 'FAILED ' + String(mr.error || '').slice(0, 60)); }
+              catch (e) { ent.result += ' · MENU CARD ERROR ' + String(e.message || e).slice(0, 60); } } }
         } catch (e) { ent.result = 'ERROR — ' + String(e.message || e).slice(0, 160); cache.remove('wam_' + m.id); }
         log.push(ent);
       });
@@ -572,7 +597,7 @@ function bnxGgSold_(cid, rows, cfg) {
 }
 function bnxGgExpireWrite_(sh, rows) { rows.forEach(function (b) { if (b._expire) bnxGgSet_(sh, b._row, { STATUS: 'EXPIRED', UPDATED_AT: bnxGgIst_() }); }); }
 function bnxGgEventsWithTickets_(cid, publicOnly) {
-  var evs = []; try { evs = bnxQrpEvents_(cid, publicOnly); } catch (e) { Logger.log('events: ' + e.message); }
+  var evs = []; try { evs = bnxQrpEvents_(cid, publicOnly).filter(function (e) { return !(typeof bnxQrpIsCfg_ === 'function' && bnxQrpIsCfg_(e)); }); } catch (e) { Logger.log('events: ' + e.message); }
   var cfg = bnxGgCfg_(cid), types = bnxGgTypes_(cid), bsh = bnxGgBookSh_(cid), rows = bnxGgRows_(bsh), sold = bnxGgSold_(cid, rows, cfg);
   return evs.map(function (e) {
     var t = types.filter(function (x) { return x.eventId === e.id && (!publicOnly || x.active); }).map(function (x) {
@@ -592,7 +617,7 @@ function bnxGgTicketBook_(p) {
   if (!name) return { success: false, error: 'Enter your name' };
   if (bnxGgOver_('ggtb_m_' + cid + '_' + mobile + '_' + bnxGgIst_('yyyyMMdd'), 8, 90000)) return { success: false, error: 'Too many bookings from this number today — please contact us' };
   if (p.requestId) { var hit = CacheService.getScriptCache().get('ggtb_req_' + cid + '_' + String(p.requestId).slice(0, 80)); if (hit) return JSON.parse(hit); }
-  var ev = bnxQrpEvents_(cid, true).filter(function (e) { return e.id === String(p.eventId || ''); })[0];
+  var ev = bnxQrpEvents_(cid, true).filter(function (e) { return e.id === String(p.eventId || '') && !(typeof bnxQrpIsCfg_ === 'function' && bnxQrpIsCfg_(e)); })[0];
   if (!ev) return { success: false, error: 'This event is no longer open for booking' };
   var type = bnxGgTypes_(cid, ev.id).filter(function (t) { return t.typeId === String(p.typeId || '') && t.active; })[0];
   if (!type) return { success: false, error: 'Ticket type not available' };
@@ -624,6 +649,168 @@ function bnxGgTicketStatus_(p) {
 }
 
 /* ═════════════════════════════════════════════════════════════════════════════════════════════════════════
+   WHATSAPP-FIRST QR · MENU CARD · ORDER + PAY · THANK-YOU  (2026-11-13)
+   ═════════════════════════════════════════════════════════════════════════════════════════════════════════ */
+/* "Hi, Send me the menu of X, I am Seated on Table Number B5 \n #CI-CL00010-TB5" → {clientId, tableId, eventName} or null.
+   The menu page's own "Please check me in … -D<device>" message keeps the WA_STATUS flow (no card). */
+function bnxGgQrFirst_(text) {
+  text = String(text || '');
+  if (!/send me the menu/i.test(text)) return null;
+  var m = text.match(/#CI-([A-Za-z0-9_]+?)-(T([A-Za-z0-9]{1,12})|C)(?:-E([A-Za-z0-9_]{1,30}))?(?:\s|$)/);
+  if (!m) return null;
+  try { return { clientId: bnxGgCid_(m[1]), tableId: m[3] || '', eventName: m[4] ? m[4].replace(/_/g, ' ') : '' }; } catch (e) { return null; }
+}
+function bnxGgSite_(cid) { var u = bnxGgCfg_(cid).siteUrl || bnxGgProp_('BNX_MENU_BASE_URL', cid) || ''; if (!/^https:\/\//i.test(u)) return ''; return /\/$/.test(u) ? u : u + '/'; }
+function bnxGgBrand_(cid) {
+  var i = {}; try { i = bnxGgLanding_(cid).info || {}; } catch (e) {}
+  var u = String(i.logoUrl || ''), m = u.match(/(?:\/d\/|[?&]id=)([\w-]{10,})/);
+  if (m && /drive\.google|docs\.google/.test(u)) u = 'https://lh3.googleusercontent.com/d/' + m[1] + '=w800';
+  return { name: String(i.name || bnxGgProp_('RESTAURANT_NAME', cid) || ''), logo: /^https:\/\//i.test(u) ? u : '' };
+}
+function bnxGgFirst_(n) { return String(n || '').trim().split(/\s+/)[0] || ''; }
+function bnxGgRs_(n) { return '₹' + Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 }); }
+/* one-visit token: menu link / rate link. Bound to the FIRST phone that opens it (a forwarded link shows nothing). */
+function bnxGgTokNew_(cid, mobile, name, table, purpose) {
+  var tok = 'W' + Utilities.getUuid().replace(/-/g, '').slice(0, 22);
+  CacheService.getScriptCache().put('ggtok_' + tok, JSON.stringify({ c: cid, m: mobile, n: bnxGgName_(name), t: String(table || ''), p: purpose || 'MENU', dev: '' }), 21600);
+  return tok;
+}
+function bnxGgTokGet_(p) {
+  var cid = bnxGgCid_(p.clientId), tok = String(p.token || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64), out = { success: true, known: false };
+  if (!tok) return { success: false, error: 'No token' };
+  var lock = bnxGgLock_('tok_' + cid);
+  try {
+    var cache = CacheService.getScriptCache(), raw = cache.get('ggtok_' + tok);
+    if (!raw) { out.expired = true; return out; }
+    var rec = JSON.parse(raw), dev = bnxDev_(p.deviceId);
+    if (rec.c !== cid) return out;
+    if (rec.dev && dev && rec.dev !== dev) return out;
+    if (!rec.dev && dev) { rec.dev = dev; cache.put('ggtok_' + tok, JSON.stringify(rec), 21600); }
+    var cfg = bnxGgCfg_(cid);
+    out.known = true; out.mobile = rec.m; out.customerName = rec.n; out.tableId = rec.t;
+    out.canOrder = !!cfg.waOrder; out.upiId = cfg.upiId || ''; out.upiName = cfg.upiName || bnxGgProp_('RESTAURANT_NAME', cid) || '';
+    try { var gs = bnxCrmSheet_(CRM_SHEET, CRM_HEAD, cid, true), gr = bnxCrmFind_(gs, rec.m, cid);
+      if (gr) { var go = bnxCrmRowObj_(gs, gr); out.crn = String(go.CRN || ''); out.points = Number(go.POINTS || 0); out.visitCount = Number(go.VISIT_COUNT || 1); if (!out.customerName) out.customerName = String(go.NAME || ''); } } catch (e) {}
+    return out;
+  } finally { lock.release(); }
+}
+/* Cloud-API send (any message object). Free-form = only inside the 24-h window the guest opened by messaging. */
+function bnxGgWaSend_(cid, mobile, msg) {
+  var pr = function (k) { return bnxGgProp_(k, cid); }, token = pr('META_WA_TOKEN'), pid = String(pr('META_WA_PHONE_ID') || '').trim();
+  if (String(pr('WA_PROVIDER')).toUpperCase() !== 'META' || !token || !/^\d{8,25}$/.test(pid)) return { sent: false, error: 'WhatsApp Cloud API not configured' };
+  msg.messaging_product = 'whatsapp'; msg.recipient_type = 'individual'; msg.to = '91' + mobile;
+  var res = UrlFetchApp.fetch('https://graph.facebook.com/' + (pr('META_WA_VERSION') || 'v20.0') + '/' + pid + '/messages',
+    { method: 'post', contentType: 'application/json', muteHttpExceptions: true, headers: { Authorization: 'Bearer ' + token }, payload: JSON.stringify(msg) });
+  var j = {}; try { j = JSON.parse(res.getContentText()); } catch (e) {}
+  if (j.messages && j.messages.length) return { sent: true, id: j.messages[0].id };
+  return { sent: false, error: String((j.error && (j.error.error_data && j.error.error_data.details || j.error.error_user_msg || j.error.message)) || ('Meta HTTP ' + res.getResponseCode())).slice(0, 300), code: j.error && j.error.code };
+}
+/* text + one link button (+ logo header). A logo WhatsApp cannot fetch → sent again without it. */
+function bnxGgCta_(cid, mobile, img, body, footer, btn, url) {
+  var it = { type: 'cta_url', body: { text: String(body).slice(0, 1024) }, action: { name: 'cta_url', parameters: { display_text: String(btn).slice(0, 20), url: url } } };
+  if (footer) it.footer = { text: String(footer).slice(0, 60) };
+  if (img) it.header = { type: 'image', image: { link: img } };
+  var r = bnxGgWaSend_(cid, mobile, { type: 'interactive', interactive: it });
+  if (!r.sent && it.header && /media|image|header|download|url/i.test(r.error || '')) { delete it.header; r = bnxGgWaSend_(cid, mobile, { type: 'interactive', interactive: it }); }
+  return r;
+}
+function bnxGgMenuReply_(cid, mobile, name, q) {
+  if (!mobile) return { sent: false, error: 'no mobile' };
+  var site = bnxGgSite_(cid); if (!site) return { sent: false, error: 'Growth Hub › Settings › Website folder (siteUrl) not set' };
+  var cfg = bnxGgCfg_(cid), br = bnxGgBrand_(cid), tok = bnxGgTokNew_(cid, mobile, name, q.tableId, 'MENU');
+  var url = site + 'customer-order.html?client=' + encodeURIComponent(cid) + (q.tableId ? '&table=' + encodeURIComponent(q.tableId) : '')
+    + (q.eventName ? '&event=' + encodeURIComponent(q.eventName) : '') + (cfg.waOrder ? '&order=1' : '') + '&wt=' + tok;
+  var first = bnxGgFirst_(name);
+  var body = (first ? 'Hi ' + first + '! ' : '') + (cfg.waCheckinText || 'You have checked in, and we are glad to have you here.')
+    + (q.tableId ? '\n\nTable ' + q.tableId : '') + (cfg.waOrder ? '\nOrder from your phone and pay by UPI — no waiting.' : '') + (br.name ? '\n\n' + br.name.toUpperCase() : '');
+  return bnxGgCta_(cid, mobile, br.logo, body, 'Powered by Balaji NextGen', cfg.waMenuBtn || 'Explore our menu', url);
+}
+/* "I have paid" from the QR menu → GUEST_PAYMENTS (CLAIMED). Staff confirm against the bank app in Growth Hub › Payments. */
+function bnxGgPayClaim_(p) {
+  var cid = bnxGgCid_(p.clientId), amt = Math.round(bnxGgNum_(p.amount, 0) * 100) / 100, req = bnxGgTxt_(p.requestId, 100);
+  if (!(amt > 0 && amt < 500000)) return { success: false, error: 'Amount looks wrong' };
+  if (req) { var hit = CacheService.getScriptCache().get('ggpy_req_' + cid + '_' + req); if (hit) return JSON.parse(hit); }
+  var lock = bnxGgLock_('pay_' + cid);
+  try {
+    var sh = bnxGgPaySh_(cid);
+    if (req) { var dup = bnxGgRows_(sh).filter(function (r) { return String(r.REQUEST_ID) === req; })[0]; if (dup) return { success: true, claimId: dup.CLAIM_ID, duplicate: true }; }
+    var id = bnxGgId_('PY');
+    bnxGgAppend_(sh, { CLAIM_ID: id, CREATED_AT: bnxGgIst_(), BUSINESS_DAY: bnxGgBizDay_(), CLIENT_ID: cid, MOBILE: bnxGgMobile_(p.mobileNo || p.mobile), NAME: bnxGgName_(p.customerName || p.name),
+      TABLE: bnxGgTxt_(p.tableId, 20), ORDER_NOS: bnxGgTxt_(p.orderNos, 300), AMOUNT: amt, UTR: String(p.utr || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 22),
+      UPI_ID: bnxGgTxt_(p.upiId, 80), STATUS: 'CLAIMED', REQUEST_ID: req, DEVICE_ID: bnxDev_(p.deviceId) });
+    var out = { success: true, claimId: id };
+    if (req) CacheService.getScriptCache().put('ggpy_req_' + cid + '_' + req, JSON.stringify(out), 900);
+    return out;
+  } finally { lock.release(); }
+}
+function bnxGgPaySet_(cid, b, who) {
+  var st = String(b.status || '').toUpperCase(); if (!/^(RECEIVED|NOT_RECEIVED|CLAIMED)$/.test(st)) return { success: false, error: 'Bad status' };
+  var lock = bnxGgLock_('pay_' + cid), r, sh;
+  try {
+    sh = bnxGgPaySh_(cid); r = bnxGgRows_(sh).filter(function (x) { return String(x.CLAIM_ID) === String(b.claimId || ''); })[0];
+    if (!r) return { success: false, error: 'Payment not found' };
+    bnxGgSet_(sh, r._row, { STATUS: st, HANDLED_BY: who, HANDLED_AT: bnxGgIst_() });
+  } finally { lock.release(); }
+  var m = bnxGgMobile_(r.MOBILE), first = bnxGgFirst_(r.NAME) || 'Guest', n = { sent: false };
+  if (m && st === 'RECEIVED') {
+    n = bnxGgWaSend_(cid, m, { type: 'text', text: { body: '✅ Payment of ' + bnxGgRs_(r.AMOUNT) + ' received' + (r.TABLE ? ' for Table ' + r.TABLE : '') + '. Thank you, ' + first + '!' } });
+    try { bnxGgThanksQueue_(cid, m, r.NAME, r.ORDER_NOS, r.TABLE, 'PAYMENT'); } catch (e) {}
+  } else if (m && st === 'NOT_RECEIVED') {
+    n = bnxGgWaSend_(cid, m, { type: 'text', text: { body: 'Hi ' + first + ', we could not find your payment of ' + bnxGgRs_(r.AMOUNT) + ' yet. Please show the payment screen to our staff.' } });
+  }
+  if (st !== 'CLAIMED') try { bnxGgSet_(sh, r._row, { NOTIFY_RESULT: n.sent ? 'SENT' : ('NOT SENT ' + (n.error || '')).slice(0, 200) }); } catch (e) {}
+  return { success: true, notify: n };
+}
+/* thank-you queue: one per guest per business day, sent by bnxGgCampaignTick after cfg.waThanksDelayMin */
+function bnxGgThanksQueue_(cid, mobile, name, billNo, table, source) {
+  mobile = bnxGgMobile_(mobile); if (!mobile) return { queued: false };
+  var key = cid + '|' + mobile + '|' + bnxGgBizDay_(), cache = CacheService.getScriptCache();
+  if (cache.get('ggtq_' + key)) return { queued: false, duplicate: true };
+  var lock = bnxGgLock_('tq_' + cid);
+  try {
+    var sh = bnxGgThanksSh_(cid), C = bnxCrmCols_(sh), last = sh.getLastRow();
+    if (last >= 2 && C.KEY) { var from = Math.max(2, last - 400); if (sh.getRange(from, C.KEY, last - from + 1, 1).getValues().some(function (x) { return x[0] === key; })) { cache.put('ggtq_' + key, '1', 90000); return { queued: false, duplicate: true }; } }
+    bnxGgAppend_(sh, { KEY: key, CREATED_AT: bnxGgIst_(), CLIENT_ID: cid, MOBILE: mobile, NAME: bnxGgName_(name), TABLE: bnxGgTxt_(table, 20), BILL_NO: bnxGgTxt_(billNo, 120),
+      DUE_MS: String(Date.now() + bnxGgCfg_(cid).waThanksDelayMin * 60000), STATUS: 'QUEUED', SOURCE: bnxGgTxt_(source, 30) });
+    cache.put('ggtq_' + key, '1', 90000);
+  } finally { lock.release(); }
+  var P = PropertiesService.getScriptProperties(), a = []; try { a = JSON.parse(P.getProperty('GG_TQ_CLIENTS') || '[]'); } catch (e) {}
+  if (a.indexOf(cid) < 0) { a.push(cid); P.setProperty('GG_TQ_CLIENTS', JSON.stringify(a.slice(-100))); }
+  return { queued: true };
+}
+function bnxGgThanksRun_(budgetMs) {
+  var a = []; try { a = JSON.parse(PropertiesService.getScriptProperties().getProperty('GG_TQ_CLIENTS') || '[]'); } catch (e) {}
+  var t0 = Date.now();
+  a.forEach(function (cid) {
+    if (Date.now() - t0 > (budgetMs || 60000)) return;
+    try {
+      var sh = bnxGgThanksSh_(cid), rows = bnxGgRows_(sh), now = Date.now(), cfg = bnxGgCfg_(cid), br = null, site = bnxGgSite_(cid);
+      rows.forEach(function (x) {
+        if (String(x.STATUS) !== 'QUEUED' || Number(x.DUE_MS) > now || Date.now() - t0 > (budgetMs || 60000)) return;
+        if (now - Number(x.DUE_MS) > 20 * 3600000) { bnxGgSet_(sh, x._row, { STATUS: 'SKIPPED', RESULT: 'too old' }); return; }
+        br = br || bnxGgBrand_(cid);
+        var r = bnxGgThanksSend_(cid, cfg, br, site, String(x.MOBILE), String(x.NAME || ''), String(x.TABLE || ''));
+        bnxGgSet_(sh, x._row, { STATUS: r.sent ? 'SENT' : 'FAILED', RESULT: r.sent ? (r.id || '') : String(r.error || '').slice(0, 200), SENT_AT: bnxGgIst_() });
+      });
+    } catch (e) { Logger.log('thank-you ' + cid + ': ' + e.message); }
+  });
+}
+function bnxGgThanksSend_(cid, cfg, br, site, mobile, name, table) {
+  if (!site) return { sent: false, error: 'siteUrl not set' };
+  var tok = bnxGgTokNew_(cid, mobile, name, table, 'FEEDBACK'), first = bnxGgFirst_(name);
+  var url = site + 'restaurant-landing.html?client=' + encodeURIComponent(cid) + (table ? '&table=' + encodeURIComponent(table) : '') + '&wt=' + tok + '#feedback';
+  var body = (first ? 'Hi ' + first + '!\n\n' : '') + (cfg.waThanksText || 'Thank you for visiting!\n\nWe appreciate your time with us and hope you had a great experience.') + (br.name ? '\n\n' + br.name.toUpperCase() : '');
+  var r = bnxGgCta_(cid, mobile, br.logo, body, 'Your feedback means the world to us!', cfg.waRateBtn || 'Rate Now!', url);
+  if (!r.sent && (r.code == 131047 || /24|re-?engage/i.test(r.error || ''))) {          /* 24-h window closed → approved template, if set */
+    var tpl = bnxGgProp_('META_WA_THANKS_TEMPLATE', cid);
+    if (tpl) r = bnxGgWaSend_(cid, mobile, { type: 'template', template: { name: tpl, language: { code: bnxGgProp_('META_WA_LANG', cid) || 'en' }, components: [
+      { type: 'body', parameters: [{ type: 'text', text: first || 'Guest' }] },
+      { type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: tok + '&client=' + cid }] }] } });
+  }
+  return r;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════════════════════════════════════
    LANDING PAGE (one public call)
    ═════════════════════════════════════════════════════════════════════════════════════════════════════════ */
 function bnxGgLanding_(cid) {
@@ -641,7 +828,7 @@ function bnxGgLanding_(cid) {
     menu: { cards: (pub.cards || []).map(function (c) { return { type: c.cardType, name: c.name, url: c.fileUrl }; }), popular: popular,
       categories: Object.keys(cats).slice(0, 16), itemCount: (pub.food || []).length + (pub.bar || []).length, orderOn: !!cfg.menuOrderOn },
     video: (pub.promo && pub.promo.video && pub.promo.video.active) ? pub.promo.video.videoUrl : '',
-    events: cfg.ticketsOn ? bnxGgEventsWithTickets_(cid, true) : (pub.promo && pub.promo.events || []).map(function (e) { return { id: e.id, title: e.title, date: e.date, time: e.time, venue: e.venue, description: e.description, posterImg: e.posterImg, tickets: [] }; }),
+    events: cfg.ticketsOn ? bnxGgEventsWithTickets_(cid, true) : (pub.promo && pub.promo.events || []).filter(function (e) { return !/^BNXCFG:/.test(String(e.description || '')) && !/GUEST SCREEN SETTINGS/.test(String(e.title || '')); }).map(function (e) { return { id: e.id, title: e.title, date: e.date, time: e.time, venue: e.venue, description: e.description, posterImg: e.posterImg, tickets: [] }; }),
     resv: { on: cfg.resvOn, open: cfg.resvOpen, close: cfg.resvClose, slotMin: cfg.slotMin, maxPax: cfg.maxPax, maxDays: cfg.maxDays, leadMin: cfg.leadMin,
       areas: String(cfg.areas || '').split(',').map(function (s) { return s.trim(); }).filter(String), occasions: String(cfg.occasions || '').split(',').map(function (s) { return s.trim(); }).filter(String),
       closedDays: cfg.closedDays, today: bnxGgIst_('yyyy-MM-dd') },
@@ -654,7 +841,7 @@ function bnxGgClearLanding_(cid) { try { CacheService.getScriptCache().remove('g
 /* ═════════════════════════════════════════════════════════════════════════════════════════════════════════
    PUBLIC DISPATCH  (GET ?action=GUEST_CHECKIN&mode=…)  — returns null when the mode is not ours
    ═════════════════════════════════════════════════════════════════════════════════════════════════════════ */
-var GG_PUBLIC_MODES = /^(WA_STATUS|LANDING|RESV_SLOTS|RESERVE|RESV_STATUS|RESV_CANCEL|TICKET_BOOK|TICKET_STATUS|FEEDBACK)$/;
+var GG_PUBLIC_MODES = /^(WA_STATUS|LANDING|RESV_SLOTS|RESERVE|RESV_STATUS|RESV_CANCEL|TICKET_BOOK|TICKET_STATUS|FEEDBACK|WA_TOKEN|PAY_INFO|PAY_CLAIM)$/;
 function bnxGgPublic_(p) {
   p = p || {};
   var mode = String(p.mode || '').toUpperCase();
@@ -664,8 +851,8 @@ function bnxGgPublic_(p) {
     var cid = bnxGgCid_(p.clientId);
     bnxCrmSpreadsheet_(cid, 'MASTER', true);                             /* unknown client → error, nothing is created */
     var dev = bnxDev_(p.deviceId), slot = Math.floor(Date.now() / 600000);
-    var limits = { RESERVE: 40, TICKET_BOOK: 60, FEEDBACK: 40, RESV_CANCEL: 20 };
-    if (bnxGgOver_('ggp_' + cid + '_' + mode + '_' + slot, mode === 'LANDING' || mode === 'RESV_SLOTS' || mode === 'WA_STATUS' ? 3000 : 600, 900)) throw new Error('Busy — please try again in a few minutes');
+    var limits = { RESERVE: 40, TICKET_BOOK: 60, FEEDBACK: 40, RESV_CANCEL: 20, PAY_CLAIM: 20, WA_TOKEN: 40 };
+    if (bnxGgOver_('ggp_' + cid + '_' + mode + '_' + slot, mode === 'LANDING' || mode === 'RESV_SLOTS' || mode === 'WA_STATUS' || mode === 'WA_TOKEN' || mode === 'PAY_INFO' ? 3000 : 600, 900)) throw new Error('Busy — please try again in a few minutes');
     if (limits[mode] && bnxGgOver_('ggpd_' + cid + '_' + mode + '_' + (dev || p.mobileNo || 'x') + '_' + slot, limits[mode] / 4, 900)) throw new Error('Too many attempts — please wait a few minutes');
     switch (mode) {
       case 'WA_STATUS': return bnxWaStatus_(p);
@@ -677,6 +864,9 @@ function bnxGgPublic_(p) {
       case 'RESV_CANCEL': out = bnxGgResvCancel_(p); break;
       case 'TICKET_BOOK': out = bnxGgTicketBook_(p); break;
       case 'TICKET_STATUS': out = bnxGgTicketStatus_(p); break;
+      case 'WA_TOKEN': out = bnxGgTokGet_(p); break;
+      case 'PAY_INFO': { var pc = bnxGgCfg_(cid); out = { success: true, upiId: pc.upiId || '', upiName: pc.upiName || bnxGgProp_('RESTAURANT_NAME', cid) || '' }; break; }
+      case 'PAY_CLAIM': out = bnxGgPayClaim_(p); break;
       case 'FEEDBACK':
         if (!bnxGgCfg_(cid).fbOn) { out = { success: false, error: 'Feedback is switched off' }; break; }
         var fk = 'ggfbreq_' + cid + '_' + String(p.requestId || '').slice(0, 80);
@@ -868,6 +1058,7 @@ function bnxGgCampaignTick() {
   var a = []; try { a = JSON.parse(PropertiesService.getScriptProperties().getProperty('GG_RUNNING') || '[]'); } catch (e) {}
   var t0 = Date.now();
   a.forEach(function (x) { if (Date.now() - t0 > 240000) return; try { bnxGgCampaignRun_(x.c, x.i, 60000); } catch (e) { Logger.log('campaign ' + x.i + ': ' + e.message); } });
+  try { bnxGgThanksRun_(Math.max(20000, 280000 - (Date.now() - t0))); } catch (e) { Logger.log('thank-you queue: ' + e.message); }   /* 2026-11-13 */
 }
 
 /* ═════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -893,7 +1084,7 @@ function bnxGgHub_(action, b) {
     case 'WA_READY': return { success: true, data: { clientId: cid, checks: bnxGrReadyChecks_(cid) } };
     case 'WA_SEND': return waSend_(b);
 
-    case 'GG_CFG_GET': return { success: true, data: { cfg: bnxGgCfg_(cid), wa: bnxGgWaState_(cid), build: BNX_GG_BUILD } };
+    case 'GG_CFG_GET': return { success: true, data: { cfg: bnxGgCfg_(cid), wa: bnxGgWaState_(cid), build: BNX_GG_BUILD, name: bnxGgBrand_(cid).name } };
     case 'GG_CFG_SAVE': { var c = bnxGgCfgSave_(cid, b.cfg || {}); bnxGgClearLanding_(cid); return { success: true, data: c }; }
     case 'GG_OVERVIEW': return { success: true, data: bnxGgOverview_(cid) };
 
@@ -956,6 +1147,14 @@ function bnxGgHub_(action, b) {
         o.DELIVERED_LIVE = Number(cache.get('ggcnt_' + cid + '_' + c.CAMPAIGN_ID + '_DELIVERED') || 0); o.READ_LIVE = Number(cache.get('ggcnt_' + cid + '_' + c.CAMPAIGN_ID + '_READ') || 0); return o; }) };
     }
     case 'GG_CAMPAIGN_REFRESH': return bnxGgCampaignTotals_(cid, String(b.campaignId || ''), '');
+
+    case 'GG_PAY_CLAIMS': {
+      var py = bnxGgRows_(bnxGgPaySh_(cid)), pf = String(b.fromDate || '');
+      py = py.filter(function (x) { return !pf || String(x.BUSINESS_DAY || x.CREATED_AT || '').slice(0, 10) >= pf; });
+      if (b.status) py = py.filter(function (x) { return String(x.STATUS).toUpperCase() === String(b.status).toUpperCase(); });
+      return { success: true, data: py.reverse().slice(0, 1000).map(function (x) { var o = bnxGgStrip_(x); delete o.DEVICE_ID; delete o.REQUEST_ID; return o; }) };
+    }
+    case 'GG_PAY_CLAIM_SET': return bnxGgPaySet_(cid, b, who);
   }
   return { success: false, error: 'Unknown Growth Hub action: ' + action };
 }
@@ -964,6 +1163,7 @@ function bnxGgWaState_(cid) {
   var pr = function (k) { return bnxGgProp_(k, cid); }, P = PropertiesService.getScriptProperties();
   return { provider: String(pr('WA_PROVIDER') || 'NONE').toUpperCase(), token: !!pr('META_WA_TOKEN'), phoneId: !!pr('META_WA_PHONE_ID'), waba: !!pr('META_WA_WABA_ID'),
     webhookVerified: !!P.getProperty('WA_HOOK_VERIFIED'), webhookSeen: !!P.getProperty('WA_HOOK_SEEN'), checkinReady: (function () { try { return bnxWaCheckinReady_(cid); } catch (e) { return false; } })(),
+    apiNumber: (function () { try { var ai = bnxWaApiInfo_(cid); return ai.ok ? ai.number : ''; } catch (e) { return ''; } })(),
     resvTemplate: pr('META_WA_RESV_TEMPLATE') || '', ticketTemplate: pr('META_WA_TICKET_TEMPLATE') || '', feedbackTemplate: pr('META_WA_FEEDBACK_TEMPLATE') || '',
     dailyCap: Number(pr('WA_CAMPAIGN_DAILY_CAP') || 1000), triggerOn: (function () { try { return ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'bnxGgCampaignTick'; }); } catch (e) { return false; } })() };
 }
@@ -1082,6 +1282,12 @@ function bnxGgOverview_(cid) {
 function bnxGrJson_(o) { return bnxGgJson_(o); }
 function bnxGrBool_(v, d) { return bnxGgBool_(v, d); }
 function bnxGrCheckin_(b) {
+  var out = bnxGrCheckin0_(b);
+  try { if (out && out.success !== false && String(b.billNo || '').trim() && Number(b.billAmount || 0) > 0)    /* bill settled → thank-you + Rate now */
+    bnxGgThanksQueue_(String(b.clientId || '').trim(), b.mobileNo || b.mobile || b.phone, out.customerName || b.customerName || b.name, b.billNo, b.tableId, 'BILL'); } catch (e) {}
+  return out;
+}
+function bnxGrCheckin0_(b) {
   var cid = String(b.clientId || '').trim();
   var mobile = String(b.mobileNo || b.mobile || b.phone || '').replace(/\D/g, '').slice(-10);
   if (!/^[6-9]\d{9}$/.test(mobile)) return { success: false, error: 'Enter a valid 10-digit mobile number' };
@@ -1177,7 +1383,10 @@ function bnxGrReadyChecks_(cid) {
         var bad = bnxGgAuth_(body); if (bad) return bnxGgJson_(bad);
         try { return bnxGgJson_(bnxGgHub_(String(body.action), body)); } catch (err) { return bnxGgJson_({ success: false, error: String(err && err.message || err) }); }
       }
-      try { var w = bnxWaRoutePost_(e); if (w) return w; } catch (x) {}   /* CRM_BILL_CAPTURE, GET_CRM_SCANS, Truecaller callback … */
+      try { var w = bnxWaRoutePost_(e); if (w) {
+        if (body && body.action === 'CRM_BILL_CAPTURE') { try { var wr = JSON.parse(w.getContent()); var bm = bnxGgMobile_(body.mobileNo || body.mobile || body.customerMobile || body.phone);
+          if (wr && wr.success !== false && bm) bnxGgThanksQueue_(String(body.clientId || '').trim(), bm, wr.customerName || body.customerName || body.name, body.billNo || body.billNumber, body.tableId || body.table, 'BILL'); } catch (x2) {} }
+        return w; } } catch (x) {}   /* CRM_BILL_CAPTURE, GET_CRM_SCANS, Truecaller callback … */
       return prevPost.apply(this, arguments);
     };
     for (var k2 in prevPost) { try { pw[k2] = prevPost[k2]; } catch (x) {} }
@@ -1213,7 +1422,11 @@ function RUN_GG_1_CheckSetup() {
   ok(w.provider === 'META' && w.token && w.phoneId, 'WhatsApp Cloud API configured', 'WA_PROVIDER=META, META_WA_TOKEN, META_WA_PHONE_ID (campaigns + server send need it)');
   ok(w.webhookVerified || w.webhookSeen, 'Meta webhook verified / messages arriving', 'Meta › WhatsApp › Configuration › Callback URL ' + (ScriptApp.getService().getUrl() || '<exec>') + ', verify token = WA_VERIFY_TOKEN, subscribe "messages"');
   ok(w.waba, 'META_WA_WABA_ID set (template list in the hub)', 'optional — Script property META_WA_WABA_ID = your WhatsApp Business Account id');
-  ok(w.triggerOn, 'campaign trigger installed', 'run RUN_GG_2_InstallCampaignTrigger once');
+  ok(w.triggerOn, 'campaign trigger installed (also sends the thank-you + Rate now)', 'run RUN_GG_2_InstallCampaignTrigger once');
+  ok(!!bnxGgSite_(cid), 'Website folder set (menu / rate links in WhatsApp)', 'Growth Hub › Settings › Website folder = https://…/ where customer-order.html lives');
+  ok(!!bnxGgCfg_(cid).upiId, 'UPI ID set (guests pay from the QR menu)', 'Growth Hub › Settings › UPI ID');
+  [['TRANSACTIONS', GG_PY_TAB, GG_PY_HEAD], ['TRANSACTIONS', GG_TQ_TAB, GG_TQ_HEAD]].forEach(function (t) {
+    try { var sh = bnxGgTab_(cid, t[0], t[1], t[2]); ok(true, t[0] + ' DB › ' + t[1] + ' ready (' + Math.max(0, sh.getLastRow() - 1) + ' rows)', ''); } catch (e) { ok(false, t[0] + ' DB › ' + t[1], e.message); } });
   L.push('ℹ️ one-tap WhatsApp check-in on the QR page is ' + (w.checkinReady ? 'ON' : 'OFF (guests type number + name — still saved)'));
   L.push('ℹ️ landing page:  https://balajinextgen.in/…/restaurant-landing.html?client=' + cid + '   (any host works; set the API id once with ?api=<deployment id>)');
   try { var lp = bnxGgLanding_(cid); L.push('ℹ️ LANDING test: ' + (lp.info.name || '(no name)') + ' · ' + lp.events.length + ' event(s) · menu items ' + lp.menu.itemCount); } catch (e) { L.push('❌ LANDING test: ' + e.message); }
@@ -1230,6 +1443,7 @@ function RUN_GG_3_Preview() {
   Logger.log('Settings: ' + JSON.stringify(bnxGgCfg_(cid)));
   Logger.log('Slots ' + d + ': ' + bnxGgSlots_(cid, d).map(function (s) { return s.time + '(' + s.left + ')'; }).join(' '));
   var a = bnxGgAudience_(cid, {}); Logger.log('Guests ' + a.totalGuests + ' · opted in to WhatsApp offers ' + a.optedIn + ' · campaign audience ' + a.list.length);
+  Logger.log('QR-first parser: ' + JSON.stringify(bnxGgQrFirst_('Hi, Send me the menu of HASHTAG SILIGURI, I am Seated on Table Number B5\n#CI-' + cid + '-TB5')));
   Logger.log('Rating parser: "5"→' + bnxGgRatingFromText_('5') + '  "4 stars nice"→' + bnxGgRatingFromText_('4 stars nice') + '  "⭐⭐⭐"→' + bnxGgRatingFromText_('⭐⭐⭐') + '  "table 5"→' + bnxGgRatingFromText_('table 5'));
 }
 
