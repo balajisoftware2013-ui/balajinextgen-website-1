@@ -15,7 +15,8 @@
  *   META_WA_TOKEN · META_WA_WABA_ID · WA_VERIFY_TOKEN · WA_WEBHOOK_URL (default https://www.balajinextgen.in/wa-webhook)
  */
 var BNX_WA_GRAPH = 'https://graph.facebook.com/v21.0/';
-var BNX_WA_WEBHOOK_DEFAULT = 'https://wa.balajinextgen.in/wa-webhook';   /* 2026-11-14: Cloudflare Worker bnx-wa with custom domain wa.balajinextgen.in (balajinextgen.in is in the same Cloudflare account) */
+var BNX_WA_WEBHOOK_DEFAULT = 'https://www.balajinextgen.in/wa-webhook';   /* relay inside the website (wrangler.jsonc + _worker.js); fallback below */
+var BNX_WA_WEBHOOK_FALLBACKS = ['https://www.balajinextgen.in/wa-webhook', 'https://wa.balajinextgen.in/wa-webhook'];   /* 2026-11-14: Cloudflare Worker bnx-wa with custom domain wa.balajinextgen.in (balajinextgen.in is in the same Cloudflare account) */
 
 function bnxWaProp_(cid, k) {
   var P = PropertiesService.getScriptProperties();
@@ -39,11 +40,20 @@ function bnxWaWebhookConnect_(cid, p) {
 
     /* 1. verify token */
     var vt = bnxWaProp_(cid, 'WA_VERIFY_TOKEN');
+    /* 2026-11-14: the first token was published in a website file — replace it once (the relay no longer holds any token) */
+    if (vt && !P.getProperty('WA_VERIFY_TOKEN_ROTATED_20261114')) { vt = ''; P.deleteProperty('WA_VERIFY_TOKEN'); if (cid) P.deleteProperty('WA_VERIFY_TOKEN_' + cid); P.setProperty('WA_VERIFY_TOKEN_ROTATED_20261114', new Date().toISOString()); steps.push('Old verify token replaced (it had been published)'); }
     if (!vt) { vt = 'bnx' + Utilities.getUuid().replace(/-/g, '').slice(0, 20); P.setProperty('WA_VERIFY_TOKEN', vt); steps.push('Created WA_VERIFY_TOKEN'); }
     else steps.push('WA_VERIFY_TOKEN present');
 
     /* 2. relay answers the handshake? */
-    var url = String(p.callbackUrl || bnxWaProp_(cid, 'WA_WEBHOOK_URL') || BNX_WA_WEBHOOK_DEFAULT).trim();
+    var cands = p.callbackUrl ? [String(p.callbackUrl).trim()] : [bnxWaProp_(cid, 'WA_WEBHOOK_URL')].concat(BNX_WA_WEBHOOK_FALLBACKS).filter(function (x, i, a) { return x && a.indexOf(x) === i; });
+    if (cands.length > 1) {
+      for (var ci = 0; ci < cands.length; ci++) {
+        try { var c0 = 'bnx' + Date.now(), pr0 = UrlFetchApp.fetch(cands[ci] + '?hub.mode=subscribe&hub.verify_token=' + encodeURIComponent(vt) + '&hub.challenge=' + c0 + '&clientId=' + encodeURIComponent(cid), { muteHttpExceptions: true, followRedirects: false });
+          if (pr0.getResponseCode() === 200 && String(pr0.getContentText()).trim() === c0) { cands = [cands[ci]]; break; } } catch (e0) {}
+      }
+    }
+    var url = String(cands[0] || '').trim();
     if (!url) return { success: false, steps: steps, error: 'No relay address yet. Create the Cloudflare Worker (bnx-wa-worker.js) and paste its address in Growth Hub → Webhook → connect.' };
     if (!/^https:\/\//i.test(url)) return { success: false, error: 'Webhook URL must start with https://', steps: steps };
     if (/script\.google\.com/i.test(url)) return { success: false, error: 'Meta cannot verify an Apps Script /exec URL (it redirects). Deploy whatsapp-webhook-worker.js on Cloudflare and use its URL.', steps: steps };
@@ -51,7 +61,7 @@ function bnxWaWebhookConnect_(cid, p) {
     var probe;
     if (/yourname|<|>/i.test(url)) return { success: false, steps: steps, error: 'That is the EXAMPLE address (it contains "yourname"). Create your own Cloudflare Worker first and paste the address Cloudflare shows.' };
     try {
-      probe = UrlFetchApp.fetch(url + (url.indexOf('?') < 0 ? '?' : '&') + 'hub.mode=subscribe&hub.verify_token=' + encodeURIComponent(vt) + '&hub.challenge=' + ch,
+      probe = UrlFetchApp.fetch(url + (url.indexOf('?') < 0 ? '?' : '&') + 'hub.mode=subscribe&hub.verify_token=' + encodeURIComponent(vt) + '&hub.challenge=' + ch + '&clientId=' + encodeURIComponent(cid),
         { muteHttpExceptions: true, followRedirects: false });
     } catch (fe) {
       /* 2026-11-14: "DNS error" = the relay address does not exist yet (Worker not deployed / custom domain not added) */
