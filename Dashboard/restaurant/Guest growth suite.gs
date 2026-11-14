@@ -72,7 +72,7 @@
  *   waThanksDelayMin, upiId, upiName. Optional Script property META_WA_THANKS_TEMPLATE (24-h window closed): body {{1}} = first
  *   name, one URL button whose dynamic suffix {{1}} = token (button URL in Meta = <site>/restaurant-landing.html?wt={{1}}).
  */
-var BNX_GG_BUILD = '2026-11-13-v1.1';
+var BNX_GG_BUILD = '2026-11-14-v1.2';   /* routed by Code.gs (any file order) · relay www.balajinextgen.in/wa-webhook */
 
 /* ─────────────────────────── tab layouts ─────────────────────────── */
 var GG_FB_TAB = 'GUEST_FEEDBACK';
@@ -1330,6 +1330,14 @@ function bnxGrVerify_(b) {
   var bad = checks.filter(function (c) { return !c.ok; });
   return { success: true, data: { clientId: cid, mobile: mobile, allOk: !bad.length, checks: checks } };
 }
+/* 2026-11-14: which code answers WhatsApp messages right now? (a file BELOW this one that re-defines / re-wraps doPost wins) */
+function bnxGgPostOwner_() {
+  var G = (typeof globalThis !== 'undefined') ? globalThis : this, f = G.doPost;
+  if (typeof f !== 'function') return 'there is no doPost at all';
+  var flags = Object.keys(f).filter(function (k) { return /^__/.test(k); }).join(', ');
+  var src = String(f).replace(/\s+/g, ' ').slice(0, 160);
+  return 'doPost now = ' + (f.name || '(anonymous)') + (flags ? ' [' + flags + ']' : ' [no flags]') + ' — starts: ' + src;
+}
 function bnxGrReadyChecks_(cid) {
   var P = PropertiesService.getScriptProperties(), pr = function (k) { return bnxGgProp_(k, cid); }, rows = [];
   function chk(label, ok, fix) { rows.push({ label: label, ok: !!ok, fix: ok ? '' : fix }); }
@@ -1337,13 +1345,17 @@ function bnxGrReadyChecks_(cid) {
   chk('Meta token saved', !!pr('META_WA_TOKEN'), 'WhatsApp setup → paste the permanent token from Meta (System user)');
   chk('Meta phone number ID saved', !!pr('META_WA_PHONE_ID'), 'WhatsApp setup → Phone number ID (Meta → WhatsApp → API setup)');
   chk('Webhook secret (WA_VERIFY_TOKEN) set', !!P.getProperty('WA_VERIFY_TOKEN'), 'Apps Script → Project settings → Script properties → WA_VERIFY_TOKEN = any secret word; same word in Meta → Webhook → Verify token');
-  chk('Meta verified the webhook', !!P.getProperty('WA_HOOK_VERIFIED') || !!P.getProperty('WA_HOOK_SEEN'), 'Meta → WhatsApp → Configuration → Callback URL = ' + (ScriptApp.getService().getUrl() || '<exec URL>') + ' → Verify and save, subscribe "messages"');
+  chk('Meta verified the webhook', !!P.getProperty('WA_HOOK_VERIFIED') || !!P.getProperty('WA_HOOK_SEEN'), 'Growth Hub → Webhook → connect (relay https://wa.balajinextgen.in/wa-webhook — Meta cannot verify the /exec URL itself), or Meta → WhatsApp → Configuration → Callback URL = that relay address → Verify and save, subscribe "messages"');
   var api = { ok: false, number: '' }; try { api = bnxWaApiInfo_(cid); } catch (e) {}
-  chk('Cloud-API number (' + (api.number || '?') + ')', api.ok, 'Meta refused the token / phone id: ' + (api.error || 'unknown') + ' — run RUN_17_CheckWhatsApp');
+  chk('Cloud-API number (' + (api.number || '?') + ')', api.ok, 'Meta refused the token / phone id: ' + (api.error || 'unknown') +
+    (/logged out|expired|session/i.test(api.error || '') ? ' — this is a TEMPORARY token. Make a permanent one: business.facebook.com → Business settings → System users → Generate new token (Expiry: Never, whatsapp_business_messaging + whatsapp_business_management) and paste it in WhatsApp setup' : ' — run RUN_17_CheckWhatsApp'));
+  try { if (!api.ok) CacheService.getScriptCache().remove('waapi_' + cid); } catch (e) {}   /* a new token is checked again at once, not after 5 min */
   chk('"Open WhatsApp button for guest" = Yes', bnxGuestCtl_(cid).waGuest, 'Guest capture control → Open WhatsApp button for guest = Yes, then Save');
   var G = (typeof globalThis !== 'undefined') ? globalThis : this;
-  chk('Server answers Meta webhook verification', !!(G.doGet && G.doGet.__bnxGg), '"Guest growth suite.gs" must be the LAST file, then deploy a NEW VERSION');
-  chk('Server receives WhatsApp messages', !!(G.doPost && G.doPost.__bnxGg), '"Guest growth suite.gs" must be the LAST file, then deploy a NEW VERSION');
+  /* 2026-11-14: Code.gs + Menu card qr promo.gs now route Meta verification, WhatsApp messages and GG_* themselves (BNX_CODE_ROUTES_GG) — file order no longer matters */
+  var codeRoutes = typeof BNX_CODE_ROUTES_GG !== 'undefined' && BNX_CODE_ROUTES_GG === true;
+  chk('Server answers Meta webhook verification', codeRoutes || !!(G.doGet && G.doGet.__bnxGg), 'deploy the 2026-11-14 Code.gs + Menu card qr promo.gs (NEW VERSION)');
+  chk('Server receives WhatsApp messages', codeRoutes || !!(G.doPost && G.doPost.__bnxGg), '"Guest growth suite.gs" must be the LAST file, then deploy a NEW VERSION. A file below it replaces doPost — search the project for this text: ' + bnxGgPostOwner_());
   return rows;
 }
 
@@ -1408,8 +1420,8 @@ function bnxGrReadyChecks_(cid) {
 function RUN_GG_1_CheckSetup() {
   var cid = (typeof CRM_TEST_CLIENT !== 'undefined') ? CRM_TEST_CLIENT : 'CL00010', L = [], G = (typeof globalThis !== 'undefined') ? globalThis : this;
   var ok = function (b, t, fix) { L.push((b ? '✅ ' : '❌ ') + t + (b ? '' : '\n      → ' + fix)); };
-  ok(!!(G.doGet && G.doGet.__bnxGg), 'doGet wrapped by Guest growth suite', 'move "Guest growth suite.gs" to the bottom of the file list');
-  ok(!!(G.doPost && G.doPost.__bnxGg), 'doPost wrapped by Guest growth suite', 'move "Guest growth suite.gs" to the bottom of the file list');
+  ok((typeof BNX_CODE_ROUTES_GG !== 'undefined') || !!(G.doGet && G.doGet.__bnxGg), 'doGet wrapped by Guest growth suite', 'move "Guest growth suite.gs" to the bottom of the file list');
+  ok((typeof BNX_CODE_ROUTES_GG !== 'undefined') || !!(G.doPost && G.doPost.__bnxGg), 'doPost wrapped by Guest growth suite', 'move "Guest growth suite.gs" to the bottom of the file list. Search the project (Ctrl+F in each file) for: ' + bnxGgPostOwner_());
   ok(!!(G.doPost && G.doPost.__bnxMp), 'menu-card / QR-promo router still in the chain', 'Menu card qr promo.gs must be ABOVE this file');
   ok(typeof bnxWaEffective_ === 'function' && typeof bnxWaReplyOrSms_ === 'function', 'customer-crm.gs is the 2026-11-09 copy', 'replace customer-crm.gs with the delivered file');
   ok(typeof bnxArReply_ !== 'function', 'old "WhatsApp auto reply.gs" removed', 'delete it — bnxWaCheckinFromMessage_ already replies (double message)');

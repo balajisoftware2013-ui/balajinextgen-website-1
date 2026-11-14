@@ -15,8 +15,8 @@
  *   META_WA_TOKEN · META_WA_WABA_ID · WA_VERIFY_TOKEN · WA_WEBHOOK_URL (default https://www.balajinextgen.in/wa-webhook)
  */
 var BNX_WA_GRAPH = 'https://graph.facebook.com/v21.0/';
-var BNX_WA_WEBHOOK_DEFAULT = 'https://www.balajinextgen.in/wa-webhook';   /* relay inside the website (wrangler.jsonc + _worker.js); fallback below */
-var BNX_WA_WEBHOOK_FALLBACKS = ['https://www.balajinextgen.in/wa-webhook', 'https://wa.balajinextgen.in/wa-webhook'];   /* 2026-11-14: Cloudflare Worker bnx-wa with custom domain wa.balajinextgen.in (balajinextgen.in is in the same Cloudflare account) */
+var BNX_WA_WEBHOOK_DEFAULT = 'https://wa.balajinextgen.in/wa-webhook';   /* 2026-11-14: www is GitHub Pages (cannot run code) → Cloudflare Worker bnx-wa on wa.balajinextgen.in */   /* relay inside the website (wrangler.jsonc + _worker.js); fallback below */
+var BNX_WA_WEBHOOK_FALLBACKS = ['https://wa.balajinextgen.in/wa-webhook'];   /* 2026-11-14: Cloudflare Worker bnx-wa with custom domain wa.balajinextgen.in (balajinextgen.in is in the same Cloudflare account) */
 
 function bnxWaProp_(cid, k) {
   var P = PropertiesService.getScriptProperties();
