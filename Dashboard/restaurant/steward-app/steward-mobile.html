@@ -8270,6 +8270,9 @@ async function bnxFlushOwned_(force){
     try{ const held=JSON.parse(localStorage.getItem(LK)||'null'); if(held && held.id===me) localStorage.removeItem(LK); }catch(e){}
   }
 }
+/* 2026-11-14 FAST KOT: KOTs this phone already printed at KOT_FAST_START are never printed again after the save */
+function bnxFastKotMark_(no,type){try{const k='bnx_fast_kot_'+CLIENT_ID;const m=JSON.parse(localStorage.getItem(k)||'{}');const now=Date.now();Object.keys(m).forEach(x=>{if(now-m[x]>86400000)delete m[x];});m[String(no)+'|'+String(type)]=now;localStorage.setItem(k,JSON.stringify(m));}catch(e){}}
+function bnxFastKotWas_(no,type){try{const m=JSON.parse(localStorage.getItem('bnx_fast_kot_'+CLIENT_ID)||'{}');return !!m[String(no)+'|'+String(type)];}catch(e){return false;}}
 async function bnxFinishOrderKot_(entry,orderNo,locationId,res){
  const done=res&&res.mobileKotSync;
  if(!done)return bnxSyncRealKotTickets_(entry,orderNo,locationId);
@@ -8280,7 +8283,7 @@ async function bnxFinishOrderKot_(entry,orderNo,locationId,res){
   confirmed.add(t.type);tickets.push(t);
   // The server may acknowledge some POS jobs before another station fails.
   // Never dispatch those acknowledged jobs again through the local fallback.
-  if(!done.queued&&!t.queueAccepted)bnxPrintSavedKot_({orderNo:orderNo,kotType:t.type,items:part.items,table:entry.table,waiter:entry.waiter,covers:entry.covers,customerName:entry.customerName,remarks:entry.remarks},{kotNumber:t.kotNumber});
+  if(!done.queued&&!t.queueAccepted&&!t.alreadyPrinted&&!bnxFastKotWas_(t.kotNumber,t.type))bnxPrintSavedKot_({orderNo:orderNo,kotType:t.type,items:part.items,table:entry.table,waiter:entry.waiter,covers:entry.covers,customerName:entry.customerName,remarks:entry.remarks},{kotNumber:t.kotNumber});
  }
  const pending=parts.filter(p=>!confirmed.has(p.type));
  if(!pending.length&&tickets.length){
@@ -15626,6 +15629,26 @@ async function bnxPlaceOrderImpl_(){
   // Persist the save first. Real Order/KOT numbers must arrive before any print dispatch.
   bnxQueuePending('SAVE_ORDER',__orderPayload,requestId,'kot');
   bnxDeferQueuedOrder_(requestId,Date.now()+120000);
+  /* 2026-11-14 FAST KOT ("steward fast need instant no delay", KOT numbers: no gaps).
+     Step 1: ask the server ONLY for the real KOT number(s) (KOT_FAST_START, ~1-3 s). The server queues the POS print
+     itself when the print station is online; otherwise this phone prints at once. Step 2: the order is saved in the
+     background with the SAME numbers (same requestId), so nothing is reserved twice and no number is skipped.
+     If fast start does not answer in 4 s, the normal save path below runs exactly as before. */
+  let __fast=null;
+  try{ __fast=await Promise.race([gasApi('KOT_FAST_START',__orderPayload,'V2_CORE'),new Promise(r=>setTimeout(()=>r(null),4000))]); }catch(e){ __fast=null; }
+  if(__fast&&__fast.success&&__fast.numbers){
+    const __fastNos=[];
+    __orderPayload.mobileKotParts.forEach(function(p){
+      const no=__fast.numbers[p.type]; if(!no)return; p.kotNumber=String(no); __fastNos.push(String(no));
+      if(__fast.queued)return;                                   /* POS station printing it */
+      const its=p.indices.map(function(i){return items[i];});
+      const ok=bnxPrintSavedKot_({orderNo:'T-'+__tbl.id,kotType:p.type,items:its,table:__tbl.id,waiter:stewardName,covers:customerFields.covers||'',customerName:customerFields.customerName,remarks:''},{kotNumber:p.kotNumber});
+      if(ok){ p.phonePrinted=true; bnxFastKotMark_(p.kotNumber,p.type); }
+    });
+    try{ const ob=bnxGetOutbox(),e=ob.find(x=>String(x.requestId)===String(requestId)); if(e){ e.payload=__orderPayload; bnxSetOutbox(ob); } }catch(_){}
+    toast('🖨️ KOT '+__fastNos.join(', ')+(__fast.queued?' sent to POS printer':' printing')+' — saving order…','success');
+    if(__fast.queued){ try{const cidv=String((typeof CLIENT_ID!=='undefined'&&CLIENT_ID)||'');const ids=__orderPayload.mobileKotParts.filter(p=>p.kotNumber).map(p=>['K',cidv,p.kotNumber,p.type,'1',''].join('-').replace(/[^A-Za-z0-9_.:-]/g,''));if(ids.length&&typeof window.bnxWatchKotJobs_==='function')window.bnxWatchKotJobs_(ids);}catch(e){} }
+  }
   const __saveP=gasApi('SAVE_ORDER',__orderPayload,'V2_CORE').finally(()=>bnxDeferQueuedOrder_(requestId,0));
   const __relT = setTimeout(function(){
     if(String(CLIENT_ID||'')!==__orderClient)return;
@@ -15635,8 +15658,8 @@ async function bnxPlaceOrderImpl_(){
     if(btn){ btn.disabled = false; btn.textContent = '📤 Send KOT'; }
     window.__BNX_PLACE_ORDER_PROMISE = null;           /* next order is not blocked */
     try{ showScreen('s-home'); }catch(e){}
-    toast('⏳ '+__tbl.id+': sending — you can take the next order','info');
-  }, 700);
+    if(!(__fast&&__fast.success))toast('⏳ '+__tbl.id+': sending — you can take the next order','info');
+  }, (__fast&&__fast.success)?0:700);
   const res = await __saveP;
   clearTimeout(__relT);
   if(String(CLIENT_ID||'')!==__orderClient){toast('Original-client order retained for verification — refresh its Pending Sync list','error');return;}
