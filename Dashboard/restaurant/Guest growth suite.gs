@@ -302,6 +302,21 @@ function bnxWaStatus_(p) {
 /* ═════════════════════════════════════════════════════════════════════════════════════════════════════════
    INCOMING WHATSAPP (webhook) — check-in, STOP/START/DELETE, feedback rating replies, delivery receipts. LOGGED.
    ═════════════════════════════════════════════════════════════════════════════════════════════════════════ */
+/* 2026-11-15 — every Meta event (guest message / delivery tick) as a row in TRANSACTION DB → WA_WEBHOOK_LOG */
+function bnxWaSheetLog_(cid, raw) {
+  var payload = typeof raw === 'string' ? JSON.parse(raw) : raw; if (!payload) return 0;
+  var ss = (typeof bnxPqDb_ === 'function') ? bnxPqDb_(cid, 'TRANSACTION') : null; if (!ss) return 0;
+  var sh = ss.getSheetByName('WA_WEBHOOK_LOG');
+  if (!sh) { sh = ss.insertSheet('WA_WEBHOOK_LOG'); sh.getRange(1, 1, 1, 6).setValues([['RECEIVED_AT', 'CLIENT_ID', 'FROM', 'TYPE', 'TEXT', 'RAW_JSON']]); sh.setFrozenRows(1); }
+  var now = Utilities.formatDate(new Date(), 'Asia/Kolkata', 'yyyy-MM-dd HH:mm:ss'), rows = [];
+  (payload.entry || []).forEach(function (en) { (en.changes || []).forEach(function (ch) { var v = ch.value || {};
+    (v.messages || []).forEach(function (m) { rows.push([now, cid, String(m.from || ''), String(m.type || ''), String((m.text && m.text.body) || (m.button && m.button.text) || (m.interactive && JSON.stringify(m.interactive)) || ''), JSON.stringify(m).slice(0, 4000)]); });
+    (v.statuses || []).forEach(function (st) { rows.push([now, cid, String(st.recipient_id || ''), 'status:' + String(st.status || ''), '', JSON.stringify(st).slice(0, 4000)]); });
+    if (!(v.messages || []).length && !(v.statuses || []).length) rows.push([now, cid, '', 'event:' + String(ch.field || ''), '', JSON.stringify(v).slice(0, 4000)]); }); });
+  if (rows.length) sh.getRange(sh.getLastRow() + 1, 1, rows.length, 6).setNumberFormat('@').setValues(rows);
+  try { PropertiesService.getScriptProperties().setProperty('WA_WEBHOOK_LAST_AT_' + cid, now); } catch (e) {}
+  return rows.length;
+}
 function bnxWaHookLog_(entries) {
   if (!entries || !entries.length) return;
   try {
@@ -1389,7 +1404,9 @@ function bnxGrReadyChecks_(cid) {
       var raw = ''; try { raw = (e && e.postData && e.postData.contents) || ''; } catch (x) {}
       if (raw && raw.indexOf('whatsapp_business_account') >= 0) {               /* Meta → message / receipt */
         if (!bnxWaHookAllowed_(e)) return bnxGgJson_({ ok: false, error: 'forbidden' });
-        return bnxWaInbound_(raw);
+        var waRes = bnxWaInbound_(raw);
+        try { bnxWaSheetLog_(String((e && e.parameter && e.parameter.clientId) || 'CL00010'), raw); } catch (x) {}   /* 2026-11-15: also keep every event in WA_WEBHOOK_LOG */
+        return waRes;
       }
       var body = null; try { body = raw ? JSON.parse(raw) : null; } catch (x) { body = null; }
       if (body && typeof body === 'object' && GG_STAFF_ACTIONS.test(String(body.action || ''))) {

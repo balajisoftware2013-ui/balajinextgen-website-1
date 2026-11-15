@@ -135,7 +135,7 @@ function bnxWaEsFinish_(cid, p) {
   var coex = /APP_ONBOARDING|COEX/i.test(String(p.event || ''));
   if (!appId || !secret) return { success: false, error: 'Balaji NextGen setup: META_APP_ID / META_APP_SECRET not set in Script properties' };
   if (!code) return { success: false, error: 'Facebook did not return a login code — press Connect WhatsApp again' };
-  if (!waba || !phone) return { success: false, error: 'Facebook did not return the WhatsApp account / number — finish every step in the Facebook window' };
+  /* 2026-11-15: WhatsApp account / number may be missing from the browser message — found from the token below */
   try {
     /* 1. code → this client's business token */
     var tr = UrlFetchApp.fetch(BNX_WA_GRAPH + 'oauth/access_token?client_id=' + encodeURIComponent(appId) + '&client_secret=' + encodeURIComponent(secret) + '&code=' + encodeURIComponent(code), { muteHttpExceptions: true });
@@ -143,6 +143,23 @@ function bnxWaEsFinish_(cid, p) {
     if (!tj.access_token) return { success: false, error: 'Meta refused the login code: ' + ((tj.error && tj.error.message) || tr.getContentText().slice(0, 160)), steps: steps };
     var token = tj.access_token; steps.push('Business token received ✓');
     var H = { Authorization: 'Bearer ' + token };
+    if (!waba || !phone) {
+      /* which WhatsApp accounts did the client share? (token's granular scopes) */
+      try {
+        var dj = JSON.parse(UrlFetchApp.fetch(BNX_WA_GRAPH + 'debug_token?input_token=' + encodeURIComponent(token) + '&access_token=' + encodeURIComponent(appId + '|' + secret), { muteHttpExceptions: true }).getContentText());
+        var gs = (dj.data && dj.data.granular_scopes) || [], ids = [];
+        gs.forEach(function (g) { if (/whatsapp_business_(management|messaging)/.test(g.scope)) (g.target_ids || []).forEach(function (t) { if (ids.indexOf(String(t)) < 0) ids.push(String(t)); }); });
+        steps.push('Shared WhatsApp accounts: ' + (ids.length ? ids.join(', ') : 'none') + ' · scopes: ' + gs.map(function (g) { return g.scope; }).join(', '));
+        for (var i = 0; i < ids.length && !phone; i++) {
+          var pj = JSON.parse(UrlFetchApp.fetch(BNX_WA_GRAPH + ids[i] + '/phone_numbers?fields=id,display_phone_number,verified_name', { headers: H, muteHttpExceptions: true }).getContentText());
+          var list = (pj && pj.data) || [];
+          if (list.length) { waba = waba || ids[i]; phone = String(list[0].id); steps.push('Number found: ' + (list[0].display_phone_number || phone) + ' ✓'); }
+          else if (!waba) waba = ids[i];
+        }
+      } catch (e) { steps.push('Lookup: ' + String(e && e.message || e).slice(0, 120)); }
+      if (!waba || !phone) return { success: false, steps: steps,
+        error: 'Facebook did not share a WhatsApp account / number. In Meta → Facebook Login for Business → Configurations, the configuration in use (' + (P.getProperty('META_ES_CONFIG_ID') || '?') + ') must be "WhatsApp Embedded Signup" with asset "WhatsApp accounts". Then connect again.' };
+    }
     /* 2. subscribe our app to this client's WhatsApp account (messages reach the shared relay / webhook) */
     var sr = UrlFetchApp.fetch(BNX_WA_GRAPH + waba + '/subscribed_apps', { method: 'post', headers: H, muteHttpExceptions: true });
     steps.push(sr.getResponseCode() === 200 ? 'Messages subscribed ✓' : 'Subscribe: ' + sr.getContentText().slice(0, 120));
