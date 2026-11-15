@@ -1345,7 +1345,7 @@ function bnxGrReadyChecks_(cid) {
   chk('Meta token saved', !!pr('META_WA_TOKEN'), 'WhatsApp setup → paste the permanent token from Meta (System user)');
   chk('Meta phone number ID saved', !!pr('META_WA_PHONE_ID'), 'WhatsApp setup → Phone number ID (Meta → WhatsApp → API setup)');
   chk('Webhook secret (WA_VERIFY_TOKEN) set', !!P.getProperty('WA_VERIFY_TOKEN'), 'Apps Script → Project settings → Script properties → WA_VERIFY_TOKEN = any secret word; same word in Meta → Webhook → Verify token');
-  chk('Meta verified the webhook', !!P.getProperty('WA_HOOK_VERIFIED') || !!P.getProperty('WA_HOOK_SEEN'), 'Growth Hub → Webhook → connect (relay https://wa.balajinextgen.in/wa-webhook — Meta cannot verify the /exec URL itself), or Meta → WhatsApp → Configuration → Callback URL = that relay address → Verify and save, subscribe "messages"');
+  chk('Meta verified the webhook', !!P.getProperty('WA_HOOK_VERIFIED') || !!P.getProperty('WA_HOOK_SEEN'), 'Growth Hub → Webhook → connect (relay https://bnx-wa.balajisoftware2013.workers.dev/wa-webhook — Meta cannot verify the /exec URL itself), or Meta → WhatsApp → Configuration → Callback URL = that relay address → Verify and save, subscribe "messages"');
   var api = { ok: false, number: '' }; try { api = bnxWaApiInfo_(cid); } catch (e) {}
   chk('Cloud-API number (' + (api.number || '?') + ')', api.ok, 'Meta refused the token / phone id: ' + (api.error || 'unknown') +
     (/logged out|expired|session/i.test(api.error || '') ? ' — this is a TEMPORARY token. Make a permanent one: business.facebook.com → Business settings → System users → Generate new token (Expiry: Never, whatsapp_business_messaging + whatsapp_business_management) and paste it in WhatsApp setup' : ' — run RUN_17_CheckWhatsApp'));

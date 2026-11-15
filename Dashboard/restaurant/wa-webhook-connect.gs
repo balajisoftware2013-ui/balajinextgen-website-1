@@ -5,7 +5,7 @@
  *
  * What it does, with the WhatsApp token already saved in Growth Hub → Settings (no Meta screen needed):
  *   1. makes sure WA_VERIFY_TOKEN exists (creates a random one if not)
- *   2. checks the relay URL answers Meta's handshake (GET hub.challenge) — the Cloudflare Worker bnx-wa-worker.js (the website is GitHub Pages and cannot run it)
+ *   2. checks the relay URL answers Meta's handshake (GET hub.challenge) — the Cloudflare Worker bnx-wa-relay-worker.js (the website is GitHub Pages and cannot run it)
  *      on https://www.balajinextgen.in/wa-webhook  (Apps Script /exec cannot: it always redirects)
  *   3. POST graph.facebook.com/<WABA_ID>/subscribed_apps  with override_callback_uri + verify_token
  *      → Meta verifies the URL and sends this WhatsApp account's messages / delivery status there
@@ -15,8 +15,8 @@
  *   META_WA_TOKEN · META_WA_WABA_ID · WA_VERIFY_TOKEN · WA_WEBHOOK_URL (default https://www.balajinextgen.in/wa-webhook)
  */
 var BNX_WA_GRAPH = 'https://graph.facebook.com/v21.0/';
-var BNX_WA_WEBHOOK_DEFAULT = 'https://wa.balajinextgen.in/wa-webhook';   /* 2026-11-14: www is GitHub Pages (cannot run code) → Cloudflare Worker bnx-wa on wa.balajinextgen.in */   /* relay inside the website (wrangler.jsonc + _worker.js); fallback below */
-var BNX_WA_WEBHOOK_FALLBACKS = ['https://wa.balajinextgen.in/wa-webhook'];   /* 2026-11-14: Cloudflare Worker bnx-wa with custom domain wa.balajinextgen.in (balajinextgen.in is in the same Cloudflare account) */
+var BNX_WA_WEBHOOK_DEFAULT = 'https://bnx-wa.balajisoftware2013.workers.dev/wa-webhook';   /* 2026-11-14: www is GitHub Pages (cannot run code) → Cloudflare Worker bnx-wa on wa.balajinextgen.in */   /* relay inside the website (wrangler.jsonc + _worker.js); fallback below */
+var BNX_WA_WEBHOOK_FALLBACKS = ['https://bnx-wa.balajisoftware2013.workers.dev/wa-webhook'];   /* 2026-11-14: Cloudflare Worker bnx-wa with custom domain wa.balajinextgen.in (balajinextgen.in is in the same Cloudflare account) */
 
 function bnxWaProp_(cid, k) {
   var P = PropertiesService.getScriptProperties();
@@ -54,7 +54,7 @@ function bnxWaWebhookConnect_(cid, p) {
       }
     }
     var url = String(cands[0] || '').trim();
-    if (!url) return { success: false, steps: steps, error: 'No relay address yet. Create the Cloudflare Worker (bnx-wa-worker.js) and paste its address in Growth Hub → Webhook → connect.' };
+    if (!url) return { success: false, steps: steps, error: 'No relay address yet. Create the Cloudflare Worker (bnx-wa-relay-worker.js) and paste its address in Growth Hub → Webhook → connect.' };
     if (!/^https:\/\//i.test(url)) return { success: false, error: 'Webhook URL must start with https://', steps: steps };
     if (/script\.google\.com/i.test(url)) return { success: false, error: 'Meta cannot verify an Apps Script /exec URL (it redirects). Deploy whatsapp-webhook-worker.js on Cloudflare and use its URL.', steps: steps };
     var ch = 'bnx' + Date.now();
@@ -66,14 +66,14 @@ function bnxWaWebhookConnect_(cid, p) {
     } catch (fe) {
       /* 2026-11-14: "DNS error" = the relay address does not exist yet (Worker not deployed / custom domain not added) */
       return { success: false, steps: steps, error: 'Relay address ' + url.replace(/\/webhook.*$/, '') + ' does not exist yet (' + String(fe.message || fe).split(':')[0] + '). ' +
-        'Create the Cloudflare Worker (Workers & Pages → Create Worker → Edit code → paste bnx-wa-worker.js → Deploy) and paste the address Cloudflare shows, ending in /wa-webhook.' };
+        'Create the Cloudflare Worker (Workers & Pages → Create Worker → Edit code → paste bnx-wa-relay-worker.js → Deploy) and paste the address Cloudflare shows, ending in /wa-webhook.' };
     }
     var pc = probe.getResponseCode(), pt = String(probe.getContentText() || '').trim();
     if (pc !== 200 || pt !== ch) {
       return { success: false, steps: steps, error: 'Relay ' + url + ' did not answer the handshake (HTTP ' + pc + ': ' + pt.slice(0, 80) + '). ' +
-        (pc === 403 ? 'The token inside the Cloudflare Worker does not match WA_VERIFY_TOKEN — paste bnx-wa-worker.js again and Deploy.'
-                    : (/yourname|<|>/i.test(url) ? 'That is the EXAMPLE address. Create your Worker first (Cloudflare → Workers & Pages → Create Worker → paste bnx-wa-worker.js → Deploy) and paste the address Cloudflare shows.'
-                    : 'No Cloudflare Worker answers at this address (error 1042 = Worker not found). Create it: Cloudflare → Workers & Pages → Create Worker → Edit code → paste bnx-wa-worker.js → Deploy, then paste its own address.')) };
+        (pc === 403 ? 'The token inside the Cloudflare Worker does not match WA_VERIFY_TOKEN — paste bnx-wa-relay-worker.js again and Deploy.'
+                    : (/yourname|<|>/i.test(url) ? 'That is the EXAMPLE address. Create your Worker first (Cloudflare → Workers & Pages → Create Worker → paste bnx-wa-relay-worker.js → Deploy) and paste the address Cloudflare shows.'
+                    : 'No Cloudflare Worker answers at this address (error 1042 = Worker not found). Create it: Cloudflare → Workers & Pages → Create Worker → Edit code → paste bnx-wa-relay-worker.js → Deploy, then paste its own address.')) };
     }
     steps.push('Relay answers the handshake ✓');
 
