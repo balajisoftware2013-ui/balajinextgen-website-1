@@ -109,3 +109,62 @@ function bnxWaWebhookStatus_(cid) {
   return { success: true, data: { verified: g('WA_WEBHOOK_VERIFIED') === 'YES', verifiedAt: g('WA_WEBHOOK_VERIFIED_AT'), url: g('WA_WEBHOOK_URL'),
     lastEventAt: g('WA_WEBHOOK_LAST_AT'), tokenSet: !!g('META_WA_TOKEN'), wabaSet: !!g('META_WA_WABA_ID') } };
 }
+
+/* ============================================================================
+ * ONE-CLICK "CONNECT WHATSAPP" FOR EVERY CLIENT — Meta Embedded Signup (2026-11-15)
+ * Growth Hub → 🔗 Connect WhatsApp → Facebook login → pick / add the number (or "Connect your existing WhatsApp Business
+ * app" = keep the phone app, Coexistence) → done. The client never sees a token, ID or Meta screen again.
+ *
+ * SET ONCE (Balaji NextGen, Apps Script → Project settings → Script properties):
+ *   META_APP_ID            your Meta app's App ID            (developers.facebook.com → App settings → Basic)
+ *   META_APP_SECRET        your Meta app's App secret        (same page — keep it ONLY here)
+ *   META_ES_CONFIG_ID      Embedded Signup configuration ID (Facebook Login for Business → Configurations)
+ * Saved per client after Connect: META_WA_TOKEN_<cid>, META_WA_PHONE_ID_<cid>, META_WA_WABA_ID_<cid>, WA_PROVIDER_<cid>=META
+ * ========================================================================== */
+function bnxWaEsConfig_(cid) {
+  var P = PropertiesService.getScriptProperties(), appId = P.getProperty('META_APP_ID') || '', cfg = P.getProperty('META_ES_CONFIG_ID') || '';
+  return { success: true, data: { ready: !!(appId && cfg && P.getProperty('META_APP_SECRET')), appId: appId, configId: cfg, graph: 'v21.0',
+    connected: !!bnxWaProp_(cid, 'META_WA_PHONE_ID') && !!bnxWaProp_(cid, 'META_WA_TOKEN'), phoneId: bnxWaProp_(cid, 'META_WA_PHONE_ID'),
+    wabaId: bnxWaProp_(cid, 'META_WA_WABA_ID'), number: bnxWaProp_(cid, 'META_WA_NUMBER'), connectedAt: bnxWaProp_(cid, 'META_WA_CONNECTED_AT') } };
+}
+function bnxWaEsFinish_(cid, p) {
+  p = p || {};
+  var P = PropertiesService.getScriptProperties(), steps = [];
+  var appId = P.getProperty('META_APP_ID'), secret = P.getProperty('META_APP_SECRET');
+  var code = String(p.code || ''), waba = String(p.wabaId || '').replace(/\D/g, ''), phone = String(p.phoneId || '').replace(/\D/g, '');
+  var coex = /APP_ONBOARDING|COEX/i.test(String(p.event || ''));
+  if (!appId || !secret) return { success: false, error: 'Balaji NextGen setup: META_APP_ID / META_APP_SECRET not set in Script properties' };
+  if (!code) return { success: false, error: 'Facebook did not return a login code — press Connect WhatsApp again' };
+  if (!waba || !phone) return { success: false, error: 'Facebook did not return the WhatsApp account / number — finish every step in the Facebook window' };
+  try {
+    /* 1. code → this client's business token */
+    var tr = UrlFetchApp.fetch(BNX_WA_GRAPH + 'oauth/access_token?client_id=' + encodeURIComponent(appId) + '&client_secret=' + encodeURIComponent(secret) + '&code=' + encodeURIComponent(code), { muteHttpExceptions: true });
+    var tj = {}; try { tj = JSON.parse(tr.getContentText()); } catch (e) {}
+    if (!tj.access_token) return { success: false, error: 'Meta refused the login code: ' + ((tj.error && tj.error.message) || tr.getContentText().slice(0, 160)), steps: steps };
+    var token = tj.access_token; steps.push('Business token received ✓');
+    var H = { Authorization: 'Bearer ' + token };
+    /* 2. subscribe our app to this client's WhatsApp account (messages reach the shared relay / webhook) */
+    var sr = UrlFetchApp.fetch(BNX_WA_GRAPH + waba + '/subscribed_apps', { method: 'post', headers: H, muteHttpExceptions: true });
+    steps.push(sr.getResponseCode() === 200 ? 'Messages subscribed ✓' : 'Subscribe: ' + sr.getContentText().slice(0, 120));
+    /* 3. a NEW number must be registered for Cloud API; a Business-app number (Coexistence) stays on the phone app */
+    if (!coex) {
+      var pin = String(100000 + Math.floor(Math.random() * 899999));
+      var rr = UrlFetchApp.fetch(BNX_WA_GRAPH + phone + '/register', { method: 'post', headers: H, contentType: 'application/json',
+        payload: JSON.stringify({ messaging_product: 'whatsapp', pin: pin }), muteHttpExceptions: true });
+      if (rr.getResponseCode() === 200) { steps.push('Number registered for Cloud API ✓'); P.setProperty('META_WA_PIN_' + cid, pin); }
+      else steps.push('Register: ' + rr.getContentText().slice(0, 160));
+    } else steps.push('Business-app number kept on the phone (Coexistence) ✓');
+    /* 4. read the number + name, save everything for THIS client */
+    var num = '', name = '';
+    try { var nr = JSON.parse(UrlFetchApp.fetch(BNX_WA_GRAPH + phone + '?fields=display_phone_number,verified_name', { headers: H, muteHttpExceptions: true }).getContentText());
+      num = nr.display_phone_number || ''; name = nr.verified_name || ''; } catch (e) {}
+    var put = function (k, v) { P.setProperty(k + '_' + cid, String(v)); };
+    put('META_WA_TOKEN', token); put('META_WA_PHONE_ID', phone); put('META_WA_WABA_ID', waba); put('WA_PROVIDER', 'META');
+    put('META_WA_NUMBER', num); put('META_WA_NAME', name); put('META_WA_CONNECTED_AT', new Date().toISOString()); put('META_WA_COEX', coex ? 'YES' : 'NO');
+    try { CacheService.getScriptCache().remove('waapi_' + cid); } catch (e) {}
+    steps.push('Saved for ' + cid + (num ? ' · ' + num : '') + (name ? ' (' + name + ')' : '') + ' ✓');
+    /* 5. point the webhook at the shared relay when it is live (optional — sending works without it) */
+    try { var wh = bnxWaWebhookConnect_(cid, {}); steps.push(wh.success ? 'Webhook connected ✓' : 'Webhook (optional, later): ' + String(wh.error || '').slice(0, 120)); } catch (e) {}
+    return { success: true, steps: steps, data: { number: num, name: name, phoneId: phone, wabaId: waba, coexistence: coex } };
+  } catch (e) { return { success: false, error: String(e && e.message || e), steps: steps }; }
+}
