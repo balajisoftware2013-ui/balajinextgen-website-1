@@ -28686,13 +28686,72 @@ function dcrRenderTable(rows, firstColLabel){
 // but for these reports it now fills a missing day with an all-zero
 // row that simply carries the running Opening/Closing Cash balance
 // forward unchanged, so the report renders instead of breaking.
+/* 2026-11-15 FIX ("Daily Collection all blank"): the report only ever read DCR_MANUAL — numbers typed into ➕ Add Entry and
+   kept in THIS browser's localStorage — so every POS bill / payment / due receipt was missing (and another PC saw nothing).
+   Sales & collection columns now come from the server (GET_DSR_RANGE: PAYMENT_MASTER by business date, same figures as the DSR);
+   Daily Exp / Bazar / Cash Deposit / Others (Banking) still come from ➕ Add Entry. A day with no POS figures (old / imported days)
+   keeps its typed-in sales as before, so nothing is counted twice. */
+const DCR_AUTO = {};            // 'YYYY-MM-DD' -> {cashSales,upiSales,...} from the server
+const DCR_AUTO_STATE = {};      // 'YYYY-MM-DD' -> 'ok' | 'wait' | failed-at ms
+let DCR_AUTO_NEED = null, DCR_AUTO_TIMER = 0;
+const DCR_SALE_KEYS = ['cashSales','upiSales','cardSales','bankSales','dueCash','dueBank','creditSales','onlineSales'];
+function dcrKey_(y,m,d){ return y+'-'+String(m).padStart(2,'0')+'-'+String(d).padStart(2,'0'); }
+function dcrAutoFromDsr_(x){
+  const n = v => Number(v)||0;
+  return { cashSales:n(x.cash), upiSales:n(x.iciciGpay), cardSales:n(x.iciciCard), bankSales:n(x.other),
+    dueCash:n(x.dueReceivedCash), dueBank:n(x.dueReceivedIcici), creditSales:n(x.guestDueSales),
+    onlineSales:n(x.zomato)+n(x.swiggy)+n(x.eazydine), bills:n(x.bills) };
+}
+function dcrNoteNeed_(k){
+  const st = DCR_AUTO_STATE[k];
+  if (st==='ok' || st==='wait' || (typeof st==='number' && Date.now()-st < 60000)) return;
+  if (!DCR_AUTO_NEED) DCR_AUTO_NEED = {lo:k, hi:k}; else { if (k<DCR_AUTO_NEED.lo) DCR_AUTO_NEED.lo=k; if (k>DCR_AUTO_NEED.hi) DCR_AUTO_NEED.hi=k; }
+  if (!DCR_AUTO_TIMER) DCR_AUTO_TIMER = setTimeout(dcrFetchAuto_, 0);
+}
+function dcrRerender_(){
+  if (!document.getElementById('dcrTable')) return;
+  if (dcrViewMode==='day') dcrLoadDay(); else if (dcrViewMode==='week') dcrLoadWeek(); else if (dcrViewMode==='month') dcrLoadMonth();
+  else if (dcrViewMode==='ytd') dcrLoadYTD(); else dcrLoadCustom();
+}
+function dcrFetchAuto_(){
+  DCR_AUTO_TIMER = 0;
+  const need = DCR_AUTO_NEED; DCR_AUTO_NEED = null;
+  if (!need || typeof gasApi !== 'function') return;
+  const today = (typeof getBusinessDate==='function') ? getBusinessDate() : new Date().toISOString().slice(0,10);
+  const from = need.lo, to = need.hi < today ? need.hi : today;   /* no future days */
+  const keys = []; for (let d=new Date(from+'T12:00:00'); dcrKey_(d.getFullYear(),d.getMonth()+1,d.getDate())<=need.hi; d.setDate(d.getDate()+1)) keys.push(dcrKey_(d.getFullYear(),d.getMonth()+1,d.getDate()));
+  if (from > to){ keys.forEach(k=>DCR_AUTO_STATE[k]='ok'); return; }
+  keys.forEach(k=>DCR_AUTO_STATE[k]='wait');
+  Promise.resolve(gasApi('GET_DSR_RANGE', {from:from, to:to}, 'V2_CORE')).then(function(r){
+    if (!r || r.success===false) throw new Error((r&&(r.error||r.message))||'Server error');
+    const byDate = (r.data && r.data.byDate) || {};
+    keys.forEach(function(k){ if (byDate[k]) DCR_AUTO[k] = dcrAutoFromDsr_(byDate[k]); else delete DCR_AUTO[k]; DCR_AUTO_STATE[k] = (k===today ? Date.now() : 'ok'); });   /* today: refresh after 60 s */
+    dcrRerender_();
+  }).catch(function(e){
+    keys.forEach(k=>DCR_AUTO_STATE[k]=Date.now());
+    console.warn('[DCR] live collection load failed:', e && e.message);
+    try{ showNotif('⚠️ Daily Collection: POS figures not loaded — '+(e&&e.message||'server error'), 'error'); }catch(_e){}
+  });
+}
 function dcrSafeDayData(y,m,d,prevClosing){
-  const real = dcrDemoDayData(y,m,d,prevClosing);
-  if (real) return real;
-  const opening = prevClosing!=null ? prevClosing : DCR_OPENING_FLOAT;
-  const zero = {}; DCR_COLS.forEach(c=>zero[c.key]=0);
-  zero.openingCash = opening; zero.netClosing = opening;
-  return zero;
+  const k = dcrKey_(y,m,d);
+  dcrNoteNeed_(k);
+  const manual = (typeof DCR_MANUAL!=='undefined' && DCR_MANUAL) ? DCR_MANUAL[k] : null;
+  const auto = DCR_AUTO[k];
+  const hasAuto = !!(auto && (auto.bills || DCR_SALE_KEYS.some(f=>auto[f])));
+  if (!manual && !hasAuto){
+    const opening = prevClosing!=null ? prevClosing : DCR_OPENING_FLOAT;
+    const zero = {}; DCR_COLS.forEach(c=>zero[c.key]=0);
+    zero.openingCash = opening; zero.netClosing = opening;
+    return zero;
+  }
+  const row = {}; DCR_COLS.forEach(c=>row[c.key]=0);
+  if (manual) Object.keys(manual).forEach(f=>{ row[f] = Number(manual[f])||0; });
+  if (hasAuto) DCR_SALE_KEYS.forEach(f=>{ row[f] = auto[f]; });
+  row.openingCash = prevClosing!=null ? prevClosing : (manual && manual.openingCash!=null ? Number(manual.openingCash)||0 : DCR_OPENING_FLOAT);
+  row.totalCollection = row.cashSales+row.upiSales+row.cardSales+row.bankSales+row.dueCash+row.dueBank+row.othersColl;
+  row.netClosing = row.openingCash + row.totalCollection - row.dailyExp - row.dailyBazar - row.cashDeposit - row.othersBank;   /* same formula as the manual rows */
+  return row;
 }
 
 function dcrLoadDay(){
