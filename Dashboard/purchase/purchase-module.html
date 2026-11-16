@@ -8313,6 +8313,193 @@ function confirmSmartImport(asDraft){
   .tb-right{min-width:0;flex:0 1 auto}
 }
 </style>
+<script id="bnx-purchase-live-load-20261116">
+/* ═══ PURCHASE MODULE — live load of the imported / server data (2026-11-16) ═══
+   ROOT CAUSES of "No records" after the store import:
+   1) Purchase Invoice register: GET_PURCHASE_INVOICES re-read PURCHASE_INVOICE_ITEMS once per invoice (858 × 2,389 rows)
+      and timed out — fixed in Code.gs; here the pull also runs when ERP_LOAD_ALL fails (it only ran on its success).
+   2) GRN register read only this browser's local GRN list, never GOODS_RECEIPT_NOTE — now loaded from the server
+      (GET_GRN_REGISTER, one row per item like the GRN page); GRNs entered on this device but not yet on the server stay. */
+(function(){
+  'use strict';
+  var W=window, lastInv=0, lastGrn=0, busy=false;
+  function ready(){ return typeof erpApi==='function' && typeof CLIENT_ID!=='undefined' && !!CLIENT_ID; }
+  async function loadGrns(force){
+    if(!ready() || (!force && Date.now()-lastGrn<60000)) return;
+    lastGrn=Date.now();
+    try{
+      var r=await erpApi('GET_GRN_REGISTER',{});
+      if(!r||!r.success||!Array.isArray(r.data)) { console.warn('[GRN] server load failed', r&&r.message); return; }
+      var ids={}; r.data.forEach(function(g){ ids[g.id]=1; });
+      var local=(DB.grns||[]).filter(function(g){ return g && !g.fromServer && !ids[g.id]; });
+      DB.grns=r.data.concat(local);
+      try{ saveLocalOnly(); }catch(e){}
+      try{ rendGRN(); }catch(e){} try{ rendDash(); }catch(e){}
+    }catch(e){ console.warn('[GRN] load error', e); }
+  }
+  async function loadInv(force){
+    if(!ready() || (!force && Date.now()-lastInv<60000)) return;
+    lastInv=Date.now();
+    try{ if(typeof refreshPurchaseInvoicesFromServer==='function') await refreshPurchaseInvoicesFromServer({silent:true}); }catch(e){}
+  }
+  async function both(force){ if(busy) return; busy=true; try{ await Promise.all([loadInv(force), loadGrns(force)]); } finally{ busy=false; } }
+  W.bnxPurchaseLiveReload=function(){ return both(true); };
+  /* the page's own poll: run it, then make sure invoices + GRNs are loaded even if ERP_LOAD_ALL failed */
+  function wrapPull(){
+    var f=W.pullInventorySyncData; if(typeof f!=='function'||f.__bnxLive) return;
+    var g=async function(){ var r; try{ r=await f.apply(this,arguments); }catch(e){} both(false); return r; };
+    g.__bnxLive=true; W.pullInventorySyncData=g;
+  }
+  /* opening GRN / Registers / Purchase pages, or the Refresh button, reloads from the server */
+  function wrapNav(){
+    var n=W.nav; if(typeof n!=='function'||n.__bnxLive) return;
+    var g=function(page){ var r=n.apply(this,arguments); if(/grn|reg|purch|dash/i.test(String(page||''))) both(false); return r; };
+    g.__bnxLive=true; W.nav=g;
+  }
+  document.addEventListener('click',function(e){ var b=e.target&&e.target.closest&&e.target.closest('button,a'); if(b&&/Refresh/i.test(b.textContent||'')) setTimeout(function(){ both(true); },300); },true);
+  var tries=0; (function boot(){ wrapPull(); wrapNav(); if(ready()){ both(true); return; } if(++tries<40) setTimeout(boot,1500); })();
+})();
+</script>
+
+<script id="bnx-store-registers-20261116">
+/* ═══ 📑 STORE REGISTERS (2026-11-16) — GRN Register · Issue Register · Stock Ledger Summary, same layout as the store
+   software's reports, read live from the ERP sheets (server action STORE_REGISTERS). Excel download per report or
+   all three in one workbook. Works in purchase-module.html and inventory.html (both have erpApi + XLSX). */
+(function(){
+  'use strict';
+  var W=window, D=document;
+  function api(a,p){ return (typeof erpApi==='function') ? erpApi(a,p||{}) : Promise.resolve({success:false,message:'Not logged in'}); }
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
+  function dmy(iso){ var m=String(iso||'').match(/^(\d{4})-(\d{2})-(\d{2})/); return m?m[3]+'/'+m[2]+'/'+m[1]:String(iso||''); }
+  function inr(n){ return (Number(n)||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+  function today(){ return new Date(Date.now()+5.5*3600e3).toISOString().slice(0,10); }
+  function fyStart(t){ return (t.slice(5)>='04-01'?t.slice(0,4):String(+t.slice(0,4)-1))+'-04-01'; }
+  var css='#bnxSR{position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:99990;display:none;align-items:center;justify-content:center;font-family:inherit}'
+    +'#bnxSR .bx{background:#fff;border-radius:14px;width:min(560px,94vw);padding:18px 18px 14px;box-shadow:0 20px 60px rgba(0,0,0,.25)}'
+    +'#bnxSR h3{margin:0 0 4px;font-size:16px}#bnxSR .sub{font-size:11.5px;color:#64748b;margin-bottom:12px}'
+    +'#bnxSR .row{display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:10px}#bnxSR label{font-size:11px;font-weight:700;color:#475569;display:flex;flex-direction:column;gap:3px}'
+    +'#bnxSR input{padding:7px 9px;border:1px solid #cbd5e1;border-radius:8px;font-size:13px}'
+    +'#bnxSR button{padding:8px 12px;border-radius:8px;border:1px solid #e2e8f0;background:#f8fafc;font-weight:700;font-size:12.5px;cursor:pointer}'
+    +'#bnxSR button.p{background:#ea580c;color:#fff;border-color:#ea580c}#bnxSR .st{font-size:12px;margin-top:8px;line-height:1.55;color:#334155;min-height:18px}'
+    +'#bnxSR table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}#bnxSR td{padding:4px 6px;border-bottom:1px solid #f1f5f9}#bnxSR td.r{text-align:right;font-variant-numeric:tabular-nums}';
+  function ui(){
+    if(D.getElementById('bnxSR')) return D.getElementById('bnxSR');
+    var st=D.createElement('style'); st.textContent=css; D.head.appendChild(st);
+    var o=D.createElement('div'); o.id='bnxSR';
+    o.innerHTML='<div class="bx"><h3>📑 Store Registers</h3><div class="sub">GRN Register · Issue Register · Stock Ledger Summary — live from the ERP, same layout as the store software. Excel download.</div>'
+      +'<div class="row"><label>FROM<input type="date" id="bnxSRf"></label><label>TO<input type="date" id="bnxSRt"></label>'
+      +'<button type="button" data-q="fy">This FY</button><button type="button" data-q="m">This month</button><button type="button" data-q="pm">Last month</button></div>'
+      +'<div class="row"><button type="button" class="p" data-x="GRN">⬇ GRN Register</button><button type="button" class="p" data-x="ISSUE">⬇ Issue Register</button>'
+      +'<button type="button" class="p" data-x="STOCK">⬇ Stock Ledger Summary</button><button type="button" data-x="ALL">⬇ All 3 (one Excel)</button></div>'
+      +'<div class="st" id="bnxSRs"></div><div style="text-align:right;margin-top:8px"><button type="button" id="bnxSRc">Close</button></div></div>';
+    D.body.appendChild(o);
+    var t=today(); D.getElementById('bnxSRf').value=fyStart(t); D.getElementById('bnxSRt').value=t;
+    o.addEventListener('click',function(e){
+      if(e.target===o||e.target.id==='bnxSRc'){ o.style.display='none'; return; }
+      var q=e.target.getAttribute&&e.target.getAttribute('data-q'), x=e.target.getAttribute&&e.target.getAttribute('data-x');
+      if(q){ var td=today(), f=D.getElementById('bnxSRf'), tt=D.getElementById('bnxSRt');
+        if(q==='fy'){ f.value=fyStart(td); tt.value=td; }
+        if(q==='m'){ f.value=td.slice(0,8)+'01'; tt.value=td; }
+        if(q==='pm'){ var d=new Date(td.slice(0,8)+'01T00:00:00Z'); d.setUTCDate(0); tt.value=d.toISOString().slice(0,10); f.value=tt.value.slice(0,8)+'01'; } }
+      if(x) run(x, e.target);
+    });
+    return o;
+  }
+  W.bnxOpenStoreRegisters=function(){ ui().style.display='flex'; };
+  function stat(h){ var s=D.getElementById('bnxSRs'); if(s) s.innerHTML=h; }
+
+  async function run(type, btn){
+    var f=D.getElementById('bnxSRf').value, t=D.getElementById('bnxSRt').value;
+    if(!f||!t||f>t) return stat('⚠️ Choose a valid From / To date.');
+    if(typeof XLSX==='undefined') return stat('⚠️ Excel library not loaded — refresh the page.');
+    var old=btn.textContent; btn.disabled=true; btn.textContent='⏳ Reading…'; stat('Reading '+dmy(f)+' → '+dmy(t)+' from the ERP…');
+    try{
+      var r=await api('STORE_REGISTERS',{type:type,from:f,to:t});
+      if(!r||!r.success) throw new Error((r&&(r.message||r.error))||'server did not answer — deploy store-registers.gs + the router line');
+      var d=r.data, wb=XLSX.utils.book_new(), sum=[];
+      if(d.grn){ XLSX.utils.book_append_sheet(wb, grnSheet(d), 'GRN Register'); sum.push(['GRN Register', d.grn.length+' GRN', d.grn.reduce(function(a,g){return a+g.total;},0)]); }
+      if(d.issue){ XLSX.utils.book_append_sheet(wb, issueSheet(d), 'Issue Register'); sum.push(['Issue Register', d.issue.length+' issue slips', d.issue.reduce(function(a,x){return a+x.lines.reduce(function(b,l){return b+l.amt;},0);},0)]); }
+      if(d.stock){ XLSX.utils.book_append_sheet(wb, stockSheet(d), 'Stock Ledger Summary'); sum.push(['Stock — closing value', d.stock.length+' items', d.stock.reduce(function(a,x){return a+x.clV;},0)]); }
+      var name={GRN:'GRN_Register',ISSUE:'Issue_Register',STOCK:'Stock_Ledger_Summary',ALL:'Store_Registers'}[type]+'_'+dmy(f).replace(/\//g,'-')+'_to_'+dmy(t).replace(/\//g,'-')+'.xlsx';
+      XLSX.writeFile(wb, name);
+      stat('✅ Downloaded <b>'+esc(name)+'</b><table>'+sum.map(function(s){ return '<tr><td>'+esc(s[0])+'</td><td>'+esc(s[1])+'</td><td class="r">₹'+inr(s[2])+'</td></tr>'; }).join('')+'</table>');
+    }catch(e){ stat('⛔ '+esc(e.message||e)); }
+    finally{ btn.disabled=false; btn.textContent=old; }
+  }
+  function head(d,title,ncol){
+    var c=d.company||{}, pad=function(a){ while(a.length<ncol) a.push(''); return a; };
+    return [pad([c.name||'']),pad([c.address||'']),pad([title]),pad(['For The Period of '+dmy(d.from)+' To '+dmy(d.to)]),pad(['','','','','','','Amount in INR'].slice(0,ncol))];
+  }
+  function finish(aoa, widths, money){
+    var ws=XLSX.utils.aoa_to_sheet(aoa); ws['!cols']=widths.map(function(w){return {wch:w};});
+    var rg=XLSX.utils.decode_range(ws['!ref']);
+    for(var R=0;R<=rg.e.r;R++) money.forEach(function(C){ var a=XLSX.utils.encode_cell({r:R,c:C}), cell=ws[a]; if(cell&&cell.t==='n') cell.z='#,##0.00'; });
+    return ws;
+  }
+  function catSummary(lines, qty){
+    var m={}; lines.forEach(function(l){ var k=l.cat||'OTHERS'; m[k]=m[k]||{q:0,v:0}; m[k].q+=l.qty; m[k].v+=l.amt; });
+    return Object.keys(m).sort().map(function(k){ return qty?[k,'','',+m[k].q.toFixed(3),'',+m[k].v.toFixed(2)]:[k,'','','','',+m[k].v.toFixed(2)]; });
+  }
+  function grnSheet(d){
+    var A=head(d,'GRN - REGISTER',8); A.push(['DocNo','DocDt','Supplier','Item','Qty','Rate','Amt','Total']);
+    var all=[], grand=0, other=0;
+    d.grn.forEach(function(g){
+      g.lines.forEach(function(l,i){ A.push(i?['','','',l.name+(l.uom?' - '+l.uom:''),l.qty,l.rate,l.amt,'']:[g.no,dmy(g.date),g.supplier,l.name+(l.uom?' - '+l.uom:''),l.qty,l.rate,l.amt,'']); all.push(l); });
+      if(!g.lines.length) A.push([g.no,dmy(g.date),g.supplier,'(no items)','','','','']);
+      A.push(['','','','Sub-Total :','','',g.sub,'']); A.push([g.no,'','','Tax/Oth Charges :','','',g.other,g.total]); A.push([]);
+      grand+=g.total; other+=g.other;
+    });
+    A.push(['Grand Total :','','','','','','',+grand.toFixed(2)]); A.push([]);
+    A.push(['NAME','','','','','TOTAL AMOUNT']);
+    catSummary(all,false).forEach(function(r){ A.push(r); });
+    A.push(['OtherCharge','','','','',+other.toFixed(2)]); A.push(['','','','','',+grand.toFixed(2)]);
+    return finish(A,[22,12,34,44,10,12,14,14],[4,5,6,7]);
+  }
+  function issueSheet(d){
+    var A=head(d,'Issue - Register',7); A.push(['SL No','Date','Location','ITEM','QTY','RATE','AMOUNT']);
+    var cur='', all=[], grand=0, locT=0, locLines=[];
+    function closeLoc(){ if(!cur) return; A.push(['Total '+cur,'','','','','',+locT.toFixed(2)]); A.push([]); }
+    d.issue.forEach(function(x){
+      if(x.dept!==cur){ closeLoc(); cur=x.dept; locT=0; A.push([cur]); }
+      A.push([x.no,dmy(x.date),x.dept,'','','','']);
+      var t=0; x.lines.forEach(function(l){ A.push(['','','',l.name+(l.uom?' - '+l.uom:''),l.qty,l.rate,l.amt]); t+=l.amt; all.push(l); });
+      A.push(['Total ','','','','','',+t.toFixed(2)]); locT+=t; grand+=t;
+    });
+    closeLoc();
+    A.push(['Grand Total','','','','','',+grand.toFixed(2)]); A.push([]);
+    A.push(['CATEGORY','','','QTY','','AMOUNT']);
+    catSummary(all,true).forEach(function(r){ A.push(r); });
+    return finish(A,[22,12,18,46,10,12,14],[4,5,6]);
+  }
+  function stockSheet(d){
+    var c=d.company||{}, A=[[c.name||''],[c.address||''],['Stock Ledger Summary'],['','','','','','','From',dmy(d.from),'To',dmy(d.to)],
+      ['SlNo','ItemName','UOM','itemcd','OpQty','OpRate','OpVal','RecQty','RecRate','RecVal','IssQty','IssRate','IssVal','ClQty','ClRate','ClVal','Category']];
+    var T={opV:0,rV:0,iV:0,clV:0};
+    d.stock.forEach(function(x,i){ A.push([i+1,x.name,x.uom,x.code,x.opQ,x.opR,x.opV,x.rQ,x.rR,x.rV,x.iQ,x.iR,x.iV,x.clQ,x.clR,x.clV,x.cat]);
+      T.opV+=x.opV; T.rV+=x.rV; T.iV+=x.iV; T.clV+=x.clV; });
+    A.push(['','TOTAL','','','','',+T.opV.toFixed(2),'','',+T.rV.toFixed(2),'','',+T.iV.toFixed(2),'','',+T.clV.toFixed(2),'']);
+    return finish(A,[6,44,7,9,10,11,14,10,11,14,10,11,14,10,11,14,20],[5,6,8,9,11,12,14,15]);
+  }
+
+  /* entry buttons: purchase-module (top bar, next to Export) and inventory (Reports group in the sidebar) */
+  function mount(){
+    if(D.getElementById('bnxSRbtn')) return;
+    var invGroup=D.getElementById('grp-reports-body');
+    if(invGroup){
+      var a=D.createElement('a'); a.className='nav-item'; a.id='bnxSRbtn'; a.tabIndex=0; a.setAttribute('role','button');
+      a.innerHTML='<span class="ni">📑</span> Store Registers (GRN · Issue · Stock)'; a.onclick=function(){ W.bnxOpenStoreRegisters(); };
+      invGroup.appendChild(a); return;
+    }
+    var exp=[].slice.call(D.querySelectorAll('button,a')).find(function(b){ return /^\s*\S*\s*Export\s*$/.test(b.textContent||'') && b.offsetParent; });
+    var b=D.createElement('button'); b.id='bnxSRbtn'; b.type='button'; b.textContent='📑 Store Registers'; b.onclick=function(){ W.bnxOpenStoreRegisters(); };
+    if(exp&&exp.parentNode){ b.className=exp.className; exp.parentNode.insertBefore(b,exp); }
+    else { b.style.cssText='position:fixed;right:16px;bottom:16px;z-index:9990;padding:10px 14px;border-radius:10px;border:0;background:#ea580c;color:#fff;font-weight:800;box-shadow:0 6px 18px rgba(0,0,0,.2);cursor:pointer'; D.body.appendChild(b); }
+  }
+  if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ setTimeout(mount,1500); }); else setTimeout(mount,1500);
+  setTimeout(mount,5000);
+})();
+</script>
+
 </body>
 
 
