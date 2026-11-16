@@ -14625,6 +14625,117 @@ window.handlePhyUpload=function(input){
   setTimeout(sync,1500); setTimeout(sync,5000);
 })();
 </script>
+<script id="bnx-inventory-live-20261116">
+/* ═══ INVENTORY — LIVE ERP DATA (2026-11-16, "full audit") ═══
+   ROOT CAUSE: this page kept items / stock_ledger / issues only in each browser (localStorage) and synced them through
+   SYNC_PUSH_TABLE / SYNC_PULL_ALL, which the ERP server does not have. So the dashboard, Stock View, Category-wise,
+   Low stock, Stock Ledger and Stock Summary never showed the real store (582 items, GRN / issue movements, closing).
+   NOW: INV_LIVE_DATA (RAW_MATERIAL_MASTER + STOCK_MOVEMENT + DEPARTMENT_ISSUE) is kept IN MEMORY and shown in place of the
+   old browser copies (no multi-MB localStorage writes). Entries made on this device after the first live load stay
+   visible until the server has them. GRN stock-in saved here is now also posted to the server (SAVE_GRN) — before it
+   stayed in this browser only. Company name / GSTIN come from COMPANY_SETTINGS unless saved by hand. */
+(function(){
+  'use strict';
+  var W=window, LIVE={}, bypass=false, srcIds={}, liveNames={};
+  var SINCE_KEY='BNX_INV_LIVE_SINCE_'+(typeof CID!=='undefined'?CID:'');
+  function since(){ try{ return localStorage.getItem(SINCE_KEY)||''; }catch(e){ return ''; } }
+  function ready(){ return typeof erpApi==='function' && typeof CID!=='undefined' && CID && (typeof _hasRealSession!=='function' || _hasRealSession()); }
+  /* which local rows still show next to the live ones */
+  var KEEP={
+    items:function(r){ return r && r._ts>since() && !liveNames[String(r.name||'').trim().toUpperCase()]; },
+    stock_ledger:function(r){ return r && r._ts>since() && !srcIds[String(r.ref_id||'')]; },
+    issues:function(r){ return r && r._ts>since(); },
+    warehouses:function(r){ return r && r._id!=='STORE'; }
+  };
+  var oAll=DB.all, oSave=DB.save;
+  DB.all=function(t){
+    var base=oAll.call(DB,t);
+    if(bypass||!LIVE[t]) return base;
+    var ids=LIVE[t].ids, keep=KEEP[t]||function(){ return false; };
+    return LIVE[t].rows.concat(base.filter(function(r){ return r && !ids[r._id] && keep(r); }));
+  };
+  DB.save=function(t,v){
+    if(!LIVE[t]) return oSave.call(DB,t,v);
+    var ids=LIVE[t].ids; bypass=true;
+    try{ return oSave.call(DB,t,(v||[]).filter(function(r){ return !r||!ids[r._id]; })); } finally{ bypass=false; }
+  };
+  function put(t,rows){ var ids={}; rows.forEach(function(r){ ids[r._id]=1; }); LIVE[t]={rows:rows,ids:ids}; }
+
+  var loading=false;
+  async function load(force){
+    if(loading||!ready()) return; loading=true;
+    try{
+      var r=await erpApi('INV_LIVE_DATA',{});
+      if(!r||!r.success||!r.data){ console.warn('[Inventory live] not loaded:', r&&r.message); return; }
+      var d=r.data;
+      srcIds={}; (d.sourceIds||[]).forEach(function(x){ srcIds[x]=1; });
+      liveNames={}; (d.items||[]).forEach(function(i){ liveNames[String(i.name||'').trim().toUpperCase()]=1; });
+      if(!since()) try{ localStorage.setItem(SINCE_KEY,new Date().toISOString()); }catch(e){}   /* older browser-only rows are hidden from now on */
+      put('items',d.items||[]); put('stock_ledger',d.stock_ledger||[]); put('issues',d.issues||[]); put('warehouses',d.warehouses||[]);
+      W.__bnxInvLive={items:(d.items||[]).length,ledger:(d.stock_ledger||[]).length,issues:(d.issues||[]).length,at:new Date().toISOString(),ms:d.ms};
+      repaint();
+    }catch(e){ console.warn('[Inventory live] error',e); }
+    finally{ loading=false; }
+  }
+  function repaint(){
+    try{ if(typeof populateDropdowns==='function') populateDropdowns(); }catch(e){}
+    try{ if(typeof currentPanel!=='undefined' && currentPanel && typeof showP==='function') showP(currentPanel); else if(typeof loadDashboard==='function') loadDashboard(); }catch(e){}
+  }
+  W.bnxInventoryLiveReload=function(){ return load(true); };
+
+  /* GRN stock-in saved on this page → server (SAVE_GRN). One call per GRN, after all its lines are written. */
+  var q={}, tq=null, oIns=DB.insert;
+  DB.insert=function(t,rec){
+    var row=oIns.call(DB,t,rec);
+    try{
+      if(t==='stock_ledger' && row && row.txn_type==='grn' && row.ref_id && ready()){
+        var g=q[row.ref_id]=q[row.ref_id]||{_id:row.ref_id,grn_date:row.date,wh_id:row.wh_id||'STORE',items:[]};
+        var it=(oAll.call(DB,'items').concat(LIVE.items?LIVE.items.rows:[])).find(function(i){ return i._id===row.item_id; })||{};
+        var grn=(oAll.call(DB,'grn_records')||[]).find(function(x){ return x._id===row.ref_id; })||{};
+        g.inv_no=grn.inv_no||g.inv_no||''; g.received_by=grn.received_by||'';
+        g.items.push({item_id:row.item_id,item_name:it.name||'',received:row.qty_in,rate:row.rate||0});
+        clearTimeout(tq); tq=setTimeout(flush,400);
+      }
+    }catch(e){}
+    return row;
+  };
+  function flush(){
+    var all=q; q={};
+    Object.keys(all).forEach(function(id){
+      erpApi('SAVE_GRN',all[id]).then(function(r){
+        if(r&&r.success===false){ try{ toast('⚠️ GRN '+id+' saved here, but the server did not take the stock: '+(r.message||''),'w'); }catch(e){} }
+        else { srcIds[id]=1; setTimeout(function(){ load(true); },1500); }
+      });
+    });
+  }
+
+  /* company profile from the ERP (unless a profile was typed in by hand on this page) */
+  async function company(){
+    if(!ready()) return;
+    try{
+      var r=await erpApi('GET_COMPANY_PROFILE',{}); var p=r&&r.success&&r.data; if(!p||!p.name) return;
+      var rows=oAll.call(DB,'client_config')||[], cfg=rows.find(function(c){ return c._id===CID; });
+      var demo=!cfg || !cfg.gstin || /^27AABCU9603R1ZX$/i.test(String(cfg.gstin)) || /balaji enterprises/i.test(String(cfg.company_name||''));
+      if(!demo && cfg.manual) return;
+      var nw=Object.assign({},cfg||{_id:CID},{company_name:p.name,gstin:p.gstin||(cfg&&cfg.gstin)||'',phone:p.phone||(cfg&&cfg.phone)||'',address:p.address||(cfg&&cfg.address)||'',email:p.email||(cfg&&cfg.email)||''});
+      var out=rows.filter(function(c){ return c._id!==CID; }).concat([nw]);
+      DB.set(CID+'_client_config',out);
+      try{ localStorage.setItem('BNJERP_'+CID+'_company_name',p.name); }catch(e){}
+      W.__bnxCompany=p;
+    }catch(e){}
+  }
+
+  /* the 🔄 sync button and the page's own poll also refresh the live data */
+  function wrapPull(){
+    var f=W.pullAllFromBackend; if(typeof f!=='function'||f.__bnxLive) return;
+    var g=async function(silent){ var r; try{ r=await f.apply(this,arguments); }catch(e){} if(silent===false) load(true); return r; };
+    g.__bnxLive=true; W.pullAllFromBackend=g; try{ pullAllFromBackend=g; }catch(e){}
+  }
+  var tries=0; (function boot(){ wrapPull(); if(ready()){ company(); load(true); return; } if(++tries<40) setTimeout(boot,1500); })();
+  setInterval(function(){ if(document.visibilityState==='visible') load(false); },5*60*1000);
+})();
+</script>
+
 <script id="bnx-store-registers-20261116">
 /* ═══ 📑 STORE REGISTERS (2026-11-16) — GRN Register · Issue Register · Stock Ledger Summary, same layout as the store
    software's reports, read live from the ERP sheets (server action STORE_REGISTERS). Excel download per report or
