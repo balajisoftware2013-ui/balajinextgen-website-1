@@ -1411,8 +1411,29 @@ function bnxGetBarIndentCatalog(session,payload){
       }
     }catch(e){ bnxLogError(clientId,'bnxGetBarIndentCatalog source '+sheetName+' failed: '+e.message,p); }
   }
+  /* 2026-11-16 ROOT FIX ("bar indent shows menu items, PC, stock —"): an indent is a requisition from the STORE, so the
+     list is the store master (RAW_MATERIAL_MASTER: bottles B700/B750, cases, KG …) with its real category as the group and
+     its live stock. BAR_ITEM_MASTER (menu pours) + ITEM_MASTER (1,303 menu dishes) used to outrank it, so the screen listed
+     menu items with unit PC and no stock. Those two stay only as a fallback when the store master is empty. */
+  try{
+    const sh=bnxClientSheet(clientId,SHEETS.RAW_MATERIAL_MASTER), vals=sh.getDataRange().getValues(), h=vals[0]||[];
+    const rank={LIQUOR:0,BEVERAGE:1,GROCERY:2};
+    for(let r=1;r<vals.length;r++){
+      const o=bnxRowToObject(vals[r],h);
+      if(o.CLIENT_ID && String(o.CLIENT_ID)!==String(clientId)) continue;
+      if(upper(o.STATUS)==='INACTIVE' || o.IS_ACTIVE===false || upper(o.IS_ACTIVE)==='FALSE') continue;
+      const id=norm(o.ITEM_CODE||o.RAW_MATERIAL_ID||o.ITEM_ID), name=norm(o.ITEM_NAME||o.MATERIAL_NAME||o.NAME); if(!id||!name) continue;
+      const rc=upper(o.CATEGORY), cat=/LIQU|BREWPUB/.test(rc)||/^(OS|IF|OI)[- ]|^BEER\b/.test(upper(name))?'LIQUOR':(/BEVERAGE/.test(rc)?'BEVERAGE':'GROCERY');
+      add({ITEM_ID:id,ITEM_NAME:name,CATEGORY:cat,UNIT:norm(o.UOM||o.UNIT||'PC').toUpperCase(),GROUP_NAME:rc||cat,SOURCE:'RAW_MATERIAL_MASTER',LOCATION_ID:locationId,
+        CURRENT_STOCK:Number(o.CURRENT_STOCK)||0,COST_PRICE:Number(o.COST_PRICE)||0,_r:rank[cat]});
+    }
+  }catch(e){ bnxLogError(clientId,'bnxGetBarIndentCatalog store master failed: '+e.message,p); }
+  if(out.length){
+    out.sort((a,b)=>(a._r-b._r)||String(a.GROUP_NAME).localeCompare(String(b.GROUP_NAME))||String(a.ITEM_NAME).localeCompare(String(b.ITEM_NAME)));
+    out.forEach(x=>{ delete x._r; });
+    return {success:true,data:{items:out,count:out.length,locationId,source:'RAW_MATERIAL_MASTER'},items:out,count:out.length};
+  }
   readSource(SHEETS.BAR_ITEM_MASTER,['BAR_ITEM_ID','ITEM_ID','ITEM_CODE'],['ITEM_NAME','MENU_ITEM_NAME'],['UOM','UNIT','UNIT_ID']);
-  readSource(SHEETS.RAW_MATERIAL_MASTER,['ITEM_CODE','RAW_MATERIAL_ID','ITEM_ID'],['ITEM_NAME','MATERIAL_NAME','NAME'],['UOM','UNIT','UNIT_NAME']);
   readSource(SHEETS.ITEM_MASTER,['ITEM_ID','ITEM_CODE'],['ITEM_NAME','NAME'],['UOM','UNIT','UNIT_NAME','UNIT_ID']);
   out.sort((a,b)=>String(a.CATEGORY).localeCompare(String(b.CATEGORY))||String(a.ITEM_NAME).localeCompare(String(b.ITEM_NAME)));
   return {success:true,data:{items:out,count:out.length,locationId},items:out,count:out.length};
@@ -1841,57 +1862,41 @@ function bnxSavePurchaseInvoiceRow(session,payload){
 }
 
 function bnxGetPurchaseInvoices(session,payload){
+  /* 2026-11-16: the items sheet is read ONCE (was once per invoice → 858 invoices × 2,389 rows timed out, page showed
+     "No records"); dates come back as yyyy-mm-dd (sheet Date objects used to give "Thu Apr 02"); only the item fields
+     the pages use are returned. */
   const clientId=session.CLIENT_ID, p=payload||{};
   try{
     const from=String(p.from||'').slice(0,10), to=String(p.to||'').slice(0,10);
+    const D=v=>{ if(v instanceof Date && !isNaN(v)) return Utilities.formatDate(v,'Asia/Kolkata','yyyy-MM-dd'); const t=String(v||'').trim(), m=t.match(/^(\d{4})-(\d{2})-(\d{2})/); if(m) return m[0]; const n=t.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})/); return n? n[3]+'-'+('0'+n[2]).slice(-2)+'-'+('0'+n[1]).slice(-2) : t.slice(0,10); };
     const sh=bnxClientSheet(clientId,SHEETS.PURCHASE_INVOICE);
     const vals=sh.getDataRange().getValues(), h=vals[0]||[];
+    const byInv={};
+    try{
+      const ish=bnxClientSheet(clientId,SHEETS.PURCHASE_INVOICE_ITEMS);
+      const iv=ish.getDataRange().getValues(), ih=iv[0]||[], I=k=>ih.indexOf(k), pc=I('PURCHASE_INVOICE_ID');
+      const pick=['ITEM_ID','ITEM_NAME','HSN_CODE','QUANTITY','UNIT_ID','RATE','DISCOUNT_PCT','GST_RATE','TAXABLE_AMOUNT','CGST','SGST','IGST','TAX_AMOUNT','EXTRA_CHARGES','LINE_TOTAL'].map(k=>[k,I(k)]).filter(x=>x[1]>=0);
+      if(pc>=0) for(let j=1;j<iv.length;j++){ const id=String(iv[j][pc]||''); if(!id) continue; const x={}; pick.forEach(([k,c])=>{ x[k]=iv[j][c]; }); (byInv[id]=byInv[id]||[]).push(x); }
+    }catch(e){}
     const rows=[];
-    const idx=k=>h.indexOf(k);
     for(let r=1;r<vals.length;r++){
       const o=bnxRowToObject(vals[r],h);
+      if(!o.PURCHASE_INVOICE_ID) continue;
       if(o.CLIENT_ID && String(o.CLIENT_ID)!==String(clientId)) continue;
-      const d=String(o.INVOICE_DATE||'').slice(0,10);
+      const d=D(o.INVOICE_DATE);
       if(from && d<from) continue;
       if(to && d>to) continue;
-
-      let items=[];
-      try{
-        const raw=o.ITEMS_JSON;
-        if(raw) items=JSON.parse(raw);
-      }catch(e){items=[];}
-
-      // Child table is authoritative when available.
-      try{
-        const ish=bnxClientSheet(clientId,SHEETS.PURCHASE_INVOICE_ITEMS);
-        const iv=ish.getDataRange().getValues(), ih=iv[0]||[], pc=ih.indexOf('PURCHASE_INVOICE_ID');
-        if(pc>=0){
-          const child=[];
-          for(let j=1;j<iv.length;j++){
-            if(String(iv[j][pc])!==String(o.PURCHASE_INVOICE_ID||'')) continue;
-            const x=bnxRowToObject(iv[j],ih);
-            child.push(x);
-          }
-          if(child.length) items=child;
-        }
-      }catch(e){}
-
+      let items=byInv[String(o.PURCHASE_INVOICE_ID)]||[];
+      if(!items.length){ try{ const raw=o.ITEMS_JSON; if(raw) items=JSON.parse(raw)||[]; }catch(e){ items=[]; } }
+      const ap=String(o.APPROVAL_STATUS||'').trim();
       rows.push({
-        _id:String(o.PURCHASE_INVOICE_ID||''),
-        inv_no:String(o.INVOICE_NO||''),
-        party_id:String(o.SUPPLIER_ID||''),
-        party_name:String(o.SUPPLIER_NAME||''),
-        inv_date:String(o.INVOICE_DATE||'').slice(0,10),
-        due_date:String(o.DUE_DATE||'').slice(0,10),
-        wh_id:String(o.LOCATION_ID||''),
-        taxable:Number(o.TAXABLE_AMOUNT)||0,
-        cgst:Number(o.CGST)||0,
-        sgst:Number(o.SGST)||0,
-        igst:Number(o.IGST)||0,
-        other_charges:Number(o.OTHER_CHARGES)||0,
-        total:Number(o.TOTAL_AMOUNT)||0,
+        _id:String(o.PURCHASE_INVOICE_ID||''), inv_no:String(o.INVOICE_NO||''), party_id:String(o.SUPPLIER_ID||''), party_name:String(o.SUPPLIER_NAME||''),
+        inv_date:d, due_date:D(o.DUE_DATE), wh_id:String(o.LOCATION_ID||''),
+        taxable:Number(o.TAXABLE_AMOUNT)||0, cgst:Number(o.CGST)||0, sgst:Number(o.SGST)||0, igst:Number(o.IGST)||0,
+        other_charges:Number(o.OTHER_CHARGES)||0, total:Number(o.TOTAL_AMOUNT)||0,
         status:String(o.PAYMENT_STATUS||o.STATUS||'unpaid'),
-        items:items
+        approval_status: ap ? ap.charAt(0).toUpperCase()+ap.slice(1).toLowerCase() : '',
+        notes:String(o.NOTES||''), items:items
       });
     }
     rows.sort((a,b)=>String(b.inv_date).localeCompare(String(a.inv_date)));
@@ -1900,6 +1905,29 @@ function bnxGetPurchaseInvoices(session,payload){
     bnxLogError(clientId,'GET_PURCHASE_INVOICES failed: '+e.message,payload||{});
     return {success:false,message:e.message,data:[]};
   }
+}
+/* 2026-11-16 GRN register for purchase-module (GOODS_RECEIPT_NOTE + GRN_ITEMS, one row per item like the GRN page) */
+function bnxGetGrnRegister_(session,payload){
+  const clientId=session.CLIENT_ID, p=payload||{};
+  try{
+    const D=v=>{ if(v instanceof Date && !isNaN(v)) return Utilities.formatDate(v,'Asia/Kolkata','yyyy-MM-dd'); const t=String(v||''), m=t.match(/^(\d{4})-(\d{2})-(\d{2})/); return m?m[0]:t.slice(0,10); };
+    const from=String(p.from||'').slice(0,10), to=String(p.to||'').slice(0,10);
+    const rowsOf=n=>{ const v=bnxClientSheet(clientId,n).getDataRange().getValues(), h=(v[0]||[]).map(String); return v.slice(1).map(r=>bnxRowToObject(r,h)); };
+    const names={}, sups={};
+    try{ rowsOf(SHEETS.RAW_MATERIAL_MASTER).forEach(r=>{ if(r.ITEM_CODE) names[String(r.ITEM_CODE)]={n:String(r.ITEM_NAME||''),u:String(r.UOM||'')}; }); }catch(e){}
+    try{ rowsOf(SHEETS.SUPPLIER_MASTER).forEach(r=>{ if(r.SUPPLIER_ID) sups[String(r.SUPPLIER_ID)]=String(r.SUPPLIER_NAME||''); }); }catch(e){}
+    const head={};
+    rowsOf('GOODS_RECEIPT_NOTE').forEach(g=>{ if(!g.GRN_ID) return; if(g.CLIENT_ID && String(g.CLIENT_ID)!==String(clientId)) return;
+      const d=D(g.GRN_DATE); if(from&&d<from) return; if(to&&d>to) return; head[String(g.GRN_ID)]={g:g,d:d}; });
+    const out=[];
+    rowsOf('GRN_ITEMS').forEach(x=>{ const hd=head[String(x.GRN_ID||'')]; if(!hd) return; const g=hd.g, it=names[String(x.ITEM_ID||'')]||{};
+      const q=Number(x.QUANTITY_RECEIVED)||0, rate=Number(x.RATE)||0, vn=sups[String(g.SUPPLIER_ID||'')]||String(g.NOTES||'').replace(/^GRN register import · /,'');
+      out.push({id:String(x.GRN_ITEM_ID||x.GRN_ID), grnId:String(g.GRN_ID), no:String(g.GRN_NUMBER||g.GRN_ID), date:hd.d, vendorId:String(g.SUPPLIER_ID||''), vendorName:vn,
+        itemId:String(x.ITEM_ID||''), item:it.n||String(x.ITEM_ID||''), unit:String(x.UNIT_ID||it.u||''), received:q, accepted:q, rejected:0, rate:rate, amount:Math.round(q*rate*100)/100,
+        godown:String(g.LOCATION_ID||''), status:String(g.STATUS||'RECEIVED')==='RECEIVED'?'Accepted':String(g.STATUS), fromServer:true}); });
+    out.sort((a,b)=>a.date<b.date?1:a.date>b.date?-1:(a.no<b.no?1:-1));
+    return {success:true,data:out,count:out.length};
+  }catch(e){ try{bnxLogError(clientId,'GET_GRN_REGISTER failed: '+e.message,p);}catch(x){} return {success:false,message:e.message,data:[]}; }
 }
 
 function bnxDeletePurchaseInvoiceRow(session,payload){
@@ -1963,6 +1991,8 @@ function bnxSaveDeptIssueLive_(session,payload){
   const lock=bnxTenantLock_();try{lock.waitLock(10000);const existing=bnxGetRows_(clientId,SHEETS.STOCK_MOVEMENT).some(m=>String(m.SOURCE_ID||'')===issueId&&String(m.SOURCE_TYPE||'').toUpperCase()==='DEPARTMENT_ISSUE');if(existing)return {success:true,issueId,duplicate:true};
     const resolved=[];for(const x of items){const it=bnxInventoryItem_(clientId,x.item_id||x.ITEM_ID,x.item_name||x.name||x.ITEM_NAME);const qty=Number(x.qty||x.quantity)||0;if(!it||qty<=0)return {success:false,message:'Invalid issue item or quantity'};const av=bnxGetAvailableStockQty_(clientId,it.itemId,wh);if(av!==null&&av+1e-9<qty)return {success:false,message:'Insufficient stock for '+it.itemName};resolved.push({it,qty});}
     const dept=String(p.department||p.dept||p.DEPARTMENT||'').trim().toUpperCase();const deptLocation=(dept==='BAR'||dept==='KITCHEN')?dept:'';for(const x of resolved){const rate=bnxGetItemPurchaseRate_(clientId,x.it.itemId),now=new Date().toISOString();bnxAppendRow(clientId,SHEETS.STOCK_MOVEMENT,{STOCK_MOVEMENT_ID:generateShortId_(clientId,'STOCK_MOVEMENT_ID'),CLIENT_ID:clientId,LOCATION_ID:wh,ITEM_ID:x.it.itemId,MOVEMENT_TYPE:'ISSUE',MOVEMENT_DATE:date,QUANTITY_IN:0,QUANTITY_OUT:x.qty,RATE:rate,SOURCE_TYPE:'DEPARTMENT_ISSUE',SOURCE_ID:issueId,REFERENCE_NUMBER:issueId,NOTES:String(p.purpose||''),CREATED_BY:String(p.issuedBy||session.USER_ID||'Store'),CREATED_AT:now});bnxUpdateStockBalanceAfterMovement_(clientId,x.it.itemId,wh,x.qty,0,now);if(deptLocation){bnxAppendRow(clientId,SHEETS.STOCK_MOVEMENT,{STOCK_MOVEMENT_ID:generateShortId_(clientId,'STOCK_MOVEMENT_ID'),CLIENT_ID:clientId,LOCATION_ID:deptLocation,ITEM_ID:x.it.itemId,MOVEMENT_TYPE:'TRANSFER_IN',MOVEMENT_DATE:date,QUANTITY_IN:x.qty,QUANTITY_OUT:0,RATE:rate,SOURCE_TYPE:'DEPARTMENT_ISSUE',SOURCE_ID:issueId,REFERENCE_NUMBER:issueId,NOTES:'Received by '+dept,CREATED_BY:String(p.issuedBy||session.USER_ID||'Store'),CREATED_AT:now});bnxUpdateStockBalanceAfterMovement_(clientId,x.it.itemId,deptLocation,0,x.qty,now);}}
+    /* 2026-11-16: also one DEPARTMENT_ISSUE row per item (department + slip no.) — Issue Register / chef / store registers */
+    try{const nowI=new Date().toISOString();resolved.forEach(function(x,i){bnxAppendRow(clientId,'DEPARTMENT_ISSUE',{CLIENT_ID:clientId,CREATED_AT:nowI,ISSUE_ID:issueId+'-'+('0'+(i+1)).slice(-2),DATE:date,INDENT_ID:issueId,ITEM_ID:x.it.itemId,ITEM_NAME:x.it.itemName||'',UNIT:String(x.it.uom||x.it.unit||''),ISSUED_QTY:x.qty,DEPARTMENT:dept||String(p.issued_to||'STORE ISSUE').toUpperCase(),ISSUED_BY:String(p.issuedBy||p.issued_by||session.USER_NAME||session.USER_ID||'Store'),REMARKS:String(p.purpose||'')});});}catch(e){bnxLogError(clientId,'DEPARTMENT_ISSUE row failed: '+e.message,{issueId:issueId});}
     return {success:true,issueId,department:dept||''};
   }catch(e){return {success:false,message:e.message};}finally{try{lock.releaseLock();}catch(e){}}
 }
@@ -2056,6 +2086,7 @@ function bnxAssertBusinessDayOpen_(clientId,businessDate){
  * code that runs without a request client keep the real script lock. Client provisioning keeps it too.
  * ========================================================================== */
 var __bnxReqCid_ = '';
+var __bnxReqAct_ = '';   /* 2026-11-16: which action holds the restaurant lock (RUN_LockWho) */
 var __bnxTenantLocks_ = {};
 var BNX_TL_TTL_S_ = 180;
 function bnxTenantLock_() {
@@ -2063,8 +2094,8 @@ function bnxTenantLock_() {
   if (!cid) return LockService.getScriptLock();
   return __bnxTenantLocks_[cid] || (__bnxTenantLocks_[cid] = bnxMakeTenantLock_(cid));
 }
-function bnxMakeTenantLock_(cid) {
-  var KEY = 'bnxtl_v1_' + cid, held = false, token = '', viaScript = null;
+function bnxMakeTenantLock_(cid, keyName, ttlS) {
+  var KEY = keyName || ('bnxtl_v1_' + cid), TTL = ttlS || BNX_TL_TTL_S_, held = false, token = '', viaScript = null;
   function attempt() {
     var g = LockService.getScriptLock();
     if (!g.tryLock(1500)) return false;
@@ -2074,8 +2105,8 @@ function bnxMakeTenantLock_(cid) {
     try {
       var cur = cache.get(KEY);
       if (cur) return false;
-      token = Utilities.getUuid();
-      cache.put(KEY, token, BNX_TL_TTL_S_);
+      token = Utilities.getUuid() + '|' + String(__bnxReqAct_ || 'TRIGGER/EDITOR').slice(0, 40) + '|' + Date.now();   /* who + since when (RUN_LockWho) */
+      cache.put(KEY, token, TTL);
       held = true; return true;
     } catch (e) {
       viaScript = g; held = true; return true;                         /* cache error: keep the global lock */
@@ -2099,6 +2130,11 @@ function bnxMakeTenantLock_(cid) {
       held = false;
       if (viaScript) { var v = viaScript; viaScript = null; try { v.releaseLock(); } catch (e) {} return; }
       var t = token; token = '';
+      try {   /* 2026-11-16: remember holds longer than 5 s (RUN_LockWho shows them) */
+        var tp = String(t).split('|'), ms = Date.now() - Number(tp[2] || Date.now());
+        if (ms > 5000) { var sc = CacheService.getScriptCache(), lk = 'bnxtl_slow_' + KEY, ls = []; try { ls = JSON.parse(sc.get(lk) || '[]'); } catch (x) {}
+          ls.unshift([Utilities.formatDate(new Date(), 'Asia/Kolkata', 'HH:mm:ss'), tp[1] || '?', Math.round(ms / 100) / 10]); sc.put(lk, JSON.stringify(ls.slice(0, 40)), 21600); }
+      } catch (x) {}
       try {
         var cache = CacheService.getScriptCache(), g = LockService.getScriptLock();
         if (g.tryLock(2000)) { try { if (cache.get(KEY) === t) cache.remove(KEY); } finally { g.releaseLock(); } }
@@ -2108,6 +2144,24 @@ function bnxMakeTenantLock_(cid) {
   };
   return L;
 }
+/* 2026-11-16 FAST PRINT ("fast print from mobile"). ROOT CAUSE: the KOT number (KOT_FAST_START) and the print queue
+   (PRINT_QUEUE_ADD / CLAIM / DONE) used the SAME restaurant lock as SAVE_ORDER / SAVE_BILL, which hold it for 8-18 s.
+   So during service a KOT waited for every other save before it got its number, and the POS print station got
+   PRINT_QUEUE_BUSY on every claim until the save finished. Now:
+   • bnxCounterLock_  — guards ONLY the SEQUENCE_COUNTERS read+write (milliseconds), for every counter reservation;
+   • bnxPrintLock_    — guards ONLY the print-queue sheet.
+   Saves still hold the restaurant lock for their own rows; they take these short locks inside it (never the reverse),
+   so no lock order can deadlock. */
+var __bnxCtrLocks_ = {};
+function bnxCounterLock_(cid) {
+  cid = String(cid || '').trim(); if (!cid) return null;
+  var o = __bnxCtrLocks_[cid]; if (o) return o;
+  var base = bnxMakeTenantLock_(cid, 'bnxctr_v1_' + cid, 30), depth = 0;
+  o = { enter: function (ms) { if (depth > 0) { depth++; return; } base.waitLock(ms || 20000); depth = 1; },
+        exit: function () { if (depth <= 0) return; depth--; if (depth === 0) base.releaseLock(); } };
+  return (__bnxCtrLocks_[cid] = o);
+}
+function bnxPrintLock_(cid) { return bnxMakeTenantLock_(String(cid || ''), 'bnxpql_v1_' + cid, 60); }
 
 /* ---- live-read cache (2026-10-28): every steward phone polls the floor / open orders / KOTs; with N phones the
    same Sheets read ran N times every few seconds. One read per change: answers are cached per restaurant and
@@ -2210,7 +2264,7 @@ function doPost(e) {
     }
 
     if (typeof bnxFinalFixInit_ === 'function') bnxFinalFixInit_();
-    __bnxReqCid_ = String(session.CLIENT_ID || '');
+    __bnxReqCid_ = String(session.CLIENT_ID || ''); __bnxReqAct_ = String(action || '');
     const op28HandlerStart=Date.now();
     const bnxLiveKey = (BNX_LIVE_READS_[action] || BNX_GEN_READS_[action] || action === 'GET_ORDERS' || action === 'LIST_BILLS' || (action === 'RD_FETCH_SHEET' && /^(04_TABLE_MASTER|PAYMENT_MASTER|SALES_LEDGER)$/.test(String(payload.tab || '')))) ? bnxLiveReadKey_(session.CLIENT_ID, action, payload) : '';
     if (bnxLiveKey) {
@@ -2462,8 +2516,22 @@ case 'GET_SALES_CHANNEL_REPORT': result = bnxGetSalesChannelReport(session, payl
       case 'DELETE_PURCHASE_INVOICE_ROW': result = bnxDeletePurchaseInvoiceRow(session, payload); break;
       case 'ISSUE_STOCK_TO_DEPT': result = bnxIssueStockToDept(session, payload); break;
       case 'SAVE_DEPT_ISSUE': result = bnxSaveDeptIssue(session, payload); break;
-      case 'GET_DEPT_ISSUES': result = bnxGetDeptIssues(session, payload); break;
-      case 'ACK_DEPT_ISSUE': result = bnxAckDeptIssue(session, payload); break;
+      case 'GET_DEPT_ISSUES': result = bnxGetDeptIssuesV2_(session, payload); break;
+      case 'STORE_REGISTERS': result = bnxStoreRegisters_(session, payload); break;
+      case 'GET_GRN_REGISTER': result = bnxGetGrnRegister_(session, payload); break;
+      case 'GET_COMPANY_PROFILE': result = bnxGetCompanyProfile_(session, payload); break;
+      case 'INV_LIVE_DATA': result = bnxInvLiveData_(session, payload); break;
+      case 'STORE_ITEM_LEDGER': result = bnxStoreItemLedger_(session, payload); break;
+      case 'BAR_COSTING_REFRESH': result = bnxBarCostingRefresh_(session, payload); break;
+      case 'GET_BAR_COSTING': result = bnxGetBarCosting_(session, payload); break;
+      case 'BAR_MAPPING_SAVE': result = bnxBarMappingSave_(session, payload); break;
+      case 'RECIPE_COSTING_LIST': result = bnxRecipeCostingList_(session, payload); break;
+      case 'RECIPE_SAVE': result = bnxRecipeSave_(session, payload); break;
+      case 'RECIPE_DELETE': result = bnxRecipeDelete_(session, payload); break;
+      case 'FOOD_COST_REPORT': result = bnxFoodCostReport_(session, payload); break;
+      case 'WASTAGE_SAVE': result = bnxWastageSave_(session, payload); break;
+      case 'RECIPE_COSTING_REFRESH': result = bnxRecipeCostingRefresh_(session, payload); break;
+      case 'ACK_DEPT_ISSUE': result = bnxAckDeptIssueV2_(session, payload); break;
       case 'SAVE_GRN': result = bnxSaveGRNLive(session, payload); break;
       case 'SAVE_STOCK_TRANSFER': result = bnxSaveTransferLive(session, payload); break;
       case 'SAVE_PHYSICAL_ADJUSTMENT': result = bnxSavePhysicalAdjustment(session, payload); break;
@@ -3896,6 +3964,7 @@ function bnxAcquireScriptLockWithRetry_(maxAttempts, waitMs) {
 
 function bnxReserveNumberBatch_(clientId, counterType, batchSize, lockAlreadyHeld) {
   const lock = lockAlreadyHeld ? null : bnxAcquireScriptLockWithRetry_(3,10000);
+  const ctr = bnxCounterLock_(clientId); if (ctr) ctr.enter(20000);   /* 2026-11-16: every counter write is serialised here */
   try {
     const sheet = bnxClientSheet(clientId, SHEETS.SEQUENCE_COUNTERS);
     const values = sheet.getDataRange().getValues();
@@ -3921,7 +3990,7 @@ function bnxReserveNumberBatch_(clientId, counterType, batchSize, lockAlreadyHel
     const defaultPad=inferredPad||(/^BILL_NUMBER_[A-Z0-9_-]+$/.test(counterType)?8:(isEntityId?5:4));
     bnxAppendRow(clientId,SHEETS.SEQUENCE_COUNTERS,{COUNTER_ID:clientId+'-SEQ-'+counterType.replace('_NUMBER',''),CLIENT_ID:clientId,COUNTER_TYPE:counterType,PREFIX:defaultPrefix,NEXT_VALUE:newValue,PAD_LENGTH:defaultPad,RESET_FREQUENCY:'NEVER',UPDATED_AT:new Date().toISOString()});
     return {from:start,to:newValue-1,prefix:defaultPrefix,padLength:defaultPad};
-  } finally { if(lock)lock.releaseLock(); }
+  } finally { if (ctr) ctr.exit(); if(lock)lock.releaseLock(); }
 }
 
 
@@ -7494,13 +7563,50 @@ function bnxSaveCreditCustomer(session, payload) {
 
 /* DUES 2026-10-22: open (DUE) bills grouped by party — feeds Customer Credit (Old balance / Bills due / ageing buckets)
    and the Due Collection Swift list (GET_OUTSTANDING_BILLS). Cached per bill generation for 5 min. */
+/* 2026-11-16 (RUN_DueTiming: each BILL_MASTER column read costs ~2.5 s in this file; reading 10 columns = 33 s).
+   Due bills are kept in a 2-hour index (row → bill no, date, customer, total, status). Each call reads only TWO columns:
+   DUE_AMOUNT (who still owes, always fresh) and BILL_ID (proves every indexed row is still the same bill — archive,
+   deletes or sorting are detected). Only bills that are new to the index are read (one row each, or a column block when
+   there are many). Same bills, same amounts as before; ~5 s instead of ~35 s. */
+function bnxDueBillCols_(sh,clientId){
+  const lastRow=sh.getLastRow(), lastCol=sh.getLastColumn();
+  const headers=sh.getRange(1,1,1,lastCol).getValues()[0].map(function(h){ return String(h==null?'':h); });
+  if(lastRow<2) return {headers:headers,rows:[]};
+  const n=lastRow-1, di=headers.indexOf('DUE_AMOUNT'), bi=headers.indexOf('BILL_ID'), ci=headers.indexOf('CLIENT_ID');
+  if(di<0||bi<0) throw new Error('BILL_MASTER needs DUE_AMOUNT and BILL_ID');
+  const want=['CLIENT_ID','BILL_STATUS','BILL_NUMBER','BUSINESS_DATE','BILL_DATE','CUSTOMER_ID','CUSTOMER_NAME','GRAND_TOTAL'].map(function(x){ return headers.indexOf(x); }).filter(function(i){ return i>=0; });
+  const dueCol=sh.getRange(2,di+1,n,1).getValues(), idCol=sh.getRange(2,bi+1,n,1).getValues();
+  const hits=[]; for(let r=0;r<n;r++){ if((parseFloat(String(dueCol[r][0]).replace(/[,₹\s]/g,''))||0)>0.009) hits.push(r); }
+  const key='dueidx_v2_'+clientId, sig=want.join(',');
+  let idx=null; try{ idx=JSON.parse(bnxBigCacheGet_(key)||'null'); }catch(e){ idx=null; }
+  if(!idx||idx.sig!==sig||!idx.rows) idx={sig:sig,rows:{}};
+  const cell=function(v){ return v instanceof Date ? Utilities.formatDate(v,bnxTz_(),'yyyy-MM-dd') : v; };
+  const missing=hits.filter(function(r){ const o=idx.rows[r]; return !o||String(o.id)!==String(idCol[r][0]); });
+  if(missing.length>8){
+    const lo=missing[0], hi=missing[missing.length-1], m=hi-lo+1;
+    missing.forEach(function(r){ idx.rows[r]={id:idCol[r][0]}; });
+    want.forEach(function(i){ const vals=sh.getRange(2+lo,i+1,m,1).getValues(); missing.forEach(function(r){ idx.rows[r][i]=cell(vals[r-lo][0]); }); });
+  } else {
+    missing.forEach(function(r){ const v=sh.getRange(r+2,1,1,lastCol).getValues()[0], o={id:idCol[r][0]}; want.forEach(function(i){ o[i]=cell(v[i]); }); idx.rows[r]=o; });
+  }
+  const keep={}; hits.forEach(function(r){ keep[r]=idx.rows[r]; }); idx.rows=keep;
+  try{ bnxBigCachePut_(key,JSON.stringify(idx),7200); }catch(e){}
+  const rows=[];
+  hits.forEach(function(r){ const o=idx.rows[r]; if(!o) return; const row=new Array(lastCol).fill('');
+    Object.keys(o).forEach(function(k){ if(k!=='id') row[+k]=o[k]; }); row[bi]=idCol[r][0]; row[di]=dueCol[r][0];
+    if(ci>=0&&String(row[ci])!==String(clientId)) return; rows.push(row); });
+  return {headers:headers,rows:rows};
+}
 function bnxDueBillsByParty_(clientId){
   const key='duebills_v1_'+clientId+'_'+bnxBillGen_(clientId);
   try{ const hit=bnxBigCacheGet_(key); if(hit) return JSON.parse(hit); }catch(e){}
   const out={bills:[]};
   try{
     const sh=bnxClientSheet(clientId,SHEETS.BILL_MASTER);
-    const read=bnxReadFilteredRows_(sh,['CLIENT_ID','DUE_AMOUNT'],function(v){ return String(v[0])===String(clientId)&&(parseFloat(String(v[1]).replace(/[,₹\s]/g,''))||0)>0.009; });
+    /* 2026-11-16 SPEED (traffic report: GET_DUE_COLLECTION avg 207 s). Credit bills are spread over the whole year, so the
+       generic filtered reader found > 40 separate row groups and read the WHOLE BILL_MASTER (13,000 rows x 52 columns).
+       Only the 10 columns the dues list uses are read now (about 5x less data). Same bills, same figures. */
+    const read=bnxDueBillCols_(sh,clientId);
     read.rows.forEach(function(r){
       const b=bnxRowToObject(r,read.headers);
       if(String(b.BILL_STATUS||'').toUpperCase()==='CANCELLED') return;
@@ -13224,18 +13330,62 @@ function bnxFastBillRange_(p, defaultToday) {
   if((from&&!/^\d{4}-\d{2}-\d{2}$/.test(from))||(to&&!/^\d{4}-\d{2}-\d{2}$/.test(to))||(from&&to&&from>to))throw new Error('Invalid bill date range');
   return {from:from,to:to};
 }
+/* 2026-11-16 TAIL READER (RUN_DueTiming: every full-column read of BILL_MASTER costs ~2.5 s, BILL_ITEMS more).
+   Bills, items and payments are appended in time order, so the rows for "today" / "this week" are at the bottom.
+   Reads the filter columns from the bottom up in chunks (one call per chunk) and stops after 2 chunks in a row with
+   nothing wanted. Returns the same { headers, rows } as bnxReadFilteredRows_ (+ vals = filter values of the hits). */
+function bnxTailFilteredRows_(sheet, colNames, test, opt) {
+  opt = opt || {};
+  const lastRow = sheet.getLastRow(), lastCol = sheet.getLastColumn();
+  const headers = lastCol > 0 ? sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function (h) { return String(h == null ? '' : h); }) : [];
+  if (lastRow < 2 || lastCol < 1) return { headers: headers, rows: [], vals: [] };
+  const idx = colNames.map(function (c) { return headers.indexOf(c); });
+  if (idx.some(function (i) { return i < 0; })) throw new Error('Missing filter column: ' + colNames.filter(function (c) { return headers.indexOf(c) < 0; }).join(', '));
+  const c0 = Math.min.apply(null, idx), c1 = Math.max.apply(null, idx), W = c1 - c0 + 1, CH = opt.chunk || 2000;
+  const hit = [], vals = []; let empty = 0;
+  const idSet = opt.ids || null, idTotal = idSet ? Object.keys(idSet).length : 0, seen = Object.create(null); let seenN = 0;
+  /* stop rule: a chunk counts as "empty" only when it has no hit AND (for a date window) all its dated rows are older than
+     the window, AND (for joins) something was already found — so an old window or old bills are never missed. */
+  for (let end = lastRow; end >= 2; ) {
+    const start = Math.max(2, end - CH + 1), block = sheet.getRange(start, c0 + 1, end - start + 1, W).getValues();
+    let got = 0;
+    for (let i = block.length - 1; i >= 0; i--) { const v = idx.map(function (k) { return block[i][k - c0]; }); if (test(v)) { hit.push(start + i); vals.push(v); got++; if (idSet) { const k0 = String(v[0]); if (!seen[k0]) { seen[k0] = 1; seenN++; } } } }
+    let quiet = !got;
+    if (quiet && opt.older) { for (let i = 0; i < block.length; i++) { const v = idx.map(function (k) { return block[i][k - c0]; }); if (opt.older(v) === false) { quiet = false; break; } } }
+    if (quiet && opt.needHitFirst && !hit.length) quiet = false;
+    if (quiet && idSet && seenN < idTotal) quiet = false;   /* every wanted id must have been found first (ids with no rows = full scan, as before) */
+    empty = quiet ? empty + 1 : 0;
+    if (empty >= (opt.emptyChunks || 2)) break;
+    end = start - 1;
+  }
+  hit.reverse(); vals.reverse();
+  if (!hit.length || opt.noRows) return { headers: headers, rows: [], vals: vals, hitRows: hit };
+  const runs = []; let a = hit[0], b = hit[0];
+  for (let k = 1; k < hit.length; k++) { if (hit[k] - b <= 8) b = hit[k]; else { runs.push([a, b]); a = hit[k]; b = hit[k]; } }
+  runs.push([a, b]);
+  const want = Object.create(null); hit.forEach(function (r) { want[r] = true; });
+  const rows = [];
+  if (runs.length > 40) {   /* scattered: one block from the first to the last hit */
+    const blk = sheet.getRange(hit[0], 1, hit[hit.length - 1] - hit[0] + 1, lastCol).getValues();
+    hit.forEach(function (r) { rows.push(blk[r - hit[0]]); });
+  } else runs.forEach(function (rn) { const blk = sheet.getRange(rn[0], 1, rn[1] - rn[0] + 1, lastCol).getValues(); for (let r = rn[0]; r <= rn[1]; r++) if (want[r]) rows.push(blk[r - rn[0]]); });
+  return { headers: headers, rows: rows, vals: vals, hitRows: hit };
+}
 function bnxFastBillRead_(clientId,p,defaultToday){
   const range=bnxFastBillRange_(p,defaultToday),location=String((p||{}).LOCATION_ID||(p||{}).locationId||'');
   const sh=bnxClientSheet(clientId,SHEETS.BILL_MASTER),h=sh.getLastColumn()?sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String):[];
   const cols=['CLIENT_ID','BILL_DATE'];
   if(h.indexOf('BUSINESS_DATE')>=0)cols.push('BUSINESS_DATE');
   if(location)cols.push('LOCATION_ID');
-  const read=bnxReadFilteredRows_(sh,cols,function(v){
+  /* 2026-11-16: a date window = tail read (rows for recent days are at the bottom); no window = whole sheet as before */
+  const useTail=!!(range.from&&range.to);
+  const older=function(v){ const d=bnxNormalizeDateKey_(cols.indexOf('BUSINESS_DATE')>=0?(v[2]||v[1]):v[1]); return !/^\d{4}-\d{2}-\d{2}$/.test(d)||d<range.from; };
+  const read=(useTail?bnxTailFilteredRows_:bnxReadFilteredRows_)(sh,cols,function(v){
     if(String(v[0])!==String(clientId))return false;
     const d=bnxNormalizeDateKey_(cols.indexOf('BUSINESS_DATE')>=0?(v[2]||v[1]):v[1]);
     if((range.from||range.to)&&!/^\d{4}-\d{2}-\d{2}$/.test(d))return false;
     return !(range.from&&d<range.from||range.to&&d>range.to||location&&String(v[cols.indexOf('LOCATION_ID')])!==location);
-  });
+  },{older:older,chunk:2000});
   return {headers:read.headers,rows:read.rows,range:range};
 }
 function bnxGetBills(session,payload){
@@ -13274,13 +13424,16 @@ function bnxListBillsLive_(session,payload){
       if(n<1)return;
       const h=sh.getRange(1,1,1,c).getValues()[0].map(String),id=h.indexOf('BILL_ID'),ci=h.indexOf('CLIENT_ID');
       if(id<0)throw new Error(sheetName+': BILL_ID header missing');
+      const names=ci<0?['BILL_ID']:['BILL_ID','CLIENT_ID'];
+      const tst=function(v){return wanted[String(v[0])]===true&&(ci<0||String(v[1])===String(clientId));};
+      const nWanted=Object.keys(wanted).length, tailOk=nWanted<=1500;   /* 2026-11-16: items / payments of recent bills sit at the bottom */
       if(summary&&sheetName===SHEETS.BILL_ITEMS){
+        if(tailOk){ bnxTailFilteredRows_(sh,names,tst,{noRows:true,chunk:4000,ids:wanted,emptyChunks:2}).vals.forEach(function(v){const key=String(v[0]);counts[key]=(counts[key]||0)+1;}); return; }
         const ids=sh.getRange(2,id+1,n,1).getValues(),clients=ci<0?null:sh.getRange(2,ci+1,n,1).getValues();
         for(let i=0;i<n;i++){const key=String(ids[i][0]);if(wanted[key]&&(!clients||String(clients[i][0])===String(clientId)))counts[key]=(counts[key]||0)+1;}
         return;
       }
-      const names=ci<0?['BILL_ID']:['BILL_ID','CLIENT_ID'];
-      const rr=bnxReadFilteredRows_(sh,names,function(v){return wanted[String(v[0])]===true&&(ci<0||String(v[1])===String(clientId));});
+      const rr=tailOk?bnxTailFilteredRows_(sh,names,tst,{chunk:4000,ids:wanted,emptyChunks:2}):bnxReadFilteredRows_(sh,names,tst);
       rr.rows.forEach(function(row){fn(bnxRowToObject(row,rr.headers));});
     }
     if(selected.length){
@@ -13658,10 +13811,11 @@ function bnxReadWindow_(sheet, dateCols, lo, hi) {
     const h = sheet.getRange(1, 1, 1, w).getValues()[0].map(function (x) { return String(x == null ? '' : x).trim(); });
     const cols = (dateCols || []).filter(function (c) { return h.indexOf(c) >= 0; });
     if (!cols.length) return sheet.getDataRange().getValues();
-    const rr = bnxReadFilteredRows_(sheet, cols, function (v) {
-      let d = ''; for (let i = 0; i < v.length && !d; i++) d = bnxNormalizeDateKey_(v[i]);
-      return !!d && (!lo || d >= lo) && (!hi || d <= hi);
-    });
+    const dk = function (v) { let d = ''; for (let i = 0; i < v.length && !d; i++) d = bnxNormalizeDateKey_(v[i]); return d; };
+    const tst = function (v) { const d = dk(v); return !!d && (!lo || d >= lo) && (!hi || d <= hi); };
+    /* 2026-11-16: a window with a start date reads from the bottom (recent rows are at the bottom) */
+    const rr = lo ? bnxTailFilteredRows_(sheet, cols, tst, { chunk: 2000, older: function (v) { const d = dk(v); return !/^\d{4}-\d{2}-\d{2}$/.test(d) || d < lo; } })
+                  : bnxReadFilteredRows_(sheet, cols, tst);
     return [rr.headers].concat(rr.rows);
   } catch (e) { console.warn('[bnxReadWindow_] full read fallback: ' + e.message); return sheet.getDataRange().getValues(); }
 }
@@ -13672,7 +13826,8 @@ function bnxReadByIds_(sheet, idCol, idSet) {
     const h = sheet.getRange(1, 1, 1, w).getValues()[0].map(function (x) { return String(x == null ? '' : x).trim(); });
     if (!keys.length) return [h];
     if (h.indexOf(idCol) < 0) return sheet.getDataRange().getValues();
-    const rr = bnxReadFilteredRows_(sheet, [idCol], function (v) { return idSet[String(v[0])] === true; });
+    const t = function (v) { return idSet[String(v[0])] === true; };
+    const rr = keys.length <= 1500 ? bnxTailFilteredRows_(sheet, [idCol], t, { chunk: 4000, ids: idSet, emptyChunks: 2 }) : bnxReadFilteredRows_(sheet, [idCol], t);   /* 2026-11-16 */
     return [rr.headers].concat(rr.rows);
   } catch (e) { console.warn('[bnxReadByIds_] full read fallback: ' + e.message); return sheet.getDataRange().getValues(); }
 }
@@ -14213,7 +14368,7 @@ function bnxBillPayments_(session, payload) {
     const out = {};
     if (Object.keys(ids).length) {
       const pm = bnxClientSheet(clientId, SHEETS.PAYMENT_MASTER);
-      const rr = bnxReadFilteredRows_(pm, ['BILL_ID'], function (v) { return ids[String(v[0])] === true; });
+      const rr = bnxTailFilteredRows_(pm, ['BILL_ID'], function (v) { return ids[String(v[0])] === true; }, { chunk: 4000, ids: ids, emptyChunks: 2 });   /* 2026-11-16 */
       rr.rows.forEach(function (row) { const o = bnxRowToObject(row, rr.headers);
         if (/^(REFUNDED|REVERSED|VOID|CANCELLED)$/.test(String(o.PAYMENT_STATUS || '').toUpperCase())) return;
         // Preserve the actual aggregator tender for bill-list totals. Global normalization
@@ -14510,6 +14665,7 @@ function bnxPrereserveIds_(clientId, want) {
   var types=Object.keys(want||{}).filter(function(t){var m=_bnxIdMem_[String(clientId)+'|'+t];return want[t]>0&&!(m&&m.length>=want[t]);});
   if(!types.length)return 0;
   var lock=bnxTenantLock_(),held=lock.hasLock();if(!held)lock.waitLock(15000);
+  var ctr=bnxCounterLock_(clientId);if(ctr)ctr.enter(20000);   /* 2026-11-16: KOT_FAST_START writes the same sheet without the restaurant lock */
   try{
     var sh=bnxClientSheet(clientId,SHEETS.SEQUENCE_COUNTERS),v=sh.getDataRange().getValues(),h=v[0]||[];
     var ci=h.indexOf('CLIENT_ID'),tc=h.indexOf('COUNTER_TYPE'),vc=h.indexOf('NEXT_VALUE'),pc=h.indexOf('PREFIX'),padc=h.indexOf('PAD_LENGTH'),uc=h.indexOf('UPDATED_AT');
@@ -14537,7 +14693,7 @@ function bnxPrereserveIds_(clientId, want) {
     // may leave gaps but cannot expose unreserved IDs to a successful save.
     plan.forEach(function(p){var key=String(clientId)+'|'+p.type,mem=_bnxIdMem_[key]||(_bnxIdMem_[key]=[]);for(var n=p.from;n<p.to;n++)mem.push(String(p.prefix)+String(n).padStart(p.pad,'0'));});
     return plan.length;
-  }finally{if(!held)lock.releaseLock();}
+  }finally{if(ctr)ctr.exit();if(!held)lock.releaseLock();}
 }
 
 /* step timer: wraps a global function so its time is added to __bnxT_ while a SAVE_BILL is running */
@@ -15492,7 +15648,7 @@ function bnxPrintApi_(session,p,action){
    }catch(fastErr){}
   }
   if(['PRINTER_MASTER_SAVE','PRINT_QUEUE_ADD','PRINT_QUEUE_CLAIM','PRINT_QUEUE_DONE'].indexOf(action)>=0){
-   lock=bnxTenantLock_();if(!lock.tryLock(action==='PRINT_QUEUE_CLAIM'?3000:10000))return {success:false,retryable:true,error:'PRINT_QUEUE_BUSY'};
+   lock=bnxPrintLock_(cid);if(!lock.tryLock(action==='PRINT_QUEUE_CLAIM'?3000:10000))return {success:false,retryable:true,error:'PRINT_QUEUE_BUSY'};   /* 2026-11-16: own short lock — a running SAVE_ORDER / SAVE_BILL no longer blocks KOT printing */
   }
   if(action==='PRINTER_MASTER_SAVE')return bnxPqMaster_(session,p,true);
   if(['PRINT_QUEUE_CLAIM','PRINT_QUEUE_DONE'].indexOf(action)>=0&&!bnxPqAdmin_(session))return {success:false,statusCode:403,error:'POS station role required'};
@@ -16688,6 +16844,7 @@ bnxSaveOrder = function (session, payload) {
   } catch (e) { /* normal one-by-one reservation still works */ }
   var r = bnxSaveOrderBase_(session, payload);
   if (!r || r.success !== true) return r;
+  if (payload.requestId) bnxKotFastDrop_(session.CLIENT_ID, payload.requestId);   /* 2026-11-16: keep Script properties small (cache copy stays 6 h) */
   var d = r.data || {}, orderNo = String(d.ORDER_NUMBER || d.ORDER_NO || '');
   if (!orderNo) return r;
   var native = payload.mobilePrintRoute === 'NATIVE';
@@ -16745,17 +16902,20 @@ bnxSaveOrder = function (session, payload) {
 
 /* BNX_PRINT_QUEUE only ever grew; the claim scan slows with it. Keeps 2 days of DONE/FAIL rows. */
 function RUN_29_PrunePrintQueue() {
-  var lock = bnxTenantLock_(); if (!lock.tryLock(20000)) { Logger.log('busy'); return 0; }
+  var lock = { releaseLock: function () {} };   /* 2026-11-16: each client's queue is locked with its own print lock below */
   var total = 0;
   try {
     var cutoff = Date.now() - 2 * 86400000;
     bnxIgcClients_().forEach(function (cid) {
       try {
+        var pl = bnxPrintLock_(cid); if (!pl.tryLock(20000)) { Logger.log(cid + ': print queue busy, skipped'); return; }
+        try {
         var sh = bnxPqSheet_(cid), lr = sh.getLastRow(); if (lr < 2) return;
         var v = sh.getRange(2, 1, lr - 1, 8).getValues(), rows = [];
         v.forEach(function (r, i) { var st = String(r[1]); if (st !== 'DONE' && st !== 'FAIL') return; var t = new Date(r[6]).getTime(); if (t && t < cutoff) rows.push(i + 2); });
         bnxDeleteRowsSafe_(sh, rows); total += rows.length;
         Logger.log(cid + ': pruned ' + rows.length + ' print jobs');
+        } finally { pl.releaseLock(); }
       } catch (e) { console.warn('[prune] ' + cid + ' ' + e.message); }
     });
   } finally { lock.releaseLock(); }
@@ -18263,7 +18423,10 @@ function bnxGetBillItemsDay_(session, payload) {
     var noOf = {};
     if (mn >= 2) {
       var lo = Math.min(cId, cNo, cDt, cCl < 0 ? cId : cCl), hi = Math.max(cId, cNo, cDt, cCl < 0 ? cId : cCl);
-      var mv = bm.getRange(2, lo + 1, mn - 1, hi - lo + 1).getValues();
+      /* 2026-11-16: read from the bottom until the day is passed (was the whole sheet) */
+      var mv = bnxTailFilteredRows_(bm, [mh[cDt]],
+        function (v) { return bnxNormalizeDateKey_(v[0]) === day; }, { noRows: true, chunk: 2000, older: function (v) { var d = bnxNormalizeDateKey_(v[0]); return !/^\d{4}-\d{2}-\d{2}$/.test(d) || d < day; } }).hitRows || [];
+      mv = mv.length ? (function (rs) { var a = rs[0], b = rs[rs.length - 1], blk = bm.getRange(a, lo + 1, b - a + 1, hi - lo + 1).getValues(), want = {}; rs.forEach(function (x) { want[x] = 1; }); return blk.filter(function (_, k) { return want[a + k]; }); })(mv) : [];
       for (var i = 0; i < mv.length; i++) {
         var r = mv[i];
         if (cCl >= 0 && r[cCl - lo] && String(r[cCl - lo]) !== String(cid)) continue;
@@ -18275,8 +18438,8 @@ function bnxGetBillItemsDay_(session, payload) {
     if (ids.length && bi.getLastRow() >= 2) {
       var iw = bi.getLastColumn(), ih = bi.getRange(1, 1, 1, iw).getValues()[0].map(String), iId = ih.indexOf('BILL_ID');
       if (iId < 0) return { success: false, error: 'BILL_ITEMS: BILL_ID header missing' };
-      var col = bi.getRange(2, iId + 1, bi.getLastRow() - 1, 1).getValues(), rows = [];
-      for (var j = 0; j < col.length; j++) if (noOf[String(col[j][0])]) rows.push(j + 2);
+      var idw = {}; ids.forEach(function (x) { idw[x] = true; });
+      var rows = (bnxTailFilteredRows_(bi, ['BILL_ID'], function (v) { return !!noOf[String(v[0])]; }, { noRows: true, chunk: 4000, ids: idw, emptyChunks: 2 }).hitRows || []).slice();   /* 2026-11-16 */
       var blocks = [];
       rows.forEach(function (rn) { var l = blocks[blocks.length - 1]; if (l && rn === l.s + l.n) l.n++; else blocks.push({ s: rn, n: 1 }); });
       blocks.forEach(function (b) {
@@ -18314,16 +18477,42 @@ function bnxKotFastGet_(cid, rid) {
   if (!v) try { v = PropertiesService.getScriptProperties().getProperty(k); } catch (e) {}
   try { return v ? JSON.parse(v) : null; } catch (e) { return null; }
 }
-function bnxKotFastPut_(cid, rid, map) {
+function bnxKotFastPut_(cid, rid, map, cacheOnly) {
   var k = bnxKotFastKey_(cid, rid), j = JSON.stringify(map);
   try { CacheService.getScriptCache().put(k, j, 21600); } catch (e) {}
-  try { PropertiesService.getScriptProperties().setProperty(k, j); } catch (e) {}
+  if (!cacheOnly) try { PropertiesService.getScriptProperties().setProperty(k, j); bnxKotFastPurge_(false); } catch (e) {}
 }
+/* 2026-11-16: the fast-KOT numbers were ALSO kept as one Script property per order and never removed. Script properties
+   hold ~500 KB in total for the WHOLE project (tokens, WhatsApp setup, archive ids…); at 3000 orders a day the store
+   fills in 1-2 days and every setProperty starts failing. Now the property is removed once the order is saved, and
+   anything older than 12 h is purged (checked at most every 10 min). Run RUN_KotFastPurge once now to clear the backlog. */
+function bnxKotFastDrop_(cid, rid) { try { PropertiesService.getScriptProperties().deleteProperty(bnxKotFastKey_(cid, rid)); } catch (e) {} }
+function bnxKotFastPurge_(force) {
+  try {
+    var C = CacheService.getScriptCache(); if (!force && C.get('kotfast_purge_at')) return 0; C.put('kotfast_purge_at', '1', 600);
+  } catch (e) {}
+  var P = PropertiesService.getScriptProperties(), all = P.getProperties(), cut = Date.now() - 12 * 3600000, n = 0;
+  Object.keys(all).forEach(function (k) {
+    if (k.indexOf('kotfast_') !== 0) return;
+    var at = 0; try { at = new Date(JSON.parse(all[k]).at).getTime() || 0; } catch (e) {}
+    if (force || !at || at < cut) { try { P.deleteProperty(k); n++; } catch (e) {} }
+  });
+  return n;
+}
+function RUN_KotFastPurge() { var n = bnxKotFastPurge_(true); Logger.log('Removed ' + n + ' old fast-KOT entries from Script properties.'); }
 /* SAVE_ORDER: copy the fast-start numbers onto the parts (the phone may have sent them already) */
 function bnxKotFastApply_(session, payload) {
   try {
     if (!payload || !payload.requestId || !Array.isArray(payload.mobileKotParts)) return;
-    var map = bnxKotFastGet_(session.CLIENT_ID, payload.requestId); if (!map || !map.numbers) return;
+    var cid = session.CLIENT_ID, ctr = bnxCounterLock_(cid), map;
+    /* 2026-11-16: when the phone gave up waiting for KOT_FAST_START (it may still be running), the save and the late fast
+       start must not BOTH reserve numbers (two different KOT numbers = two kitchen tickets). Under the counter lock the
+       save either takes the fast numbers or leaves a 'saving' mark that makes a late fast start step aside. */
+    if (ctr) ctr.enter(20000);
+    try {
+      map = bnxKotFastGet_(cid, payload.requestId);
+      if (!map || !map.numbers) { bnxKotFastPut_(cid, payload.requestId, { saving: true, at: new Date().toISOString() }, true); return; }
+    } finally { if (ctr) ctr.exit(); }
     payload.mobileKotParts.forEach(function (p) { if (p && !p.kotNumber && map.numbers[p.type]) p.kotNumber = map.numbers[p.type]; });
   } catch (e) {}
 }
@@ -18343,7 +18532,8 @@ function bnxKotFastStart_(session, payload) {
   if (!map) {
     /* the order is already saved (outbox retry) → its numbers came from SAVE_ORDER; reserve nothing */
     try { if (bnxSyncLogCacheGet_(cid, rid)) return { success: false, error: 'ORDER_ALREADY_SAVED', alreadySaved: true }; } catch (e) {}
-    var tl = bnxTenantLock_(), had = tl.hasLock(); if (!had) tl.waitLock(15000);
+    /* 2026-11-16 FAST PRINT: only the short counter lock — no longer waits 8-18 s behind other SAVE_ORDER / SAVE_BILL */
+    var ctr = bnxCounterLock_(cid); ctr.enter(20000);
     try {
       map = bnxKotFastGet_(cid, rid);
       if (!map) {
@@ -18352,8 +18542,9 @@ function bnxKotFastStart_(session, payload) {
         map = { numbers: nums, at: new Date().toISOString() };
         bnxKotFastPut_(cid, rid, map);
       }
-    } finally { if (!had) tl.releaseLock(); }
+    } finally { ctr.exit(); }
   }
+  if (map && map.saving) return { success: false, error: 'ORDER_BEING_SAVED', alreadySaved: true };   /* SAVE_ORDER got there first: it reserves + prints */
   var native = payload.mobilePrintRoute === 'NATIVE', online = false, queued = false;
   if (!native) {
     try { online = bnxPqOnline_(cid); } catch (e) { online = false; }
@@ -18430,3 +18621,106 @@ function RUN_FixCustomerIds() {
   try { bnxLiveGenBump_(cid); } catch (e) {}
   Logger.log((log.length ? log.join('\n') : 'Nothing to fix — every customer has its own ID.') + '\nOpen Customer Credit → total must be ₹43,03,565.');
 }
+
+/* 2026-11-16 RUN_LockWho — who keeps the restaurant lock busy. Watches it for 60 s (every 2 s) and lists every hold
+   longer than 5 s from the last 6 h: time · action · seconds. Changes nothing. Edit LOCKWHO_CID for another client. */
+var LOCKWHO_CID = 'CL00010';
+function RUN_LockWho() {
+  var c = CacheService.getScriptCache(), keys = ['bnxtl_v1_' + LOCKWHO_CID, 'bnxctr_v1_' + LOCKWHO_CID, 'bnxpql_v1_' + LOCKWHO_CID], L = [];
+  var names = { 0: 'SAVE lock', 1: 'COUNTER lock', 2: 'PRINT lock' };
+  L.push('═══ Holds longer than 5 s (latest first, last 6 h) ═══');
+  keys.forEach(function (k, i) { var ls = []; try { ls = JSON.parse(c.get('bnxtl_slow_' + k) || '[]'); } catch (e) {}
+    L.push(names[i] + ': ' + (ls.length ? '' : 'none'));
+    ls.forEach(function (x) { L.push('   ' + x[0] + '  ' + x[1] + '  ' + x[2] + ' s'); }); });
+  L.push('', '═══ Live, every 2 s for 60 s ═══');
+  for (var n = 0; n < 30; n++) {
+    var row = keys.map(function (k, i) { var v = c.get(k); if (!v) return names[i] + ': free'; var p = v.split('|'); return names[i] + ': ' + (p[1] || '?') + ' ' + (p[2] ? Math.round((Date.now() - Number(p[2])) / 1000) + ' s' : ''); });
+    L.push(Utilities.formatDate(new Date(), 'Asia/Kolkata', 'HH:mm:ss') + '  ' + row.join('  |  '));
+    Utilities.sleep(2000);
+  }
+  Logger.log('\n' + L.join('\n'));
+}
+
+/* 2026-11-16 RUN_SPEED_2_RemoveRowColourRules — speed check: reading ONE column of BILL_MASTER took 16.5 s.
+   Every tab of the TRANSACTION DB carries a conditional-format rule =MOD(ROW(),2)=0 over its whole data range
+   (BILL_ITEMS 2 million cells, ORDER_ITEMS 1.1 million, BILL_MASTER 0.7 million) plus a filter over the whole range.
+   Sheets re-evaluates that formula rule on every change, which slows every read and every save.
+   This removes ONLY rules whose formula is MOD(ROW(),2)=0 (the zebra colour) and the filter on each tab, for the
+   TRANSACTION and MASTER DB of each client below. No values, no other rules, no formats are touched.
+   Run once after service. Safe to run again. */
+var SPEED2_CLIENTS = ['CL00010', 'CL00011'];
+function RUN_SPEED_2_RemoveRowColourRules() {
+  var L = [];
+  SPEED2_CLIENTS.forEach(function (cid) {
+    var ids = {}; try { ids = bnxGetClientDbIds_(cid) || {}; } catch (e) {}
+    var P = PropertiesService.getScriptProperties();
+    var list = [['TRANSACTION', ids.TRANSACTION || P.getProperty('CRM_TRANSACTIONS_ID_' + cid) || P.getProperty('TRANSACTION_DB_ID_' + cid)], ['MASTER', ids.MASTER || P.getProperty('MASTER_DB_ID_' + cid)]];
+    list.forEach(function (d) {
+      if (!d[1]) { L.push(cid + ' ' + d[0] + ': id not found'); return; }
+      var ss; try { ss = SpreadsheetApp.openById(d[1]); } catch (e) { L.push(cid + ' ' + d[0] + ': cannot open ' + e.message); return; }
+      var rules = 0, filters = 0;
+      ss.getSheets().forEach(function (sh) {
+        try {
+          var cf = sh.getConditionalFormatRules(), keep = cf.filter(function (r) {
+            var b = r.getBooleanCondition(); if (!b) return true;
+            var v = (b.getCriteriaValues() || []).join(' ').replace(/\s+/g, '').toUpperCase();
+            return !/^=?MOD\(ROW\(\),2\)=[01]$/.test(v);
+          });
+          if (keep.length !== cf.length) { rules += cf.length - keep.length; sh.setConditionalFormatRules(keep); }
+          var f = sh.getFilter(); if (f) { f.remove(); filters++; }
+        } catch (e) { L.push('  ' + sh.getName() + ': ' + e.message); }
+      });
+      L.push(cid + ' ' + d[0] + ' (' + ss.getName() + '): removed ' + rules + ' zebra rules, ' + filters + ' filters on ' + ss.getSheets().length + ' tabs');
+    });
+  });
+  Logger.log('\n' + L.join('\n') + '\nNow run RUN_SPEED_1_Check again (after service) and compare "Read BILL_DATE column".');
+}
+
+/* 2026-11-16 RUN_DueTiming — WHY does GET_DUE_COLLECTION take 170-207 s (traffic report)? Times every step for one client.
+   Changes nothing. Send the whole log. */
+function RUN_DueTiming() {
+  var cid = 'CL00010', L = [], T = function (label, fn) { var t = Date.now(), r; try { r = fn(); } catch (e) { L.push('🔴 ' + label + ': ERROR ' + e.message); return null; } L.push(((Date.now() - t) > 5000 ? '🔴 ' : (Date.now() - t) > 1500 ? '🟡 ' : '🟢 ') + label + ': ' + (Date.now() - t) + ' ms'); return r; };
+  try { __bnxReqCid_ = cid; } catch (e) {}
+  L.push('Live function: ' + String(bnxGetDueCollection.__base || bnxGetDueCollection).slice(0, 160).replace(/\s+/g, ' '));
+  L.push('Live dues-bill helper: ' + String(bnxDueBillsByParty_).slice(0, 120).replace(/\s+/g, ' '));
+  var bm = T('Open BILL_MASTER', function () { return bnxClientSheet(cid, SHEETS.BILL_MASTER); });
+  if (bm) { var h = bm.getRange(1, 1, 1, bm.getLastColumn()).getValues()[0].map(String), c = h.indexOf('DUE_AMOUNT') + 1, n = bm.getLastRow() - 1;
+    T('BILL_MASTER DUE_AMOUNT column — 1st read', function () { return bm.getRange(2, c, n, 1).getValues().length; });
+    T('BILL_MASTER DUE_AMOUNT column — 2nd read (same run)', function () { return bm.getRange(2, c, n, 1).getValues().length; });
+    T('Due bills (10 columns, new reader)', function () { return bnxDueBillCols_(bm, cid).rows.length; }); }
+  T('CUSTOMER_DUES full read', function () { return bnxClientSheet(cid, SHEETS.CUSTOMER_DUES).getDataRange().getValues().length; });
+  T('CUSTOMER_MASTER full read (MASTER DB)', function () { return bnxClientSheet(cid, SHEETS.CUSTOMER_MASTER).getDataRange().getValues().length; });
+  T('DUES_RECEIPT full read', function () { return bnxClientSheet(cid, SHEETS.DUES_RECEIPT).getDataRange().getValues().length; });
+  var r = T('bnxGetDueCollection (whole, no cache)', function () { return (bnxGetDueCollection.__base || bnxGetDueCollection)({ CLIENT_ID: cid, USER_ID: 'TIMING' }, {}); });
+  if (r) L.push('   → success=' + r.success + ' customers=' + (r.data && r.data.customers ? r.data.customers.length : '-') + ' total=' + (r.data && r.data.totalOutstanding) + (r.error ? ' error=' + r.error : ''));
+  T('bnxGetDueCollection again (cache warm)', function () { return bnxGetDueCollection({ CLIENT_ID: cid, USER_ID: 'TIMING' }, {}); });
+  Logger.log('\n' + L.join('\n'));
+}
+
+/* 2026-11-16 DUES LIST: ONE computation at a time per restaurant. Traffic report: 8 GET_DUE_COLLECTION in 15 min, each
+   170-207 s, = 1.5 servers busy all the time — every page that shows dues (Customer Credit, Guest Net Dues, Receive,
+   DSR) asked again while the previous answer was still being worked out, and a screen that gave up re-asked.
+   Now: an answer is reused for 90 s (a new receipt or bill gives a new answer at once); while one request is working
+   it out, the others get the last answer (marked stale) instead of starting the same 3-minute job again. */
+(function () {
+  if (typeof bnxGetDueCollection !== 'function' || bnxGetDueCollection.__bnxSf) return;
+  var base = bnxGetDueCollection;
+  var f = function (session, payload) {
+    var p = payload || {}, cid = String(session && session.CLIENT_ID || '');
+    if (!cid || p.asOfDate || p.noCache) return base.apply(this, arguments);
+    var C = CacheService.getScriptCache(), rc = 0;
+    try { rc = bnxClientSheet(cid, SHEETS.DUES_RECEIPT).getLastRow(); } catch (e) {}
+    var per = [p.from || p.FROM_DATE || '', p.to || p.TO_DATE || '', p.range || '', p.date || p.businessDate || ''].join(',');
+    var key = 'duecoll_v2_' + cid + '_' + bnxBillGen_(cid) + '_' + rc + '_' + per.replace(/[^0-9A-Za-z,_-]/g, '');
+    var lastKey = 'duecoll_last_' + cid + '_' + per.replace(/[^0-9A-Za-z,_-]/g, ''), runKey = 'duecoll_run_' + cid;
+    var hit = bnxBigCacheGet_(key); if (hit) { try { return JSON.parse(hit); } catch (e) {} }
+    if (C.get(runKey)) { var last = bnxBigCacheGet_(lastKey); if (last) { try { var o = JSON.parse(last); o.stale = true; return o; } catch (e) {} } }
+    C.put(runKey, '1', 300);
+    try {
+      var r = base.apply(this, arguments);
+      if (r && r.success) { var txt = JSON.stringify(r); bnxBigCachePut_(key, txt, 90); bnxBigCachePut_(lastKey, txt, 21600); }
+      return r;
+    } finally { try { C.remove(runKey); } catch (e) {} }
+  };
+  f.__bnxSf = true; f.__base = base; bnxGetDueCollection = f;
+})();

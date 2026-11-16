@@ -80,6 +80,8 @@ function bnxMenuPromoRoute_(action, req) {
     case 'QR_PROMO_SAVE_EVENTS':   return bnxQrpSaveEvents_(req);
     case 'QR_PROMO_UPLOAD_INIT':   return bnxQrpUploadInit_(req);
     case 'QR_PROMO_UPLOAD_CHUNK':  return bnxQrpUploadChunk_(req);
+    case 'GUEST_SHORTS_GET':       return bnxShortsGet_(req);    /* 2026-11-16 Highlights / item videos / daily event videos */
+    case 'GUEST_SHORTS_SAVE':      return bnxShortsSave_(req);
     case 'GET_CLIENT_ASSETS':      /* logo / banner / UPI QR / item photos (BNX_ClientAssets.gs) */
     case 'SAVE_CLIENT_ASSETS':     return (typeof bnxCA_handle_ === 'function') ? bnxCA_handle_(String(action), req) : { success: false, error: 'BNX_ClientAssets.gs is not in this Apps Script project — add the file' };
     case 'SAVE_MENU_ITEM_IMAGE':   return bnxMiImage_(req);
@@ -527,7 +529,8 @@ function bnxQrpPublic_(clientId) {
   var ev = bnxQrpEvents_(clientId, true).map(function (e) { delete e.row; delete e.past; return e; });
   /* state: ON = own video plays · OFF = owner switched video off (nothing plays) · NONE = no video set → page plays the default */
   var state = v.active ? 'ON' : (v.videoUrl ? 'OFF' : 'NONE');
-  return { video: { videoUrl: v.active ? v.videoUrl : '', fileId: v.active ? v.fileId : '', name: v.name, active: v.active, state: state }, events: ev };
+  var sh = []; try { sh = bnxShortsPublic_(clientId); } catch (e) {}
+  return { video: { videoUrl: v.active ? v.videoUrl : '', fileId: v.active ? v.fileId : '', name: v.name, active: v.active, state: state }, events: ev, shorts: sh };
 }
 
 /* QR_PROMO_GET — admin: video + every event (incl. past / hidden) */
@@ -859,7 +862,8 @@ function doGet(e) {
     if (e && e.parameter && e.parameter['hub.mode'] === 'subscribe' && e.parameter['hub.challenge']) {
       var P0 = PropertiesService.getScriptProperties(), cid0 = String(e.parameter.clientId || '');
       var vt0 = String((cid0 && P0.getProperty('WA_VERIFY_TOKEN_' + cid0)) || P0.getProperty('WA_VERIFY_TOKEN') || '');
-      if (vt0 && String(e.parameter['hub.verify_token'] || '') === vt0) return ContentService.createTextOutput(String(e.parameter['hub.challenge']));
+      var hs0 = P0.getProperty('WA_HOOK_SECRET') || '', kok0 = !hs0 || String(e.parameter.k || '') === hs0;
+      if (vt0 && kok0 && String(e.parameter['hub.verify_token'] || '') === vt0) { try { P0.setProperty('WA_HOOK_VERIFIED', String(Date.now())); } catch (x0) {} return ContentService.createTextOutput(String(e.parameter['hub.challenge'])); }
       return ContentService.createTextOutput('Verify token mismatch');
     }
     if (e && e.parameter && e.parameter.action === 'PUBLIC_MENU') return bnxPublicMenuOut_(e.parameter.clientId);
@@ -897,7 +901,7 @@ function doGet(e) {
    file position. When this file IS last, the doPost wrapper below takes only the actions Code.gs has no handler for —
    PRINT_QUEUE_* / PRINTER_MASTER_* / DASH_FIN / KITCHEN_TDB / DSR_TDB / DSR_ITEM_GROUP / BILL_PAYMENTS / CLIENT_ASSETS /
    SAVE_MENU_ITEM_IMAGE stay with Code.gs (one print queue, one image save — before, two different queues could take KOTs). */
-var BNX_MP_ACTIONS = /^(QR_PROMO_[A-Z_]+|APPROVAL_[A-Z_]+|STEWARD_CONTROL_[A-Z]+|TALLY_SALES_DATA|TALLY_MARK_POSTED|TALLY_CFG_GET|TALLY_CFG_SAVE|CASHBOOK_DAYWISE|CASHBOOK_DAY_DETAIL|CASHBOOK_CFG_GET|CASHBOOK_CFG_SAVE|PETTY_META_SAVE|PETTY_META_GET|GUEST_CTL_GET|GUEST_CTL_SAVE|WA_SETUP_GET|WA_SETUP_SAVE|WA_TEST|DUES_LIST|POS_IMPORT|BAR_TDB|MENU_ITEM_ENSURE|SAVE_MENU_CARD_LINK|SAVE_MENU_CARD_UPLOAD|GET_MENU_CARDS|GET_ACTIVE_MENU_CARD|ACTIVATE_MENU_CARD|DELETE_MENU_CARD)$/;
+var BNX_MP_ACTIONS = /^(QR_PROMO_[A-Z_]+|GUEST_SHORTS_[A-Z]+|APPROVAL_[A-Z_]+|STEWARD_CONTROL_[A-Z]+|TALLY_SALES_DATA|TALLY_MARK_POSTED|TALLY_CFG_GET|TALLY_CFG_SAVE|CASHBOOK_DAYWISE|CASHBOOK_DAY_DETAIL|CASHBOOK_CFG_GET|CASHBOOK_CFG_SAVE|PETTY_META_SAVE|PETTY_META_GET|GUEST_CTL_GET|GUEST_CTL_SAVE|WA_SETUP_GET|WA_SETUP_SAVE|WA_TEST|DUES_LIST|POS_IMPORT|BAR_TDB|MENU_ITEM_ENSURE|SAVE_MENU_CARD_LINK|SAVE_MENU_CARD_UPLOAD|GET_MENU_CARDS|GET_ACTIVE_MENU_CARD|ACTIVATE_MENU_CARD|DELETE_MENU_CARD)$/;
 function bnxMpJson_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
 /* same rule the suite's session check uses: client id + a session token in the issued (UUID) shape */
 function bnxMpAuth_(req) {
@@ -2228,7 +2232,17 @@ function bnxBarTdb_(b) {
       tabs[t] = sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).getValues().filter(function (r) { return r.some(function (v) { return v !== '' && v !== null; }); })
         .map(function (r) { return r.map(function (v) { return Object.prototype.toString.call(v) === '[object Date]' ? Utilities.formatDate(v, tz, 'yyyy-MM-dd') : v; }); });
     });
-    return { success: true, data: { from: from, to: to, sales: rows, codemaster: cm, summary: S, byCategory: byCat, byDay: byDay, tabs: tabs, source: 'TRANSACTION_DB BILL_ITEMS (LIQUOR) + MASTER_DB BAR_ITEM_MASTER', build: 'GS-2026.10.09-v19' } };
+    /* 2026-11-16: Code Master from the store mapping (bar-costing.gs → BAR_B13_POS_ITEM_MAPPING, CM_ID layout):
+       store item = the real store bottle, bottle ml from the conversion, cost/ml from the purchase rate */
+    var cmSource = 'BAR_ITEM_MASTER';
+    try {
+      var b13 = ss.getSheetByName('BAR_B13_POS_ITEM_MAPPING');
+      if (b13 && b13.getLastRow() > 1 && String(b13.getRange(1, 1).getValue()) === 'CM_ID') {
+        var cmv = b13.getRange(2, 1, b13.getLastRow() - 1, Math.min(12, b13.getLastColumn())).getValues().filter(function (r) { return r[0] && r[2]; });
+        if (cmv.length) { cm = cmv; cmSource = 'BAR_STORE_MAPPING'; }
+      }
+    } catch (eCm) {}
+    return { success: true, data: { from: from, to: to, sales: rows, codemaster: cm, cmSource: cmSource, summary: S, byCategory: byCat, byDay: byDay, tabs: tabs, source: 'TRANSACTION_DB BILL_ITEMS (LIQUOR) + MASTER_DB BAR_ITEM_MASTER', build: 'GS-2026.11.16-v20' } };
   } catch (e) { return { success: false, error: String(e && e.message || e) }; }
 }
 
@@ -2406,4 +2420,77 @@ function bnxBillPays_(b) {
     try { var txt = JSON.stringify(out); if (txt.length < 95000) cache.put(ck, txt, 120); } catch (e) {}
     return { success: true, data: out };
   } catch (e) { return { success: false, error: String(e && e.message || e) }; }
+}
+
+/* ============================================================
+   GUEST SHORTS (2026-11-16, "item video client upload and image upload", "daily event upload video")
+   The restaurant uploads its own photos / short videos from Dashboard → Settings → Customer QR Promotion → Highlights.
+   Files go to the client's QR-promo Drive folder (same chunked upload as the welcome video, up to 100 MB). The list is one
+   JSON file in that folder. Each entry can be linked to a menu item (▶ on the item + "Add to order" in the viewer) and can
+   be shown every day, only on some weekdays (e.g. SAT for the Saturday DJ) or only between two dates (a one-day event).
+   The guest page gets today's list inside PUBLIC_MENU → promo.shorts.
+   ============================================================ */
+var SHORTS_MAX = 40, SHORTS_DAYS = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+function bnxShortsFile_(cid, create) {
+  var P = PropertiesService.getScriptProperties(), k = 'QRP_SHORTS_FILE_' + cid, id = P.getProperty(k);
+  if (id) { try { return DriveApp.getFileById(id); } catch (e) {} }
+  if (!create) return null;
+  var f = bnxQrpFolder_(cid).createFile('guest-shorts.json', JSON.stringify({ clientId: cid, items: [] }), 'application/json');
+  P.setProperty(k, f.getId()); return f;
+}
+function bnxShortsRead_(cid) {
+  var c = CacheService.getScriptCache(), hit = c.get('shorts_' + cid); if (hit) { try { return JSON.parse(hit); } catch (e) {} }
+  var f = bnxShortsFile_(cid, false), items = [];
+  if (f) { try { var d = JSON.parse(f.getBlob().getDataAsString('UTF-8')); if (d && d.clientId === cid && Array.isArray(d.items)) items = d.items; } catch (e) {} }
+  try { c.put('shorts_' + cid, JSON.stringify(items), 3600); } catch (e) {}
+  return items;
+}
+function bnxShortsClean_(x, i) {
+  x = x || {};
+  var type = x.type === 'image' ? 'image' : 'video', fid = String(x.fileId || '').trim(), src = String(x.src || '').trim(), pf = String(x.posterFileId || '').trim();
+  if (fid && !/^[A-Za-z0-9_-]{10,}$/.test(fid)) throw new Error('Bad file id in line ' + (i + 1));
+  if (!fid && !/^https:\/\/\S+$/i.test(src)) throw new Error('Line ' + (i + 1) + ': upload a file or give an https link');
+  var days = (Array.isArray(x.days) ? x.days : String(x.days || '').split(',')).map(function (d) { return String(d).trim().toUpperCase().slice(0, 3); }).filter(function (d) { return SHORTS_DAYS.indexOf(d) >= 0; });
+  var dt = function (v) { v = String(v || '').trim(); return /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : ''; };
+  return { id: String(x.id || Utilities.getUuid()).slice(0, 40), type: type, fileId: fid, src: fid ? '' : src, posterFileId: /^[A-Za-z0-9_-]{10,}$/.test(pf) ? pf : '',
+    title: String(x.title || '').replace(/[<>]/g, '').slice(0, 60), item: String(x.item || '').replace(/[<>]/g, '').slice(0, 80),
+    days: days, from: dt(x.from), to: dt(x.to), active: x.active !== false, place: x.place === 'item' ? 'item' : 'strip' };
+}
+function bnxShortsGet_(req) {
+  try { var cid = bnxMcCid_(req); return { success: true, data: { items: bnxShortsRead_(cid), today: bnxQrpBusinessDay_() } }; }
+  catch (e) { return { success: false, error: String(e && e.message || e) }; }
+}
+function bnxShortsSave_(req) {
+  try {
+    var cid = bnxMcCid_(req), list = Array.isArray(req.items) ? req.items : null;
+    if (!list) return { success: false, error: 'items required' };
+    if (list.length > SHORTS_MAX) return { success: false, error: 'Up to ' + SHORTS_MAX + ' items' };
+    var items = list.map(bnxShortsClean_);
+    var lock = bnxSoftLock_('shorts_' + cid);
+    try {
+      var f = bnxShortsFile_(cid, true); f.setContent(JSON.stringify({ clientId: cid, items: items, updatedAt: new Date().toISOString() }));
+      items.forEach(function (x) { [x.fileId, x.posterFileId].forEach(function (id) { if (id) { try { bnxMcShare_(DriveApp.getFileById(id)); } catch (e) {} } }); });
+      try { CacheService.getScriptCache().remove('shorts_' + cid); } catch (e) {}
+      bnxMcClearPublicCache_(cid);
+    } finally { try { lock.release(); } catch (e) {} }
+    return { success: true, data: { items: items } };
+  } catch (e) { return { success: false, error: String(e && e.message || e) }; }
+}
+/* today's list for the guest page: active, inside its dates, on its weekday */
+function bnxShortsPublic_(cid) {
+  var day = bnxQrpBusinessDay_(), wd = SHORTS_DAYS[new Date(day + 'T12:00:00Z').getUTCDay()];
+  return bnxShortsRead_(cid).filter(function (x) {
+    if (!x || x.active === false) return false;
+    if (x.from && day < x.from) return false; if (x.to && day > x.to) return false;
+    if (x.days && x.days.length && x.days.indexOf(wd) < 0) return false;
+    return true;
+  }).map(function (x) {
+    var o = { type: x.type, title: x.title, item: x.item, place: x.place };
+    if (x.fileId) {
+      if (x.type === 'image') o.src = 'https://lh3.googleusercontent.com/d/' + x.fileId + '=w1080';
+      else { o.src = 'https://drive.google.com/uc?export=download&id=' + x.fileId; o.drive = 'https://drive.google.com/file/d/' + x.fileId + '/preview'; }
+      o.poster = x.posterFileId ? 'https://lh3.googleusercontent.com/d/' + x.posterFileId + '=w600' : 'https://drive.google.com/thumbnail?id=' + x.fileId + '&sz=w600';
+    } else { o.src = x.src; }
+    return o;
+  });
 }
