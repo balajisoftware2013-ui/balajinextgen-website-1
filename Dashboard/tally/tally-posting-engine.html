@@ -142,10 +142,11 @@ select,input[type=text],input[type=number],input[type=date],input[type=url]{padd
     <div class="desc">Upload Excel (.xlsx/.xls), CSV, or PDF — bank statements, sales, purchase, payroll, expense, journal, or Tally-exported files. Type is auto-detected.</div>
     <div class="drop" id="dropzone" onclick="document.getElementById('fileInput').click()">
       <div style="font-size:34px;margin-bottom:8px;">📤</div>
-      <div><b>Click to browse</b> or drag & drop a file here</div>
+      <div><b>Click to browse</b> or drag & drop one or many files here</div>
+      <div class="tinytxt" style="margin-top:4px;">Any Excel layout works — title rows, merged / 2-line headers, Total &amp; Opening/Closing rows, split narration lines and odd date/₹ formats are auto-cleaned.</div>
       <div class="tinytxt" style="margin-top:6px;">.xlsx · .xls · .csv · .pdf — up to 50,000 rows</div>
     </div>
-    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv,.pdf">
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv,.pdf" multiple>
     <div id="fileInfo" class="small" style="margin-top:12px;"></div>
     <div class="row" style="margin-top:16px;">
       <button class="btn" id="btnAnalyze" disabled onclick="goStep('analyze')">Analyze File →</button>
@@ -1075,13 +1076,46 @@ const DEMO_LEDGERS = [
 // ==========================================================================
 function wireFileInput(){
   const dz = document.getElementById('dropzone'), fi = document.getElementById('fileInput');
-  fi.addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); });
+  fi.addEventListener('change', e => { if (e.target.files.length) handleFiles(e.target.files); e.target.value=''; });
   dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag'); });
   dz.addEventListener('dragleave', () => dz.classList.remove('drag'));
-  dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag'); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); });
+  dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag'); if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files); });
 }
 
+/* 2026-11-16 several files at once: each is read → auto-formatted → posted in turn (⚡ Auto on). If a file leaves rows to
+   review, the rest wait — "▶ Next file" continues after you fix / skip them. */
+async function handleFiles(list){
+  const files = Array.from(list||[]).filter(f => /\.(xlsx|xls|csv|pdf)$/i.test(f.name));
+  if (!files.length) { toast('Unsupported file type', 'err'); return; }
+  STATE.fileQueue = files.slice(1);
+  await handleFile(files[0]);
+  await bnxDrainFileQueue();
+}
+async function bnxDrainFileQueue(){
+  const auto = document.getElementById('autoFlowOn') && document.getElementById('autoFlowOn').checked;
+  while ((STATE.fileQueue||[]).length && auto && !STATE.autoHeld) await handleFile(STATE.fileQueue.shift());
+  bnxShowFileQueue();
+}
+function bnxShowFileQueue(){
+  const n = (STATE.fileQueue||[]).length, info = document.getElementById('sheetQueueInfo');
+  let fb = document.getElementById('bnxFileQ');
+  if (!n){ if (fb) fb.remove(); return; }
+  if (!fb){ fb = document.createElement('button'); fb.id = 'bnxFileQ'; fb.className = 'btn';
+    fb.style.cssText = 'position:fixed;right:18px;bottom:18px;z-index:9999;box-shadow:0 6px 20px rgba(0,0,0,.25);padding:10px 16px;';
+    fb.onclick = () => bnxNextFile(); document.body.appendChild(fb); }
+  fb.textContent = `▶ Next file (${n} waiting): ${STATE.fileQueue[0].name}`;
+  if (!info) return;
+  info.insertAdjacentHTML('beforeend', `<div style="margin-top:6px;">📂 ${n} more file(s) waiting: ${STATE.fileQueue.map(f=>'<b>'+escapeHtml(f.name)+'</b>').join(', ')} <button class="btn" style="padding:4px 10px;margin-left:6px;" onclick="bnxNextFile()">▶ Next file</button></div>`);
+}
+async function bnxNextFile(){
+  if (!(STATE.fileQueue||[]).length) return;
+  STATE.autoHeld = false; goStep('import');
+  const f = STATE.fileQueue.shift(); bnxShowFileQueue();
+  await handleFile(f);
+  await bnxDrainFileQueue();
+}
 async function handleFile(file){
+  STATE.autoHeld = false;
   STATE.file = file; STATE.docTypeManual = false; STATE.sheetQueue = []; STATE.forcedTemplate = null;
   STATE.ext = file.name.split('.').pop().toLowerCase();
   document.getElementById('importSpinner').textContent = '⏳ Reading file…';
@@ -1093,7 +1127,7 @@ async function handleFile(file){
     document.getElementById('importSpinner').textContent = `✓ Parsed ${STATE.rawRows.length} rows, ${STATE.headers.length} columns`;
     document.getElementById('btnAnalyze').disabled = STATE.rawRows.length === 0;
     if (STATE.rawRows.length === 0) toast('Could not detect any tabular rows in this file', 'err');
-    else if (document.getElementById('autoFlowOn') && document.getElementById('autoFlowOn').checked) runAutoFlow();
+    else if (document.getElementById('autoFlowOn') && document.getElementById('autoFlowOn').checked) await runAutoFlow();
   } catch(e){
     console.error(e);
     document.getElementById('importSpinner').textContent = '';
@@ -1101,37 +1135,174 @@ async function handleFile(file){
   }
 }
 
+/* ===================== 2026-11-16 AUTO-FORMAT: any Excel layout → clean header + rows =====================
+   Root causes fixed: (1) Excel date cells were read as their display text ("11/16/26", "16-Nov-26") and then mis-parsed
+   (US m/d swapped, or new Date() shifted a day back in IST) → now real dates are read from the cell serial;
+   (2) numbers were read as formatted text → raw values now; (3) only rows 1-15 were searched for the header and a
+   single keyword was enough → scored over 60 rows; (4) merged / 2-line headers, repeated page headers, Total /
+   Opening / Closing rows and wrapped narration lines were posted as rows → removed / joined;
+   (5) only the first sheet of a non-template workbook was read → every transaction sheet is queued. */
+const BNX_HDR_KW = ['date','invoice','inv no','bill','voucher','vch','amount','amt','debit','credit','dr','cr','customer','vendor','supplier','party','name','narration','description','particular','remarks','details','gst','gstin','hsn','sac','taxable','cgst','sgst','igst','qty','quantity','rate','item','product','employee','basic','hra','gross','net','balance','withdrawal','deposit','ledger','group','ref','cheque','chq','utr','mode','total','opening','received','paid','category','head','value'];
+const BNX_MON = {jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,sept:9,oct:10,nov:11,dec:12};
+function bnxIsoOk(y,m,d){ y=+y; m=+m; d=+d; if (y<100) y+=2000; if (!(y>1900&&y<2200&&m>=1&&m<=12&&d>=1&&d<=31)) return null;
+  const dt = new Date(Date.UTC(y,m-1,d)); if (dt.getUTCMonth()!==m-1) return null;
+  return `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`; }
+/* pref: 'DD/MM/YYYY' (Indian default) or 'MM/DD/YYYY'. serialOk: accept a bare Excel serial (only for the date column). */
+function bnxParseDateAny(v, pref, serialOk){
+  if (v===undefined||v===null) return null;
+  if (v instanceof Date) return isNaN(v) ? null : bnxIsoOk(v.getFullYear(), v.getMonth()+1, v.getDate());
+  let s = String(v).trim().replace(/ /g,' ');
+  if (!s) return null;
+  let m;
+  if ((m = s.match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?:[T\s].*)?$/))) return bnxIsoOk(m[1],m[2],m[3]);
+  if ((m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})(?:\s+\d{1,2}:\d{2}.*)?$/))){
+    let a=+m[1], b=+m[2];
+    if (a>12) return bnxIsoOk(m[3],b,a);
+    if (b>12) return bnxIsoOk(m[3],a,b);
+    return pref==='MM/DD/YYYY' ? bnxIsoOk(m[3],a,b) : bnxIsoOk(m[3],b,a);
+  }
+  if ((m = s.match(/^(\d{1,2})(?:st|nd|rd|th)?[\s\-\/.,]*([A-Za-z]{3,9})[\s\-\/.,']*(\d{2,4})(?:\s+\d{1,2}:\d{2}.*)?$/))){
+    const mo = BNX_MON[m[2].toLowerCase().slice(0, m[2].toLowerCase().startsWith('sept')?4:3)]; if (mo) return bnxIsoOk(m[3],mo,m[1]);
+  }
+  if ((m = s.match(/^([A-Za-z]{3,9})[\s\-\/.]+(\d{1,2})(?:st|nd|rd|th)?,?[\s\-\/.]+(\d{2,4})$/))){
+    const mo = BNX_MON[m[1].toLowerCase().slice(0,3)]; if (mo) return bnxIsoOk(m[3],mo,m[2]);
+  }
+  if ((m = s.match(/^(\d{4})(\d{2})(\d{2})$/))) { const r = bnxIsoOk(m[1],m[2],m[3]); if (r) return r; }
+  if (serialOk && /^\d{5}(\.\d+)?$/.test(s)) { const n=+s; if (n>25000 && n<80000 && typeof XLSX!=='undefined'){ const d=XLSX.SSF.parse_date_code(n); if (d) return bnxIsoOk(d.y,d.m,d.d); } }
+  return null;
+}
+function bnxIsNum(s){ s=String(s||'').trim(); if (!s) return false;
+  return /^[(\-−+]?\s*(?:rs\.?|inr|₹)?\s*[(\-−]?\d[\d,]*(?:\.\d+)?\)?\s*(?:cr|dr)?\.?$/i.test(s); }
+/* Read a sheet into a 2-D grid of strings: dates → dd/mm/yyyy from the serial, numbers → raw value, merged cells filled. */
+function bnxSheetGrid(ws){
+  if (!ws || !ws['!ref']) return [];
+  const rg = XLSX.utils.decode_range(ws['!ref']);
+  const maxR = Math.min(rg.e.r, rg.s.r + 60000), grid = [];
+  for (let R = rg.s.r; R <= maxR; R++){
+    const row = [];
+    for (let C = rg.s.c; C <= rg.e.c; C++){
+      const c = ws[XLSX.utils.encode_cell({r:R,c:C})];
+      let v = '';
+      if (c){
+        if (c.t === 'd' && c.v instanceof Date) { const iso = bnxParseDateAny(c.v); v = iso ? iso.split('-').reverse().join('/') : (c.w||''); }
+        else if (c.t === 'n' && c.z && typeof c.z==='string' && XLSX.SSF.is_date(c.z)) {
+          const d = XLSX.SSF.parse_date_code(c.v); v = d ? `${String(d.d).padStart(2,'0')}/${String(d.m).padStart(2,'0')}/${d.y}` : (c.w||String(c.v));
+        }
+        else if (c.t === 'n') v = (c.z==='@' || /^0{2,}$/.test(String(c.z||''))) ? (c.w||String(c.v)) : String(c.v);
+        else if (c.t === 'b') v = c.v ? 'TRUE' : 'FALSE';
+        else if (c.t === 'e') v = '';
+        else v = c.w !== undefined ? c.w : String(c.v===undefined?'':c.v);
+      }
+      row.push(String(v).replace(/ /g,' ').replace(/\s+/g,' ').trim());
+    }
+    grid.push(row);
+  }
+  (ws['!merges']||[]).forEach(mg => {
+    const top = grid[mg.s.r - rg.s.r]; if (!top) return;
+    const val = top[mg.s.c - rg.s.c]; if (!val) return;
+    for (let R = mg.s.r; R <= mg.e.r; R++) for (let C = mg.s.c; C <= mg.e.c; C++){
+      const row = grid[R - rg.s.r]; if (row && !row[C - rg.s.c]) row[C - rg.s.c] = val;
+    }
+  });
+  return grid;
+}
+const BNX_SKIP_ROW = /^(?:grand\s*total|sub[\s\-]*total|total\b|totals\b|opening\s*bal|closing\s*bal|balance\s*(?:b\/?f|c\/?f|brought|carried)|b\/f\b|c\/f\b|brought\s*forward|carried\s*forward|\*+\s*end|end of statement|page\s*\d+|statement summary|net total|summary\b)/i;
+/* grid → {headers, rows, dateShare} */
+function bnxNormalizeGrid(grid){
+  const g = grid.filter(r => r && r.some(c => c!==''));
+  if (!g.length) return {headers:[], rows:[], dateShare:0};
+  const kwHit = c => { const l=c.toLowerCase(); return BNX_HDR_KW.some(k => k.length<=3 ? new RegExp('(^|[^a-z])'+k.replace('.','\\.')+'([^a-z]|$)').test(l) : l.includes(k)); };
+  let best = -1, bestScore = -1e9; const cand = [];
+  for (let i=0;i<Math.min(g.length,60);i++){
+    const cells = g[i].filter(c=>c!=='');
+    if (cells.length < 2) continue;
+    const kw = cells.filter(kwHit).length, nums = cells.filter(bnxIsNum).length, dates = cells.filter(c=>bnxParseDateAny(c)).length;
+    const text = cells.length - nums - dates;
+    const score = kw*3 + text - (nums+dates)*3 + (kw>=2 ? 4 : 0);
+    if (kw>=1) cand.push([i,score]);
+    if (kw>=1 && score > bestScore) { bestScore = score; best = i; }
+  }
+  /* the FIRST strong header wins — later copies are page repeats */
+  if (best >= 0){ const f = cand.find(c => c[1] >= bestScore*0.7); if (f) best = f[0]; }
+  if (best < 0) best = Math.max(0, g.findIndex(r => r.filter(c=>c!=='' && !bnxIsNum(c) && !bnxParseDateAny(c)).length >= 2));
+  let headers = g[best].slice(), start = best + 1;
+  // 2-line header: the next row holds sub-headings (Debit/Credit, CGST/SGST, Rate/Amount …) and no data
+  const nx = g[best+1];
+  if (nx){
+    const cells = nx.filter(c=>c!=='');
+    const sub = cells.filter(c => /^(dr|cr|debit|credit|withdrawals?|deposits?|cgst|sgst|igst|cess|rate|amount|amt|qty|value|no\.?|date|%|in|out|receipts?|payments?)\b/i.test(c)).length;
+    if (cells.length>=2 && sub>=2 && !cells.some(c=>bnxIsNum(c)||bnxParseDateAny(c))){
+      headers = headers.map((h,i) => { const b = nx[i]||''; return b && b!==h ? (h ? h+' '+b : b) : h; });
+      start++;
+    }
+  }
+  const width = Math.max(...g.map(r=>r.length));
+  while (headers.length < width) headers.push('');
+  const body = g.slice(start);
+  const keep = headers.map((h,i) => h!=='' || body.some(r => (r[i]||'')!==''));
+  const seen = {};
+  const hdr = headers.map((h,i) => { let n = h || ('Col'+(i+1)); if (seen[n]) n = n+' '+(++seen[n]); else seen[n]=1; return n; });
+  const cols = hdr.map((h,i)=>i).filter(i=>keep[i]);
+  // date column = header says date (not "value date"/"due date" if a better one exists), else the column most often parsing as a date
+  const dateShareOf = i => { const vals = body.filter(r => !r.slice(0,4).some(c=>BNX_SKIP_ROW.test(c||''))).map(r=>r[i]||'').filter(v=>v && v.toLowerCase()!==hdr[i].toLowerCase()); return vals.length ? vals.filter(v=>bnxParseDateAny(v)).length/vals.length : 0; };
+  let dcol = cols.find(i => /date|dt\b/i.test(hdr[i]) && !/value|due|cheque|chq/i.test(hdr[i]) && dateShareOf(i)>0.5);
+  if (dcol===undefined) dcol = cols.find(i => /date|dt\b/i.test(hdr[i]) && dateShareOf(i)>0.5);
+  if (dcol===undefined){ let bs=0; cols.forEach(i=>{ const sh=dateShareOf(i); if (sh>bs && sh>=0.6){ bs=sh; dcol=i; } }); }
+  const hdrLower = hdr.map(h=>h.toLowerCase());
+  const rows = [];
+  let lastObj = null, dated = 0;
+  body.forEach(r => {
+    const cells = cols.map(i => r[i]||'');
+    const nonEmpty = cells.filter(c=>c!=='');
+    if (!nonEmpty.length) return;
+    // repeated header (multi-page exports)
+    if (cols.filter(i => (r[i]||'').toLowerCase()===hdrLower[i] && r[i]).length >= Math.max(2, Math.ceil(nonEmpty.length*0.6))) return;
+    // totals / opening / closing / page footers
+    if (cells.slice(0,4).some(c => BNX_SKIP_ROW.test(c)) || (nonEmpty.length<=3 && nonEmpty.some(c=>BNX_SKIP_ROW.test(c)))) return;
+    const hasDate = dcol!==undefined && bnxParseDateAny(r[dcol]||'');
+    const hasNum = cells.some(bnxIsNum);
+    // wrapped narration line: no date, no amount, text only → join to the row above
+    if (dcol!==undefined && !hasDate && !hasNum && lastObj){
+      cols.forEach(i => { const v = r[i]||''; if (v){ const k = hdr[i]; lastObj[k] = lastObj[k] ? lastObj[k]+' '+v : v; } });
+      return;
+    }
+    if (nonEmpty.length===1 && !hasNum && !hasDate) return; // section title like "April 2026"
+    if (dcol!==undefined && !hasDate && hasNum && nonEmpty.length<=2) return; // stray sub-total number
+    const obj = {}; cols.forEach(i => obj[hdr[i]] = r[i]||'');
+    rows.push(obj); lastObj = obj; if (hasDate) dated++;
+  });
+  return {headers: cols.map(i=>hdr[i]), rows, dateShare: rows.length ? dated/rows.length : 0};
+}
 function parseSpreadsheet(file){
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
-        const wb = XLSX.read(e.target.result, {type:'array', cellDates:true, dateNF:'dd/mm/yyyy'});
-        /* 2026-11-16: every sheet is read. Template sheets (exact header row / sheet name) are queued in order and posted one
-           after another; the Example / How-to-fill sheets are skipped. A plain file uses its first sheet as before. */
+        const isCsv = /\.csv$/i.test(file.name);
+        const wb = isCsv ? XLSX.read(new TextDecoder('utf-8').decode(new Uint8Array(e.target.result)), {type:'string', raw:true})
+                         : XLSX.read(e.target.result, {type:'array', cellDates:false, cellNF:true, cellText:true});
+        /* Template sheets (exact header row / sheet name) are queued in order; the Example / How-to-fill sheets are skipped.
+           A free-format workbook now queues EVERY sheet that holds dated transaction rows (not only the first). */
         const sheets = [];
         wb.SheetNames.forEach(name => {
           if (/^(example|how to fill)$/i.test(name.trim())) return;
-          const raw = XLSX.utils.sheet_to_json(wb.Sheets[name], {header:1, defval:'', raw:false, dateNF:'dd/mm/yyyy'});
-          const headerRowIdx = findHeaderRow(raw);
-          const headers = (raw[headerRowIdx]||[]).map(h => String(h||'').trim());
-          const rows = [];
-          for (let i = headerRowIdx+1; i < raw.length; i++){
-            const r = raw[i];
-            if (!r || r.every(c => String(c||'').trim()==='')) continue;
-            const obj = {};
-            headers.forEach((h,idx)=> obj[h||('Col'+(idx+1))] = r[idx]!==undefined? String(r[idx]).trim() : '');
-            rows.push(obj);
-          }
-          sheets.push({name, headers: headers.filter(h=>h), rows, tpl: templateKeyFor(name, headers)});
+          const ws = wb.Sheets[name];
+          if (wb.Workbook && wb.Workbook.Sheets){ const meta = wb.Workbook.Sheets.find(x=>x.name===name); if (meta && meta.Hidden) return; }
+          const n = bnxNormalizeGrid(bnxSheetGrid(ws));
+          sheets.push({name, headers: n.headers, rows: n.rows, dateShare: n.dateShare, tpl: templateKeyFor(name, n.headers)});
         });
         const tplSheets = sheets.filter(x => x.tpl && x.rows.length);
-        const chosen = tplSheets.length ? tplSheets : sheets.filter(x=>x.rows.length).slice(0,1);
+        let chosen = tplSheets;
+        if (!chosen.length){
+          chosen = sheets.filter(x => x.rows.length && x.dateShare >= 0.5);
+          if (!chosen.length) chosen = sheets.filter(x => x.rows.length && x.headers.some(h=>/ledger name/i.test(h)));
+          if (!chosen.length) chosen = sheets.filter(x=>x.rows.length).slice(0,1);
+        }
         STATE.sheetQueue = chosen.slice(1);
         const first = chosen[0] || sheets[0] || {headers:[], rows:[], tpl:null, name:''};
         loadSheetIntoState(first);
         const info = document.getElementById('sheetQueueInfo');
-        if (info) info.innerHTML = chosen.length>1 ? `📑 ${chosen.length} filled sheets found: ${chosen.map(x=>'<b>'+escapeHtml(x.name)+'</b> ('+x.rows.length+')').join(', ')} — posted one after another.` : (first.tpl ? `✅ Template recognised: <b>${escapeHtml(TEMPLATES[first.tpl].label)}</b>` : '');
+        if (info) info.innerHTML = chosen.length>1 ? `📑 ${chosen.length} sheets with entries: ${chosen.map(x=>'<b>'+escapeHtml(x.name)+'</b> ('+x.rows.length+')').join(', ')} — posted one after another.` : (first.tpl ? `✅ Template recognised: <b>${escapeHtml(TEMPLATES[first.tpl].label)}</b>` : (first.rows.length ? `🧹 Auto-formatted: header “${escapeHtml(first.headers.slice(0,6).join(' | '))}”, ${first.rows.length} entries` : ''));
         resolve();
       } catch(err){ reject(err); }
     };
@@ -1240,9 +1411,32 @@ function detectDocType(){
   let best = Object.entries(scores).sort((a,b)=>b[1]-a[1])[0];
   STATE.docType = best[1] > 0 ? best[0] : 'unknown';
   STATE.docTypeConfidence = Math.round(best[1]*100);
+  /* 2026-11-16 weak header match → decide from the file / sheet name and from what the columns contain */
+  if (!STATE.docTypeManual && best[1] < 0.3){
+    const inf = bnxInferDocType();
+    if (inf && inf.type !== STATE.docType){ STATE.docType = inf.type; STATE.docTypeConfidence = inf.conf; }
+  }
   detectBankFormat();
   detectColumnRoles();
   detectDateFormat();
+}
+function bnxHdrWord(re, skip){ return STATE.headers.find(h => re.test(h.toLowerCase()) && !(skip && skip.test(h.toLowerCase()))) || null; }
+function bnxInferDocType(){
+  const name = ((STATE.file && STATE.file.name) || '') + ' ' + (STATE.sheetName || '');
+  const H = STATE.headers.map(h=>h.toLowerCase()), hj = H.join(' | ');
+  const has = re => H.some(h => re.test(h));
+  const dr = has(/(^|[^a-z])(dr|debit|withdrawals?|paid out)([^a-z]|$)/), cr = has(/(^|[^a-z])(cr|credit|deposits?|paid in)([^a-z]|$)/);
+  const bal = has(/balance/), narr = has(/narration|description|particular|remarks|details/);
+  if (dr && cr && (bal || /bank|statement|passbook|stmt|a\/c|account/i.test(name))) return {type:'bank_statement', conf:80};
+  const hints = [[/bank|statement|passbook|stmt/i,'bank_statement'],[/sales?\b|invoice|billing|dsr/i,'sales'],[/purchase|bills? payable|grn|supplier/i,'purchase'],
+    [/receipt|collection|received/i,'receipt'],[/payment|paid/i,'payment'],[/expense|petty|exp\b/i,'expense'],[/salary|payroll|wages/i,'payroll'],
+    [/journal|jv\b/i,'journal'],[/contra|transfer/i,'contra'],[/ledger|master|parties|party list|customers? list/i,'ledger_master'],[/credit note|sales return/i,'credit_note'],[/debit note|purchase return/i,'debit_note']];
+  for (const [re,t] of hints) if (re.test(name)) return {type:t, conf:60};
+  if (dr && cr && narr) return {type:'bank_statement', conf:65};
+  if (has(/debit ledger|dr ledger/) && has(/credit ledger|cr ledger/)) return {type:'journal', conf:70};
+  if (has(/ledger name|account name/) && has(/group|under/)) return {type:'ledger_master', conf:70};
+  if (has(/expense|head|category/) && has(/amount|amt/)) return {type:'expense', conf:55};
+  return null;
 }
 function findHeader(patterns){
   return STATE.headers.find(h => patterns.some(p => h.toLowerCase().includes(p))) || null;
@@ -1351,6 +1545,20 @@ function detectColumnRoles(){
   r.state       = findHeader(['state']);
   r.mobile      = findHeader(['mobile','phone']);
   r.email       = findHeader(['email']);
+  /* 2026-11-16 fallbacks for free-format sheets */
+  if (!r.invoiceNo) r.invoiceNo = bnxHdrWord(/(^|[^a-z])(inv|invoice|bill|vch|voucher|doc|receipt|ref)\.?\s*(no|number|#|num)\b/);
+  if (!r.debit)  r.debit  = bnxHdrWord(/(^|[^a-z])(dr|dr amount|debit amount|paid out|payments?|out)([^a-z]|$)/, /ledger|note|date|days|card/);
+  if (!r.credit) r.credit = bnxHdrWord(/(^|[^a-z])(cr|cr amount|credit amount|paid in|receipts?|in)([^a-z]|$)/, /ledger|note|date|days|card|invoice|income tax/);
+  if (!r.party && STATE.docType !== 'bank_statement' && STATE.docType !== 'ledger_master')
+    r.party = bnxHdrWord(/(^|[^a-z])(name|party|client|account|a\/c|particulars?|buyer|seller|payee|paid to|received from)([^a-z]|$)/, /item|product|ledger|file|account no|a\/c no|bank|group|employee id/);
+  if (!r.total && !r.amountCol) r.total = bnxHdrWord(/amt|value|net|payable|receivable/, /taxable|tax amt|gst|date|no\b/);
+  if (!r.narration) r.narration = bnxHdrWord(/details|memo|note|comment|purpose|for\b/, /no\b|date/);
+  if (!r.date || !STATE.rawRows.slice(0,50).some(row => bnxParseDateAny(row[r.date], STATE.dateFormat, true))){
+    let bs = 0, bc = r.date;
+    STATE.headers.forEach(h => { const vals = STATE.rawRows.slice(0,100).map(x=>x[h]).filter(v=>v); if (!vals.length) return;
+      const sh = vals.filter(v=>bnxParseDateAny(v)).length/vals.length; if (sh > bs && sh >= 0.6) { bs = sh; bc = h; } });
+    r.date = bc;
+  }
   STATE.colRoles = r;
 }
 function detectDateFormat(){
@@ -1363,11 +1571,14 @@ function detectDateFormat(){
     if (m && parseInt(m[1])>12) ddGt12 = true;
     if (/^\d{4}-\d{2}-\d{2}/.test(v)) isoLike = true;
   });
-  STATE.dateFormat = isoLike ? 'YYYY-MM-DD' : 'DD/MM/YYYY';
+  /* a value like 11/16/2026 (second part > 12) with none like 16/11/2026 means the column is month-first */
+  let mdGt12 = false; STATE.rawRows.slice(0,200).forEach(row => { const m = String(row[dcol]||'').match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.]\d{2,4}/); if (m && +m[2]>12) mdGt12 = true; if (m && +m[1]>12) ddGt12 = true; });
+  STATE.dateFormat = isoLike ? 'YYYY-MM-DD' : (mdGt12 && !ddGt12 ? 'MM/DD/YYYY' : 'DD/MM/YYYY');
 }
 function parseAmt(v){
   if (v===undefined||v===null||v==='') return 0;
-  const s = String(v).trim();
+  let s = String(v).trim().replace(/[\u2212\u2013\u2014]/g,'-').replace(/\b(?:rs|inr)\b\.?|₹/gi,'').trim();
+  if (s==='-' || s==='--') return 0;
   // Accounting notation: amounts wrapped in parentheses, e.g. "(3,950)", mean negative
   // (credit notes / purchase returns) — common in ledger-style Excel/Sheets exports.
   const isParenNeg = /^\(.*\)$/.test(s);
@@ -1391,21 +1602,8 @@ function parseAmtWithSign(amtVal, drcrVal){
   return {amount: n, isCredit: isCredit === true};
 }
 function parseRowDate(v){
-  if (!v) return null;
-  const s = String(v).trim();
-  let m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/);
-  if (m){
-    let [_, a, b, y] = m;
-    if (y.length===2) y = '20'+y;
-    let dd,mm;
-    if (STATE.dateFormat==='DD/MM/YYYY' || parseInt(a)>12) { dd=a; mm=b; } else { dd=b; mm=a; }
-    return `${y}-${String(mm).padStart(2,'0')}-${String(dd).padStart(2,'0')}`;
-  }
-  m = s.match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})/);
-  if (m) return `${m[1]}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}`;
-  const d = new Date(s);
-  if (!isNaN(d)) return d.toISOString().slice(0,10);
-  return null;
+  /* 2026-11-16: no more new Date(text).toISOString() — it shifted dates one day back in IST and read 16-Nov as US */
+  return bnxParseDateAny(v, STATE.dateFormat, true);
 }
 function tallyDateFmt(iso){ return iso ? iso.replace(/-/g,'') : ''; }
 
@@ -1820,6 +2018,8 @@ function buildRecords(){
     } else {
       rec.amount = parseAmt(row[r.total] || row[r.debit] || row[r.credit]);
       rec.voucherType = 'Journal';
+      /* 2026-11-16 unknown layout: never auto-post a journal without ledgers — choose the document type on Analyze */
+      rec.errors.push('File type not recognised — pick the document type on the Analyze step (or use a template)');
     }
 
     if (!rec.date) rec.errors.push('Missing/unparseable date');
@@ -2282,9 +2482,9 @@ async function runAutoFlow(){
       const ready = STATE.records.filter(r=>r.status==='ready').length, hold = STATE.records.length - ready;
       const label = STATE.forcedTemplate ? TEMPLATES[STATE.forcedTemplate].label : STATE.docType;
       if (ready) { toast(`⚡ ${label}: posting ${ready} ready row(s)…`, 'ok'); await postRecords('valid'); }
-      const log = STATE.postingLog.filter(l=>l.importId===STATE.currentImportId);
+      const log = ready ? STATE.postingLog.filter(l=>l.importId===STATE.currentImportId) : [];
       summary.push(`${label}: ${log.filter(l=>l.status==='POSTED').length} posted` + (log.filter(l=>l.status==='FAILED').length?`, ${log.filter(l=>l.status==='FAILED').length} failed`:'') + (hold?`, ${hold} to review`:''));
-      if (hold && !(STATE.sheetQueue||[]).length) { goStep('preview'); switchPreviewTab(STATE.records.some(r=>r.status==='error')?'error':'needs_review'); break; }
+      if (hold && !(STATE.sheetQueue||[]).length) { STATE.autoHeld = true; goStep('preview'); switchPreviewTab(STATE.records.some(r=>r.status==='error')?'error':'needs_review'); break; }
       if (!(STATE.sheetQueue||[]).length) break;
       loadSheetIntoState(STATE.sheetQueue.shift()); STATE.docTypeManual = false;
     }
