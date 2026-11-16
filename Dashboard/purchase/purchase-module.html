@@ -1520,6 +1520,8 @@ async function erpApi(action, payload){
   }
   /* 2026-11-16: primary = the updated ERP deployment (has the new purchase / GRN / store-register actions); if it
      answers "unknown action" or cannot be reached, the same call is retried once on the older deployment. */
+  window.__bnxNoAction=window.__bnxNoAction||{};
+  if(window.__bnxNoAction[action]) return { success:false, message:'Unknown action: '+action+' (not on the server — skipped)' };
   var urls=[BNX_API_PRIMARY_URL, PURCHASE_GAS_URL].filter(function(u,i,a){ return u && a.indexOf(u)===i; });
   for(var ui=0; ui<urls.length; ui++){
   try{
@@ -1538,7 +1540,9 @@ async function erpApi(action, payload){
       result.success=false;
       result.message=result.message||('Server request failed (HTTP '+r.status+').');
     }
-    if(ui<urls.length-1 && result && result.success===false && /unknown action|unknown_action|not (supported|registered|found)|invalid action|no handler|unsupported/i.test(String(result.message||result.error||''))) continue;
+    var unk = result && result.success===false && /unknown action|unknown_action|not (supported|registered|found)|invalid action|no handler|unsupported/i.test(String(result.message||result.error||''));
+    if(ui<urls.length-1 && unk) continue;
+    if(unk) window.__bnxNoAction[action]=1;
     return result;
   }catch(e){
     if(ui<urls.length-1) continue;
@@ -6537,7 +6541,7 @@ function rendDash(){
     // too instead of silently appearing as two ordinary-looking rows.
     const {pinvDupGroupSize:dashDupGroupSize}=_pinvComputeDupGroups();
     const recent=[...DB.purchases.map(p=>({...p,_mode:'inventory'})),...DB.acctInvs.map(p=>({...p,_mode:'accounting'}))]
-      .sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).slice(0,6);
+      .sort((a,b)=>String(b.date||'').localeCompare(String(a.date||''))||(new Date(b.createdAt)-new Date(a.createdAt))).slice(0,6);   /* newest bill date first (imported rows share one createdAt) */
     if(!recent.length){recEl.innerHTML='<div style="text-align:center;padding:24px;color:var(--text3);font-style:italic">No purchases yet.</div>';}
     // FIX ("recent purchase table alienment fix" / "all formatting
     // problem" — Aug 2026): the NOT SYNCED/syncing/Duplicate badges used
@@ -8331,6 +8335,7 @@ function confirmSmartImport(asDraft){
       (GET_GRN_REGISTER, one row per item like the GRN page); GRNs entered on this device but not yet on the server stay. */
 (function(){
   'use strict';
+  try{ var cs=document.createElement('style'); cs.textContent='#d-total{font-size:clamp(14px,1.35vw,20px)!important;white-space:nowrap;letter-spacing:-.02em}'; document.head.appendChild(cs); }catch(e){}
   var W=window, lastInv=0, lastGrn=0, busy=false;
   function ready(){ return typeof erpApi==='function' && typeof CLIENT_ID!=='undefined' && !!CLIENT_ID; }
   async function loadGrns(force){
@@ -8350,6 +8355,8 @@ function confirmSmartImport(asDraft){
     if(!ready() || (!force && Date.now()-lastInv<60000)) return;
     lastInv=Date.now();
     try{ if(typeof refreshPurchaseInvoicesFromServer==='function') await refreshPurchaseInvoicesFromServer({silent:true}); }catch(e){}
+    /* imported invoices ARE the GRN register lines — show their GRN no. in the register's GRN No column */
+    try{ var ch=0; (DB.purchases||[]).forEach(function(p){ if(p && !p.grnRef && /^GRN\//.test(String(p.no||''))){ p.grnRef=p.no; ch++; } }); if(ch){ try{ rendRegs(); }catch(e){} } }catch(e){}
     /* every supplier on a loaded invoice must exist in the vendor list (Vendor Ledger, supplier filters, Payment Advice) —
        vendors only arrived through ERP_LOAD_ALL, which this server does not always answer */
     try{
@@ -8401,138 +8408,228 @@ function confirmSmartImport(asDraft){
 </script>
 
 <script id="bnx-store-registers-20261116">
-/* ═══ 📑 STORE REGISTERS (2026-11-16) — GRN Register · Issue Register · Stock Ledger Summary, same layout as the store
-   software's reports, read live from the ERP sheets (server action STORE_REGISTERS). Excel download per report or
-   all three in one workbook. Works in purchase-module.html and inventory.html (both have erpApi + XLSX). */
+/* ═══ 📑 STORE REPORTS — TALLY-STYLE VIEWER (2026-11-16) ═══
+   Stock Summary → stock group → item → Stock Item Vouchers (ledger) → voucher.
+   Purchase Register → month → purchase vouchers → voucher.      Issue Register → department → issue slips → slip.
+   Click / Enter = drill down · Esc / Backspace = back · ↑ ↓ = move · every screen exports to Excel.
+   Data: STORE_REGISTERS (GRN · issues · stock) and STORE_ITEM_LEDGER, live from the ERP sheets. */
 (function(){
   'use strict';
   var W=window, D=document;
   function api(a,p){ return (typeof erpApi==='function') ? erpApi(a,p||{}) : Promise.resolve({success:false,message:'Not logged in'}); }
   function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
-  function dmy(iso){ var m=String(iso||'').match(/^(\d{4})-(\d{2})-(\d{2})/); return m?m[3]+'/'+m[2]+'/'+m[1]:String(iso||''); }
-  function inr(n){ return (Number(n)||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+  function dmy(iso){ var m=String(iso||'').match(/^(\d{4})-(\d{2})-(\d{2})/); return m?m[3]+'-'+m[2]+'-'+m[1]:String(iso||''); }
+  function money(n){ n=Number(n)||0; return n?n.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}):''; }
+  function qty(n,u){ n=Number(n)||0; if(!n) return ''; return (Math.round(n*1000)/1000).toLocaleString('en-IN')+(u?' '+u:''); }
   function today(){ return new Date(Date.now()+5.5*3600e3).toISOString().slice(0,10); }
   function fyStart(t){ return (t.slice(5)>='04-01'?t.slice(0,4):String(+t.slice(0,4)-1))+'-04-01'; }
-  var css='#bnxSR{position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:99990;display:none;align-items:center;justify-content:center;font-family:inherit}'
-    +'#bnxSR .bx{background:#fff;border-radius:14px;width:min(560px,94vw);padding:18px 18px 14px;box-shadow:0 20px 60px rgba(0,0,0,.25)}'
-    +'#bnxSR h3{margin:0 0 4px;font-size:16px}#bnxSR .sub{font-size:11.5px;color:#64748b;margin-bottom:12px}'
-    +'#bnxSR .row{display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:10px}#bnxSR label{font-size:11px;font-weight:700;color:#475569;display:flex;flex-direction:column;gap:3px}'
-    +'#bnxSR input{padding:7px 9px;border:1px solid #cbd5e1;border-radius:8px;font-size:13px}'
-    +'#bnxSR button{padding:8px 12px;border-radius:8px;border:1px solid #e2e8f0;background:#f8fafc;font-weight:700;font-size:12.5px;cursor:pointer}'
-    +'#bnxSR button.p{background:#ea580c;color:#fff;border-color:#ea580c}#bnxSR .st{font-size:12px;margin-top:8px;line-height:1.55;color:#334155;min-height:18px}'
-    +'#bnxSR table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}#bnxSR td{padding:4px 6px;border-bottom:1px solid #f1f5f9}#bnxSR td.r{text-align:right;font-variant-numeric:tabular-nums}';
+  var MONTHS=['January','February','March','April','May','June','July','August','September','October','November','December'];
+
+  var css='#bnxTV{position:fixed;inset:0;z-index:99990;background:#f8f5ef;display:none;flex-direction:column;font:13px/1.35 "Segoe UI",system-ui,sans-serif;color:#1f2937}'
+   +'#bnxTV .hd{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 14px;background:#1e3a5f;color:#fff}'
+   +'#bnxTV .hd b{font-size:14px}#bnxTV .hd .co{opacity:.85;font-size:12px}#bnxTV .hd .sp{flex:1}'
+   +'#bnxTV .hd input{padding:4px 6px;border-radius:5px;border:0;font-size:12px}#bnxTV .hd button{padding:5px 10px;border-radius:6px;border:1px solid rgba(255,255,255,.35);background:transparent;color:#fff;font-weight:600;cursor:pointer;font-size:12px}'
+   +'#bnxTV .hd button.on{background:#f59e0b;border-color:#f59e0b;color:#111}#bnxTV .hd button.x{background:#dc2626;border-color:#dc2626}'
+   +'#bnxTV .bc{padding:7px 14px;background:#e8eef6;border-bottom:1px solid #cbd5e1;font-size:12.5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}'
+   +'#bnxTV .bc a{color:#1e3a5f;font-weight:700;cursor:pointer;text-decoration:underline}#bnxTV .bc .tt{font-weight:800;font-size:14px;margin-right:8px}'
+   +'#bnxTV .bc input{margin-left:auto;padding:5px 8px;border:1px solid #cbd5e1;border-radius:6px;min-width:220px}'
+   +'#bnxTV .bd{flex:1;overflow:auto;padding:0 14px 10px}#bnxTV table{width:100%;border-collapse:collapse;background:#fff;margin-top:8px}'
+   +'#bnxTV th{position:sticky;top:0;background:#fdf6e3;border-bottom:2px solid #1e3a5f;padding:6px 8px;text-align:left;font-size:11.5px;text-transform:uppercase;letter-spacing:.02em;z-index:1}'
+   +'#bnxTV th.r,#bnxTV td.r{text-align:right;font-variant-numeric:tabular-nums}#bnxTV td{padding:5px 8px;border-bottom:1px solid #eef0f3;white-space:nowrap}'
+   +'#bnxTV td.w{white-space:normal;min-width:240px}#bnxTV tr.go{cursor:pointer}#bnxTV tr.go:hover td{background:#fff7e6}#bnxTV tr.sel td{background:#fde68a!important}'
+   +'#bnxTV tr.grp td{font-weight:700}#bnxTV tr.tot td{font-weight:800;border-top:2px solid #1e3a5f;background:#f1f5f9}#bnxTV tr.op td{font-style:italic;color:#475569}'
+   +'#bnxTV .ft{padding:6px 14px;background:#1e3a5f;color:#cbd5e1;font-size:11.5px;display:flex;gap:18px;flex-wrap:wrap}#bnxTV .ft b{color:#fff}'
+   +'#bnxTV .msg{padding:40px;text-align:center;color:#64748b}#bnxTV .vh{background:#fff;margin-top:10px;padding:12px 14px;border:1px solid #e5e7eb;border-radius:8px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}'
+   +'#bnxTV .vh div{font-size:12px;color:#64748b}#bnxTV .vh div b{display:block;color:#111827;font-size:13.5px}';
+  var st={from:'',to:'',data:null,loading:false,stack:[],sel:0,rows:[],q:''};
+
   function ui(){
-    if(D.getElementById('bnxSR')) return D.getElementById('bnxSR');
-    var st=D.createElement('style'); st.textContent=css; D.head.appendChild(st);
-    var o=D.createElement('div'); o.id='bnxSR';
-    o.innerHTML='<div class="bx"><h3>📑 Store Registers</h3><div class="sub">GRN Register · Issue Register · Stock Ledger Summary — live from the ERP, same layout as the store software. Excel download.</div>'
-      +'<div class="row"><label>FROM<input type="date" id="bnxSRf"></label><label>TO<input type="date" id="bnxSRt"></label>'
-      +'<button type="button" data-q="fy">This FY</button><button type="button" data-q="m">This month</button><button type="button" data-q="pm">Last month</button></div>'
-      +'<div class="row"><button type="button" class="p" data-x="GRN">⬇ GRN Register</button><button type="button" class="p" data-x="ISSUE">⬇ Issue Register</button>'
-      +'<button type="button" class="p" data-x="STOCK">⬇ Stock Ledger Summary</button><button type="button" data-x="ALL">⬇ All 3 (one Excel)</button></div>'
-      +'<div class="st" id="bnxSRs"></div><div style="text-align:right;margin-top:8px"><button type="button" id="bnxSRc">Close</button></div></div>';
+    var o=D.getElementById('bnxTV'); if(o) return o;
+    var s=D.createElement('style'); s.textContent=css; D.head.appendChild(s);
+    o=D.createElement('div'); o.id='bnxTV';
+    o.innerHTML='<div class="hd"><b>📑 Store Reports</b><span class="co" id="tvCo"></span><span class="sp"></span>'
+      +'<button data-r="stock">Stock Summary</button><button data-r="pur">Purchase Register</button><button data-r="iss">Issue Register</button>'
+      +'<span>From <input type="date" id="tvF"> To <input type="date" id="tvT"></span><button data-q="fy">FY</button><button data-q="m">Month</button>'
+      +'<button data-x="view">⬇ Excel (this view)</button><button data-x="all">⬇ All 3 registers</button><button class="x" data-c="1">✕ Close</button></div>'
+      +'<div class="bc" id="tvBc"></div><div class="bd" id="tvBd"></div>'
+      +'<div class="ft"><span><b>Click / Enter</b> open</span><span><b>Esc / Backspace</b> back</span><span><b>↑ ↓</b> move</span><span id="tvInfo"></span></div>';
     D.body.appendChild(o);
-    var t=today(); D.getElementById('bnxSRf').value=fyStart(t); D.getElementById('bnxSRt').value=t;
+    var t=today(); D.getElementById('tvF').value=fyStart(t); D.getElementById('tvT').value=t;
     o.addEventListener('click',function(e){
-      if(e.target===o||e.target.id==='bnxSRc'){ o.style.display='none'; return; }
-      var q=e.target.getAttribute&&e.target.getAttribute('data-q'), x=e.target.getAttribute&&e.target.getAttribute('data-x');
-      if(q){ var td=today(), f=D.getElementById('bnxSRf'), tt=D.getElementById('bnxSRt');
-        if(q==='fy'){ f.value=fyStart(td); tt.value=td; }
-        if(q==='m'){ f.value=td.slice(0,8)+'01'; tt.value=td; }
-        if(q==='pm'){ var d=new Date(td.slice(0,8)+'01T00:00:00Z'); d.setUTCDate(0); tt.value=d.toISOString().slice(0,10); f.value=tt.value.slice(0,8)+'01'; } }
-      if(x) run(x, e.target);
+      var b=e.target.closest('button,a,tr.go'); if(!b) return;
+      if(b.dataset.c){ close(); return; }
+      if(b.dataset.r){ reset(b.dataset.r); return; }
+      if(b.dataset.q){ var td=today(); D.getElementById('tvF').value=b.dataset.q==='fy'?fyStart(td):td.slice(0,8)+'01'; D.getElementById('tvT').value=td; reload(); return; }
+      if(b.dataset.x){ b.dataset.x==='all'?downloadAll(b):exportView(); return; }
+      if(b.dataset.bc!==undefined){ st.stack=st.stack.slice(0,+b.dataset.bc+1); st.sel=0; render(); return; }
+      if(b.classList.contains('go')){ st.sel=+b.dataset.i; open(st.rows[st.sel]); }
+    });
+    ['tvF','tvT'].forEach(function(id){ D.getElementById(id).addEventListener('change',reload); });
+    D.addEventListener('keydown',function(e){
+      if(o.style.display!=='flex') return;
+      var typing=/INPUT|SELECT|TEXTAREA/.test((e.target&&e.target.tagName)||'');
+      if(e.key==='Escape'){ e.preventDefault(); back(); return; }
+      if(typing) return;
+      if(e.key==='Backspace'){ e.preventDefault(); back(); }
+      else if(e.key==='ArrowDown'||e.key==='ArrowUp'){ e.preventDefault(); var n=st.rows.length; if(!n) return; st.sel=Math.max(0,Math.min(n-1,st.sel+(e.key==='ArrowDown'?1:-1))); paintSel(true); }
+      else if(e.key==='Enter'){ e.preventDefault(); if(st.rows[st.sel]) open(st.rows[st.sel]); }
     });
     return o;
   }
-  W.bnxOpenStoreRegisters=function(){ ui().style.display='flex'; };
-  function stat(h){ var s=D.getElementById('bnxSRs'); if(s) s.innerHTML=h; }
+  function close(){ var o=D.getElementById('bnxTV'); if(o) o.style.display='none'; }
+  function back(){ if(st.stack.length>1){ st.stack.pop(); st.sel=st.stack[st.stack.length-1].sel||0; render(); } else close(); }
+  function top(){ return st.stack[st.stack.length-1]; }
+  function reset(r){ st.stack=[{v:r==='pur'?'purMonths':r==='iss'?'issDepts':'stockGroups',t:r==='pur'?'Purchase Register':r==='iss'?'Issue Register':'Stock Summary'}]; st.sel=0;
+    D.querySelectorAll('#bnxTV .hd button[data-r]').forEach(function(b){ b.classList.toggle('on',b.dataset.r===r); }); render(); }
+  W.bnxOpenStoreRegisters=function(which){ ui().style.display='flex'; if(!st.data) reload(which||'stock'); else reset(which||'stock'); };
 
-  async function run(type, btn){
-    var f=D.getElementById('bnxSRf').value, t=D.getElementById('bnxSRt').value;
-    if(!f||!t||f>t) return stat('⚠️ Choose a valid From / To date.');
-    if(typeof XLSX==='undefined') return stat('⚠️ Excel library not loaded — refresh the page.');
-    var old=btn.textContent; btn.disabled=true; btn.textContent='⏳ Reading…'; stat('Reading '+dmy(f)+' → '+dmy(t)+' from the ERP…');
-    try{
-      var r=await api('STORE_REGISTERS',{type:type,from:f,to:t});
-      if(!r||!r.success) throw new Error((r&&(r.message||r.error))||'server did not answer — deploy store-registers.gs + the router line');
-      var d=r.data, wb=XLSX.utils.book_new(), sum=[];
-      if(d.grn){ XLSX.utils.book_append_sheet(wb, grnSheet(d), 'GRN Register'); sum.push(['GRN Register', d.grn.length+' GRN', d.grn.reduce(function(a,g){return a+g.total;},0)]); }
-      if(d.issue){ XLSX.utils.book_append_sheet(wb, issueSheet(d), 'Issue Register'); sum.push(['Issue Register', d.issue.length+' issue slips', d.issue.reduce(function(a,x){return a+x.lines.reduce(function(b,l){return b+l.amt;},0);},0)]); }
-      if(d.stock){ XLSX.utils.book_append_sheet(wb, stockSheet(d), 'Stock Ledger Summary'); sum.push(['Stock — closing value', d.stock.length+' items', d.stock.reduce(function(a,x){return a+x.clV;},0)]); }
-      var name={GRN:'GRN_Register',ISSUE:'Issue_Register',STOCK:'Stock_Ledger_Summary',ALL:'Store_Registers'}[type]+'_'+dmy(f).replace(/\//g,'-')+'_to_'+dmy(t).replace(/\//g,'-')+'.xlsx';
-      XLSX.writeFile(wb, name);
-      stat('✅ Downloaded <b>'+esc(name)+'</b><table>'+sum.map(function(s){ return '<tr><td>'+esc(s[0])+'</td><td>'+esc(s[1])+'</td><td class="r">₹'+inr(s[2])+'</td></tr>'; }).join('')+'</table>');
-    }catch(e){ stat('⛔ '+esc(e.message||e)); }
-    finally{ btn.disabled=false; btn.textContent=old; }
+  async function reload(which){
+    st.from=D.getElementById('tvF').value; st.to=D.getElementById('tvT').value;
+    if(!st.from||!st.to||st.from>st.to){ body('<div class="msg">Choose a valid From / To date.</div>'); return; }
+    st.loading=true; body('<div class="msg">⏳ Reading the ERP for '+dmy(st.from)+' to '+dmy(st.to)+'…</div>');
+    var r=await api('STORE_REGISTERS',{type:'ALL',from:st.from,to:st.to}); st.loading=false;
+    if(!r||!r.success){ body('<div class="msg">⛔ '+esc((r&&(r.message||r.error))||'server did not answer')+'<br><br>Deploy the latest Code.gs + store-registers.gs as a New version.</div>'); return; }
+    st.data=r.data; D.getElementById('tvCo').textContent=(r.data.company&&r.data.company.name)||'';
+    var cur=typeof which==='string'?which:(top()&&top().v.indexOf('pur')===0?'pur':top()&&top().v.indexOf('iss')===0?'iss':'stock');
+    reset(cur);
   }
-  function head(d,title,ncol){
-    var c=d.company||{}, pad=function(a){ while(a.length<ncol) a.push(''); return a; };
-    return [pad([c.name||'']),pad([c.address||'']),pad([title]),pad(['For The Period of '+dmy(d.from)+' To '+dmy(d.to)]),pad(['','','','','','','Amount in INR'].slice(0,ncol))];
+  function body(h){ D.getElementById('tvBd').innerHTML=h; }
+  function crumbs(){
+    var bc=st.stack.map(function(s,i){ return i<st.stack.length-1?'<a data-bc="'+i+'">'+esc(s.t)+'</a> ›':'<span class="tt">'+esc(s.t)+'</span>'; }).join(' ');
+    D.getElementById('tvBc').innerHTML=bc+'<span style="color:#64748b">'+dmy(st.from)+' to '+dmy(st.to)+'</span><input id="tvQ" placeholder="🔍 Filter this list…" value="'+esc(st.q)+'">';
+    var q=D.getElementById('tvQ'); q.oninput=function(){ st.q=q.value; st.sel=0; draw(); };
   }
-  function finish(aoa, widths, money){
-    var ws=XLSX.utils.aoa_to_sheet(aoa); ws['!cols']=widths.map(function(w){return {wch:w};});
-    var rg=XLSX.utils.decode_range(ws['!ref']);
-    for(var R=0;R<=rg.e.r;R++) money.forEach(function(C){ var a=XLSX.utils.encode_cell({r:R,c:C}), cell=ws[a]; if(cell&&cell.t==='n') cell.z='#,##0.00'; });
-    return ws;
+  function open(row){ if(!row||!row.go) return; top().sel=st.sel; st.q=''; st.stack.push(row.go); st.sel=0; render(); }
+  function render(){ if(!st.data) return; crumbs(); draw(); }
+  function paintSel(scroll){ D.querySelectorAll('#tvBd tr.go').forEach(function(tr){ var on=+tr.dataset.i===st.sel; tr.classList.toggle('sel',on); if(on&&scroll) tr.scrollIntoView({block:'nearest'}); }); }
+  function info(t){ D.getElementById('tvInfo').innerHTML=t||''; }
+
+  /* table helper: cols=[{h,k,r,w,f}] rows=[{...,go,cls}] */
+  function table(cols,rows,tot){
+    var q=st.q.trim().toUpperCase(), list=q?rows.filter(function(r){ return JSON.stringify(r.cells||r).toUpperCase().indexOf(q)>=0; }):rows;
+    st.rows=list;
+    var h='<table id="tvTbl"><thead><tr>'+cols.map(function(c){ return '<th class="'+(c.r?'r':'')+'">'+esc(c.h)+'</th>'; }).join('')+'</tr></thead><tbody>';
+    h+=list.map(function(r,i){ return '<tr class="'+(r.go?'go ':'')+(r.cls||'')+'" data-i="'+i+'">'+cols.map(function(c){ var v=c.f?c.f(r):r[c.k]; return '<td class="'+(c.r?'r ':'')+(c.w?'w':'')+'">'+(c.html?v:esc(v))+'</td>'; }).join('')+'</tr>'; }).join('');
+    if(tot) h+='<tr class="tot">'+cols.map(function(c){ var v=c.f?c.f(tot):tot[c.k]; return '<td class="'+(c.r?'r':'')+'">'+esc(v==null?'':v)+'</td>'; }).join('')+'</tr>';
+    body(h+'</tbody></table>'+(list.length?'':'<div class="msg">Nothing in this period.</div>')); paintSel(false);
   }
-  function catSummary(lines, qty){
-    var m={}; lines.forEach(function(l){ var k=l.cat||'OTHERS'; m[k]=m[k]||{q:0,v:0}; m[k].q+=l.qty; m[k].v+=l.amt; });
-    return Object.keys(m).sort().map(function(k){ return qty?[k,'','',+m[k].q.toFixed(3),'',+m[k].v.toFixed(2)]:[k,'','','','',+m[k].v.toFixed(2)]; });
-  }
-  function grnSheet(d){
-    var A=head(d,'GRN - REGISTER',8); A.push(['DocNo','DocDt','Supplier','Item','Qty','Rate','Amt','Total']);
-    var all=[], grand=0, other=0;
-    d.grn.forEach(function(g){
-      g.lines.forEach(function(l,i){ A.push(i?['','','',l.name+(l.uom?' - '+l.uom:''),l.qty,l.rate,l.amt,'']:[g.no,dmy(g.date),g.supplier,l.name+(l.uom?' - '+l.uom:''),l.qty,l.rate,l.amt,'']); all.push(l); });
-      if(!g.lines.length) A.push([g.no,dmy(g.date),g.supplier,'(no items)','','','','']);
-      A.push(['','','','Sub-Total :','','',g.sub,'']); A.push([g.no,'','','Tax/Oth Charges :','','',g.other,g.total]); A.push([]);
-      grand+=g.total; other+=g.other;
-    });
-    A.push(['Grand Total :','','','','','','',+grand.toFixed(2)]); A.push([]);
-    A.push(['NAME','','','','','TOTAL AMOUNT']);
-    catSummary(all,false).forEach(function(r){ A.push(r); });
-    A.push(['OtherCharge','','','','',+other.toFixed(2)]); A.push(['','','','','',+grand.toFixed(2)]);
-    return finish(A,[22,12,34,44,10,12,14,14],[4,5,6,7]);
-  }
-  function issueSheet(d){
-    var A=head(d,'Issue - Register',7); A.push(['SL No','Date','Location','ITEM','QTY','RATE','AMOUNT']);
-    var cur='', all=[], grand=0, locT=0, locLines=[];
-    function closeLoc(){ if(!cur) return; A.push(['Total '+cur,'','','','','',+locT.toFixed(2)]); A.push([]); }
-    d.issue.forEach(function(x){
-      if(x.dept!==cur){ closeLoc(); cur=x.dept; locT=0; A.push([cur]); }
-      A.push([x.no,dmy(x.date),x.dept,'','','','']);
-      var t=0; x.lines.forEach(function(l){ A.push(['','','',l.name+(l.uom?' - '+l.uom:''),l.qty,l.rate,l.amt]); t+=l.amt; all.push(l); });
-      A.push(['Total ','','','','','',+t.toFixed(2)]); locT+=t; grand+=t;
-    });
-    closeLoc();
-    A.push(['Grand Total','','','','','',+grand.toFixed(2)]); A.push([]);
-    A.push(['CATEGORY','','','QTY','','AMOUNT']);
-    catSummary(all,true).forEach(function(r){ A.push(r); });
-    return finish(A,[22,12,18,46,10,12,14],[4,5,6]);
-  }
-  function stockSheet(d){
-    var c=d.company||{}, A=[[c.name||''],[c.address||''],['Stock Ledger Summary'],['','','','','','','From',dmy(d.from),'To',dmy(d.to)],
-      ['SlNo','ItemName','UOM','itemcd','OpQty','OpRate','OpVal','RecQty','RecRate','RecVal','IssQty','IssRate','IssVal','ClQty','ClRate','ClVal','Category']];
-    var T={opV:0,rV:0,iV:0,clV:0};
-    d.stock.forEach(function(x,i){ A.push([i+1,x.name,x.uom,x.code,x.opQ,x.opR,x.opV,x.rQ,x.rR,x.rV,x.iQ,x.iR,x.iV,x.clQ,x.clR,x.clV,x.cat]);
-      T.opV+=x.opV; T.rV+=x.rV; T.iV+=x.iV; T.clV+=x.clV; });
-    A.push(['','TOTAL','','','','',+T.opV.toFixed(2),'','',+T.rV.toFixed(2),'','',+T.iV.toFixed(2),'','',+T.clV.toFixed(2),'']);
-    return finish(A,[6,44,7,9,10,11,14,10,11,14,10,11,14,10,11,14,20],[5,6,8,9,11,12,14,15]);
+  function sum(a,k){ return a.reduce(function(s,x){ return s+(Number(x[k])||0); },0); }
+
+  async function draw(){
+    var s=top(), d=st.data; if(!s||!d) return;
+    if(s.v==='stockGroups'){
+      var g={}; d.stock.forEach(function(x){ var k=x.cat||'OTHERS'; var o=g[k]=g[k]||{name:k,opV:0,rV:0,iV:0,clV:0,n:0}; o.opV+=x.opV; o.rV+=x.rV; o.iV+=x.iV; o.clV+=x.clV; o.n++; });
+      var rows=Object.keys(g).sort().map(function(k){ var o=g[k]; o.cls='grp'; o.go={v:'stockItems',t:k,cat:k}; return o; });
+      info('<b>'+d.stock.length+'</b> items · closing value <b>₹'+money(sum(d.stock,'clV'))+'</b>');
+      table([{h:'Particulars (stock group)',k:'name',w:1},{h:'Items',k:'n',r:1},{h:'Opening value',f:function(r){return money(r.opV);},r:1},{h:'Inwards value',f:function(r){return money(r.rV);},r:1},
+        {h:'Outwards value',f:function(r){return money(r.iV);},r:1},{h:'Closing value',f:function(r){return money(r.clV);},r:1}],rows,
+        {name:'Grand Total',n:d.stock.length,opV:sum(d.stock,'opV'),rV:sum(d.stock,'rV'),iV:sum(d.stock,'iV'),clV:sum(d.stock,'clV')});
+    }
+    else if(s.v==='stockItems'){
+      var it=d.stock.filter(function(x){ return (x.cat||'OTHERS')===s.cat; }).map(function(x){ return Object.assign({},x,{go:{v:'ledger',t:x.name,item:x.code,uom:x.uom}}); });
+      info('Click an item for its vouchers');
+      table([{h:'Particulars (item)',k:'name',w:1},{h:'Opening',f:function(r){return qty(r.opQ,r.uom);},r:1},{h:'Value',f:function(r){return money(r.opV);},r:1},
+        {h:'Inwards',f:function(r){return qty(r.rQ,r.uom);},r:1},{h:'Value',f:function(r){return money(r.rV);},r:1},{h:'Outwards',f:function(r){return qty(r.iQ,r.uom);},r:1},{h:'Value',f:function(r){return money(r.iV);},r:1},
+        {h:'Closing',f:function(r){return qty(r.clQ,r.uom);},r:1},{h:'Rate',f:function(r){return r.clQ?money(r.clR):'';},r:1},{h:'Value',f:function(r){return money(r.clV);},r:1}],it,
+        {name:'Total',opV:sum(it,'opV'),rV:sum(it,'rV'),iV:sum(it,'iV'),clV:sum(it,'clV')});
+    }
+    else if(s.v==='ledger'){
+      if(!s.data){ body('<div class="msg">⏳ Loading vouchers…</div>'); var r=await api('STORE_ITEM_LEDGER',{item:s.item,from:st.from,to:st.to});
+        if(top()!==s) return; if(!r||!r.success){ body('<div class="msg">⛔ '+esc((r&&(r.message||r.error))||'no answer')+'</div>'); return; } s.data=r.data; }
+      var L=s.data, u=s.uom||'';
+      var rows=[{cls:'op',date:'',party:'Opening Balance',type:'',no:'',inQ:L.opening.qty>0?L.opening.qty:0,inV:L.opening.qty>0?L.opening.value:0,outQ:L.opening.qty<0?-L.opening.qty:0,outV:0,bal:L.opening.qty}]
+        .concat(L.rows.map(function(x){ var go=/PURCHASE|ISSUE/.test(x.vtype)?{v:'voucher',t:x.type+' '+x.no,kind:x.vtype==='ISSUE'?'iss':'grn',no:x.no,sid:x.sid}:null; return Object.assign({},x,{go:go}); }));
+      info('Inwards <b>'+qty(L.totals.inQ,u)+'</b> · Outwards <b>'+qty(L.totals.outQ,u)+'</b> · Closing <b>'+qty(L.closing.qty,u)+'</b>');
+      table([{h:'Date',f:function(r){return dmy(r.date);}},{h:'Particulars',k:'party',w:1},{h:'Vch Type',k:'type'},{h:'Vch No.',k:'no'},
+        {h:'Inwards',f:function(r){return qty(r.inQ);},r:1},{h:'Value',f:function(r){return money(r.inV);},r:1},{h:'Outwards',f:function(r){return qty(r.outQ);},r:1},{h:'Value',f:function(r){return money(r.outV);},r:1},
+        {h:'Closing',f:function(r){return qty(r.bal,u);},r:1}],rows,
+        {party:'Totals',inQ:L.totals.inQ+(L.opening.qty>0?L.opening.qty:0),inV:L.totals.inV+(L.opening.qty>0?L.opening.value:0),outQ:L.totals.outQ,outV:L.totals.outV,bal:L.closing.qty});
+    }
+    else if(s.v==='purMonths'){
+      var m={}; d.grn.forEach(function(g){ var k=g.date.slice(0,7); var o=m[k]=m[k]||{k:k,n:0,amt:0}; o.n++; o.amt+=g.total; });
+      var rows=Object.keys(m).sort().map(function(k){ var o=m[k]; o.name=MONTHS[+k.slice(5)-1]+' '+k.slice(0,4); o.go={v:'purVch',t:o.name,month:k}; return o; });
+      info('<b>'+d.grn.length+'</b> purchase vouchers · <b>₹'+money(sum(d.grn,'total'))+'</b>');
+      table([{h:'Particulars (month)',k:'name',w:1},{h:'Vouchers',k:'n',r:1},{h:'Amount',f:function(r){return money(r.amt);},r:1}],rows,{name:'Grand Total',n:d.grn.length,amt:sum(d.grn,'total')});
+    }
+    else if(s.v==='purVch'){
+      var v=d.grn.filter(function(g){ return g.date.slice(0,7)===s.month; }).map(function(g){ return Object.assign({},g,{go:{v:'voucher',t:'Purchase '+g.no,kind:'grn',no:g.no}}); });
+      table([{h:'Date',f:function(r){return dmy(r.date);}},{h:'Particulars (supplier)',k:'supplier',w:1},{h:'Vch Type',f:function(){return 'Purchase';}},{h:'Vch No.',k:'no'},
+        {h:'Items',f:function(r){return r.lines?r.lines.length:'';},r:1},{h:'Amount',f:function(r){return money(r.total);},r:1}],v,{supplier:'Total',total:sum(v,'total')});
+    }
+    else if(s.v==='issDepts'){
+      var dp={}; d.issue.forEach(function(x){ var o=dp[x.dept]=dp[x.dept]||{name:x.dept,n:0,amt:0}; o.n++; o.amt+=x.lines.reduce(function(a,l){return a+l.amt;},0); });
+      var rows=Object.keys(dp).sort().map(function(k){ var o=dp[k]; o.go={v:'issVch',t:k,dept:k}; return o; });
+      var all=rows.reduce(function(a,r){return a+r.amt;},0);
+      info('<b>'+d.issue.length+'</b> issue slips · <b>₹'+money(all)+'</b>');
+      table([{h:'Particulars (department)',k:'name',w:1},{h:'Slips',k:'n',r:1},{h:'Value',f:function(r){return money(r.amt);},r:1}],rows,{name:'Grand Total',n:d.issue.length,amt:all});
+    }
+    else if(s.v==='issVch'){
+      var v=d.issue.filter(function(x){ return x.dept===s.dept; }).map(function(x){ var a=x.lines.reduce(function(s2,l){return s2+l.amt;},0); return Object.assign({},x,{amt:a,go:{v:'voucher',t:'Issue '+x.no,kind:'iss',no:x.no,dept:x.dept}}); });
+      table([{h:'Date',f:function(r){return dmy(r.date);}},{h:'Vch No.',k:'no'},{h:'Items',f:function(r){return r.lines?r.lines.map(function(l){return l.name;}).join(', '):'';},w:1},{h:'Value',f:function(r){return money(r.amt);},r:1}],v,{no:'Total',amt:sum(v,'amt')});
+    }
+    else if(s.v==='voucher'){
+      var V=null, kind=s.kind;
+      if(kind==='grn') V=d.grn.find(function(g){ return g.no===s.no; });
+      else V=d.issue.find(function(x){ return x.no===s.no&&(!s.dept||x.dept===s.dept); })||d.issue.find(function(x){ return x.no===s.no||x.no===s.sid; });
+      if(!V){ body('<div class="msg">This voucher is outside '+dmy(st.from)+' – '+dmy(st.to)+'. Widen the period to open it.</div>'); st.rows=[]; return; }
+      var lines=V.lines.map(function(l){ return Object.assign({},l); }), tot=sum(lines,'amt');
+      var head=kind==='grn'
+        ?'<div class="vh"><div>Voucher type<b>Purchase (GRN)</b></div><div>Voucher no.<b>'+esc(V.no)+'</b></div><div>Date<b>'+dmy(V.date)+'</b></div><div>Party (supplier)<b>'+esc(V.supplier)+'</b></div><div>Items value<b>₹'+money(V.sub)+'</b></div><div>Tax / other charges<b>₹'+money(V.other)+'</b></div><div>Voucher total<b>₹'+money(V.total)+'</b></div></div>'
+        :'<div class="vh"><div>Voucher type<b>Store Issue</b></div><div>Slip no.<b>'+esc(V.no)+'</b></div><div>Date<b>'+dmy(V.date)+'</b></div><div>Issued to<b>'+esc(V.dept)+'</b></div><div>Value<b>₹'+money(tot)+'</b></div></div>';
+      body(head+'<div id="tvLines"></div>');
+      var rows=lines.map(function(l){ var it=(d.stock||[]).find(function(x){ return x.name===l.name; }); if(it) l.go={v:'ledger',t:it.name,item:it.code,uom:it.uom}; return l; });
+      var holder=D.getElementById('tvLines'), save=body; body=function(h){ holder.innerHTML=h; };
+      try{ table([{h:'Item',k:'name',w:1},{h:'Qty',f:function(r){return qty(r.qty,r.uom);},r:1},{h:'Rate',f:function(r){return money(r.rate);},r:1},{h:'Amount',f:function(r){return money(r.amt);},r:1}],rows,{name:'Total',amt:tot}); }
+      finally{ body=save; }
+      info('Click an item to open its stock vouchers');
+    }
   }
 
-  /* entry buttons: purchase-module (top bar, next to Export) and inventory (Reports group in the sidebar) */
+  function exportView(){
+    var t=D.getElementById('tvTbl'); if(!t||typeof XLSX==='undefined') return;
+    var wb=XLSX.utils.book_new(), ws=XLSX.utils.table_to_sheet(t,{raw:false});
+    XLSX.utils.book_append_sheet(wb,ws,'Report');
+    XLSX.writeFile(wb,(top().t||'Report').replace(/[^\w\- ]+/g,'').slice(0,40).trim().replace(/\s+/g,'_')+'_'+dmy(st.from)+'_to_'+dmy(st.to)+'.xlsx');
+  }
+
+  /* ---------- "All 3" workbook in the store software's layout ---------- */
+  function head(d,title,ncol){ var c=d.company||{}, pad=function(a){ while(a.length<ncol) a.push(''); return a; };
+    return [pad([c.name||'']),pad([c.address||'']),pad([title]),pad(['For The Period of '+dmy(d.from).replace(/-/g,'/')+' To '+dmy(d.to).replace(/-/g,'/')]),pad(['Amount in INR'])]; }
+  function finish(aoa,widths,moneyCols){ var ws=XLSX.utils.aoa_to_sheet(aoa); ws['!cols']=widths.map(function(w){return {wch:w};});
+    var rg=XLSX.utils.decode_range(ws['!ref']); for(var R=0;R<=rg.e.r;R++) moneyCols.forEach(function(C){ var c=ws[XLSX.utils.encode_cell({r:R,c:C})]; if(c&&c.t==='n') c.z='#,##0.00'; }); return ws; }
+  function catSum(lines,withQty){ var m={}; lines.forEach(function(l){ var k=l.cat||'OTHERS'; m[k]=m[k]||{q:0,v:0}; m[k].q+=l.qty; m[k].v+=l.amt; });
+    return Object.keys(m).sort().map(function(k){ return withQty?[k,'','',+m[k].q.toFixed(3),'',+m[k].v.toFixed(2)]:[k,'','','','',+m[k].v.toFixed(2)]; }); }
+  function grnSheet(d){ var A=head(d,'GRN - REGISTER',8); A.push(['DocNo','DocDt','Supplier','Item','Qty','Rate','Amt','Total']); var all=[],grand=0,oth=0;
+    d.grn.forEach(function(g){ g.lines.forEach(function(l,i){ var nm=l.name+(l.uom?' - '+l.uom:''); A.push(i?['','','',nm,l.qty,l.rate,l.amt,'']:[g.no,dmy(g.date).replace(/-/g,'/'),g.supplier,nm,l.qty,l.rate,l.amt,'']); all.push(l); });
+      A.push(['','','','Sub-Total :','','',g.sub,'']); A.push([g.no,'','','Tax/Oth Charges :','','',g.other,g.total]); A.push([]); grand+=g.total; oth+=g.other; });
+    A.push(['Grand Total :','','','','','','',+grand.toFixed(2)]); A.push([]); A.push(['NAME','','','','','TOTAL AMOUNT']); catSum(all,false).forEach(function(r){A.push(r);});
+    A.push(['OtherCharge','','','','',+oth.toFixed(2)]); A.push(['','','','','',+grand.toFixed(2)]); return finish(A,[22,12,34,44,10,12,14,14],[4,5,6,7]); }
+  function issueSheet(d){ var A=head(d,'Issue - Register',7); A.push(['SL No','Date','Location','ITEM','QTY','RATE','AMOUNT']); var cur='',all=[],grand=0,locT=0;
+    function closeLoc(){ if(cur){ A.push(['Total '+cur,'','','','','',+locT.toFixed(2)]); A.push([]); } }
+    d.issue.forEach(function(x){ if(x.dept!==cur){ closeLoc(); cur=x.dept; locT=0; A.push([cur]); } A.push([x.no,dmy(x.date).replace(/-/g,'/'),x.dept,'','','','']); var t=0;
+      x.lines.forEach(function(l){ A.push(['','','',l.name+(l.uom?' - '+l.uom:''),l.qty,l.rate,l.amt]); t+=l.amt; all.push(l); }); A.push(['Total ','','','','','',+t.toFixed(2)]); locT+=t; grand+=t; });
+    closeLoc(); A.push(['Grand Total','','','','','',+grand.toFixed(2)]); A.push([]); A.push(['CATEGORY','','','QTY','','AMOUNT']); catSum(all,true).forEach(function(r){A.push(r);});
+    return finish(A,[22,12,18,46,10,12,14],[4,5,6]); }
+  function stockSheet(d){ var c=d.company||{}, A=[[c.name||''],[c.address||''],['Stock Ledger Summary'],['','','','','','','From',dmy(d.from).replace(/-/g,'/'),'To',dmy(d.to).replace(/-/g,'/')],
+    ['SlNo','ItemName','UOM','itemcd','OpQty','OpRate','OpVal','RecQty','RecRate','RecVal','IssQty','IssRate','IssVal','ClQty','ClRate','ClVal','Category']], T={o:0,r:0,i:0,c:0};
+    d.stock.forEach(function(x,i){ A.push([i+1,x.name,x.uom,x.code,x.opQ,x.opR,x.opV,x.rQ,x.rR,x.rV,x.iQ,x.iR,x.iV,x.clQ,x.clR,x.clV,x.cat]); T.o+=x.opV; T.r+=x.rV; T.i+=x.iV; T.c+=x.clV; });
+    A.push(['','TOTAL','','','','',+T.o.toFixed(2),'','',+T.r.toFixed(2),'','',+T.i.toFixed(2),'','',+T.c.toFixed(2),'']); return finish(A,[6,44,7,9,10,11,14,10,11,14,10,11,14,10,11,14,20],[5,6,8,9,11,12,14,15]); }
+  function downloadAll(btn){
+    if(!st.data||typeof XLSX==='undefined') return; var d=st.data, wb=XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,grnSheet(d),'GRN Register'); XLSX.utils.book_append_sheet(wb,issueSheet(d),'Issue Register'); XLSX.utils.book_append_sheet(wb,stockSheet(d),'Stock Ledger Summary');
+    XLSX.writeFile(wb,'Store_Registers_'+dmy(d.from)+'_to_'+dmy(d.to)+'.xlsx');
+  }
+
+  /* entry buttons: purchase page top bar + inventory sidebar (Reports) */
   function mount(){
     if(D.getElementById('bnxSRbtn')) return;
-    var invGroup=D.getElementById('grp-reports-body');
-    if(invGroup){
-      var a=D.createElement('a'); a.className='nav-item'; a.id='bnxSRbtn'; a.tabIndex=0; a.setAttribute('role','button');
-      a.innerHTML='<span class="ni">📑</span> Store Registers (GRN · Issue · Stock)'; a.onclick=function(){ W.bnxOpenStoreRegisters(); };
-      invGroup.appendChild(a); return;
-    }
+    var g=D.getElementById('grp-reports-body');
+    if(g){ var a=D.createElement('a'); a.className='nav-item'; a.id='bnxSRbtn'; a.tabIndex=0; a.setAttribute('role','button');
+      a.innerHTML='<span class="ni">📑</span> Store Reports (Tally view)'; a.onclick=function(){ W.bnxOpenStoreRegisters('stock'); }; g.insertBefore(a,g.firstChild); return; }
     var exp=[].slice.call(D.querySelectorAll('button,a')).find(function(b){ return /^\s*\S*\s*Export\s*$/.test(b.textContent||'') && b.offsetParent; });
-    var b=D.createElement('button'); b.id='bnxSRbtn'; b.type='button'; b.textContent='📑 Store Registers'; b.onclick=function(){ W.bnxOpenStoreRegisters(); };
+    var b=D.createElement('button'); b.id='bnxSRbtn'; b.type='button'; b.textContent='📑 Store Reports'; b.onclick=function(){ W.bnxOpenStoreRegisters('stock'); };
     if(exp&&exp.parentNode){ b.className=exp.className; exp.parentNode.insertBefore(b,exp); }
-    else { b.style.cssText='position:fixed;right:16px;bottom:16px;z-index:9990;padding:10px 14px;border-radius:10px;border:0;background:#ea580c;color:#fff;font-weight:800;box-shadow:0 6px 18px rgba(0,0,0,.2);cursor:pointer'; D.body.appendChild(b); }
+    else { b.style.cssText='position:fixed;right:16px;bottom:16px;z-index:9990;padding:10px 14px;border-radius:10px;border:0;background:#ea580c;color:#fff;font-weight:800;cursor:pointer'; D.body.appendChild(b); }
   }
   if(D.readyState==='loading') D.addEventListener('DOMContentLoaded',function(){ setTimeout(mount,1500); }); else setTimeout(mount,1500);
   setTimeout(mount,5000);
