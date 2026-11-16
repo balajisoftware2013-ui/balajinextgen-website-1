@@ -14752,9 +14752,35 @@ window.handlePhyUpload=function(input){
         g.items.push({item_id:row.item_id,item_name:it.name||'',received:row.qty_in,rate:row.rate||0});
         clearTimeout(tq); tq=setTimeout(flush,400);
       }
+      /* 2026-11-16 ("entry system fix"): stock adjustment / physical count, stock transfer, damage and write-off were saved
+         only in this browser — the ERP stock, reports and other PCs never saw them. Now each is posted to the server too. */
+      if(t==='stock_ledger' && row && row.ref_id && ready() && /^(adjustment|physical_count|transfer_out|transfer_in|damage|write_off)$/.test(row.txn_type||'')){
+        var e2=q2[row.ref_id]=q2[row.ref_id]||{id:row.ref_id,kind:/transfer/.test(row.txn_type)?'transfer':/adjust|physical/.test(row.txn_type)?'count':'waste',date:row.date,rows:[]};
+        e2.rows.push(row); clearTimeout(tq2); tq2=setTimeout(flush2,500);
+      }
     }catch(e){}
     return row;
   };
+  var q2={}, tq2=null;
+  function flush2(){
+    var all=q2; q2={};
+    Object.keys(all).forEach(function(id){
+      var e=all[id], act, pl;
+      if(e.kind==='transfer'){
+        var out=e.rows.filter(function(r){ return r.txn_type==='transfer_out'; }), inn=e.rows.filter(function(r){ return r.txn_type==='transfer_in'; });
+        if(!out.length||!inn.length) return;
+        act='SAVE_STOCK_TRANSFER'; pl={_id:id,date:e.date,from_wh:out[0].wh_id,to_wh:inn[0].wh_id,items:out.map(function(r){ return {item_id:r.item_id,qty:r.qty_out}; })};
+      } else if(e.kind==='count'){
+        act='SAVE_PHYSICAL_ADJUSTMENT'; pl={countId:id,date:e.date,wh_id:e.rows[0].wh_id,items:e.rows.map(function(r){ return {item_id:r.item_id,countedQty:r.balance,remark:r.remarks||''}; })};
+      } else {
+        act='WASTAGE_SAVE'; pl={voucherNo:id,date:e.date,department:'STORE',source:'STORE',lines:e.rows.map(function(r){ var it=(LIVE.items?LIVE.items.rows:[]).find(function(i){ return i._id===r.item_id; })||{}; return {code:r.item_id,qty:r.qty_out,unit:it.unit||'',reason:r.remarks||(r.txn_type==='write_off'?'Dead stock write-off':'Damage')}; })};
+      }
+      erpApi(act,pl).then(function(r){
+        if(r&&r.success===false){ try{ toast('⚠️ '+id+' saved on this PC, but the server refused it: '+(r.message||r.error||''),'w'); }catch(x){} }
+        else { srcIds[id]=1; try{ toast('✓ '+id+' posted to the ERP','s'); }catch(x){} setTimeout(function(){ load(true); },1500); }
+      });
+    });
+  }
   function flush(){
     var all=q; q={};
     Object.keys(all).forEach(function(id){
@@ -14871,7 +14897,9 @@ window.handlePhyUpload=function(input){
   function top(){ return st.stack[st.stack.length-1]; }
   function reset(r){ st.stack=[{v:r==='pur'?'purMonths':r==='iss'?'issDepts':'stockGroups',t:r==='pur'?'Purchase Register':r==='iss'?'Issue Register':'Stock Summary'}]; st.sel=0;
     D.querySelectorAll('#bnxTV .hd button[data-r]').forEach(function(b){ b.classList.toggle('on',b.dataset.r===r); }); render(); }
-  W.bnxOpenStoreRegisters=function(which){ ui().style.display='flex'; if(!st.data) reload(which||'stock'); else reset(which||'stock'); };
+  W.bnxOpenStoreRegisters=function(which,from,to){ ui().style.display='flex';
+    if(from&&to){ D.getElementById('tvF').value=from; D.getElementById('tvT').value=to; if(!st.data||st.from!==from||st.to!==to) return reload(which||'stock'); }
+    if(!st.data) reload(which||'stock'); else reset(which||'stock'); };
   /* open a stock group / one item's ledger directly (warehouse, division and item screens) — Esc goes back up */
   W.bnxOpenStoreGroup=async function(cat){
     ui().style.display='flex'; if(!st.data) await reload('stock'); if(!st.data) return;
@@ -15183,6 +15211,48 @@ window.handlePhyUpload=function(input){
     var r=t.closest('#sv-wh-cards tr[data-item]'); if(r){ e.stopPropagation(); var id=r.getAttribute('data-item'); if(typeof drillStockItem==='function') drillStockItem(id); else if(W.bnxOpenStoreItem) W.bnxOpenStoreItem(id,''); }
   },true);
   var oWh=W.renderWhCards; if(typeof oWh==='function'&&!oWh.__sg){ W.renderWhCards=function(){ try{ whView(); }catch(e){ return oWh.apply(this,arguments); } }; W.renderWhCards.__sg=1; }
+})();
+</script>
+<script id="bnx-dash-drill">
+/* ═══ DASHBOARD CLICK-THROUGH (2026-11-16, "all places link transactions click one by one") ═══════════════════════
+   Stock value / SKUs → Stock Summary · Purchase → Purchase Register · Issues / Kitchen / Bar → Issue Register (for the
+   dashboard period) · a category → its items · warehouse → Stock Summary · low-stock / movement row → the item's ledger.
+   Each opens the Tally-style viewer: group → item → ledger → voucher, Esc goes back. */
+(function(){
+  var W=window, D=document;
+  function iso(d){ if(!d) return ''; if(typeof d==='string') return d.slice(0,10); var z=new Date(d.getTime()-d.getTimezoneOffset()*6e4); return z.toISOString().slice(0,10); }
+  function per(){ try{ var r=bnxGetRange('dash'); if(r&&r.start&&r.end) return [iso(r.start),iso(r.end)]; }catch(e){} var t=new Date(), y=t.getMonth()>=3?t.getFullYear():t.getFullYear()-1; return [y+'-04-01',iso(t)]; }
+  function reg(which){ var p=per(); if(typeof W.bnxOpenStoreRegisters==='function') W.bnxOpenStoreRegisters(which,p[0],p[1]); }
+  function item(name){ var it=(typeof DB!=='undefined'?DB.all('items'):[]).find(function(i){ return String(i.name||'').trim().toUpperCase()===String(name||'').trim().toUpperCase(); });
+    if(typeof W.bnxOpenStoreItem==='function') W.bnxOpenStoreItem(it?it._id:'',name); }
+  var oK=W.showKPIDetail;
+  if(typeof oK==='function'&&!oK.__dash){
+    W.showKPIDetail=function(type){
+      if(type==='stock-value'||type==='skus') return reg('stock');
+      if(type==='purchase-mtd') return reg('pur');
+      if(type==='issues-mtd'||type==='kitchen-today'||type==='bar-today') return reg('iss');
+      return oK.apply(this,arguments);   /* low / out of stock keep their lists */
+    };
+    W.showKPIDetail.__dash=1;
+  }
+  var css=D.createElement('style');
+  css.textContent='#cat-cap-body>div{cursor:pointer;border-radius:6px;padding:2px 4px;margin-left:-4px;margin-right:-4px}#cat-cap-body>div:hover{background:#fdf0dc}'+
+    '#wh-dash-body tr,#low-stock-body tr,#movements-body tr{cursor:pointer}#wh-dash-body tr:hover td,#low-stock-body tr:hover td,#movements-body tr:hover td{background:#fdf0dc}';
+  D.head.appendChild(css);
+  D.addEventListener('click',function(e){
+    var t=e.target; if(!t||!t.closest) return;
+    if(t.closest('button,a,input,select')) return;
+    var c=t.closest('#cat-cap-body>div'); if(c){ var nm=(c.querySelector('span')||c).textContent.trim(); if(typeof W.bnxOpenStoreGroup==='function') W.bnxOpenStoreGroup(nm); return; }
+    if(t.closest('#wh-dash-body tr')){ reg('stock'); return; }
+    var r=t.closest('#low-stock-body tr'); if(r&&r.cells.length>1){ item((r.cells[0].innerText||'').split('\n')[0]); return; }
+    var m=t.closest('#movements-body tr'); if(m&&m.cells.length>2){ item((m.cells[2].innerText||'').split('\n')[0]); return; }
+  },true);
+  /* the Issues card kept its grey "loading" bar after the value was written */
+  function unload(){ D.querySelectorAll('#dash-kpis .kpi-val.kpi-loading').forEach(function(v){ if(String(v.textContent).trim()&&v.textContent.trim()!=='—') v.classList.remove('kpi-loading'); }); }
+  var oL=W.loadDashboard; if(typeof oL==='function'&&!oL.__dash){ W.loadDashboard=function(){ var r=oL.apply(this,arguments); setTimeout(unload,50); return r; }; W.loadDashboard.__dash=1; }
+  setInterval(unload,3000);
+  /* hint on the cards */
+  setTimeout(function(){ D.querySelectorAll('#dash-kpis .kpi').forEach(function(k){ if(!k.title) k.title='Click to open the register / ledger'; }); },2000);
 })();
 </script>
 </body>
