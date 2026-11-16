@@ -8370,7 +8370,84 @@ function confirmSmartImport(asDraft){
       if(added){ try{ saveLocalOnly(); }catch(e){} try{ rendVendTb(); }catch(e){} try{ rendRegs(); }catch(e){} }
     }catch(e){}
   }
-  async function both(force){ if(busy) return; busy=true; try{ await Promise.all([loadInv(force), loadGrns(force)]); } finally{ busy=false; } }
+  /* invoices that arrive without item lines (any older loader / sheet copy) get them from their GRN lines (same GRN no.) —
+     Monthwise Summary, Purchase Register (Tally) and Expand Items need the items */
+  function fillItems(){
+    try{
+      var by={}; (DB.grns||[]).forEach(function(g){ if(!g||!g.no) return; (by[g.no]=by[g.no]||[]).push(g); });
+      var n=0;
+      (DB.purchases||[]).forEach(function(p){
+        if(!p || (Array.isArray(p.items) && p.items.length)) return;
+        var lines=by[p.no]||by[p.grnRef]||[]; if(!lines.length) return;
+        p.items=lines.map(function(g){ var amt=+g.amount||((+g.received||0)*(+g.rate||0));
+          return {itemId:g.itemId||'',name:g.item||'',hsn:'',qty:+g.received||0,unit:g.unit||'',rate:+g.rate||0,disc:0,gst:0,taxAmt:0,lineNet:amt,extraShare:0,pcTaxable:amt,amt:amt}; });
+        n++;
+      });
+      if(n){ try{ saveLocalOnly(); }catch(e){} }
+      return n;
+    }catch(e){ return 0; }
+  }
+  W.bnxFillPurchaseItems=fillItems;
+
+  /* ── SEARCH / FILTERS / DUPLICATES (2026-11-16) ──
+     · Search box: invoice no, GRN no, supplier, ITEM name, amount, date (dd-mm-yyyy or yyyy-mm-dd) — several words = all must match
+     · Supplier filter: list built from the suppliers actually on invoices + vendor master, matched ignoring case/spaces
+       (master "Uttam Saha" vs invoice "UTTAM SAHA" used to give zero rows)
+     · Duplicates button: SHOW only duplicate invoices (ticked, earliest copy left unticked) → 🗑 Delete Selected removes them;
+       click again = show all */
+  var norm=function(x){ return String(x||'').toUpperCase().replace(/[^A-Z0-9]+/g,' ').trim(); };
+  W._pRegPopulateFilterOptions=function(){
+    var vSel=document.getElementById('pReg-vendor'), aSel=document.getElementById('pReg-acct');
+    if(vSel){
+      var cur=vSel.value, seen={}, names=[];
+      (DB.purchases||[]).concat(DB.acctInvs||[]).forEach(function(p){ var n=String(p.vendorName||'').trim(), k=norm(n); if(n&&!seen[k]){ seen[k]=1; names.push(n); } });
+      (DB.vendors||[]).forEach(function(v){ var n=String(v.name||'').trim(), k=norm(n); if(n&&!seen[k]){ seen[k]=1; names.push(n); } });
+      names.sort(function(a,b){ return a.localeCompare(b); });
+      var cnt={}; (DB.purchases||[]).forEach(function(p){ var k=norm(p.vendorName); cnt[k]=(cnt[k]||0)+1; });
+      vSel.innerHTML='<option value="">All Suppliers ('+names.length+')</option>'+names.map(function(n){ var c=cnt[norm(n)]||0; return '<option value="'+n.replace(/"/g,'&quot;')+'">'+n+(c?' — '+c:'')+'</option>'; }).join('');
+      if(cur) vSel.value=cur;
+    }
+    if(aSel){
+      var cur2=aSel.value, heads=(DB.ledgerAccounts||[]).map(function(l){ return l.name; });
+      aSel.innerHTML='<option value="">All Accounting Heads</option>'+heads.map(function(n){ return '<option value="'+n+'">'+n+'</option>'; }).join('')+'<option value="General Purchase">General Purchase (unset)</option>';
+      if(heads.indexOf(cur2)>=0||cur2==='General Purchase') aSel.value=cur2;
+    }
+  };
+  W._pRegMatchesFilters=function(p){
+    var qEl=document.getElementById('pReg-q'), q=String(qEl&&qEl.value||'').trim().toLowerCase();
+    var vendF=(document.getElementById('pReg-vendor')||{}).value||'', acctF=(document.getElementById('pReg-acct')||{}).value||'';
+    if(W._pinvShowDupOnly && !(W._pinvDuplicateIds&&W._pinvDuplicateIds.has(p.id))) return false;
+    if(q){
+      var d=String(p.date||''), dmy=d.slice(8,10)+'-'+d.slice(5,7)+'-'+d.slice(0,4);
+      var hay=[p.no,p.grnRef,p.vendorName,d,dmy,p.grand,(+p.grand||0).toFixed(2),p.status,p.notes].concat((p.items||[]).map(function(i){ return i.name; })).join(' | ').toLowerCase();
+      if(!q.split(/\s+/).every(function(w){ return hay.indexOf(w)>=0; })) return false;
+    }
+    if(vendF && norm(p.vendorName)!==norm(vendF)) return false;
+    if(acctF){ var led=(DB.ledgerAccounts||[]).find(function(l){ return l.id===p.ledgerAccountId; }); if((led?led.name:'General Purchase')!==acctF) return false; }
+    return true;
+  };
+  W.selectDuplicatePurchases=function(){
+    try{ if(typeof _pinvComputeDupGroups==='function'){ var r=_pinvComputeDupGroups(); if(r&&r.pinvDuplicateIds) W._pinvDuplicateIds=r.pinvDuplicateIds; } }catch(e){}
+    var ids=W._pinvDuplicateIds||new Set();
+    var btn=[].slice.call(document.querySelectorAll('button')).find(function(b){ return /selectDuplicatePurchases/.test(b.getAttribute('onclick')||''); });
+    if(W._pinvShowDupOnly){ W._pinvShowDupOnly=false; if(btn) btn.innerHTML='🔁 Duplicates'; try{ rendRegs(); }catch(e){} toast('Showing all invoices','ok','📋'); return; }
+    if(!ids.size){ toast('No duplicate invoices found (same invoice no. + supplier).','ok','✅'); return; }
+    W._pinvShowDupOnly=true; if(btn) btn.innerHTML='👁 Show all ('+ids.size+' dup)';
+    try{ rendRegs(); }catch(e){}
+    setTimeout(function(){ document.querySelectorAll('.pinv-row-chk').forEach(function(c){ if(ids.has(c.dataset.id)) c.checked=true; }); try{ updatePinvSelectionUI(); }catch(e){} },50);
+    toast('Showing '+ids.size+' duplicate invoice(s), ticked (earliest copy of each left unticked). Check, then 🗑 Delete Selected — or click again to show all.','warn','🔁');
+  };
+  setTimeout(function(){ var q=document.getElementById('pReg-q'); if(q) q.setAttribute('placeholder','🔍 Search invoice / GRN no, supplier, item, amount, date…'); },2500);
+  async function both(force){ if(busy) return; busy=true;
+    try{ await Promise.all([loadInv(force), loadGrns(force)]); }
+    finally{ busy=false; }
+    if(fillItems()){ try{ rendRegs(); }catch(e){} try{ rendMonthwiseSummary(); }catch(e){} try{ rendDash(); }catch(e){} }
+  }
+  /* every render of the monthwise summary / registers first fills missing item lines */
+  ['rendMonthwiseSummary','rendRegs','exportMonthwiseCSV','exportTallyRegisterCSV'].forEach(function(fn){
+    var f=W[fn]; if(typeof f!=='function'||f.__bnxFill) return;
+    var g=function(){ fillItems(); return f.apply(this,arguments); }; g.__bnxFill=true; W[fn]=g;
+  });
   W.bnxPurchaseLiveReload=function(){ return both(true); };
   /* company name / GSTIN from COMPANY_SETTINGS (was the demo "Balaji Enterprises / 27AABCU9603R1ZX"); a real profile
      saved by hand on this page is kept, a saved demo one is replaced */
@@ -8482,6 +8559,14 @@ function confirmSmartImport(asDraft){
   function reset(r){ st.stack=[{v:r==='pur'?'purMonths':r==='iss'?'issDepts':'stockGroups',t:r==='pur'?'Purchase Register':r==='iss'?'Issue Register':'Stock Summary'}]; st.sel=0;
     D.querySelectorAll('#bnxTV .hd button[data-r]').forEach(function(b){ b.classList.toggle('on',b.dataset.r===r); }); render(); }
   W.bnxOpenStoreRegisters=function(which){ ui().style.display='flex'; if(!st.data) reload(which||'stock'); else reset(which||'stock'); };
+  /* open one voucher directly (inventory item ledger rows) — Esc goes back to its register */
+  W.bnxOpenStoreVoucher=async function(kind,no,dept){
+    ui().style.display='flex';
+    if(!st.data) await reload(kind==='grn'?'pur':'iss');
+    if(!st.data) return;
+    st.stack=[{v:kind==='grn'?'purMonths':'issDepts',t:kind==='grn'?'Purchase Register':'Issue Register'},{v:'voucher',t:(kind==='grn'?'Purchase ':'Issue ')+no,kind:kind,no:no,dept:kind==='iss'?String(dept||'').toUpperCase():''}];
+    st.sel=0; st.q=''; render();
+  };
 
   async function reload(which){
     st.from=D.getElementById('tvF').value; st.to=D.getElementById('tvT').value;
@@ -8574,8 +8659,8 @@ function confirmSmartImport(asDraft){
       if(!V){ body('<div class="msg">This voucher is outside '+dmy(st.from)+' – '+dmy(st.to)+'. Widen the period to open it.</div>'); st.rows=[]; return; }
       var lines=V.lines.map(function(l){ return Object.assign({},l); }), tot=sum(lines,'amt');
       var head=kind==='grn'
-        ?'<div class="vh"><div>Voucher type<b>Purchase (GRN)</b></div><div>Voucher no.<b>'+esc(V.no)+'</b></div><div>Date<b>'+dmy(V.date)+'</b></div><div>Party (supplier)<b>'+esc(V.supplier)+'</b></div><div>Items value<b>₹'+money(V.sub)+'</b></div><div>Tax / other charges<b>₹'+money(V.other)+'</b></div><div>Voucher total<b>₹'+money(V.total)+'</b></div></div>'
-        :'<div class="vh"><div>Voucher type<b>Store Issue</b></div><div>Slip no.<b>'+esc(V.no)+'</b></div><div>Date<b>'+dmy(V.date)+'</b></div><div>Issued to<b>'+esc(V.dept)+'</b></div><div>Value<b>₹'+money(tot)+'</b></div></div>';
+        ?'<div class="vh"><div>Voucher type<b>Purchase (GRN)</b></div><div>Voucher no.<b>'+esc(V.no)+'</b></div><div>Date<b>'+dmy(V.date)+'</b></div><div>Party (supplier)<b>'+esc(V.supplier)+'</b></div><div>Items value<b>₹'+(money(V.sub)||'0.00')+'</b></div><div>Tax / other charges<b>₹'+(money(V.other)||'0.00')+'</b></div><div>Voucher total<b>₹'+(money(V.total)||'0.00')+'</b></div></div>'
+        :'<div class="vh"><div>Voucher type<b>Store Issue</b></div><div>Slip no.<b>'+esc(V.no)+'</b></div><div>Date<b>'+dmy(V.date)+'</b></div><div>Issued to<b>'+esc(V.dept)+'</b></div><div>Value<b>₹'+(money(tot)||'0.00')+'</b></div></div>';
       body(head+'<div id="tvLines"></div>');
       var rows=lines.map(function(l){ var it=(d.stock||[]).find(function(x){ return x.name===l.name; }); if(it) l.go={v:'ledger',t:it.name,item:it.code,uom:it.uom}; return l; });
       var holder=D.getElementById('tvLines'), save=body; body=function(h){ holder.innerHTML=h; };
