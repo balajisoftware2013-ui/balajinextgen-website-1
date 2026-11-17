@@ -63,4 +63,4 @@ http.createServer((req, res) => {
       res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Unknown route');
     } catch (e) { res.writeHead(502, { 'Content-Type': 'text/plain' }); res.end('Connector could not reach Tally: ' + e.message); }
   });
-}).listen(PORT, '127.0.0.1', () => console.log('Connector running on http://127.0.0.1:' + PORT + '  ->  Tally ' + TALLY.href + '\nKeep this window open.'));
+}).on('error', e => { if (e.code === 'EADDRINUSE') { console.log('Connector is already running on port ' + PORT + '. Nothing to do.'); process.exit(0); } throw e; }).listen(PORT, '127.0.0.1', () => console.log('Connector running on http://127.0.0.1:' + PORT + '  ->  Tally ' + TALLY.href + '\nKeep this window open.'));
