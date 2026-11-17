@@ -1540,7 +1540,8 @@ async function erpApi(action, payload){
       result.success=false;
       result.message=result.message||('Server request failed (HTTP '+r.status+').');
     }
-    var unk = result && result.success===false && /unknown action|unknown_action|not (supported|registered|found)|invalid action|no handler|unsupported/i.test(String(result.message||result.error||''));
+    var unk = result && result.success===false && /unknown action|unknown_action|not (supported|registered|found)|invalid action|no handler|unsupported|sheetName required/i.test(String(result.message||result.error||''));
+    if(unk && /sheetName required/i.test(String(result.message||result.error||'')) && ui>=urls.length-1){ unk=false; } // backend sheet bug: never mark action as permanently missing
     if(ui<urls.length-1 && unk) continue;
     if(unk) window.__bnxNoAction[action]=1;
     return result;
@@ -1937,7 +1938,15 @@ async function syncPurchaseInvoiceRowToServer(doc){
   if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return {success:false,message:'no session'};
   try{
     const row=_mapDocToSyncPurchaseRecord(doc);
-    const r=await erpApi('SYNC_PURCHASE_INVOICE_ROW',{row});
+    let r=await erpApi('SYNC_PURCHASE_INVOICE_ROW',{row});
+    if(r&&r.success===false&&/sheetName required/i.test(String(r.message||''))){
+      // Server bug (bnxClientSheet called without sheetName). Fall back to the per-table
+      // push, which passes the table name explicitly, so the edit is not lost/rolled back.
+      console.warn('[Row Sync] row action broken on server, using SYNC_PUSH_TABLE fallback for',doc.id);
+      const r2=await erpApi('SYNC_PUSH_TABLE',{table:'purchase_invoices',rows:[row],deletedIds:[]});
+      if(r2&&r2.success!==false)r={success:true,message:'saved via table fallback'};
+      else r=r2||r;
+    }
     if(r&&r.success===false)console.warn('[Row Sync] SYNC_PURCHASE_INVOICE_ROW failed for',doc.id,':',r.message);
     return r;
   }catch(e){
@@ -4304,6 +4313,7 @@ function buildTallyAutoMastersXML(item){
     blocks.push(buildTallyLedgerXML(d.purchaseLedger,'Purchase Accounts'));
     (d.items||[]).forEach(it=>blocks.push(buildTallyStockItemXML(it)));
   }
+  if(_tallyBalance(d,item.voucherType==='journal').diff!==0)blocks.push(buildTallyLedgerXML('Round Off','Indirect Expenses'));
   if(d.cgst>0)blocks.push(buildTallyGstLedgerXML('Input CGST','Central Tax'));
   if(d.sgst>0)blocks.push(buildTallyGstLedgerXML('Input SGST','State Tax'));
   if(d.igst>0)blocks.push(buildTallyGstLedgerXML('Input IGST','Integrated Tax'));
@@ -4311,45 +4321,71 @@ function buildTallyAutoMastersXML(item){
 }
 
 // ── Build the Tally voucher XML for one queued item ──
+// FIX (Nov 2026 — wrong ledger head / amount mismatch / "POSTED" but missing):
+//  1) Item-wise Purchase vouchers had NO purchase-ledger allocation, so Tally put the
+//     items in its default ledger instead of the head picked in the form. Each stock
+//     line now carries ACCOUNTINGALLOCATIONS.LIST with the selected head.
+//  2) Debit side (items + GST) and the party credit (grand) could differ by paise or by
+//     freight/other charges, so Tally threw an import exception. Amounts are now
+//     2-decimal and any difference goes to a "Round Off" line so the voucher balances.
+//  3) Voucher now carries VOUCHERNUMBER (blocks duplicate re-posts), ISINVOICE and, if set,
+//     the Tally company name (SVCURRENTCOMPANY) so it lands in the right open company.
+function _tallyAmt(n){return (Math.round((+n||0)*100)/100).toFixed(2);}
+function _tallyBalance(d,isJournal){
+  let debit=isJournal?(+d.taxable||0):(d.items||[]).reduce((a,it)=>a+(+it.pcTaxable||0),0);
+  debit+=(+d.cgst||0)+(+d.sgst||0)+(+d.igst||0);
+  debit=Math.round(debit*100)/100;
+  const grand=Math.round((+d.grand||0)*100)/100;
+  const diff=Math.round((grand-debit)*100)/100;
+  if(Math.abs(diff)>1)console.warn('[Tally] Invoice '+d.invoiceNo+': items+GST ('+debit+') differs from total ('+grand+') by '+diff+' — posted the difference to Round Off. Check freight/other charges/TCS on this invoice.');
+  return {debit,grand,diff};
+}
+function _tallyCompanyXml(){
+  let co='';try{co=localStorage.getItem('bnx_tally_company')||'';}catch(e){}
+  return co?`<STATICVARIABLES><SVCURRENTCOMPANY>${xmlEscape(co)}</SVCURRENTCOMPANY></STATICVARIABLES>`:'';
+}
+function setTallyCompany(){
+  let cur='';try{cur=localStorage.getItem('bnx_tally_company')||'';}catch(e){}
+  const v=prompt('Exact company name as shown in Tally (leave blank = whichever company is open in Tally):',cur);
+  if(v===null)return;
+  try{localStorage.setItem('bnx_tally_company',v.trim());localStorage.setItem('bnx_tally_company_asked','1');}catch(e){}
+  toast(v.trim()?'Tally company set: '+v.trim():'Tally company cleared (uses open company)','ok','🏢');
+}
+function _askTallyCompanyOnce(){
+  try{ if(!localStorage.getItem('bnx_tally_company_asked')){ localStorage.setItem('bnx_tally_company_asked','1'); setTallyCompany(); } }catch(e){}
+}
+function downloadTallyXml(id,mode){
+  const arr=mode==='accounting'?DB.acctInvs:DB.purchases;
+  const doc=arr.find(x=>x.id===id);if(!doc){toast('Record not found','err','⚠️');return;}
+  const {isJournal,voucherXmlData}=_buildTallyVoucherXmlData(doc);
+  const xml=buildTallyVoucherXML({invoiceId:doc.id,voucherType:isJournal?'journal':'purchase',voucherXmlData});
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([xml],{type:'text/xml'}));
+  a.download='tally-'+String(doc.no||doc.id).replace(/[^\w.-]+/g,'_')+'.xml';a.click();
+  toast('XML downloaded — in Tally: Import Data ▸ Vouchers to see the exact exception if any','ok','⬇️');
+}
 function buildTallyVoucherXML(item){
   const d=item.voucherXmlData;
+  const isJ=item.voucherType==='journal';
   const mastersXml=buildTallyAutoMastersXML(item);
-  if(item.voucherType==='journal'){
-    // Accounting/expense invoice: Dr Expense (+GST unless ITC Reverse — see
-    // _buildTallyVoucherXmlData comment), Cr Party
-    const ledgerRows=[
-      `<ALLLEDGERENTRIES.LIST><LEDGERNAME>${xmlEscape(d.expenseLedger)}</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.taxable}</AMOUNT></ALLLEDGERENTRIES.LIST>`
-    ];
-    if(d.cgst>0)ledgerRows.push(`<ALLLEDGERENTRIES.LIST><LEDGERNAME>Input CGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.cgst}</AMOUNT></ALLLEDGERENTRIES.LIST>`);
-    if(d.sgst>0)ledgerRows.push(`<ALLLEDGERENTRIES.LIST><LEDGERNAME>Input SGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.sgst}</AMOUNT></ALLLEDGERENTRIES.LIST>`);
-    if(d.igst>0)ledgerRows.push(`<ALLLEDGERENTRIES.LIST><LEDGERNAME>Input IGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.igst}</AMOUNT></ALLLEDGERENTRIES.LIST>`);
-    // FIX ("mode of purchase invoice mode entry need in tally"): credits
-    // whichever ledger the Payment Mode actually implies (Cash/Bank
-    // Account for immediate payment, vendor's own Sundry Creditors only
-    // when genuinely "Credit") — see _buildTallyVoucherXmlData comment.
-    ledgerRows.push(`<ALLLEDGERENTRIES.LIST><LEDGERNAME>${xmlEscape(d.creditLedgerName||d.vendorName)}</LEDGERNAME><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>${d.grand}</AMOUNT></ALLLEDGERENTRIES.LIST>`);
-    return `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME></REQUESTDESC><REQUESTDATA>${mastersXml}<TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Journal" ACTION="Create"><DATE>${tallyDate(d.date,d.createdAt)}</DATE><NARRATION>${xmlEscape(d.narration)}</NARRATION><VOUCHERTYPENAME>Journal</VOUCHERTYPENAME><REFERENCE>${xmlEscape(d.invoiceNo)}</REFERENCE>${ledgerRows.join('')}</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+  const bal=_tallyBalance(d,isJ);
+  const tag=isJ?'ALLLEDGERENTRIES.LIST':'LEDGERENTRIES.LIST';
+  const row=(name,dr,amt)=>`<${tag}><LEDGERNAME>${xmlEscape(name)}</LEDGERNAME><ISDEEMEDPOSITIVE>${dr?'Yes':'No'}</ISDEEMEDPOSITIVE><AMOUNT>${dr?'-':''}${_tallyAmt(amt)}</AMOUNT></${tag}>`;
+  const gstRows=[];
+  if(d.cgst>0)gstRows.push(row('Input CGST',true,d.cgst));
+  if(d.sgst>0)gstRows.push(row('Input SGST',true,d.sgst));
+  if(d.igst>0)gstRows.push(row('Input IGST',true,d.igst));
+  const roundRow=bal.diff!==0?row('Round Off',bal.diff>0,Math.abs(bal.diff)):'';
+  const creditRow=row(d.creditLedgerName||d.vendorName,false,bal.grand);
+  const hdr=`<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME>${_tallyCompanyXml()}</REQUESTDESC><REQUESTDATA>${mastersXml}`;
+  const date=tallyDate(d.date,d.createdAt);
+  if(isJ){
+    const head=row(d.expenseLedger,true,d.taxable);
+    return `${hdr}<TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Journal" ACTION="Create"><DATE>${date}</DATE><NARRATION>${xmlEscape(d.narration)}</NARRATION><VOUCHERTYPENAME>Journal</VOUCHERTYPENAME><VOUCHERNUMBER>${xmlEscape(d.invoiceNo)}</VOUCHERNUMBER><REFERENCE>${xmlEscape(d.invoiceNo)}</REFERENCE>${head}${gstRows.join('')}${roundRow}${creditRow}</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
   }
-
-  // FIX ("import exception... mismatch" — Aug 2026): see the big comment
-  // in _buildTallyVoucherXmlData() for the full story. Each item's AMOUNT
-  // is now d.itcReverse-aware pcTaxable (the ONE place GST for that item
-  // lives when reversed) — no more redundant Purchase Ledger line
-  // duplicating the same taxable value the items already carry, and GST
-  // ledger lines only appear at all when NOT itcReverse (otherwise that
-  // GST is already inside each item's own AMOUNT above).
   const invRows=(d.items||[]).map(it=>
-    `<ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>${xmlEscape(it.name)}</STOCKITEMNAME><RATE>${it.rate}/${xmlEscape(it.unit||'Nos')}</RATE><AMOUNT>-${it.pcTaxable}</AMOUNT><ACTUALQTY>${it.qty} ${xmlEscape(it.unit||'Nos')}</ACTUALQTY><BILLEDQTY>${it.qty} ${xmlEscape(it.unit||'Nos')}</BILLEDQTY></ALLINVENTORYENTRIES.LIST>`
+    `<ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>${xmlEscape(it.name)}</STOCKITEMNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><RATE>${it.rate}/${xmlEscape(it.unit||'Nos')}</RATE><AMOUNT>-${_tallyAmt(it.pcTaxable)}</AMOUNT><ACTUALQTY>${it.qty} ${xmlEscape(it.unit||'Nos')}</ACTUALQTY><BILLEDQTY>${it.qty} ${xmlEscape(it.unit||'Nos')}</BILLEDQTY><ACCOUNTINGALLOCATIONS.LIST><LEDGERNAME>${xmlEscape(d.purchaseLedger)}</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${_tallyAmt(it.pcTaxable)}</AMOUNT></ACCOUNTINGALLOCATIONS.LIST></ALLINVENTORYENTRIES.LIST>`
   ).join('');
-  const ledgerRows=[];
-  if(d.cgst>0)ledgerRows.push(`<LEDGERENTRIES.LIST><LEDGERNAME>Input CGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.cgst}</AMOUNT></LEDGERENTRIES.LIST>`);
-  if(d.sgst>0)ledgerRows.push(`<LEDGERENTRIES.LIST><LEDGERNAME>Input SGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.sgst}</AMOUNT></LEDGERENTRIES.LIST>`);
-  if(d.igst>0)ledgerRows.push(`<LEDGERENTRIES.LIST><LEDGERNAME>Input IGST</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${d.igst}</AMOUNT></LEDGERENTRIES.LIST>`);
-  // FIX ("mode of purchase invoice mode entry need in tally"): same
-  // payment-mode-aware credit ledger as the Journal path above.
-  ledgerRows.push(`<LEDGERENTRIES.LIST><LEDGERNAME>${xmlEscape(d.creditLedgerName||d.vendorName)}</LEDGERNAME><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>${d.grand}</AMOUNT></LEDGERENTRIES.LIST>`);
-
-  return `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME></REQUESTDESC><REQUESTDATA>${mastersXml}<TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Purchase" ACTION="Create"><DATE>${tallyDate(d.date,d.createdAt)}</DATE><PARTYLEDGERNAME>${xmlEscape(d.vendorName)}</PARTYLEDGERNAME><VOUCHERTYPENAME>Purchase</VOUCHERTYPENAME><REFERENCE>${xmlEscape(d.invoiceNo)}</REFERENCE>${invRows}${ledgerRows.join('')}</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+  return `${hdr}<TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="Purchase" ACTION="Create"><DATE>${date}</DATE><PARTYLEDGERNAME>${xmlEscape(d.vendorName)}</PARTYLEDGERNAME><VOUCHERTYPENAME>Purchase</VOUCHERTYPENAME><VOUCHERNUMBER>${xmlEscape(d.invoiceNo)}</VOUCHERNUMBER><REFERENCE>${xmlEscape(d.invoiceNo)}</REFERENCE><ISINVOICE>Yes</ISINVOICE><PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>${invRows}${gstRows.join('')}${roundRow}${creditRow}</VOUCHER></TALLYMESSAGE></REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
 }
 
 // Shared builder: same shape used by enqueueTallyVoucher (queued/auto path)
@@ -4470,6 +4506,7 @@ async function postSingleToTally(id,mode){
   const arr=mode==='accounting'?DB.acctInvs:DB.purchases;
   const doc=arr.find(x=>x.id===id);
   if(!doc){toast('Record not found','err','⚠️');return;}
+  _askTallyCompanyOnce();
   _tallyPostingInProgress.add(id);
   rendRegs(); // re-render immediately so the row shows a "posting" state (see dd-item below)
   const {isJournal,voucherXmlData}=_buildTallyVoucherXmlData(doc);
@@ -4480,7 +4517,7 @@ async function postSingleToTally(id,mode){
     await fetch(TALLY_GATEWAY_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/xml'},body:xml});
     await erpApi('TALLY_MARK_STATUS',{invoiceId:doc.id,status:'POSTED'});
     _updateLocalTallyStatus(doc.id,'POSTED','');
-    toast('✅ '+doc.no+' posted to Tally ('+(isJournal?'account head':'item-wise')+')','ok','✅');
+    toast('✅ '+doc.no+' sent to Tally ('+(isJournal?'account head':'item-wise')+') — confirm in Tally Day Book','ok','✅');
   }catch(e){
     await erpApi('TALLY_MARK_STATUS',{invoiceId:doc.id,status:'FAILED',error:e.message});
     _updateLocalTallyStatus(doc.id,'FAILED',e.message);
@@ -4507,11 +4544,68 @@ async function postAllPendingToTally(){
     toast('Already posting pending invoices — please wait for the current run to finish','','⏳');
     return;
   }
+  _askTallyCompanyOnce();
   toast('📤 Posting all pending invoices to Tally...','','📤');
   await pollTallyQueue();
-  toast('✅ Done — check the Tally column for each record\'s status','ok','✅');
   rendRegs();
+  const bad=_collectTallyProblemInvoices();
+  if(bad.length){
+    toast('⚠️ '+bad.length+' invoice(s) have problems — opening fix list','warn','⚠️');
+    openTallyFixQueue(bad);
+  }else{
+    toast('✅ Done — check the Tally column for each record\'s status','ok','✅');
+  }
 }
+
+// ── Fix entries one by one: invoices that failed Tally or have missing/invalid data ──
+let _tallyFixQueue=[];
+function _invoiceProblems(p){
+  const issues=[];
+  if(p.tallyStatus==='FAILED')issues.push('Tally post failed'+(p.tallyError?': '+p.tallyError:''));
+  if(!p.vendorId&&!p.vendorName)issues.push('Vendor missing');
+  if(!(+p.grand>0))issues.push('Total is zero');
+  if(p.mode!=='accounting'&&!(p.items&&p.items.length))issues.push('No items');
+  if(p.mode!=='accounting'&&!p.ledgerAccountId)issues.push('Purchase ledger/head not selected');
+  if(p.synced===false)issues.push('Not synced to server');
+  return issues;
+}
+function _collectTallyProblemInvoices(){
+  const out=[];
+  [['inventory',DB.purchases],['accounting',DB.acctInvs]].forEach(([m,arr])=>{
+    (arr||[]).forEach(p=>{
+      if(p.tallyStatus==='POSTED'&&p.synced!==false)return;
+      const issues=_invoiceProblems(p);
+      if(issues.length)out.push({id:p.id,mode:p.mode||m,no:p.no,vendor:p.vendorName||'',issues});
+    });
+  });
+  return out;
+}
+function openTallyFixQueue(list){
+  _tallyFixQueue=list||_collectTallyProblemInvoices();
+  let box=el('tallyFixQueueBox');
+  if(!box){
+    box=document.createElement('div');box.id='tallyFixQueueBox';
+    box.style.cssText='position:fixed;right:16px;bottom:16px;z-index:99999;width:340px;max-height:60vh;overflow:auto;background:#fff;border:1px solid #FDBA74;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.2);font:12px system-ui,sans-serif;color:#222';
+    document.body.appendChild(box);
+  }
+  renderTallyFixQueue();
+}
+function renderTallyFixQueue(){
+  const box=el('tallyFixQueueBox');if(!box)return;
+  // drop entries that are now clean
+  _tallyFixQueue=_tallyFixQueue.filter(q=>{
+    const p=(q.mode==='accounting'?DB.acctInvs:DB.purchases).find(x=>x.id===q.id);
+    if(!p)return false;q.issues=_invoiceProblems(p);return q.issues.length>0&&p.tallyStatus!=='POSTED';
+  });
+  if(!_tallyFixQueue.length){box.innerHTML='<div style="padding:12px"><b>✅ All entries fixed.</b> <button class="btn btn-sm" onclick="el(\'tallyFixQueueBox\').remove()">Close</button></div>';return;}
+  box.innerHTML='<div style="padding:10px 12px;background:#FFF7ED;border-bottom:1px solid #FED7AA;display:flex;justify-content:space-between;align-items:center"><b>⚠️ Fix entries ('+_tallyFixQueue.length+')</b><span><button class="btn btn-sm btn-primary" onclick="fixNextTallyEntry()">Fix next ▶</button> <button class="btn btn-sm" onclick="el(\'tallyFixQueueBox\').remove()">✕</button></span></div>'+
+    _tallyFixQueue.map(q=>'<div style="padding:8px 12px;border-bottom:1px solid #eee;cursor:pointer" onclick="fixTallyEntry(\''+q.id+'\',\''+q.mode+'\')"><b>'+xmlEscape(q.no||q.id)+'</b> <span style="color:#666">'+xmlEscape(q.vendor)+'</span><div style="color:#dc2626">'+q.issues.map(xmlEscape).join(' • ')+'</div></div>').join('');
+}
+function fixTallyEntry(id,mode){ editPurchase(id,mode); openM('mPurch'); }
+function fixNextTallyEntry(){ if(_tallyFixQueue.length)fixTallyEntry(_tallyFixQueue[0].id,_tallyFixQueue[0].mode); }
+// after each save/close of the edit modal, refresh the queue so the next entry is one click away
+const _origCloseM=closeM;
+closeM=function(id){ _origCloseM(id); if(id==='mPurch'&&el('tallyFixQueueBox'))setTimeout(renderTallyFixQueue,300); };
 
 // ── Poller: only does anything useful when Tally is actually reachable
 // (i.e. this page is open on the PC Tally runs on) ──
