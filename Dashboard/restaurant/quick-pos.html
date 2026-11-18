@@ -317,28 +317,47 @@ function buildBody(mode,ref){var T=totals(),d=new Date(),mob=$('mob').value.repl
     billDate:d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()),billTime:pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds())}};}
 function localToken(){var k=K('tk'),day=new Date().toDateString(),o={};try{o=JSON.parse(ls(k)||'{}');}catch(e){}if(o.d!==day)o={d:day,n:0};o.n++;ls(k,JSON.stringify(o));return o.n;}
 async function send(body){var r=await api('SAVE_BILL',body,75000);return r;}
-async function save(mode,ref,given){if(BUSY||!CART.length)return;BUSY=true;
-  var body=buildBody(mode,ref),snap={lines:CART.map(function(l){return Object.assign({},l);}),T:totals(),mode:mode,given:given,ot:OT,mob:body.bill.mob,name:body.bill.customer},tk=localToken();
-  ['cashOk','upiOk','cardOk'].forEach(function(b){$(b).disabled=true;$(b).dataset.t=$(b).textContent;$(b).textContent='Saving…';});
-  var r=null;try{r=await send(body);}catch(e){r={success:false,net:true,error:e.message};}
-  ['cashOk','upiOk','cardOk'].forEach(function(b){$(b).disabled=false;$(b).textContent=$(b).dataset.t||$(b).textContent;});BUSY=false;
-  var no='',queued=false;
-  if(r&&r.success){no=String((r.data&&r.data.BILL_NUMBER)||r.transactionId||'');
-    if(snap.mob&&snap.mob.length===10)api('WA_CRM_SAVE',{mobile:snap.mob,name:$('cname').value.trim(),source:'POS_BILL',note:'Quick POS bill '+no},20000).catch(function(){});}   /* customer kept in the guest CRM */
-  else if(r&&(r.net||/took too long|busy|timeout|SERVER_BUSY|Failed to fetch/i.test(String(r.error||r.message||'')))){var ob=outbox();ob.push({body:body,tk:tk,at:Date.now()});outbox(ob);queued=true;}
-  else{toast('Bill not saved: '+(r&&(r.message||r.error)||'no reply'),1);return;}
-  snap.no=no;snap.tk=tk;closeAll();$('cart').classList.remove('open');
-  $('tkBig').textContent=tk;$('doneMsg').textContent=(queued?'Saved on this device — will upload when online':'Bill '+no+' saved')+' · '+mode;$('doneSub').textContent=inr(snap.T.total)+(snap.given>snap.T.total?' · change '+inr(snap.given-snap.T.total):'');
+/* FAST SAVE (2026-11-19): token + print + clear happen instantly; the bill goes to the durable outbox first and
+   uploads in the background with a FIXED requestId — the server's bnxClaimRequest makes every retry return the same bill. */
+async function save(mode,ref,given){if(BUSY||!CART.length)return;var T0=totals();if(!(T0.total>0)){toast('Bill total is zero',1);return;}BUSY=true;
+  try{
+  var body=buildBody(mode,ref),snap={lines:CART.map(function(l){return Object.assign({},l);}),T:T0,mode:mode,given:given,ot:OT,mob:body.bill.mob,name:body.bill.customer,cname:$('cname').value.trim()},tk=localToken();
+  var ob=outbox();ob.push({body:body,tk:tk,at:Date.now(),mob:snap.mob,cname:snap.cname,tries:0});outbox(ob);   /* durable before anything else */
+  snap.no='';snap.tk=tk;snap.rid=body.requestId;closeAll();$('cart').classList.remove('open');
+  $('tkBig').textContent=tk;$('doneMsg').textContent='Token '+tk+' · '+mode+' · saving…';$('doneSub').textContent=inr(snap.T.total)+(snap.given>snap.T.total?' · change '+inr(snap.given-snap.T.total):'');
   $('waSend').style.display=snap.mob&&snap.mob.length===10?'':'none';window.__last=snap;open('ovDone');
-  if(KIOSK){if(directReady())setTimeout(function(){var k=PRN.kot;PRN.kot=true;printR(snap,{}).finally(function(){PRN.kot=k;});},150);}
-  else if(CFG.autoPrint||directReady())setTimeout(function(){printR(snap,{drawer:/CASH/i.test(mode)});},150);
   CART=[];$('mob').value='';$('cname').value='';drawCart();drawGrid();
+  setTimeout(function(){   /* next frame: token screen paints before the print dialog / printer socket */
+    if(KIOSK){if(directReady()){var k=PRN.kot;PRN.kot=true;printR(snap,{}).finally(function(){PRN.kot=k;});}}
+    else if(CFG.autoPrint||directReady())printR(snap,{drawer:/CASH/i.test(mode)});},30);
+  }finally{BUSY=false;}
+  setTimeout(pump,0);
 }
-async function flush(){var ob=outbox();if(!ob.length||!navigator.onLine)return;var keep=[];
-  for(var i=0;i<ob.length;i++){var r=await send(ob[i].body).catch(function(){return null;});if(!(r&&r.success)&&!(r&&r.success===false&&!r.net&&/duplicate/i.test(String(r.message||''))))keep.push(ob[i]);}
-  outbox(keep);if(ob.length>keep.length)toast((ob.length-keep.length)+' offline bill(s) uploaded');}
-function netState(){var n=outbox().length,on=navigator.onLine;$('net').textContent=on?(n?'Online · '+n+' to upload':'Online'):'Offline'+(n?' · '+n+' waiting':'');$('net').className='net'+(on?'':' off');}
-addEventListener('online',function(){netState();flush();});addEventListener('offline',netState);setInterval(flush,60000);
+function doneUpdate(rid,txt){var s=window.__last;if(s&&s.rid===rid&&$('ovDone').classList.contains('open'))$('doneMsg').textContent=txt;}
+var PUMPING=false;
+async function pump(force){if(PUMPING)return;PUMPING=true;var ok=0;
+  try{while(true){var ob=outbox(),it=null;
+      for(var i=0;i<ob.length;i++){if(!ob[i].bad||force){it=ob[i];break;}}
+      if(!it||!navigator.onLine)break;
+      var rid=it.body.requestId,r=null;try{r=await send(it.body);}catch(e){r={success:false,net:true,error:e.message};}
+      var cur=outbox(),idx=cur.findIndex(function(x){return x.body.requestId===rid;});
+      if(r&&r.success){var no=String((r.data&&r.data.BILL_NUMBER)||r.transactionId||'');if(idx>=0)cur.splice(idx,1);outbox(cur);ok++;
+        if(window.__last&&window.__last.rid===rid)window.__last.no=no;doneUpdate(rid,'Bill '+no+' saved · token '+it.tk);
+        if(it.mob&&it.mob.length===10)api('WA_CRM_SAVE',{mobile:it.mob,name:it.cname||'',source:'POS_BILL',note:'Quick POS bill '+no},20000).catch(function(){});
+        continue;}
+      var msg=String(r&&(r.error||r.message)||'no reply'),code=r&&r.statusCode;
+      var transient=!r||r.net||code===401||code===409||code>=500||/took too long|busy|timeout|SERVER_BUSY|Failed to fetch|retry|lock/i.test(msg);
+      if(idx>=0){cur[idx].tries=(cur[idx].tries||0)+1;cur[idx].err=msg;if(!transient)cur[idx].bad=true;outbox(cur);}
+      doneUpdate(rid,transient?'Saved on this device — uploading when the server answers':'⚠ Server refused: '+msg);
+      if(!transient)toast('Bill (token '+it.tk+') not accepted: '+msg+' — tap the status pill to retry',1);
+      break;}   /* stop on first failure; next pump retries in order */
+  }finally{PUMPING=false;netState();}
+  if(ok>1)toast(ok+' bills uploaded');}
+async function flush(){return pump(false);}
+function netState(){var ob=outbox(),n=ob.length,bad=ob.filter(function(x){return x.bad;}).length,on=navigator.onLine;$('net').textContent=(on?(n?'Online · '+n+' to upload':'Online'):'Offline'+(n?' · '+n+' waiting':''))+(bad?' · ⚠'+bad+' refused':'');$('net').className='net'+(on?'':' off');}
+addEventListener('online',function(){netState();pump();});addEventListener('offline',netState);setInterval(pump,15000);
+document.addEventListener('visibilitychange',function(){if(!document.hidden)pump();});
+try{$('net').style.cursor='pointer';$('net').onclick=function(){if(outbox().length){toast('Retrying upload…');pump(true);}};}catch(e){}
 
 function printBrowser(s){var sh=CFG.shop||{},h='<h4>'+esc(sh.name||'')+'</h4>'+(sh.address?'<div class="c">'+esc(sh.address)+'</div>':'')+(sh.gstin?'<div class="c">GSTIN '+esc(sh.gstin)+'</div>':'')+
   '<hr><div class="tk">TOKEN '+s.tk+'</div><div class="c">'+esc(s.ot)+(s.no?' · Bill '+esc(s.no):'')+'</div><div class="c">'+new Date().toLocaleString('en-IN')+'</div><hr><table>'+
@@ -445,7 +464,8 @@ $('holdsBtn').onclick=function(){var h=holds();$('holdsList').innerHTML=h.length
 $('holdsList').onclick=function(e){var b=e.target.closest('button[data-i]');if(!b)return;var h=holds(),x=h.splice(+b.getAttribute('data-i'),1)[0];holds(h);CART=x.lines;setOT(x.ot);$('mob').value=x.mob||'';drawCart();drawGrid();closeAll();toast('Token '+x.tk+' loaded — take Cash / UPI / Card');};
 paintHolds();
 
-applyCfg();drawCart();netState();loadMenu();loadCfg();setTimeout(flush,4000);kApply();
+applyCfg();drawCart();netState();loadMenu();loadCfg();setTimeout(pump,1500);kApply();
+setTimeout(function(){if(directReady())qzConnect().catch(function(){});},2500);   /* warm the printer link so the first bill prints instantly */
 document.addEventListener('keydown',function(e){if(e.key==='Escape')closeAll();});
 })();
 </script>
