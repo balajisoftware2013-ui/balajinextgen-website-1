@@ -1,6 +1,65 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<script id="bnx-stw-priority-lane-20261119">
+/* PRIORITY LANE (2026-11-19, "steward fast, no hang, fast print KOT").
+   ROOT CAUSE: one steward phone sent up to 19 server calls at the same time (tables, orders, KOT list, menu, printers,
+   reservations…). The Apps Script server answers them in a queue, so a KOT tapped right after opening the app waited
+   10+ s behind the phone's own background reads — KOT_FAST_START missed its 7 s window and the KOT printed only after
+   the full order save (~19 s).
+   FIX at the network layer (every gasApi / fetch path goes through it):
+   • saves / KOT / bill / print calls go out AT ONCE, never queued;
+   • background reads: max 3 at a time (5 for a read already waiting 8 s), and new reads wait while a save/KOT is in flight, so the KOT is always next in
+     the server's queue; old reads get the 2 spare slots first, so screens keep filling;
+   • order screen open: only 1 background read at a time (2 for an old one), so a tap on Send KOT is answered first;
+   • nothing is dropped, cached or changed — reads just start a moment later; an aborted read leaves the queue. */
+(function(){
+  var W=window; if(W.__bnxLane)return; var oF=W.fetch; if(typeof oF!=='function')return;
+  var MAX_READ=3, OVER=5, MAX_WAIT=8000, reads=0, writes=0, q=[], stats={reads:0,writes:0,held:0,maxWait:0};
+  var READ=/^(GET_|LIST_|FETCH_|RD_FETCH|SEARCH_|LOAD_|PING|BNX_WHOAMI|HEARTBEAT|CHECK_|VERSION|BNX_VERSION)|_GET$|_LIST$|_STATUS_GET$/i;
+  function actionOf(input,init){
+    try{ var b=init&&init.body; if(typeof b==='string'&&b.charAt(0)==='{'){ var m=b.match(/"action"\s*:\s*"([^"]+)"/); if(m)return m[1]; } }catch(e){}
+    try{ var u=typeof input==='string'?input:(input&&input.url)||''; var m2=String(u).match(/[?&]action=([^&]+)/); if(m2)return decodeURIComponent(m2[1]); }catch(e){}
+    return '';
+  }
+  function isGas(input){ var u=typeof input==='string'?input:(input&&input.url)||''; return /script\.google(usercontent)?\.com\//.test(String(u)); }
+  var tmr=0;
+  /* while the steward is building an order, only ONE background read travels — the KOT never stands behind a crowd */
+  function taking(){ try{ var e=document.getElementById('s-new-order'); return !!(e&&e.classList.contains('active')); }catch(x){ return false; } }
+  function pump(){
+    for(var i=0;i<q.length;){
+      var j=q[i]; if(j.dead){ q.splice(i,1); continue; }
+      var waited=Date.now()-j.t;
+      /* start when a slot is free and no save/KOT is travelling; a read waiting 8 s+ may use 2 extra slots (never a burst) */
+      var cap=taking()?1:MAX_READ, over=taking()?2:OVER;
+      if((writes===0&&reads<cap)||(waited>=MAX_WAIT&&reads<over)){ q.splice(i,1); if(waited>stats.maxWait)stats.maxWait=waited; if(writes>0)stats.held++; start(j); continue; }
+      i++;
+    }
+    clearTimeout(tmr); if(q.length)tmr=setTimeout(pump,250);
+  }
+  function start(j){ reads++; var done=false; function fin(){ if(done)return; done=true; reads--; pump(); }
+    var p; try{ p=oF.apply(j.self,j.args); }catch(e){ fin(); j.no(e); return; }
+    p.then(function(r){ fin(); j.ok(r); },function(e){ fin(); j.no(e); }); }
+  W.fetch=function(input,init){
+    if(!isGas(input))return oF.apply(this,arguments);
+    var A=actionOf(input,init), self=this, args=arguments;
+    if(!A||!READ.test(A)){                                            /* save / KOT / bill / print: straight out */
+      writes++; stats.writes++; var p; try{ p=oF.apply(self,args); }catch(e){ writes--; pump(); throw e; }
+      var end=function(){ writes=Math.max(0,writes-1); pump(); }; p.then(end,end); return p;
+    }
+    stats.reads++;
+    if(reads<(taking()?1:MAX_READ)&&writes===0&&!q.length){ return new Promise(function(ok,no){ start({self:self,args:args,ok:ok,no:no,t:Date.now()}); }); }
+    return new Promise(function(ok,no){
+      var j={self:self,args:args,ok:ok,no:no,t:Date.now()}; q.push(j);
+      var sig=init&&init.signal; if(sig){ if(sig.aborted){ j.dead=true; var e0=new Error('aborted');e0.name='AbortError'; no(e0); return; }
+        sig.addEventListener('abort',function(){ if(q.indexOf(j)>=0){ j.dead=true; var e=new Error('The operation was aborted.'); e.name='AbortError'; no(e); } },{once:true}); }
+      pump();
+    });
+  };
+  W.__bnxLane=true;
+  W.bnxLaneStats=function(){ return Object.assign({inFlightReads:reads,inFlightWrites:writes,queued:q.length},stats); };
+})();
+</script>
 <script id="bnx-core-pin-20261118">
 /* 2026-11-18 ROOT FIX ("Unknown action: GET_DASHBOARD_SUMMARY", nothing loads): when the core server was slow, the page
    switched V2_CORE to another deployment that answers BNX_WHOAMI — the LOGIN (V2_AUTH) project — and saved it in
