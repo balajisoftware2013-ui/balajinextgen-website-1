@@ -2,6 +2,66 @@
 <!-- BALAJI NEXTGEN ERP · FINAL MASTER AUDIT · 2026-09-08 -->
 <html lang="en">
 <head>
+<script id="bnx-rd-priority-lane-20261119">
+/* PRIORITY LANE (2026-11-19, "order register loading take time · items loading take time").
+   ROOT CAUSE: on open the dashboard sends 10-20 background reads at once (masters, staff, dues, DSR, floor, KOT batch…).
+   The Apps Script server answers them in a queue, so the read the user is WAITING for (Order Register list, bill items,
+   bill list, table bill) stood behind all of them (2.6 s+ on a quiet server, much more on a busy night).
+   FIX at the network layer (every gasApi / fetch path goes through it):
+   • saves / KOT / bill / print and every read started by a tap (1.5 s) or for the open screen go out AT ONCE;
+   • other background reads: max 3 at a time, and they wait while a save is travelling; a read waiting 8 s+ may use
+     2 spare slots, so nothing is starved; nothing is dropped, cached or changed. */
+(function(){
+  var W=window; if(W.__bnxLane)return; var oF=W.fetch; if(typeof oF!=='function')return;
+  var MAX_READ=3, OVER=5, MAX_WAIT=8000, reads=0, writes=0, q=[], lastTap=0, tmr=0,
+      stats={reads:0,fg:0,writes:0,held:0,maxWait:0};
+  var READ=/^(GET_|LIST_|FETCH_|RD_FETCH|SEARCH_|LOAD_|PING|BNX_WHOAMI|HEARTBEAT|CHECK_|VERSION|BNX_VERSION|DUES_LIST|NEXT_BILL_NO|DSR_)|_GET$|_LIST$/i;
+  var FG=/^(GET_ORDERS|LIST_BILLS|GET_BILLS|GET_BILL_FOR_REPRINT|GET_BILL_DETAIL|GET_BILL_ITEMS|GET_BILL_ITEMS_DAY|GET_TABLE_BILL_CONTEXT|GET_TRANSFER_CONTEXT|GET_ACTIVE_ORDERS|GET_TABLE_FLOOR|GET_POS_MENU)$/i;
+  ['pointerdown','keydown'].forEach(function(e){ try{ document.addEventListener(e,function(){ lastTap=Date.now(); },{capture:true,passive:true}); }catch(x){} });
+  W.addEventListener('hashchange',function(){ lastTap=Date.now(); });
+  function actionOf(input,init){
+    try{ var b=init&&init.body; if(typeof b==='string'&&b.charAt(0)==='{'){ var m=b.match(/"action"\s*:\s*"([^"]+)"/); if(m)return m[1]; } }catch(e){}
+    try{ var u=typeof input==='string'?input:(input&&input.url)||''; var m2=String(u).match(/[?&]action=([^&]+)/); if(m2)return decodeURIComponent(m2[1]); }catch(e){}
+    return '';
+  }
+  function isGas(input){ var u=typeof input==='string'?input:(input&&input.url)||''; return /script\.google(usercontent)?\.com\//.test(String(u)); }
+  function pump(){
+    for(var i=0;i<q.length;){
+      var j=q[i]; if(j.dead){ q.splice(i,1); continue; }
+      var waited=Date.now()-j.t;
+      if((writes===0&&reads<MAX_READ)||(waited>=MAX_WAIT&&reads<OVER)){ q.splice(i,1); if(waited>stats.maxWait)stats.maxWait=waited; if(writes>0)stats.held++; start(j); continue; }
+      i++;
+    }
+    clearTimeout(tmr); if(q.length)tmr=setTimeout(pump,250);
+  }
+  function start(j){ reads++; var done=false; function fin(){ if(done)return; done=true; reads--; pump(); }
+    var p; try{ p=oF.apply(j.self,j.args); }catch(e){ fin(); j.no(e); return; }
+    p.then(function(r){ fin(); j.ok(r); },function(e){ fin(); j.no(e); }); }
+  function direct(self,args,isWrite){
+    if(isWrite){ writes++; stats.writes++; } else stats.fg++;
+    var p; try{ p=oF.apply(self,args); }catch(e){ if(isWrite){ writes--; pump(); } throw e; }
+    if(isWrite){ var end=function(){ writes=Math.max(0,writes-1); pump(); }; p.then(end,end); }
+    return p;
+  }
+  W.fetch=function(input,init){
+    if(!isGas(input))return oF.apply(this,arguments);
+    var A=actionOf(input,init);
+    if(!A||!READ.test(A))return direct(this,arguments,true);                 /* save / KOT / bill / print */
+    if(FG.test(A)||Date.now()-lastTap<1500)return direct(this,arguments,false); /* what the user is waiting for */
+    stats.reads++;
+    var self=this,args=arguments;
+    if(reads<MAX_READ&&writes===0&&!q.length)return new Promise(function(ok,no){ start({self:self,args:args,ok:ok,no:no,t:Date.now()}); });
+    return new Promise(function(ok,no){
+      var j={self:self,args:args,ok:ok,no:no,t:Date.now()}; q.push(j);
+      var sig=init&&init.signal; if(sig){ if(sig.aborted){ j.dead=true; var e0=new Error('aborted');e0.name='AbortError'; no(e0); return; }
+        sig.addEventListener('abort',function(){ if(q.indexOf(j)>=0){ j.dead=true; var e=new Error('The operation was aborted.'); e.name='AbortError'; no(e); } },{once:true}); }
+      pump();
+    });
+  };
+  W.__bnxLane=true;
+  W.bnxLaneStats=function(){ return Object.assign({inFlightReads:reads,inFlightWrites:writes,queued:q.length},stats); };
+})();
+</script>
 <script id="bnx-core-pin-20261118">
 /* 2026-11-18 ROOT FIX ("Unknown action: GET_DASHBOARD_SUMMARY", nothing loads): when the core server was slow, the page
    switched V2_CORE to another deployment that answers BNX_WHOAMI — the LOGIN (V2_AUTH) project — and saved it in
@@ -2389,7 +2449,11 @@ async function gasApi(action, payload, endpoint) {
         }
       } catch(e){ resolve({success:false,error:e.message,statusCode:e.status||0}); }
     };
-    const critical = !bnxIsReadOnlyAction_(action);
+    /* 2026-11-19 ROOT FIX ("loading take time"): lookups that change nothing (PING, DUES_LIST, BILL_PAYMENTS, DASH_FIN, *_CFG_GET,
+       *_LIST, *_REPORT …) were treated as SAVES: they ran one at a time and each one held every read (order register, bill items)
+       for up to 10 s. They now queue as reads; real saves keep the front of the queue exactly as before. */
+    const __lookup = /_(GET|LIST|REPORT|STATUS)$|^(BILL_PAYMENTS|DASH_FIN|DUES_LIST|PING|HEARTBEAT|BNX_WHOAMI|SWIFT_MAP_LIST|BNX_DSR_RECEIPT_PERIOD|BNX_DSR_DUES_AS_OF)$/.test(String(action||'').toUpperCase()) && !/SAVE|SET_|UPDATE|DELETE|CREATE|POST|SETTLE|APPLY|CANCEL|VOID|IMPORT|CLEAR/.test(String(action||'').toUpperCase());
+    const critical = !bnxIsReadOnlyAction_(action) && !__lookup;
     /* SPEED 2026-10-08: the dashboard's own numbers (and day / client / menu basics) go to the FRONT of the read
        queue; slow background reads (ledgers, DSR, reports) may use at most 2 of the 5 parallel slots, so they can
        never hold up what is on screen ("Core is slow" with every card showing —). */
@@ -2399,6 +2463,10 @@ async function gasApi(action, payload, endpoint) {
     task.__floor=_act==='GET_TABLE_FLOOR'||_act==='GET_PENDING_TABLE_BILLS'||(_act==='RD_FETCH_SHEET'&&payload&&payload.tab==='04_TABLE_MASTER');
     if(task.__floor||task.__detail){task.__prio=true;task.__heavy=false;}
     task.__print=/^(GET_BILL_FOR_REPRINT|GET_BILL_DETAIL|GET_BILL_ITEMS|BILL_ITEMS)$/.test(_act);
+    /* 2026-11-19 ("loading products take time"): GET_BILL_ITEMS_DAY (all item lines of a day, used by View / Prev / Next) was not
+       in any class, so it queued as a background read behind every start-up / report read while the bill showed
+       "Loading items & rates…". It now goes in the bill View / Reprint lane. */
+    if(_act==='GET_BILL_ITEMS_DAY'){ task.__print=true; task.__heavy=false; }   /* View / Prev / Next wait for it (also when it was started a moment before the tap) */
     task.__billCrit=/^(SAVE_BILL|SAVE_ORDER|SAVE_KOT|SETTLE_|APPLY_TABLE_TRANSFER|TRANSFER_TABLE|MERGE_TABLES|CANCEL_OPEN_ORDER_FAST)/.test(_act);
     if(_act==='RD_FETCH_SHEET'&&payload&&payload.tab==='DUES_RECEIPT'&&document.getElementById('detailModal')&&document.getElementById('detailModal').style.display!=='none')task.__prio=true;
     if (/^(LIST_BILLS|GET_BILLS|GET_STAFF_LIST|GET_DASHBOARD_SUMMARY|GET_DAY_STATUS|GET_CLIENT_INFO|GET_CONFIG|GET_BOOTSTRAP|GET_POS_MENU|GET_MENU_ITEMS|GET_BAR_MENU|GET_ACTIVE_ORDERS|GET_TABLE_FLOOR|GET_TABLE_LAYOUT|GET_TAX_CONFIG|HEARTBEAT|PING|GET_BILL_DETAIL|GET_BILL_FOR_REPRINT)$/.test(_act)
@@ -2452,7 +2520,7 @@ function processRequestQueue() {
     const crit = !!task.__crit;
     /* SPEED 2026-10-28: a running SAVE_BILL used to hold EVERY read (tables, POS order, KOT) with no time limit. On-screen
        reads now wait at most 1.5 s for a save, background reads at most the normal hold. */
-    const __onScreenRead = !!(task.__floor||task.__tableContext||task.__detail||task.__prio);
+    const __onScreenRead = !!(task.__floor||task.__tableContext||task.__detail||task.__prio||task.__print);   /* 2026-11-19: bill View / Reprint reads wait max 1.5 s for a save (were held up to 10 s) */
     const critHold = ((REQUEST_QUEUE.billActive||0)>0 || REQUEST_QUEUE.critActive > 0) && (Date.now() - (REQUEST_QUEUE.critSince||0)) < (__onScreenRead ? 1500 : (window.bnxCritHoldMs_?window.bnxCritHoldMs_():10000));   // reads yield to a write for max 10 s
     /* 2026-10-15 SPEED: on-screen basics (menu, day status, tables, tax) get 3 reserved lanes — they never wait behind
        5 slow report reads. While Apps Script is slow (avg > 10 s) background reads drop to 3 at a time: fewer
@@ -2464,7 +2532,7 @@ function processRequestQueue() {
     if(!crit&&!task.__print&&!task.__floor&&!task.__detail&&((REQUEST_QUEUE.printActive||0)>0||P.some(function(x){return x.__print;}))){i++;continue;}
     if(!crit&&!task.__print&&!task.__floor&&!task.__detail&&((REQUEST_QUEUE.tableContextActive||0)>0||(REQUEST_QUEUE.detailActive||0)>0||P.some(function(x){return x.__detail;}))){i++;continue;}
     if(task.__print&&(REQUEST_QUEUE.printActive||0)>=1){i++;continue;}
-    if (!crit && ((window.__bnxReceiptWriteActive>0) || critHold || (task.__tableContext ? (REQUEST_QUEUE.tableContextActive||0)>=2 : task.__floor ? (REQUEST_QUEUE.floorActive||0)>=1 : task.__detail ? (REQUEST_QUEUE.detailActive||0)>=1 : REQUEST_QUEUE.active >= cap))) { i++; continue; }
+    if (!crit && ((window.__bnxReceiptWriteActive>0) || critHold || (task.__tableContext ? (REQUEST_QUEUE.tableContextActive||0)>=2 : task.__floor ? (REQUEST_QUEUE.floorActive||0)>=1 : task.__detail ? (REQUEST_QUEUE.detailActive||0)>=1 : task.__print ? false /* 2026-11-19: own lane (1 at a time), never behind background reads */ : REQUEST_QUEUE.active >= cap))) { i++; continue; }
     if (task.__heavy && !task.__floor && !task.__detail && (REQUEST_QUEUE.heavyActive||0) >= 2) { i++; continue; }      /* keep 3 slots free for on-screen reads */
     P.splice(i, 1);
     if(task.__floor)REQUEST_QUEUE.floorActive=(REQUEST_QUEUE.floorActive||0)+1;
@@ -10710,14 +10778,14 @@ if(D.readyState==='loading')D.addEventListener('DOMContentLoaded',watch);else wa
          first time DSR Reports is opened. Client comes from the session, not the URL
          (hard-coded client=CL00010 removed). -->
     <iframe id="dsrFrame"
-      data-src="dsr-client.html?v=20261109-instant-v27"
+      data-src="dsr-client.html?v=20261119-dues-instant-v28"
       title="DSR Client — Live DSR / Swift Transaction Report"
       style="width:100%;height:100%;border:0;display:block;background:transparent;"
       onload="window.bnxDsrFrameLoaded&&window.bnxDsrFrameLoaded();"
       onerror="document.getElementById('dsrFrameFallback').style.display='flex'"></iframe>
     <div id="dsrFrameFallback" style="display:none;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:40px;color:var(--text3);font-size:13px;text-align:center;">
       ⚠️ Could not load dsr-client.html here.<br>Make sure dsr-client.html is uploaded in the same folder as this dashboard file, then
-      <button class="btn btn-sm btn-primary" onclick="window.open('dsr-client.html?v=20261109-instant-v27','_blank')">Open Full DSR Client</button>
+      <button class="btn btn-sm btn-primary" onclick="window.open('dsr-client.html?v=20261119-dues-instant-v28','_blank')">Open Full DSR Client</button>
     </div>
   </div>
 </div>
@@ -32046,7 +32114,7 @@ const REPORTS_META = [
   {cat:'sales', accent:'#B8690E', icon:'📒', title:'Debtors Report', desc:'Outstanding dues aging 0-30 / 30-60 / 60+ days', anchor:'debtors'},
   {cat:'sales', accent:'#B8690E', icon:'💎', title:'Tips & Swipe Report', desc:'Steward-wise tips, card swipes & UPI collections', anchor:'tips'},
   {cat:'dsr', accent:'#2563EB', icon:'📅', title:'Daily Sales Report', desc:'Full day-end breakdown for selected period', anchor:'daily-sales'},
-  {cat:'dsr', accent:'#2563EB', icon:'👤', title:'Client DSR', desc:'Per-client daily sales view', href:'dsr-client.html?v=20261109-instant-v27'},
+  {cat:'dsr', accent:'#2563EB', icon:'👤', title:'Client DSR', desc:'Per-client daily sales view', href:'dsr-client.html?v=20261119-dues-instant-v28'},
   {cat:'dsr', accent:'#2563EB', icon:'📊', title:'Monthly DSR Report', desc:'Day-by-day DSR matrix for the whole month', anchor:'dsr-csv'},
   {cat:'recon', accent:'#0891B2', icon:'🔄', title:'Sale vs Bank Reconciliation', desc:'Match DSR sales against bank/UPI settlement', anchor:'recon-csv'},
   {cat:'cancel', accent:'#DC2626', icon:'❌', title:'Cancelled Bill Report', desc:'Every cancelled bill with reason & authoriser', anchor:'cancelled-bills'},
@@ -47027,7 +47095,7 @@ body:has(#page-customer-credit.active) #bnxGlobalPeriodBar{display:none!importan
     var f=frame();if(!f)return;
     if(f.dataset.parked==='1'||!f.getAttribute('src')){ if(active()) ensure(); return; }
     if(!hard){try{var w=f.contentWindow;if(w&&typeof w.bnxFinalDsrReload_==='function'){w.bnxFinalDsrReload_();last=Date.now();return;}}catch(e){}}
-    var base=f.getAttribute('data-src')||'dsr-client.html?v=20261109-instant-v27';
+    var base=f.getAttribute('data-src')||'dsr-client.html?v=20261119-dues-instant-v28';
     try{window.bnxDsrLoader&&window.bnxDsrLoader(true);}catch(e){} f.src=base+(base.indexOf('?')>-1?'&':'?')+'t='+Date.now();last=Date.now();
   };
   /* 2026-10-08 ROOT FIX (console full of "[API_DEBUG] Fetch error" from dsr-client.html while on Settings / Home):
@@ -47071,7 +47139,7 @@ body:has(#page-customer-credit.active) #bnxGlobalPeriodBar{display:none!importan
     var f=frame();if(!f)return;
     clearTimeout(parkT);
     var src=f.getAttribute('src')||'';
-    if(!src||f.dataset.parked==='1'||/^about:blank/.test(src)){ f.dataset.parked=''; try{window.bnxDsrLoader&&window.bnxDsrLoader(true);}catch(e){} f.src=f.getAttribute('data-src')||'dsr-client.html?v=20261109-instant-v27'; }
+    if(!src||f.dataset.parked==='1'||/^about:blank/.test(src)){ f.dataset.parked=''; try{window.bnxDsrLoader&&window.bnxDsrLoader(true);}catch(e){} f.src=f.getAttribute('data-src')||'dsr-client.html?v=20261119-dues-instant-v28'; }
     fit();
   }
   function park(){
@@ -51844,7 +51912,7 @@ function preloadItemIndex(){
    so the bill opens as soon as the day arrives and Next / Previous on the same day open at once. A past day is kept on this PC
    (localStorage, 40 days), so it is read from the server only once. Falls back to the one-bill read if the server has no such action. */
 var dayJobs=W.__bnxBillItemDayJobs=W.__bnxBillItemDayJobs||{};
-function billDay(no){var b=billFor(no)||{};var v=String(b.businessDate||b.BUSINESS_DATE||b.dt||b.date||b.BILL_DATE||'');var m=v.match(/^(\d{4})-(\d{2})-(\d{2})/);if(m)return m[0];m=v.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})/);return m?m[3]+'-'+('0'+m[2]).slice(-2)+'-'+('0'+m[1]).slice(-2):'';}
+function billDay(no){var b=billFor(no)||{};var v=String(b.businessDate||b.BUSINESS_DATE||b.dt||b.date||b.BILL_DATE||'');if(!v){try{var _o=(W.orderRegData||[]).find(function(o){return String(o.BILL_NUMBER||o.INVOICE_NO||'')===String(no);});if(_o)v=String(_o.BUSINESS_DATE||_o.ORDER_DATE||'');}catch(e){}}var m=v.match(/^(\d{4})-(\d{2})-(\d{2})/);if(m)return m[0];m=v.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})/);return m?m[3]+'-'+('0'+m[2]).slice(-2)+'-'+('0'+m[1]).slice(-2):'';}
 function dayKey(c,d){return 'bnx_bill_items_day_v1_'+c+'_'+d;}
 function putDay(c,d,bills){Object.keys(bills||{}).forEach(function(n){var it=normItems(bills[n]);if(it.length&&!(itemCache[n]&&itemCache[n].length))itemCache[n]=it;});}
 function loadDayItems(d){
@@ -68384,7 +68452,7 @@ html body #page-dashboard .bnxd-kpi .stat-chg{flex:0 0 auto!important;margin-top
   /* ---- one entry point for every "open DSR" click: opens inside the dashboard, never navigates away ---- */
   window.bnxOpenDsrClient=function(){
     var nav=document.querySelector('.nav-item[onclick*="dsr-reports"]');
-    try{ showPage('dsr-reports',nav); }catch(e){ try{ window._erpNavigating=true; location.href='dsr-client.html?v=20261109-instant-v27&client='+encodeURIComponent(window.CLIENT_ID||''); }catch(_){} }
+    try{ showPage('dsr-reports',nav); }catch(e){ try{ window._erpNavigating=true; location.href='dsr-client.html?v=20261119-dues-instant-v28&client='+encodeURIComponent(window.CLIENT_ID||''); }catch(_){} }
   };
   /* ---- warm the DSR in the background shortly after the dashboard is up (and on hover/touch) so a click is instant ---- */
   function warm(){ try{ window.bnxDsrEnsure&&window.bnxDsrEnsure(); }catch(e){} }
@@ -76811,6 +76879,55 @@ W.addEventListener('load',function(){setTimeout(boot,500);setTimeout(boot,3000);
   D.addEventListener('keydown', function(e){ if (e.key === 'Escape' && D.getElementById('bnxCtrM') && D.getElementById('bnxCtrM').classList.contains('on')) unmodal(); });
 })();
 
+</script>
+<style id="bnx-topbar-tidy-20261119">
+/* TOP BAR TIDY (2026-11-19, "fix look top places"): the status dock let its pills run past its edge, so the version text
+   and the KOT-station warning were cut in the middle and ran under the role chip; "Loading…" sat on top of the
+   connection text. Now every pill shrinks with "…" (full text on hover), the warning keeps priority, the connection
+   text is readable, and the busy chip sits at the bottom-right where it covers nothing. */
+html body .db-bar{gap:6px!important}
+html body #bnxStatusDock{display:flex!important;align-items:center!important;gap:6px!important;min-width:0!important;overflow:hidden!important}
+html body #bnxStatusDock>*{flex:0 1 auto!important;min-width:0!important;overflow:hidden!important;text-overflow:ellipsis!important;white-space:nowrap!important}
+html body #bnxStatusDock>#bnx-ver-badge{flex:0 3 auto!important;max-width:280px!important}
+html body #bnxStatusDock>#bnx-station-chip{flex:0 1 auto!important;max-width:340px!important}
+html body #bnxStatusDock>.bnx-status-wrap,html body #bnxStatusDock>#bnxApvFab{flex:0 0 auto!important}
+html body #bnxStatusDock>#bnxBalPill{flex:0 2 auto!important;max-width:170px!important}
+html body #bnx-ver-badge,html body #bnx-station-chip,html body #bnxBalPill{text-overflow:ellipsis!important}
+html body #dbRoleCluster{flex:0 0 auto!important;margin-left:6px!important}
+html body #dbSync{color:rgba(255,255,255,.88)!important;opacity:1!important;flex:0 1 auto!important;min-width:0!important;text-overflow:ellipsis!important}
+html body #bnx-busy-bar span{top:auto!important;bottom:calc(14px + env(safe-area-inset-bottom,0px))!important;right:16px!important;box-shadow:0 2px 8px rgba(0,0,0,.25)}
+@media (max-width:1280px){html body #bnxStatusDock>#bnx-ver-badge{max-width:170px!important}html body #bnxStatusDock>#bnx-station-chip{max-width:240px!important}}
+</style>
+<script id="bnx-topbar-tidy-js-20261119">
+/* full text of any cut pill on hover */
+(function(D){function tip(){['bnx-ver-badge','bnx-station-chip','bnxBalPill','dbSync','bnx-live-badge'].forEach(function(id){var e=D.getElementById(id);if(e){var t=(e.textContent||'').replace(/\s+/g,' ').trim();if(t&&e.getAttribute('title')!==t&&!e.dataset.bnxOwnTitle)e.setAttribute('title',t);}});}
+try{new MutationObserver(function(){clearTimeout(tip.t);tip.t=setTimeout(tip,300);}).observe(D.documentElement,{subtree:true,characterData:true,childList:true});}catch(e){}setTimeout(tip,1500);})(document);
+</script>
+
+<script id="bnx-orreg-items-prefetch-20261119">
+/* ITEMS READY BEFORE THE TAP (2026-11-19, "loading products take time"): when Order Register / Bills List shows a day,
+   that day's bill items are fetched once in the background (one GET_BILL_ITEMS_DAY per day, max 3 days, past days kept on
+   this PC), so View / Prev / Next open with items at once instead of "Loading items & rates…". */
+(function(W,D){
+  var done={};
+  function days(){
+    var out={},pg=(D.querySelector('.page.active')||{}).id||'';
+    if(pg==='page-order-register')(W.orderRegData||[]).forEach(function(o){if(o.BILL_NUMBER||o.INVOICE_NO){var d=String(o.BUSINESS_DATE||o.ORDER_DATE||'').slice(0,10);if(/^\d{4}-\d{2}-\d{2}$/.test(d))out[d]=(out[d]||0)+1;}});
+    else if(pg==='page-bills-list'&&typeof W.blGetAllBills==='function')(W.blGetAllBills()||[]).forEach(function(b){var d=String(b.businessDate||b.BUSINESS_DATE||b.dt||b.date||b.BILL_DATE||'').slice(0,10);if(/^\d{4}-\d{2}-\d{2}$/.test(d))out[d]=(out[d]||0)+1;});
+    return Object.keys(out).sort().reverse().slice(0,3);
+  }
+  function run(){
+    if(D.hidden||typeof W.bnxLoadBillItemsDay_!=='function')return;
+    var cid=String(W.CLIENT_ID||'');
+    days().forEach(function(d,i){var k=cid+'|'+d;if(done[k]&&Date.now()-done[k]<120000)return;done[k]=Date.now();
+      setTimeout(function(){try{W.bnxLoadBillItemsDay_(d);}catch(e){}},400+i*700);});
+  }
+  var t=0;function soon(){clearTimeout(t);t=setTimeout(run,1200);}
+  W.addEventListener('hashchange',soon);setInterval(soon,30000);
+  try{new MutationObserver(soon).observe(D.getElementById('orderRegList')||D.body,{childList:true});}catch(e){}
+  try{var bl=D.getElementById('blTableBody');if(bl)new MutationObserver(soon).observe(bl,{childList:true});}catch(e){}
+  soon();
+})(window,document);
 </script>
 </body></html>
 
