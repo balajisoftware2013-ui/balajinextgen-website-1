@@ -1763,10 +1763,10 @@ async function uploadManualBillAndAttach(docId, mode){
       clientId:CLIENT_ID, fileName:billFileName, mimeType:file.type||'application/octet-stream',
       base64Data, subPath:['Purchase Invoice',monthStr]
     });
-    if(!res||!res.success||!res.url){toast('⚠️ Bill file upload failed — invoice saved without it','warn','⚠️');return;}
+    if(!res||!res.success||!res.url){toast('⚠️ Bill file upload failed: '+((res&&res.message)||'no response from server')+' — invoice saved without it','warn','⚠️');console.warn('[Bill upload] server said:',res);return;}
     const link=res.url;
     const idx=arr.findIndex(x=>x.id===docId);
-    if(idx>=0){arr[idx].billFileUrl=link;save();rendPurchaseList();rendRegs();}
+    if(idx>=0){arr[idx].billFileUrl=link;save();rendPurchaseList();rendRegs();bnxPersistBillLink(arr[idx],link);}
     toast((res.usedSharedAccount?'📎 Bill uploaded — shareable link ready, linked to ':'📎 Bill uploaded to your Drive and linked to ')+(idx>=0?arr[idx].no:'invoice'),'ok','📁');
   }catch(e){
     console.warn('Manual bill upload failed:',e);
@@ -1976,6 +1976,71 @@ async function deletePurchaseInvoiceRowFromServer(id){
     return {success:false,message:e.message};
   }
 }
+
+// ════ BILL LINKS + PURCHASE HEADS from the Transaction DB (PURCHASE_BILL_LINKS / PURCHASE_INVOICE.PURCHASE_HEAD) ════
+// The server's GET_PURCHASE_INVOICES never returned the bill link (billFileUrl was always ''), so every
+// existing purchase showed "No file". GET_PURCHASE_EXTRAS (BNX_DriveAutoFolders.gs) reads the two
+// Transaction DB sheets directly; this overlays them onto the purchase records.
+window._bnxExtras=window._bnxExtras||null;
+function _bnxNoKey(x){return String(x||'').replace(/[^A-Za-z0-9]/g,'').toUpperCase();}
+function _bnxApplyExtras(arr){
+  const ex=window._bnxExtras; if(!ex||!Array.isArray(arr))return 0;
+  let n=0;
+  arr.forEach(p=>{
+    if(!p)return;
+    const e=ex.byId[p.id]||ex.byNo[_bnxNoKey(p.no)];
+    if(!e)return;
+    if(e.links&&e.links.length){
+      p.billLinks=e.links;
+      if(!p.billFileUrl)p.billFileUrl=e.links[0];
+      n++;
+    }
+    if(e.head)p.purchaseHead=e.head;
+  });
+  return n;
+}
+async function bnxLoadPurchaseExtras(){
+  if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return;
+  try{
+    const r=await erpApi('GET_PURCHASE_EXTRAS',{});
+    if(!r||r.success===false||!Array.isArray(r.items)){
+      if(r&&r.success===false)console.warn('[Extras] GET_PURCHASE_EXTRAS:',r.message);
+      return;
+    }
+    const byId={},byNo={};
+    r.items.forEach(it=>{ if(it.id)byId[it.id]=it; if(it.no)byNo[_bnxNoKey(it.no)]=it; });
+    window._bnxExtras={byId,byNo};
+    const n=_bnxApplyExtras(DB.purchases)+_bnxApplyExtras(DB.acctInvs);
+    if(n){ saveLocalOnly(); try{rendPurchaseList();}catch(e){} try{rendRegs();}catch(e){} }
+  }catch(e){console.warn('[Extras] failed:',e.message);}
+}
+// Saves a bill link into PURCHASE_BILL_LINKS so it survives reloads (the invoice row sync doesn't carry it).
+function bnxPersistBillLink(p,url){
+  try{
+    if(!p||!url||typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return;
+    erpApi('SET_PURCHASE_BILL',{invoiceId:p.id,invoiceNo:p.no,supplierName:p.vendorName||'',billDate:p.date||'',billAmount:+p.grand||0,url:url,head:p.purchaseHead||''})
+      .then(r=>{ if(r&&r.success===false)console.warn('[Bill link] not persisted:',r.message); });
+  }catch(e){}
+}
+// Purchase head shown in the register: Transaction DB head first, then the ledger head, then General Purchase.
+function bnxHeadName(p){
+  if(p&&p.purchaseHead)return p.purchaseHead;
+  const l=(DB.ledgerAccounts||[]).find(x=>x.id===(p&&p.ledgerAccountId));
+  return l?l.name:'General Purchase';
+}
+function bnxAllHeadNames(){
+  const set=new Set((DB.ledgerAccounts||[]).map(l=>l.name));
+  [DB.purchases,DB.acctInvs].forEach(a=>(a||[]).forEach(p=>{ if(p&&p.purchaseHead)set.add(p.purchaseHead); }));
+  return [...set].sort((a,b)=>a.localeCompare(b));
+}
+// Bill cell: first link as the button, extra links (one purchase can cover several bills) as small numbered links.
+function bnxBillCell(p,label){
+  const links=(p.billLinks&&p.billLinks.length)?p.billLinks:(p.billFileUrl?[p.billFileUrl]:[]);
+  if(!links.length)return '<span class="badge b-gray" style="font-size:9px">No file</span>';
+  let h=`<a href="${links[0]}" target="_blank" class="btn btn-xs btn-green" title="View bill">${label||'📎 View'}</a>`;
+  for(let i=1;i<links.length;i++)h+=` <a href="${links[i]}" target="_blank" class="btn btn-xs btn-green" title="View bill ${i+1}" style="padding:1px 5px">${i+1}</a>`;
+  return h;
+}
 async function refreshPurchaseInvoicesFromServer(options={}){
   if(typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return {success:false,message:'no session'};
   try{
@@ -2012,6 +2077,8 @@ async function refreshPurchaseInvoicesFromServer(options={}){
     });
     // Server is authoritative for confirmed rows. Preserve only truly unsynced local rows.
     DB.purchases=[...mapped,...localUnsynced.filter(p=>!mapped.some(m=>m.id===p.id))];
+    _bnxApplyExtras(DB.purchases);   // re-apply bill links / heads (server rows carry neither)
+    bnxLoadPurchaseExtras();          // fetch/refresh them from the Transaction DB (non-blocking)
     saveLocalOnly();
     try{rendDash();}catch(e){} try{rendPurchaseList();}catch(e){} try{rendRegs();}catch(e){} try{updateApprCount();}catch(e){}
     return {success:true,data:mapped,count:mapped.length};
@@ -4212,6 +4279,7 @@ async function savePurchase(sendApproval,forceSave){
     }
     toast(`${doc.no} updated successfully.`,'ok','✏️');
     savePurchaseToDrive(doc,vend);
+    if(doc.billFileUrl)bnxPersistBillLink(doc,doc.billFileUrl);
     if(pendingManualBillFile)uploadManualBillAndAttach(doc.id,doc.mode);
     enqueueTallyVoucher(doc,vend);
     return;
@@ -4225,6 +4293,7 @@ async function savePurchase(sendApproval,forceSave){
   if(vi>=0)DB.vendors[vi].outstanding=(DB.vendors[vi].outstanding||0)+grand;
   save();updateApprCount();
   toast(sendApproval?`${doc.no} sent for approval!`:`${doc.no} saved as draft.`,'ok','📦');
+  if(doc.billFileUrl)bnxPersistBillLink(doc,doc.billFileUrl); // keep the scanned-bill link in PURCHASE_BILL_LINKS
   // Inventory Purchase Invoice is persisted by the row-authoritative backend.
   // Do not call SYNC_PURCHASE_TO_INVENTORY here: the production backend rejects
   // that action because physical stock is posted only by GRN.
@@ -4753,7 +4822,7 @@ function rendPurchaseList(){
     else {dbCls='#059669';dbLabel='✓ Live';}
     const tally=p.tallyStatus==='POSTED'?'✓ Posted':p.tallyStatus==='FAILED'?'⚠ Failed':'… Pending';
     const tallyCls=p.tallyStatus==='POSTED'?'#059669':p.tallyStatus==='FAILED'?'#dc2626':'#94a3b8';
-    return `<tr><td><b>${p.no}</b></td><td>${dCell}</td><td>${p.vendorName}</td><td class="td-r">${fmt(p.taxable)}</td><td class="td-r">${fmt(p.gstTotal)}</td><td class="td-r"><b>${fmt(p.grand)}</b></td><td>${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View original scanned bill">📎 Bill</a>`:'<span class="badge b-gray" style="font-size:9px">No file</span>'}</td><td>${p.grnStatus==='Completed'?'<span class="badge b-green">✓ '+(p.grnNo||'Done')+'</span>':'<span class="badge b-gray">Pending</span>'}</td><td><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':'b-green'}">${p.status}</span></td><td class="dd-wrap" style="position:relative">
+    return `<tr><td><b>${p.no}</b></td><td>${dCell}</td><td>${p.vendorName}</td><td class="td-r">${fmt(p.taxable)}</td><td class="td-r">${fmt(p.gstTotal)}</td><td class="td-r"><b>${fmt(p.grand)}</b></td><td>${bnxBillCell(p,'📎 Bill')}</td><td>${p.grnStatus==='Completed'?'<span class="badge b-green">✓ '+(p.grnNo||'Done')+'</span>':'<span class="badge b-gray">Pending</span>'}</td><td><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':'b-green'}">${p.status}</span></td><td class="dd-wrap" style="position:relative">
       <button class="btn btn-xs" onclick="event.stopPropagation();toggleRowActions('list-${p.id}',this)" title="Actions">⋮</button>
       <div class="dd-list" id="row-actions-list-${p.id}" style="min-width:180px;left:auto;right:0">
         <div class="dd-item" style="color:${dbCls};cursor:default" onmousedown="event.preventDefault()">${dbLabel}</div>
@@ -5437,6 +5506,7 @@ async function saveAttachment(){
       // a Bill column so it shows immediately — no reload/poll needed.
       if(linkedPurch){
         linkedPurch.billFileUrl=driveLink;
+        bnxPersistBillLink(linkedPurch,driveLink);
         save();
         try{ rendPurchaseList(); }catch(e){}
         try{ rendRegs(); }catch(e){}
@@ -6187,6 +6257,7 @@ function _attachDriveLinkToSavedInvoice(link,invNo,vendorName,mode){
   if(!matches.length)return; // record not saved yet (pendingBillDriveLink handles that), or already had a link
   const rec=matches.sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt))[0];
   rec.billFileUrl=link;
+  bnxPersistBillLink(rec,link);
   save();
   if(typeof rendPurchaseList==='function')rendPurchaseList();
   if(typeof erpApi==='function')syncPurchaseInvoiceRowToServer(rec).then(r=>{ if(r&&r.success===false)console.warn('[Scan] Drive link attach: server sync failed',r.message); });
@@ -7191,7 +7262,7 @@ async function handleLedgerFileChosen(e){
       clientId:CLIENT_ID, fileName:fname, mimeType:file.type||'application/octet-stream', base64Data,
       subPath:['Ledger',month]
     });
-    if(!res||!res.success||!res.url){toast('⚠️ Ledger upload failed — check connection','err','⚠️');return;}
+    if(!res||!res.success||!res.url){toast('⚠️ Ledger upload failed: '+((res&&res.message)||'no response from server'),'err','⚠️');console.warn('[Ledger upload] server said:',res);return;}
     const link=res.url;
     if(!Array.isArray(DB.vendorLedgers))DB.vendorLedgers=[];
     const idx=DB.vendorLedgers.findIndex(l=>l.vendorName===vendorName&&l.month===month);
@@ -7241,7 +7312,7 @@ function _pRegPopulateFilterOptions(){
   }
   if(aSel){
     const cur=aSel.value;
-    const heads=(DB.ledgerAccounts||[]).map(l=>l.name);
+    const heads=bnxAllHeadNames();
     aSel.innerHTML='<option value="">All Accounting Heads</option>'+heads.map(n=>`<option value="${n}">${n}</option>`).join('')+'<option value="General Purchase">General Purchase (unset)</option>';
     if(heads.includes(cur)||cur==='General Purchase')aSel.value=cur;
   }
@@ -7253,9 +7324,7 @@ function _pRegMatchesFilters(p){
   if(q&&!(String(p.no||'').toLowerCase().includes(q)||String(p.vendorName||'').toLowerCase().includes(q)))return false;
   if(vendF&&p.vendorName!==vendF)return false;
   if(acctF){
-    const _led=(DB.ledgerAccounts||[]).find(l=>l.id===p.ledgerAccountId);
-    const _ln=_led?_led.name:'General Purchase';
-    if(_ln!==acctF)return false;
+    if(bnxHeadName(p)!==acctF)return false;
   }
   return true;
 }
@@ -7333,8 +7402,7 @@ function rendRegs(){
   if(ptb){
     if(!purchasesPage.length)ptb.innerHTML='<tr class="empty-r"><td colspan="14">No records</td></tr>';
     else ptb.innerHTML=purchasesPage.map(p=>{
-      const _led=(DB.ledgerAccounts||[]).find(l=>l.id===p.ledgerAccountId);
-      const _ln=_led?_led.name:'General Purchase';
+      const _ln=bnxHeadName(p);
       // FIX (item 6): items were saved correctly all along, but the register
       // never surfaced them — only the "View" modal did. Add an inline
       // expand/collapse row so item-wise breakdown is visible right here.
@@ -7352,7 +7420,7 @@ function rendRegs(){
         <td style="vertical-align:top"><span class="badge b-teal">${p.mode||'inventory'}</span></td>
         <td style="vertical-align:top"><span class="badge b-purple" style="font-size:10px;white-space:nowrap">${_ln}</span></td>
         <td class="td-r" style="vertical-align:top">${fmt(p.taxable)}</td><td class="td-r" style="vertical-align:top">${fmt(p.gstTotal)}</td><td class="td-r" style="vertical-align:top"><b>${fmt(p.grand)}</b></td>
-        <td style="vertical-align:top">${p.billFileUrl?`<a href="${p.billFileUrl}" target="_blank" class="btn btn-xs btn-green" title="View enclosed/attached copy of the bill">📎 View</a>`:'<span class="badge b-gray" style="font-size:9px">No file</span>'}</td>
+        <td style="vertical-align:top">${bnxBillCell(p,'📎 View')}</td>
         <td style="vertical-align:top">${p.grnRef?'<span class="badge b-teal">'+p.grnRef+'</span>':'—'}</td>
         <td style="vertical-align:top"><span class="badge ${p.status==='Draft'?'b-gray':p.status==='Pending Approval'?'b-amber':p.status==='Approved'?'b-green':'b-red'}">${p.status}</span></td>
         <td class="dd-wrap" style="position:relative;vertical-align:top">
@@ -8641,7 +8709,7 @@ function confirmSmartImport(asDraft){
       if(cur) vSel.value=cur;
     }
     if(aSel){
-      var cur2=aSel.value, heads=(DB.ledgerAccounts||[]).map(function(l){ return l.name; });
+      var cur2=aSel.value, heads=bnxAllHeadNames();
       aSel.innerHTML='<option value="">All Accounting Heads</option>'+heads.map(function(n){ return '<option value="'+n+'">'+n+'</option>'; }).join('')+'<option value="General Purchase">General Purchase (unset)</option>';
       if(heads.indexOf(cur2)>=0||cur2==='General Purchase') aSel.value=cur2;
     }
@@ -8656,7 +8724,7 @@ function confirmSmartImport(asDraft){
       if(!q.split(/\s+/).every(function(w){ return hay.indexOf(w)>=0; })) return false;
     }
     if(vendF && norm(p.vendorName)!==norm(vendF)) return false;
-    if(acctF){ var led=(DB.ledgerAccounts||[]).find(function(l){ return l.id===p.ledgerAccountId; }); if((led?led.name:'General Purchase')!==acctF) return false; }
+    if(acctF){ if(bnxHeadName(p)!==acctF) return false; }
     return true;
   };
   W.selectDuplicatePurchases=function(){
