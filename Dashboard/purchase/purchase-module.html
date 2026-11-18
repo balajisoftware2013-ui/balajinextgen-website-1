@@ -4090,7 +4090,13 @@ function editPurchase(id,mode){
   sv('p-no',p.no);sv('p-date',p.date);sv('p-po',p.poRef||'');sv('p-grn',p.grnRef||'');sv('p-notes',p.notes||'');
   sv('p-due',p.due||'');
   try{ populateWarehouseSelect(); }catch(e){}
-  sv('p-wh',p.whId||'');sv('p-paymode',p.paymentMode||'Credit');
+  /* 2026-11-19 FIX ("edit not saving"): an invoice whose warehouse id is not in THIS device's godown list (saved on another
+     PC / pulled from the server) landed on "-- Select --", and Save stopped with "Please select a Warehouse". Its own
+     warehouse is now kept as an option; a blank one falls back to the main godown. */
+  (function(){const s0=el('p-wh');if(!s0)return;const wid=String(p.whId||'');
+    if(wid&&![].some.call(s0.options,o=>o.value===wid)){const o=document.createElement('option');o.value=wid;o.textContent=p.whName||p.warehouse||p.warehouseName||wid;s0.insertBefore(o,s0.options[1]||null);}
+    if(wid)s0.value=wid;else if(!s0.value){const m=[].find.call(s0.options,o=>o.value&&o.value!=='__add_new__');if(m)s0.value=m.value;}})();
+  sv('p-paymode',p.paymentMode||'Credit');
   const paEdit=el('p-purchase-acct');if(paEdit){paEdit.value=p.purchaseAcct||'Purchase - Local';paEdit.dataset.touched='1';}
   el('vendQuickInfo').style.display='none';
   selectVend(p.vendorId,p.vendorName);
@@ -4278,19 +4284,12 @@ async function savePurchase(sendApproval,forceSave){
       doc.department=doc.department||orig.department;doc.ackAt=orig.ackAt;
       arr[idx]=doc;
     }
-    // Server-first edit for inventory purchase invoices. Purchase Invoice is
-    // financial/AP only; physical stock is changed by GRN, never here.
-    if(doc.mode==='inventory'){
-      const serverResult=await syncPurchaseInvoiceRowToServer(doc);
-      if(!serverResult || serverResult.success===false){
-        if(idx>=0 && originalBeforeEdit) arr[idx]=originalBeforeEdit;
-        saveLocalOnly();
-        editingPurchaseId=null;editingPurchaseMode=null;pendingBillDriveLink=null;
-        rendDash();rendRegs();rendPurchaseList();updateApprCount();
-        toast(`⚠️ ${doc.no} was NOT updated on the server: ${(serverResult&&serverResult.message)||'sync failed'}`,'err','☁️');
-        return;
-      }
-    }
+    /* 2026-11-19 FAST EDIT ("save and edit fast"): the edit used to wait for the server (5-20 s on a busy day) with the form
+       open. Now — exactly like a new invoice — the form closes at once and the server confirms in the background; if the
+       server refuses, the invoice goes back to how it was before the edit (and the vendor balance too) with a clear message.
+       Purchase Invoice is financial/AP only; physical stock is changed by GRN, never here. */
+    const __editSync=doc.mode==='inventory'?syncPurchaseInvoiceRowToServer(doc):null;
+    if(__editSync){ doc.synced=false; doc.syncUnconfirmed=true; }
     if(originalBeforeEdit && doc.mode==='inventory'){
       const oldVendorId=originalBeforeEdit.vendorId, newVendorId=doc.vendorId;
       const oldAmt=+originalBeforeEdit.grand||0, newAmt=+doc.grand||0;
@@ -4303,8 +4302,22 @@ async function savePurchase(sendApproval,forceSave){
     }
     editingPurchaseId=null;editingPurchaseMode=null;pendingBillDriveLink=null;
     saveLocalOnly();closeM('mPurch');rendDash();rendRegs();rendPurchaseList();updateApprCount();
-    if(doc.mode==='inventory'){
-      doc.synced=true;
+    if(__editSync){
+      toast(`${doc.no} updated — saving to server…`,'ok','✏️');
+      const serverResult=await __editSync;
+      const cur=arr.findIndex(x=>x.id===doc.id);
+      if(!serverResult || serverResult.success===false){
+        if(cur>=0 && originalBeforeEdit) arr[cur]=originalBeforeEdit;
+        if(originalBeforeEdit){ const oldAmt=+originalBeforeEdit.grand||0,newAmt=+doc.grand||0;
+          if(originalBeforeEdit.vendorId!==doc.vendorId||Math.abs(oldAmt-newAmt)>0.005){
+            const nv=DB.vendors.findIndex(v=>v.id===doc.vendorId); if(nv>=0)DB.vendors[nv].outstanding=Math.max(0,(DB.vendors[nv].outstanding||0)-newAmt);
+            const ov=DB.vendors.findIndex(v=>v.id===originalBeforeEdit.vendorId); if(ov>=0)DB.vendors[ov].outstanding=(DB.vendors[ov].outstanding||0)+oldAmt; } }
+        saveLocalOnly();rendDash();rendRegs();rendPurchaseList();updateApprCount();
+        toast(`⚠️ ${doc.no} was NOT updated on the server: ${(serverResult&&serverResult.message)||'sync failed'} — the earlier version is kept. Please edit again.`,'err','☁️');
+        return;
+      }
+      if(cur>=0){ arr[cur].synced=true; arr[cur].syncUnconfirmed=false; }
+      saveLocalOnly();rendRegs();rendPurchaseList();
       broadcastInventoryChange('PURCHASE_UPDATED', doc);
     }
     toast(`${doc.no} updated successfully.`,'ok','✏️');

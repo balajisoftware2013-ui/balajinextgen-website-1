@@ -6416,7 +6416,18 @@ function calcPurchaseTotals() {
   if(total>0) document.getElementById('pi-acc-preview').innerHTML=`<table><thead><tr><th>Ledger</th><th class="r">Dr</th><th class="r">Cr</th></tr></thead><tbody><tr><td>Purchase A/c</td><td class="r">${fmt(taxable)}</td><td class="r">—</td></tr>${cgst>0?`<tr><td>Input CGST</td><td class="r">${fmt(cgst)}</td><td class="r">—</td></tr><tr><td>Input SGST</td><td class="r">${fmt(sgst)}</td><td class="r">—</td></tr>`:''}<tr><td>${vName} (Creditor)</td><td class="r">—</td><td class="r">${fmt(total)}</td></tr></tbody><tfoot><tr class="rep-total"><td>Total</td><td class="r">${fmt(total)}</td><td class="r">${fmt(total)}</td></tr></tfoot></table>`;
 }
 
+/* 2026-11-19 FAST SAVE ("purchase save / edit fast, no breaks"):
+   · a second tap while saving is ignored (a double tap used to create the same invoice TWICE on this device);
+   · the invoice, its voucher and the screen update AT ONCE; the server confirms in the background;
+   · if the server refuses, this device goes back exactly to how it was (new invoice removed / edit undone, voucher too)
+     with a clear message — it no longer kept a local copy the server never got. */
+let __bnxPiSaving=false;
 async function savePurchase() {
+  if(__bnxPiSaving){ toast('Saving… please wait','i'); return; }
+  __bnxPiSaving=true;
+  try{ return await __bnxSavePurchaseImpl_(); } finally { __bnxPiSaving=false; }
+}
+async function __bnxSavePurchaseImpl_() {
   const supplier = document.getElementById('pi-supplier').value;
   const invno = document.getElementById('pi-invno').value.trim();
   const invdate = document.getElementById('pi-invdate').value;
@@ -6451,6 +6462,7 @@ async function savePurchase() {
   // never silently double- or under-count stock.
   const isEdit = !!editingPiId;
   const origPi = isEdit ? DB.findOne('purchase_invoices',{_id:editingPiId}) : null;
+  const __bnxPiOrig = origPi ? JSON.parse(JSON.stringify(origPi)) : null;   /* 2026-11-19: to undo if the server refuses */
   if(isEdit && origPi) reversePurchaseStockImpact(origPi, 'Reversal for edit of invoice '+origPi.inv_no);
   const pi={
     _id: isEdit ? editingPiId : uid('PI'),
@@ -6472,11 +6484,8 @@ async function savePurchase() {
   // comment above. The generic DB.save() full-array push (fired
   // automatically by DB.insert/DB.update) still runs too as the
   // existing safety net.
-  const serverSave=await syncPurchaseInvoiceRowToServer(pi);
-  if(serverSave&&serverSave.success===false){
-    toast('Server save failed: '+(serverSave.message||serverSave.error||'Unknown error'),'e');
-    return;
-  }
+  const __serverP=syncPurchaseInvoiceRowToServer(pi);
+  const __bnxPiOldV=JSON.parse(JSON.stringify(DB.all('vouchers').filter(v=>v.ref_doc===pi._id && v.ref_type==='purchase_invoice')));
   window._piBillAttachments = []; renderPIBillPreview();
   // IMPORTANT: physical stock is NOT posted by Purchase Invoice. GRN owns stock.
   // The server writes PURCHASE_INVOICE_ITEMS and supplier dues; stock is posted only by SAVE_GRN.
@@ -6487,12 +6496,25 @@ async function savePurchase() {
     DB.save('vouchers', remainingVouchers);
   }
   DB.insert('vouchers',{_id:uid('VCH'),type:'purchase',v_no:'PI/'+invno,date:invdate,narration:'Purchase from '+vendor?.name+' | Inv: '+invno,total,ref_doc:pi._id,ref_type:'purchase_invoice',entries:[{ledger:'Purchase',dr:taxable,cr:0},{ledger:'Input CGST',dr:cgst,cr:0},{ledger:'Input SGST',dr:sgst,cr:0},{ledger:vendor?.name||supplier,dr:0,cr:total}]});
-  toast(isEdit?`${pi.inv_no} updated ✓`:'Purchase invoice saved & accounting posted ✓','s');
+  toast(isEdit?`${pi.inv_no} updated — saving to server…`:'Purchase invoice saved — sending to server…','s');
   editingPiId=null;
   document.getElementById('pi-items-body').innerHTML='';
   document.getElementById('pi-invno').value='';
   loadPurchaseRegister();
   loadDashboard();
+  __bnxPiSaving=false;   /* the next invoice can be entered while the server confirms this one */
+  let serverSave=null; try{ serverSave=await __serverP; }catch(e){ serverSave={success:false,message:e.message}; }
+  if(serverSave&&serverSave.success===false){
+    try{
+      if(isEdit&&__bnxPiOrig) DB.update('purchase_invoices', pi._id, __bnxPiOrig);
+      else DB.save('purchase_invoices', DB.all('purchase_invoices').filter(x=>x._id!==pi._id));
+      DB.save('vouchers', DB.all('vouchers').filter(v=>!(v.ref_doc===pi._id && v.ref_type==='purchase_invoice')).concat(isEdit?__bnxPiOldV:[]));
+    }catch(e){ console.warn('[PI revert]',e); }
+    loadPurchaseRegister(); loadDashboard();
+    toast(`⚠️ ${pi.inv_no} NOT saved on the server: ${serverSave.message||serverSave.error||'Unknown error'} — ${isEdit?'the earlier version is kept':'please enter it again'}.`,'e');
+    return;
+  }
+  toast(isEdit?`${pi.inv_no} updated ✓`:`${pi.inv_no} saved on the server ✓`,'s');
 }
 
 function getStockBalance(itemId, whId) {
