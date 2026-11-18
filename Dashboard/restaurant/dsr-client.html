@@ -5354,6 +5354,13 @@ async function _loadDsrReconciliationImpl_(force){
   if(body)body.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:14px">Loading live DSR / Swift / settlement / bank controls…</td></tr>';
   if(warn){warn.style.display='none';warn.textContent='';}
   let bank=null, liveNote='';
+  /* 2026-11-19 SPEED ("reconciliation fast"): the dues read and the live bank read used to run ONE AFTER THE OTHER, and the
+     table waited for the dues read before drawing anything. Both now start together at once; the table is drawn from the
+     local DSR + Swift figures immediately and upgraded as each answer arrives. */
+  const dueP=Promise.resolve().then(()=>bnxGetDuePeriod_(rf,rt)).catch(()=>null);
+  const bankP=Promise.resolve().then(()=>gasApi('GET_DSR_BANK_RECONCILIATION',{from:rf,to:rt}));
+  let __final=false;
+  dueP.then(function(){ if(!__final){ try{ paint(); }catch(e){} } });
   /* 2026-10-13: paint() draws the controls from LOCAL data (DSR + uploaded Swift) at once; the live bank call then upgrades it.
      Before, the table stayed on "Loading…" until the slow / expired live call came back (or forever), so Reconciliation looked empty. */
   const paint=async()=>{
@@ -5362,7 +5369,7 @@ async function _loadDsrReconciliationImpl_(force){
     const swiftCard=swiftTxnRows.filter(r=>r.mode==='CARD').reduce((s,r)=>s+r.amount,0);
     const swiftUpi=swiftTxnRows.filter(r=>r.mode==='UPI').reduce((s,r)=>s+r.amount,0);
     const swiftTotal=swiftCard+swiftUpi;
-    let due=0;try{due=(await bnxGetDuePeriod_(rf,rt)).received||0;}catch(e){}
+    let due=0;try{const dv=await Promise.race([dueP,new Promise(r=>setTimeout(()=>r(undefined),__final?25000:0))]);due=(dv&&dv.received)||0;}catch(e){}
     let dsrCard=0,dsrUpi=0,dsrDue=0;
     Object.entries(STANDARD_DATA||{}).forEach(([d,r])=>{if(d>=rf&&d<=rt){dsrCard+=bnxDueNum_(r.card);dsrUpi+=bnxDueNum_(r.gpay);dsrDue+=bnxDueNum_(r.duerecvcash)+bnxDueNum_(r.duerecvbank);}});
     const live=bank?.rows?.[0]||null;
@@ -5390,13 +5397,13 @@ async function _loadDsrReconciliationImpl_(force){
   };
   try{ await paint(); }catch(e){ console.warn('[DSR RECON local]',e); }
   try{
-    const r=await gasApi('GET_DSR_BANK_RECONCILIATION',{from:rf,to:rt});
+    const r=await bankP;
     if(r&&r.authExpired) liveNote='⚠️ Server did not accept the request — live bank data not loaded. Your login is kept; press Run Live again.';
     else if(r&&r.__timeout) liveNote='⏱ Live bank data is slow — showing DSR and uploaded Swift figures. Press Run Live to retry.';
     else if(r&&r.success&&r.data) bank=r.data;
     else liveNote='ℹ️ Live bank data is not available right now — showing DSR and uploaded Swift figures.';
   }catch(e){ console.warn('[DSR RECON]',e); liveNote='ℹ️ Live bank data could not be loaded — showing DSR and uploaded Swift figures.'; }
-  let ok=true; try{ ok=await paint(); }catch(e){ console.warn('[DSR RECON live]',e); }
+  __final=true; let ok=true; try{ ok=await paint(); }catch(e){ console.warn('[DSR RECON live]',e); }
   if(liveNote&&warn){ warn.textContent=(warn.style.display==='block'&&warn.textContent?warn.textContent+'  ':'')+liveNote; warn.style.display='block'; }
   return ok;
 }
@@ -10785,6 +10792,43 @@ W.bnxDuesRollbackRun_=run;
   var st=D.createElement('style'); st.textContent='input.dsr-val{font-variant-numeric:tabular-nums}'; D.head.appendChild(st);
 })(window,document);
 </script>
+<script id="bnx-swift-fast-20261119">
+/* SWIFT FAST (2026-11-19, "swift transaction and reconciliation fast"). ROOT CAUSE: bnxSwiftTxns_() (three layers: parse every
+   Swift row, re-read the mapping / collection-date / status stores from localStorage, rebuild every row's column map) ran in
+   full EVERY time a part of the screen asked for it — 10 times in one reconciliation run, 3 times per report draw.
+   Now the finished list is kept and handed out (as copies) until something it depends on changes: the uploaded rows, the
+   column mapping, the server mapping sync, or any saved setting on this device. Same numbers, computed once. */
+(function(W){
+  var ver=0;
+  try{ var P=Storage.prototype,oS=P.setItem,oR=P.removeItem,oC=P.clear;
+    P.setItem=function(k){ if(/swift|bnx_sw|bank|recon|platform|bnx_rc|bnx_cd|bnx_st|opt/i.test(String(k)))ver++; return oS.apply(this,arguments); };
+    P.removeItem=function(k){ ver++; return oR.apply(this,arguments); };
+    P.clear=function(){ ver++; return oC.apply(this,arguments); };
+  }catch(e){}
+  var memo={sig:null,list:null,at:0}, stats={hit:0,miss:0};
+  function sig(){
+    var rows=(typeof swiftRows!=='undefined'&&Array.isArray(swiftRows))?swiftRows:null, m='';
+    try{ m=JSON.stringify(typeof swiftMap!=='undefined'?swiftMap:{}); }catch(e){}
+    if(!memo.rowsRef||memo.rowsRef!==rows){ memo.rowsRef=rows; memo.rowsId=(memo.rowsId||0)+1; }
+    return memo.rowsId+'|'+(rows?rows.length:0)+'|'+m+'|'+ver+'|'+(W.__bnxSwMapV||0)+'|'+(typeof BNX_BUSINESS_DAY_START_HOUR_!=='undefined'?BNX_BUSINESS_DAY_START_HOUR_:'');
+  }
+  function wrap(){
+    var base=W.bnxSwiftTxns_; if(typeof base!=='function'||base.__bnxMemo)return;
+    var f=function(){
+      var s=sig();
+      if(memo.sig!==s||!memo.list||Date.now()-memo.at>30000){ memo.list=base.apply(this,arguments)||[]; memo.sig=s; memo.at=Date.now(); stats.miss++; }
+      else stats.hit++;
+      return memo.list.map(function(o){ return Object.assign({},o); });
+    };
+    f.__bnxMemo=1; f.__bnxSt=base.__bnxSt||1; W.bnxSwiftTxns_=f;
+  }
+  W.bnxSwiftMemoReset_=function(){ memo.sig=null; ver++; };
+  W.bnxSwiftMemoStats_=function(){ return stats; };
+  wrap(); var n=0, ti=setInterval(function(){ wrap(); if(++n>40)clearInterval(ti); },500);
+  W.addEventListener('load',function(){ setTimeout(wrap,0); setTimeout(wrap,1500); });
+})(window);
+</script>
+
 </body>
 </html>
 
