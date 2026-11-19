@@ -97,6 +97,11 @@
       });
     });
   }
-  setTimeout(function () { try { ready(); } catch (e) {} }, 3500);
+  /* preload the menu only when the phone is idle and not on Data Saver / 2G (slow phones stayed busy otherwise) */
+  (function () {
+    var c = navigator.connection || {}; if (c.saveData || /(^|-)2g$/.test(c.effectiveType || '')) return;
+    var go = function () { try { ready(); } catch (e) {} };
+    setTimeout(function () { if (W.requestIdleCallback) W.requestIdleCallback(go, { timeout: 8000 }); else go(); }, 4000);
+  })();
   W.bnxAr = { open: open, close: close, url: url, preview: function (row, nameSel, priceSel) { var im = row.querySelector('img'), n = row.querySelector(nameSel), p = row.querySelector(priceSel); return { name: n ? n.textContent.trim() : '', price: p ? Number(String(p.textContent).replace(/[^\d.]/g, '')) || 0 : 0, photo: im && /^https:/.test(im.currentSrc || im.src) ? (im.currentSrc || im.src) : '' }; }, menuUrl: function (cid) { return url('', cid); }, decorate: decorate, get ready() { return ready(); }, get page() { return page(); } };
 })(window, document);
