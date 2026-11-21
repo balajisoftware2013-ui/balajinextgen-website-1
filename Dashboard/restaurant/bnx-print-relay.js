@@ -2,7 +2,7 @@
 'use strict';
 
 /*
- * Balaji NextGen — RAW ESC/POS Print Relay  (v3.2)
+ * Balaji NextGen — RAW ESC/POS Print Relay  (v3.3)
  *
  * A phone browser can never open a raw TCP socket to a thermal printer.
  * This relay runs on any always-on PC / Raspberry Pi on the same Wi-Fi/LAN.
@@ -220,7 +220,7 @@ function writeRawToPrinter(host, port, bytes) {
         if (err) return finish(err);
         wrote = true;
         socket.end();                               // send FIN, keep reading
-        setTimeout(() => finish(), 600);            // short grace so the last bytes drain
+        setTimeout(() => finish(), 150);            // short grace so the last bytes drain
       });
     });
     socket.once('close', () => {
