@@ -74,6 +74,7 @@
   W.fetch=function(input,init){
     if(!isGas(input))return oF.apply(this,arguments);
     var A=actionOf(input,init);
+    if(W.__bnxOlFetch){ try{ var olh=W.__bnxOlFetch(A,init); if(olh) return olh; }catch(e){} }   /* 2026-11-21 offline billing: internet down → fail at once, no 30 s wait */
     /* 2026-11-21 ("wifi pos printers" / dashboard slow on the KOT-station PC): the station asks PRINT_QUEUE_CLAIM every 1.5 s.
        It counted as a SAVE, and while a "save" travels every background read waits — on the station PC that was almost always,
        so the whole dashboard crawled. Print-queue calls go straight out and hold nothing. */
@@ -77376,6 +77377,163 @@ W.addEventListener('storage',function(e){if(e.key===KEY)apply();});
 })(window,document);
 </script>
 
+<script id="bnx-offline-bill-20261121">
+/* ═══ OFFLINE BILLING (2026-11-21) — "if internet drop wifi printing not work its need offline billing" ═══════════════
+   Root cause: when the internet dropped, SAVE_BILL could not get a bill number from the server, so the bill was only
+   queued ("Nothing printed") and every server call waited ~30 s first. The WiFi printer itself never needed internet
+   (QZ Tray on this PC → printer IP on the shop WiFi; printer list and QZ key are kept on this PC).
+   Now:
+   · internet down (browser offline, or a request fails and a quick check of script.google.com also fails) →
+     every ERP request fails AT ONCE (no 30 s wait) until the internet is back (checked every 8 s);
+   · a NEW bill that cannot reach the server gets this PC's OFFLINE number OL<pc>-<FY>-<00001>, prints on the WiFi
+     printer as usual, and is kept on this PC (outbox, survives refresh / restart);
+   · internet back → sent as SAVE_BILL_OFFLINE (offline-bill.gs) with the same number; same requestId = never twice;
+   · a slow server while the internet works is NOT treated as offline (old safe behaviour: queued, not printed);
+   · edits of saved bills, approvals and credit checks stay online-only (they run first, unchanged). */
+(function(){
+  var W=window, LS=W.localStorage;
+  function g(k,d){ try{ var v=LS.getItem(k); return v==null?d:v; }catch(e){ return d; } }
+  function s(k,v){ try{ LS.setItem(k,v); }catch(e){} }
+  function cid(){ try{ return String((typeof CLIENT_ID!=='undefined'&&CLIENT_ID)||g('ERP_CLIENT','')||g('bnx_client_id','')||'default'); }catch(e){ return 'default'; } }
+  function on(){ return g('bnx_offline_bill','1')!=='0'; }
+  function note(m,t){ try{ if(typeof showNotif==='function') showNotif(m,t||'info'); }catch(e){} }
+
+  /* ---------- internet state ---------- */
+  var down=false, downSince=0, probing=null, timer=null;
+  function probe(){
+    if(probing) return probing;
+    if(navigator.onLine===false){ setDown(true); return Promise.resolve(false); }
+    probing=Promise.race([
+      fetch('https://script.google.com/favicon.ico?_ol='+Date.now(),{mode:'no-cors',cache:'no-store'}).then(function(){ return true; },function(){ return false; }),
+      new Promise(function(r){ setTimeout(function(){ r(false); },4000); })
+    ]).then(function(ok){ probing=null; if(navigator.onLine===false) ok=false; setDown(!ok); return ok; });
+    return probing;
+  }
+  function setDown(v){
+    var was=down; down=!!v;
+    if(down&&!was){ downSince=Date.now(); note('📴 Internet is down — billing and WiFi printing continue on this PC. Bills sync when the internet is back.','warning'); }
+    if(!down&&was){ note('🌐 Internet is back — sending offline bills…','success'); setTimeout(function(){ try{ if(typeof bnxFlushOutbox==='function') bnxFlushOutbox(true); }catch(e){} },800); }
+    clearInterval(timer); if(down) timer=setInterval(probe,8000);
+    paint();
+  }
+  W.addEventListener('offline',function(){ setDown(true); });
+  W.addEventListener('online',function(){ probe(); });
+  /* called by the fetch lane at the top of the page for every ERP request */
+  W.__bnxOlFetch=function(A){
+    if(!A||!on()) return null;
+    if(navigator.onLine===false||down) return Promise.reject(new TypeError('Failed to fetch (internet is down)'));
+    return null;
+  };
+  W.bnxOlIsDown=function(){ return down||navigator.onLine===false; };
+
+  /* ---------- offline number: OL<pc code>-<FY>-<5 digits> ---------- */
+  function devCode(){
+    var c=g('bnx_ol_dev','');
+    if(!/^[A-Z0-9]{2}$/.test(c)){ var L='ABCDEFGHJKLMNPQRSTUVWXYZ', A=L+'23456789'; c=L[Math.floor(Math.random()*L.length)]+A[Math.floor(Math.random()*A.length)]; s('bnx_ol_dev',c); }
+    return c;
+  }
+  function fyOf(dt){
+    var m=String(dt||'').match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/), d=m?new Date(+m[3],+m[2]-1,+m[1]):new Date();
+    var y=d.getMonth()>=3?d.getFullYear():d.getFullYear()-1; return String(y).slice(-2);
+  }
+  function REGK(){ return 'bnx_ol_bills_'+cid(); }
+  function reg(){ try{ return JSON.parse(g(REGK(),'[]'))||[]; }catch(e){ return []; } }
+  function setReg(a){ s(REGK(),JSON.stringify(a.slice(-500))); paint(); }
+  function nextNo(dt){
+    var dev=devCode(), fy=fyOf(dt), k='bnx_ol_seq_'+cid()+'_'+dev+'_'+fy, n=parseInt(g(k,'0'),10)||0, pre='OL'+dev+'-'+fy+'-';
+    reg().forEach(function(r){ if(String(r.no||'').indexOf(pre)===0){ var x=parseInt(String(r.no).slice(pre.length),10)||0; if(x>n) n=x; } });
+    n++; s(k,String(n)); return pre+String(n).padStart(5,'0');
+  }
+  function inOutbox(rid){ try{ return typeof bnxGetOutbox==='function'&&bnxGetOutbox().some(function(e){ return String(e&&e.requestId)===rid; }); }catch(e){ return false; } }
+  function netFail(r){
+    if(!r||r.success||r.blocked) return false;
+    if(Number(r.statusCode||0)>=400) return false;
+    var m=String(r.error||r.message||'');
+    if(/approv|not allowed|permission|session|login|closed|invalid|required/i.test(m)) return false;
+    return !!(r.offline||r.circuitOpen||/failed to fetch|networkerror|network error|load failed|internet|timeout|timed out|could not reach|not reachable|ERR_|offline/i.test(m));
+  }
+  function userName(){ try{ return (W.currentUser&&(W.currentUser.FULL_NAME||W.currentUser.name))||(typeof currentUser!=='undefined'&&currentUser&&(currentUser.FULL_NAME||currentUser.USERNAME))||''; }catch(e){ return ''; } }
+
+  function makeOffline(p){
+    var rid=String(p.requestId), b=p.bill||{}, no=nextNo(b.dt);
+    var bill=Object.assign({},b,{offlineNo:no,offlineAt:new Date().toISOString()});
+    try{ if(typeof bnxGetOutbox==='function'&&typeof bnxSetOutbox==='function') bnxSetOutbox(bnxGetOutbox().filter(function(e){ return !(String(e&&e.requestId)===rid&&e.action==='SAVE_BILL'); })); }catch(e){}
+    try{ bnxQueuePending('SAVE_BILL_OFFLINE',Object.assign({},p,{requestId:rid,bill:bill}),rid); }catch(e){ console.error('[OFFLINE BILL] queue failed',e); return null; }
+    var a=reg(); a.push({no:no,rid:rid,at:Date.now(),dt:b.dt||'',total:Number(b.total||0),table:b.table||b.tableId||'',pay:b.pay||'',status:'pending'}); setReg(a);
+    note('📴 Offline bill '+no+' saved on this PC — printing. It goes to the server when the internet is back.','warning');
+    return { success:true, offline:true, offlineNo:no, transactionId:'OL:'+rid, billNo:no, billNumber:no, BILL_NUMBER:no,
+      data:{ BILL_NUMBER:no, BILL_DATE:b.dt||'', BILL_TIME:b.tm||'', GRAND_TOTAL:Number(b.total||0), TABLE_ID:b.table||'', CUSTOMER_NAME:b.customer||b.cust||'', BILLING_USER_NAME:userName(), OFFLINE:true } };
+  }
+  function markSynced(rid,no,res){
+    var a=reg(), r=a.filter(function(x){ return x.rid===rid; })[0]; if(!r) return;
+    var saved=String((res&&res.data&&res.data.BILL_NUMBER)||no);
+    r.status=saved===no?'synced':'renumbered'; r.serverNo=saved; r.syncedAt=Date.now(); setReg(a);
+    if(saved!==no) note('⚠️ Offline bill '+no+' was saved on the server as '+saved+' — please reprint that bill for the customer.','error');
+  }
+
+  /* ---------- gasApi: the outermost layer for SAVE_BILL ---------- */
+  function install(){
+    var base=W.gasApi; if(typeof base!=='function'||base.__bnxOl) return;
+    var w=async function(a,p){
+      var args=arguments, self=this;
+      if(a==='SAVE_BILL_OFFLINE'&&p&&p.bill){
+        var no=String(p.bill.offlineNo||''), r=await base.apply(self,args);
+        if(r&&!r.success&&/unknown action|not handled|invalid action|unsupported/i.test(String(r.error||r.message||''))){
+          /* server not updated yet (offline-bill.gs / router v41): save with the normal series, tell the cashier */
+          var p2=Object.assign({},p,{bill:Object.assign({},p.bill)}); delete p2.bill.offlineNo; delete p2.bill.offlineAt;
+          r=await base.call(self,'SAVE_BILL',p2);
+        }
+        if(r&&r.success){ if(down) setDown(false); markSynced(String(p.requestId),no,r); }
+        return r;
+      }
+      if(a!=='SAVE_BILL'||!on()||!p||!p.bill||p.bill.no) return base.apply(self,args);
+      var rid=String(p.requestId||''); if(!rid||inOutbox(rid)) return base.apply(self,args);
+      var res=await base.apply(self,args);
+      if(res&&res.success){ return res; }
+      if(!netFail(res)) return res;
+      if(!(navigator.onLine===false||down)){ var ok=await probe(); if(ok) return res; }   /* internet fine, server slow → old safe path */
+      return makeOffline(p)||res;
+    };
+    w.__bnxOl=1; W.gasApi=w; try{ gasApi=w; }catch(e){}
+  }
+  install();
+  W.addEventListener('load',function(){ setTimeout(install,0); setTimeout(install,3000); });
+
+  /* ---------- small status pill + list ---------- */
+  var css=document.createElement('style');
+  css.textContent='#bnxOlPill{position:fixed;left:12px;bottom:12px;z-index:9998;font:600 12px system-ui,sans-serif;padding:7px 12px;border-radius:999px;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.18);display:none}'
+   +'#bnxOlPill.dn{background:#c0392b;color:#fff}#bnxOlPill.pd{background:#fff4e0;color:#a35c00;border:1px solid #f0c27a}'
+   +'#bnxOlBox{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center}#bnxOlBox .in{background:#fff;border-radius:12px;width:min(640px,94vw);max-height:84vh;overflow:auto;padding:16px;font:13px system-ui,sans-serif}'
+   +'#bnxOlBox table{width:100%;border-collapse:collapse;margin-top:8px}#bnxOlBox th,#bnxOlBox td{padding:5px 6px;border-bottom:1px solid #eee;text-align:left;white-space:nowrap}#bnxOlBox button{padding:6px 10px;border-radius:8px;border:1px solid #ccc;background:#fff;cursor:pointer;margin-right:6px}';
+  document.head.appendChild(css);
+  function pill(){ var e=document.getElementById('bnxOlPill'); if(!e){ e=document.createElement('div'); e.id='bnxOlPill'; e.onclick=function(){ W.bnxOlOpen(); }; (document.body||document.documentElement).appendChild(e); } return e; }
+  function paint(){
+    if(!document.body) return;
+    var pend=reg().filter(function(r){ return r.status==='pending'; }).length, e=pill();
+    if(down||navigator.onLine===false){ e.className='dn'; e.textContent='📴 Offline — billing & printing on this PC'+(pend?' · '+pend+' to sync':''); e.style.display='block'; }
+    else if(pend){ e.className='pd'; e.textContent='🔄 '+pend+' offline bill'+(pend>1?'s':'')+' to sync'; e.style.display='block'; }
+    else e.style.display='none';
+  }
+  function esc(x){ return String(x==null?'':x).replace(/[&<>"]/g,function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+  W.bnxOlOpen=function(){
+    var old=document.getElementById('bnxOlBox'); if(old) old.remove();
+    var a=reg().slice().reverse().slice(0,100), st={pending:'⏳ waiting for internet',synced:'✅ on server',renumbered:'⚠️ server no. — reprint'};
+    var box=document.createElement('div'); box.id='bnxOlBox';
+    box.innerHTML='<div class="in"><div style="display:flex;justify-content:space-between;align-items:center"><b style="font-size:15px">📴 Offline billing</b><button onclick="document.getElementById(\'bnxOlBox\').remove()">✕</button></div>'
+      +'<p style="color:#555;margin:6px 0">Internet: <b>'+(down||navigator.onLine===false?'down':'working')+'</b> · This PC\'s offline series: <b>OL'+esc(devCode())+'-'+fyOf()+'-00001…</b> (each PC has its own code, so numbers never clash). '
+      +'Bills keep printing on the WiFi printers while the internet is down and are saved to the server automatically when it is back.</p>'
+      +'<div><button onclick="bnxFlushOutbox&&bnxFlushOutbox(true);setTimeout(bnxOlOpen,2500)">🔄 Sync now</button>'
+      +'<button onclick="var c=prompt(\'2 letters/digits for this PC (A1, B2 …). Use a different code on every billing PC.\',localStorage.getItem(\'bnx_ol_dev\')||\'\');if(c&&/^[A-Za-z0-9]{2}$/.test(c)){localStorage.setItem(\'bnx_ol_dev\',c.toUpperCase());bnxOlOpen();}">Change PC code</button>'
+      +'<label><input type="checkbox" '+(on()?'checked':'')+' onchange="localStorage.setItem(\'bnx_offline_bill\',this.checked?\'1\':\'0\')"> Offline billing on</label></div>'
+      +(a.length?'<table><tr><th>Bill no.</th><th>Date</th><th>Table</th><th>Amount</th><th>Status</th></tr>'+a.map(function(r){ return '<tr><td><b>'+esc(r.no)+'</b>'+(r.serverNo&&r.serverNo!==r.no?' → '+esc(r.serverNo):'')+'</td><td>'+esc(r.dt||new Date(r.at).toLocaleDateString('en-GB'))+'</td><td>'+esc(r.table)+'</td><td>₹'+Number(r.total||0).toFixed(2)+'</td><td>'+(st[r.status]||esc(r.status))+'</td></tr>'; }).join('')+'</table>':'<p style="color:#888">No offline bills on this PC.</p>')
+      +'</div>';
+    box.onclick=function(ev){ if(ev.target===box) box.remove(); };
+    document.body.appendChild(box);
+  };
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',paint); else paint();
+  if(navigator.onLine===false) setDown(true);
+})();
+</script>
 </body></html>
 
 <style id="bnx-achievement-actual-fix">
