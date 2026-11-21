@@ -17,6 +17,12 @@
   var W=window; if(W.__bnxLane)return; var oF=W.fetch; if(typeof oF!=='function')return;
   var MAX_READ=3, OVER=5, MAX_WAIT=8000, reads=0, writes=0, q=[], stats={reads:0,writes:0,held:0,maxWait:0};
   var READ=/^(GET_|LIST_|FETCH_|RD_FETCH|SEARCH_|LOAD_|PING|BNX_WHOAMI|HEARTBEAT|CHECK_|VERSION|BNX_VERSION)|_GET$|_LIST$|_STATUS_GET$/i;
+  /* 2026-11-21 ("steward slow"): the queue was first-come-first-served — on open the phone first asked order history, bills list,
+     reservations and sheet reads, so TABLES and MENU (what the steward needs) started only after 8+ s and showed after ~13 s on a
+     4 s server. Screen basics now go to the FRONT and may use 2 extra slots; anything started by a tap (1.5 s) goes out at once.
+     History / bills / reservations / images / printers wait behind them. */
+  var FG=/^(GET_TABLE_FLOOR|GET_POS_MENU|GET_MASTER|GET_BOOTSTRAP|GET_CONFIG|GET_ACTIVE_ORDERS|GET_TABLE_BILL_CONTEXT|GET_TRANSFER_CONTEXT|GET_KOT_NUMBER_BATCH|GET_MENU_VERSION|STEWARD_CONTROL_GET|GET_CLIENT_INFO|PRINT_QUEUE_STATUS)$/i, lastTap=0, fgReads=0;
+  ['pointerdown','keydown'].forEach(function(e){ try{ document.addEventListener(e,function(){ lastTap=Date.now(); },{capture:true,passive:true}); }catch(x){} });
   function actionOf(input,init){
     try{ var b=init&&init.body; if(typeof b==='string'&&b.charAt(0)==='{'){ var m=b.match(/"action"\s*:\s*"([^"]+)"/); if(m)return m[1]; } }catch(e){}
     try{ var u=typeof input==='string'?input:(input&&input.url)||''; var m2=String(u).match(/[?&]action=([^&]+)/); if(m2)return decodeURIComponent(m2[1]); }catch(e){}
@@ -31,8 +37,8 @@
       var j=q[i]; if(j.dead){ q.splice(i,1); continue; }
       var waited=Date.now()-j.t;
       /* start when a slot is free and no save/KOT is travelling; a read waiting 8 s+ may use 2 extra slots (never a burst) */
-      var cap=taking()?1:MAX_READ, over=taking()?2:OVER;
-      if((writes===0&&reads<cap)||(waited>=MAX_WAIT&&reads<over)){ q.splice(i,1); if(waited>stats.maxWait)stats.maxWait=waited; if(writes>0)stats.held++; start(j); continue; }
+      var cap=(taking()?1:MAX_READ)+(j.fg?2:0), over=taking()?2:OVER;
+      if((writes===0&&reads<cap)||(j.fg&&reads<cap)||(waited>=MAX_WAIT&&reads<over)){ q.splice(i,1); if(waited>stats.maxWait)stats.maxWait=waited; if(writes>0)stats.held++; start(j); continue; }
       i++;
     }
     clearTimeout(tmr); if(q.length)tmr=setTimeout(pump,250);
@@ -48,9 +54,12 @@
       var end=function(){ writes=Math.max(0,writes-1); pump(); }; p.then(end,end); return p;
     }
     stats.reads++;
-    if(reads<(taking()?1:MAX_READ)&&writes===0&&!q.length){ return new Promise(function(ok,no){ start({self:self,args:args,ok:ok,no:no,t:Date.now()}); }); }
+    if(Date.now()-lastTap<1500){ return new Promise(function(ok,no){ start({self:self,args:args,ok:ok,no:no,t:Date.now()}); }); }   /* the steward is waiting for it */
+    var fg=FG.test(A)||(/^(RD_FETCH_SHEET)$/i.test(A)&&/"tab"\s*:\s*"04_TABLE_MASTER"/.test(String(init&&init.body||'')))||/^LIST_RESERVATIONS$/i.test(A);   /* the table floor itself */
+    if((reads<(taking()?1:MAX_READ)+(fg?2:0))&&(writes===0||fg)&&(fg||!q.length)){ return new Promise(function(ok,no){ start({self:self,args:args,ok:ok,no:no,t:Date.now()}); }); }
     return new Promise(function(ok,no){
-      var j={self:self,args:args,ok:ok,no:no,t:Date.now()}; q.push(j);
+      var j={self:self,args:args,ok:ok,no:no,t:Date.now(),fg:fg};
+      if(fg){ var k=0; while(k<q.length&&q[k].fg)k++; q.splice(k,0,j); } else q.push(j);
       var sig=init&&init.signal; if(sig){ if(sig.aborted){ j.dead=true; var e0=new Error('aborted');e0.name='AbortError'; no(e0); return; }
         sig.addEventListener('abort',function(){ if(q.indexOf(j)>=0){ j.dead=true; var e=new Error('The operation was aborted.'); e.name='AbortError'; no(e); } },{once:true}); }
       pump();
