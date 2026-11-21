@@ -157,6 +157,13 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface public boolean isReady() { return true; }
 
+        /** true when a printer answers on ip:port through the Wi-Fi network (blocks <1 s; the page calls it off the UI thread). */
+        @JavascriptInterface public boolean probe(String ip, String port) {
+            int p = 9100;
+            try { p = Integer.parseInt(port == null ? "" : port.trim()); } catch (NumberFormatException ignored) {}
+            return Printer.get(MainActivity.this).probe(ip, p);
+        }
+
         @JavascriptInterface public String version() { return BuildInfo.VERSION; }
 
         /** Printers found on this WiFi (port 9100) as JSON ["192.168.1.50", …] — slow (up to ~4 s), for setup screens. */
@@ -212,7 +219,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    static final class BuildInfo { static final String VERSION = "1.0"; }
+    static final class BuildInfo { static final String VERSION = "1.1"; }
 
     @SuppressWarnings("unused") static void hide(View v) { v.setVisibility(View.GONE); }
 }
