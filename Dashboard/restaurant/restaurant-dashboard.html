@@ -82336,3 +82336,91 @@ W.bnxMenuRefreshNow=function(){ return reload('manual'); };
 })(window, document);
 
 </script>
+<script id="bnx-bills-bulk-cancel-20261121">
+/* 2026-11-21 ("invoice all delete fast workable"): Bills List had only a one-bill-at-a-time Cancel (a reason prompt per bill).
+   Adds tick boxes + "Cancel selected" / "Cancel ALL shown": ONE reason, ONE confirmation, then every bill is cancelled in
+   parallel (4 at a time) through the same real VOID_BILL action blCancelBill uses (payments reversed, stock restored,
+   offline-safe outbox). A bill the server rejects is rolled back and listed — nothing is claimed cancelled that is not. */
+(function(){
+  var W=window; if(W.__bnxBulkCancel) return; W.__bnxBulkCancel=true;
+  var SEL=Object.create(null), BUSY=false;
+  function $(i){ return document.getElementById(i); }
+  function live(b){ return b && b.status!=='Cancelled' && b.status!=='Not Required'; }
+  function shown(){ return (Array.isArray(W._blLastData)?W._blLastData:[]).filter(live); }   /* ALL filtered bills, not just the painted 60 */
+  function count(){ return Object.keys(SEL).length; }
+  function notif(m,t){ try{ if(typeof W.showNotif==='function') W.showNotif(m,t||'success'); }catch(e){} }
+  function bar(){
+    var b=$('blBulkBar'); if(b) return b;
+    var tbl=$('blTable'); if(!tbl) return null;
+    var card=tbl.closest('.card')||tbl.parentNode;
+    b=document.createElement('div'); b.id='blBulkBar';
+    b.style.cssText='display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:0 0 10px;padding:8px 10px;border:1px solid var(--border,#e5e0d8);border-radius:10px;background:var(--surface,#fff);font-size:12px;font-weight:700';
+    b.innerHTML='<span id="blBulkInfo" style="flex:1;min-width:140px;color:var(--text2,#555)">Tick bills to cancel in bulk</span>'
+      +'<button type="button" class="btn btn-sm btn-ghost" id="blBulkShown">☑ Select all shown</button>'
+      +'<button type="button" class="btn btn-sm btn-ghost" id="blBulkClear">Clear</button>'
+      +'<button type="button" class="btn btn-sm bl-cancel-btn" id="blBulkGo" disabled>🚫 Cancel selected</button>';
+    card.parentNode.insertBefore(b,card);
+    $('blBulkShown').onclick=function(){ shown().forEach(function(x){ SEL[String(x.no)]=1; }); paint(); };
+    $('blBulkClear').onclick=function(){ SEL=Object.create(null); paint(); };
+    $('blBulkGo').onclick=function(){ run(); };
+    return b;
+  }
+  function paint(){
+    if(!bar()) return;
+    var rows=document.querySelectorAll('#blTableBody tr');
+    rows.forEach(function(tr){
+      var td=tr.cells&&tr.cells[0]; if(!td||tr.cells.length<8||td.querySelector('.bl-bulk-cb')) return;
+      var no=String(td.textContent||'').trim(); if(!no) return;
+      var pill=tr.querySelector('.pill'); if(pill&&/Cancelled|Not Required/i.test(pill.textContent)) return;
+      var cb=document.createElement('input'); cb.type='checkbox'; cb.className='bl-bulk-cb'; cb.dataset.no=no; cb.style.cssText='margin-right:6px;transform:scale(1.15);vertical-align:middle';
+      cb.onclick=function(e){ e.stopPropagation(); };
+      cb.onchange=function(){ if(cb.checked) SEL[no]=1; else delete SEL[no]; info(); };
+      td.insertBefore(cb,td.firstChild);
+    });
+    document.querySelectorAll('.bl-bulk-cb').forEach(function(cb){ cb.checked=!!SEL[cb.dataset.no]; });
+    info();
+  }
+  function info(){
+    var n=count(), i=$('blBulkInfo'), g=$('blBulkGo'); if(!i) return;
+    i.textContent=n?(n+' bill'+(n>1?'s':'')+' selected'):'Tick bills to cancel in bulk ('+shown().length+' cancellable in this view)';
+    if(g){ g.disabled=!n||BUSY; g.textContent=BUSY?'⏳ Cancelling…':'🚫 Cancel selected'+(n?' ('+n+')':''); }
+  }
+  async function run(){
+    if(BUSY) return;
+    if(typeof W.bnxRequireFullAccess==='function' && !W.bnxRequireFullAccess('Cancelling bills')) return;
+    var nos=Object.keys(SEL); if(!nos.length) return;
+    var list=W.bnxGetBillRegister(); var by={}; list.forEach(function(x){ by[String(x.no)]=x; });
+    var todo=nos.map(function(n){ return by[n]; }).filter(live);
+    if(!todo.length){ notif('Nothing to cancel — selected bills are already cancelled or not saved yet.','error'); return; }
+    var tot=todo.reduce(function(a,b){ return a+(Number(b.total)||0); },0);
+    var reason=prompt('Cancel '+todo.length+' bill(s) (₹'+Math.round(tot).toLocaleString('en-IN')+') — reason for ALL (required):');
+    if(!reason||!reason.trim()) return;
+    reason=reason.trim(); BUSY=true;
+    var prev={}; todo.forEach(function(b){ prev[b.no]=b.status; b.status='Cancelled'; b.cancelReason=reason; });
+    W.bnxSaveBillRegister(list); SEL=Object.create(null); W.blRenderTable(); info();
+    var done=0, ok=0, failed=[], i=0;
+    notif('🚫 Cancelling '+todo.length+' bills…','error');
+    async function worker(){
+      while(i<todo.length){
+        var b=todo[i++];
+        try{
+          var r=await W.bnxGuaranteedSync('VOID_BILL',{billNumber:b.no,reason:reason},true);
+          if(r&&r.error&&!r.success){ failed.push(b.no+': '+r.error); b.status=prev[b.no]; delete b.cancelReason; } else ok++;   /* no success AND no error = queued offline, keep the mark */
+        }catch(e){ ok++; }   /* queued in the outbox by bnxGuaranteedSync */
+        done++; if(done%5===0||done===todo.length) notif('🚫 '+done+'/'+todo.length+' processed…','error');
+      }
+    }
+    await Promise.all([worker(),worker(),worker(),worker()]);
+    W.bnxSaveBillRegister(list); W.blRenderTable(); BUSY=false; info();
+    if(failed.length){ notif('⚠️ '+ok+' cancelled, '+failed.length+' rejected by server','error'); alert('Not cancelled:\n'+failed.slice(0,15).join('\n')+(failed.length>15?'\n…+'+(failed.length-15)+' more':'')); }
+    else notif('✅ '+ok+' bill'+(ok>1?'s':'')+' cancelled','success');
+  }
+  var orig=W.blRenderTable;
+  if(typeof orig==='function'){
+    W.blRenderTable=function(){ var r=orig.apply(this,arguments); try{ paint(); }catch(e){ console.warn('[bulk cancel]',e); } return r; };
+    try{ blRenderTable=W.blRenderTable; }catch(e){}
+  }
+  var tb=$('blTableBody'); if(tb&&W.MutationObserver) new MutationObserver(function(){ if(!BUSY) try{ paint(); }catch(e){} }).observe(tb,{childList:true});
+  try{ paint(); }catch(e){}
+})();
+</script>
