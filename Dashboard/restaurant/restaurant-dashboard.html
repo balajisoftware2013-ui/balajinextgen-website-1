@@ -41,7 +41,10 @@
   var MAX_READ=3, OVER=5, MAX_WAIT=8000, reads=0, writes=0, q=[], lastTap=0, tmr=0,
       stats={reads:0,fg:0,writes:0,held:0,maxWait:0};
   var READ=/^(GET_|LIST_|FETCH_|RD_FETCH|SEARCH_|LOAD_|PING|BNX_WHOAMI|HEARTBEAT|CHECK_|VERSION|BNX_VERSION|DUES_LIST|NEXT_BILL_NO|DSR_)|_GET$|_LIST$/i;
-  var FG=/^(GET_ORDERS|LIST_BILLS|GET_BILLS|GET_BILL_FOR_REPRINT|GET_BILL_DETAIL|GET_BILL_ITEMS|GET_BILL_ITEMS_DAY|GET_TABLE_BILL_CONTEXT|GET_TRANSFER_CONTEXT|GET_ACTIVE_ORDERS|GET_TABLE_FLOOR|GET_POS_MENU)$/i;
+  /* 2026-11-21 ("bill take time"): SAVE_BILL waits for the approval rules (NC / credit / discount) when this PC has no saved
+     copy (new PC, cleared or full browser storage). APPROVAL_SETTINGS_GET queued as a background read behind ~40 start-up
+     reads, so the first bill after opening took 14 s+ to start. It now goes out at once (tiny read). */
+  var FG=/^(GET_ORDERS|LIST_BILLS|GET_BILLS|GET_BILL_FOR_REPRINT|GET_BILL_DETAIL|GET_BILL_ITEMS|GET_BILL_ITEMS_DAY|GET_TABLE_BILL_CONTEXT|GET_TRANSFER_CONTEXT|GET_ACTIVE_ORDERS|GET_TABLE_FLOOR|GET_POS_MENU|APPROVAL_SETTINGS_GET)$/i;
   ['pointerdown','keydown'].forEach(function(e){ try{ document.addEventListener(e,function(){ lastTap=Date.now(); },{capture:true,passive:true}); }catch(x){} });
   W.addEventListener('hashchange',function(){ lastTap=Date.now(); });
   function actionOf(input,init){
@@ -2369,6 +2372,31 @@ function bnxEnrichItems_(payload){
   return payload;
 }
 window.bnxEnrichItems_=bnxEnrichItems_;
+/* 2026-11-21 USER LANE ("bill list / order list / bill take time"): a Bills List / Order Register read or a bill the person
+   just tapped (View / Reprint / Prev / Next) waited in the 3 shared "on-screen" slots behind ~40 start-up reads (staff, config,
+   dashboard, DSR, dues …) — on the live server that is 30-90 s. They now get their own 3 lanes and start at once
+   (a running SAVE_BILL still goes first, max 1.5 s). Background refreshes of the same screens keep the normal queue. */
+function bnxUserLane_(act){
+  try{
+    if(document.visibilityState!=='visible') return false;
+    var a=String(act||'').toUpperCase(), pg=((document.querySelector('.page.active')||{}).id)||'', recent=(Date.now()-(window.__bnxLastUserActAt||0))<20000;
+    if(!recent) return false;
+    if(/^(GET_BILL_DETAIL|GET_BILL_FOR_REPRINT|GET_BILL_ITEMS|BILL_ITEMS|GET_BILL_ITEMS_DAY)$/.test(a)) return true;
+    if(pg==='page-bills-list' && /^(LIST_BILLS|GET_BILLS|BILL_PAYMENTS)$/.test(a)) return true;
+    if(pg==='page-order-register' && /^(GET_ORDERS|GET_ORDER_DETAIL|GET_ORDER_ITEMS|GET_KOT_REGISTER)$/.test(a)) return true;
+  }catch(e){}
+  return false;
+}
+/* 2026-11-21 SPEED ("dashboard take time"): staff list, tax, payment modes, table layout, client / POS profile and config were asked
+   again on EVERY page load (staff list 4×) — ~10 of the ~40 start-up reads. The last copy (same login) is now kept on this PC for
+   30 min: under 5 min old it is used as is, older it shows at once and refreshes quietly. Any save clears it, exactly like the
+   in-memory cache. */
+var BNX_SWR_LS='bnx_swr1_';
+function bnxSwrLsKey_(k){ var h=5381; for(var i=0;i<k.length;i++){ h=((h<<5)+h+k.charCodeAt(i))|0; } return BNX_SWR_LS+(h>>>0).toString(36)+'_'+k.length; }
+function bnxSwrLsOk_(a,p){ try{ return BNX_SWR_ACTIONS.test(String(a||'')) && bnxSwrRead_(a,p); }catch(e){ return false; } }
+function bnxSwrLsGet_(k){ try{ var v=localStorage.getItem(bnxSwrLsKey_(k)); if(!v) return null; var o=JSON.parse(v); if(!o||o.k!==k||Date.now()-o.t>1800000) return null; return o; }catch(e){ return null; } }
+function bnxSwrLsPut_(k,r){ try{ var v=JSON.stringify({k:k,t:Date.now(),r:r}); if(v.length>150000) return; localStorage.setItem(bnxSwrLsKey_(k),v); }catch(e){ bnxSwrLsClear_(); } }
+function bnxSwrLsClear_(){ try{ for(var i=localStorage.length-1;i>=0;i--){ var k=localStorage.key(i); if(k&&k.indexOf(BNX_SWR_LS)===0) localStorage.removeItem(k); } }catch(e){} }
 async function gasApi(action, payload, endpoint) {
   // Import owns the data-write path. Defer nonessential reports without occupying request slots.
   /* 2026-11-10 ("server busy · queue:34" while 679 import rows were syncing): every report widget kept asking during the import,
@@ -2404,11 +2432,14 @@ async function gasApi(action, payload, endpoint) {
     /* 2026-10-21: the screen now needs a read that a background warm-up already queued -> promote that queued task */
     try{ const qt=window.__bnxInflightTask&&window.__bnxInflightTask.get(inflightKey); if(qt&&!qt.__prio&&!qt.__crit&&bnxOnScreenRead_(String(action||'').toUpperCase())){ qt.__prio=true; qt.__heavy=false;
       const P=REQUEST_QUEUE.pending, ix=P.indexOf(qt); if(ix>=0){ P.splice(ix,1); let k=0; while(k<P.length&&(P[k].__crit||P[k].__prio))k++; P.splice(k,0,qt); if(qt.__retime) qt.__retime(); processRequestQueue(); } } }catch(_e){}
+    try{ const qt=window.__bnxInflightTask&&window.__bnxInflightTask.get(inflightKey); if(qt&&!qt.__user&&!qt.__crit&&bnxUserLane_(action)){ qt.__user=true; qt.__prio=true; qt.__heavy=false;
+      const P=REQUEST_QUEUE.pending, ix=P.indexOf(qt); if(ix>=0){ P.splice(ix,1); let k=0; while(k<P.length&&(P[k].__crit||P[k].__user))k++; P.splice(k,0,qt); if(qt.__retime) qt.__retime(); processRequestQueue(); } } }catch(_e){}
     return BNX_INFLIGHT_API.get(inflightKey);
   }
   const _bnxCacheable = !!inflightKey && bnxIsCacheableRead_(action);
-  if (!_bnxCacheable) { if (!bnxIsReadOnlyAction_(action) && !bnxIsNeutralAction_(action)) {BNX_READ_CACHE.clear(); BNX_READ_GENERATION++;} }
+  if (!_bnxCacheable) { if (!bnxIsReadOnlyAction_(action) && !bnxIsNeutralAction_(action)) {BNX_READ_CACHE.clear(); BNX_READ_GENERATION++; bnxSwrLsClear_();} }
   else {
+    if (!BNX_READ_CACHE.has(inflightKey) && bnxSwrLsOk_(action, payload)) { const ls=bnxSwrLsGet_(inflightKey); if(ls){ const age=Date.now()-ls.t; BNX_READ_CACHE.set(inflightKey,{t:age<300000?Date.now():Date.now()-BNX_READ_CACHE_TTL-1,r:ls.r}); } }
     const hit = BNX_READ_CACHE.get(inflightKey);
     const clone = function(r){ try{ return structuredClone(r); }catch(e){ return JSON.parse(JSON.stringify(r)); } };
     if (hit && (Date.now() - hit.t) < bnxFreshTtl_(action)) {
@@ -2501,9 +2532,11 @@ async function gasApi(action, payload, endpoint) {
        read (max 2 slots) behind DSR / dues / RD_FETCH warm-ups, never started within 30 s and failed with "Server busy".
        Reads for the page that is ON SCREEN (Reports Hub, Bills List, DSR, Accounts) now go to the front of the queue. */
     try{ if(!task.__prio && bnxOnScreenRead_(_act)){ task.__prio=true; task.__heavy=false; } }catch(_e){}
+    try{ if(!critical && bnxUserLane_(_act)){ task.__user=true; task.__prio=true; task.__heavy=false; } }catch(_e){}
     if(_act==='RD_FETCH_SHEET'&&payload&&/^(DUES_RECEIPT|PAYMENT_MASTER|SALES_LEDGER)$/.test(payload.tab||'')&&document.getElementById('detailModal')&&document.getElementById('detailModal').style.display!=='none'){task.__prio=true;task.__heavy=false;}
     try{ if(inflightKey){ (window.__bnxInflightTask=window.__bnxInflightTask||new Map()).set(inflightKey,task); } }catch(_e){}
-    if (critical) { task.__crit=true;let k=0;while(k<REQUEST_QUEUE.pending.length&&REQUEST_QUEUE.pending[k].__crit)k++;REQUEST_QUEUE.pending.splice(k,0,task); }
+    if (task.__user) { let k=0; while(k<REQUEST_QUEUE.pending.length&&(REQUEST_QUEUE.pending[k].__crit||REQUEST_QUEUE.pending[k].__user))k++; REQUEST_QUEUE.pending.splice(k,0,task); }
+    else if (critical) { task.__crit=true;let k=0;while(k<REQUEST_QUEUE.pending.length&&REQUEST_QUEUE.pending[k].__crit)k++;REQUEST_QUEUE.pending.splice(k,0,task); }
     else if(task.__print){let k=0;while(k<REQUEST_QUEUE.pending.length&&(REQUEST_QUEUE.pending[k].__crit||REQUEST_QUEUE.pending[k].__print))k++;REQUEST_QUEUE.pending.splice(k,0,task);}
     else if(task.__tableContext){let k=0;while(k<REQUEST_QUEUE.pending.length&&(REQUEST_QUEUE.pending[k].__crit||REQUEST_QUEUE.pending[k].__print||REQUEST_QUEUE.pending[k].__tableContext))k++;REQUEST_QUEUE.pending.splice(k,0,task);}
     else if(task.__floor||task.__detail){let k=0;while(k<REQUEST_QUEUE.pending.length&&(REQUEST_QUEUE.pending[k].__crit||REQUEST_QUEUE.pending[k].__print||REQUEST_QUEUE.pending[k].__tableContext||REQUEST_QUEUE.pending[k].__detail||REQUEST_QUEUE.pending[k].__floor))k++;REQUEST_QUEUE.pending.splice(k,0,task);}
@@ -2525,9 +2558,9 @@ async function gasApi(action, payload, endpoint) {
     promise.finally(()=>{ if(BNX_INFLIGHT_API.get(inflightKey)===promise) BNX_INFLIGHT_API.delete(inflightKey); try{ window.__bnxInflightTask&&window.__bnxInflightTask.delete(inflightKey); }catch(_e){} });
   }
   if (_bnxCacheable) {
-    promise.then(function(r){ if (r && r.success !== false && readGeneration===BNX_READ_GENERATION && requestClient===bnxCurrentClient_()) { try{ BNX_READ_CACHE.set(inflightKey, {t:Date.now(), r:structuredClone(r)}); }catch(e){} } });
+    promise.then(function(r){ if (r && r.success !== false && readGeneration===BNX_READ_GENERATION && requestClient===bnxCurrentClient_()) { try{ BNX_READ_CACHE.set(inflightKey, {t:Date.now(), r:structuredClone(r)}); }catch(e){} if(bnxSwrLsOk_(action,payload)) bnxSwrLsPut_(inflightKey,r); } });
   } else if (!bnxIsReadOnlyAction_(action) && !bnxIsNeutralAction_(action)) {
-    promise.finally(function(){ BNX_READ_CACHE.clear(); BNX_READ_GENERATION++;try{localStorage.setItem('bnx_data_changed_'+requestClient,Date.now()+'-'+Math.random());}catch(e){} });
+    promise.finally(function(){ BNX_READ_CACHE.clear(); BNX_READ_GENERATION++; bnxSwrLsClear_();try{localStorage.setItem('bnx_data_changed_'+requestClient,Date.now()+'-'+Math.random());}catch(e){} });
   }
   return promise;
 }
@@ -2543,6 +2576,13 @@ function processRequestQueue() {
   for (let i = 0; i < P.length; ) {
     const task = P[i];
     const crit = !!task.__crit;
+    /* 2026-11-21 user lane: own 3 slots; waits only for a bill save that started < 1.5 s ago */
+    if (task.__user && !crit) {
+      if ((REQUEST_QUEUE.userActive||0) >= 3 || (((REQUEST_QUEUE.billActive||0) > 0) && (Date.now()-(REQUEST_QUEUE.critSince||0)) < 1500)) { i++; continue; }
+      P.splice(i, 1); REQUEST_QUEUE.userActive=(REQUEST_QUEUE.userActive||0)+1; REQUEST_QUEUE.active++; task.__startedAt=Date.now();
+      Promise.resolve().then(task).catch(function(e){ console.warn('Queue task error:', e); }).finally(function(){ REQUEST_QUEUE.active--; REQUEST_QUEUE.userActive=Math.max(0,(REQUEST_QUEUE.userActive||0)-1); processRequestQueue(); });
+      continue;
+    }
     /* SPEED 2026-10-28: a running SAVE_BILL used to hold EVERY read (tables, POS order, KOT) with no time limit. On-screen
        reads now wait at most 1.5 s for a save, background reads at most the normal hold. */
     const __onScreenRead = !!(task.__floor||task.__tableContext||task.__detail||task.__prio||task.__print);   /* 2026-11-19: bill View / Reprint reads wait max 1.5 s for a save (were held up to 10 s) */
@@ -77114,6 +77154,20 @@ W.addEventListener('storage',function(e){if(e.key===KEY)apply();});
   function esc(v){ return String(v==null?'':v).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
   function months(f,t){ var a=[], y=+f.slice(0,4), m=+f.slice(5,7); for(var i=0;i<30;i++){ var k=y+'-'+('0'+m).slice(-2); a.push(k); if(k>=t.slice(0,7)) break; m++; if(m>12){m=1;y++;} } return a; }
   var NG=/NON[\s-]*GST|LIQUOR|BEER|WINE|SPIRIT/i;
+  /* HSN summary (GSTR-1 Table 12) — same rules as the GST page: line HSN from the bill, else Hashfreezer → 24031110,
+     else by rate (5 % / 18 % → 996331, 40 % → 24031110, liquor → 22087011); the GST page's own HSN-by-rate table wins. */
+  var RM={'5':['996331','Services provided by restaurant','NA'],'18':['996331','Restaurant service @18%','NA'],'40':['24031110','Hashfreezer','OTH'],'L':['22087011','Liquor (non-GST)','OTH'],'X':['','Tax-free items (exempt)','OTH']};
+  function gstRateMap(gstin){ try{ for(var i=0;i<localStorage.length;i++){ var k=localStorage.key(i); if(k.indexOf('bnx_gst_workflow_v3_')!==0||(gstin&&k.indexOf(gstin)<0)) continue; var v=JSON.parse(localStorage.getItem(k)||'null'); var m=v&&v.client&&v.client.hsnRateMap; if(m) return m; } }catch(e){} return {}; }
+  function hsnRows(S,gstin){ var own=gstRateMap(gstin), map=function(k){ var d=RM[k]||['','',''], o=own[k]||{}; return [o.hsn||d[0],o.desc||d[1],o.uqc||d[2]]; }, H={};
+    S.forEach(function(s){ s.items.forEach(function(i){ var tax=(i.cgst||0)+(i.sgst||0)+(i.igst||0)+(i.cess||0), parts=[];
+      if(i.hsn){ var tot=0; Object.keys(i.hsn).forEach(function(k){ tot+=Math.abs(i.hsn[k]); }); Object.keys(i.hsn).forEach(function(k){ var j=k.indexOf('|'); parts.push({code:k.slice(0,j<0?k.length:j),nm:j<0?'':k.slice(j+1),sh:tot?Math.abs(i.hsn[k])/tot:0}); }); }
+      else if(!tax&&i.parts&&i.parts.length>1){ var t2=0; i.parts.forEach(function(q){t2+=Math.abs(q.a);}); i.parts.forEach(function(q){ parts.push({code:'',nm:'',lab:q.l,sh:t2?Math.abs(q.a)/t2:0}); }); }
+      else parts=[{code:'',nm:'',lab:(i.parts&&i.parts[0]&&i.parts[0].l)||'',sh:1}];
+      parts.forEach(function(pt){ var ng=!tax&&(NG.test(pt.lab||'')||/^22/.test(pt.code)), key=tax?String(i.rate):ng?'L':'X', m;
+        if(pt.code){ var dm=map(key); m=[pt.code,pt.nm||(dm[0]===pt.code?dm[1]:''),/^99/.test(pt.code)?'NA':'OTH']; } else if(/hash\s*freez|hookah|shisha|sheesha|tobacco/i.test(pt.nm||'')) m=['24031110','Hashfreezer','OTH']; else m=map(key);
+        var rk=(m[0]||'(no HSN · '+key+')')+'|'+(tax?i.rate:0), o=H[rk]||(H[rk]={hsn:m[0]||'—',desc:m[1]||'',uqc:m[2]||'',rt:tax?i.rate:0,tx:0,c:0,s:0,i:0,miss:!m[0]});
+        o.tx+=i.taxable*pt.sh; o.c+=(i.cgst||0)*pt.sh; o.s+=(i.sgst||0)*pt.sh; o.i+=(i.igst||0)*pt.sh; }); }); });
+    return Object.keys(H).map(function(k){return H[k];}).sort(function(a,b){return b.tx-a.tx;}); }
   function render(from,to){
     var today=new Date(Date.now()+19800000).toISOString().slice(0,10); from=from||today.slice(0,8)+'01'; to=to||today;
     var ms=months(from,to);
@@ -77138,6 +77192,9 @@ W.addEventListener('storage',function(e){if(e.key===KEY)apply();});
         rows.push('<tr class="rpt-total-row"><td colspan="2">TOTAL ('+(b2b?b2b+' B2B bills, ':'')+'Table 13: '+bills+' bills)</td><td class="mono">'+bills+'</td><td class="mono">'+money(T.tx+ex+ng)+'</td><td class="mono">'+money(T.c)+'</td><td class="mono">'+money(T.s)+'</td><td class="mono">'+money(T.i)+'</td><td class="mono" style="color:var(--gold)">'+money(T.tx+ex+ng+out)+'</td></tr>');
         if(tb) tb.innerHTML=rows.join('');
         var n1=card1.querySelector('.rpt-live-note')||(function(){ var el=D.createElement('div'); el.className='rpt-live-note'; el.style.cssText='text-align:center;font-size:12px;color:var(--text2);margin-top:8px;'; (tb?tb.closest('table'):card1).insertAdjacentElement('afterend',el); return el; })();
+        var hr=hsnRows(S,d.gstin), hb=card1.querySelector('#bnxHsnTbl')||(function(){ var el=D.createElement('div'); el.id='bnxHsnTbl'; el.style.marginTop='14px'; (tb?tb.closest('table'):card1).insertAdjacentElement('afterend',el); return el; })();
+        hb.innerHTML='<div style="font-weight:800;margin:6px 0">HSN summary — Table 12 (B2C + B2B)</div><table class="tbl"><thead><tr><th>HSN / SAC</th><th>Description</th><th>UQC</th><th>Rate</th><th>Taxable</th><th>CGST</th><th>SGST</th><th>IGST</th></tr></thead><tbody>'
+          +hr.map(function(o){ return '<tr'+(o.miss?' style="color:#b91c1c"':'')+'><td class="mono">'+esc(o.hsn)+'</td><td>'+esc(o.desc)+'</td><td>'+esc(o.uqc)+'</td><td>'+o.rt+'%</td><td class="mono">'+money(o.tx)+'</td><td class="mono">'+money(o.c)+'</td><td class="mono">'+money(o.s)+'</td><td class="mono">'+money(o.i)+'</td></tr>'; }).join('')+'</tbody></table>';
         n1.innerHTML='Live from the bills, rate-wise · liquor shown as non-GST · '+esc(from)+' → '+esc(to)+'. <a href="../gst/gst.html" target="_blank" rel="noopener">Open GST workspace ↗</a> for the GSTR-1 JSON, HSN and documents.';
         var bd=card1.querySelector('.rpt-demo-badge'); if(bd) bd.remove(); }
       var card2=D.getElementById('rpt-anchor-gstr3b');
@@ -81060,16 +81117,25 @@ function repaint(a,p){
     if(a==='LIST_BILLS'&&typeof W.bnxPullBillsFromServer==='function'){ var f=p&&(p.FROM_DATE||p.from), t=p&&(p.TO_DATE||p.to); if(f) Promise.resolve(W.bnxPullBillsFromServer(f,t||f)).then(function(){ try{ if(D.querySelector('#page-bills-list.active')&&typeof W.renderBillsList==='function') W.renderBillsList(); }catch(e){} try{ W.dispatchEvent(new CustomEvent('bnx:detail-data',{detail:{from:f,to:t}})); }catch(e){} }).catch(function(){}); }
   }catch(e){}
 }
-var inflight={};
+var inflight={}, down={};
+/* 2026-11-21 ROOT FIX ("order list / bill list take time", Order Register never loads): hook() re-runs every second, and
+   other layers re-wrap gasApi in between, so this layer sat in the chain TWICE. Both copies share `inflight`: the outer copy
+   registered the call and sent it down; the inner copy found it in `inflight` and awaited it — the call waited on itself and
+   never reached the server (no saved copy → "Loading orders from server…" for ever; saved copy → never refreshed).
+   A copy further down the chain now passes a call that a copy above is already sending straight through (the core
+   gasApi still joins identical requests, so nothing is sent twice). */
 function hook(){
   var base=W.gasApi; if(typeof base!=='function'||base.__bnxInstant) return;
   var f=async function(action,payload){
     var A=String(action||''), self=this, args=arguments;
     if(WRITE.test(A)){ var r0=await base.apply(self,args); if(r0&&r0.success!==false) W.__bnxIrStale=Date.now(); return r0; }
     if(!ACT.test(A)||(payload&&(payload.force===true||payload.noCache===true))) return base.apply(self,args);
-    var k=keyOf(A,payload), c=await get(k), now=Date.now();
+    var k=keyOf(A,payload);
+    if(down[k]) return base.apply(self,args);
+    var c=await get(k), now=Date.now();
     function live(){ if(inflight[k]) return inflight[k];
-      var pr=Promise.resolve().then(function(){ return base.apply(self,args); }).then(function(r){ if(r&&(r.success===true||r.ok===true)) put(k,{t:Date.now(),r:r,s:sig(r)}); return r; }).finally(function(){ delete inflight[k]; });
+      down[k]=(down[k]||0)+1; var up=false, rel=function(){ if(up) return; up=true; down[k]=Math.max(0,(down[k]||1)-1); if(!down[k]) delete down[k]; };
+      var pr=Promise.resolve().then(function(){ return base.apply(self,args); }).then(function(r){ if(r&&(r.success===true||r.ok===true)) put(k,{t:Date.now(),r:r,s:sig(r)}); return r; }).finally(function(){ rel(); delete inflight[k]; });
       inflight[k]=pr; return pr; }
     if(!(c&&c.r&&now-c.t<MAXAGE)){ var cv=await cover(A,payload); if(cv) c=cv; }
     if(c&&c.r&&now-c.t<MAXAGE){
