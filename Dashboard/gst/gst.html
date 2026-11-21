@@ -1384,12 +1384,43 @@ function ledgerClassCard(p) {
 }
 G4.setLedgerClass = function (u, v) { if (!GST.client) return; const m = GST.client.ledgerClass || (GST.client.ledgerClass = {}); if (v) m[u] = v; else delete m[u]; if (G4.silentSave) G4.silentSave(); drawGST(); };
 
+/* 2026-11-21 ("B2C-20261010: more than one GST rate in the voucher — split by rate in the offline tool"): an ERP day voucher can
+   carry one line whose tax is a MIX of rates (bills whose GST break-up had no rate heads). It went to GSTR-1 with rate 0 and an
+   alert. Now the line is split here: the tax fits 5 % + the voucher's other rate (40 / 18 / 12 / 28) exactly; tax below 5 % =
+   the rest of the value is exempt. Taxable, CGST / SGST / IGST totals are unchanged — only the rate split is added. */
+function mixItems(r) {
+  if (!r || !Array.isArray(r.items)) return [];
+  if (r.__mx && r.__mxOf === r.items) return r.__mx;
+  const others = r.items.map(i => i.rate != null && i.rate !== '' ? Number(i.rate) : null).filter(x => x != null && x > 5);
+  const out = [];
+  r.items.forEach(i => {
+    const tax = (+i.igst || 0) + (+i.cgst || 0) + (+i.sgst || 0), T = +i.taxable || 0;
+    const fixed = i.rate != null && i.rate !== '' && (Number(i.rate) > 0 || !tax);
+    if (fixed || !tax || !T) { out.push(i); return; }
+    const sr = snapRate(tax / T * 100); if (sr != null) { out.push(Object.assign({}, i, { rate: sr })); return; }
+    const part = (share, taxShare, rt, extra) => { const o = Object.assign({}, i, { rate: rt, taxable: r2(T * share), igst: r2((+i.igst || 0) * taxShare), cgst: r2((+i.cgst || 0) * taxShare), sgst: r2((+i.sgst || 0) * taxShare), cess: r2((+i.cess || 0) * taxShare) }, extra || {});
+      if (i.hsn) { const h = {}; Object.keys(i.hsn).forEach(k => h[k] = r2(i.hsn[k] * share)); o.hsn = h; }
+      if (Array.isArray(i.parts) && !extra) o.parts = i.parts.map(q => ({ l: q.l, a: r2(q.a * share) })); return o; };
+    const eff = tax / T * 100;
+    if (eff < 5) {   /* only part of the value carried 5 % GST; the rest is exempt */
+      const t5 = r2(tax / 0.05), sh = t5 / T; out.push(Object.assign(part(sh, 1, 5), { taxable: t5, igst: +i.igst || 0, cgst: +i.cgst || 0, sgst: +i.sgst || 0, cess: +i.cess || 0 }));
+      out.push(Object.assign(part(1 - sh, 0, 0, { parts: [{ l: 'Tax-free items (exempt)', a: r2(T - t5) }] }), { igst: 0, cgst: 0, sgst: 0, cess: 0 })); return; }
+    const cands = Array.from(new Set(others.sort((a, b) => b - a).concat([18, 40, 12, 28]))).filter(h => h > eff);
+    for (const h of cands) { const txH = (tax - 0.05 * T) / (h / 100 - 0.05); if (txH >= 0 && txH <= T) { const tH = r2(txH), tL = r2(T - tH), taxH = tH * h / 100;
+      const hi = part(tH / T, taxH / tax, h);
+      if (tL > 0.004) { const lo = part(tL / T, (tax - taxH) / tax, 5); ['taxable', 'igst', 'cgst', 'sgst', 'cess'].forEach(f => { hi[f] = r2((+i[f] || 0) - (+lo[f] || 0)); }); out.push(lo); }
+      out.push(hi); return; } }
+    out.push(Object.assign({}, i, { rate: Math.round(eff * 100) / 100 }));
+  });
+  r.__mx = out; r.__mxOf = r.items; return out;
+}
+G4.mixItems = mixItems;
 /* ═════════ 3. GSTR-1 JSON (B2B / B2CL / B2CS / CDNR) ═════════ */
 function gstr1(p) {
   const st = (GST.client && GST.client.stateCode) || (GST.client && GST.client.gstin || '').slice(0, 2), out = { gstin: GST.client.gstin, fp: fp(p), version: 'GST3.2.1', hash: 'hash', b2b: [], b2cl: [], b2cs: [], cdnr: [] }, issues = [];
   const b2b = {}, b2cl = {}, b2cs = {}, nil = {};
   GST.sales.filter(r => inMonth(r, p)).forEach(r => {
-    const inter = r.pos && r.pos !== st, itms = []; r.items.forEach(i => { const sp = split3(i), nk = (inter ? 'INTR' : 'INTRA') + (r.gstin ? 'B2B' : 'B2C'), nb = nil[nk] || (nil[nk] = { sply_ty: nk, expt_amt: 0, nil_amt: 0, ngsup_amt: 0 });
+    const inter = r.pos && r.pos !== st, itms = []; mixItems(r).forEach(i => { const sp = split3(i), nk = (inter ? 'INTR' : 'INTRA') + (r.gstin ? 'B2B' : 'B2C'), nb = nil[nk] || (nil[nk] = { sply_ty: nk, expt_amt: 0, nil_amt: 0, ngsup_amt: 0 });
       nb.expt_amt = r2(nb.expt_amt + sp.ex); nb.ngsup_amt = r2(nb.ngsup_amt + sp.ng);
       const taxd = (+i.igst || 0) + (+i.cgst || 0) + (+i.sgst || 0) + (+i.cess || 0); if (!sp.tx && !taxd) return;
       const rt = i.rate != null && i.rate !== '' && (i.rate > 0 || !taxd) ? Number(i.rate) : rateOf(Object.assign({}, i, { taxable: sp.tx })); if (rt == null) issues.push(r.invoiceNo + ': more than one GST rate in the voucher — split by rate in the offline tool');
@@ -3150,14 +3181,25 @@ drawGST();
      below (5 % / 18 % → 996331 restaurant service, 40 % → 24031110 Hashfreezer, liquor → 22087011, as in Tally). Liquor
      (non-GST) is in the summary like TallyPrime shows it; untick to leave it out. */
   const RMAP_DEF = { '5': { hsn: '996331', desc: 'Services provided by restaurant', uqc: 'NA' }, '18': { hsn: '996331', desc: 'Restaurant service @18%', uqc: 'NA' }, '40': { hsn: '24031110', desc: 'Hashfreezer', uqc: 'OTH' },
-    '12': { hsn: '', desc: 'Items @12%', uqc: 'OTH' }, '28': { hsn: '', desc: 'Items @28%', uqc: 'OTH' }, 'L': { hsn: '22087011', desc: 'Liquor (non-GST)', uqc: 'OTH' }, 'X': { hsn: '', desc: 'Tax-free items (exempt)', uqc: 'OTH' } };
+    '12': { hsn: '', desc: 'Items @12%', uqc: 'OTH' }, '28': { hsn: '', desc: 'Items @28%', uqc: 'OTH' }, 'L': { hsn: '22087011', desc: 'Liquor (non-GST)', uqc: 'OTH' }, 'X': { hsn: '996331', desc: 'Restaurant — no-GST / exempt part', uqc: 'NA' } };
   const rmap = () => { const o = {}, c = (GST.client && GST.client.hsnRateMap) || {}; Object.keys(RMAP_DEF).concat(Object.keys(c)).forEach(k => { o[k] = Object.assign({}, RMAP_DEF[k] || { hsn: '', desc: '', uqc: 'OTH' }, c[k] || {}); }); return o; };
   const hashRule = n => /hash\s*freez|hookah|hukka|shisha|sheesha|tobacco|\bhash\b/i.test(n || '') ? { hsn: '24031110', desc: 'Hashfreezer', uqc: 'OTH' } : null;
+  /* 2026-11-21 ("HSN missing for 33 items: X, CRAFTSMITH, JAMESON, LONG ISLAND ICED TEA, QUA WATER 500ML…"): ERP bar / beverage items
+     without an HSN in the item master — HSN from the item name (liquor brand / pour size, beer, wine, cocktail, water, soft drink).
+     A code typed on this page (HSN master) or in the ERP item master still wins. */
+  const nameRule = (n, key, M) => { const u = String(n || '').toUpperCase(); if (!u) return null;
+    const liq = (M && M.L && M.L.hsn) ? M.L : { hsn: '22087011', desc: 'Liquor (non-GST)', uqc: 'OTH' };
+    if (/\bBEER\b|KINGFISHER|BUDWEISER|HEINEKEN|CORONA|\bBIRA\b|TUBORG|CARLSBERG|HOEGAARDEN|SIMBA|\bKOTSBERG|\bPINT\b|PITCHER/.test(u)) return { hsn: '2203', desc: 'Beer', uqc: 'OTH' };
+    if (/\bWINE\b|SULA|CHARDONNAY|MERLOT|SHIRAZ|CABERNET|SAUVIGNON|PROSECCO|CHAMPAGNE|SANGRIA|ROSE WINE/.test(u)) return { hsn: '2204', desc: 'Wine', uqc: 'OTH' };
+    if ((key === 'L' || key === 'X') && /WHISK|SCOTCH|VODKA|\bGIN\b|\bRUM\b|TEQUILA|BRANDY|COGNAC|LIQUEUR|JAGER|JAMESON|SAPPHIRE|SMIRNOFF|ABSOLUT|BACARDI|OLD MONK|LABEL|GLENFIDDICH|GLENLIVET|CHIVAS|JACK DANIEL|TEACHER|BLENDERS|ROYAL STAG|IMPERIAL BLUE|MCDOWELL|MAGIC MOMENT|BEEFEATER|TANQUERAY|HENDRICK|GREATER THAN|MONKEY SHOULDER|BAILEYS|KAHLUA|COINTREAU|CRAFTSMITH|AMRUT|PAUL JOHN|ANTIQUITY|SIGNATURE|OAKSMITH|BLACK DOG|BALLANTINE|DEWAR|VAT 69|100 PIPERS|SINGLETON|TALISKER|MACALLAN|JIM BEAM|MAKER|CAMUS|HENNESSY|MORPHEUS|BREEZER|\bSHOTS?\b|\bPEG\b|\(\s*(30|60|90|180|375|750)\s*ML\s*\)|\b(30|60)\s*ML\b|LONG ISLAND|\bLIIT\b|COCKTAIL|MARGARITA|COSMOPOLITAN|MARTINI|SCREWDRIVER|BLOODY MARY|PINA COLADA|DAIQUIRI|NEGRONI|OLD FASHIONED|WHISKY SOUR|MOJITO(?!.*VIRGIN)/.test(u) && !/VIRGIN|MOCKTAIL/.test(u)) return { hsn: liq.hsn, desc: liq.desc || 'Liquor', uqc: liq.uqc || 'OTH' };
+    if (/WATER|\bQUA\b|BISLERI|KINLEY|AQUAFINA|HIMALAYAN|EVOCUS|PERRIER/.test(u) && !/WATERMELON|CHESTNUT/.test(u)) return { hsn: '2201', desc: 'Packaged drinking water', uqc: 'OTH' };
+    if (/\bCOKE\b|COCA|PEPSI|SPRITE|THUMS|FANTA|MIRINDA|7 ?UP|\bSODA\b|TONIC|GINGER ALE|RED ?BULL|\bDIET\b|AERATED|\bCAN\b|MOUNTAIN DEW|SCHWEPPES/.test(u)) return { hsn: '2202', desc: 'Aerated / soft drinks', uqc: 'OTH' };
+    return null; };
   const hsnPrev16 = hsnLines;
   hsnLines = function (r, sign) {
     if (r.source !== 'ERP_LIVE') return hsnPrev16(r, sign);
     const out = [], b2b = !!r.gstin, M = rmap(), inclNg = !(GST.client && GST.client.hsnNonGst === false);
-    r.items.forEach(i => {
+    mixItems(r).forEach(i => {
       const tax = (+i.igst || 0) + (+i.cgst || 0) + (+i.sgst || 0) + (+i.cess || 0), rt = i.rate != null ? +i.rate : (rateOf(i) || 0);
       let parts = [];
       if (i.hsn && Object.keys(i.hsn).length) { const tot = Object.values(i.hsn).reduce((a, v) => a + Math.abs(v), 0) || 1; Object.keys(i.hsn).forEach(k => { const j = k.indexOf('|'); parts.push({ code: k.slice(0, j < 0 ? k.length : j), nm: j < 0 ? '' : k.slice(j + 1), share: Math.abs(i.hsn[k]) / tot }); }); }
@@ -3167,7 +3209,8 @@ drawGST();
         const ng = !tax && /liquor|non-gst/i.test(pt.lab || (i.ledgers || []).join(' ')) || (!tax && !pt.lab && rt === 0 && /^22/.test(pt.code));
         if (ng && !inclNg) return;
         const key = tax ? String(rt) : ng ? 'L' : 'X', nm = pt.nm || '', hm = nm && GST.hsnMap[nm] && GST.hsnMap[nm].hsn ? GST.hsnMap[nm] : null, km = GST.hsnMap['ERP sales · ' + key] && GST.hsnMap['ERP sales · ' + key].hsn ? GST.hsnMap['ERP sales · ' + key] : null;
-        const m = pt.code ? { hsn: pt.code, desc: (GST.hsnMap[nm] || {}).desc || nm || (M[key] && M[key].hsn === pt.code ? M[key].desc : ''), uqc: /^99/.test(pt.code) ? 'NA' : 'OTH' } : hm || hashRule(nm) || (key === '40' ? M['40'] : null) || km || M[key] || { hsn: '', desc: '', uqc: 'OTH' };
+        const m = pt.code ? { hsn: pt.code, desc: (GST.hsnMap[nm] || {}).desc || nm || (M[key] && M[key].hsn === pt.code ? M[key].desc : ''), uqc: /^99/.test(pt.code) ? 'NA' : 'OTH' }
+          : hm || hashRule(nm) || (key === '40' ? M['40'] : null) || km || nameRule(nm, key, M) || (M[key] && M[key].hsn ? M[key] : null) || { hsn: '', desc: '', uqc: 'OTH' };
         const k0 = m.hsn ? (nm || 'ERP sales · ' + key) : (nm || 'ERP sales · ' + key);
         out.push({ key: k0, hsn: m.hsn || '', uqc: m.uqc || (/^99/.test(m.hsn || '') ? 'NA' : 'OTH'), qty: 0, rt: tax ? rt : 0, b2b, desc: m.desc || '', txval: r2(i.taxable * pt.share * sign), iamt: r2(i.igst * pt.share * sign), camt: r2(i.cgst * pt.share * sign), samt: r2(i.sgst * pt.share * sign), csamt: r2((i.cess || 0) * pt.share * sign) });
       });
