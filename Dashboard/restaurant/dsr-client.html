@@ -511,9 +511,16 @@ var BNX_DBG_=function(){};
    leave DSR Reports (so re-opening is instant). document.hidden is false there, so the 60 s auto-refresh and the 5 min
    refresh kept calling the slow server while staff were billing on POS — competing with SAVE_BILL / menu / KOT.
    Auto-refresh now runs only while the report is actually on screen. */
+var BNX_DSR_TOUCH_=Date.now();
+['pointerdown','mousemove','keydown','wheel','touchstart','scroll','click'].forEach(function(ev){try{window.addEventListener(ev,function(){BNX_DSR_TOUCH_=Date.now();},{passive:true,capture:true});}catch(e){}});
 function bnxDsrOffscreen_(){
   try{
+    /* 2026-11-22 FIX: a forced Retry, or any click / mouse move / key inside this frame in the last 45 s, proves the report IS on screen.
+       The frame-size test could report 0 x 0 while the dashboard was still laying the iframe out, which skipped every server read
+       ("Report is off screen") and left Swift on "Loading…" forever with Retry doing nothing. */
+    if(window.__bnxDsrForceVisible&&Date.now()<window.__bnxDsrForceVisible) return false;
     if(document.hidden) return true;
+    if(Date.now()-BNX_DSR_TOUCH_<45000) return false;
     var fe=window.frameElement;
     if(fe && (!fe.getClientRects().length || fe.offsetWidth===0 || fe.offsetHeight===0)) return true;
   }catch(e){}
@@ -614,7 +621,7 @@ function bnxDsrAccessibleParent_(){
 async function gasApiRaw_(action,payload,endpoint){
   // All report reads share this frame's flight/cache gate and the signed-in dashboard's scheduler.
   const read=bnxDsrReadAction_(action);
-  if(read&&bnxDsrOffscreen_())return {success:false,deferred:true,error:'Report is off screen. Refresh when visible.'};
+  if(read&&bnxDsrOffscreen_()){window.__bnxDeferredAt=Date.now();return {success:false,deferred:true,error:'Report is off screen. Refresh when visible.'};}
   const parentApi=bnxDsrAccessibleParent_();
   if(read&&parentApi&&typeof parentApi.gasApi==='function'){
     const client=String(getClientId_()||CLIENT_ID||'');
@@ -622,7 +629,7 @@ async function gasApiRaw_(action,payload,endpoint){
     if(!contextOk())return {success:false,error:'Client changed. Refresh DSR.'};
     let slot=false;
     try{await bnxNetSlot_();slot=true;
-      if(bnxDsrOffscreen_())return {success:false,deferred:true,error:'Report is off screen. Refresh when visible.'};
+      if(bnxDsrOffscreen_()){window.__bnxDeferredAt=Date.now();return {success:false,deferred:true,error:'Report is off screen. Refresh when visible.'};}
       if(!contextOk())return {success:false,error:'Client changed. Refresh DSR.'};
       const r=await parentApi.gasApi(action,payload||{},endpoint||'V2_CORE');
       if(!contextOk())return {success:false,error:'Client changed while loading DSR.'};
@@ -1731,6 +1738,7 @@ async function bnxDsrLoadFyBg_(ds){
     if(ok && $('repDate')?.value===ds){
       bnxDsrPaint_(ds);
       try{ (buildYTD.__bnxOriginal||buildYTD)(); }catch(e){}
+      try{ bnxYtdWarn_(); }catch(e){}
       try{ buildDash(); }catch(e){}
     }
     return ok;
@@ -1838,10 +1846,38 @@ async function directPOSFetch(date){
   return false;
 }
 
+/* 2026-11-22 YTD FIX: one failed month (server busy / read skipped) used to abort the whole fiscal-year load, so YTD stayed blank.
+   Now every month is tried on its own (3 tries, 4 s -> 8 s apart), months already on screen are not re-read, a saved copy of a month is
+   used when the server cannot answer, and YTD shows what it has with the missing months named (window.__bnxFyMissing). */
+window.__bnxFyMissing=[];
+function bnxYtdProgress_(txt){ try{ const b=document.getElementById('ytdBody'); if(b&&(!b.querySelector('tr')||/Loading YTD|No live YTD|could not be loaded/.test(b.textContent||''))) b.innerHTML='<tr><td colspan="18" style="text-align:center;padding:14px;color:#b45309;font-weight:700">⏳ '+txt+'</td></tr>'; }catch(e){} }
+async function bnxMonthFromCache_(key){
+ const tenant=getClientId_();let j=null;
+ try{ j=JSON.parse(localStorage.getItem('bnx_atomic_dsr_v1_'+tenant+'_'+key)||'null'); }catch(e){}
+ if(!(j&&j.rows)&&window.bnxDsrIdb_){ try{ j=await window.bnxDsrIdb_.get('bnx_atomic_dsr_v1_'+tenant+'_'+key); }catch(e){} }
+ if(j&&j.rows&&Object.keys(j.rows).length){ Object.keys(j.rows).forEach(k=>{ if(!STANDARD_DATA[k]||STANDARD_DATA[k]._snap){ STANDARD_DATA[k]=j.rows[k]; } }); return true; }
+ return false;
+}
 async function directPOSFetchRange(fromDate,toDate){
- let y=+fromDate.slice(0,4),m=+fromDate.slice(5,7);const end=toDate.slice(0,7);
- try{while(String(y)+'-'+String(m).padStart(2,'0')<=end){await fetchDsrMonthLive_(y,m);if(++m>12){y++;m=1;}}
- BNX_FY_LOADED_={from:fromDate,to:toDate};return true;}catch(e){return false;}
+ let y=+fromDate.slice(0,4),m=+fromDate.slice(5,7);const end=toDate.slice(0,7),curKey=(typeof bnxToday_==='function'?bnxToday_():toDate).slice(0,7);
+ const keys=[];while(String(y)+'-'+String(m).padStart(2,'0')<=end){keys.push([y,m]);if(++m>12){y++;m=1;}}
+ const missing=[];let loaded=0;
+ for(let i=0;i<keys.length;i++){
+  const yy=keys[i][0],mm=keys[i][1],key=yy+'-'+String(mm).padStart(2,'0');
+  const have=Object.keys(STANDARD_DATA||{}).some(d=>d.slice(0,7)===key&&STANDARD_DATA[d]&&!STANDARD_DATA[d]._snap);
+  if(have&&key!==curKey&&key!==end){loaded++;continue;}
+  bnxYtdProgress_('Loading YTD · '+key+' ('+(i+1)+' of '+keys.length+')…');
+  let ok=false;
+  for(let t=1;t<=3&&!ok;t++){
+   try{ window.__bnxDsrForceVisible=Date.now()+120000; ok=!!(await fetchDsrMonthLive_(yy,mm)); }catch(e){ ok=false; }
+   if(!ok&&t<3) await new Promise(r=>setTimeout(r,4000*t));
+  }
+  if(!ok) ok=have||await bnxMonthFromCache_(key);
+  if(ok)loaded++;else missing.push(key);
+ }
+ window.__bnxFyMissing=missing;
+ if(!missing.length){BNX_FY_LOADED_={from:fromDate,to:toDate};}
+ return loaded>0;
 }
 
 window.BNX_DEFAULT_CLIENT_NAME=window.BNX_DEFAULT_CLIENT_NAME||'HASHTAG SILIGURI'; /* client's own name; "Balaji NextGen" is the software vendor, never a client */
@@ -6641,13 +6677,21 @@ async function printItemGroupDsr_(){
       var ds=document.getElementById('repDate')?.value||'';
       if(/^\d{4}-\d{2}-\d{2}$/.test(ds)&&typeof window.ensureDsrFiscalRangeLoaded_==='function'){
         var ok=false;try{ok=await window.ensureDsrFiscalRangeLoaded_(ds);}catch(e){ok=false;}
-        if(!ok){var body=document.getElementById('ytdBody');if(body)body.innerHTML='<tr><td colspan="18" style="text-align:center;padding:14px;color:#b45309;font-weight:700">Live YTD range could not be verified. Refresh the live connection; stale totals are not shown as verified.</td></tr>';return false;}
+        if(!ok){var body=document.getElementById('ytdBody');if(body)body.innerHTML='<tr><td colspan="18" style="text-align:center;padding:14px;color:#b45309;font-weight:700">Live YTD could not be loaded from the server. <a href="#" onclick="bnxYtdRetry_();return false">Retry now</a></td></tr>';return false;}
       }
-      return oldYtd.apply(this,arguments);
+      var res=oldYtd.apply(this,arguments);try{bnxYtdWarn_();}catch(e){}return res;
     };
     wrapped.__bnxYtdAuditGuard=true;wrapped.__bnxOriginal=oldYtd;window.buildYTD=wrapped;
   }
 })();
+function bnxYtdWarn_(){
+  var area=document.getElementById('ytdChartArea');if(!area)return;
+  var w=document.getElementById('bnxYtdWarn');var miss=window.__bnxFyMissing||[];
+  if(!miss.length){if(w)w.remove();return;}
+  if(!w){w=document.createElement('div');w.id='bnxYtdWarn';w.style.cssText='margin:6px 0;padding:8px 12px;border:1px solid #f0b35a;background:#fff7e6;color:#92400e;border-radius:8px;font-size:12px;font-weight:700';area.parentNode.insertBefore(w,area);}
+  w.innerHTML='⚠️ YTD is incomplete — month(s) not received from the server: '+miss.join(', ')+'. Totals below cover only the months loaded. <a href="#" onclick="bnxYtdRetry_();return false" style="color:#b45309;text-decoration:underline">Retry missing months</a>';
+}
+window.bnxYtdRetry_=function(){try{BNX_FY_BG_=null;BNX_FY_LOADED_=null;window.__bnxDsrForceVisible=Date.now()+180000;bnxDsrLoadFyBg_();}catch(e){}};
 
 
 /* ITEM GROUP DSR -> HD JPG -> WhatsApp.
@@ -7822,7 +7866,7 @@ html.bnx-embedded #step-4 .dsr-row *{font-size:inherit}
     var rows=FILTER==='ALL'?inRange:inRange.filter(function(t){ return t.to===FILTER; });
     if(typeof W.bnxSwRowFilter_==='function') rows=rows.filter(W.bnxSwRowFilter_);   /* 2026-10-29: status chips + search */
     var body=D.getElementById('swiftReportBody'), foot=D.getElementById('swiftReportFoot'); if(!body) return;
-    if(!all.length){ var swSt=W.__bnxSwiftState||'loading'; body.innerHTML='<tr><td colspan="12" style="text-align:center;color:var(--muted)">'+((swSt==='nosrc'||swSt==='ok')?'Upload a Swift Transaction file (Settings → Swift Transaction &amp; Settlement Upload) to view and map transactions.':(swSt==='failed'?'⏳ Swift transactions not received from the server yet (server slow) — retrying automatically. ':'⏳ Loading Swift transactions from the Transaction DB… ')+'<a href="#" onclick="bnxSwiftFromDb_(true);return false">Retry now</a>')+'</td></tr>'; if(foot) foot.innerHTML=''; renderMatch(from,to,all); return; }
+    if(!all.length){ var swSt=W.__bnxSwiftState||'waiting'; body.innerHTML='<tr><td colspan="12" style="text-align:center;color:var(--muted)">'+((swSt==='nosrc'||swSt==='ok')?'Upload a Swift Transaction file (Settings → Swift Transaction &amp; Settlement Upload) to view and map transactions.':(swSt==='failed'?'⏳ Swift transactions not received from the server yet (server slow) — retrying automatically. ':(swSt==='loading'?'⏳ Loading Swift transactions from the Transaction DB… ':'⏳ Starting Swift transactions load… '))+'<a href="#" onclick="bnxSwiftFromDb_(true);return false">Retry now</a>')+'</td></tr>'; if(foot) foot.innerHTML=''; renderMatch(from,to,all); return; }
     var LIM=1500, shown=rows.slice(0,LIM);
     body.innerHTML=shown.length?shown.map(function(t){
       return '<tr data-k="'+esc(t.key)+'"'+(t.to==='FAIL'?' style="opacity:.55"':'')+'><td><b>'+esc(t.to==='FEE'?t.biz:t.cdate)+'</b>'+(t.manual?' <span title="mapped by hand">✎</span>':'')+'</td><td>'+esc(t.date)+(t.time?' · '+esc(t.time):'')+'</td><td class="sw-payer" style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(t.payer||'')+'">'+esc(t.payer&&t.payer!=='-'?t.payer:'—')+'</td><td style="font-family:monospace;font-size:10.5px">'+esc(t.ref||'—')+'</td><td>'+esc(t.mode)+'</td><td class="r">'+money(t.amount)+'</td><td class="r">'+money(t.charge)+'</td><td class="r"><b>'+money(t.net)+'</b></td><td>'+esc(t.settle||'—')+'</td><td class="sw-map">'+badge(t)+'</td><td class="sw-st">'+(typeof W.bnxSwStatusChip_==='function'?W.bnxSwStatusChip_(t):'')+'</td><td><button type="button" class="bnx-sw-ico" title="Map this transaction (POS sale / Due received bank / exclude), set its collection date, payer and status" data-map="'+esc(t.key)+'">🔗</button></td></tr>';
@@ -9782,7 +9826,8 @@ html:not(#_t1):not(#_t2):not(#_t3):not(#_t4):not(#_t5) body .dsr-matrix .diff-ro
    header row), retries 20 s → 40 s → 80 s … until loaded, and shows what is happening in the Swift table.
    An uploaded file still wins. */
 (function(){
-  var W=window, busy=false, nextAt=0, wait=20000, lastWhy='';
+  var W=window, busy=false, busyAt=0, nextAt=0, wait=20000, lastWhy='';
+  function withTimeout(p,ms){ return new Promise(function(res){ var t=setTimeout(function(){ res({success:false,error:'timed out after '+Math.round(ms/1000)+' s'}); },ms); Promise.resolve(p).then(function(v){ clearTimeout(t); res(v); },function(e){ clearTimeout(t); res({success:false,error:String(e&&e.message||e)}); }); }); }
   var TXN_TABS=['Swift_Transaction Report','Swift_Transaction_Report','Swift Transaction Report','SWIFT_TRANSACTION_REPORT','SWIFT_TRANSACTION','Swift_Transaction','SWIFT_TXN'];
   var SET_TABS=['Swift_Settlement Report','Swift_Settlement_Report','Swift Settlement Report','SWIFT_SETTLEMENT_REPORT','SWIFT_SETTLEMENT','Swift_Settlement'];
   function txnCount(){ try{ return (typeof swiftRows!=='undefined'&&Array.isArray(swiftRows))?swiftRows.length:0; }catch(e){ return 0; } }
@@ -9804,7 +9849,7 @@ html:not(#_t1):not(#_t2):not(#_t3):not(#_t4):not(#_t5) body .dsr-matrix .diff-ro
   async function readTab(tabs){
     var why=[];
     for(var i=0;i<tabs.length;i++){
-      var r=null; try{ r=await W.bnxDsrSheet_(tabs[i]); }catch(e){ r={success:false,error:String(e&&e.message||e)}; }
+      var r=await withTimeout(W.bnxDsrSheet_(tabs[i]),60000);   /* 2026-11-22: a hung request can no longer keep the loader busy forever */
       if(r&&r.deferred) return {rows:[],deferred:true,why:'report not on screen'};   /* 2026-11-16: not a failure - nothing was asked */
       var rows=nonEmpty(rowsOf(r));
       if(rows.length) return {rows:rows,tab:tabs[i]};
@@ -9822,14 +9867,16 @@ html:not(#_t1):not(#_t2):not(#_t3):not(#_t4):not(#_t5) body .dsr-matrix .diff-ro
     }catch(e){}
   }
   async function load(force){
-    if(bnxDsrOffscreen_())return;
+    if(force===true){ W.__bnxDsrForceVisible=Date.now()+180000; nextAt=0; W.__bnxSwiftNoSrc=0; }   /* Retry now = the person is looking at it */
+    if(bnxDsrOffscreen_()){ if(!txnCount()) W.__bnxSwiftState='waiting'; return; }
     var panel=document.getElementById('itab-swift');if(!force&&(!panel||!panel.classList.contains('active')))return;
+    if(busy&&Date.now()-busyAt>150000) busy=false;   /* stale lock from a request that never came back */
     if(busy||typeof W.bnxDsrSheet_!=='function') return;
     var needT=!txnCount(), needS=!setCount();
     if(!needT&&!needS&&!force) return;
     if(!force&&Date.now()<nextAt) return;
     if(!force&&W.__bnxSwiftNoSrc&&Date.now()-W.__bnxSwiftNoSrc<1800000) return;   /* 2026-10-17: server has no Swift source yet - ask again only every 30 min (or on Retry now) */
-    busy=true; W.__bnxSwiftState='loading'; note('⏳ Loading Swift transactions from the Transaction DB…');
+    busy=true; busyAt=Date.now(); W.__bnxSwiftState='loading'; note('⏳ Loading Swift transactions from the Transaction DB…');
     var gotT=!needT, gotS=!needS, deferred=false;
     try{
       if(needT||force){
@@ -10883,8 +10930,8 @@ html:not(#bnxSpacing) body .dsr-val.editable{height:27px!important;min-height:0!
 
 <script id="bnx-version-badge">
 (function(){
- var build='DSR-2026.10.24-v9';window.BNX_PAGE_BUILD=build;
- function paint(){var b=document.getElementById('bnx-ver-badge');if(!b){b=document.createElement('div');b.id='bnx-ver-badge';b.style.cssText='position:fixed;right:8px;bottom:8px;z-index:9989;padding:4px 8px;border-radius:8px;background:#f3f4f6;color:#333;font:700 10px/1.25 Arial,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.12)';(document.body||document.documentElement).appendChild(b);}b.textContent=build;b.title='Frontend build · 24 October 2026';}
+ var build='DSR-2026.11.22-v10';window.BNX_PAGE_BUILD=build;
+ function paint(){var b=document.getElementById('bnx-ver-badge');if(!b){b=document.createElement('div');b.id='bnx-ver-badge';b.style.cssText='position:fixed;right:8px;bottom:8px;z-index:9989;padding:4px 8px;border-radius:8px;background:#f3f4f6;color:#333;font:700 10px/1.25 Arial,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.12)';(document.body||document.documentElement).appendChild(b);}b.textContent=build;b.title='Frontend build · 22 November 2026';}
  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',paint);else paint();
 })();
 </script>
@@ -11171,3 +11218,599 @@ W.bnxToggleAutoLive_=function(){try{localStorage.setItem(KEY,on()?'0':'1');}catc
 if(D.readyState==='loading')D.addEventListener('DOMContentLoaded',function(){paint();arm();});else{paint();arm();}
 })(window,document);
 </script>
+
+<style id="bnx-swift-remarks-css-20261122">
+#swiftReportTable th.bnx-rmk-h,#swiftReportTable td.bnx-rmk{min-width:170px;max-width:240px}
+#swiftReportTable td.bnx-rmk{cursor:pointer;font-size:11px;line-height:1.3;white-space:normal;vertical-align:middle}
+#swiftReportTable td.bnx-rmk:hover{background:#fff4e0}
+.bnx-rmk-chip{display:inline-block;margin:1px 2px 1px 0;padding:1px 7px;border-radius:10px;background:#e7f6ec;color:#0a6b2d;border:1px solid #b6e3c5;font-weight:700;font-size:10.5px}
+.bnx-rmk-add{color:#b45309;font-weight:700;border:1px dashed #f0b35a;border-radius:10px;padding:1px 8px;font-size:10.5px;display:inline-block}
+.bnx-rmk-txt{color:#4b5563;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px}
+#bnxRmkOv{position:fixed;inset:0;z-index:10060;background:rgba(28,18,8,.55);display:flex;align-items:center;justify-content:center;padding:12px}
+#bnxRmkOv .bx{background:#fff;color:#202938;border-radius:12px;width:min(920px,100%);max-height:92vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.35)}
+#bnxRmkOv .hd{display:flex;gap:10px;align-items:center;padding:12px 14px;border-bottom:1px solid #eee;background:#ff9800;color:#fff;border-radius:12px 12px 0 0}
+#bnxRmkOv .hd b{font-size:15px;flex:1}
+#bnxRmkOv .bd{padding:12px 14px;overflow:auto}
+#bnxRmkOv h4{margin:12px 0 6px;font-size:13px;color:#7a4a00}
+#bnxRmkOv table{width:100%;border-collapse:collapse;font-size:12px}
+#bnxRmkOv th{background:#fff3df;text-align:left;padding:6px 8px;border-bottom:1px solid #f0d9b5;white-space:nowrap}
+#bnxRmkOv td{padding:6px 8px;border-bottom:1px solid #f1f1f1;vertical-align:middle}
+#bnxRmkOv td.r,#bnxRmkOv th.r{text-align:right}
+#bnxRmkOv .kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px;margin-bottom:6px}
+#bnxRmkOv .kv div{background:#fffaf2;border:1px solid #f0d9b5;border-radius:8px;padding:6px 8px;font-size:12px}
+#bnxRmkOv .kv small{display:block;color:#7b8794;font-size:10px;text-transform:uppercase;letter-spacing:.3px}
+#bnxRmkOv button.b{border:1px solid #ddd;background:#fff;border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer}
+#bnxRmkOv button.b.p{background:#ff9800;border-color:#ff9800;color:#fff;font-weight:700}
+#bnxRmkOv button.b.g{background:#16a34a;border-color:#16a34a;color:#fff;font-weight:700}
+#bnxRmkOv button.lnk{border:0;background:none;color:#0b5ed7;text-decoration:underline;cursor:pointer;font:inherit;padding:0;font-weight:700}
+#bnxRmkOv input[type=text]{border:1px solid #ccc;border-radius:8px;padding:6px 8px;font-size:12px;width:100%;box-sizing:border-box}
+#bnxRmkOv .sc{display:inline-block;min-width:34px;text-align:center;border-radius:8px;padding:1px 6px;font-weight:700;font-size:11px}
+#bnxRmkOv .sc.hi{background:#dcfce7;color:#166534}#bnxRmkOv .sc.md{background:#fef3c7;color:#92400e}#bnxRmkOv .sc.lo{background:#f3f4f6;color:#555}
+#bnxRmkOv .note{color:#6b7280;font-size:11.5px;margin:4px 0}
+#bnxSwAutoFix{margin-left:6px}
+@media print{#bnxRmkOv{display:none!important}}
+</style>
+<script id="bnx-swift-remarks-js-20261122">
+/* 2026-11-22  SWIFT "REMARKS" COLUMN + INVOICE-WISE LINK + AUTO-FIX
+   • Far-right Remarks column on every Swift transaction: shows the note and the POS invoices linked to the swipe.
+   • Click it → panel with the swipe, the linked invoices (click an invoice number to open the original bill), suggested invoices
+     found automatically (same amount / payment mode / date / time) and a free-text remark.
+   • "Auto link" links the single best exact match; "Auto-fix all" does it for every shown Card / UPI row (ambiguous rows are left for you).
+   • Links are kept inside the transaction note as  [INV: A, B]  so they save to the server and show on every PC with the existing
+     SWIFT_MAP_SAVE sync — nothing else on the server changes. */
+(function(W,D){
+'use strict';
+if(W.__bnxSwRmk)return;W.__bnxSwRmk=1;
+var TOK=/\s*\[INV:\s*([^\]]*)\]\s*/;
+function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function num(v){var n=parseFloat(String(v==null?'':v).replace(/[₹,\s]/g,''));return isFinite(n)?n:0;}
+function money(n){return (Math.round((+n||0)*100)/100).toLocaleString('en-IN',{minimumFractionDigits:0,maximumFractionDigits:2});}
+function dmy(k){k=String(k||'');return k.length>=10?k.slice(8,10)+'/'+k.slice(5,7)+'/'+k.slice(0,4):k;}
+function toast(m,k){try{if(typeof W.showToast==='function')W.showToast(m,k||'ok');}catch(e){}}
+function ymd(d){return (typeof W.bnxIsoDay_==='function')?W.bnxIsoDay_(d):String(d==null?'':d).slice(0,10);}
+function addDays(d,n){var x=new Date(d+'T00:00:00');x.setDate(x.getDate()+n);return x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0');}
+function tol(){return Number((D.getElementById('s_swift_tol')||{}).value)||1;}
+function parseNote(note){var m=TOK.exec(note||'');return {inv:m?m[1].split(',').map(function(s){return s.trim();}).filter(Boolean):[],text:String(note||'').replace(TOK,' ').trim()};}
+function buildNote(text,inv){text=String(text||'').trim();return text+(inv.length?(text?' ':'')+'[INV: '+inv.join(', ')+']':'');}
+function txns(){try{return W.bnxSwiftTxns_()||[];}catch(e){return [];}}
+function txnByKey(k){return txns().find(function(t){return t.key===k;});}
+function withTimeout(p,ms){return new Promise(function(res,rej){var t=setTimeout(function(){rej(new Error('Bills took too long to load'));},ms);Promise.resolve(p).then(function(v){clearTimeout(t);res(v);},function(e){clearTimeout(t);rej(e);});});}
+
+/* ---------- bills ---------- */
+var BILLS={};
+function nb(b){return {no:String(b.BILL_NUMBER||b.billNumber||'').trim(),id:b.BILL_ID||b.billId||'',date:ymd(b.BUSINESS_DATE||b.BILL_DATE||b.billDate),
+  amt:num(b.GRAND_TOTAL!=null?b.GRAND_TOTAL:(b.grandTotal!=null?b.grandTotal:(b.NET_AMOUNT!=null?b.NET_AMOUNT:b.TOTAL_AMOUNT))),
+  mode:String(b.PAYMENT_MODE||b.paymentMode||'').toUpperCase(),cust:String(b.CUSTOMER_NAME||b.customerName||'').trim(),
+  status:String(b.BILL_STATUS||b.STATUS||'').toUpperCase(),time:(String(b.BILL_TIME||b.CREATED_AT||b.BILL_DATE||'').match(/(\d{1,2}):(\d{2})/)||[]).slice(1,3).join(':')};}
+async function billsFor(from,to,force){
+  var k=from+'|'+to,h=BILLS[k];if(!force&&h&&Date.now()-h.at<120000)return h.v;
+  if(typeof W.bnxDsrBills_!=='function')throw new Error('Bills reader not available');
+  W.__bnxDsrForceVisible=Date.now()+120000;
+  var raw=await withTimeout(W.bnxDsrBills_(from,to),60000);
+  var v=(raw||[]).map(nb).filter(function(b){return b.no&&!/CANCEL|VOID/.test(b.status);});
+  BILLS[k]={at:Date.now(),v:v};return v;
+}
+function modeOk(tm,bm){
+  if(!bm)return 0.5;
+  if(tm==='CARD')return /CARD|POS|VISA|MASTER|SWIPE/.test(bm)?1:(/UPI|GPAY|PHONEPE|PAYTM|QR|CASH|DUE|CREDIT/.test(bm)&&!/MULTI|SPLIT|MIX/.test(bm)?0:0.5);
+  if(tm==='UPI')return /UPI|GPAY|PHONEPE|PAYTM|QR|BHIM/.test(bm)?1:(/CARD|CASH|DUE|CREDIT/.test(bm)&&!/MULTI|SPLIT|MIX/.test(bm)?0:0.5);
+  return 0.5;
+}
+function mins(t){var m=/^(\d{1,2}):(\d{2})/.exec(t||'');return m?(+m[1])*60+(+m[2]):null;}
+function usedMap(exceptKey){var u={};txns().forEach(function(t){if(t.key===exceptKey)return;parseNote(t.note).inv.forEach(function(n){(u[n]=u[n]||[]).push(t);});});return u;}
+function score(t,b,used){
+  var s=0,d=Math.abs(b.amt-t.amount);if(d>tol())return -1;
+  s+=60-Math.min(10,d*5);
+  if(b.date===t.cdate)s+=20;else if(b.date===addDays(t.cdate,-1)||b.date===addDays(t.cdate,1))s+=6;else return -1;
+  var mo=modeOk(t.mode,b.mode);if(mo===0)s-=40;else s+=mo*20;
+  var a=mins(t.time),c=mins(b.time);if(a!=null&&c!=null){var diff=Math.abs(a-c);if(diff>720)diff=1440-diff;if(diff<=30)s+=12;else if(diff<=120)s+=5;}
+  if(used[b.no])s-=45;
+  return Math.max(0,Math.min(100,Math.round(s)));
+}
+function suggest(t,bills,used){
+  var singles=[];bills.forEach(function(b){var sc=score(t,b,used);if(sc>=0)singles.push({b:[b],sc:sc,kind:'1'});});
+  singles.sort(function(a,b){return b.sc-a.sc;});
+  var combos=[];
+  if(!singles.some(function(x){return x.sc>=85;})){
+    var pool=bills.filter(function(b){return b.date===t.cdate&&b.amt>0&&b.amt<t.amount&&modeOk(t.mode,b.mode)>0&&!used[b.no];}).slice(0,160);
+    outer:for(var i=0;i<pool.length;i++)for(var j=i+1;j<pool.length;j++){
+      if(Math.abs(pool[i].amt+pool[j].amt-t.amount)<=tol()){combos.push({b:[pool[i],pool[j]],sc:62,kind:'2'});if(combos.length>=4)break outer;}
+    }
+  }
+  return singles.slice(0,8).concat(combos);
+}
+function save(key,text,inv){
+  if(typeof W.bnxSwMetaSet_!=='function'){toast('Save function not ready — refresh the page','err');return false;}
+  W.bnxSwMetaSet_(key,{note:buildNote(text,inv)});return true;
+}
+function rerender(){try{if(typeof W.renderSwiftReport==='function')W.renderSwiftReport();}catch(e){}}
+
+/* ---------- the Remarks column ---------- */
+function cellHtml(t){
+  var p=parseNote(t.note),h='';
+  if(p.inv.length){h+=p.inv.slice(0,3).map(function(n){return '<span class="bnx-rmk-chip" title="Invoice '+esc(n)+' — click to open / manage">🧾 '+esc(n)+'</span>';}).join('');if(p.inv.length>3)h+='<span class="bnx-rmk-chip">+'+(p.inv.length-3)+'</span>';}
+  if(p.text)h+='<span class="bnx-rmk-txt" title="'+esc(p.text)+'">'+esc(p.text)+'</span>';
+  if(!h)h=(t.to==='POS'||t.to==='DUE'||t.to==='REVIEW')&&t.amount>0?'<span class="bnx-rmk-add">＋ Find invoice</span>':'<span class="bnx-rmk-add" style="color:#9ca3af;border-color:#ddd">＋ Remark</span>';
+  return h;
+}
+function decorate(){
+  var tbl=D.getElementById('swiftReportTable');if(!tbl)return;
+  var head=tbl.querySelector('thead tr');
+  if(head&&!head.querySelector('.bnx-rmk-h')){var th=D.createElement('th');th.className='bnx-rmk-h';th.textContent='Remarks · Invoice';head.appendChild(th);}
+  var map={};txns().forEach(function(t){map[t.key]=t;});
+  tbl.querySelectorAll('#swiftReportBody tr').forEach(function(tr){
+    var k=tr.getAttribute('data-k');
+    if(!k){var td0=tr.cells&&tr.cells.length===1?tr.cells[0]:null;if(td0&&Number(td0.colSpan)>=7&&Number(td0.colSpan)<13)td0.colSpan=13;return;}
+    var t=map[k];if(!t)return;var h=cellHtml(t),td=tr.querySelector('td.bnx-rmk');
+    if(!td){td=D.createElement('td');td.className='bnx-rmk';td.setAttribute('data-rmk',k);td.title='Click: linked invoices & remarks';tr.appendChild(td);}
+    if(td.__h!==h){td.innerHTML=h;td.__h=h;}
+  });
+  var ft=tbl.querySelector('#swiftReportFoot tr');if(ft&&!ft.querySelector('.bnx-rmk-f')){var f=D.createElement('td');f.className='bnx-rmk-f';ft.appendChild(f);}
+  addAutoBtn();
+}
+function addAutoBtn(){
+  if(D.getElementById('bnxSwAutoFix'))return;var anchor=D.getElementById('bnxSwVerify');if(!anchor)return;
+  var b=D.createElement('button');b.type='button';b.id='bnxSwAutoFix';b.className='btn btn-ghost btn-sm';b.textContent='🧾 Auto-link invoices';
+  b.title='Find the POS invoice for every shown Card / UPI swipe (same amount, mode, date, time) and link it in Remarks';
+  b.onclick=autoLinkAll;anchor.parentNode.insertBefore(b,anchor.nextSibling);
+}
+
+/* ---------- auto-fix all shown rows ---------- */
+async function autoLinkAll(){
+  var b=D.getElementById('bnxSwAutoFix');if(b){b.disabled=true;b.textContent='⏳ Matching…';}
+  try{
+    var from=(D.getElementById('swiftReportFrom')||{}).value||'',to=(D.getElementById('swiftReportTo')||{}).value||from;
+    if(from&&to&&from>to){var x=from;from=to;to=x;}
+    var rows=txns().filter(function(t){return t.to==='POS'&&t.amount>0&&(t.mode==='CARD'||t.mode==='UPI')&&(!from||t.cdate>=from)&&(!to||t.cdate<=to)&&!parseNote(t.note).inv.length;});
+    if(!rows.length){toast('Every shown Card / UPI swipe already has an invoice link','ok');return;}
+    var lo=rows.reduce(function(m,t){return t.cdate<m?t.cdate:m;},rows[0].cdate),hi=rows.reduce(function(m,t){return t.cdate>m?t.cdate:m;},rows[0].cdate);
+    var bills=await billsFor(addDays(lo,-1),addDays(hi,1),true);
+    if(!bills.length){toast('POS bills could not be loaded — try again','warn');return;}
+    var used=usedMap(''),linked=0,amb=0,none=0;
+    rows.forEach(function(t){
+      var cand=suggest(t,bills,used).filter(function(s){return s.kind==='1'&&s.sc>=80;});
+      if(!cand.length){none++;return;}
+      var best=cand[0];
+      if(cand.length>1&&cand[1].sc===best.sc){   /* equal amount at the same score: use the nearest time, otherwise leave for a person */
+        var a=mins(t.time);
+        if(a==null||mins(best.b[0].time)==null||mins(cand[1].b[0].time)==null){amb++;return;}
+        var d0=Math.abs(a-mins(best.b[0].time)),d1=Math.abs(a-mins(cand[1].b[0].time));
+        if(d0===d1){amb++;return;}if(d1<d0)best=cand[1];
+      }
+      var no=best.b[0].no;if(save(t.key,parseNote(t.note).text,[no])){used[no]=[t];linked++;}
+    });
+    rerender();
+    toast('🧾 Linked '+linked+' · need your check '+amb+' · no invoice found '+none,linked?'ok':'warn');
+  }catch(e){toast('Auto-link failed: '+String(e&&e.message||e),'err');}
+  finally{var b2=D.getElementById('bnxSwAutoFix');if(b2){b2.disabled=false;b2.textContent='🧾 Auto-link invoices';}}
+}
+
+/* ---------- panel ---------- */
+var CUR=null;
+function close(){var e=D.getElementById('bnxRmkOv');if(e)e.remove();CUR=null;}
+function openBillSafe(no,id){
+  if(typeof W.bnxAuditOpenBill==='function'){W.bnxAuditOpenBill(no,id);return;}
+  if(typeof W.blViewBill==='function'){W.blViewBill(no);return;}
+  toast('Bill viewer not available on this page','warn');
+}
+async function openPanel(key){
+  var t=txnByKey(key);if(!t)return;CUR={key:key};close();CUR={key:key};
+  var ov=D.createElement('div');ov.id='bnxRmkOv';ov.setAttribute('role','dialog');ov.setAttribute('aria-modal','true');
+  ov.innerHTML='<div class="bx"><div class="hd"><b>🧾 Remarks · Invoice-wise link</b><button type="button" class="b" data-x>✕ Close</button></div><div class="bd" id="bnxRmkBd"></div></div>';
+  D.body.appendChild(ov);
+  ov.addEventListener('click',function(e){if(e.target===ov)close();});
+  ov.querySelector('[data-x]').onclick=close;
+  paint(t,null,'⏳ Finding matching invoices…');
+  try{
+    var bills=await billsFor(addDays(t.cdate,-1),addDays(t.cdate,1),false);
+    if(!D.getElementById('bnxRmkOv')||!CUR||CUR.key!==key)return;
+    paint(txnByKey(key)||t,bills,'');
+  }catch(e){if(D.getElementById('bnxRmkOv')&&CUR&&CUR.key===key)paint(txnByKey(key)||t,null,'⚠️ '+String(e&&e.message||e),true);}
+}
+function paint(t,bills,msg,failed){
+  var bd=D.getElementById('bnxRmkBd');if(!bd)return;
+  var p=parseNote(t.note),used=usedMap(t.key),byNo={};(bills||[]).forEach(function(b){byNo[b.no]=b;});
+  var h='<div class="kv"><div><small>Collection date</small><b>'+esc(dmy(t.cdate))+'</b></div><div><small>Txn · time</small>'+esc(dmy(t.date))+(t.time?' · '+esc(t.time):'')+'</div><div><small>Payer</small>'+esc(t.payer&&t.payer!=='-'?t.payer:'—')+'</div><div><small>Reference</small><span style="font-family:monospace">'+esc(t.ref||'—')+'</span></div><div><small>Mode</small>'+esc(t.mode)+'</div><div><small>Amount</small><b>₹ '+money(t.amount)+'</b></div></div>';
+  /* linked */
+  h+='<h4>Linked invoices ('+p.inv.length+')</h4>';
+  if(p.inv.length){
+    var sum=0;
+    h+='<table><thead><tr><th>Invoice</th><th>Bill date</th><th>Customer</th><th>Pay mode</th><th class="r">Bill total</th><th></th></tr></thead><tbody>'+p.inv.map(function(n){var b=byNo[n];if(b)sum+=b.amt;
+      return '<tr><td><button type="button" class="lnk" data-open="'+esc(n)+'" data-id="'+esc(b?b.id:'')+'" title="Open original bill">'+esc(n)+'</button></td><td>'+esc(b?dmy(b.date):'—')+'</td><td>'+esc(b?(b.cust||'—'):'—')+'</td><td>'+esc(b?(b.mode||'—'):'—')+'</td><td class="r">'+(b?money(b.amt):'—')+'</td><td class="r"><button type="button" class="b" data-unlink="'+esc(n)+'">Unlink</button></td></tr>';}).join('')+'</tbody></table>';
+    var known=p.inv.every(function(n){return byNo[n];});
+    if(known){var df=Math.round((sum-t.amount)*100)/100;h+='<div class="note">'+(Math.abs(df)<=tol()?'✅ Invoices total ₹ '+money(sum)+' = swipe amount.':'⚠️ Invoices total ₹ '+money(sum)+' · difference ₹ '+money(df)+' against the swipe.')+'</div>';}
+  }else h+='<div class="note">No invoice linked yet.</div>';
+  /* suggestions */
+  h+='<h4>Suggested invoices <small style="font-weight:400;color:#6b7280">(same amount · payment mode · date · time)</small> <button type="button" class="b g" data-auto style="float:right">⚡ Auto link best</button></h4>';
+  if(msg)h+='<div class="note">'+esc(msg)+(failed?' <button type="button" class="b" data-retry>Retry</button>':'')+'</div>';
+  else if(bills){
+    var sg=suggest(t,bills,used).filter(function(s){return !s.b.every(function(b){return p.inv.indexOf(b.no)>=0;});});
+    if(!sg.length)h+='<div class="note">No bill with the same amount (±₹'+tol()+') on '+esc(dmy(addDays(t.cdate,-1)))+' – '+esc(dmy(addDays(t.cdate,1)))+'. Type the invoice number below, or change the collection date with 🔗.</div>';
+    else h+='<table><thead><tr><th>Match</th><th>Invoice</th><th>Bill date · time</th><th>Customer</th><th>Pay mode</th><th class="r">Amount</th><th></th></tr></thead><tbody>'+sg.map(function(s,i){
+      var cls=s.sc>=80?'hi':s.sc>=55?'md':'lo',nos=s.b.map(function(b){return b.no;});
+      var used2=s.b.map(function(b){return used[b.no];}).filter(Boolean)[0];
+      return '<tr><td><span class="sc '+cls+'">'+s.sc+'%</span></td><td>'+s.b.map(function(b){return '<button type="button" class="lnk" data-open="'+esc(b.no)+'" data-id="'+esc(b.id)+'">'+esc(b.no)+'</button>';}).join(' + ')+(s.kind==='2'?' <small style="color:#92400e">split</small>':'')+'</td><td>'+s.b.map(function(b){return esc(dmy(b.date))+(b.time?' '+esc(b.time):'');}).join('<br>')+'</td><td>'+s.b.map(function(b){return esc(b.cust||'—');}).join('<br>')+'</td><td>'+s.b.map(function(b){return esc(b.mode||'—');}).join('<br>')+'</td><td class="r">'+s.b.map(function(b){return money(b.amt);}).join('<br>')+'</td><td class="r">'+(used2?'<small style="color:#b91c1c" title="Linked to another swipe: '+esc(used2[0].ref||'')+'">used ⚠</small> ':'')+'<button type="button" class="b p" data-link="'+esc(nos.join('|'))+'">Link</button></td></tr>';}).join('')+'</tbody></table>';
+  }
+  /* manual + remark */
+  h+='<h4>Add invoice number / remark</h4><div style="display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:end"><div><div class="note" style="margin:0 0 2px">Invoice number(s), comma separated</div><input type="text" id="bnxRmkInv" placeholder="e.g. HINV00012345"></div><div><div class="note" style="margin:0 0 2px">Remark</div><input type="text" id="bnxRmkTxt" value="'+esc(p.text)+'" placeholder="Remark for this swipe"></div><button type="button" class="b p" data-save>Save</button></div>';
+  bd.innerHTML=h;
+}
+function curAdd(nos){
+  var t=txnByKey(CUR.key);if(!t)return;var p=parseNote(t.note),inv=p.inv.slice();
+  nos.forEach(function(n){n=String(n).trim();if(n&&inv.indexOf(n)<0)inv.push(n);});
+  if(save(t.key,p.text,inv)){rerender();paint(txnByKey(t.key)||t,currentBills(t),'');toast('🧾 Invoice linked: '+nos.join(', '));}
+}
+function currentBills(t){var h=BILLS[addDays(t.cdate,-1)+'|'+addDays(t.cdate,1)];return h?h.v:null;}
+D.addEventListener('click',function(e){
+  var c=e.target.closest&&e.target.closest('td.bnx-rmk');
+  if(c){e.preventDefault();e.stopPropagation();openPanel(c.getAttribute('data-rmk'));return;}
+  var ov=D.getElementById('bnxRmkOv');if(!ov||!ov.contains(e.target)||!CUR)return;
+  var b;
+  if((b=e.target.closest('[data-open]'))){openBillSafe(b.getAttribute('data-open'),b.getAttribute('data-id'));return;}
+  if((b=e.target.closest('[data-link]'))){curAdd(b.getAttribute('data-link').split('|'));return;}
+  if((b=e.target.closest('[data-unlink]'))){var t=txnByKey(CUR.key);if(!t)return;var p=parseNote(t.note);save(t.key,p.text,p.inv.filter(function(n){return n!==b.getAttribute('data-unlink');}));rerender();paint(txnByKey(t.key)||t,currentBills(t),'');toast('Invoice unlinked');return;}
+  if(e.target.closest('[data-retry]')){openPanel(CUR.key);return;}
+  if(e.target.closest('[data-auto]')){
+    var t2=txnByKey(CUR.key),bills=t2&&currentBills(t2);if(!bills){toast('Invoices are still loading','warn');return;}
+    var sg=suggest(t2,bills,usedMap(t2.key)).filter(function(s){return s.kind==='1'&&s.sc>=80;});
+    if(!sg.length){toast('No exact invoice found — pick one from the list or type its number','warn');return;}
+    curAdd([sg[0].b[0].no]);return;}
+  if(e.target.closest('[data-save]')){
+    var t3=txnByKey(CUR.key);if(!t3)return;var p3=parseNote(t3.note),inv=p3.inv.slice();
+    String((D.getElementById('bnxRmkInv')||{}).value||'').split(/[,;\s]+/).forEach(function(n){n=n.trim();if(n&&inv.indexOf(n)<0)inv.push(n);});
+    if(save(t3.key,(D.getElementById('bnxRmkTxt')||{}).value||'',inv)){rerender();toast('✅ Remarks saved');close();}}
+},true);
+D.addEventListener('keydown',function(e){if(e.key==='Escape'&&D.getElementById('bnxRmkOv')){e.stopPropagation();close();}},true);
+
+/* ---------- keep the column on every re-render ---------- */
+function wrap(){
+  var f=W.renderSwiftReport;if(typeof f!=='function'||f.__bnxRmk)return;
+  var w=function(){var r=f.apply(this,arguments);try{decorate();}catch(e){}return r;};w.__bnxRmk=1;W.renderSwiftReport=w;
+}
+setInterval(function(){wrap();try{decorate();}catch(e){}},1500);
+wrap();
+
+/* ---------- main DSR: a read skipped as "off screen" is retried the moment the person uses the page ---------- */
+(function(){
+  var last=0;
+  function chk(){
+    try{
+      var s=D.getElementById('dsrSourceStatus'),st=s?(s.textContent||''):'';
+      var stale=(W.__bnxDeferredAt&&!(W.bnxDsrOffscreen_&&W.bnxDsrOffscreen_()))||(/Report unavailable/i.test(st)&&/off screen|deferred|visible/i.test(st));
+      if(!stale||W.BNX_DSR_LOADING_||Date.now()-last<30000||typeof W.onDsrDateChange!=='function')return;
+      last=Date.now();W.__bnxDeferredAt=0;W.onDsrDateChange();   /* reloads the month + dues */
+      try{var cb=D.getElementById('cbTbody');if(cb&&/Loading live POS cashbook/.test(cb.textContent||'')&&typeof W.loadCashbookLive_==='function')W.loadCashbookLive_();}catch(e){}
+    }catch(e){}
+  }
+  ['pointerdown','keydown','click'].forEach(function(ev){D.addEventListener(ev,function(){setTimeout(chk,400);},true);});
+  setInterval(chk,8000);
+})();
+})(window,document);
+</script>
+
+<style id="bnx-rw-css-20261122">
+#itab-recon #bnxDvb{display:none!important}
+#bnxRw{--rw-o:#ff9800;--rw-g:#15803d;--rw-r:#b42318;--rw-b:#1d4ed8;--rw-bd:#e5dccb}
+#bnxRw .rw-sub{font-size:11px;font-weight:500;opacity:.9;margin-left:8px}
+#bnxRw .rw-actions{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
+#bnxRw .rw-actions button{background:#fff;color:#7a4a00;border:1px solid #f0d9b5;border-radius:8px;padding:5px 10px;font-size:12px;font-weight:700;cursor:pointer}
+#bnxRw .rw-actions button.p{background:#16a34a;color:#fff;border-color:#16a34a}
+#bnxRw .rw-fil{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;padding:10px 4px;border-bottom:1px solid var(--rw-bd)}
+#bnxRw .rw-grp{display:flex;gap:4px;align-items:center;flex-wrap:wrap}
+#bnxRw .rw-grp>label{font-size:10px;font-weight:800;color:#7b8794;text-transform:uppercase;letter-spacing:.4px;margin-right:2px}
+#bnxRw .chp{border:1px solid #e3d5bd;background:#fff;color:#4b3a1d;border-radius:16px;padding:4px 11px;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap}
+#bnxRw .chp:hover{background:#fff4e0}
+#bnxRw .chp.on{background:var(--rw-o);border-color:var(--rw-o);color:#fff}
+#bnxRw input.fi{font-size:12px;padding:5px 8px}
+#bnxRw .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin:10px 0}
+#bnxRw .kpi{border:1px solid var(--rw-bd);border-left:5px solid var(--rw-o);border-radius:10px;background:#fff;padding:8px 12px;position:relative}
+#bnxRw .kpi small{display:block;font-size:10px;font-weight:800;color:#7b8794;text-transform:uppercase;letter-spacing:.4px}
+#bnxRw .kpi b{display:block;font-size:20px;line-height:1.25;color:#1f2937}
+#bnxRw .kpi i{font-style:normal;font-size:11px;color:#6b7280}
+#bnxRw .kpi.dsr{border-left-color:#2563eb}#bnxRw .kpi.bk{border-left-color:#0891b2}#bnxRw .kpi.st{border-left-color:#16a34a}#bnxRw .kpi.ch{border-left-color:#9333ea}
+#bnxRw .kpi.df.ok{border-left-color:#16a34a;background:#f0fdf4}#bnxRw .kpi.df.bad{border-left-color:#dc2626;background:#fef2f2}
+#bnxRw .kpi .ic{position:absolute;right:10px;top:8px;font-size:20px;opacity:.85}
+#bnxRw .prog{height:8px;border-radius:6px;background:#eee;overflow:hidden;margin:2px 0 10px}
+#bnxRw .prog span{display:block;height:100%;background:linear-gradient(90deg,#16a34a,#4ade80)}
+#bnxRw .split{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:12px;align-items:start}
+@media(max-width:1100px){#bnxRw .split{grid-template-columns:1fr}}
+#bnxRw .pane{border:1px solid var(--rw-bd);border-radius:10px;background:#fff;overflow:hidden}
+#bnxRw .pane>h4{margin:0;padding:8px 12px;font-size:13px;color:#7a4a00;background:#fff3df;border-bottom:1px solid var(--rw-bd);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+#bnxRw .pane>h4 .sp{margin-left:auto;font-weight:500;font-size:11px;color:#6b7280}
+#bnxRw .scr{overflow:auto;max-height:68vh}
+#bnxRw table{border-collapse:collapse;width:100%;font-size:12px;font-variant-numeric:tabular-nums}
+#bnxRw th{position:sticky;top:0;z-index:2;background:#f8f1e4;color:#5b4a2a;text-align:right;padding:6px 8px;border-bottom:1px solid var(--rw-bd);white-space:nowrap;font-size:11px}
+#bnxRw th.l,#bnxRw td.l{text-align:left}
+#bnxRw th.hd{background:#dbeafe;color:#1e3a8a}#bnxRw th.hb{background:#cffafe;color:#155e75}#bnxRw th.hf{background:#fee2e2;color:#7f1d1d}
+#bnxRw td{padding:6px 8px;border-bottom:1px solid #f1ece2;text-align:right;white-space:nowrap}
+#bnxRw tbody tr{cursor:pointer}#bnxRw tbody tr:hover td{background:#fff8ec}
+#bnxRw tbody tr.sel td{background:#ffedd0;box-shadow:inset 0 0 0 0 #000}
+#bnxRw tbody tr.sel td:first-child{box-shadow:inset 4px 0 0 var(--rw-o)}
+#bnxRw td.dsr{background:#f5f9ff}#bnxRw td.bk{background:#f2fcfe}
+#bnxRw td.df.ok{color:#166534;font-weight:800}#bnxRw td.df.bad{color:#b42318;font-weight:800;background:#fef2f2}
+#bnxRw tfoot td{font-weight:800;background:#f8f1e4;position:sticky;bottom:0}
+#bnxRw .badge{display:inline-block;border-radius:12px;padding:2px 9px;font-size:11px;font-weight:800;border:1px solid transparent}
+#bnxRw .b-ok{background:#dcfce7;color:#166534;border-color:#bbf7d0}#bnxRw .b-pd{background:#fef3c7;color:#92400e;border-color:#fde68a}
+#bnxRw .b-sh{background:#fee2e2;color:#991b1b;border-color:#fecaca}#bnxRw .b-ex{background:#ffedd5;color:#9a3412;border-color:#fed7aa}#bnxRw .b-nd{background:#f3f4f6;color:#4b5563;border-color:#e5e7eb}
+#bnxRw .cmp{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;padding:10px}
+#bnxRw .cmp div{border:1px solid var(--rw-bd);border-radius:8px;padding:6px 8px;font-size:11px;background:#fffaf2}
+#bnxRw .cmp b{display:block;font-size:12px;margin-bottom:2px}
+#bnxRw .fixbox{margin:0 10px 10px;border-radius:8px;padding:9px 11px;font-size:12px;border:1px solid #fecaca;background:#fef2f2;color:#7f1d1d}
+#bnxRw .fixbox.ex{border-color:#fed7aa;background:#fff7ed;color:#7c2d12}#bnxRw .fixbox.ok{border-color:#bbf7d0;background:#f0fdf4;color:#166534}
+#bnxRw .fixbox button,#bnxRw .bulk button{border:1px solid #d1d5db;background:#fff;border-radius:8px;padding:4px 10px;font-size:12px;font-weight:700;cursor:pointer;margin:4px 4px 0 0}
+#bnxRw .fixbox button.p,#bnxRw .bulk button.p{background:var(--rw-o);border-color:var(--rw-o);color:#fff}
+#bnxRw .bulk{padding:6px 10px;display:flex;gap:2px;flex-wrap:wrap;align-items:center;border-bottom:1px solid #f1ece2;background:#fffdf8}
+#bnxRw .bulk .sp{margin-left:auto;font-size:11px;color:#6b7280}
+#bnxRw select.sts{border:1px solid #d6c9ad;border-radius:8px;padding:3px 4px;font-size:11.5px;font-weight:700;background:#fff}
+#bnxRw select.sts.s-ok{background:#dcfce7;border-color:#86efac;color:#166534}#bnxRw select.sts.s-pd{background:#fef3c7;border-color:#fcd34d;color:#92400e}
+#bnxRw .tx2{display:block;font-size:10.5px;color:#6b7280;max-width:190px;overflow:hidden;text-overflow:ellipsis}
+#bnxRw .empty{padding:26px;text-align:center;color:#6b7280;font-size:13px}
+#bnxRw .legend{font-size:11px;color:#6b7280;margin-top:8px;line-height:1.6}
+@media print{#bnxRw .rw-fil,#bnxRw .rw-actions,#bnxRw .bulk,#bnxRw .fixbox button{display:none!important}#bnxRw .scr{max-height:none!important}#bnxRw .split{grid-template-columns:1fr}}
+</style>
+<script id="bnx-rw-js-20261122">
+/* 2026-11-22 RECONCILIATION CENTRE — DSR ↔ Swift ↔ Settlement ↔ Bank, side by side.
+   Left: day-wise (or settlement-wise) list, DSR vs Bank next to each other with the difference and a clear status.
+   Right: the selected day / settlement batch — mode-wise comparison, a "Bank credit fix" box, and every transaction with a one-tap
+   settlement-status control (single, selected, or all). Uses the existing data (Swift transactions, mappings, statuses, bank receipts)
+   and the existing sync, so nothing on the server changes and every PC sees the same updates. */
+(function(W,D){
+'use strict';
+if(W.__bnxRw)return;W.__bnxRw=1;
+var S={from:'',to:'',mode:'ALL',stat:'ALL',q:'',view:'day',sel:'',busy:false,seq:0,chk:{},mapV:-1,pending:false};
+function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function pad(n){return String(n).padStart(2,'0');}
+function iso(d){return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());}
+function dmy(k){k=String(k||'');return k.length>=10?k.slice(8,10)+'/'+k.slice(5,7)+'/'+k.slice(0,4):k;}
+function inr(n){n=Math.round(+n||0);var s=Math.abs(n).toLocaleString('en-IN');return n<0?'-'+s:s;}
+function lac(n){return (n/100000).toFixed(2)+' L';}
+function toast(m,k){try{if(typeof W.showToast==='function')W.showToast(m,k||'ok');}catch(e){}}
+function tol(){return Number((D.getElementById('s_swift_tol')||{}).value)||1;}
+function today(){try{return W.bnxToday_();}catch(e){return iso(new Date());}}
+function dsrDay(d){var r=(typeof W.STANDARD_DATA!=='undefined'&&W.STANDARD_DATA[d])||(typeof STANDARD_DATA!=='undefined'&&STANDARD_DATA[d])||null;return r&&!r._snap?r:null;}
+function daysIn(a,b){var o=[],x=new Date(a+'T12:00:00'),e=new Date(b+'T12:00:00');for(var g=0;x<=e&&g<400;g++){o.push(iso(x));x.setDate(x.getDate()+1);}return o;}
+function txns(){try{return W.bnxSwiftTxns_()||[];}catch(e){return [];}}
+function incl(t){return (t.to==='POS'||t.to==='DUE')&&t.amount>0;}
+function bm(t){return t.mode==='CARD'?'CARD':t.mode==='UPI'?'UPI':'BANK';}
+function stU(t){return String(t.stDisp||'').toUpperCase();}
+function isPendSt(t){var s=stU(t);return s==='PENDING'||s==='HOLD'||s==='DISPUTED';}
+function isRecv(t){return /^(VERIFIED|RECEIVED|SETTLED)$/.test(stU(t));}
+function settled(t){return isRecv(t)||(!!t.settle&&!isPendSt(t));}
+var ICON={UPI:'📱',CARD:'💳',BANK:'🏦'};
+
+async function ensureMonths(from,to){
+  if(typeof W.fetchDsrMonthLive_!=='function')return;
+  var ms={};daysIn(from,to).forEach(function(d){ms[d.slice(0,7)]=1;});
+  var ks=Object.keys(ms).slice(0,13);
+  for(var i=0;i<ks.length;i++){var mo=ks[i],has=Object.keys(STANDARD_DATA||{}).some(function(k){return k.indexOf(mo)===0&&STANDARD_DATA[k]&&!STANDARD_DATA[k]._snap;});
+    if(!has){try{W.__bnxDsrForceVisible=Date.now()+120000;await W.fetchDsrMonthLive_(+mo.slice(0,4),+mo.slice(5,7));}catch(e){}}}
+}
+
+/* ---------- numbers ---------- */
+function modeFilter(t){return S.mode==='ALL'||bm(t)===S.mode;}
+function dsrVal(r,m){var u=r?+r.gpay||0:0,c=r?+r.card||0:0,b=r?+r.duerecvbank||0:0;return m==='UPI'?u:m==='CARD'?c:m==='BANK'?b:u+c+b;}
+function compute(){
+  var all=txns().filter(incl),by={},batch={};
+  all.forEach(function(t){if(t.cdate<S.from||t.cdate>S.to)return;(by[t.cdate]=by[t.cdate]||[]).push(t);
+    var k=t.settle||'—';(batch[k]=batch[k]||[]).push(t);});
+  var rows=[],T={dsr:0,bank:0,chg:0,net:0,setAmt:0,n:0,nSet:0,days:0,okDays:0,difDays:0,pendDays:0,miss:0};
+  daysIn(S.from,S.to).forEach(function(d){
+    var r=dsrDay(d),list=by[d]||[],f=list.filter(modeFilter);
+    if(!r&&!f.length)return;if(!r)T.miss++;
+    var dv=dsrVal(r,S.mode),bank=0,chg=0,pend=0,set=0,setAmt=0;
+    f.forEach(function(t){bank+=t.amount;chg+=t.charge;if(settled(t)){set++;setAmt+=t.net;}else pend++;});
+    var diff=dv-bank,st=!r?'nodsr':Math.abs(diff)>tol()?(diff>0?'short':'excess'):(pend?'pending':'ok');
+    rows.push({d:d,dsr:dv,bank:bank,chg:chg,diff:diff,n:f.length,set:set,pend:pend,st:st,hasDsr:!!r});
+    T.dsr+=dv;T.bank+=bank;T.chg+=chg;T.net+=bank-chg;T.setAmt+=setAmt;T.n+=f.length;T.nSet+=set;T.days++;
+    if(st==='ok')T.okDays++;else if(st==='pending')T.pendDays++;else T.difDays++;
+  });
+  var bl=Object.keys(batch).sort().map(function(k){var l=batch[k].filter(modeFilter);if(!l.length)return null;var g=0,c=0,sc=0;l.forEach(function(t){g+=t.amount;c+=t.charge;if(settled(t))sc++;});return {k:k,list:l,n:l.length,gross:g,chg:c,net:g-c,sc:sc};}).filter(Boolean);
+  return {rows:rows,T:T,by:by,batches:bl};
+}
+var R=null;
+function statFilterRows(rows){
+  return rows.filter(function(x){
+    if(S.stat==='DIFF')return x.st==='short'||x.st==='excess'||x.st==='nodsr';
+    if(S.stat==='PEND')return x.st==='pending';
+    if(S.stat==='OK')return x.st==='ok';
+    return true;});
+}
+function badge(st,x){
+  if(st==='ok')return '<span class="badge b-ok">✔ Reconciled</span>';
+  if(st==='pending')return '<span class="badge b-pd">⏳ '+x.pend+' to confirm</span>';
+  if(st==='short')return '<span class="badge b-sh">🔴 Bank short ₹'+inr(x.diff)+'</span>';
+  if(st==='excess')return '<span class="badge b-ex">🟠 Bank extra ₹'+inr(-x.diff)+'</span>';
+  return '<span class="badge b-nd">DSR not loaded</span>';
+}
+
+/* ---------- shell ---------- */
+function shell(){
+  var host=D.getElementById('itab-recon');if(!host)return null;var c=D.getElementById('bnxRw');if(c)return c;
+  c=D.createElement('div');c.className='card';c.id='bnxRw';
+  c.innerHTML='<div class="card-title">🔄 Reconciliation Centre<span class="rw-sub">DSR ↔ Swift ↔ Settlement ↔ Bank</span><div class="rw-actions"><button type="button" data-a="run">🔄 Refresh</button><button type="button" data-a="bank">🏦 + Bank credit</button><button type="button" data-a="xl" class="p">📊 Excel</button><button type="button" data-a="print">🖨 Print</button></div></div>'+
+   '<div class="rw-fil">'+
+    '<div class="rw-grp"><label>Period</label><button class="chp" data-p="today">Today</button><button class="chp" data-p="yest">Yesterday</button><button class="chp" data-p="week">This week</button><button class="chp" data-p="month">This month</button><button class="chp" data-p="last">Last month</button><button class="chp" data-p="fy">FY</button><input type="date" class="fi" id="rwFrom"> → <input type="date" class="fi" id="rwTo"></div>'+
+    '<div class="rw-grp" id="rwModes"><label>Mode</label><button class="chp" data-m="ALL">All</button><button class="chp" data-m="UPI">📱 UPI</button><button class="chp" data-m="CARD">💳 Card</button><button class="chp" data-m="BANK">🏦 Bank / Due</button></div>'+
+    '<div class="rw-grp" id="rwStats"><label>Show</label><button class="chp" data-s="ALL">All days</button><button class="chp" data-s="DIFF">⚠ Differences</button><button class="chp" data-s="PEND">⏳ To confirm</button><button class="chp" data-s="OK">✔ Reconciled</button></div>'+
+    '<div class="rw-grp"><label>Search</label><input type="text" class="fi" id="rwQ" placeholder="Payer / reference / amount" style="min-width:190px"></div>'+
+   '</div><div id="rwKpi"></div><div class="rw-grp" style="margin:4px 0 8px" id="rwViews"><label>View</label><button class="chp" data-v="day">📅 Day-wise</button><button class="chp" data-v="batch">🏦 Settlement-wise</button></div><div id="rwMain"></div>'+
+   '<div class="legend"><b>How to read:</b> 🧾 <b>DSR</b> = what the restaurant booked as UPI / Card / Due-received-bank. 💳 <b>Bank received</b> = Swift (and manual bank credit) amounts counted on the same collection date. <b>Difference = DSR − Bank</b>. '+
+   '🔴 <b>Bank short</b> = DSR is more than the bank → add the missing bank credit or move a transaction to this date. 🟠 <b>Bank extra</b> = bank is more than the DSR → check the mapping. '+
+   '⏳ <b>To confirm</b> = difference is nil but some transactions are not yet settled / verified — set them to <b>Received</b> when the credit is seen in the bank. A transaction counts as settled when it has a settlement date in the Swift file or you mark it Verified / Received.</div>';
+  host.insertBefore(c,host.firstChild);
+  c.addEventListener('click',onClick);c.addEventListener('change',onChange);
+  var q=c.querySelector('#rwQ');q.addEventListener('input',function(){S.q=this.value;clearTimeout(q.__t);q.__t=setTimeout(function(){drawMain();},180);});
+  c.querySelector('#rwFrom').addEventListener('change',function(){S.from=this.value;if(S.to<S.from)S.to=S.from;S.sel='';run(true);});
+  c.querySelector('#rwTo').addEventListener('change',function(){S.to=this.value;if(S.from>S.to)S.from=S.to;S.sel='';run(true);});
+  return c;
+}
+function preset(p){
+  var ds=(D.getElementById('repDate')||{}).value||today(),d=new Date(ds+'T12:00:00');
+  if(p==='today'){S.from=S.to=today();}
+  else if(p==='yest'){var y=new Date(today()+'T12:00:00');y.setDate(y.getDate()-1);S.from=S.to=iso(y);}
+  else if(p==='week'){var w=new Date(today()+'T12:00:00');w.setDate(w.getDate()-((w.getDay()+6)%7));S.from=iso(w);S.to=today();}
+  else if(p==='month'){S.from=ds.slice(0,8)+'01';S.to=ds;}
+  else if(p==='last'){var m=new Date(ds.slice(0,8)+'01T12:00:00');m.setDate(0);S.to=iso(m);S.from=S.to.slice(0,8)+'01';}
+  else if(p==='fy'){var yy=+ds.slice(0,4)-(+ds.slice(5,7)<4?1:0);S.from=yy+'-04-01';S.to=ds;}
+  S.sel='';
+}
+
+/* ---------- drawing ---------- */
+function drawFilters(){
+  var c=D.getElementById('bnxRw');if(!c)return;
+  c.querySelector('#rwFrom').value=S.from;c.querySelector('#rwTo').value=S.to;
+  c.querySelectorAll('#rwModes .chp').forEach(function(b){b.classList.toggle('on',b.dataset.m===S.mode);});
+  c.querySelectorAll('#rwStats .chp').forEach(function(b){b.classList.toggle('on',b.dataset.s===S.stat);});
+  c.querySelectorAll('#rwViews .chp').forEach(function(b){b.classList.toggle('on',b.dataset.v===S.view);});
+  c.querySelectorAll('.rw-grp [data-p]').forEach(function(b){b.classList.remove('on');});
+}
+function drawKpi(){
+  var T=R.T,k=D.getElementById('rwKpi');if(!k)return;var diff=T.dsr-T.bank,ok=Math.abs(diff)<=tol()*Math.max(1,T.days),pct=T.days?Math.round(T.okDays*100/T.days):0;
+  k.innerHTML='<div class="kpis">'+
+   '<div class="kpi dsr"><span class="ic">🧾</span><small>DSR sale (UPI+Card+Due)</small><b>₹ '+inr(T.dsr)+'</b><i>'+lac(T.dsr)+' · '+T.days+' day(s)</i></div>'+
+   '<div class="kpi bk"><span class="ic">💳</span><small>Bank / Swift received</small><b>₹ '+inr(T.bank)+'</b><i>'+T.n+' transactions</i></div>'+
+   '<div class="kpi st"><span class="ic">🏦</span><small>Settled · net in bank</small><b>₹ '+inr(T.setAmt)+'</b><i>'+T.nSet+' of '+T.n+' settled / verified</i></div>'+
+   '<div class="kpi ch"><span class="ic">💸</span><small>Charges (MDR / GST)</small><b>₹ '+inr(T.chg)+'</b><i>Net after charges ₹ '+inr(T.net)+'</i></div>'+
+   '<div class="kpi df '+(ok?'ok':'bad')+'"><span class="ic">'+(ok?'✅':'⚖️')+'</span><small>Difference (DSR − Bank)</small><b>₹ '+inr(diff)+'</b><i>'+(ok?'Matched':'Needs attention')+' · '+T.difDays+' day(s) with difference</i></div></div>'+
+   '<div class="prog" title="'+pct+'% of days fully reconciled"><span style="width:'+pct+'%"></span></div>'+
+   '<div style="font-size:11px;color:#6b7280;margin:-6px 0 8px">'+pct+'% of days fully reconciled · ✔ '+T.okDays+' · ⏳ '+T.pendDays+' · ⚠ '+T.difDays+(T.miss?' · DSR not loaded for '+T.miss+' day(s)':'')+'</div>';
+}
+function listDay(){
+  var rows=statFilterRows(R.rows),T=R.T;
+  if(!rows.length)return '<div class="empty">No days match this filter.</div>';
+  var h='<div class="scr"><table><thead><tr><th class="l">Date</th><th class="hd">🧾 DSR</th><th class="hb">💳 Bank</th><th class="hf">⚖️ Diff</th><th>Settled</th><th class="l">Status</th></tr></thead><tbody>';
+  rows.forEach(function(x){var ok=Math.abs(x.diff)<=tol();
+    h+='<tr data-day="'+x.d+'" class="'+(S.sel===x.d?'sel':'')+'"><td class="l"><b>'+dmy(x.d)+'</b></td><td class="dsr">'+inr(x.dsr)+'</td><td class="bk">'+inr(x.bank)+'</td><td class="df '+(ok?'ok':'bad')+'">'+(ok?'✓':inr(x.diff))+'</td><td>'+x.set+'/'+x.n+'</td><td class="l">'+badge(x.st,x)+'</td></tr>';});
+  return h+'</tbody><tfoot><tr><td class="l">TOTAL</td><td>'+inr(T.dsr)+'</td><td>'+inr(T.bank)+'</td><td>'+inr(T.dsr-T.bank)+'</td><td>'+T.nSet+'/'+T.n+'</td><td></td></tr></tfoot></table></div>';
+}
+function listBatch(){
+  if(!R.batches.length)return '<div class="empty">No transactions in this period.</div>';
+  var h='<div class="scr"><table><thead><tr><th class="l">Settlement date</th><th>Txns</th><th>Gross</th><th>Charges</th><th class="hb">Net credit</th><th class="l">Status</th></tr></thead><tbody>';
+  R.batches.forEach(function(b){var done=b.sc===b.n,none=b.k==='—';
+    h+='<tr data-batch="'+esc(b.k)+'" class="'+(S.sel===('B:'+b.k)?'sel':'')+'"><td class="l"><b>'+(none?'Awaiting settlement':dmy(b.k))+'</b></td><td>'+b.n+'</td><td>'+inr(b.gross)+'</td><td>'+inr(b.chg)+'</td><td class="bk"><b>'+inr(b.net)+'</b></td><td class="l">'+(done?'<span class="badge b-ok">✔ Received</span>':'<span class="badge b-pd">⏳ '+(b.n-b.sc)+' open</span>')+'</td></tr>';});
+  return h+'</tbody></table></div>';
+}
+function selList(){
+  if(S.sel.indexOf('B:')===0){var k=S.sel.slice(2),b=R.batches.filter(function(x){return x.k===k;})[0];return b?b.list:[];}
+  return (R.by[S.sel]||[]).filter(modeFilter);
+}
+function qMatch(t){if(!S.q)return true;var q=S.q.toLowerCase().trim(),a=String(Math.round(t.amount));return (String(t.payer||'')+' '+t.ref+' '+(t.note||'')+' '+t.stDisp).toLowerCase().indexOf(q)>=0||a===q.replace(/[,₹\s]/g,'');}
+function stOptions(t){
+  var cur=String(t.st||'');var opts=['Pending','Verified','Received','Hold'];if(cur&&opts.indexOf(cur)<0)opts.push(cur);
+  return '<option value="">'+(cur?'↺ Auto':esc(t.stDisp||'Auto'))+'</option>'+opts.map(function(o){return '<option'+(o===cur?' selected':'')+'>'+esc(o)+'</option>';}).join('');
+}
+function detail(){
+  if(!S.sel)return '<div class="pane"><h4>👈 Select a day or settlement</h4><div class="empty">Tap a row on the left to see its transactions, update settlement status and fix bank credit.</div></div>';
+  var isB=S.sel.indexOf('B:')===0,list=selList(),x=!isB&&R.rows.filter(function(r){return r.d===S.sel;})[0],shown=list.filter(qMatch).sort(function(a,b){return (a.date+a.time).localeCompare(b.date+b.time);});
+  var title=isB?(S.sel.slice(2)==='—'?'Awaiting settlement':'Settlement '+dmy(S.sel.slice(2))):'📅 '+dmy(S.sel);
+  var h='<div class="pane"><h4>'+title+(x?' '+badge(x.st,x):'')+'<span class="sp">'+shown.length+' of '+list.length+' transaction(s)</span></h4>';
+  if(x){
+    var d=dsrDay(S.sel),m=['UPI','CARD','BANK'],lab={UPI:'📱 UPI',CARD:'💳 Card',BANK:'🏦 Due bank'};
+    h+='<div class="cmp">'+m.map(function(k){var dv=dsrVal(d,k),bv=0;(R.by[S.sel]||[]).forEach(function(t){if(bm(t)===k)bv+=t.amount;});var df=dv-bv,ok=Math.abs(df)<=tol();
+      return '<div><b>'+lab[k]+'</b>DSR ₹'+inr(dv)+'<br>Bank ₹'+inr(bv)+'<br><span style="font-weight:800;color:'+(ok?'#166534':'#b42318')+'">'+(ok?'✔ matched':'Diff ₹'+inr(df))+'</span></div>';}).join('')+'</div>';
+    h+=fixBox(x);
+  }
+  h+='<div class="bulk"><button type="button" class="p" data-bulk="Verified">✔ Verify all</button><button type="button" class="p" data-bulk="Received">🏦 Mark all Received</button><button type="button" data-bulk="">↺ Auto</button><button type="button" data-bulk-sel="Received">Selected → Received</button><span class="sp">Received = credit seen in bank</span></div>';
+  if(!shown.length)return h+'<div class="empty">No transactions.</div></div>';
+  h+='<div class="scr" style="max-height:48vh"><table><thead><tr><th><input type="checkbox" data-all title="Select all"></th><th class="l">Time · Payer / Ref</th><th>Mode</th><th>Amount</th><th>Charges</th><th>Settle</th><th class="l">Status</th><th></th></tr></thead><tbody>';
+  shown.forEach(function(t){var s=settled(t),cls=isRecv(t)?'s-ok':isPendSt(t)?'s-pd':'';
+    h+='<tr style="cursor:default"><td><input type="checkbox" data-ck="'+esc(t.key)+'"'+(S.chk[t.key]?' checked':'')+'></td><td class="l"><b>'+esc(t.time||'—')+'</b> '+esc(t.payer&&t.payer!=='-'?t.payer:'')+'<span class="tx2" style="font-family:monospace">'+esc(t.ref||'—')+(t.isBank?' · bank credit':'')+'</span></td><td>'+ICON[bm(t)]+' '+esc(t.mode)+'</td><td><b>'+inr(t.amount)+'</b></td><td>'+inr(t.charge)+'</td><td>'+(t.settle?dmy(t.settle):'<span style="color:#b45309">—</span>')+'</td>'+
+      '<td class="l"><select class="sts '+cls+'" data-sts="'+esc(t.key)+'" title="Settlement status">'+stOptions(t)+'</select></td><td><button type="button" data-map="'+esc(t.key)+'" title="Change mapping / collection date / payer" style="border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer">🔗</button></td></tr>';});
+  return h+'</tbody></table></div></div>';
+}
+function fixBox(x){
+  var tl=tol();
+  if(x.st==='nodsr')return '<div class="fixbox ex">DSR is not loaded for this day. Press <b>Refresh</b>, or open DSR for this date.</div>';
+  if(Math.abs(x.diff)<=tl)return '<div class="fixbox ok">✔ DSR and bank agree for this day'+(x.pend?' — confirm '+x.pend+' transaction(s) below to finish.':'.')+'</div>';
+  var amt=Math.abs(x.diff),near=txns().filter(function(t){return t.amount>0&&Math.abs(t.amount-amt)<=tl&&!(incl(t)&&t.cdate===S.sel)&&Math.abs((new Date(t.cdate+'T12:00:00')-new Date(S.sel+'T12:00:00'))/864e5)<=5&&t.to!=='FEE';}).slice(0,3);
+  var h;
+  if(x.diff>0){
+    h='<div class="fixbox"><b>🔴 Bank credit is ₹'+inr(amt)+' less than DSR.</b><br>Fix: add the missing credit (NEFT / IMPS / cheque / manual) or move a swipe that belongs to this day.<br><button type="button" class="p" data-fixbank="'+x.d+'|'+amt+'">🏦 Add bank credit ₹'+inr(amt)+'</button>';
+    if(near.length)h+='<div style="margin-top:6px"><b>Possible match (same amount, nearby date):</b></div>'+near.map(function(t){return '<div style="margin-top:3px">'+dmy(t.cdate)+' · '+esc(t.mode)+' ₹'+inr(t.amount)+' · '+esc(t.payer&&t.payer!=='-'?t.payer:t.ref||'')+' <span class="badge b-nd">'+esc(t.to)+'</span> <button type="button" data-map="'+esc(t.key)+'">🔗 Map to this day</button></div>';}).join('');
+    return h+'</div>';
+  }
+  h='<div class="fixbox ex"><b>🟠 Bank is ₹'+inr(amt)+' more than DSR.</b><br>Fix: check for a duplicate or a swipe counted on the wrong day, and change its mapping / collection date with 🔗.';
+  var big=(R.by[S.sel]||[]).filter(function(t){return Math.abs(t.amount-amt)<=tl;}).slice(0,3);
+  if(big.length)h+=big.map(function(t){return '<div style="margin-top:3px">Same amount: '+esc(t.time||'')+' · '+esc(t.mode)+' ₹'+inr(t.amount)+' <button type="button" data-map="'+esc(t.key)+'">🔗 Change</button></div>';}).join('');
+  return h+'</div>';
+}
+function drawMain(){
+  var m=D.getElementById('rwMain');if(!m||!R)return;
+  var left=S.view==='batch'?'<div class="pane"><h4>🏦 Settlement-wise <span class="sp">tap a settlement to update its status</span></h4>'+listBatch()+'</div>':'<div class="pane"><h4>🧾 DSR  vs  💳 Bank — day-wise <span class="sp">tap a day for details</span></h4>'+listDay()+'</div>';
+  m.innerHTML='<div class="split">'+left+detail()+'</div>';
+}
+function draw(){drawFilters();drawKpi();drawMain();}
+
+/* ---------- running ---------- */
+async function run(load){
+  var c=shell();if(!c)return;
+  var ds=(D.getElementById('repDate')||{}).value||today();
+  if(!S.from){S.from=ds.slice(0,8)+'01';S.to=ds;}
+  var my=++S.seq;drawFilters();
+  var m=D.getElementById('rwMain');
+  if(load){if(m)m.style.opacity='.55';await ensureMonths(S.from,S.to);if(my!==S.seq)return;}
+  if(m)m.style.opacity='';
+  if(!txns().length&&!dsrDay(S.from)){var k=D.getElementById('rwKpi');if(k)k.innerHTML='';if(m)m.innerHTML='<div class="empty">No Swift transactions loaded yet — open the <b>Swift Transaction</b> tab (they load from the server) or upload a Swift file in Settings.</div>';return;}
+  R=compute();S.mapV=W.__bnxSwMapV||0;draw();
+}
+function bulkSet(keys,status){
+  if(typeof W.bnxSwMetaSet_!=='function'){toast('Not ready — refresh the page','err');return;}
+  if(!keys.length){toast('No transactions to update','warn');return;}
+  keys.forEach(function(k){W.bnxSwMetaSet_(k,{status:status});});
+  toast('✔ '+keys.length+' transaction(s) → '+(status||'Auto'));
+  try{if(typeof W.renderSwiftReport==='function')W.renderSwiftReport();}catch(e){}
+  run(false);
+}
+function onChange(e){
+  var s=e.target.closest&&e.target.closest('select[data-sts]');
+  if(s){bulkSet([s.getAttribute('data-sts')],s.value);return;}
+  var a=e.target.closest&&e.target.closest('input[data-all]');
+  if(a){selList().filter(qMatch).forEach(function(t){S.chk[t.key]=a.checked;});drawMain();return;}
+  var c=e.target.closest&&e.target.closest('input[data-ck]');
+  if(c)S.chk[c.getAttribute('data-ck')]=c.checked;
+}
+function onClick(e){
+  var b;
+  if((b=e.target.closest('[data-p]'))){preset(b.dataset.p);run(true);return;}
+  if((b=e.target.closest('[data-m]'))){S.mode=b.dataset.m;S.sel='';run(false);return;}
+  if((b=e.target.closest('[data-s]'))){S.stat=b.dataset.s;run(false);return;}
+  if((b=e.target.closest('[data-v]'))){S.view=b.dataset.v;S.sel='';S.chk={};run(false);return;}
+  if((b=e.target.closest('[data-a]'))){var a=b.dataset.a;if(a==='run')return run(true);if(a==='bank')return bankDlg('',0);if(a==='xl')return excel();if(a==='print')return W.print();}
+  if((b=e.target.closest('[data-fixbank]'))){var p=b.getAttribute('data-fixbank').split('|');return bankDlg(p[0],+p[1]);}
+  if((b=e.target.closest('[data-bulk]'))){var st=b.getAttribute('data-bulk');if(st==='Received'&&!confirm('Mark all '+selList().filter(qMatch).length+' transaction(s) as Received in bank?'))return;return bulkSet(selList().filter(qMatch).map(function(t){return t.key;}),st);}
+  if((b=e.target.closest('[data-bulk-sel]'))){var ks=Object.keys(S.chk).filter(function(k){return S.chk[k];});S.chk={};return bulkSet(ks,b.getAttribute('data-bulk-sel'));}
+  if(e.target.closest('select,input,[data-map],button'))return;
+  if((b=e.target.closest('tr[data-day]'))){S.sel=b.dataset.day;S.chk={};drawMain();return;}
+  if((b=e.target.closest('tr[data-batch]'))){S.sel='B:'+b.getAttribute('data-batch');S.chk={};drawMain();return;}
+}
+function bankDlg(day,amt){
+  if(typeof W.bnxSwBankDlg_!=='function'){toast('Bank credit form not ready — refresh the page','err');return;}
+  W.bnxSwBankDlg_();
+  setTimeout(function(){var ovs=D.querySelectorAll('.bnx-dlg-ov'),ov=ovs[ovs.length-1];if(!ov)return;
+    if(day){['#bkD','#bkC'].forEach(function(s){var i=ov.querySelector(s);if(i)i.value=day;});}
+    var a=ov.querySelector('#bkA');if(a&&amt){a.value=Math.round(amt*100)/100;}
+    var sI=ov.querySelector('#bkS');if(sI)sI.value='Received';
+    var n=ov.querySelector('#bkN');if(n&&day)n.value='Bank credit added from Reconciliation for '+dmy(day);},30);
+}
+function excel(){
+  if(!W.XLSX){toast('Excel library still loading — try again','warn');return;}if(!R)return;
+  var X=W.XLSX,T=R.T,a=[['Reconciliation '+dmy(S.from)+' to '+dmy(S.to)+' · mode '+S.mode],[],['Date','DSR Sale','Bank Received','Difference','Charges','Txns','Settled','Status']];
+  R.rows.forEach(function(x){a.push([dmy(x.d),Math.round(x.dsr),Math.round(x.bank),Math.round(x.diff),Math.round(x.chg),x.n,x.set,{ok:'Reconciled',pending:'To confirm',short:'Bank short',excess:'Bank extra',nodsr:'DSR not loaded'}[x.st]]);});
+  a.push(['TOTAL',Math.round(T.dsr),Math.round(T.bank),Math.round(T.dsr-T.bank),Math.round(T.chg),T.n,T.nSet,'']);
+  var tx=[['Collection Date','Txn Date','Time','Payer','Reference','Mode','Amount','Charges','Net','Settlement Date','Mapped To','Status','Note']];
+  txns().filter(function(t){return incl(t)&&t.cdate>=S.from&&t.cdate<=S.to&&modeFilter(t);}).sort(function(p,q){return (p.cdate+p.time).localeCompare(q.cdate+q.time);})
+   .forEach(function(t){tx.push([dmy(t.cdate),dmy(t.date),t.time||'',t.payer||'',t.ref||'',t.mode,t.amount,t.charge,t.net,t.settle?dmy(t.settle):'',t.to,t.stDisp||'',t.note||'']);});
+  var wb=X.utils.book_new(),w1=X.utils.aoa_to_sheet(a);w1['!cols']=[{wch:12},{wch:14},{wch:14},{wch:12},{wch:10},{wch:7},{wch:8},{wch:16}];
+  X.utils.book_append_sheet(wb,w1,'Day-wise');var w2=X.utils.aoa_to_sheet(tx);w2['!cols']=[{wch:12},{wch:12},{wch:8},{wch:20},{wch:22},{wch:7},{wch:11},{wch:9},{wch:11},{wch:12},{wch:9},{wch:11},{wch:24}];X.utils.book_append_sheet(wb,w2,'Transactions');
+  X.writeFile(wb,'Reconciliation_'+S.from+'_to_'+S.to+'.xlsx');
+}
+
+/* ---------- keep in step with the rest of the page ---------- */
+function active(){var p=D.getElementById('itab-recon');return !!(p&&(p.classList.contains('active')||p.offsetParent));}
+function wrapTab(){var it=W.innerTab;if(typeof it!=='function'||it.__bnxRw)return;var g=function(name){var r=it.apply(this,arguments);if(name==='recon')setTimeout(function(){run(true);},120);return r;};g.__bnxRw=1;W.innerTab=g;try{innerTab=g;}catch(e){}}
+wrapTab();setInterval(wrapTab,2000);
+setInterval(function(){if(D.hidden||!active())return;if(!D.getElementById('bnxRw')){run(true);return;}if(W.__bnxSwMapV!==S.mapV&&!S.busy&&R){run(false);}},1200);
+D.addEventListener('click',function(ev){var b=ev.target.closest&&ev.target.closest('button,.tab');if(b&&/Reconcil/i.test(b.textContent||''))setTimeout(function(){run(true);},250);},true);
+})(window,document);
+</script>
+
