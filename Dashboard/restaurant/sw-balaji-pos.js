@@ -1,6 +1,6 @@
 /* Balaji NextGen — offline service worker for the Balaji POS page.
    Keep this file in the SAME folder as balaji-pos-billing.html and restaurant-dashboard.html. */
-const CACHE = 'bnx-pos-offline-v1';
+const CACHE = 'bnx-pos-offline-v2';
 const CORE = ['balaji-pos-billing.html'];
 
 self.addEventListener('install', (e) => {
@@ -20,7 +20,7 @@ self.addEventListener('fetch', (e) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   const isPos = url.origin === location.origin && /balaji-pos-billing\.html$/.test(url.pathname);
-  const isFont = /fonts\.(googleapis|gstatic)\.com$/.test(url.hostname);
+  const isFont = /fonts\.(googleapis|gstatic)\.com$/.test(url.hostname) || (url.hostname === 'cdn.jsdelivr.net' && /\/qz-tray@/.test(url.pathname));
   if (!isPos && !isFont) return; // never touch dashboard / API calls
 
   // Stale-while-revalidate: open instantly (even offline), refresh cache when online.
