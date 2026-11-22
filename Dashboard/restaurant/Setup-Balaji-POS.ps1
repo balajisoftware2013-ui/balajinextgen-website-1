@@ -18,27 +18,29 @@ try {
     if (!$qz) {
         Write-Host 'Downloading QZ Tray from its official release repository...'
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/qzind/tray/releases/tags/v2.3.0' -Headers @{'User-Agent'='Balaji-NextGen-POS-Setup'}
         $architecture = $env:PROCESSOR_ARCHITECTURE
         if ($env:PROCESSOR_ARCHITEW6432) { $architecture = $env:PROCESSOR_ARCHITEW6432 }
-        $names = switch ($architecture) {
-            'ARM64' { @('qz-tray-2.3.0-arm64.exe','qz-tray-2.3.0-aarch64.exe') }
-            'AMD64' { @('qz-tray-2.3.0.exe','qz-tray-2.3.0-x86_64.exe','qz-tray-2.3.0-x64.exe','qz-tray-2.3.0-amd64.exe') }
-            default { throw "Unsupported Windows architecture: $architecture. Install QZ Tray from https://qz.io/download/." }
+        if ($env:PROCESSOR_IDENTIFIER -match '^ARMv') { $architecture = 'ARM64' }
+        switch ($architecture) {
+            'ARM64' {
+                $asset = 'qz-tray-2.3.0%2B1-arm64.exe'
+                $expectedHash = '76ce2e492779589e2a61697344ba0b871ec8ec67942c9e08c5a1c9d90f5119c5'
+            }
+            'AMD64' {
+                $asset = 'qz-tray-2.3.0%2B1-x86_64.exe'
+                $expectedHash = '01a8ae33da31c78f386ef8335024723f2dd2cb7d8bc44ce33079bf6bc0360011'
+            }
+            default { throw "Unsupported Windows architecture: $architecture. See https://qz.io/download/." }
         }
-        $asset = $null
-        foreach ($name in $names) {
-            $asset = $release.assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
-            if ($asset) { break }
-        }
-        if (!$asset -or $asset.browser_download_url -notmatch '^https://github\.com/qzind/tray/releases/download/v2\.3\.0/[A-Za-z0-9_.-]+\.exe$') {
-            throw 'A compatible official installer was not found. Install QZ Tray from https://qz.io/download/ and rerun setup.'
-        }
+        $downloadUrl = 'https://github.com/qzind/tray/releases/download/v2.3.0/' + $asset
         $file = Join-Path ([IO.Path]::GetTempPath()) ("bnx-qz-" + [guid]::NewGuid().ToString() + '.exe')
         try {
-            Invoke-WebRequest -Uri $asset.browser_download_url -UseBasicParsing -OutFile $file
+            Invoke-WebRequest -Uri $downloadUrl -UseBasicParsing -OutFile $file
+            if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $expectedHash) {
+                throw 'The QZ download checksum did not match. Setup stopped before installation.'
+            }
             $sig = Get-AuthenticodeSignature -FilePath $file
-            if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch '\bQZ Industries\b') {
+            if ($sig.Status -ne 'Valid') {
                 throw "Windows could not verify the QZ installer publisher ($($sig.Status)). Setup stopped."
             }
             $install = Start-Process -FilePath $file -ArgumentList '/S' -Verb RunAs -Wait -PassThru
