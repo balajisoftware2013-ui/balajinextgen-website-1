@@ -810,6 +810,7 @@ style="display:none"
 onchange="handleScan(this)">
       </div>
 
+      <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin:12px 0"><button class="btn btn-primary" onclick="BNXB.pickFolder()">📁 Upload Folder — Bulk AI Purchase</button><button class="btn" onclick="BNXB.pickFiles()">🗂 Select Many Files</button><button class="btn" onclick="BNXB.watch()">👁 Auto-Watch Folder</button><button class="btn btn-sm" onclick="BNXB.open()">📋 Queue</button></div>
       <div id="extractedArea" style="display:none">
         <div class="extracted-box">
           <div class="ex-header"><span style="font-size:22px">✅</span><div><div style="font-size:14px;font-weight:800;color:var(--green)">AI Extraction Complete</div><div style="font-size:11px;color:var(--text3)">Review and verify before importing</div></div><span class="ex-badge" id="exBadgeLabel">AI VERIFIED</span></div>
@@ -11305,6 +11306,167 @@ async function bnxSheetLinksSync(){
   }catch(e){ toast('Sync failed: '+_bnxSx(e.message),'err','⚠️'); }
   finally{ if(b){b.disabled=false;b.textContent='🔄 Sync bills & ledgers';} }
 }
+</script>
+<script id="bnx-bulk-ai">
+(function(){
+'use strict';
+var CK='BNX_BULK_CFG',SK='BNX_BULK_SEEN',Q=[],run_=false,stop=false,nid=0,dirH=null,wt=null;
+function ld(k,d){try{return JSON.parse(localStorage.getItem(k))||d}catch(e){return d}}
+var cfg=Object.assign({auto:true,minConf:80,gap:1200,stopErr:false},ld(CK,{}));
+var seen=new Set(ld(SK,[]));
+var OK=/\.(pdf|jpe?g|png)$/i,OTHER=/ledger|statement|payout|credit\s*note|debit\s*note|\bsoa\b/i;
+var fp=function(f){return f.name.replace(/\s*\(\d+\)(?=\.)/,'').toLowerCase()+'|'+f.size};
+var sleep=function(ms){return new Promise(function(r){setTimeout(r,ms)})};
+var esc=function(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})};
+var norm=function(s){return String(s||'').toLowerCase().replace(/[^a-z0-9]/g,'')};
+function saveCfg(){localStorage.setItem(CK,JSON.stringify(cfg))}
+function remember(f){seen.add(fp(f));localStorage.setItem(SK,JSON.stringify([...seen].slice(-5000)))}
+function add(files){
+  var n=0,sk=0;
+  files.forEach(function(f){
+    var path=f._p||f.webkitRelativePath||f.name;
+    if(!OK.test(f.name)){sk++;return}
+    if(Q.some(function(r){return fp(r.f)===fp(f)}))return;
+    var r={id:++nid,f:f,path:path,st:'wait',note:'',info:''};
+    if(seen.has(fp(f))){r.st='skip';r.note='Already processed earlier'}
+    else if(OTHER.test(path)){r.st='other';r.note='Ledger / credit note — not a purchase bill'}
+    Q.push(r);n++;
+  });
+  if(typeof toast==='function')toast('📁 '+n+' file(s) queued'+(sk?' · '+sk+' non-invoice file(s) ignored':''),'ok','🤖');
+  ui(true);run();
+}
+function isDup(d){
+  var all=(DB.purchases||[]).concat(DB.acctInvs||[]);
+  return all.some(function(p){
+    return norm(p.vendorName)===norm(d.vendorName)&&norm(p.billNo||p.no)===norm(d.invoiceNo)&&Math.abs((+p.grand||0)-(+d.total||0))<1;
+  });
+}
+function problem(d){
+  try{
+    var rt=computeReconciledTotals(d),s=computeAutoMatchSummary(d);
+    if(!d.items||!d.items.length)return 'No items read';
+    if(!(d.total>0))return 'Total is zero';
+    if(/^unknown vendor$/i.test(d.vendorName))return 'Vendor not read';
+    if((d.confidence||0)<cfg.minConf)return 'Low confidence '+d.confidence+'%';
+    if(rt.taxableMismatch)return 'Totals do not tally';
+    if(s.hasVendorAmbiguity)return 'Vendor match uncertain';
+    if(s.hasItemAmbiguity)return 'Item match uncertain';
+  }catch(e){return 'Check failed: '+e.message}
+  return '';
+}
+async function waitSave(n){for(var i=0;i<40;i++){if(DB.purchases.length>n)return true;await sleep(250)}return false}
+async function run(){
+  if(run_)return;run_=true;stop=false;ui();
+  for(var i=0;i<Q.length;i++){
+    var r=Q[i];if(stop)break;if(r.st!=='wait')continue;
+    r.st='read';ui();
+    try{
+      extractedData=null;
+      await processInvoiceScan(r.f);
+      var d=extractedData;if(!d)throw new Error('Could not read this file');
+      r.snap=JSON.parse(JSON.stringify(d));
+      r.info=d.vendorName+' · '+d.invoiceNo+' · ₹'+Math.round(d.total||0);
+      if(isDup(d)){r.st='dup';r.note='Already in purchases';remember(r.f)}
+      else{
+        var why=problem(d);
+        if(why||!cfg.auto){r.st='review';r.note=why||'Auto-save is off'}
+        else{
+          var n=DB.purchases.length;autoCreateAndSave();
+          if(await waitSave(n)){r.st='saved';remember(r.f)}
+          else{r.st='review';r.note='Needs a check before saving'}
+        }
+      }
+    }catch(e){r.st='fail';r.note=String(e&&e.message||e).slice(0,90);if(cfg.stopErr)stop=true}
+    ui();await sleep(cfg.gap);
+  }
+  run_=false;ui();
+  var c=function(s){return Q.filter(function(r){return r.st===s}).length};
+  if(typeof toast==='function')toast('✅ Bulk done — '+c('saved')+' saved · '+c('review')+' to review · '+c('dup')+' duplicate · '+c('fail')+' failed','ok','🤖');
+}
+var ST={wait:['Waiting','#6b7280'],read:['Reading…','#2563eb'],saved:['Saved','#15803d'],review:['Review','#c2410c'],dup:['Duplicate','#7c3aed'],fail:['Failed','#dc2626'],other:['Not a bill','#6b7280'],skip:['Skipped','#6b7280']};
+function ui(open){
+  var p=document.getElementById('bnxBulk');
+  if(!p){p=document.createElement('div');p.id='bnxBulk';
+    p.style.cssText='position:fixed;right:14px;bottom:14px;width:410px;max-width:calc(100vw - 28px);z-index:99999;background:#fff;border:1.5px solid #6d28d9;border-radius:14px;box-shadow:0 10px 40px rgba(0,0,0,.25);font:12px Outfit,"Noto Sans",sans-serif;color:#111;display:none';
+    document.body.appendChild(p)}
+  if(open)p.style.display='block';
+  if(p.style.display==='none')return;
+  var c=function(s){return Q.filter(function(r){return r.st===s}).length};
+  var done=Q.filter(function(r){return r.st!=='wait'&&r.st!=='read'}).length;
+  var pct=Q.length?Math.round(done/Q.length*100):0;
+  var rows=Q.map(function(r){
+    var s=ST[r.st],b='';
+    if(r.st==='review')b='<button onclick="BNXB.review('+r.id+')">Review</button>';
+    if(r.st==='fail')b='<button onclick="BNXB.retry('+r.id+')">Retry</button>';
+    if(r.st==='other'||r.st==='dup'||r.st==='skip')b='<button onclick="BNXB.retry('+r.id+')">Scan anyway</button>';
+    return '<div style="padding:6px 0;border-bottom:1px solid #eee;display:flex;gap:6px;align-items:center"><div style="flex:1;min-width:0"><div style="font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="'+esc(r.path)+'">'+esc(r.path)+'</div><div style="color:#6b7280;font-size:11px">'+esc(r.info||r.note)+(r.info&&r.note?' — '+esc(r.note):'')+'</div></div><span style="color:'+s[1]+';font-weight:800;font-size:11px;white-space:nowrap">'+s[0]+'</span>'+b+'</div>';
+  }).join('')||'<div style="padding:14px;color:#6b7280;text-align:center">Queue is empty — upload a folder.</div>';
+  var bs='border:1px solid #c4b5fd;background:#f5f3ff;border-radius:8px;padding:4px 9px;font:inherit;font-weight:700;cursor:pointer';
+  p.innerHTML='<style>#bnxBulk button{border:1px solid #c4b5fd;background:#f5f3ff;border-radius:7px;padding:3px 8px;font:inherit;font-weight:700;cursor:pointer}</style>'+
+  '<div style="padding:10px 12px;background:#6d28d9;color:#fff;border-radius:12px 12px 0 0;display:flex;align-items:center;gap:8px"><b style="flex:1">🤖 Bulk AI Purchase — '+done+'/'+Q.length+'</b><button onclick="BNXB.close()" style="background:#fff">✕</button></div>'+
+  '<div style="height:5px;background:#eee"><div style="height:5px;width:'+pct+'%;background:#15803d"></div></div>'+
+  '<div style="padding:8px 12px;display:flex;gap:5px;flex-wrap:wrap;color:#374151"><span>✅ '+c('saved')+'</span><span>🔎 '+c('review')+'</span><span>♻️ '+c('dup')+'</span><span>⚠️ '+c('fail')+'</span><span>📄 '+(c('other')+c('skip'))+'</span></div>'+
+  '<div style="padding:0 12px 8px;display:flex;gap:5px;flex-wrap:wrap"><button onclick="BNXB.pickFolder()">📁 Folder</button><button onclick="BNXB.pickFiles()">🗂 Files</button><button onclick="BNXB.watch()">'+(dirH?'👁 Watching ✓':'👁 Watch')+'</button>'+(run_?'<button onclick="BNXB.stop()" style="background:#fee2e2">⏹ Stop</button>':'<button onclick="BNXB.start()">▶ Start</button>')+'<button onclick="BNXB.csv()">⬇ Report</button><button onclick="BNXB.clear()">🧹 Clear done</button></div>'+
+  '<div style="padding:0 12px 8px;color:#374151;display:flex;gap:10px;flex-wrap:wrap;align-items:center"><label><input type="checkbox" '+(cfg.auto?'checked':'')+' onchange="BNXB.set(\'auto\',this.checked)"> Auto-save clean bills</label><label>Min confidence <input type="number" min="0" max="100" value="'+cfg.minConf+'" style="width:48px" onchange="BNXB.set(\'minConf\',+this.value)">%</label><label><input type="checkbox" '+(cfg.stopErr?'checked':'')+' onchange="BNXB.set(\'stopErr\',this.checked)"> Stop on error</label></div>'+
+  '<div style="max-height:270px;overflow:auto;padding:0 12px 10px">'+rows+'</div>';
+}
+function pick(dir){
+  var i=document.createElement('input');i.type='file';i.multiple=true;
+  if(dir)i.webkitdirectory=true;else i.accept='.pdf,.jpg,.jpeg,.png';
+  i.onchange=function(){add([...i.files])};i.click();
+}
+async function readEntries(ens){
+  var out=[];
+  async function w(en,p){
+    if(en.isFile){await new Promise(function(r){en.file(function(f){f._p=p+f.name;out.push(f);r()},r)})}
+    else{var rd=en.createReader(),b;do{b=await new Promise(function(r){rd.readEntries(r,function(){r([])})});for(var k=0;k<b.length;k++)await w(b[k],p+en.name+'/')}while(b.length)}
+  }
+  for(var i=0;i<ens.length;i++)await w(ens[i],'');
+  return out;
+}
+async function walk(h,p,out){
+  for await(var kv of h.entries()){var n=kv[0],x=kv[1];
+    if(x.kind==='file'){var f=await x.getFile();f._p=p+n;out.push(f)}else await walk(x,p+n+'/',out)}
+}
+async function poll(){
+  if(!dirH)return;
+  try{var out=[];await walk(dirH,'',out);
+    var fresh=out.filter(function(f){return OK.test(f.name)&&!seen.has(fp(f))&&!Q.some(function(r){return fp(r.f)===fp(f)})});
+    if(fresh.length)add(fresh);
+  }catch(e){console.warn('watch failed',e)}
+}
+window.BNXB={
+  pickFolder:function(){pick(true)},pickFiles:function(){pick(false)},open:function(){ui(true)},
+  close:function(){document.getElementById('bnxBulk').style.display='none'},
+  start:function(){run()},stop:function(){stop=true;ui()},
+  set:function(k,v){cfg[k]=v;saveCfg()},
+  retry:function(id){var r=Q.find(function(x){return x.id===id});if(r){r.st='wait';r.note='';ui();run()}},
+  review:function(id){var r=Q.find(function(x){return x.id===id});if(!r||!r.snap)return;
+    extractedData=JSON.parse(JSON.stringify(r.snap));lastScannedFile=r.f;showExtracted();openSmartMatch();r.st='saved';r.note='Opened for manual review';remember(r.f);ui()},
+  clear:function(){for(var i=Q.length-1;i>=0;i--)if(['saved','dup','skip','other'].indexOf(Q[i].st)>-1)Q.splice(i,1);ui()},
+  csv:function(){var t='File,Status,Vendor / Invoice / Total,Note\n'+Q.map(function(r){return [r.path,ST[r.st][0],r.info,r.note].map(function(v){return '"'+String(v||'').replace(/"/g,'""')+'"'}).join(',')}).join('\n');
+    var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([t],{type:'text/csv'}));a.download='bulk-ai-purchase-report.csv';a.click()},
+  watch:async function(){
+    if(dirH){dirH=null;clearInterval(wt);ui(true);return}
+    if(!window.showDirectoryPicker){alert('Auto-watch needs Chrome or Edge on a computer.');return}
+    try{dirH=await window.showDirectoryPicker({mode:'read'})}catch(e){return}
+    ui(true);await poll();wt=setInterval(poll,60000);
+    if(typeof toast==='function')toast('👁 Watching folder — new bills are picked up every minute while this tab stays open','ok','🤖');
+  }
+};
+window.scanDrop=function(e){
+  e.preventDefault();e.currentTarget.classList.remove('drag-over');
+  var ens=[...(e.dataTransfer.items||[])].map(function(i){return i.webkitGetAsEntry&&i.webkitGetAsEntry()}).filter(Boolean);
+  var fl=[...e.dataTransfer.files];
+  if(!ens.length){if(fl.length>1)add(fl);else if(fl[0])processInvoiceScan(fl[0]);return}
+  if(ens.length===1&&ens[0].isFile){fl[0]&&processInvoiceScan(fl[0]);return}
+  readEntries(ens).then(add);
+};
+window.handleScan=function(input){
+  var fs=[...input.files];input.value='';
+  if(fs.length>1)add(fs);else if(fs[0])processInvoiceScan(fs[0]);
+};
+})();
 </script>
 </body>
 
