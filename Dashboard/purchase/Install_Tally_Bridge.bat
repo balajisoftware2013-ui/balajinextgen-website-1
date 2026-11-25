@@ -1,11 +1,66 @@
 @echo off
-title Install Tally Bridge (one time)
+setlocal
+title Tally Bridge installer
 set "D=%LOCALAPPDATA%\BalajiTallyBridge"
-mkdir "%D%" 2>nul
-copy /y "%~dp0Tally_Bridge.ps1" "%D%\Tally_Bridge.ps1" >nul
-> "%D%\run.vbs" echo CreateObject("WScript.Shell").Run "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""%D%\Tally_Bridge.ps1""", 0, False
-copy /y "%D%\run.vbs" "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\BalajiTallyBridge.vbs" >nul
-wscript "%D%\run.vbs"
+if not exist "%D%" mkdir "%D%"
+(
+echo IyBCYWxhamkgVGFsbHkgQnJpZGdlOiBsZXRzIHRoZSB3ZWIgcGFnZSB0YWxrIHRvIFRhbGx5
+echo IG9uIHRoaXMgUEMuCiMgTGlzdGVucyBvbiBodHRwOi8vMTI3LjAuMC4xOjcwNzEgYW5kIGZv
+echo cndhcmRzIHJlcXVlc3RzIHRvIFRhbGx5IChwb3J0IDkwMDAsIHRoZW4gOTAwMSwgOTAwMiwg
+echo OTAxMCkuCiRwb3J0ID0gNzA3MQokcG9ydHMgPSBAKDkwMDAsIDkwMDEsIDkwMDIsIDkwMTAs
+echo IDk5OTkpCiRsYXN0ID0gJG51bGwKJGwgPSBOZXctT2JqZWN0IFN5c3RlbS5OZXQuSHR0cExp
+echo c3RlbmVyCiRsLlByZWZpeGVzLkFkZCgiaHR0cDovLzEyNy4wLjAuMTokcG9ydC8iKQokbC5Q
+echo cmVmaXhlcy5BZGQoImh0dHA6Ly9sb2NhbGhvc3Q6JHBvcnQvIikKdHJ5IHsgJGwuU3RhcnQo
+echo KSB9IGNhdGNoIHsgZXhpdCB9ICAgIyBhbHJlYWR5IHJ1bm5pbmcKCmZ1bmN0aW9uIFNlbmQo
+echo JHJzLCBbaW50XSRjb2RlLCBbc3RyaW5nXSR0ZXh0KSB7CiAgICAkYiA9IFtUZXh0LkVuY29k
+echo aW5nXTo6VVRGOC5HZXRCeXRlcygkdGV4dCkKICAgICRycy5TdGF0dXNDb2RlID0gJGNvZGUK
+echo ICAgICRycy5Db250ZW50VHlwZSA9ICd0ZXh0L3BsYWluOyBjaGFyc2V0PXV0Zi04JwogICAg
+echo JHJzLkNvbnRlbnRMZW5ndGg2NCA9ICRiLkxlbmd0aAogICAgJHJzLk91dHB1dFN0cmVhbS5X
+echo cml0ZSgkYiwgMCwgJGIuTGVuZ3RoKQp9Cgp3aGlsZSAoJGwuSXNMaXN0ZW5pbmcpIHsKICAg
+echo ICRjID0gJGwuR2V0Q29udGV4dCgpCiAgICAkcnEgPSAkYy5SZXF1ZXN0OyAkcnMgPSAkYy5S
+echo ZXNwb25zZQogICAgdHJ5IHsKICAgICAgICAkcnMuSGVhZGVycy5BZGQoJ0FjY2Vzcy1Db250
+echo cm9sLUFsbG93LU9yaWdpbicsICcqJykKICAgICAgICAkcnMuSGVhZGVycy5BZGQoJ0FjY2Vz
+echo cy1Db250cm9sLUFsbG93LUhlYWRlcnMnLCAnKicpCiAgICAgICAgJHJzLkhlYWRlcnMuQWRk
+echo KCdBY2Nlc3MtQ29udHJvbC1BbGxvdy1NZXRob2RzJywgJ1BPU1QsIEdFVCwgT1BUSU9OUycp
+echo CiAgICAgICAgJHJzLkhlYWRlcnMuQWRkKCdBY2Nlc3MtQ29udHJvbC1BbGxvdy1Qcml2YXRl
+echo LU5ldHdvcmsnLCAndHJ1ZScpCiAgICAgICAgaWYgKCRycS5IdHRwTWV0aG9kIC1lcSAnT1BU
+echo SU9OUycpIHsgJHJzLlN0YXR1c0NvZGUgPSAyMDQgfQogICAgICAgIGVsc2VpZiAoJHJxLlVy
+echo bC5BYnNvbHV0ZVBhdGggLWVxICcvcGluZycpIHsgU2VuZCAkcnMgMjAwICdvaycgfQogICAg
+echo ICAgIGVsc2UgewogICAgICAgICAgICAkbXMgPSBOZXctT2JqZWN0IElPLk1lbW9yeVN0cmVh
+echo bQogICAgICAgICAgICAkcnEuSW5wdXRTdHJlYW0uQ29weVRvKCRtcykKICAgICAgICAgICAg
+echo JGJvZHkgPSAkbXMuVG9BcnJheSgpCiAgICAgICAgICAgICRvcmRlciA9IEAoKTsgaWYgKCRs
+echo YXN0KSB7ICRvcmRlciArPSAkbGFzdCB9OyAkb3JkZXIgKz0gKCRwb3J0cyB8IFdoZXJlLU9i
+echo amVjdCB7ICRfIC1uZSAkbGFzdCB9KQogICAgICAgICAgICAkcmVzcCA9ICRudWxsOyAkZXJy
+echo ID0gJycKICAgICAgICAgICAgZm9yZWFjaCAoJHAgaW4gJG9yZGVyKSB7CiAgICAgICAgICAg
+echo ICAgICB0cnkgewogICAgICAgICAgICAgICAgICAgICR3YyA9IE5ldy1PYmplY3QgU3lzdGVt
+echo Lk5ldC5XZWJDbGllbnQKICAgICAgICAgICAgICAgICAgICAkd2MuSGVhZGVycy5BZGQoJ0Nv
+echo bnRlbnQtVHlwZScsICd0ZXh0L3htbCcpCiAgICAgICAgICAgICAgICAgICAgJHJlc3AgPSAk
+echo d2MuVXBsb2FkRGF0YSgiaHR0cDovLzEyNy4wLjAuMTokcCIsICdQT1NUJywgJGJvZHkpCiAg
+echo ICAgICAgICAgICAgICAgICAgJGxhc3QgPSAkcDsgYnJlYWsKICAgICAgICAgICAgICAgIH0g
+echo Y2F0Y2ggeyAkZXJyID0gJF8uRXhjZXB0aW9uLk1lc3NhZ2UgfQogICAgICAgICAgICB9CiAg
+echo ICAgICAgICAgIGlmICgkcmVzcCAtZXEgJG51bGwpIHsgU2VuZCAkcnMgNTAyICgiVGFsbHkg
+echo bm90IHJlYWNoYWJsZSBvbiB0aGlzIFBDOiAiICsgJGVycikgfQogICAgICAgICAgICBlbHNl
+echo IHsKICAgICAgICAgICAgICAgIGlmICgkcmVzcC5MZW5ndGggLWd0IDEgLWFuZCAkcmVzcFsx
+echo XSAtZXEgMCkgeyAkdCA9IFtUZXh0LkVuY29kaW5nXTo6VW5pY29kZS5HZXRTdHJpbmcoJHJl
+echo c3ApIH0KICAgICAgICAgICAgICAgIGVsc2UgeyAkdCA9IFtUZXh0LkVuY29kaW5nXTo6VVRG
+echo OC5HZXRTdHJpbmcoJHJlc3ApIH0KICAgICAgICAgICAgICAgIFNlbmQgJHJzIDIwMCAkdAog
+echo ICAgICAgICAgICB9CiAgICAgICAgfQogICAgfSBjYXRjaCB7IHRyeSB7IFNlbmQgJHJzIDUw
+echo MCAkXy5FeGNlcHRpb24uTWVzc2FnZSB9IGNhdGNoIHt9IH0KICAgIGZpbmFsbHkgeyB0cnkg
+echo eyAkcnMuQ2xvc2UoKSB9IGNhdGNoIHt9IH0KfQo=
+) > "%D%\b.b64"
+certutil -f -decode "%D%\b.b64" "%D%\TallyBridge.ps1" >nul
+del "%D%\b.b64" >nul 2>&1
+echo Set s=CreateObject("WScript.Shell") > "%D%\start.vbs"
+echo s.Run "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""%D%\TallyBridge.ps1""",0,False >> "%D%\start.vbs"
+reg add "HKCU\Software\Classes\tallybridge" /ve /d "URL:Tally Bridge" /f >nul
+reg add "HKCU\Software\Classes\tallybridge" /v "URL Protocol" /d "" /f >nul
+reg add "HKCU\Software\Classes\tallybridge\shell\open\command" /ve /d "wscript.exe \"%D%\start.vbs\"" /f >nul
+copy /y "%D%\start.vbs" "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\BalajiTallyBridge.vbs" >nul
+wscript.exe "%D%\start.vbs"
+timeout /t 3 /nobreak >nul
+powershell -NoProfile -Command "try{(Invoke-WebRequest http://127.0.0.1:7071/ping -UseBasicParsing).Content}catch{'not running'}" > "%D%\ping.txt"
+set /p R=<"%D%\ping.txt"
 echo.
-echo Done. Tally Bridge now starts automatically with Windows. You can close this window.
+if "%R%"=="ok" (echo Tally Bridge installed and running. It starts automatically with Windows.) else (echo Installed, but the bridge did not answer. Restart the PC and try again.)
+echo You can close this window and press the Tally button in the web page.
 pause
