@@ -1073,8 +1073,8 @@ onchange="handleScan(this)">
           <label class="pa-toggle" title="Untick = all transactions (paid and due). Tick = only parties with pending due"><input type="checkbox" id="pa-dueonly" onchange="renderPaymentAdvice()"> Due only</label>
           <label class="pa-toggle" title="Show / hide Bill and Ledger columns"><input type="checkbox" id="pa-showatt" checked onchange="renderPaymentAdvice()"> Attachments</label>
           <div class="pa-actions">
-            <button class="btn btn-sm" id="bnxSheetSyncBtn" onclick="bnxSheetLinksSync()" title="Bring new / changed bill links (Purchase tab) and supplier ledgers (Print tab) from the client's Google sheet into the ERP now">🔄 Sync bills &amp; ledgers</button>
             <button class="btn btn-sm btn-primary" onclick="openPaymentModal()">💳 Record Payment</button>
+            <button class="btn btn-sm" id="bnxTallyAutoBtn" onclick="bnxTallyAutoPull(true)" title="Payments are pulled from Tally automatically. Click to run now.">🔄 Tally auto-sync</button>
             <button class="btn btn-sm" onclick="printPaymentAdvice()">🖨️ Print</button>
             <button class="btn btn-sm" onclick="exportPaymentAdviceCSV()">📥 Export CSV</button>
           </div>
@@ -9985,6 +9985,11 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape'){var o=docum
      if(!lastDate){bad++;continue;}
      found.push({date:lastDate,party:party,no:g('no')?String(g('no').v||'').trim():'',amount:Math.round(amt*100)/100});}});
    if(!found.length){toast('No Payment vouchers found. Export Tally "Day Book"/"Payment Register" to Excel (columns Date, Particulars, Vch Type, Vch No., Debit/Credit).','warn','⚠️');return;}
+   await ingest(found,false);
+  }catch(err){console.error(err);toast('Could not read Tally payments file: '+err.message,'err','⚠️');}};
+  fr.readAsArrayBuffer(file);}
+ W.bnxIngestTallyPayments=function(found,quiet){return ingest(found,quiet);};
+ async function ingest(found,quiet){var ret={added:0,dup:0,unmatched:[],saved:0,failed:0};try{
    var al=aliases(),byNorm={};(DB.vendors||[]).forEach(function(v){byNorm[norm(v.name)]=v;});
    var existing={};(DB.payments||[]).forEach(function(p){existing[(p.ref||'')+'|'+p.date+'|'+p.amount]=1;});
    var added=0,dup=0,unmatched={},saved=0,failed=0;DB.payments=DB.payments||[];
@@ -9996,14 +10001,15 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape'){var o=docum
     DB.payments.push(pay);var vi=DB.vendors.findIndex(function(x){return x.id===v.id;});
     if(vi>=0)DB.vendors[vi].outstanding=Math.max(0,(DB.vendors[vi].outstanding||0)-f.amount);added++;
     pay.synced=false;}
-   var sr=await W.bnxSyncTallyPayments();saved=sr.saved;failed=sr.failed;   /* every Tally payment (new or earlier failed) → transaction DB */
+   var sr=await W.bnxSyncTallyPayments();saved=sr.saved;failed=sr.failed;
    if(typeof save==='function')save();
    if(typeof renderPaymentAdvice==='function')renderPaymentAdvice();if(typeof rendRegs==='function')rendRegs();
-   var un=Object.keys(unmatched);
-   toast('Tally payments: '+added+' added'+(dup?', '+dup+' already present':'')+' · '+saved+' saved to transaction sheet'+(failed?', '+failed+' failed to sync':'')+(un.length?' · '+un.length+' party name(s) unmatched':''),failed||un.length?'warn':'ok','💸');
-   if(un.length){var un2=un.map(function(n){return [n,0];});aliasDialog(un2);}
-  }catch(err){console.error(err);toast('Could not read Tally payments file: '+err.message,'err','⚠️');}};
-  fr.readAsArrayBuffer(file);}
+   var un=Object.keys(unmatched);ret={added:added,dup:dup,unmatched:un,saved:saved,failed:failed};
+   if(!quiet||added||failed)toast('Tally payments: '+added+' added'+(dup&&!quiet?', '+dup+' already present':'')+' · '+saved+' saved to transaction sheet'+(failed?', '+failed+' failed to sync':'')+(un.length?' · '+un.length+' party name(s) unmatched':''),failed||un.length?'warn':'ok','💸');
+   if(un.length&&!quiet){var un2=un.map(function(n){return [n,0];});aliasDialog(un2);}
+  }catch(err){console.error(err);if(!quiet)toast('Tally payment sync error: '+err.message,'err','⚠️');}
+  return ret;}
+
 
  /* ───────── Tally-style party ledger popup ───────── */
  W.bnxPtSwitch=function(n){n=(n||'').trim();if(!n)return;var m=known(),c=m[norm(n)]||dbNames().find(function(x){return x.toLowerCase()===n.toLowerCase();})||dbNames().filter(function(x){return x.toLowerCase().indexOf(n.toLowerCase())>=0;})[0];if(c)W.openPartyTally(c);else toast('Party not found','warn','⚠️');};
@@ -11662,6 +11668,24 @@ async function bnxSheetLinksSync(){
   }catch(e){ toast('Sync failed: '+_bnxSx(e.message),'err','⚠️'); }
   finally{ if(b){b.disabled=false;b.textContent='🔄 Sync bills & ledgers';} }
 }
+/* AUTO: direct connect — runs silently at start, every 3 minutes, and when Payment Advice is opened (no button needed) */
+let _bnxAutoBusy=false,_bnxAutoLast=0;
+async function bnxSheetAutoSync(force){
+  if(_bnxAutoBusy||typeof erpApi!=='function'||typeof CLIENT_ID==='undefined'||!CLIENT_ID)return;
+  if(!force&&Date.now()-_bnxAutoLast<60000)return;
+  _bnxAutoBusy=true;_bnxAutoLast=Date.now();
+  try{
+    const r=await erpApi('SHEET_LINKS_SYNC',{});
+    if(!r||r.success===false)return;
+    try{ await bnxLoadPurchaseExtras(); }catch(e){}
+    try{ await bnxLoadVendorLedgers(); }catch(e){}
+    try{ if(document.getElementById('paAdviceArea')&&document.getElementById('paAdviceArea').innerHTML)renderPaymentAdvice(); }catch(e){}
+  }catch(e){}
+  finally{_bnxAutoBusy=false;}
+}
+setTimeout(function(){bnxSheetAutoSync(true);},4000);
+setInterval(function(){bnxSheetAutoSync(true);},180000);
+document.addEventListener('click',function(ev){var t=ev.target.closest&&ev.target.closest('[onclick*="payadvice"]');if(t)setTimeout(function(){bnxSheetAutoSync(false);},300);});
 </script>
 <script id="bnx-bulk-ai">
 (function(){
@@ -11906,6 +11930,76 @@ window.handleScan=function(input){
     bnxShowGRNTxn(tr.getAttribute('data-grn'));
   });
   setTimeout(function(){try{renderRegister();renderPage();}catch(e){}},0);
+})();
+</script>
+<script id="bnx-tally-pay-vendor-20261125">
+(function(){var W=window;
+ var orig=W.bnxSyncTallyPayments;if(typeof orig!=='function')return;
+ W.bnxSyncTallyPayments=async function(){
+  var res=await orig.apply(this,arguments);
+  try{
+   var ids={};(DB.payments||[]).forEach(function(p){if(String(p.ref||'').indexOf('TALLY:')===0&&p.vendorId)ids[p.vendorId]=1;});
+   var vs=(DB.vendors||[]).filter(function(v){return ids[v.id]&&v.id;}),fail=0,n=0;
+   for(var i=0;i<vs.length;i++){var v=vs[i];
+    if(v._tallyPushed===v.outstanding)continue;
+    try{var rr=await erpApi('ERP_SAVE_VENDOR',{id:v.id,name:v.name,mobile:v.mobile||'',email:v.email||'',gstin:v.gstin||'',address:[v.addr,v.pincode].filter(Boolean).join(' - '),city:v.city||'',state:v.state||'',creditDays:v.terms,outstanding:Math.max(0,+v.outstanding||0)});
+     if(rr&&rr.success===false)fail++;else{v._tallyPushed=v.outstanding;n++;}}catch(e){fail++;}}
+   if(typeof save==='function')save();
+   ['rendVendTb','renderPaymentAdvice','rendRegs'].forEach(function(f){try{if(typeof W[f]==='function')W[f]();else if(f==='rendVendTb'&&typeof rendVendTb==='function')rendVendTb();else if(f==='rendRegs'&&typeof rendRegs==='function')rendRegs();else if(f==='renderPaymentAdvice'&&typeof renderPaymentAdvice==='function')renderPaymentAdvice();}catch(e){}});
+   if(typeof toast==='function')toast('Vendor balances updated: '+n+(fail?' · '+fail+' failed':''),fail?'warn':'ok','🏦');
+  }catch(e){console.warn('[tally vendor sync]',e);}
+  return res;};
+})();
+</script>
+<script id="bnx-tally-auto-20261125">
+(function(){var W=window,busy=false,last=0,warned=false;
+ function cid(){try{return CLIENT_ID;}catch(e){return '';}}
+ function X(t){return String(t||'').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&#13;|&#10;/g,' ').trim();}
+ function tag(b,k){var m=b.match(new RegExp('<'+k+'[^>]*>([\\s\\S]*?)</'+k+'>','i'));return m?X(m[1]):'';}
+ function ymd(d){return d.getFullYear()+String(d.getMonth()+1).padStart(2,'0')+String(d.getDate()).padStart(2,'0');}
+ function req(from,to){var c='';try{c=localStorage.getItem('bnx_tally_company')||'';}catch(e){}
+  return '<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>BnxPayVch</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVFROMDATE>'+from+'</SVFROMDATE><SVTODATE>'+to+'</SVTODATE>'+(c?'<SVCURRENTCOMPANY>'+c.replace(/&/g,'&amp;')+'</SVCURRENTCOMPANY>':'')+'</STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="BnxPayVch" ISMODIFY="No"><TYPE>Voucher</TYPE><FETCH>Date,VoucherTypeName,VoucherNumber,PartyLedgerName,Amount,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>';}
+ function nrm(x){return (typeof bnxNP==='function'?bnxNP(x):String(x||'').toUpperCase().replace(/[^A-Z0-9]/g,''));}
+ function parse(xml){
+  var out=[],re=/<VOUCHER[ >][\s\S]*?<\/VOUCHER>/gi,m;
+  var al={};try{al=JSON.parse(localStorage.getItem('BNX_ALIAS_'+cid())||'{}');}catch(e){}
+  var byN={};(DB.vendors||[]).forEach(function(v){byN[nrm(v.name)]=v;});
+  while((m=re.exec(xml))){var b=m[0];
+   if(!/pay/i.test(tag(b,'VOUCHERTYPENAME')))continue;if(/yes/i.test(tag(b,'ISCANCELLED')))continue;
+   var d=tag(b,'DATE').replace(/\D/g,'');if(d.length<8)continue;var date=d.slice(0,4)+'-'+d.slice(4,6)+'-'+d.slice(6,8);
+   var cands=[],pl=tag(b,'PARTYLEDGERNAME');if(pl)cands.push({n:pl,a:Math.abs(parseFloat(tag(b,'AMOUNT'))||0)});
+   var le=b.match(/<(?:ALLLEDGERENTRIES|LEDGERENTRIES)\.LIST[\s\S]*?<\/(?:ALLLEDGERENTRIES|LEDGERENTRIES)\.LIST>/gi)||[];
+   le.forEach(function(x){var n=tag(x,'LEDGERNAME'),a=parseFloat(tag(x,'AMOUNT'))||0;if(n)cands.push({n:n,a:Math.abs(a),dr:a<0});});
+   var pick=null;for(var i=0;i<cands.length&&!pick;i++){var c=cands[i];if(al[c.n]==='__skip__')continue;if(al[c.n]||byN[nrm(c.n)])pick=c;}
+   if(!pick)pick=cands[0];if(!pick)continue;
+   if(!pick.a){var mx=0;cands.forEach(function(c){if(c.n===pick.n&&c.a>mx)mx=c.a;});pick.a=mx;}
+   if(pick.a<=0)continue;
+   out.push({date:date,party:pick.n,no:tag(b,'VOUCHERNUMBER'),amount:Math.round(pick.a*100)/100});}
+  return out;}
+ W.bnxTallyAutoPull=async function(manual){
+  if(busy)return;if(!manual&&Date.now()-last<120000)return;busy=true;last=Date.now();
+  var btn=document.getElementById('bnxTallyAutoBtn');
+  try{
+   if(typeof bnxTallyProbe!=='function')return;
+   var mode=await bnxTallyProbe(manual);
+   if(mode!=='read'){if(btn)btn.textContent='⚪ Tally offline';
+    if(manual)toast(mode==='off'?'Tally is not reachable — open Tally with the company (port 9000)':'Tally is open but its answer cannot be read — start the Tally connector','warn','⚠️');return;}
+   var cut=(typeof bnxSettledBefore==='function'?bnxSettledBefore():'')||'',from=new Date();from.setDate(from.getDate()-60);
+   if(/^\d{4}-\d{2}$/.test(cut)){var cd=new Date(cut+'-01T00:00:00');if(cd<from)from=cd;}
+   var u=(typeof bnxTallyUrl==='function'?bnxTallyUrl():'http://localhost:9000');
+   var ct=new AbortController(),tm=setTimeout(function(){ct.abort();},60000),xml;
+   try{var r=await fetch(u,{method:'POST',headers:{'Content-Type':'text/plain'},body:req(ymd(from),ymd(new Date())),signal:ct.signal});xml=await r.text();}finally{clearTimeout(tm);}
+   var found=parse(xml);
+   var res=await W.bnxIngestTallyPayments(found,!manual);
+   if(btn)btn.textContent='🟢 Tally synced '+new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+   if(res&&res.unmatched&&res.unmatched.length&&!warned){warned=true;toast(res.unmatched.length+' Tally party name(s) not matched to a vendor — map them once via Alias','warn','🔗');}
+   if(manual&&res&&!res.added&&!res.failed)toast('Tally: '+found.length+' payment vouchers checked, nothing new','ok','🔄');
+  }catch(e){console.warn('[tally auto]',e);if(btn)btn.textContent='⚪ Tally offline';if(manual)toast('Tally sync failed: '+e.message,'err','⚠️');}
+  finally{busy=false;}};
+ setTimeout(function(){W.bnxTallyAutoPull(false);},6000);
+ setInterval(function(){W.bnxTallyAutoPull(false);},300000);
+ document.addEventListener('visibilitychange',function(){if(!document.hidden)W.bnxTallyAutoPull(false);});
+ var _rpa=W.renderPaymentAdvice;if(typeof _rpa==='function')W.renderPaymentAdvice=function(){setTimeout(function(){W.bnxTallyAutoPull(false);},0);return _rpa.apply(this,arguments);};
 })();
 </script>
 </body>
