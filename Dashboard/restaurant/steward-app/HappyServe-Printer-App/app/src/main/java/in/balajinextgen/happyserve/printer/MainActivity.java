@@ -16,6 +16,7 @@ import android.util.Base64;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.WindowManager;
+import android.webkit.DownloadListener;
 import android.webkit.JavascriptInterface;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
@@ -73,9 +74,37 @@ public class MainActivity extends Activity {
         web.addJavascriptInterface(new Bridge(), "BNXPrinter");
         web.setWebViewClient(new Client());
         web.setWebChromeClient(new Chrome());
+        /* APK update / any file download → the phone's browser downloads it (WebView cannot) */
+        web.setDownloadListener(new DownloadListener() {
+            @Override public void onDownloadStart(String url, String ua, String cd, String mime, long len) {
+                try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); }
+                catch (ActivityNotFoundException e) { Toast.makeText(MainActivity.this, "No browser to download", Toast.LENGTH_SHORT).show(); }
+            }
+        });
 
-        if (state != null) web.restoreState(state);
+        String deep = deepLink(getIntent());
+        if (deep != null) web.loadUrl(deep);
+        else if (state != null) web.restoreState(state);
         else web.loadUrl(startUrl());
+    }
+
+    /** happyserve://open?p=/Dashboard/restaurant/steward-app/steward-mobile.html → that page on OUR site only. */
+    String deepLink(Intent i) {
+        try {
+            if (i == null || i.getData() == null || !"happyserve".equals(i.getData().getScheme())) return null;
+            String p = i.getData().getQueryParameter("p");
+            Uri home = Uri.parse(startUrl());
+            if (p == null || !p.startsWith("/") || p.startsWith("//")) return startUrl();
+            String u = home.getScheme() + "://" + home.getHost() + p;
+            prefs.edit().putString("url", u.replaceAll("[?#].*$", "")).apply();
+            return u;
+        } catch (Exception e) { return null; }
+    }
+
+    @Override protected void onNewIntent(Intent i) {
+        super.onNewIntent(i);
+        String deep = deepLink(i);
+        if (deep != null) web.loadUrl(deep);
     }
 
     String startUrl() {
@@ -156,13 +185,6 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface public boolean isReady() { return true; }
-
-        /** true when a printer answers on ip:port through the Wi-Fi network (blocks <1 s; the page calls it off the UI thread). */
-        @JavascriptInterface public boolean probe(String ip, String port) {
-            int p = 9100;
-            try { p = Integer.parseInt(port == null ? "" : port.trim()); } catch (NumberFormatException ignored) {}
-            return Printer.get(MainActivity.this).probe(ip, p);
-        }
 
         @JavascriptInterface public String version() { return BuildInfo.VERSION; }
 
