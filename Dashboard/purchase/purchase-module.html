@@ -2135,6 +2135,7 @@ async function bnxLoadPurchaseExtras(){
     const byId={},byNo={};
     r.items.forEach(it=>{ if(it.id)byId[it.id]=it; if(it.no)byNo[_bnxNoKey(it.no)]=it; });
     window._bnxExtras={byId,byNo};
+    window._bnxExtrasList=r.items.slice();   /* 2026-11-26: raw list kept for part-bill suggestions */
     const n=_bnxApplyExtras(DB.purchases)+_bnxApplyExtras(DB.acctInvs);
     if(n){ saveLocalOnly(); try{rendPurchaseList();}catch(e){} try{rendRegs();}catch(e){} }
   }catch(e){console.warn('[Extras] failed:',e.message);}
@@ -2245,6 +2246,19 @@ async function refreshPurchaseInvoicesFromServer(options={}){
         createdAt:rec.created_at||rec._ts||new Date().toISOString(),synced:true
       };
     });
+    /* 2026-11-26 SYNC FIX: the server row has no GRN link / part-bill fields, so every refresh wiped them
+       (grnRef:'' above) -> GRN showed "Pending" again and the same GRN could be posted twice.
+       Carry the local-only fields over from the previous copy, then re-derive the GRN no from the GRN lines. */
+    mapped.forEach(m=>{
+      const o=_prevById[m.id]; if(!o)return;
+      ['grnStatus','grnNo','grnRef','partBills','billAdjust','poRef','whId'].forEach(k=>{ if((m[k]==null||m[k]==='')&&o[k]!=null&&o[k]!=='')m[k]=o[k]; });
+      if((!m.items||!m.items.length)&&o.items&&o.items.length)m.items=o.items;
+      if(!m.notes&&o.notes)m.notes=o.notes;
+      if(!m.billNo&&o.billNo)m.billNo=o.billNo;
+      if(!m.billFileUrl&&o.billFileUrl){m.billFileUrl=o.billFileUrl;m.billLinks=o.billLinks||[o.billFileUrl];}
+    });
+    try{ const _gBy={}; (DB.grns||[]).forEach(g=>{ if(!g)return; if(g.purchaseId)_gBy['I:'+g.purchaseId]=g.no; if(g.no)_gBy['N:'+g.no]=g.no; });
+      mapped.forEach(m=>{ if(!m.grnRef){ const gn=_gBy['I:'+m.id]||_gBy['N:'+m.no]; if(gn){m.grnRef=gn;m.grnNo=gn;m.grnStatus='Completed';} else if(/^\s*GRN\s*[\/\-]/i.test(String(m.no||'')))m.grnRef=m.no; } }); }catch(e){}
     // Server is authoritative for confirmed rows. Preserve only truly unsynced local rows.
     DB.purchases=[...mapped,...localUnsynced.filter(p=>!mapped.some(m=>m.id===p.id))];
     DB.purchases.forEach(bnFixTotals);
@@ -7481,6 +7495,15 @@ function savePayment(){
 // Due, per vendor. Only vendors with any activity (old due, a bill, or a
 // payment) this month are shown, matching your real sheet's "Regular
 // Suppliers" scope rather than listing every vendor ever entered.
+/* 2026-11-26: amount of a bill for the Payment Advice. GRN-register invoices can carry total 0 although the item / GRN lines
+   hold the value — they made the party's month figure 0 (and, with all figures 0, the party vanished from the list). */
+function bnxPaAmt(d){
+  if(!d)return 0; let a=+d.grand||0; if(a)return a;
+  try{ if(Array.isArray(d.items)&&d.items.length){ a=d.items.reduce((x,it)=>x+(+it.amt||+it.pcTaxable||0),0); if(a)return Math.round(a*100)/100; } }catch(e){}
+  try{ const key=[d.no,d.grnRef,d.grnNo].filter(Boolean).map(x=>String(x).trim().toUpperCase());
+    a=(DB.grns||[]).filter(g=>g&&(key.indexOf(String(g.no||'').trim().toUpperCase())>=0||(g.purchaseId&&g.purchaseId===d.id))).reduce((x,g)=>x+(+g.amount||((+g.accepted||+g.received||0)*(+g.rate||0))),0); }catch(e){ a=0; }
+  return Math.round(a*100)/100;
+}
 function bnxPaDocs(){
   const seenId={},seenKey={},out=[];
   let dupIds=window._pinvDuplicateIds; try{ dupIds=_pinvComputeDupGroups().pinvDuplicateIds; }catch(e){}
@@ -7503,10 +7526,10 @@ function bnxPaBills(vname){
   const inMon=all.filter(d=>(bnxBillDateOf(d)||'').slice(0,7)===mon||(d.date||'').slice(0,7)===mon);
   inMon.sort((a,b)=>String(a.date).localeCompare(String(b.date)));
   let tot=0;
-  const rows=inMon.map(d=>{const counted=used.has(d.id)&&(bnxBillDateOf(d)||'').slice(0,7)===mon; if(counted)tot+=(+d.grand||0);
+  const rows=inMon.map(d=>{const counted=used.has(d.id)&&(bnxBillDateOf(d)||'').slice(0,7)===mon; if(counted)tot+=bnxPaAmt(d);
     const why=!used.has(d.id)?'duplicate — not counted':((bnxBillDateOf(d)||'').slice(0,7)!==mon?'bill dated '+fmtD(d.billDate)+' — other month':'');
     const L=bnxBillLinks(d);
-    return `<tr style="${counted?'':'color:#9ca3af;text-decoration:line-through'}"><td>${fmtD(d.date)}</td><td>${bnxEsc(bnxSupBillNo(d)||'—')}</td><td>${bnxEsc(bnxGrnNo(d)||d.no||'')}</td><td>${bnxEsc(bnxHeadName(d))}</td><td style="text-align:right">${fmt(d.grand)}</td><td>${L.length?`<a href="${L[0]}" target="_blank">${BNX_CLIP_SVG} bill</a>`:'<span style="color:#b45309">no file</span>'}</td><td style="text-decoration:none;color:#b45309;font-size:11px">${why}</td><td><a href="#" onclick="event.preventDefault();viewPurchase('${d.id}','${d.mode||'inventory'}')">view</a></td></tr>`;}).join('')||'<tr><td colspan="8" style="text-align:center;color:#999;padding:16px">No bills this month</td></tr>';
+    return `<tr style="${counted?'':'color:#9ca3af;text-decoration:line-through'}"><td>${fmtD(d.date)}</td><td>${bnxEsc(bnxSupBillNo(d)||'—')}</td><td>${bnxEsc(bnxGrnNo(d)||d.no||'')}</td><td>${bnxEsc(bnxHeadName(d))}</td><td style="text-align:right">${fmt(bnxPaAmt(d))}</td><td>${L.length?`<a href="${L[0]}" target="_blank">${BNX_CLIP_SVG} bill</a>`:'<span style="color:#b45309">no file</span>'}</td><td style="text-decoration:none;color:#b45309;font-size:11px">${why}</td><td><a href="#" onclick="event.preventDefault();viewPurchase('${d.id}','${d.mode||'inventory'}')">view</a></td></tr>`;}).join('')||'<tr><td colspan="8" style="text-align:center;color:#999;padding:16px">No bills this month</td></tr>';
   const old=document.getElementById('bnxPaBillsOv');if(old)old.remove();
   const o=document.createElement('div');o.id='bnxPaBillsOv';o.onclick=e=>{if(e.target===o)o.remove();};
   o.style.cssText='position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:99990;display:flex;align-items:flex-start;justify-content:center;padding:5vh 10px;overflow:auto';
@@ -7538,12 +7561,12 @@ function renderPaymentAdvice(){
     const vendDocs=allDocs.filter(d=>d.vendorName===vname);
     const vendPays=DB.payments.filter(p=>p.vendorName===vname&&(!_cut||(p.date||'').slice(0,7)>=_cut));
     const mStart=monthVal+'-01';
-    let oldDue=vendDocs.filter(d=>!_isPaid(d)&&d._bd<mStart).reduce((s,d)=>s+(+d.grand||0),0)
+    let oldDue=vendDocs.filter(d=>!_isPaid(d)&&d._bd<mStart).reduce((s,d)=>s+bnxPaAmt(d),0)
               -vendPays.filter(p=>p.date<mStart).reduce((s,p)=>s+p.amount,0);
     const thisMonthDocs=vendDocs.filter(d=>(d._bd||'').slice(0,7)===monthVal);
-    const thisMonthBill=thisMonthDocs.reduce((s,d)=>s+(+d.grand||0),0);
+    const thisMonthBill=thisMonthDocs.reduce((s,d)=>s+bnxPaAmt(d),0);
     let thisMonthPaid=vendPays.filter(p=>(p.date||'').slice(0,7)===monthVal).reduce((s,p)=>s+p.amount,0)
-                     +thisMonthDocs.filter(_isPaid).reduce((s,d)=>s+d.grand,0);
+                     +thisMonthDocs.filter(_isPaid).reduce((s,d)=>s+bnxPaAmt(d),0);
     let netDue=oldDue+thisMonthBill-thisMonthPaid;
     // Current due from the Tally ledger (Group Summary import) wins for its own month
     const tallyDue=(typeof bnxTallyDueFor==='function')?bnxTallyDueFor(vname,monthVal):null;
@@ -7554,7 +7577,7 @@ function renderPaymentAdvice(){
       if(netDue>oldDue+thisMonthBill-thisMonthPaid)oldDue=netDue-thisMonthBill+thisMonthPaid; else thisMonthPaid=oldDue+thisMonthBill-netDue;
       tallyNote=Math.abs(dbNet-netDue)<1?'Tally ✓':'Tally ≠ DB '+fmt(dbNet);
     }
-    if(oldDue===0&&thisMonthBill===0&&thisMonthPaid===0&&netDue===0)return null;
+    if(oldDue===0&&thisMonthBill===0&&thisMonthPaid===0&&netDue===0&&!thisMonthDocs.length)return null;   /* 2026-11-26: a party with a bill entered this month stays listed even when every figure is 0 */
     if(((document.getElementById('pa-dueonly')||{}).checked!==false)&&netDue<=0.5)return null; // Due only
     const _withB=thisMonthDocs.filter(d=>bnxBillLinks(d).length), _vq=String(vname).replace(/&/g,'&amp;').replace(/"/g,'&quot;');
     const attachHtml=_withB.length
@@ -7583,7 +7606,7 @@ function renderPaymentAdvice(){
     /* ledger column was blank until a file was uploaded — the ERP's own party ledger is always available */
     const _icBook='<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h11a3 3 0 013 3v13H7a3 3 0 01-3-3z"/><path d="M8 8h6M8 12h6M8 16h4"/></svg>';
     const ledgerHtml2=`<button class="ledger-ic" data-v="${_dq}" onclick="openPartyTally(this.dataset.v)" title="Party ledger from ERP bills &amp; payments">${_icBook}</button>`+ledgerHtml;
-    const suggestedRemark=((window._paRemarks||{})[vname])||ledgerRemark||tallyNote||(netDue<=0.5&&thisMonthBill>0?'Paid / settled':'')||(thisMonthDocs.length===1&&oldDue===0?'Single bill':(netDue===0?'Zero':''));
+    const suggestedRemark=((window._paRemarks||{})[vname])||ledgerRemark||tallyNote||(thisMonthDocs.length&&thisMonthBill===0?'Bill entered — amount ₹0, check':'')||(netDue<=0.5&&thisMonthBill>0?'Paid / settled':'')||(thisMonthDocs.length===1&&oldDue===0?'Single bill':(netDue===0?'Zero':''));
     grandNetDue+=netDue;
     return {vname,oldDue,thisMonthBill,thisMonthPaid,netDue,attachHtml,ledgerHtml:ledgerHtml2,suggestedRemark,nBills:thisMonthDocs.length,hasBill:_withB.length>0};
   }).filter(Boolean);
@@ -9203,7 +9226,11 @@ function confirmSmartImport(asDraft){
       var r=await erpApi('GET_GRN_REGISTER',{});
       if(!r||!r.success||!Array.isArray(r.data)) { console.warn('[GRN] server load failed', r&&r.message); return; }
       var ids={}; r.data.forEach(function(g){ ids[g.id]=1; });
-      var local=(DB.grns||[]).filter(function(g){ return g && !g.fromServer && !ids[g.id]; });
+      /* 2026-11-26 SYNC FIX: a GRN line saved here (own id) and the same line coming back from the server (server id)
+         were both kept -> every new GRN showed twice after a sync. Drop the local copy once the server has that GRN no + item. */
+      var _k=function(g){ return String(g.no||'').trim().toUpperCase()+'|'+String(g.item||'').trim().toUpperCase(); };
+      var _srv={}; r.data.forEach(function(g){ _srv[_k(g)]=1; });
+      var local=(DB.grns||[]).filter(function(g){ return g && !g.fromServer && !ids[g.id] && !_srv[_k(g)]; });
       DB.grns=r.data.concat(local);
       try{ saveLocalOnly(); }catch(e){}
       try{ rendGRN(); }catch(e){} try{ rendDash(); }catch(e){}
@@ -11902,46 +11929,352 @@ window.handleScan=function(input){
 <div class="mt">🚛 GRN Transaction <button class="mc" onclick="closeM('mGRNTxn')">✕</button></div>
 <div id="grnTxnBody"></div>
 <div style="margin-top:14px"><button class="btn" onclick="closeM('mGRNTxn')">Close</button></div></div></div>
+<style id="bnx-part-bills-20261126-css">
+#bnxPbOv{position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:99991;display:flex;align-items:flex-start;justify-content:center;padding:5vh 10px;overflow:auto}
+#bnxPbBox{background:var(--card,#fff);color:var(--text,#111827);border-radius:12px;max-width:860px;width:100%;padding:16px 18px;box-shadow:0 20px 50px rgba(0,0,0,.3);font-size:13px}
+#bnxPbBox .pb-h{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:10px}
+#bnxPbBox .pb-t{font-size:15px;font-weight:800}
+#bnxPbBox .pb-sum{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin:10px 0}
+#bnxPbBox .pb-sum div{background:var(--bg2,#f8fafc);border:1px solid var(--border,#e5e7eb);border-radius:8px;padding:7px 10px}
+#bnxPbBox .pb-sum span{display:block;font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--text3,#6b7280)}
+#bnxPbBox .pb-sum b{font-size:14px;font-variant-numeric:tabular-nums}
+#bnxPbBox table{width:100%;border-collapse:collapse;margin:6px 0}
+#bnxPbBox th,#bnxPbBox td{padding:5px 8px;border-bottom:1px solid var(--border,#e5e7eb);text-align:left;white-space:nowrap}
+#bnxPbBox th.r,#bnxPbBox td.r{text-align:right;font-variant-numeric:tabular-nums}
+#bnxPbBox input,#bnxPbBox textarea{border:1.5px solid var(--border2,#cbd5e1);border-radius:6px;padding:5px 8px;font-size:12.5px;background:var(--card,#fff);color:inherit;box-sizing:border-box}
+#bnxPbBox .pb-add{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:8px 0}
+#bnxPbBox .pb-box{border:1px dashed var(--border2,#cbd5e1);border-radius:8px;padding:8px 10px;margin-top:10px}
+#bnxPbBox .pb-st{font-weight:800}
+#bnxPbBox .pb-st.part{color:#b45309}#bnxPbBox .pb-st.full{color:#047857}#bnxPbBox .pb-st.over{color:#b91c1c}#bnxPbBox .pb-st.none{color:#6b7280}
+#bnxPbBox .mut{color:var(--text3,#6b7280);font-size:11.5px}
+</style>
+<script id="bnx-part-bills-20261126">
+/* ═══ ONE GRN → SEVERAL SUPPLIER BILLS (2026-11-26) ═══════════════════════════════════════════════════════════
+   Case: the whole consignment is received on ONE GRN (e.g. GRN/00583 · ₹2,60,876.96) but the supplier sends the bills in
+   parts (3 bills on 15-Sep …). Before: one invoice = one bill no, so the register showed "＋ Bill no" for ever.
+   Now each GRN invoice can carry any number of supplier bills (bill no, date, amount, file link):
+     GRN total  −  Σ bills  −  accepted difference (TCS / other charges / round-off)  =  Balance
+     Balance ≈ 0 (within ₹ tolerance) → "Billed", > 0 → "Part billed", < 0 → "Over billed".
+   Stock is NOT touched here — stock is posted by the GRN only. */
+(function(W){
+  'use strict';
+  var D=document;
+  function X(s){ return bnxEsc(s); }
+  function r2(n){ return Math.round((+n||0)*100)/100; }
+  function tol(){ var t=parseFloat(localStorage.getItem('bnx_bill_tol')); return isNaN(t)?1:t; }
+  function inr(n){ return typeof fmt==='function'?fmt(n):'₹'+(+n||0).toFixed(2); }
+  function doc(id){ return (DB.purchases||[]).find(function(x){ return x.id===id; }); }
+  function nd(x){ return typeof normalizeDateStr==='function'?(normalizeDateStr(x)||''):String(x||''); }
+  function nk(x){ return String(x||'').toUpperCase().replace(/[^A-Z0-9]+/g,' ').trim(); }
+
+  /* ── status of one invoice ── */
+  W.bnxBillingOf=function(p){
+    var parts=(p&&Array.isArray(p.partBills))?p.partBills.filter(function(b){ return b&&(b.billNo||+b.amount); }):[];
+    var total=r2(p&&p.grand), adj=r2(p&&p.billAdjust&&p.billAdjust.amount);
+    var bn=String((p&&p.billNo)||'').trim();
+    if(parts.length){
+      var billed=r2(parts.reduce(function(a,b){ return a+(+b.amount||0); },0));
+      var diff=r2(total-billed-adj);
+      return {status:Math.abs(diff)<=tol()?'full':(diff>0?'part':'over'),total:total,billed:billed,adj:adj,diff:diff,count:parts.length};
+    }
+    if(bn){
+      if(bn.indexOf(',')>=0) return {status:'multi',total:total,billed:total,adj:0,diff:0,count:bn.split(',').length};
+      if(!bnxIsGrnNo(bn)) return {status:'full',total:total,billed:total,adj:0,diff:0,count:1};
+    }
+    return {status:'none',total:total,billed:0,adj:0,diff:total,count:0};
+  };
+  W.bnxBillChip=function(p){
+    var b=W.bnxBillingOf(p), cls,t,tip;
+    if(b.status==='none'){ cls='b-gray'; t='Bill pending'; tip='No supplier bill recorded for this GRN — click to add the bill(s)'; }
+    else if(b.status==='part'){ cls='b-amber'; t='Part billed · bal '+inr(b.diff); tip=b.count+' bill(s) = '+inr(b.billed)+' of '+inr(b.total); }
+    else if(b.status==='over'){ cls='b-red'; t='Over billed '+inr(-b.diff); tip='Bills exceed the GRN value by '+inr(-b.diff); }
+    else if(b.status==='multi'){ cls='b-teal'; t=b.count+' bills'; tip='Several bill numbers saved; amounts are on the device that entered them'; }
+    else { cls='b-green'; t=b.count>1?'Billed · '+b.count+' bills':'Billed'; tip=b.adj?'Billed (incl. accepted difference '+inr(b.adj)+')':'Billed in full'; }
+    return '<span class="badge '+cls+'" style="cursor:pointer;font-size:9px;white-space:nowrap" title="'+X(tip)+'" onclick="event.stopPropagation();bnxPartBills(\''+X(p.id)+'\')">'+X(t)+'</span>';
+  };
+
+  /* ── register cells ── */
+  var oInv=W.bnxInvNoCell;
+  W.bnxInvNoCell=function(p){
+    var parts=(p&&Array.isArray(p.partBills))?p.partBills:[];
+    if(parts.length){
+      var more=parts.length>1?' <span class="badge b-amber" style="font-size:9px">+'+(parts.length-1)+'</span>':'';
+      return '<a href="#" class="bnx-addbill" style="border-style:solid" title="'+X(parts.map(function(b){ return b.billNo; }).join(', '))+' — click to manage bills" onclick="event.preventDefault();event.stopPropagation();bnxPartBills(\''+X(p.id)+'\')"><b class="pl-inv">'+X(parts[0].billNo)+'</b>'+more+'</a>';
+    }
+    if(p&&bnxGrnNo(p)&&!bnxSupBillNo(p))
+      return '<a href="#" class="bnx-addbill" onclick="event.preventDefault();event.stopPropagation();bnxPartBills(\''+X(p.id)+'\')" title="Supplier bill no not entered — add one bill or several part bills">＋ Bill no</a>';
+    return oInv?oInv(p):'—';
+  };
+  var oGrnCell=W.bnxGrnCell;
+  W.bnxGrnCell=function(p){
+    var h=oGrnCell?oGrnCell(p):'—'; if(!p||!bnxGrnNo(p))return h;
+    return h+'<div style="margin-top:2px">'+W.bnxBillChip(p)+'</div>';
+  };
+  var oSet=W.bnxSetBillNo;
+  W.bnxSetBillNo=function(id){ var p=doc(id)||(DB.acctInvs||[]).find(function(x){ return x.id===id; }); if(p&&doc(id)&&bnxGrnNo(p))return W.bnxPartBills(id); return oSet?oSet(id):undefined; };
+
+  /* ── paste-from-sheet parser: one bill per line (tab separated, as copied from Google Sheets) ── */
+  function parsePaste(text){
+    var out=[];
+    String(text||'').split(/\r?\n/).forEach(function(line){
+      if(!line.trim())return;
+      var cells=line.indexOf('\t')>=0?line.split('\t'):line.split(/\s{2,}|\s*\|\s*/);
+      cells=cells.map(function(c){ return c.trim(); }).filter(Boolean);
+      var dt='',amt=null,amtIdx=-1,bill='';
+      cells.forEach(function(c){ var m=c.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/); if(m&&!dt){ var y=m[3].length===2?'20'+m[3]:m[3]; dt=y+'-'+('0'+m[2]).slice(-2)+'-'+('0'+m[1]).slice(-2); } });
+      for(var i=cells.length-1;i>=0;i--){ if(/^(?:₹|Rs\.?)?\s*-?[\d,]+(?:\.\d{1,2})?$/.test(cells[i])&&/\d/.test(cells[i])){ var v=parseFloat(cells[i].replace(/[^\d.\-]/g,'')); if(!isNaN(v)&&v>0){ amt=v; amtIdx=i; break; } } }
+      cells.forEach(function(c,i){
+        if(bill||i===amtIdx)return;
+        if(!/\d/.test(c))return;
+        if(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/.test(c))return;
+        if(/^\d{4}-\d{2,4}$/.test(c))return;                 /* FY like 2026-2027 */
+        if(/^[A-Za-z]{3}'?\d{2}$/.test(c))return;            /* month like Sep'26 */
+        if(/^(?:₹|Rs\.?)?\s*-?[\d,]+(?:\.\d{1,2})?$/.test(c)&&c.replace(/\D/g,'').length>=3&&cells.filter(function(z){ return /^(?:₹|Rs\.?)?\s*-?[\d,]+(?:\.\d{1,2})?$/.test(z); }).length<2)return;
+        bill=c;
+      });
+      if(!bill&&cells.length){ /* only pure numbers on the line: first = bill no, last = amount */
+        var nums=cells.filter(function(c){ return /^[\d,.₹Rs\s]+$/.test(c); }); if(nums.length>=2)bill=nums[0];
+      }
+      if(bill&&amt!=null)out.push({billNo:bill,billDate:dt,amount:r2(amt),url:''});
+    });
+    return out;
+  }
+
+  /* ── the dialog ── */
+  W.bnxPartBills=function(id){
+    var p=doc(id); if(!p){ toast('Invoice not found','err','⚠️'); return; }
+    var parts=(p.partBills||[]).map(function(b){ return Object.assign({},b); });
+    var adj=p.billAdjust?{amount:r2(p.billAdjust.amount),reason:p.billAdjust.reason||''}:{amount:0,reason:''};
+    var old=D.getElementById('bnxPbOv'); if(old)old.remove();
+    var o=D.createElement('div'); o.id='bnxPbOv'; o.onclick=function(e){ if(e.target===o)o.remove(); };
+    var grn=bnxGrnNo(p)||p.no;
+    o.innerHTML='<div id="bnxPbBox">'
+     +'<div class="pb-h"><div><div class="pb-t">Supplier bills against '+X(bnxShortNo(grn))+'</div><div class="mut">'+X(p.vendorName||'')+' · GRN date '+fmtD(p.date)+' · GRN value <b>'+inr(p.grand)+'</b></div></div><button class="btn btn-sm" id="pbClose">Close</button></div>'
+     +'<div class="mut">Use this when the goods came on one GRN but the supplier bills in parts. Add every bill below; the balance must reach ₹0 (or be accepted as a difference).</div>'
+     +'<div id="pbSum" class="pb-sum"></div>'
+     +'<div class="tw" style="max-height:240px"><table><thead><tr><th>#</th><th>Bill no</th><th>Bill date</th><th class="r">Amount</th><th>File</th><th></th></tr></thead><tbody id="pbRows"></tbody></table></div>'
+     +'<div class="pb-add"><input id="pbNo" placeholder="Supplier bill no" style="flex:1.4;min-width:150px"><input id="pbDt" type="date"><input id="pbAmt" type="number" step="0.01" placeholder="Amount" style="width:120px"><input id="pbUrl" placeholder="Drive link (optional)" style="flex:1;min-width:130px"><button class="btn btn-sm btn-primary" id="pbAdd">＋ Add bill</button></div>'
+     +'<div class="pb-box"><b>Paste from your Google Sheet</b> <span class="mut">— copy the rows (Bill No + Bill Amount, date optional) from the Purchase tab and paste here</span><textarea id="pbPaste" rows="3" style="width:100%;margin-top:6px" placeholder="2026-2027/W/2022/014/01/013767&#9;15/09/2026&#9;80892"></textarea><div style="margin-top:6px"><button class="btn btn-sm" id="pbRead">Read pasted rows</button> <span id="pbPasteMsg" class="mut"></span></div></div>'
+     +'<div class="pb-box" id="pbSugBox" style="display:none"><b>Bills already synced from the sheet</b> <span class="mut">(same supplier, near this GRN date, not yet linked)</span><div id="pbSug"></div></div>'
+     +'<div class="pb-box"><b>Difference</b> <span class="mut">— if the supplier bills total differs from the GRN value (TCS, special fee, round-off) accept it here</span><div class="pb-add"><input id="pbAdjAmt" type="number" step="0.01" placeholder="Difference ₹" style="width:130px"><input id="pbAdjWhy" placeholder="Reason (e.g. TCS / other charges / round-off)" style="flex:1;min-width:200px"><button class="btn btn-sm" id="pbAdjFill">Accept full balance</button></div></div>'
+     +'<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px"><button class="btn" id="pbCancel">Cancel</button><button class="btn btn-primary" id="pbSave">💾 Save bills</button></div></div>';
+    D.body.appendChild(o);
+    var $=function(i){ return D.getElementById(i); };
+    function calc(){ var billed=r2(parts.reduce(function(a,b){ return a+(+b.amount||0); },0)); var diff=r2((+p.grand||0)-billed-adj.amount); var st=!parts.length?'none':(Math.abs(diff)<=tol()?'full':(diff>0?'part':'over')); return {billed:billed,diff:diff,st:st}; }
+    function paint(){
+      var c=calc(), lbl={none:'No bills yet',part:'Part billed',full:'Fully billed',over:'Over billed'}[c.st];
+      $('pbSum').innerHTML='<div><span>GRN value</span><b>'+inr(p.grand)+'</b></div><div><span>Bills ('+parts.length+')</span><b>'+inr(c.billed)+'</b></div><div><span>Accepted difference</span><b>'+inr(adj.amount)+'</b></div><div><span>Balance</span><b class="pb-st '+c.st+'">'+inr(c.diff)+'</b></div><div><span>Status</span><b class="pb-st '+c.st+'">'+lbl+'</b></div>';
+      $('pbRows').innerHTML=parts.length?parts.map(function(b,i){ return '<tr><td>'+(i+1)+'</td><td>'+X(b.billNo)+'</td><td>'+(b.billDate?fmtD(b.billDate):'—')+'</td><td class="r"><b>'+inr(b.amount)+'</b></td><td>'+(b.url?'<a href="'+X(b.url)+'" target="_blank">open</a>':'—')+'</td><td><button class="btn btn-xs" data-rm="'+i+'" style="color:#b91c1c">Remove</button></td></tr>'; }).join(''):'<tr><td colspan="6" class="mut" style="padding:12px">No supplier bill added yet.</td></tr>';
+      [].forEach.call($('pbRows').querySelectorAll('button[data-rm]'),function(b){ b.onclick=function(){ parts.splice(+b.dataset.rm,1); paint(); }; });
+      suggest();
+    }
+    function add(b){
+      if(!b||!b.billNo||!(+b.amount>0))return false;
+      if(parts.some(function(x){ return nk(x.billNo)===nk(b.billNo); })){ return false; }
+      parts.push({id:'PB'+Math.random().toString(36).slice(2,9),billNo:String(b.billNo).trim(),billDate:nd(b.billDate)||'',amount:r2(b.amount),url:b.url||''}); return true;
+    }
+    function suggest(){
+      var box=$('pbSugBox'),list=W._bnxExtrasList||[]; if(!list.length){ box.style.display='none'; return; }
+      var vk=nk(p.vendorName), gd=nd(p.date), ids=new Set((DB.purchases||[]).map(function(x){ return x.id; }));
+      var have=new Set(parts.map(function(b){ return nk(b.billNo); })), other=new Set(); (DB.purchases||[]).forEach(function(x){ if(x.id!==p.id){ (x.partBills||[]).forEach(function(b){ other.add(nk(b.billNo)); }); if(x.billNo&&!/,/.test(x.billNo))other.add(nk(x.billNo)); } });
+      var res=list.filter(function(it){
+        if(it.id&&ids.has(it.id))return false;
+        var bn=it.billNo||it.no; if(!bn||have.has(nk(bn))||other.has(nk(bn)))return false;
+        var sup=nk(it.supplierName||it.supplier||it.vendorName||it.party||''); if(sup&&vk&&sup.indexOf(vk)<0&&vk.indexOf(sup)<0)return false;
+        var d=nd(it.billDate||it.date); if(d&&gd){ var diff=(new Date(d)-new Date(gd))/864e5; if(diff<-3||diff>14)return false; }
+        return !!(+(it.billAmount||it.amount||0));
+      }).slice(0,12);
+      if(!res.length){ box.style.display='none'; return; }
+      box.style.display='block';
+      $('pbSug').innerHTML='<table><tbody>'+res.map(function(it,i){ return '<tr><td>'+X(it.billNo||it.no)+'</td><td>'+(nd(it.billDate||it.date)?fmtD(it.billDate||it.date):'—')+'</td><td class="r">'+inr(it.billAmount||it.amount)+'</td><td><button class="btn btn-xs" data-sg="'+i+'">＋ Add</button></td></tr>'; }).join('')+'</tbody></table>';
+      [].forEach.call($('pbSug').querySelectorAll('button[data-sg]'),function(b){ b.onclick=function(){ var it=res[+b.dataset.sg]; add({billNo:it.billNo||it.no,billDate:it.billDate||it.date,amount:it.billAmount||it.amount,url:(it.links&&it.links[0])||''}); paint(); }; });
+    }
+    $('pbAdjAmt').value=adj.amount||''; $('pbAdjWhy').value=adj.reason||'';
+    $('pbAdjAmt').oninput=function(){ adj.amount=r2($('pbAdjAmt').value); paint(); };
+    $('pbAdjWhy').oninput=function(){ adj.reason=$('pbAdjWhy').value; };
+    $('pbAdjFill').onclick=function(){ adj.amount=0; var c=calc(); adj.amount=c.diff; $('pbAdjAmt').value=adj.amount||''; if(!$('pbAdjWhy').value){ $('pbAdjWhy').value='TCS / other charges / round-off'; adj.reason=$('pbAdjWhy').value; } paint(); };
+    $('pbAdd').onclick=function(){
+      var b={billNo:$('pbNo').value.trim(),billDate:$('pbDt').value,amount:$('pbAmt').value,url:$('pbUrl').value.trim()};
+      if(!b.billNo){ toast('Enter the supplier bill no','warn','⚠️'); return; } if(!(+b.amount>0)){ toast('Enter the bill amount','warn','⚠️'); return; }
+      if(!add(b)){ toast('Bill '+b.billNo+' is already in this list','warn','⚠️'); return; }
+      $('pbNo').value='';$('pbAmt').value='';$('pbUrl').value=''; paint(); $('pbNo').focus();
+    };
+    $('pbRead').onclick=function(){
+      var rows=parsePaste($('pbPaste').value), n=0,dup=0; rows.forEach(function(r){ if(add(r))n++; else dup++; });
+      $('pbPasteMsg').textContent=rows.length?(n+' bill(s) added'+(dup?', '+dup+' skipped (already listed)':'')):'No bill no + amount found in the pasted text'; if(n)$('pbPaste').value=''; paint();
+    };
+    $('pbClose').onclick=$('pbCancel').onclick=function(){ o.remove(); };
+    $('pbSave').onclick=async function(){
+      var c=calc();
+      if(c.st==='over'&&!confirm('Bills total '+inr(c.billed)+' is MORE than the GRN value '+inr(p.grand)+' by '+inr(-c.diff)+'.\nSave anyway?'))return;
+      if(c.st==='part'&&!confirm('Balance '+inr(c.diff)+' is still unbilled on this GRN (part billed).\nSave the bills entered so far?'))return;
+      if(adj.amount&&!String(adj.reason||'').trim()){ toast('Enter a reason for the accepted difference','warn','⚠️'); return; }
+      $('pbSave').disabled=true; $('pbSave').textContent='⏳ Saving…';
+      var prevJoined=(p.partBills||[]).map(function(b){ return b.billNo; }).join(', ');
+      var prevLinks=bnxBillLinks(p).slice();
+      p.partBills=parts; p.billAdjust=adj.amount?{amount:adj.amount,reason:adj.reason}:null;
+      if(parts.length){ p.billNo=parts.map(function(b){ return b.billNo; }).join(', '); p.billDate=parts.map(function(b){ return b.billDate; }).filter(Boolean).sort()[0]||p.billDate||''; }
+      else if(!p.billNo||p.billNo===prevJoined){ p.billNo=''; }
+      var links=prevLinks.slice(); parts.forEach(function(b){ if(b.url&&links.indexOf(b.url)<0)links.push(b.url); });
+      if(links.length){ p.billLinks=links; p.billFileUrl=links[0]; }
+      try{ saveLocalOnly(); }catch(e){}
+      ['rendRegs','rendPurchaseList','rendDash','rendGRN'].forEach(function(f){ try{ W[f](); }catch(e){} });
+      var warn=[];
+      try{ var r1=await erpApi('PURCHASE_BILLNO_SET',{invoiceId:p.id,billNo:p.billNo||'',billDate:p.billDate||''}); if(r1&&r1.success===false)warn.push('bill no: '+(r1.message||r1.error||'not saved')); }catch(e){ warn.push('bill no: '+e.message); }
+      try{ var r2_=await erpApi('PURCHASE_PART_BILLS_SET',{invoiceId:p.id,invoiceNo:p.no,grnNo:grn,supplierName:p.vendorName||'',grnValue:+p.grand||0,parts:parts,adjust:p.billAdjust}); if(r2_&&r2_.success===false)warn.push('amounts/dates stay on this device (server action PURCHASE_PART_BILLS_SET not available yet)'); }catch(e){ warn.push('amounts/dates stay on this device'); }
+      for(var i=0;i<parts.length;i++){ var b=parts[i]; if(b.url&&prevLinks.indexOf(b.url)<0){ try{ await erpApi('SET_PURCHASE_BILL',{invoiceId:p.id,invoiceNo:p.no,supplierName:p.vendorName||'',billNo:b.billNo,billDate:b.billDate||p.date||'',billAmount:+b.amount||0,url:b.url,head:p.purchaseHead||''}); }catch(e){} } }
+      o.remove();
+      toast(warn.length?('Bills saved · '+warn[0]):('Bills saved · '+(calc().st==='full'?'GRN fully billed':'balance '+inr(calc().diff))),warn.length?'warn':'ok',warn.length?'⚠️':'✅');
+    };
+    paint();
+  };
+})(window);
+</script>
+<style id="bnx-grn-filter-20261126-css">
+.grn-fbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 10px;margin:0 0 6px;background:var(--bg2,#f8fafc);border:1px solid var(--border,#e5e7eb);border-radius:10px}
+.grn-fbar input,.grn-fbar select{border:1.5px solid var(--border2,#cbd5e1);border-radius:6px;padding:5px 8px;font-size:12.5px;background:var(--card,#fff);color:inherit;min-width:0}
+.grn-fbar .gq{flex:1 1 240px;min-width:200px}
+.grn-fbar .gl{font-size:11px;color:var(--text3,#6b7280)}
+.grn-fbar .gcnt{margin-left:auto;font-size:12px;font-weight:700;white-space:nowrap}
+.grn-tbl tfoot td{font-weight:800;background:var(--bg2,#f8fafc);border-top:2px solid var(--border2,#cbd5e1)}
+.grn-tbl .grn-bal-p{color:#b45309;font-weight:700}.grn-tbl .grn-bal-o{color:#b91c1c;font-weight:700}
+</style>
 <script id="bnx-grn-register-20261125-js">
+/* GRN register (page + Registers tab) — grouped one row per GRN no.
+   2026-11-26: + search (GRN no incl. just the number e.g. "583", supplier, item, PO, invoice / bill no, godown, amount, date),
+   supplier / date-range / godown / bill-status filters, GRN value · billed · balance · bill status per GRN,
+   totals of the filtered list, and a "Bills" button (one GRN → several supplier bills). */
 (function(){
+  var W=window,D=document;
+  var F={q:'',vendor:'',from:'',to:'',bill:'',godown:''};
+  var norm=function(x){return String(x||'').toUpperCase().replace(/[^A-Z0-9]+/g,' ').trim();};
   function groups(list){var m={},o=[];list.forEach(function(g){var k=g.no;if(!m[k]){m[k]={no:k,rows:[]};o.push(m[k]);}m[k].rows.push(g);});return o;}
   function sum(rows,f){return rows.reduce(function(a,r){return a+(+r[f]||0);},0);}
   function q(n){return (+n||0).toLocaleString('en-IN',{maximumFractionDigits:2});}
-  var HEAD='<thead><tr><th>GRN No</th><th>Date</th><th>PO No</th><th>Vendor</th><th>Item</th><th class="th-r">Received</th><th class="th-r">Accepted</th><th class="th-r">Rejected</th><th>Godown</th><th>Status</th></tr></thead>';
-  function rowHtml(G){
-    var r=G.rows[0],n=G.rows.length;
-    var item=n>1?bnxEsc(r.item)+' <span class="badge b-gray">+'+(n-1)+' more</span>':bnxEsc(r.item);
-    return '<tr class="grn-row" data-grn="'+bnxEsc(G.no)+'"><td class="grn-no" title="'+bnxEsc(G.no)+'">'+bnxEsc(bnxShortNo(G.no))+'</td><td>'+fmtD(r.date)+'</td><td>'+(r.poRef?bnxEsc(bnxShortNo(r.poRef)):'—')+'</td><td class="grn-vendor" title="'+bnxEsc(r.vendorName)+'">'+bnxEsc(r.vendorName)+'</td><td class="grn-item">'+item+'</td><td class="td-r">'+q(sum(G.rows,'received'))+'</td><td class="td-r" style="color:var(--green);font-weight:600">'+q(sum(G.rows,'accepted'))+'</td><td class="td-r" style="color:var(--red);font-weight:600">'+q(sum(G.rows,'rejected'))+'</td><td>'+bnxEsc(r.godown||'—')+'</td><td><span class="badge b-teal">'+bnxEsc(r.status||'Received')+'</span></td></tr>';
+  function r2(n){return Math.round((+n||0)*100)/100;}
+  function dmy(d){d=String(d||'');return d.slice(8,10)+'-'+d.slice(5,7)+'-'+d.slice(0,4);}
+  var HEAD='<thead><tr><th>GRN No</th><th>Date</th><th>PO No</th><th>Vendor</th><th>Item</th><th class="th-r">Received</th><th class="th-r">Accepted</th><th class="th-r">Rejected</th><th class="th-r">GRN Value</th><th class="th-r">Billed</th><th class="th-r">Balance</th><th>Bill status</th><th>Godown</th></tr></thead>';
+  var NCOL=13;
+
+  /* link every GRN to its purchase invoice (imported GRN invoices carry the GRN no as invoice no) and work out billing */
+  function enrich(G){
+    var idx=W._bnxGrnIdx;
+    if(!idx){ idx={byId:{},byNo:{}};
+      (DB.purchases||[]).forEach(function(p){ if(!p)return; idx.byId[p.id]=p; if(p.no)idx.byNo[String(p.no).trim().toUpperCase()]=p; var gn=typeof bnxGrnNo==='function'?bnxGrnNo(p):''; if(gn)idx.byNo[String(gn).trim().toUpperCase()]=p; }); W._bnxGrnIdx=idx; }
+    var r=G.rows[0], p=null;
+    G.rows.some(function(x){ if(x.purchaseId&&idx.byId[x.purchaseId]){p=idx.byId[x.purchaseId];return true;} return false; });
+    if(!p)p=idx.byNo[String(G.no).trim().toUpperCase()]||null;
+    G.inv=p;
+    var lineVal=r2(G.rows.reduce(function(a,x){return a+(+x.amount||((+x.accepted||+x.received||0)*(+x.rate||0)));},0));
+    G.value=p?r2(+p.grand||0):lineVal;
+    G.bill=p&&typeof bnxBillingOf==='function'?bnxBillingOf(p):null;
+    G.status=G.bill?G.bill.status:'noinv';
+    G.billed=G.bill?(G.bill.billed+(G.bill.adj||0)):0;
+    G.bal=G.bill?G.bill.diff:G.value;
+    return G;
   }
+  function hay(G){
+    var r=G.rows[0],d=String(r.date||''),p=G.inv,digits=String(G.no||'').replace(/\D/g,'').replace(/^0+/,'');
+    var parts=[G.no,digits,bnxShortNo(G.no),r.vendorName,r.poRef,r.godown,r.vehicle,r.driver,r.remarks,r.purchaseNo,d,dmy(d),G.value.toFixed(2),Math.round(G.value),String(G.value.toFixed(2)).replace('.','')]
+      .concat(G.rows.map(function(x){return x.item;}));
+    if(p){ parts.push(p.no,p.billNo,p.vendorName); (p.partBills||[]).forEach(function(b){ parts.push(b.billNo,b.amount); }); }
+    return parts.join(' | ').toLowerCase();
+  }
+  function pass(G){
+    var r=G.rows[0],d=String(r.date||'').slice(0,10);
+    if(F.vendor&&norm(r.vendorName)!==norm(F.vendor))return false;
+    if(F.from&&(!d||d<F.from))return false;
+    if(F.to&&(!d||d>F.to))return false;
+    if(F.godown&&String(r.godown||'')!==F.godown)return false;
+    if(F.bill){ var s=G.status; if(F.bill==='open'){ if(!(s==='none'||s==='part'||s==='over'))return false; } else if(s!==F.bill)return false; }
+    if(F.q){ var h=hay(G); if(!F.q.toLowerCase().split(/\s+/).every(function(w){return h.indexOf(w)>=0;}))return false; }
+    return true;
+  }
+  var CHIP={none:['b-gray','Bill pending'],part:['b-amber','Part billed'],full:['b-green','Billed'],over:['b-red','Over billed'],multi:['b-teal','Multiple bills'],noinv:['b-gray','No invoice']};
+  function rowHtml(G){
+    var r=G.rows[0],n=G.rows.length,c=CHIP[G.status]||CHIP.noinv;
+    var item=n>1?bnxEsc(r.item)+' <span class="badge b-gray">+'+(n-1)+' more</span>':bnxEsc(r.item);
+    var balCls=G.status==='part'?'grn-bal-p':(G.status==='over'?'grn-bal-o':'');
+    var btn=G.inv?' <button class="btn btn-xs" onclick="event.stopPropagation();bnxPartBills(\''+bnxEsc(G.inv.id)+'\')" title="Add / edit the supplier bills of this GRN">🧾 Bills'+(G.bill&&G.bill.count>1?' ('+G.bill.count+')':'')+'</button>':'';
+    return '<tr class="grn-row" data-grn="'+bnxEsc(G.no)+'"><td class="grn-no" title="'+bnxEsc(G.no)+'">'+bnxEsc(bnxShortNo(G.no))+'</td><td>'+fmtD(r.date)+'</td><td>'+(r.poRef?bnxEsc(bnxShortNo(r.poRef)):'—')+'</td><td class="grn-vendor" title="'+bnxEsc(r.vendorName)+'">'+bnxEsc(r.vendorName)+'</td><td class="grn-item">'+item+'</td><td class="td-r">'+q(sum(G.rows,'received'))+'</td><td class="td-r" style="color:var(--green);font-weight:600">'+q(sum(G.rows,'accepted'))+'</td><td class="td-r" style="color:var(--red);font-weight:600">'+q(sum(G.rows,'rejected'))+'</td><td class="td-r"><b>'+(G.value?fmt(G.value):'—')+'</b></td><td class="td-r">'+(G.inv?fmt(G.billed):'—')+'</td><td class="td-r '+balCls+'">'+(G.inv?fmt(G.bal):'—')+'</td><td><span class="badge '+c[0]+'" style="white-space:nowrap">'+c[1]+'</span>'+btn+'</td><td>'+(r.godown?bnxEsc(r.godown):'—')+'</td></tr>';
+  }
+  function foot(GS){
+    var v=0,b=0,bal=0,withInv=0; GS.forEach(function(G){ v+=G.value; if(G.inv){ withInv++; b+=G.billed; bal+=G.bal; } });
+    return '<tfoot><tr><td colspan="8" style="text-align:right">Total — '+GS.length+' GRN(s):</td><td class="td-r">'+fmt(v)+'</td><td class="td-r">'+fmt(b)+'</td><td class="td-r">'+fmt(bal)+'</td><td colspan="2"></td></tr></tfoot>';
+  }
+  function filtered(list){ W._bnxGrnIdx=null; var GS=groups(list).map(enrich); return {all:GS,shown:GS.filter(pass)}; }
   function paint(host,list,empty){
-    if(!list.length){host.innerHTML='<tr class="empty-r"><td colspan="10">'+empty+'</td></tr>';return;}
-    host.innerHTML=groups(list).map(rowHtml).join('');
+    var R=filtered(list);
+    if(!R.shown.length){host.innerHTML='<tr class="empty-r"><td colspan="'+NCOL+'">'+(R.all.length?'No GRN matches the search / filters.':empty)+'</td></tr>';}
+    else host.innerHTML=R.shown.map(rowHtml).join('');
+    var t=host.closest('table'); if(t){ var f=t.querySelector('tfoot'); if(f)f.remove(); if(R.shown.length)t.insertAdjacentHTML('beforeend',foot(R.shown)); }
+    return R;
   }
   function fixTable(tb){var t=tb.closest('table');if(t){t.classList.add('grn-tbl');var old=t.querySelector('thead');if(old)old.outerHTML=HEAD;}}
+
+  /* ── filter bars (one above the GRN page list, one above the Registers › GRN table) ── */
+  function barHtml(k){
+    return '<input class="gq" id="grnF-q-'+k+'" type="search" placeholder="🔍 Search GRN no (e.g. 583), supplier, item, PO, bill no, amount, date…" autocomplete="off" oninput="bnxGrnFilter(this,\'q\')">'
+     +'<select id="grnF-vendor-'+k+'" onchange="bnxGrnFilter(this,\'vendor\')" title="Supplier"></select>'
+     +'<span class="gl">From</span><input type="date" id="grnF-from-'+k+'" onchange="bnxGrnFilter(this,\'from\')"><span class="gl">To</span><input type="date" id="grnF-to-'+k+'" onchange="bnxGrnFilter(this,\'to\')">'
+     +'<select id="grnF-bill-'+k+'" onchange="bnxGrnFilter(this,\'bill\')" title="Supplier bill status"><option value="">All bill status</option><option value="open">⏳ Not fully billed</option><option value="none">Bill pending</option><option value="part">Part billed</option><option value="full">Billed</option><option value="over">Over billed</option><option value="noinv">No invoice linked</option></select>'
+     +'<select id="grnF-godown-'+k+'" onchange="bnxGrnFilter(this,\'godown\')" title="Godown"></select>'
+     +'<button class="btn btn-sm" onclick="bnxGrnFilterClear()">✕ Clear</button><span class="gcnt" id="grnF-cnt-'+k+'"></span>';
+  }
+  function ensureBars(){
+    var pg=D.getElementById('ll-grn');
+    if(pg&&!D.getElementById('grnFb-p')){ var d=D.createElement('div'); d.id='grnFb-p'; d.className='grn-fbar'; d.innerHTML=barHtml('p'); pg.parentNode.insertBefore(d,pg); }
+    var rt=D.getElementById('rt-grn'), tw=rt&&rt.closest('.tw');
+    if(tw&&!D.getElementById('grnFb-r')){ var d2=D.createElement('div'); d2.id='grnFb-r'; d2.className='grn-fbar'; d2.style.margin='6px 10px'; d2.innerHTML=barHtml('r'); tw.parentNode.insertBefore(d2,tw); }
+  }
+  function syncBars(){
+    ['p','r'].forEach(function(k){
+      var qe=D.getElementById('grnF-q-'+k); if(!qe)return;
+      if(D.activeElement!==qe)qe.value=F.q;
+      D.getElementById('grnF-from-'+k).value=F.from; D.getElementById('grnF-to-'+k).value=F.to; D.getElementById('grnF-bill-'+k).value=F.bill;
+      var vs=D.getElementById('grnF-vendor-'+k), gs=D.getElementById('grnF-godown-'+k), seenV={},vn=[],seenG={},gn=[];
+      (DB.grns||[]).forEach(function(g){ var n=String(g.vendorName||'').trim(),kk=norm(n); if(n&&!seenV[kk]){seenV[kk]=1;vn.push(n);} var go=String(g.godown||'').trim(); if(go&&!seenG[go]){seenG[go]=1;gn.push(go);} });
+      vn.sort(function(a,b){return a.localeCompare(b);}); gn.sort();
+      vs.innerHTML='<option value="">All suppliers ('+vn.length+')</option>'+vn.map(function(n){return '<option value="'+bnxEsc(n)+'">'+bnxEsc(n)+'</option>';}).join(''); vs.value=F.vendor;
+      gs.innerHTML='<option value="">All godowns</option>'+gn.map(function(n){return '<option value="'+bnxEsc(n)+'">'+bnxEsc(n)+'</option>';}).join(''); gs.value=F.godown;
+    });
+  }
+  function setCounts(R){
+    ['p','r'].forEach(function(k){ var c=D.getElementById('grnF-cnt-'+k); if(!c||!R)return; var v=0; R.shown.forEach(function(G){v+=G.value;}); c.textContent=R.shown.length+' of '+R.all.length+' GRNs · '+fmt(v); });
+  }
+  W.bnxGrnFilter=function(el,k){ F[k]=String(el.value||'').trim(); ['p','r'].forEach(function(s){ var e=D.getElementById('grnF-'+k+'-'+s); if(e&&e!==el&&k!=='q')e.value=el.value; if(k==='q'&&e&&e!==el)e.value=el.value; }); renderAll(); };
+  W.bnxGrnFilterClear=function(){ F={q:'',vendor:'',from:'',to:'',bill:'',godown:''}; syncBars(); renderAll(); };
+
   function renderRegister(){
-    var tb=document.getElementById('rt-grn');if(!tb)return;
+    var tb=D.getElementById('rt-grn');if(!tb)return;
     var range=(typeof bnxGetRange==='function')?bnxGetRange('pReg'):null;
     var list=DB.grns.filter(function(g){return range?bnxInRange(g.date,range):true;});
-    fixTable(tb);paint(tb,list,'No GRNs');
+    ensureBars();fixTable(tb);var R=paint(tb,list,'No GRNs');setCounts(R);
   }
   function renderPage(){
-    var e=document.getElementById('ll-grn');if(!e)return;
-    var cnt=document.getElementById('grn-count');
-    var G=groups(DB.grns);if(cnt)cnt.textContent=G.length+' GRNs · '+DB.grns.length+' lines';
-    if(!G.length){e.innerHTML='<div style="text-align:center;padding:28px;color:var(--text3);font-style:italic">No GRNs yet.</div>';return;}
-    e.innerHTML='<div class="tw"><table class="grn-tbl">'+HEAD+'<tbody>'+G.map(rowHtml).join('')+'</tbody></table></div>';
+    var e=D.getElementById('ll-grn');if(!e)return;
+    ensureBars();
+    var cnt=D.getElementById('grn-count');
+    var GS=groups(DB.grns);if(cnt)cnt.textContent=GS.length+' GRNs · '+DB.grns.length+' lines';
+    if(!GS.length){e.innerHTML='<div style="text-align:center;padding:28px;color:var(--text3);font-style:italic">No GRNs yet.</div>';setCounts({all:[],shown:[]});return;}
+    var R=filtered(DB.grns);
+    e.innerHTML='<div class="tw"><table class="grn-tbl">'+HEAD+'<tbody>'+(R.shown.length?R.shown.map(rowHtml).join(''):'<tr class="empty-r"><td colspan="'+NCOL+'">No GRN matches the search / filters.</td></tr>')+'</tbody>'+(R.shown.length?foot(R.shown):'')+'</table></div>';
+    setCounts(R);
   }
-  var oR=window.rendRegs;window.rendRegs=function(){var r=oR&&oR.apply(this,arguments);try{renderRegister();}catch(e){console.error(e);}return r;};
-  var oG=window.rendGRN;window.rendGRN=function(){var r=oG&&oG.apply(this,arguments);try{renderPage();}catch(e){console.error(e);}return r;};
+  function renderAll(){ try{renderPage();}catch(e){console.error(e);} try{renderRegister();}catch(e){console.error(e);} syncBars(); }
+  var oR=window.rendRegs;window.rendRegs=function(){var r=oR&&oR.apply(this,arguments);try{renderRegister();syncBars();}catch(e){console.error(e);}return r;};
+  var oG=window.rendGRN;window.rendGRN=function(){var r=oG&&oG.apply(this,arguments);try{renderPage();syncBars();}catch(e){console.error(e);}return r;};
   window.bnxShowGRNTxn=function(no){
     var rows=DB.grns.filter(function(g){return String(g.no)===String(no);});
     if(!rows.length){toast('GRN not found','err','⚠️');return;}
-    var h=rows[0],rate=0,tot=0;
+    W._bnxGrnIdx=null; var h=rows[0],tot=0,G=enrich({no:no,rows:rows});
     var lines=rows.map(function(r,i){var amt=(+r.accepted||0)*(+r.rate||0);tot+=amt;
-      return '<tr><td>'+(i+1)+'</td><td>'+bnxEsc(r.item)+'</td><td class="r">'+q(r.received)+'</td><td class="r" style="color:var(--green)">'+q(r.accepted)+'</td><td class="r" style="color:var(--red)">'+q(r.rejected)+'</td><td class="r">'+fmt(r.rate||0)+'</td><td class="r"><b>'+fmt(amt)+'</b></td><td><button class="btn" style="padding:2px 8px;font-size:11px" onclick="closeM(\'mGRNTxn\');editGRN(\''+bnxEsc(r.id)+'\')">✏️</button> <button class="btn" style="padding:2px 8px;font-size:11px" onclick="closeM(\'mGRNTxn\');deleteGRN(\''+bnxEsc(r.id)+'\')">🗑</button></td></tr>';}).join('');
+      return '<tr><td>'+(i+1)+'</td><td>'+bnxEsc(r.item)+'</td><td class="r">'+q(r.received)+'</td><td class="r" style="color:var(--green)">'+q(r.accepted)+'</td><td class="r" style="color:var(--red)">'+q(r.rejected)+'</td><td class="r">'+fmt(r.rate||0)+'</td><td class="r"><b>'+fmt(amt)+'</b></td><td><button class="btn" style="padding:2px 8px;font-size:11px" onclick="closeM(\'mGRNTxn\');editGRN(\''+bnxEsc(r.id)+'\')">✏️</button> <button class="btn" style="padding:2px 8px;font-size:11px" onclick="closeM(\'mGRNTxn\');deleteGRN(\''+bnxEsc(r.id)+'\')">🗑️</button></td></tr>';}).join('');
     function f(l,v){return '<div><span>'+l+'</span>'+(v||'—')+'</div>';}
+    var c=CHIP[G.status]||CHIP.noinv, parts=(G.inv&&G.inv.partBills)||[];
+    var billBox=G.inv?('<div style="margin:12px 0;padding:10px 12px;border:1px solid var(--border,#e5e7eb);border-radius:8px"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><div><b>Supplier bills</b> <span class="badge '+c[0]+'">'+c[1]+'</span> <span class="mut" style="font-size:12px">GRN '+fmt(G.value)+' · billed '+fmt(G.billed)+' · balance '+fmt(G.bal)+'</span></div><button class="btn btn-sm btn-primary" onclick="closeM(\'mGRNTxn\');bnxPartBills(\''+bnxEsc(G.inv.id)+'\')">🧾 Add / edit bills</button></div>'+(parts.length?'<table style="margin-top:8px"><thead><tr><th>Bill no</th><th>Date</th><th class="r">Amount</th></tr></thead><tbody>'+parts.map(function(b){return '<tr><td>'+bnxEsc(b.billNo)+'</td><td>'+(b.billDate?fmtD(b.billDate):'—')+'</td><td class="r">'+fmt(b.amount)+'</td></tr>';}).join('')+'</tbody></table>':(G.inv.billNo?'<div style="margin-top:6px;font-size:12.5px">Bill no: '+bnxEsc(G.inv.billNo)+'</div>':''))+'</div>'):'<div class="mut" style="margin:10px 0;font-size:12.5px">No purchase invoice is linked to this GRN yet — supplier bills cannot be recorded until it is.</div>';
     document.getElementById('grnTxnBody').innerHTML=
-      '<div class="hg">'+f('GRN No',bnxEsc(h.no))+f('Date',fmtD(h.date))+f('Vendor',bnxEsc(h.vendorName))+f('PO Ref',bnxEsc(h.poRef))+f('Purchase Invoice',bnxEsc(h.purchaseNo))+f('Godown',bnxEsc(h.godown))+f('Vehicle',bnxEsc(h.vehicle))+f('Driver',bnxEsc(h.driver))+f('Status',bnxEsc(h.status))+f('Remarks',bnxEsc(h.remarks))+'</div>'+
+      '<div class="hg">'+f('GRN No',bnxEsc(h.no))+f('Date',fmtD(h.date))+f('Vendor',bnxEsc(h.vendorName))+f('PO Ref',bnxEsc(h.poRef))+f('Purchase Invoice',bnxEsc(h.purchaseNo||(G.inv&&G.inv.no)))+f('Godown',bnxEsc(h.godown))+f('Vehicle',bnxEsc(h.vehicle))+f('Driver',bnxEsc(h.driver))+f('Status',bnxEsc(h.status))+f('Remarks',bnxEsc(h.remarks))+'</div>'+billBox+
       '<div class="tw"><table><thead><tr><th>#</th><th>Item</th><th class="r">Received</th><th class="r">Accepted</th><th class="r">Rejected</th><th class="r">Rate</th><th class="r">Amount</th><th></th></tr></thead><tbody>'+lines+'</tbody><tfoot><tr><td colspan="2"><b>Total</b></td><td class="r"><b>'+q(sum(rows,'received'))+'</b></td><td class="r"><b>'+q(sum(rows,'accepted'))+'</b></td><td class="r"><b>'+q(sum(rows,'rejected'))+'</b></td><td></td><td class="r"><b>'+fmt(tot)+'</b></td><td></td></tr></tfoot></table></div>';
     openM('mGRNTxn');
   };
@@ -11950,7 +12283,7 @@ window.handleScan=function(input){
     if(ev.target.closest('a,button,.party-lnk'))return;
     bnxShowGRNTxn(tr.getAttribute('data-grn'));
   });
-  setTimeout(function(){try{renderRegister();renderPage();}catch(e){}},0);
+  setTimeout(function(){try{renderAll();}catch(e){}},0);
 })();
 </script>
 <script id="bnx-tally-pay-vendor-20261125">
