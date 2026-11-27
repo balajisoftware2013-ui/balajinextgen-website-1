@@ -132,23 +132,33 @@
               m.innerHTML='<div style="font-weight:900">Guest scans & pays ₹'+amt.toLocaleString('en-IN')+'</div><div id="cbQr" style="display:inline-block;margin:8px auto;padding:8px;background:#fff;border-radius:12px"></div><button type="button" id="cbUpiOk" style="width:100%;border:0;border-radius:12px;padding:14px;background:#16a34a;color:#fff;font-weight:900">✓ UPI received → book & let in</button>';
               qrInto(m.querySelector('#cbQr'),l); m.querySelector('#cbUpiOk').onclick=function(){ this.disabled=true; book('UPI'); }; }); return; }
           b.disabled=true; book(mode);
-          function book(md){ m.innerHTML='Booking…';
-            var q=new URLSearchParams({action:'GUEST_CHECKIN',mode:'TICKET_BOOK',clientId:(typeof CLIENT_ID!=='undefined'?CLIENT_ID:''),eventId:EV[ei].id,typeId:t.typeId||t.id||'',qty:String(qty),customerName:name,mobileNo:mob,source:'COUNTER',requestId:'door-'+Date.now().toString(36)});
-            fetch(coreEp()+'?'+q.toString()).then(function(x){ return x.json(); }).then(function(br){
-              if(!br||!br.success||!br.code){ m.innerHTML='<b style="color:#dc2626">'+esc(br&&br.error||'Could not book')+'</b>'; b.disabled=false; return; }
-              var pr=md==='FREE'||!amt?{code:br.code,status:'CHECKED_IN',notify:true}:{code:br.code,status:'CHECKED_IN',notify:true,collect:true,payMode:md};
-              api('GG_TICKET_SET',pr).then(function(r2){
-                if(r2&&r2.success){ m.innerHTML='<div style="background:#e8f7ee;color:#146c2e;border-radius:12px;padding:14px;font-weight:900;font-size:17px">✅ LET IN — '+esc(name)+' · '+qty+' × '+esc(t.name)+'<br><span style="font-size:22px;letter-spacing:.2em">'+esc(br.code)+'</span><br><span style="font-weight:600;font-size:13px">'+(md==='FREE'?'free pass':md==='LATER'?'to pay later':md+' ₹'+amt.toLocaleString('en-IN'))+' · auto WhatsApp to the guest</span></div>';
-                  t.sold=(Number(t.sold)||0)+qty; paint.nm=''; paint.mb=''; try{ navigator.vibrate&&navigator.vibrate(60); }catch(e){} }
-                else m.innerHTML='<div style="color:#dc2626;font-weight:800">Booked '+esc(br.code)+' but check-in failed: '+esc(r2&&r2.error||'')+' — use Door entry with this code</div>'; });
-            }).catch(function(){ m.innerHTML='<b style="color:#dc2626">No connection — try again</b>'; b.disabled=false; }); }
+          function book(md){ m.innerHTML='<div style="font-weight:800">Booking & checking in…</div>';
+            api('GG_DOOR_SELL',{eventId:EV[ei].id,typeId:t.typeId||t.id||'',qty:qty,customerName:name,mobileNo:mob,payMode:md==='FREE'||!amt?'FREE':md}).then(function(r2){
+              var code=r2&&(r2.code||(r2.booking&&r2.booking.code));
+              if(r2&&r2.success){ m.innerHTML='<div style="background:#e8f7ee;color:#146c2e;border-radius:12px;padding:14px;font-weight:900;font-size:17px">✅ LET IN — '+esc(name)+' · '+qty+' × '+esc(t.name)+'<br><span style="font-size:22px;letter-spacing:.2em">'+esc(code)+'</span><br><span style="font-weight:600;font-size:13px">'+(md==='FREE'?'free pass':md==='LATER'?'to pay later':md+' ₹'+amt.toLocaleString('en-IN'))+' · auto WhatsApp to the guest</span></div>';
+                t.sold=(Number(t.sold)||0)+qty; paint.nm=''; paint.mb=''; nm.value=''; mb.value=''; b.disabled=false; try{ navigator.vibrate&&navigator.vibrate(60); }catch(e){} DOORIX[code]={CODE:code,NAME:name,QTY:qty,TYPE_NAME:t.name,STATUS:'CHECKED_IN',AT:Date.now()}; }
+              else { m.innerHTML='<div style="color:#dc2626;font-weight:800">'+esc(r2&&r2.error||'Could not book — try again')+'</div>'; b.disabled=false; }
+            }); }
         }; });
       }
       paint();
     });
   }
+  /* fast door: today's bookings are kept on this phone (refreshed every 30 s) → a scan answers at once from that list;
+     the check-in / payment goes to the server in the background (kept and retried if the network drops). */
+  var DOORIX={}, DOORAT=0, DOORQ=[];
+  try{ DOORQ=JSON.parse(localStorage.getItem('bnx_door_q')||'[]')||[]; }catch(e){}
+  function qsave(){ try{ localStorage.setItem('bnx_door_q',JSON.stringify(DOORQ.slice(-200))); }catch(e){} }
+  function qflush(){ if(!DOORQ.length||qflush.busy) return; qflush.busy=1; var j=DOORQ[0];
+    api('GG_TICKET_SET',j).then(function(r){ if(r&&(r.success||/already|checked in|cancel/i.test(String(r.error||'')))){ DOORQ.shift(); qsave(); if(!r.success) toast('Server: '+r.error+' ('+j.code+')','error'); } else if(r&&r.unpaid&&!j.collect){ DOORQ.shift(); qsave(); toast('⚠ '+j.code+' is NOT paid on the server — collect','error'); } })
+      .catch(function(){}).then(function(){ qflush.busy=0; if(DOORQ.length) setTimeout(qflush,1500); }); }
+  setInterval(qflush,8000);
+  function doorLoad(force){ if(!force&&Date.now()-DOORAT<30000) return Promise.resolve(); DOORAT=Date.now();
+    return api('GG_EVENTS',{}).then(function(r){ var td=new Date(Date.now()-6*3600e3), tday=td.toISOString().slice(0,10), tmr=new Date(td.getTime()+864e5).toISOString().slice(0,10);
+      var ev=((r&&r.data)||[]).filter(function(e){ return !e.past&&(String(e.date).slice(0,10)===tday||String(e.date).slice(0,10)===tmr); });
+      return Promise.all(ev.map(function(e){ return api('GG_TICKETS_LIST',{eventId:e.id}).then(function(x){ ((x&&x.data)||[]).forEach(function(b){ var k=String(b.CODE||'').toUpperCase(); if(!k) return; var cur=DOORIX[k]; if(cur&&cur.STATUS==='CHECKED_IN'&&cur.AT&&String(b.STATUS).toUpperCase()!=='CHECKED_IN'&&Date.now()-cur.AT<600000) return; b.EVENT_TITLE=b.EVENT_TITLE||e.title; DOORIX[k]=b; }); }); })); }).catch(function(){}); }
   function drawDoor(p){
-    var c=dcfg();
+    var c=dcfg(); doorLoad(true);
     var body=shell(p,'<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:12px;margin:2px 0 8px;padding:8px;border-radius:10px;background:var(--surface2,#f6f6f6)"><b>Door rules:</b>'
         +'<label><input type="checkbox" id="dcLater" '+(c.allowLater?'checked':'')+'> Let unpaid in (collect later)</label>'
         +'<label><input type="checkbox" id="dcCash" '+(c.cash?'checked':'')+'> 💵 Cash</label><label><input type="checkbox" id="dcUpi" '+(c.upi?'checked':'')+'> 📱 UPI</label><label><input type="checkbox" id="dcCard" '+(c.card?'checked':'')+'> 💳 Card</label></div>'
@@ -163,10 +173,23 @@
     function ok(x,how){ msg.innerHTML='<div style="background:#e8f7ee;color:#146c2e;border-radius:12px;padding:14px;font-weight:900;font-size:17px">✅ LET IN — '+esc(x.NAME||'')+' · '+esc(x.QTY||1)+' × '+esc(x.TYPE_NAME||'')+'<br><span style="font-weight:600;font-size:13px">'+esc(x.EVENT_TITLE||'')+(how?' · '+esc(how):'')+' · auto WhatsApp to the guest (business number)</span></div>'; inp.value=''; try{ navigator.vibrate&&navigator.vibrate(60); }catch(e){} }
     function bad(t,x){ msg.innerHTML='<div style="background:#fdecec;color:#a12020;border-radius:12px;padding:12px;font-weight:800">⛔ '+esc(t||'Not valid')+(x?' — '+esc(x.NAME||'')+', '+esc(x.QTY||'')+' × '+esc(x.TYPE_NAME||''):'')+'</div>'; try{ navigator.vibrate&&navigator.vibrate([80,60,80]); }catch(e){} }
     function check(code,mode){ code=String(code||'').toUpperCase(); code=(code.match(/BNXTK:[^:]*:([A-Z0-9]+)/)||[])[1]||code.replace(/[^A-Z0-9]/g,''); if(code.length<4){ msg.innerHTML='<b style="color:#dc2626">Enter the ticket code</b>'; return; }
+      var L=DOORIX[code];
+      if(L){ var st=String(L.STATUS||'').toUpperCase(), amt0=Number(L.AMOUNT||0);
+        if(st==='CHECKED_IN'||L.CHECKED_IN_AT){ if(!mode){ bad('Already checked in'+(L.CHECKED_IN_AT?' at '+String(L.CHECKED_IN_AT).slice(11,16):''),L); return; } }
+        else if(/CANCEL/.test(st)){ bad('Cancelled ticket',L); return; }
+        else if(mode||st==='PAID'||st==='CONFIRMED'||!amt0){
+          L.STATUS='CHECKED_IN'; L.CHECKED_IN_AT=(function(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'); })(new Date()); L.AT=Date.now();
+          DOORQ.push(Object.assign({code:code,status:'CHECKED_IN',notify:true,requestId:'dq-'+code},mode?{collect:true,payMode:mode}:{})); qsave(); qflush();
+          ok(L,mode==='CASH'?'cash taken':mode==='UPI'?'UPI received':mode==='CARD'?'card swiped':mode==='LATER'?'to pay later':'paid'); doorLoad(); return; }
+        /* unpaid → payment buttons at once (local amount) */
+        unpaidUi(code,L,amt0); return; }
       go.disabled=true; if(!mode) msg.textContent='Checking '+code+'…';
       api('GG_TICKET_SET',Object.assign({code:code,status:'CHECKED_IN',notify:true},mode?{collect:true,payMode:mode}:{})).then(function(r){ go.disabled=false;
         if(r&&r.success){ ok(r.data||{},mode==='CASH'?'cash taken':mode==='UPI'?'UPI received':mode==='CARD'?'card swiped':mode==='LATER'?'to pay later':'paid'); }
-        else if(r&&r.unpaid){ var x=r.data||{}, amt=Number(x.AMOUNT||x.amount||0)||Number((String(r.error||'').replace(/,/g,'').match(/(\d+(?:\.\d+)?)/)||[])[1]||0);
+        else if(r&&r.unpaid){ var x=r.data||{}; unpaidUi(code,x,Number(x.AMOUNT||x.amount||0)||Number((String(r.error||'').replace(/,/g,'').match(/(\d+(?:\.\d+)?)/)||[])[1]||0)); }
+        else bad(r&&r.error,r&&r.data);
+        inp.focus(); }); }
+    function unpaidUi(code,x,amt){
           msg.innerHTML='<div style="background:#fff7e6;color:#8a5a00;border-radius:12px;padding:12px;font-weight:900;font-size:16px">💰 NOT PAID'+(amt?' — ₹'+amt.toLocaleString('en-IN'):'')+'<br><span style="font-weight:600;font-size:13px">'+esc(x.NAME||'')+(x.QTY?' · '+esc(x.QTY)+' × '+esc(x.TYPE_NAME||''):'')+'</span></div>'
             +'<div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">'
             +(c.cash?'<button type="button" data-m="CASH" style="border:0;border-radius:12px;padding:14px;background:#16a34a;color:#fff;font-weight:900;font-size:15px">💵 Cash received → let in</button>':'')
@@ -181,9 +204,8 @@
                 +'<button type="button" id="gdUpiOk" style="width:100%;border:0;border-radius:12px;padding:14px;background:#16a34a;color:#fff;font-weight:900;font-size:15px">✓ UPI received (seen on guest phone / bank) → let in</button>';
               qrInto(box.querySelector('#gdQrImg'),l); qb.style.display='none';
               box.querySelector('#gdUpiOk').onclick=function(){ this.disabled=true; check(code,'UPI'); }; }); };
-        }
-        else bad(r&&r.error,r&&r.data);
-        inp.focus(); }); }
+        
+    }
     go.onclick=function(){ check(inp.value); }; inp.onkeydown=function(e){ if(e.key==='Enter') check(inp.value); }; setTimeout(function(){ inp.focus(); },100);
     var cam=body.querySelector('#gdCam'); if(cam) cam.onclick=function(){ if(scanning){ stop(); return; }
       navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}}).then(function(st){ stream=st; var v=body.querySelector('#gdVid'); v.srcObject=st; v.style.display='block'; v.play(); scanning=true;
