@@ -814,8 +814,9 @@ button:focus-visible,[role=button]:focus-visible,input:focus-visible{outline:3px
   <div class="screen" id="s-confirm">
     <div class="center-col">
       <div class="ok-badge">✓</div>
-      <div style="font-size:19px;font-weight:800;">Yum, it's on its way to the kitchen! 🎉</div>
+      <div style="font-size:19px;font-weight:800;">Order sent to your steward! 🎉</div>
       <div class="order-no" id="cf-orderno">ORD-000</div>
+      <div id="cf-qrst" style="display:none;margin:10px auto 6px;max-width:320px;padding:10px 14px;border-radius:12px;background:#fff7e6;color:#8a5a00;font-weight:800;font-size:14px"></div>
       <div class="hint">Sit back and relax — a staff member will bring it to <b id="cf-table">your table</b> shortly.</div>
       <div class="hint" id="cf-points" style="display:none;color:var(--gold);font-weight:700;"></div>
       <div class="channel-note" id="cf-channel" style="display:none;"></div>
@@ -2204,8 +2205,11 @@ document.getElementById('ph-continue').onclick = async ()=>{
      with SMS as its own fallback) — this page never sends WhatsApp/SMS
      itself, it only records what the guest agreed to. See the
      accompanying backend-gas-crm-order.gs for the server side of this. */
-  const res = await gasApi('CUSTOMER_CHECKIN', {
-    requestId: 'chkin-' + STATE.scanKey + '-' + Date.now().toString(36),
+  /* 2026-11-27 crowd / event time ("not wait, not take time"): with name + number typed, the guest waits at most 4 s — if the
+     server is slow the check-in finishes in the background (same request id, retried until saved) and the menu opens at once. */
+  const _ckRid = 'chkin-' + STATE.scanKey + '-' + Date.now().toString(36);
+  const _ckP = gasApi('CUSTOMER_CHECKIN', {
+    requestId: _ckRid,
     mobileNo: STATE.customerPhone,
     phone: STATE.customerPhone,
     mobile: STATE.customerPhone,
@@ -2218,6 +2222,15 @@ document.getElementById('ph-continue').onclick = async ()=>{
     /* name typed (or AutoFilled) on the same screen → saved in the same call, welcome goes at once */
     ...(phName.length>=2 ? { customerName: phName, name: phName, updateName: true, welcomeSms: true, deferWelcome: false } : { deferWelcome: true }),
   }, 'V2_CORE');
+  const res = phName.length>=2 ? await Promise.race([_ckP, new Promise(r=>setTimeout(()=>r({success:false,slow:true}),4000))]) : await _ckP;
+  if (res && res.slow && phName.length>=2){
+    _ckP.then(r=>{ if(!r||r.success!==true){ try{ bnxQueueCheckin_({ requestId:_ckRid, mobileNo:STATE.customerPhone, customerName:phName, name:phName, updateName:true, tableId:STATE.tableId, scanKey:STATE.scanKey, notifyOptIn:STATE.notifyOptIn, source:'QR_SCAN', clientId:STATE.clientId }); }catch(e){} }
+      else { try{ gxSave({phone:STATE.customerPhone, saved:true, name:phName, crn:gxCrn(r)}); }catch(e){} } }).catch(()=>{});
+    btn.disabled = false; btn.textContent = 'Continue';
+    STATE.gateOk = true; STATE.customerName = phName; STATE.isNewCustomer = false; STATE.points = Number(STATE.points||0);
+    try{ gxSave({phone:STATE.customerPhone, name:phName}); }catch(e){}
+    bnxToast('✅ Welcome '+phName.split(' ')[0]+'!'); enterMenu(); return;
+  }
 
   btn.disabled = false; btn.textContent = 'Continue';
 
@@ -2856,13 +2869,16 @@ document.getElementById('cart-place').onclick = async ()=>{
     billAmount: finalAmount,
     notifyOptIn: STATE.notifyOptIn,
   };
-  let res = await gasApi('SAVE_ORDER', _soPayload, 'V2_CORE');
-  if (!res || res.success===false){ await new Promise(r=>setTimeout(r,1200)); res = await gasApi('SAVE_ORDER', _soPayload, 'V2_CORE'); }
+  /* 2026-11-27 QR order → steward confirms → KOT: the order goes to the steward of the table (one quick row, no kitchen write,
+     so no more "signal is aborted"); the steward accepts and sends the KOT; this page shows the progress. */
+  _soPayload.guest = true; _soPayload.source = 'CUSTOMER_QR';
+  let res = await gasApi('QR_ORDER_REQUEST', _soPayload, 'V2_CORE');
+  if (!res || res.success===false){ await new Promise(r=>setTimeout(r,1500)); res = await gasApi('QR_ORDER_REQUEST', _soPayload, 'V2_CORE'); }
 
   btn.disabled = false; btn.textContent = 'Place order';
 
   if (!res || res.success===false){
-    document.getElementById('cart-err').textContent = "Couldn't reach the kitchen — please check your connection and try again, or tell a staff member." + ((res && (res.error||res.message)) ? ' ('+String(res.error||res.message).slice(0,80)+')' : '');
+    document.getElementById('cart-err').textContent = "Couldn't send the order — please check your connection and try again, or tell a staff member." + ((res && (res.error||res.message)) ? ' ('+String(res.error||res.message).slice(0,80)+')' : '');
     return;
   }
   document.getElementById('cf-orderno').textContent = res.orderNo || res.data?.ORDER_NO || ('ORD-'+Date.now().toString().slice(-6));
@@ -2888,7 +2904,19 @@ document.getElementById('cart-place').onclick = async ()=>{
   try{ sessionStorage.removeItem(CART_KEY); }catch(e){}
   bnxHaptic([20,40,20]);
   goScreen('s-confirm');
+  try{ bnxQrWatch_(res.reqId||''); }catch(e){}
 };
+function bnxQrWatch_(id){
+  const el=document.getElementById('cf-qrst'); if(!el) return; if(!id){ el.style.display='none'; return; }
+  const paint=(st,ord,why)=>{ el.style.display='block';
+    if(st==='CONFIRMED'){ el.style.background='#e8f7ee'; el.style.color='#146c2e'; el.textContent='✅ Confirmed — the kitchen has your order'+(ord?' ('+ord+')':''); }
+    else if(st==='REJECTED'){ el.style.background='#fdecec'; el.style.color='#a12020'; el.textContent='✕ Not accepted'+(why?' — '+why:'')+'. Please call your steward.'; }
+    else if(st==='ACCEPTED'){ el.style.background='#eef4ff'; el.style.color='#1d4ed8'; el.textContent='👍 Your steward is sending it to the kitchen…'; }
+    else { el.style.background='#fff7e6'; el.style.color='#8a5a00'; el.textContent='⏳ Waiting for your steward to confirm…'; } };
+  paint('PENDING'); let n=0;
+  const tick=async()=>{ if(++n>120) return; try{ const r=await gasApi('QR_ORDER_STATUS',{reqId:id},'V2_CORE'); if(r&&r.success){ paint(r.status,r.orderNo,r.reason); if(r.status==='CONFIRMED'||r.status==='REJECTED') return; } }catch(e){} setTimeout(tick,n<10?5000:10000); };
+  setTimeout(tick,4000);
+}
 
 document.getElementById('cf-more').onclick = ()=>{ renderMenu(); goScreen('s-menu'); };
 
