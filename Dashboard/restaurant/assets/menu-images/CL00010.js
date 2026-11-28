@@ -1,0 +1,1 @@
+window.BNX_IMAGE_MAP = {"group":{},"category":{},"item":{}};
