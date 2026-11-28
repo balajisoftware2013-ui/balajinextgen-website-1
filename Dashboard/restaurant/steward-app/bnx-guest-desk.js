@@ -60,7 +60,14 @@
     p.querySelectorAll('[data-acc]').forEach(function(b){ b.onclick=function(){ accept(b.getAttribute('data-acc'),b); }; });
     /* one tap: order saved on the server (source CUSTOMER) + KOT to every printer (Kitchen / Bar / Hukka) + guest WhatsApp "confirmed" */
     p.querySelectorAll('[data-cf]').forEach(function(b){ b.onclick=function(){ var id=b.getAttribute('data-cf'); b.disabled=true; b.textContent='Sending to kitchen…';
-      api('QR_ORDER_SET',{reqId:id,status:'CONFIRMED',create:true}).then(function(r){
+      /* HAPPYSERVE app on this phone → the KOT prints from the phone straight to the Kitchen / Bar printer (works with the restaurant
+         PC off); otherwise the POS print queue as before */
+      var o=LIST.filter(function(x){ return x.reqId===id; })[0]||{}, nat=false; try{ nat=!!(W.bnxHasNative_&&W.bnxHasNative_()&&typeof W.bnxDirectKOTPrint_==='function'); }catch(e){}
+      api('QR_ORDER_SET',{reqId:id,status:'CONFIRMED',create:true,noPrint:nat}).then(function(r){
+        if(r&&r.success&&nat){ var g={}; (o.items||[]).forEach(function(i){ var role=/HUKKA|HOOKAH|SHEESHA|SHISHA/i.test(String(i.name||''))?'HUKKA':/BAR|BEVERAGE|LIQUOR/i.test(String(i.groupType||''))?'BAR':'KITCHEN'; (g[role]=g[role]||[]).push({name:i.name,qty:Number(i.qty)||1,note:''}); });
+          var who=''; try{ who=(typeof getCurrentStaffIdentity==='function'&&(getCurrentStaffIdentity().name||getCurrentStaffIdentity().fullName))||''; }catch(e){}
+          Object.keys(g).reduce(function(pr,role){ return pr.then(function(){ return Promise.resolve(W.bnxDirectKOTPrint_(role,{items:g[role],table:o.table||'TAKEAWAY',kotNo:r.kotNo||r.orderNo||id,orderNo:r.orderNo||'',waiter:who,covers:'',remarks:(o.notes||'')+(o.name?' · '+o.name:''),role:role})).catch(function(){}); }); },Promise.resolve());
+          r.printed=Object.keys(g).map(function(k){ return k+' (phone)'; }); }
         if(r&&r.success){ LIST=LIST.filter(function(x){ return x.reqId!==id; }); ui(); toast('✅ Order '+(r.orderNo||'')+' confirmed · KOT → '+((r.printed&&r.printed.length)?r.printed.join(' + '):'print queue')+' · guest told on WhatsApp','success'); }
         else { b.disabled=false; b.textContent='✅ Confirm → KOT prints'; toast((r&&r.error)||'Could not confirm','error'); V=''; poll(); } }); }; });
     p.querySelectorAll('[data-rej]').forEach(function(b){ b.onclick=function(){ var why=prompt('Reason for the guest (optional):','Item not available')||''; b.disabled=true;
